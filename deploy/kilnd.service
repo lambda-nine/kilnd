@@ -12,8 +12,9 @@ ExecStart=/usr/local/bin/kilnd --kiln /usr/local/bin/kiln --log-format json
 # startup reconciliation adopts them again. Only the main process is
 # signaled; kilnd itself stops its kiln exec clients.
 KillMode=process
-# Longer than --shutdown-grace-secs (30) plus kilnd's final wait (10).
-TimeoutStopSec=60
+# Covers --shutdown-grace-secs, the final RPC wait, and the longest accepted
+# create plus failed-publication compensation before systemd forces a stop.
+TimeoutStopSec=300
 Restart=on-failure
 RestartSec=2
 StateDirectory=kilnd

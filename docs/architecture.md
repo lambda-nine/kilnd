@@ -71,8 +71,13 @@ Executions: `RUNNING` → `EXITED` (with exit code) | `TIMED_OUT` | `CANCELED`
 `INTERRUPTED` (found running at startup).
 
 A sandbox row is written as `CREATING` before `kiln create` runs, so a crash
-mid-create leaves evidence. An execution row is written before `kiln exec`
-runs and finished in one update afterwards.
+mid-create leaves evidence. Creation then belongs to a tracked daemon task,
+not the gRPC handler: disconnecting only drops the waiter. A successful
+backend ID is published as `READY`; if that write fails, kilnd first records
+`DELETING`, removes the backend, and records `FAILED`. Failed removal stays
+`DELETING`, retains the backend ID, counts against the active limit, and is
+retryable. An execution row is written before `kiln exec` runs and finished
+in one update afterwards.
 
 ## Reconciliation
 
@@ -107,12 +112,22 @@ execution's cancel token. Delete marks the sandbox `DELETING`, cancels the
 running execution, waits for the lock, then runs `kiln rm`. Executions waiting
 behind the lock see `DELETING` and refuse.
 
+Accepted create operations live in a task tracker owned by the manager. The
+RPC awaits a one-shot result but does not own or cancel the task. Validation,
+capacity admission and the `CREATING` insert happen inside that task before
+its first backend await, preserving the active-sandbox cap. Backend create is
+itself isolated so a panic can be recorded as `FAILED` when no backend ID was
+returned.
+
 ## Shutdown and restarts
 
 On SIGTERM or SIGINT, kilnd refuses new creates and execs and stops accepting
 connections. It lets in-flight requests finish for `--shutdown-grace-secs`
 (30), then cancels running executions (recorded as `CANCELED`), waits up to 10
-more seconds, removes the socket and exits. Sandboxes keep running.
+more seconds for RPC replies, and drains accepted create/compensation tasks
+before removing the socket and exiting. Sandboxes keep running. Forced
+termination can still interrupt an operation; startup reconciliation handles
+the state it can identify.
 
 The systemd unit uses `KillMode=process` because kiln's shims are forked from
 kilnd's cgroup and must survive daemon restarts. systemd logs "left-over

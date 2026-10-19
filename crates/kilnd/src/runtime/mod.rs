@@ -70,8 +70,10 @@ pub trait Runtime: Send + Sync + 'static {
 
     fn version(&self) -> impl Future<Output = Result<String, RuntimeError>> + Send;
 
-    /// Creates a sandbox, returning once it accepts commands. Returns the
-    /// backend's ID for it.
+    /// Creates a fresh sandbox owned by this invocation, returning once it
+    /// accepts commands. A successful call returns that new backend's ID.
+    /// An error may be ambiguous if the backend made a resource before it
+    /// lost the ability to report the ID.
     fn create(&self, spec: &SandboxSpec) -> impl Future<Output = Result<String, RuntimeError>> + Send;
 
     /// Runs one command and waits for it. When the timeout passes or `cancel`

@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- `CreateSandbox` work is daemon-owned after acceptance: client cancellation
+  no longer strands `CREATING` rows or live unrecorded backends, failed state
+  publication is compensated and retryable, and shutdown drains accepted
+  creates before exit.
+
 ## 0.1.0 - 2026-10-13
 
 First vertical slice.

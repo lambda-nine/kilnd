@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::oneshot;
+use tokio_util::task::TaskTracker;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -117,6 +119,8 @@ pub struct Manager<R> {
     shutting_down: CancellationToken,
     /// Cancels running executions once canceled.
     abort_executions: CancellationToken,
+    /// Daemon-owned operations that must outlive the RPC waiting for them.
+    operations: TaskTracker,
     started_at_ms: i64,
 }
 
@@ -157,6 +161,7 @@ impl<R: Runtime> Manager<R> {
             slots: Mutex::new(HashMap::new()),
             shutting_down: CancellationToken::new(),
             abort_executions: CancellationToken::new(),
+            operations: TaskTracker::new(),
             started_at_ms: now_ms(),
         }
     }
@@ -265,7 +270,28 @@ impl<R: Runtime> Manager<R> {
         })
     }
 
-    pub async fn create(&self, req: CreateRequest) -> Result<Sandbox> {
+    /// Starts a daemon-owned create and waits for its result. Dropping this
+    /// waiter does not cancel the operation: once admitted, the supervisor
+    /// always publishes the backend ID or compensates by removing it.
+    pub async fn create(self: &Arc<Self>, req: CreateRequest) -> Result<Sandbox> {
+        // No await separates this check from task registration, so shutdown
+        // cannot close and drain the tracker before an accepted task exists.
+        self.check_serving()?;
+        let (result_tx, result_rx) = oneshot::channel();
+        let manager = Arc::clone(self);
+        self.operations.spawn(async move {
+            let result = manager.create_owned(req).await;
+            if let Err(result) = result_tx.send(result) {
+                match result {
+                    Ok(sandbox) => info!(sandbox = %sandbox.id, "create RPC stopped waiting; supervised operation completed"),
+                    Err(error) => warn!(error = %error, "create RPC stopped waiting; supervised operation failed"),
+                }
+            }
+        });
+        result_rx.await.map_err(|_| Error::Internal(anyhow::anyhow!("create supervisor stopped without a result")))?
+    }
+
+    async fn create_owned(self: Arc<Self>, req: CreateRequest) -> Result<Sandbox> {
         self.check_serving()?;
         let spec = self.resolve_spec(req)?;
         if self.store.count_active_sandboxes()? >= self.limits.max_sandboxes {
@@ -290,12 +316,29 @@ impl<R: Runtime> Manager<R> {
         // trace for reconciliation.
         self.store.insert_sandbox(&sandbox)?;
         info!(sandbox = %sandbox.id, image = %sandbox.spec.image, "creating sandbox");
-        match self.runtime.create(&sandbox.spec).await {
+        // Isolate a backend panic from the supervisor so the database still
+        // reaches a terminal state. A backend that panics after making an
+        // external resource but before returning its ID remains ambiguous by
+        // the Runtime contract and is left for startup reconciliation to
+        // report as unmanaged if it can still observe it.
+        let backend_create = {
+            let manager = Arc::clone(&self);
+            let spec = sandbox.spec.clone();
+            tokio::spawn(async move { manager.runtime.create(&spec).await })
+        };
+        let created = match backend_create.await {
+            Ok(result) => result,
+            Err(join) => {
+                let reason = if join.is_panic() { "backend create task panicked" } else { "backend create task was canceled" };
+                warn!(sandbox = %sandbox.id, error = reason, "sandbox creation failed");
+                self.store.set_sandbox_state(&sandbox.id, SandboxState::Failed, None, Some(reason))?;
+                return Err(Error::Backend(format!("create sandbox {}: {reason}", sandbox.id)));
+            }
+        };
+        match created {
             Ok(backend_id) => {
                 if let Err(e) = self.store.set_sandbox_state(&sandbox.id, SandboxState::Ready, Some(&backend_id), None) {
-                    // Unrecorded backend sandboxes would leak; undo.
-                    let _ = self.runtime.remove(&backend_id).await;
-                    return Err(e.into());
+                    return Err(self.compensate_failed_publication(&sandbox.id, &backend_id, e).await);
                 }
                 info!(sandbox = %sandbox.id, backend_id = %backend_id, "sandbox ready");
                 sandbox.backend_id = Some(backend_id);
@@ -307,6 +350,45 @@ impl<R: Runtime> Manager<R> {
                 warn!(sandbox = %sandbox.id, error = %reason, "sandbox creation failed");
                 self.store.set_sandbox_state(&sandbox.id, SandboxState::Failed, None, Some(&reason))?;
                 Err(Error::Backend(format!("create sandbox {}: {reason}", sandbox.id)))
+            }
+        }
+    }
+
+    /// A backend exists but READY could not be persisted. Publish cleanup
+    /// intent before awaiting removal, then preserve any failed compensation
+    /// as DELETING so it remains counted and retryable.
+    async fn compensate_failed_publication(&self, sandbox_id: &str, backend_id: &str, publication: anyhow::Error) -> Error {
+        let slot = self.slot(sandbox_id);
+        let _guard = slot.exec_lock.lock().await;
+        let publication_reason = format!("record ready state failed: {publication:#}");
+        if let Err(e) = self.store.set_sandbox_state(
+            sandbox_id,
+            SandboxState::Deleting,
+            Some(backend_id),
+            Some(&publication_reason),
+        ) {
+            warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %format!("{e:#}"), "could not record create compensation intent");
+        }
+
+        match self.runtime.remove(backend_id).await {
+            Ok(()) | Err(RuntimeError::NotFound(_)) => {
+                let reason = format!("{publication_reason}; backend removed");
+                if let Err(e) = self.store.set_sandbox_state(sandbox_id, SandboxState::Failed, Some(backend_id), Some(&reason)) {
+                    warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %format!("{e:#}"), "backend removed but create failure could not be finalized");
+                }
+                self.slots.lock().unwrap().remove(sandbox_id);
+                warn!(sandbox = %sandbox_id, backend_id = %backend_id, "ready publication failed; removed backend sandbox");
+                Error::Internal(publication)
+            }
+            Err(cleanup) => {
+                let reason = format!("{publication_reason}; cleanup failed: {cleanup}");
+                if let Err(e) =
+                    self.store.set_sandbox_state(sandbox_id, SandboxState::Deleting, Some(backend_id), Some(&reason))
+                {
+                    warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %format!("{e:#}"), "create compensation failure could not be recorded");
+                }
+                warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %cleanup, "ready publication and compensation failed");
+                Error::Internal(anyhow::anyhow!("{publication_reason}; cleanup failed: {cleanup}"))
             }
         }
     }
@@ -463,6 +545,13 @@ impl<R: Runtime> Manager<R> {
     /// executions continue until `cancel_executions`.
     pub fn begin_shutdown(&self) {
         self.shutting_down.cancel();
+        self.operations.close();
+    }
+
+    /// Waits until every accepted daemon-owned operation has finished. Call
+    /// after `begin_shutdown`, which closes the tracker to new idle periods.
+    pub async fn drain_operations(&self) {
+        self.operations.wait().await;
     }
 
     /// Cancels every running execution; they finish as CANCELED.

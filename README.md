@@ -43,6 +43,11 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   (directory 0750, socket 0660), per-execution timeouts that stop the command
   inside the sandbox, bounded output, stdin and argv, a cap on active
   sandboxes, graceful shutdown, and structured logs (text or JSON).
+- **Supervised creates:** after acceptance, `CreateSandbox` belongs to the
+  daemon rather than the RPC future. A disconnected caller stops receiving
+  the result, but creation still reaches `ready` or attempts compensation.
+  Failed cleanup stays counted and retryable; shutdown drains this work
+  before exit.
 - **`kilndctl`**, a small client covering the whole API.
 
 Sandboxes outlive kilnd: restarting or upgrading the daemon leaves them

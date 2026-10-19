@@ -56,12 +56,23 @@ pub fn bind(path: &Path, gid: Option<u32>) -> Result<UnixListener> {
 
 /// Serves until `shutdown` resolves, then: refuses new work and stops
 /// accepting connections, lets in-flight requests finish for `grace`,
-/// cancels running executions, and waits briefly for their replies.
+/// cancels running executions, waits briefly for their replies, and drains
+/// accepted manager-owned operations even if their RPCs disconnected.
 pub async fn serve<R: Runtime>(
     manager: Arc<Manager<R>>,
     listener: UnixListener,
     shutdown: impl Future<Output = ()>,
     grace: Duration,
+) -> Result<()> {
+    serve_with_final_wait(manager, listener, shutdown, grace, FINAL_WAIT).await
+}
+
+async fn serve_with_final_wait<R: Runtime>(
+    manager: Arc<Manager<R>>,
+    listener: UnixListener,
+    shutdown: impl Future<Output = ()>,
+    grace: Duration,
+    final_wait: Duration,
 ) -> Result<()> {
     let incoming = UnixListenerStream::new(listener).map(|conn| {
         match &conn {
@@ -80,24 +91,90 @@ pub async fn serve<R: Runtime>(
     tokio::pin!(server);
     tokio::pin!(shutdown);
 
-    tokio::select! {
-        r = &mut server => return r.context("serve"),
-        () = &mut shutdown => {}
+    let early = tokio::select! {
+        r = &mut server => Some(r),
+        () = &mut shutdown => None,
+    };
+    if let Some(result) = early {
+        manager.begin_shutdown();
+        manager.drain_operations().await;
+        return result.context("serve");
     }
     info!(grace_secs = grace.as_secs(), "shutting down: refusing new work, waiting for requests in flight");
     manager.begin_shutdown();
     stop.cancel();
-    tokio::select! {
-        r = &mut server => return r.context("serve"),
-        () = tokio::time::sleep(grace) => {}
+    let during_grace = tokio::select! {
+        r = &mut server => Some(r),
+        () = tokio::time::sleep(grace) => None,
+    };
+    if let Some(result) = during_grace {
+        manager.drain_operations().await;
+        return result.context("serve");
     }
     warn!("grace period over; canceling running executions");
     manager.cancel_executions();
-    tokio::select! {
-        r = &mut server => r.context("serve"),
-        () = tokio::time::sleep(FINAL_WAIT) => {
-            warn!("requests still in flight; exiting anyway");
-            Ok(())
+    let result = tokio::select! {
+        r = &mut server => Some(r),
+        () = tokio::time::sleep(final_wait) => {
+            warn!("requests still in flight; draining accepted create operations before exit");
+            None
         }
+    };
+    manager.drain_operations().await;
+    match result {
+        Some(result) => result.context("serve"),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manager::{CreateRequest, Limits};
+    use crate::model::SandboxState;
+    use crate::runtime::fake::{FakeGate, FakeRuntime};
+    use crate::store::Store;
+
+    #[tokio::test]
+    async fn shutdown_drains_detached_compensation_beyond_final_rpc_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("kilnd.sock");
+        let fake = FakeRuntime::default();
+        let remove_gate = FakeGate::default();
+        fake.state().remove_before_delete = Some(remove_gate.clone());
+        let store = Store::open_in_memory().unwrap();
+        store.reject_ready_updates().unwrap();
+        let manager = Arc::new(Manager::new(fake.clone(), store, Limits::default()));
+
+        let waiter = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.create(CreateRequest::default()).await }
+        });
+        remove_gate.entered().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(manager.list(true).unwrap()[0].state, SandboxState::Deleting);
+
+        // No transport connection exists. The shortened transport deadlines
+        // expire, but the server must remain alive for manager-owned cleanup.
+        let listener = bind(&socket, None).unwrap();
+        let mut server = tokio::spawn(serve_with_final_wait(
+            manager.clone(),
+            listener,
+            async {},
+            Duration::ZERO,
+            Duration::from_millis(20),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut server).await.is_err(),
+            "server exited at its final RPC deadline while compensation was paused"
+        );
+
+        remove_gate.release();
+        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
+        let row = manager.list(true).unwrap().remove(0);
+        assert_eq!(row.state, SandboxState::Failed);
+        assert!(row.failure_reason.as_deref().unwrap().contains("backend removed"));
+        assert!(fake.state().sandboxes.is_empty());
     }
 }

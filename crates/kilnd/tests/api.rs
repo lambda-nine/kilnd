@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use kilnd::manager::{Limits, Manager};
-use kilnd::runtime::fake::FakeRuntime;
+use kilnd::runtime::fake::{FakeGate, FakeRuntime};
 use kilnd::store::Store;
 use kilnd_api::v1 as pb;
 use pb::kilnd_service_client::KilndServiceClient;
@@ -171,6 +171,44 @@ async fn graceful_shutdown_cancels_running_executions_after_the_grace_period() {
     assert_eq!(e.state, pb::ExecutionState::Canceled as i32);
     assert_eq!(e.failure_reason, "kilnd shut down");
     tokio::time::timeout(Duration::from_secs(15), server).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn graceful_shutdown_drains_a_create_after_its_rpc_disconnects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("kilnd.sock");
+    let fake = FakeRuntime::default();
+    let gate = FakeGate::default();
+    fake.state().create_before_allocation = Some(gate.clone());
+    let manager = Arc::new(Manager::new(fake.clone(), Store::open_in_memory().unwrap(), Limits::default()));
+    let listener = kilnd::server::bind(&socket, None).unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut server = tokio::spawn(kilnd::server::serve(
+        manager.clone(),
+        listener,
+        async {
+            let _ = stop_rx.await;
+        },
+        Duration::ZERO,
+    ));
+    let mut c = client(socket).await;
+    let request = tokio::spawn(async move { c.create_sandbox(pb::CreateSandboxRequest { spec: None }).await });
+
+    gate.entered().await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    stop_tx.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut server).await.is_err(),
+        "server exited without draining its accepted create"
+    );
+    assert_eq!(manager.list(true).unwrap()[0].state, kilnd::model::SandboxState::Creating);
+
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
+    let row = manager.list(true).unwrap().remove(0);
+    assert_eq!(row.state, kilnd::model::SandboxState::Ready);
+    assert_eq!(row.backend_id.as_ref(), fake.state().sandboxes.keys().next());
 }
 
 #[test]

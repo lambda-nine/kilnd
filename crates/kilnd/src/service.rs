@@ -205,3 +205,42 @@ pub fn execution_pb(e: Execution) -> pb::Execution {
         stderr: Some(output_pb(e.stderr)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manager::Limits;
+    use crate::runtime::fake::{FakeGate, FakeRuntime};
+    use crate::store::Store;
+    use pb::kilnd_service_server::KilndService;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn dropping_create_handler_does_not_drop_owned_operation() {
+        let fake = FakeRuntime::default();
+        let gate = FakeGate::default();
+        fake.state().create_after_allocation = Some(gate.clone());
+        let manager = Arc::new(Manager::new(fake.clone(), Store::open_in_memory().unwrap(), Limits::default()));
+        let service = Arc::new(Service::new(manager.clone()));
+        let handler = tokio::spawn(async move {
+            KilndService::create_sandbox(
+                service.as_ref(),
+                Request::new(pb::CreateSandboxRequest { spec: None }),
+            )
+            .await
+        });
+
+        gate.entered().await;
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+        gate.release();
+        manager.begin_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), manager.drain_operations())
+            .await
+            .expect("owned create did not finish");
+
+        let row = manager.list(true).unwrap().remove(0);
+        assert_eq!(row.state, SandboxState::Ready);
+        assert_eq!(row.backend_id.as_ref(), fake.state().sandboxes.keys().next());
+    }
+}

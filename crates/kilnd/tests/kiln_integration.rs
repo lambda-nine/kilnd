@@ -6,6 +6,7 @@
 //! every sandbox it creates.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kilnd::manager::{CreateRequest, ExecRequest, Limits, Manager};
@@ -40,7 +41,7 @@ async fn lifecycle_against_real_kiln() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let limits = Limits { max_output_bytes: 4096, ..Limits::default() };
-    let m = Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), limits);
+    let m = Arc::new(Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), limits));
     m.reconcile().await.unwrap();
     assert!(m.health().await.unwrap().serving);
 
@@ -86,7 +87,7 @@ async fn lifecycle_against_real_kiln() {
 
     // Restart: a new manager over the same database keeps the sandbox.
     drop(m);
-    let m = Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), Limits::default());
+    let m = Arc::new(Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), Limits::default()));
     let r = m.reconcile().await.unwrap();
     assert!(r.lost.is_empty(), "{r:?}");
     assert_eq!(m.get(&s.id, 0).unwrap().0.state, SandboxState::Ready);
@@ -105,7 +106,7 @@ async fn a_sandbox_killed_behind_kilnds_back_is_lost_after_reconcile() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let m = Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), Limits::default());
+    let m = Arc::new(Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), Limits::default()));
     let s = m.create(CreateRequest { memory_bytes: 64 << 20, disk_bytes: 16 << 20, ..Default::default() }).await.unwrap();
     // Remove it with kiln directly, as an operator or a reboot would.
     m.runtime().remove(s.backend_id.as_ref().unwrap()).await.unwrap();

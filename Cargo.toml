@@ -23,7 +23,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.47", features = ["rt", "net", "process", "time", "signal", "io-util", "sync", "macros", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "transport", "router", "server", "channel"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"

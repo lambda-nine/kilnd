@@ -246,6 +246,17 @@ impl Store {
         Ok(self.conn().query_row("SELECT COUNT(*) FROM executions WHERE state = 'running'", [], |r| r.get(0))?)
     }
 
+    #[cfg(test)]
+    pub(crate) fn reject_ready_updates(&self) -> Result<()> {
+        self.conn().execute_batch(
+            "CREATE TEMP TRIGGER reject_ready_updates
+             BEFORE UPDATE OF state ON sandboxes
+             WHEN NEW.state = 'ready'
+             BEGIN SELECT RAISE(FAIL, 'injected ready publication failure'); END;",
+        )?;
+        Ok(())
+    }
+
     /// Marks every execution still recorded as running as interrupted.
     /// Only valid at startup, before any new execution begins.
     pub fn interrupt_running_executions(&self, reason: &str) -> Result<usize> {

@@ -11,10 +11,40 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::{BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
 use crate::model::{Captured, SandboxSpec};
+
+/// A deterministic one-shot pause for lifecycle tests. Tests wait for
+/// `entered`, cancel a caller or begin shutdown, then explicitly `release`.
+#[derive(Clone)]
+pub struct FakeGate {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl Default for FakeGate {
+    fn default() -> Self {
+        Self { entered: Arc::new(Semaphore::new(0)), release: Arc::new(Semaphore::new(0)) }
+    }
+}
+
+impl FakeGate {
+    pub async fn entered(&self) {
+        self.entered.acquire().await.expect("fake gate closed").forget();
+    }
+
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    async fn hold(&self) {
+        self.entered.add_permits(1);
+        self.release.acquire().await.expect("fake gate closed").forget();
+    }
+}
 
 #[derive(Default)]
 pub struct FakeState {
@@ -22,11 +52,21 @@ pub struct FakeState {
     /// Specs passed to `create`, in order.
     pub created: Vec<SandboxSpec>,
     pub removed: Vec<String>,
+    /// Removal attempts, including failed ones.
+    pub remove_attempts: Vec<String>,
     pub gc_runs: u32,
     /// When set, `create` fails with this message.
     pub fail_create: Option<String>,
+    /// Panics before allocating a backend, for supervisor recovery tests.
+    pub panic_create: bool,
     /// When set, `remove` fails while the sandbox stays.
     pub fail_remove: bool,
+    /// Optional one-shot pause before create allocates a backend.
+    pub create_before_allocation: Option<FakeGate>,
+    /// Optional one-shot pause after allocation but before create returns.
+    pub create_after_allocation: Option<FakeGate>,
+    /// Optional one-shot pause before remove changes backend state.
+    pub remove_before_delete: Option<FakeGate>,
     /// When set, `list` and `version` fail, like a missing kiln binary.
     pub unavailable: bool,
     next: u64,
@@ -39,7 +79,7 @@ pub struct FakeRuntime {
 
 impl FakeRuntime {
     pub fn state(&self) -> MutexGuard<'_, FakeState> {
-        self.state.lock().unwrap()
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Adds a sandbox the way something other than kilnd would.
@@ -78,15 +118,25 @@ impl Runtime for FakeRuntime {
     }
 
     async fn create(&self, spec: &SandboxSpec) -> Result<String, RuntimeError> {
-        tokio::task::yield_now().await;
-        let mut s = self.state();
-        if let Some(msg) = &s.fail_create {
-            return Err(RuntimeError::Backend(msg.clone()));
+        let before = self.state().create_before_allocation.take();
+        if let Some(gate) = before {
+            gate.hold().await;
         }
-        s.created.push(spec.clone());
-        s.next += 1;
-        let id = format!("f00d-{}", s.next);
-        s.sandboxes.insert(id.clone(), BackendStatus::Running);
+        let (id, after) = {
+            let mut s = self.state();
+            assert!(!s.panic_create, "injected fake create panic");
+            if let Some(msg) = &s.fail_create {
+                return Err(RuntimeError::Backend(msg.clone()));
+            }
+            s.created.push(spec.clone());
+            s.next += 1;
+            let id = format!("f00d-{}", s.next);
+            s.sandboxes.insert(id.clone(), BackendStatus::Running);
+            (id, s.create_after_allocation.take())
+        };
+        if let Some(gate) = after {
+            gate.hold().await;
+        }
         Ok(id)
     }
 
@@ -118,6 +168,17 @@ impl Runtime for FakeRuntime {
     }
 
     async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
+        let gate = {
+            let mut s = self.state();
+            s.remove_attempts.push(id.to_string());
+            if !s.sandboxes.contains_key(id) {
+                return Err(RuntimeError::NotFound(id.to_string()));
+            }
+            s.remove_before_delete.take()
+        };
+        if let Some(gate) = gate {
+            gate.hold().await;
+        }
         let mut s = self.state();
         if !s.sandboxes.contains_key(id) {
             return Err(RuntimeError::NotFound(id.to_string()));

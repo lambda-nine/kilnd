@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
-use crate::runtime::fake::FakeRuntime;
+use crate::runtime::fake::{FakeGate, FakeRuntime};
 
 fn manager() -> (Arc<Manager<FakeRuntime>>, FakeRuntime) {
     manager_with(Limits::default())
@@ -16,6 +16,13 @@ fn manager_with(limits: Limits) -> (Arc<Manager<FakeRuntime>>, FakeRuntime) {
 
 fn exec_req(id: &str, argv: &[&str]) -> ExecRequest {
     ExecRequest { sandbox_id: id.into(), argv: argv.iter().map(|s| s.to_string()).collect(), stdin: vec![], timeout_ms: 0 }
+}
+
+async fn drain(m: &Arc<Manager<FakeRuntime>>) {
+    m.begin_shutdown();
+    tokio::time::timeout(Duration::from_secs(5), m.drain_operations())
+        .await
+        .expect("supervised operations did not drain");
 }
 
 #[tokio::test]
@@ -45,6 +52,144 @@ async fn create_failure_is_recorded_and_returned() {
     // A failed sandbox can be cleared.
     let gone = m.delete(&all[0].id).await.unwrap();
     assert_eq!(gone.state, SandboxState::Deleted);
+}
+
+#[tokio::test]
+async fn an_unpolled_create_does_nothing() {
+    let (m, fake) = manager();
+    let create = m.create(CreateRequest::default());
+    drop(create);
+    tokio::task::yield_now().await;
+    assert!(m.list(true).unwrap().is_empty());
+    assert!(fake.state().sandboxes.is_empty());
+}
+
+#[tokio::test]
+async fn dropping_the_waiter_before_backend_allocation_does_not_cancel_create() {
+    let (m, fake) = manager();
+    let gate = FakeGate::default();
+    fake.state().create_before_allocation = Some(gate.clone());
+    let waiter = tokio::spawn({
+        let m = m.clone();
+        async move { m.create(CreateRequest::default()).await }
+    });
+    gate.entered().await;
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    gate.release();
+    drain(&m).await;
+
+    let rows = m.list(true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, SandboxState::Ready);
+    assert_eq!(fake.state().sandboxes.len(), 1);
+    assert_eq!(rows[0].backend_id.as_ref(), fake.state().sandboxes.keys().next());
+}
+
+#[tokio::test]
+async fn dropping_the_waiter_after_backend_allocation_publishes_its_id() {
+    let (m, fake) = manager();
+    let gate = FakeGate::default();
+    fake.state().create_after_allocation = Some(gate.clone());
+    let waiter = tokio::spawn({
+        let m = m.clone();
+        async move { m.create(CreateRequest::default()).await }
+    });
+    gate.entered().await;
+    let backend_id = fake.state().sandboxes.keys().next().unwrap().clone();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    gate.release();
+    drain(&m).await;
+
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!(row.state, SandboxState::Ready);
+    assert_eq!(row.backend_id.as_deref(), Some(backend_id.as_str()));
+    assert_eq!(fake.state().sandboxes.len(), 1);
+}
+
+#[tokio::test]
+async fn dropped_waiter_still_records_backend_failure() {
+    let (m, fake) = manager();
+    let gate = FakeGate::default();
+    {
+        let mut state = fake.state();
+        state.create_before_allocation = Some(gate.clone());
+        state.fail_create = Some("injected create failure".into());
+    }
+    let waiter = tokio::spawn({
+        let m = m.clone();
+        async move { m.create(CreateRequest::default()).await }
+    });
+    gate.entered().await;
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    gate.release();
+    drain(&m).await;
+
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!(row.state, SandboxState::Failed);
+    assert!(row.failure_reason.as_deref().unwrap().contains("injected create failure"));
+    assert!(fake.state().sandboxes.is_empty());
+}
+
+#[tokio::test]
+async fn dropped_waiter_does_not_interrupt_publication_compensation() {
+    let (m, fake) = manager();
+    m.store.reject_ready_updates().unwrap();
+    let remove_gate = FakeGate::default();
+    fake.state().remove_before_delete = Some(remove_gate.clone());
+    let waiter = tokio::spawn({
+        let m = m.clone();
+        async move { m.create(CreateRequest::default()).await }
+    });
+    remove_gate.entered().await;
+    let during = m.list(true).unwrap().remove(0);
+    assert_eq!(during.state, SandboxState::Deleting);
+    assert!(during.backend_id.is_some());
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    remove_gate.release();
+    drain(&m).await;
+
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!(row.state, SandboxState::Failed);
+    assert!(row.failure_reason.as_deref().unwrap().contains("backend removed"));
+    let state = fake.state();
+    assert!(state.sandboxes.is_empty());
+    assert_eq!(state.remove_attempts.len(), 1);
+}
+
+#[tokio::test]
+async fn failed_publication_and_compensation_remain_retryable_and_counted() {
+    let (m, fake) = manager();
+    m.store.reject_ready_updates().unwrap();
+    fake.state().fail_remove = true;
+    let err = m.create(CreateRequest::default()).await.unwrap_err();
+    assert!(matches!(err, Error::Internal(_)));
+
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!(row.state, SandboxState::Deleting);
+    assert!(row.backend_id.is_some());
+    assert!(row.failure_reason.as_deref().unwrap().contains("cleanup failed"));
+    assert_eq!(m.health().await.unwrap().active_sandboxes, 1);
+    assert_eq!(fake.state().sandboxes.len(), 1);
+
+    fake.state().fail_remove = false;
+    assert_eq!(m.delete(&row.id).await.unwrap().state, SandboxState::Deleted);
+    assert!(fake.state().sandboxes.is_empty());
+}
+
+#[tokio::test]
+async fn backend_create_panic_is_recorded_as_failed() {
+    let (m, fake) = manager();
+    fake.state().panic_create = true;
+    let err = m.create(CreateRequest::default()).await.unwrap_err();
+    assert!(matches!(err, Error::Backend(ref message) if message.contains("panicked")));
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!(row.state, SandboxState::Failed);
+    assert!(row.failure_reason.as_deref().unwrap().contains("panicked"));
+    assert!(fake.state().sandboxes.is_empty());
 }
 
 #[tokio::test]
@@ -285,7 +430,7 @@ async fn health_reports_backend_trouble() {
 async fn reconcile_repairs_state_and_is_repeatable() {
     let fake = FakeRuntime::default();
     let store = Store::open_in_memory().unwrap();
-    let m = Manager::new(fake.clone(), store, Limits::default());
+    let m = Arc::new(Manager::new(fake.clone(), store, Limits::default()));
 
     let alive = m.create(CreateRequest::default()).await.unwrap();
     let rebooted = m.create(CreateRequest::default()).await.unwrap();

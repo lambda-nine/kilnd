@@ -15,9 +15,12 @@ service KilndService {
   // Reports whether the daemon and its backend are usable.
   rpc Health(HealthRequest) returns (HealthResponse);
 
-  // Creates a sandbox and waits until it is ready for Exec. On failure the
-  // sandbox is kept in SANDBOX_STATE_FAILED for inspection and an error is
-  // returned.
+  // Creates a sandbox and waits until it is ready for Exec. A failed create
+  // is kept in SANDBOX_STATE_FAILED for inspection; failed compensation stays
+  // SANDBOX_STATE_DELETING so deletion can be retried. Canceling or timing out
+  // the RPC only stops waiting: an accepted create continues to READY or
+  // compensates its backend resource. Retrying is not idempotent and may
+  // create another sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
   // Returns one sandbox and its most recent executions.
@@ -70,7 +73,7 @@ enum SandboxState {
   SANDBOX_STATE_CREATING = 1;
   // Accepts Exec.
   SANDBOX_STATE_READY = 2;
-  // DeleteSandbox is removing it.
+  // DeleteSandbox, or compensation for a failed create, is removing it.
   SANDBOX_STATE_DELETING = 3;
   // Removed. The record stays for history.
   SANDBOX_STATE_DELETED = 4;

@@ -52,10 +52,12 @@ sandbox compromises the host.
 - **kiln's own errors and command output share stderr.** When `kiln exec`
   fails (exit 125), its message is mixed into the captured stderr. A command
   that itself exits 125 is reported as a backend failure.
-- **A crash during `kiln create`** can leave a kiln sandbox kilnd never
-  recorded. Reconciliation logs it as unmanaged but doesn't remove it, since
-  it can't tell it from one an operator made with the CLI. Remove it with
-  `kiln rm`.
+- **A daemon crash during `kiln create`** can leave a kiln sandbox whose
+  backend ID was never returned to kilnd. Reconciliation logs it as unmanaged
+  but doesn't remove it, since it can't tell it from one an operator made
+  with the CLI. Remove it with `kiln rm`. Ordinary RPC cancellation is not
+  this case: accepted creates are daemon-owned and finish or compensate even
+  after the caller disconnects.
 - **Group members are not isolated from each other.** Any member can exec in
   or delete any sandbox. Per-caller ownership belongs to the harness layer or
   a later API version.
