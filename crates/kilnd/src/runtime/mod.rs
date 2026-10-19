@@ -76,9 +76,11 @@ pub trait Runtime: Send + Sync + 'static {
     /// lost the ability to report the ID.
     fn create(&self, spec: &SandboxSpec) -> impl Future<Output = Result<String, RuntimeError>> + Send;
 
-    /// Runs one command and waits for it. When the timeout passes or `cancel`
-    /// fires, the command must be stopped inside the sandbox, not just
-    /// abandoned, and the sandbox left usable.
+    /// Runs one command and waits for it. A pre-canceled token must be honored.
+    /// When the timeout passes or `cancel` fires, the command and all of its
+    /// descendants must be stopped inside the sandbox, all I/O resources must
+    /// be released, and the sandbox left usable before this future returns.
+    /// Return an error rather than success when cleanup cannot be confirmed.
     fn exec(
         &self,
         id: &str,

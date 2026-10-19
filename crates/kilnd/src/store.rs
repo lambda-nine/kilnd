@@ -150,6 +150,18 @@ impl Store {
         Ok(())
     }
 
+    /// Marks a sandbox lost only if it is still READY. Delete publishes
+    /// DELETING before waiting for a running exec, so a late NotFound result
+    /// must not overwrite that cleanup intent.
+    pub fn mark_sandbox_lost_if_ready(&self, id: &str, failure_reason: &str) -> Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE sandboxes SET state = 'lost', failure_reason = ?2, updated_at_ms = ?3
+             WHERE id = ?1 AND state = 'ready'",
+            params![id, failure_reason, now_ms()],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn sandbox(&self, id: &str) -> Result<Option<Sandbox>> {
         self.conn()
             .query_row(&format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"), [id], sandbox_row)
@@ -254,6 +266,23 @@ impl Store {
              WHEN NEW.state = 'ready'
              BEGIN SELECT RAISE(FAIL, 'injected ready publication failure'); END;",
         )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reject_execution_finishes(&self) -> Result<()> {
+        self.conn().execute_batch(
+            "CREATE TEMP TRIGGER reject_execution_finishes
+             BEFORE UPDATE OF state ON executions
+             WHEN OLD.state = 'running' AND NEW.state != 'running'
+             BEGIN SELECT RAISE(FAIL, 'injected execution finalization failure'); END;",
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allow_execution_finishes(&self) -> Result<()> {
+        self.conn().execute_batch("DROP TRIGGER reject_execution_finishes")?;
         Ok(())
     }
 

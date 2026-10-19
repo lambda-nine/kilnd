@@ -264,6 +264,121 @@ async fn exec_records_the_result() {
 }
 
 #[tokio::test]
+async fn an_unpolled_exec_does_nothing() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let exec = m.exec(exec_req(&s.id, &["echo", "never"]));
+    drop(exec);
+    tokio::task::yield_now().await;
+    assert!(m.get(&s.id, 10).unwrap().1.is_empty());
+    assert!(fake.state().exec_calls.is_empty());
+}
+
+#[tokio::test]
+async fn closed_queued_exec_never_reaches_the_backend_or_store() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
+
+    let mut first_req = exec_req(&s.id, &["sleep"]);
+    first_req.timeout_ms = 1;
+    let first = tokio::spawn({
+        let m = m.clone();
+        async move { m.exec(first_req).await }
+    });
+    gate.entered().await;
+
+    let queued = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.exec(exec_req(&id, &["echo", "must-not-run"])).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!queued.is_finished(), "second exec should be queued behind the sandbox lock");
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+
+    gate.release();
+    assert_eq!(first.await.unwrap().unwrap().state, ExecutionState::TimedOut);
+    drain(&m).await;
+    assert_eq!(fake.state().exec_calls.len(), 1);
+    assert_eq!(m.get(&s.id, 10).unwrap().1.len(), 1);
+}
+
+#[tokio::test]
+async fn backend_exec_panic_is_finalized_and_releases_the_sandbox_lock() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    fake.state().panic_exec = true;
+
+    let failed = m.exec(exec_req(&s.id, &["echo", "panic"])).await.unwrap();
+    assert_eq!(failed.state, ExecutionState::Failed);
+    assert!(failed.failure_reason.as_deref().unwrap().contains("panicked"));
+    assert!(failed.finished_at_ms.is_some());
+    assert_eq!(fake.state().active_execs, 0);
+
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
+    let after_await = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.exec(exec_req(&id, &["echo", "panic-after-await"])).await }
+    });
+    gate.entered().await;
+    gate.release();
+    let failed = after_await.await.unwrap().unwrap();
+    assert_eq!(failed.state, ExecutionState::Failed);
+    assert!(failed.failure_reason.as_deref().unwrap().contains("panicked"));
+    assert_eq!(fake.state().active_execs, 0);
+
+    fake.state().panic_exec = false;
+    let next = m.exec(exec_req(&s.id, &["echo", "usable"])).await.unwrap();
+    assert_eq!(next.state, ExecutionState::Exited);
+    assert_eq!(next.stdout.data, b"usable\n");
+}
+
+#[tokio::test]
+async fn finalization_failure_stays_owned_until_storage_recovers() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    m.store.reject_execution_finishes().unwrap();
+    let waiter = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.exec(exec_req(&id, &["echo", "completed"])).await }
+    });
+
+    while fake.state().active_execs != 0 || fake.state().exec_calls.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    tokio::task::yield_now().await;
+    let execution_id = m.get(&s.id, 10).unwrap().1[0].id.clone();
+    assert!(!waiter.is_finished(), "terminal publication failure escaped the supervisor");
+    let health = m.health().await.unwrap();
+    assert!(!health.serving);
+    assert_eq!(health.running_executions, 1);
+    assert!(health.detail.contains("finalization write"));
+
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    m.begin_shutdown();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), m.drain_operations()).await.is_err(),
+        "shutdown reported a successful drain while terminal publication was failing"
+    );
+
+    m.store.allow_execution_finishes().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), m.drain_operations())
+        .await
+        .expect("supervisor did not retry finalization after storage recovered");
+    let execution = m.execution(&execution_id).unwrap();
+    assert_eq!(execution.state, ExecutionState::Exited);
+    assert_eq!(execution.stdout.data, b"completed\n");
+    assert!(m.health().await.unwrap().detail.is_empty());
+}
+
+#[tokio::test]
 async fn exec_output_is_bounded() {
     let (m, _) = manager_with(Limits { max_output_bytes: 100, ..Limits::default() });
     let s = m.create(CreateRequest::default()).await.unwrap();
@@ -343,6 +458,94 @@ async fn delete_cancels_a_running_exec() {
     assert_eq!(e.failure_reason.as_deref(), Some("sandbox deleted"));
     assert!(fake.state().sandboxes.is_empty());
     assert!(matches!(m.exec(exec_req(&s.id, &["echo"])).await, Err(Error::FailedPrecondition(_))));
+}
+
+#[tokio::test]
+async fn first_recorded_delete_reason_wins_over_shutdown() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
+    let running = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.exec(exec_req(&id, &["sleep"])).await }
+    });
+    gate.entered().await;
+    let deleting = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.delete(&id).await }
+    });
+    while m.get(&s.id, 0).unwrap().0.state != SandboxState::Deleting {
+        tokio::task::yield_now().await;
+    }
+    m.begin_shutdown();
+    m.cancel_executions();
+    gate.release();
+
+    let execution = running.await.unwrap().unwrap();
+    assert_eq!(execution.failure_reason.as_deref(), Some("sandbox deleted"));
+    assert_eq!(deleting.await.unwrap().unwrap().state, SandboxState::Deleted);
+}
+
+#[tokio::test]
+async fn first_recorded_shutdown_reason_wins_over_delete() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
+    let running = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.exec(exec_req(&id, &["sleep"])).await }
+    });
+    gate.entered().await;
+    m.begin_shutdown();
+    m.cancel_executions();
+    let deleting = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.delete(&id).await }
+    });
+    gate.release();
+
+    let execution = running.await.unwrap().unwrap();
+    assert_eq!(execution.failure_reason.as_deref(), Some("kilnd shut down"));
+    assert_eq!(deleting.await.unwrap().unwrap().state, SandboxState::Deleted);
+}
+
+#[tokio::test]
+async fn waiter_drop_preserves_a_backend_completed_outcome() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
+    let waiter = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.exec(exec_req(&id, &["echo", "completed"])).await }
+    });
+    gate.entered().await;
+    let execution_id = m.get(&s.id, 1).unwrap().1[0].id.clone();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    tokio::task::yield_now().await;
+    gate.release();
+
+    let execution = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let execution = m.execution(&execution_id).unwrap();
+            if execution.state != ExecutionState::Running {
+                break execution;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(execution.state, ExecutionState::Exited);
+    assert_eq!(execution.stdout.data, b"completed\n");
 }
 
 #[tokio::test]

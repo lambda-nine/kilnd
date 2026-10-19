@@ -37,7 +37,11 @@ service KilndService {
   // sandbox run one at a time, in arrival order. The command's own outcome
   // (any exit code, a timeout, cancellation) is a successful RPC whose
   // Execution says what happened; RPC errors mean the request was invalid or
-  // the sandbox couldn't run it.
+  // the sandbox couldn't run it. Canceling the RPC discards a queued request
+  // that has not started; once an execution row exists, it requests
+  // cancellation but the daemon retains cleanup and finalization ownership.
+  // Cancellation does not undo command side effects. A disconnected caller
+  // can find recent execution IDs with GetSandbox, then use GetExecution.
   rpc Exec(ExecRequest) returns (ExecResponse);
 
   // Returns one execution, including its captured output.
@@ -209,7 +213,8 @@ enum ExecutionState {
   EXECUTION_STATE_EXITED = 2;
   // The timeout passed and the command was killed.
   EXECUTION_STATE_TIMED_OUT = 3;
-  // Stopped by DeleteSandbox or daemon shutdown; see failure_reason.
+  // Stopped by caller disconnect, DeleteSandbox, or daemon shutdown; see
+  // failure_reason. A completed command outcome wins over a late disconnect.
   EXECUTION_STATE_CANCELED = 4;
   // The backend couldn't run it; see failure_reason.
   EXECUTION_STATE_FAILED = 5;

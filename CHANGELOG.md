@@ -10,6 +10,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   no longer strands `CREATING` rows or live unrecorded backends, failed state
   publication is compensated and retryable, and shutdown drains accepted
   creates before exit.
+- Recorded executions are daemon-owned: disconnecting an `Exec` caller
+  requests cancellation without dropping cleanup or finalization, queued
+  disconnected calls are discarded, terminal writes retry while retaining
+  ownership, and shutdown drains execution supervisors even after the
+  transport reply deadline.
+- Requires kiln at or after `3b42552` for per-execution cgroup teardown and
+  cumulative runtime hardening.
 
 ## 0.1.0 - 2026-10-13
 

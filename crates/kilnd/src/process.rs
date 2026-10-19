@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::model::Captured;
 
@@ -45,6 +46,9 @@ pub struct Request<'a> {
 }
 
 pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Outcome> {
+    if cancel.is_cancelled() {
+        return Ok(Outcome { finish: Finish::Canceled, stdout: Captured::default(), stderr: Captured::default() });
+    }
     let mut cmd = Command::new(req.program);
     cmd.args(req.args)
         .env_clear()
@@ -70,36 +74,49 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
     let mut child = cmd.spawn()?;
 
     let stop_reading = CancellationToken::new();
-    let stdout = tokio::spawn(capture(child.stdout.take(), req.max_output, stop_reading.clone()));
-    let stderr = tokio::spawn(capture(child.stderr.take(), req.max_output, stop_reading.clone()));
+    // Capture and stdin tasks must never detach from this operation. If the
+    // run future is unexpectedly dropped (for example by a backend panic),
+    // these wrappers abort the tasks and release their pipe handles.
+    let mut stdout = spawn_capture(
+        child.stdout.take(),
+        req.max_output,
+        stop_reading.clone(),
+    );
+    let mut stderr = spawn_capture(
+        child.stderr.take(),
+        req.max_output,
+        stop_reading.clone(),
+    );
     let writer = child.stdin.take().map(|mut pipe| {
         let data = req.stdin.to_vec();
         // A command that doesn't read its input gets EPIPE here; that's fine.
-        tokio::spawn(async move {
+        AbortOnDropHandle::new(tokio::spawn(async move {
             let _ = pipe.write_all(&data).await;
-        })
+        }))
     });
 
     let finish = tokio::select! {
-        status = child.wait() => Finish::Exited(status?),
+        status = child.wait() => status.map(Finish::Exited),
         () = tokio::time::sleep(req.timeout) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            Finish::TimedOut
+            Ok(Finish::TimedOut)
         }
         () = cancel.cancelled() => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            Finish::Canceled
+            Ok(Finish::Canceled)
         }
     };
-    if let Some(writer) = writer {
+    if let Some(mut writer) = writer {
         writer.abort();
+        let _ = (&mut writer).await;
     }
 
     let drain = async {
-        let out = stdout.await.unwrap_or_default();
-        let err = stderr.await.unwrap_or_default();
+        let (out, err) = tokio::join!(&mut stdout, &mut stderr);
+        let out = out.unwrap_or_default();
+        let err = err.unwrap_or_default();
         (out, err)
     };
     tokio::pin!(drain);
@@ -110,7 +127,15 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
             drain.await
         }
     };
+    let finish = finish?;
     Ok(Outcome { finish, stdout, stderr })
+}
+
+fn spawn_capture<R>(pipe: Option<R>, max: usize, stop: CancellationToken) -> AbortOnDropHandle<Captured>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    AbortOnDropHandle::new(tokio::spawn(capture(pipe, max, stop)))
 }
 
 /// Keeps the first `max` bytes of a stream and counts the rest, reading to
@@ -139,7 +164,29 @@ async fn capture<R: AsyncRead + Unpin>(pipe: Option<R>, max: usize, stop: Cancel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
     use std::time::Instant;
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct DropReader {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for DropReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl Drop for DropReader {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
 
     async fn sh(script: &str, stdin: &[u8], timeout: Duration, max_output: usize) -> Outcome {
         let args = [OsStr::new("-c"), OsStr::new(script)];
@@ -226,5 +273,46 @@ mod tests {
         let input = vec![b'x'; 1 << 20];
         let o = sh("exit 0", &input, Duration::from_secs(10), 1024).await;
         assert_eq!(code(&o), Some(0));
+    }
+
+    #[tokio::test]
+    async fn dropping_capture_owner_aborts_the_task_and_releases_its_pipe() {
+        let (reader, _writer) = tokio::io::duplex(64);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task = spawn_capture(
+            Some(DropReader { inner: reader, dropped: dropped.clone() }),
+            1024,
+            CancellationToken::new(),
+        );
+        tokio::task::yield_now().await;
+        drop(task);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted capture task retained its pipe");
+    }
+
+    #[tokio::test]
+    async fn a_pre_canceled_request_never_spawns_the_program() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned");
+        let script = format!("touch '{}'", marker.display());
+        let args = [OsStr::new("-c"), OsStr::new(&script)];
+        let req = Request {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            stdin: b"",
+            timeout: Duration::from_secs(1),
+            max_output: 1024,
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = run(&req, &cancel).await.unwrap();
+        assert!(matches!(outcome.finish, Finish::Canceled));
+        assert!(!marker.exists(), "pre-canceled process produced a side effect");
     }
 }

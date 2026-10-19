@@ -3,9 +3,13 @@
 //! `create`, `exec`, `ls`, `rm` and `gc` are the whole interface.
 
 use std::ffi::OsStr;
+use std::io::ErrorKind;
+#[cfg(test)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
@@ -20,14 +24,17 @@ const CONTROL_OUTPUT: usize = 64 * 1024;
 const CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 const REMOVE_TIMEOUT: Duration = Duration::from_secs(60);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+const CLEANUP_POLL: Duration = Duration::from_millis(10);
 
 pub struct KilnRuntime {
     bin: PathBuf,
+    cgroup_root: PathBuf,
 }
 
 impl KilnRuntime {
     pub fn new(bin: PathBuf) -> Self {
-        Self { bin }
+        Self { bin, cgroup_root: PathBuf::from("/sys/fs/cgroup/kiln") }
     }
 
     /// Runs a kiln subcommand that should exit 0, returning its stdout.
@@ -48,6 +55,51 @@ impl KilnRuntime {
 
     async fn is_known(&self, id: &str) -> Result<bool, RuntimeError> {
         Ok(self.list().await?.iter().any(|s| s.id == id))
+    }
+
+    /// A killed `kiln exec` client cannot receive PID 1's post-cleanup reply.
+    /// The required kiln revision gives every command a fixed `exec` cgroup;
+    /// observing `populated 0` is the host-side cleanup acknowledgment.
+    async fn wait_exec_cleanup(&self, id: &str) -> Result<(), RuntimeError> {
+        let events = self.cgroup_root.join(id).join("exec/cgroup.events");
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        loop {
+            match tokio::fs::read_to_string(&events).await {
+                Ok(value) => match exec_populated(&value) {
+                    Some(false) => return Ok(()),
+                    Some(true) => {}
+                    None => {
+                        return Err(RuntimeError::Backend(format!(
+                            "kiln cleanup barrier {} has no populated state",
+                            events.display()
+                        )));
+                    }
+                },
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    if !self.is_known(id).await? {
+                        return Err(RuntimeError::NotFound(id.to_string()));
+                    }
+                    return Err(RuntimeError::Backend(format!(
+                        "kiln cleanup barrier {} is missing; kiln 3b42552 or later is required",
+                        events.display()
+                    )));
+                }
+                Err(error) => return Err(RuntimeError::Io(error)),
+            }
+            if Instant::now() >= deadline {
+                return Err(RuntimeError::Backend(format!(
+                    "kiln did not empty execution cgroup {} within {}s",
+                    events.display(),
+                    CLEANUP_TIMEOUT.as_secs()
+                )));
+            }
+            tokio::time::sleep(CLEANUP_POLL).await;
+        }
+    }
+
+    #[cfg(test)]
+    fn with_cgroup_root(bin: PathBuf, cgroup_root: &Path) -> Self {
+        Self { bin, cgroup_root: cgroup_root.to_path_buf() }
     }
 }
 
@@ -72,6 +124,13 @@ impl Runtime for KilnRuntime {
 
     async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> Result<ExecOutcome, RuntimeError> {
         check_id(id)?;
+        if cancel.is_cancelled() {
+            return Ok(ExecOutcome {
+                finish: ExecFinish::Canceled,
+                stdout: crate::model::Captured::default(),
+                stderr: crate::model::Captured::default(),
+            });
+        }
         let mut args: Vec<&OsStr> = vec![OsStr::new("exec"), OsStr::new(id), OsStr::new("--")];
         args.extend(spec.argv.iter().map(OsStr::new));
         let req = process::Request {
@@ -81,9 +140,10 @@ impl Runtime for KilnRuntime {
             timeout: spec.timeout,
             max_output: spec.max_output,
         };
-        // Killing the `kiln exec` client on timeout or cancel is enough:
-        // kiln's PID 1 then kills the command's process group and keeps the
-        // sandbox serving.
+        // Killing the `kiln exec` client asks kiln's PID 1 to tear down the
+        // command's per-execution cgroup. Because the killed client cannot
+        // receive PID 1's eventual reply, timeout and cancellation explicitly
+        // wait for the host cgroup to report empty before returning.
         let out = process::run(&req, cancel).await?;
         let finish = match out.finish {
             Finish::Exited(status) => match status.code() {
@@ -99,8 +159,14 @@ impl Runtime for KilnRuntime {
                 Some(code) => ExecFinish::Exited(code),
                 None => return Err(RuntimeError::Backend(format!("kiln exec ended abnormally ({status})"))),
             },
-            Finish::TimedOut => ExecFinish::TimedOut,
-            Finish::Canceled => ExecFinish::Canceled,
+            Finish::TimedOut => {
+                self.wait_exec_cleanup(id).await?;
+                ExecFinish::TimedOut
+            }
+            Finish::Canceled => {
+                self.wait_exec_cleanup(id).await?;
+                ExecFinish::Canceled
+            }
         };
         Ok(ExecOutcome { finish, stdout: out.stdout, stderr: out.stderr })
     }
@@ -193,6 +259,14 @@ fn check_id(id: &str) -> Result<(), RuntimeError> {
     if valid_kiln_id(id) { Ok(()) } else { Err(RuntimeError::Backend(format!("invalid kiln sandbox ID {id:?}"))) }
 }
 
+fn exec_populated(events: &str) -> Option<bool> {
+    events.lines().find_map(|line| match line.split_once(' ')? {
+        ("populated", "0") => Some(false),
+        ("populated", "1") => Some(true),
+        _ => None,
+    })
+}
+
 /// The end of kiln's stderr as one printable line, for error messages.
 fn summarize(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
@@ -214,6 +288,9 @@ fn summarize(stderr: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
 
     fn spec(network: Network) -> SandboxSpec {
         SandboxSpec {
@@ -279,5 +356,51 @@ mod tests {
             assert!(check_id(id).is_err(), "{id:?}");
         }
         assert!(check_id("18de453339a8cc89-3762").is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_the_exec_cgroup_to_be_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("fake-kiln");
+        let started = tmp.path().join("started");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nexec </dev/null >/dev/null 2>&1\n: > '{}'\nexec sleep 30\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let cgroup_root = tmp.path().join("cgroup");
+        let exec_scope = cgroup_root.join("abcd/exec");
+        fs::create_dir_all(&exec_scope).unwrap();
+        let events = exec_scope.join("cgroup.events");
+        fs::write(&events, "populated 1\n").unwrap();
+
+        let runtime = Arc::new(KilnRuntime::with_cgroup_root(bin, &cgroup_root));
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let mut task = tokio::spawn(async move {
+            let argv = vec!["sleep".to_string(), "30".to_string()];
+            let spec = ExecSpec { argv: &argv, stdin: b"", timeout: Duration::from_secs(30), max_output: 1024 };
+            runtime.exec("abcd", &spec, &task_cancel).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fake kiln client did not start");
+
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut task).await.is_err(),
+            "runtime returned before kiln's execution cgroup was empty"
+        );
+        fs::write(&events, "populated 0\n").unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+        assert_eq!(outcome.finish, ExecFinish::Canceled);
     }
 }

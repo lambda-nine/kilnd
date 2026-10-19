@@ -3,7 +3,8 @@
 //! translation on top of this.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -14,7 +15,7 @@ use tracing::{info, warn};
 use crate::model::{
     Captured, Execution, ExecutionState, Network, Sandbox, SandboxSpec, SandboxState, new_id, now_ms, valid_id,
 };
-use crate::runtime::{BackendStatus, ExecFinish, ExecSpec, Runtime, RuntimeError};
+use crate::runtime::{BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
 use crate::store::{ExecutionResult, Store};
 
 /// Limits and defaults; see `Config` in main.rs for the flags that set them.
@@ -107,7 +108,48 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Default)]
 struct Slot {
     exec_lock: tokio::sync::Mutex<()>,
-    running: Mutex<Option<CancellationToken>>,
+    running: Mutex<Option<Arc<ExecCancellation>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecCancelReason {
+    ClientGone,
+    SandboxDeleted,
+    Shutdown,
+}
+
+impl ExecCancelReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ClientGone => "client disconnected",
+            Self::SandboxDeleted => "sandbox deleted",
+            Self::Shutdown => "kilnd shut down",
+        }
+    }
+}
+
+/// One authoritative cancellation source for a running execution. Recording
+/// the reason before firing the token makes the first observed request win
+/// across RPC disconnect, delete and daemon shutdown races.
+struct ExecCancellation {
+    token: CancellationToken,
+    reason: OnceLock<ExecCancelReason>,
+}
+
+impl ExecCancellation {
+    fn new() -> Self {
+        Self { token: CancellationToken::new(), reason: OnceLock::new() }
+    }
+
+    fn request(&self, reason: ExecCancelReason) {
+        if self.reason.set(reason).is_ok() {
+            self.token.cancel();
+        }
+    }
+
+    fn reason(&self) -> Option<ExecCancelReason> {
+        self.reason.get().copied()
+    }
 }
 
 pub struct Manager<R> {
@@ -117,10 +159,10 @@ pub struct Manager<R> {
     slots: Mutex<HashMap<String, Arc<Slot>>>,
     /// Refuses new work once canceled.
     shutting_down: CancellationToken,
-    /// Cancels running executions once canceled.
-    abort_executions: CancellationToken,
     /// Daemon-owned operations that must outlive the RPC waiting for them.
     operations: TaskTracker,
+    /// Terminal execution writes currently retrying after a store failure.
+    finalization_failures: AtomicU32,
     started_at_ms: i64,
 }
 
@@ -160,8 +202,8 @@ impl<R: Runtime> Manager<R> {
             limits,
             slots: Mutex::new(HashMap::new()),
             shutting_down: CancellationToken::new(),
-            abort_executions: CancellationToken::new(),
             operations: TaskTracker::new(),
+            finalization_failures: AtomicU32::new(0),
             started_at_ms: now_ms(),
         }
     }
@@ -254,10 +296,18 @@ impl<R: Runtime> Manager<R> {
     }
 
     pub async fn health(&self) -> Result<Health> {
-        let (serving, backend_version, detail) = match self.runtime.version().await {
+        let (mut serving, backend_version, mut detail) = match self.runtime.version().await {
             Ok(v) => (true, v, String::new()),
             Err(e) => (false, String::new(), format!("backend: {e}")),
         };
+        let finalization_failures = self.finalization_failures.load(Ordering::Relaxed);
+        if finalization_failures != 0 {
+            serving = false;
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(&format!("{finalization_failures} execution finalization write(s) retrying"));
+        }
         Ok(Health {
             serving,
             shutting_down: self.shutting_down.is_cancelled(),
@@ -436,7 +486,7 @@ impl<R: Runtime> Manager<R> {
         info!(sandbox = %id, "deleting sandbox");
         let slot = self.slot(id);
         if let Some(cancel) = &*slot.running.lock().unwrap() {
-            cancel.cancel();
+            cancel.request(ExecCancelReason::SandboxDeleted);
         }
         // Wait for a running execution to finish canceling; new ones see
         // DELETING and refuse.
@@ -465,18 +515,86 @@ impl<R: Runtime> Manager<R> {
         }
     }
 
-    pub async fn exec(&self, req: ExecRequest) -> Result<Execution> {
+    /// Starts a daemon-owned execution and waits for its result. Once the
+    /// execution row exists, dropping this waiter requests cancellation but
+    /// cannot drop backend cleanup, output capture or row finalization.
+    pub async fn exec(self: &Arc<Self>, req: ExecRequest) -> Result<Execution> {
         self.check_serving()?;
-        let timeout = self.check_exec(&req)?;
+        self.check_exec(&req)?;
         let sandbox = self.load(&req.sandbox_id)?;
         ready(&sandbox)?;
+        // No await separates the admission check from tracker registration.
+        // On the daemon's current-thread runtime, shutdown cannot close and
+        // finish draining the tracker between these two operations.
+        let (result_tx, result_rx) = oneshot::channel();
+        let manager = Arc::clone(self);
+        self.operations.spawn(async move {
+            manager.supervise_exec(req, result_tx).await;
+        });
+        result_rx.await.map_err(|_| Error::Internal(anyhow::anyhow!("exec supervisor stopped without a result")))?
+    }
+
+    async fn supervise_exec(self: Arc<Self>, req: ExecRequest, mut reply: oneshot::Sender<Result<Execution>>) {
+        let Some(result) = self.exec_owned(req, &mut reply).await else {
+            return;
+        };
+        if let Err(result) = reply.send(result) {
+            match result {
+                Ok(execution) => info!(execution = %execution.id, state = execution.state.as_str(), "exec RPC stopped waiting; supervised operation completed"),
+                Err(error) => warn!(error = %error, "exec RPC stopped waiting; supervised operation failed"),
+            }
+        }
+    }
+
+    /// Returns `None` only when the waiter vanished before an execution row
+    /// was inserted. After insertion the supervisor retains ownership until
+    /// it has published a terminal result; an unavailable store keeps it
+    /// pending and retrying.
+    async fn exec_owned(
+        self: &Arc<Self>,
+        req: ExecRequest,
+        reply: &mut oneshot::Sender<Result<Execution>>,
+    ) -> Option<Result<Execution>> {
+        let timeout = match self.check_exec(&req) {
+            Ok(timeout) => timeout,
+            Err(error) => return Some(Err(error)),
+        };
+        let sandbox = match self.load(&req.sandbox_id).and_then(|sandbox| {
+            ready(&sandbox)?;
+            Ok(sandbox)
+        }) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return Some(Err(error)),
+        };
         let slot = self.slot(&sandbox.id);
-        let _guard = slot.exec_lock.lock().await;
+        // A queued RPC that disappears must not run later. Bias cancellation
+        // when the lock and closure become ready in the same scheduler turn.
+        let _guard = tokio::select! {
+            biased;
+            () = reply.closed() => {
+                info!(sandbox = %sandbox.id, "queued exec RPC stopped waiting; discarding request");
+                return None;
+            }
+            () = self.shutting_down.cancelled() => return Some(Err(Error::ShuttingDown)),
+            guard = slot.exec_lock.lock() => guard,
+        };
+        if reply.is_closed() {
+            info!(sandbox = %sandbox.id, "queued exec RPC stopped waiting; discarding request");
+            return None;
+        }
         // The sandbox may have changed while this request waited its turn.
-        let sandbox = self.load(&req.sandbox_id)?;
-        ready(&sandbox)?;
-        self.check_serving()?;
-        let backend_id = sandbox.backend_id.clone().ok_or_else(|| Error::FailedPrecondition("sandbox has no backend ID".into()))?;
+        let sandbox = match self.load(&req.sandbox_id).and_then(|sandbox| {
+            ready(&sandbox)?;
+            self.check_serving()?;
+            Ok(sandbox)
+        }) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return Some(Err(error)),
+        };
+        let backend_id = match sandbox.backend_id.clone() {
+            Some(id) => id,
+            None => return Some(Err(Error::FailedPrecondition("sandbox has no backend ID".into()))),
+        };
 
         let mut execution = Execution {
             id: new_id("ex"),
@@ -492,41 +610,102 @@ impl<R: Runtime> Manager<R> {
             stdout: Captured::default(),
             stderr: Captured::default(),
         };
-        self.store.insert_execution(&execution)?;
-        let cancel = self.abort_executions.child_token();
+        if let Err(error) = self.store.insert_execution(&execution) {
+            return Some(Err(error.into()));
+        }
+        let cancel = Arc::new(ExecCancellation::new());
         *slot.running.lock().unwrap() = Some(cancel.clone());
         info!(sandbox = %sandbox.id, execution = %execution.id, argc = execution.argv.len(), "exec started");
 
-        let spec = ExecSpec { argv: &execution.argv, stdin: &req.stdin, timeout, max_output: self.limits.max_output_bytes };
-        let outcome = self.runtime.exec(&backend_id, &spec, &cancel).await;
+        // The backend future lives in its own task so both construction-time
+        // and polling-time panics become a result the supervisor can record.
+        // All borrowed ExecSpec data is owned by that task.
+        let backend_manager = Arc::clone(self);
+        let backend_id_for_task = backend_id.clone();
+        let argv = execution.argv.clone();
+        let stdin = req.stdin;
+        let max_output = self.limits.max_output_bytes;
+        let backend_cancel = cancel.clone();
+        let mut backend = tokio::spawn(async move {
+            if backend_cancel.token.is_cancelled() {
+                return Ok(ExecOutcome {
+                    finish: ExecFinish::Canceled,
+                    stdout: Captured::default(),
+                    stderr: Captured::default(),
+                });
+            }
+            let spec = ExecSpec { argv: &argv, stdin: &stdin, timeout, max_output };
+            backend_manager.runtime.exec(&backend_id_for_task, &spec, &backend_cancel.token).await
+        });
+        // Poll backend completion first so a late receiver drop cannot turn
+        // an already-completed command into a cancellation. Once closure is
+        // observed, disable that branch by leaving the select and await the
+        // exact same backend task through cleanup.
+        let joined = tokio::select! {
+            biased;
+            joined = &mut backend => joined,
+            () = reply.closed() => {
+                cancel.request(ExecCancelReason::ClientGone);
+                backend.await
+            }
+        };
         slot.running.lock().unwrap().take();
 
+        let (outcome, task_failure) = match joined {
+            Ok(outcome) => (Some(outcome), None),
+            Err(join) => {
+                let reason = if join.is_panic() { "backend exec task panicked" } else { "backend exec task was canceled" };
+                warn!(sandbox = %sandbox.id, execution = %execution.id, error = reason, "exec backend task failed");
+                (None, Some(reason))
+            }
+        };
         let (state, exit_code, reason) = match &outcome {
-            Ok(o) => match o.finish {
+            Some(Ok(o)) => match o.finish {
                 ExecFinish::Exited(code) => (ExecutionState::Exited, Some(code), None),
                 ExecFinish::TimedOut => {
                     (ExecutionState::TimedOut, None, Some(format!("timed out after {} ms", timeout.as_millis())))
                 }
                 ExecFinish::Canceled => {
-                    let why = if self.abort_executions.is_cancelled() { "kilnd shut down" } else { "sandbox deleted" };
+                    let why = cancel.reason().map_or("backend canceled execution", ExecCancelReason::message);
                     (ExecutionState::Canceled, None, Some(why.to_string()))
                 }
             },
-            Err(e) => (ExecutionState::Failed, None, Some(e.to_string())),
+            Some(Err(e)) => (ExecutionState::Failed, None, Some(e.to_string())),
+            None => (ExecutionState::Failed, None, Some(task_failure.unwrap_or("backend exec task stopped").to_string())),
         };
         let empty = Captured::default();
         let (stdout, stderr) = match &outcome {
-            Ok(o) => (&o.stdout, &o.stderr),
-            Err(_) => (&empty, &empty),
+            Some(Ok(o)) => (&o.stdout, &o.stderr),
+            None | Some(Err(_)) => (&empty, &empty),
         };
-        self.store.finish_execution(
-            &execution.id,
-            &ExecutionResult { state, exit_code, failure_reason: reason.as_deref(), stdout, stderr },
-        )?;
-        if let Err(RuntimeError::NotFound(_)) = &outcome {
+        let mut retry_delay = Duration::from_millis(10);
+        let mut finalization_degraded = false;
+        loop {
+            match self.store.finish_execution(
+                &execution.id,
+                &ExecutionResult { state, exit_code, failure_reason: reason.as_deref(), stdout, stderr },
+            ) {
+                Ok(()) => break,
+                Err(error) => {
+                    if !finalization_degraded {
+                        self.finalization_failures.fetch_add(1, Ordering::Relaxed);
+                        finalization_degraded = true;
+                    }
+                    warn!(execution = %execution.id, state = state.as_str(), error = %format!("{error:#}"), retry_ms = retry_delay.as_millis(), "exec cleanup completed but terminal state could not be recorded; retaining ownership and retrying");
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+                }
+            }
+        }
+        if finalization_degraded {
+            self.finalization_failures.fetch_sub(1, Ordering::Relaxed);
+        }
+        if matches!(&outcome, Some(Err(RuntimeError::NotFound(_)))) {
             let why = format!("backend sandbox {backend_id} disappeared during an execution");
             warn!(sandbox = %sandbox.id, "{why}");
-            self.store.set_sandbox_state(&sandbox.id, SandboxState::Lost, None, Some(&why))?;
+            if let Err(error) = self.store.mark_sandbox_lost_if_ready(&sandbox.id, &why) {
+                return Some(Err(error.into()));
+            }
         }
         info!(
             sandbox = %sandbox.id,
@@ -537,8 +716,12 @@ impl<R: Runtime> Manager<R> {
             stderr_bytes = stderr.total_bytes,
             "exec finished"
         );
-        execution = self.store.execution(&execution.id)?.ok_or_else(|| anyhow::anyhow!("execution vanished"))?;
-        Ok(execution)
+        execution = match self.store.execution(&execution.id) {
+            Ok(Some(execution)) => execution,
+            Ok(None) => return Some(Err(Error::Internal(anyhow::anyhow!("execution vanished")))),
+            Err(error) => return Some(Err(error.into())),
+        };
+        Some(Ok(execution))
     }
 
     /// Starts shutdown: new sandboxes and executions are refused. Running
@@ -556,7 +739,12 @@ impl<R: Runtime> Manager<R> {
 
     /// Cancels every running execution; they finish as CANCELED.
     pub fn cancel_executions(&self) {
-        self.abort_executions.cancel();
+        let slots: Vec<_> = self.slots.lock().unwrap().values().cloned().collect();
+        for slot in slots {
+            if let Some(cancel) = &*slot.running.lock().unwrap() {
+                cancel.request(ExecCancelReason::Shutdown);
+            }
+        }
     }
 
     fn check_exec(&self, req: &ExecRequest) -> Result<Duration> {

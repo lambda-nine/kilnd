@@ -33,6 +33,20 @@ fn exec(id: &str, argv: &[&str], timeout_ms: u32) -> ExecRequest {
     ExecRequest { sandbox_id: id.into(), argv: argv.iter().map(|s| s.to_string()).collect(), stdin: vec![], timeout_ms }
 }
 
+fn exec_scope_populated(backend_id: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/fs/cgroup/kiln/{backend_id}/exec/cgroup.events"))
+        .is_ok_and(|events| events.lines().any(|line| line == "populated 1"))
+}
+
+fn pipe_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .filter(|target| target.to_string_lossy().starts_with("pipe:["))
+        .count()
+}
+
 #[tokio::test]
 #[ignore = "privileged; run scripts/integration-test.sh in the VM"]
 async fn lifecycle_against_real_kiln() {
@@ -116,5 +130,64 @@ async fn a_sandbox_killed_behind_kilnds_back_is_lost_after_reconcile() {
     assert_eq!(m.get(&s.id, 0).unwrap().0.state, SandboxState::Lost);
     let again = m.reconcile().await.unwrap();
     assert!(again.lost.is_empty(), "reconcile is repeatable");
+    assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
+}
+
+#[tokio::test]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let m = Arc::new(Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), Limits::default()));
+    let s = m
+        .create(CreateRequest { memory_bytes: 64 << 20, pids: 64, disk_bytes: 16 << 20, ..Default::default() })
+        .await
+        .unwrap();
+    let backend_id = s.backend_id.clone().unwrap();
+    let baseline_pipes = pipe_fd_count();
+    let waiter = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move {
+            m.exec(exec(
+                &id,
+                &["sh", "-c", "setsid sh -c 'sleep 30 & wait' & sleep 30"],
+                60_000,
+            ))
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !exec_scope_populated(&backend_id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached descendant never entered the exec cgroup");
+    let execution_id = m.get(&s.id, 1).unwrap().1[0].id.clone();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+
+    let execution = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let execution = m.execution(&execution_id).unwrap();
+            if execution.state != ExecutionState::Running {
+                break execution;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("client-disconnected execution did not finalize");
+    assert_eq!(execution.state, ExecutionState::Canceled);
+    assert_eq!(execution.failure_reason.as_deref(), Some("client disconnected"));
+    assert!(!exec_scope_populated(&backend_id), "execution cgroup still has descendants");
+    assert_eq!(pipe_fd_count(), baseline_pipes, "backend stdout/stderr pipe descriptors leaked");
+
+    let reuse = m.exec(exec(&s.id, &["sh", "-c", "pgrep sleep || echo none"], 10_000)).await.unwrap();
+    assert_eq!(reuse.stdout.data, b"none\n", "canceled descendants survived into the next exec");
     assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
 }

@@ -48,6 +48,11 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   the result, but creation still reaches `ready` or attempts compensation.
   Failed cleanup stays counted and retryable; shutdown drains this work
   before exit.
+- **Supervised executions:** once an execution is recorded, it belongs to the
+  daemon rather than the RPC future. A disconnected caller requests
+  cancellation, but kilnd waits for backend cleanup, drains output capture,
+  records a terminal outcome, and only then releases the sandbox. A queued
+  request canceled before it starts is discarded without an execution row.
 - **`kilndctl`**, a small client covering the whole API.
 
 Sandboxes outlive kilnd: restarting or upgrading the daemon leaves them

@@ -33,8 +33,8 @@ sudo scripts/setup-storage.sh       # XFS project quotas for --disk
 scripts/install.sh                  # /usr/local/bin/kiln, kiln-dns, kiln-metrics
 ```
 
-kilnd needs kiln at or after commit `3736329` (exec cancellation and exit
-code 125).
+kilnd needs kiln at or after commit `3b42552` (per-execution cgroup teardown,
+PID 1 hardening, and exit code 125).
 
 ## 3. kilnd in the VM
 

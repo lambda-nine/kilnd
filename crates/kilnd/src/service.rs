@@ -243,4 +243,65 @@ mod tests {
         assert_eq!(row.state, SandboxState::Ready);
         assert_eq!(row.backend_id.as_ref(), fake.state().sandboxes.keys().next());
     }
+
+    #[tokio::test]
+    async fn dropping_exec_handler_cancels_and_finalizes_owned_operation() {
+        let fake = FakeRuntime::default();
+        let manager = Arc::new(Manager::new(fake.clone(), Store::open_in_memory().unwrap(), Limits::default()));
+        let sandbox = manager.create(Default::default()).await.unwrap();
+        let gate = FakeGate::default();
+        fake.state().exec_before_run = Some(gate.clone());
+        let service = Arc::new(Service::new(manager.clone()));
+        let handler = tokio::spawn({
+            let service = service.clone();
+            let sandbox_id = sandbox.id.clone();
+            async move {
+                KilndService::exec(
+                    service.as_ref(),
+                    Request::new(pb::ExecRequest {
+                        sandbox_id,
+                        argv: vec!["sleep".into()],
+                        ..Default::default()
+                    }),
+                )
+                .await
+            }
+        });
+
+        gate.entered().await;
+        let execution_id = manager.get(&sandbox.id, 1).unwrap().1[0].id.clone();
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+        assert_eq!(manager.execution(&execution_id).unwrap().state, ExecutionState::Running);
+        assert_eq!(fake.state().active_execs, 1);
+
+        gate.release();
+        let execution = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let execution = manager.execution(&execution_id).unwrap();
+                if execution.state != ExecutionState::Running {
+                    break execution;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supervised exec did not finalize");
+        assert_eq!(execution.state, ExecutionState::Canceled);
+        assert_eq!(execution.failure_reason.as_deref(), Some("client disconnected"));
+        assert_eq!(fake.state().active_execs, 0);
+        assert_eq!(fake.state().canceled_execs, 1);
+
+        let next = manager
+            .exec(ExecRequest {
+                sandbox_id: sandbox.id,
+                argv: vec!["echo".into(), "usable".into()],
+                stdin: vec![],
+                timeout_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.state, ExecutionState::Exited);
+        assert_eq!(next.stdout.data, b"usable\n");
+    }
 }

@@ -174,6 +174,63 @@ async fn graceful_shutdown_cancels_running_executions_after_the_grace_period() {
 }
 
 #[tokio::test]
+async fn canceling_a_tonic_exec_request_finalizes_and_releases_the_backend() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("kilnd.sock");
+    let fake = FakeRuntime::default();
+    let manager = Arc::new(Manager::new(fake.clone(), Store::open_in_memory().unwrap(), Limits::default()));
+    let sandbox = manager.create(Default::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
+    let listener = kilnd::server::bind(&socket, None).unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(kilnd::server::serve(
+        manager.clone(),
+        listener,
+        async {
+            let _ = stop_rx.await;
+        },
+        Duration::from_secs(1),
+    ));
+    let mut c = client(socket).await;
+    let request = tokio::spawn({
+        let sandbox_id = sandbox.id.clone();
+        async move {
+            c.exec(pb::ExecRequest {
+                sandbox_id,
+                argv: vec!["sleep".into()],
+                ..Default::default()
+            })
+            .await
+        }
+    });
+
+    gate.entered().await;
+    let execution_id = manager.get(&sandbox.id, 1).unwrap().1[0].id.clone();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    gate.release();
+    let execution = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let execution = manager.execution(&execution_id).unwrap();
+            if execution.state != kilnd::model::ExecutionState::Running {
+                break execution;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("canceled tonic exec did not finalize");
+    assert_eq!(execution.state, kilnd::model::ExecutionState::Canceled);
+    assert_eq!(execution.failure_reason.as_deref(), Some("client disconnected"));
+    assert_eq!(fake.state().active_execs, 0);
+    assert_eq!(fake.state().canceled_execs, 1);
+
+    stop_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn graceful_shutdown_drains_a_create_after_its_rpc_disconnects() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("kilnd.sock");

@@ -91,37 +91,54 @@ async fn serve_with_final_wait<R: Runtime>(
     tokio::pin!(server);
     tokio::pin!(shutdown);
 
-    let early = tokio::select! {
+    let mut server_result = tokio::select! {
         r = &mut server => Some(r),
         () = &mut shutdown => None,
     };
-    if let Some(result) = early {
-        manager.begin_shutdown();
-        manager.drain_operations().await;
-        return result.context("serve");
-    }
-    info!(grace_secs = grace.as_secs(), "shutting down: refusing new work, waiting for requests in flight");
+    let requested = server_result.is_none();
+    info!(grace_secs = grace.as_secs(), "shutting down: refusing new work, waiting for requests and owned operations");
     manager.begin_shutdown();
-    stop.cancel();
-    let during_grace = tokio::select! {
-        r = &mut server => Some(r),
-        () = tokio::time::sleep(grace) => None,
-    };
-    if let Some(result) = during_grace {
-        manager.drain_operations().await;
+    if requested {
+        stop.cancel();
+    }
+    let operations = manager.drain_operations();
+    tokio::pin!(operations);
+    let mut operations_done = false;
+    let grace_deadline = tokio::time::sleep(grace);
+    tokio::pin!(grace_deadline);
+
+    // Transport completion does not own manager operations. Keep the grace
+    // clock running until both have finished, and never repoll either future
+    // after completion.
+    while server_result.is_none() || !operations_done {
+        tokio::select! {
+            result = &mut server, if server_result.is_none() => server_result = Some(result),
+            () = &mut operations, if !operations_done => operations_done = true,
+            () = &mut grace_deadline => break,
+        }
+    }
+    if operations_done && let Some(result) = server_result.take() {
         return result.context("serve");
     }
+
     warn!("grace period over; canceling running executions");
     manager.cancel_executions();
-    let result = tokio::select! {
-        r = &mut server => Some(r),
-        () = tokio::time::sleep(final_wait) => {
-            warn!("requests still in flight; draining accepted create operations before exit");
-            None
+    let final_deadline = tokio::time::sleep(final_wait);
+    tokio::pin!(final_deadline);
+    while server_result.is_none() || !operations_done {
+        tokio::select! {
+            result = &mut server, if server_result.is_none() => server_result = Some(result),
+            () = &mut operations, if !operations_done => operations_done = true,
+            () = &mut final_deadline => {
+                warn!("requests still in flight; continuing to drain accepted manager operations before exit");
+                break;
+            }
         }
-    };
-    manager.drain_operations().await;
-    match result {
+    }
+    if !operations_done {
+        operations.await;
+    }
+    match server_result {
         Some(result) => result.context("serve"),
         None => Ok(()),
     }
@@ -130,8 +147,8 @@ async fn serve_with_final_wait<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::{CreateRequest, Limits};
-    use crate::model::SandboxState;
+    use crate::manager::{CreateRequest, ExecRequest, Limits};
+    use crate::model::{ExecutionState, SandboxState};
     use crate::runtime::fake::{FakeGate, FakeRuntime};
     use crate::store::Store;
 
@@ -176,5 +193,54 @@ mod tests {
         assert_eq!(row.state, SandboxState::Failed);
         assert!(row.failure_reason.as_deref().unwrap().contains("backend removed"));
         assert!(fake.state().sandboxes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_transport_honors_grace_and_drains_exec_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("kilnd.sock");
+        let fake = FakeRuntime::default();
+        let manager = Arc::new(Manager::new(fake.clone(), Store::open_in_memory().unwrap(), Limits::default()));
+        let sandbox = manager.create(CreateRequest::default()).await.unwrap();
+        let gate = FakeGate::default();
+        fake.state().exec_before_run = Some(gate.clone());
+        let waiter = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .exec(ExecRequest {
+                        sandbox_id: sandbox.id,
+                        argv: vec!["sleep".into()],
+                        stdin: vec![],
+                        timeout_ms: 0,
+                    })
+                    .await
+            }
+        });
+        gate.entered().await;
+
+        // There is no transport connection to keep tonic alive. The grace
+        // deadline must still request shutdown cancellation, while owned exec
+        // cleanup keeps the server alive beyond the final reply deadline.
+        let listener = bind(&socket, None).unwrap();
+        let mut server = tokio::spawn(serve_with_final_wait(
+            manager.clone(),
+            listener,
+            async {},
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut server).await.is_err(),
+            "server exited while canceled exec cleanup was paused"
+        );
+        assert_eq!(manager.health().await.unwrap().running_executions, 1);
+
+        gate.release();
+        let execution = tokio::time::timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap().unwrap();
+        assert_eq!(execution.state, ExecutionState::Canceled);
+        assert_eq!(execution.failure_reason.as_deref(), Some("kilnd shut down"));
+        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
+        assert_eq!(fake.state().active_execs, 0);
     }
 }

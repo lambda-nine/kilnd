@@ -54,17 +54,26 @@ pub struct FakeState {
     pub removed: Vec<String>,
     /// Removal attempts, including failed ones.
     pub remove_attempts: Vec<String>,
+    /// Commands whose backend execution was entered, in order.
+    pub exec_calls: Vec<Vec<String>>,
+    pub active_execs: u32,
+    pub canceled_execs: u32,
     pub gc_runs: u32,
     /// When set, `create` fails with this message.
     pub fail_create: Option<String>,
     /// Panics before allocating a backend, for supervisor recovery tests.
     pub panic_create: bool,
+    /// Panics after the optional exec gate. Without a gate this is before the
+    /// backend future's first await; with one it exercises a polling panic.
+    pub panic_exec: bool,
     /// When set, `remove` fails while the sandbox stays.
     pub fail_remove: bool,
     /// Optional one-shot pause before create allocates a backend.
     pub create_before_allocation: Option<FakeGate>,
     /// Optional one-shot pause after allocation but before create returns.
     pub create_after_allocation: Option<FakeGate>,
+    /// Optional one-shot pause after exec entry and before observing cancel.
+    pub exec_before_run: Option<FakeGate>,
     /// Optional one-shot pause before remove changes backend state.
     pub remove_before_delete: Option<FakeGate>,
     /// When set, `list` and `version` fail, like a missing kiln binary.
@@ -75,6 +84,17 @@ pub struct FakeState {
 #[derive(Clone, Default)]
 pub struct FakeRuntime {
     state: Arc<Mutex<FakeState>>,
+}
+
+struct ActiveExec {
+    state: Arc<Mutex<FakeState>>,
+}
+
+impl Drop for ActiveExec {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active_execs -= 1;
+    }
 }
 
 impl FakeRuntime {
@@ -142,6 +162,25 @@ impl Runtime for FakeRuntime {
 
     async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> Result<ExecOutcome, RuntimeError> {
         self.running(id)?;
+        if cancel.is_cancelled() {
+            self.state().canceled_execs += 1;
+            return Ok(ExecOutcome {
+                finish: ExecFinish::Canceled,
+                stdout: Captured::default(),
+                stderr: Captured::default(),
+            });
+        }
+        let (gate, panic_exec) = {
+            let mut state = self.state();
+            state.exec_calls.push(spec.argv.to_vec());
+            state.active_execs += 1;
+            (state.exec_before_run.take(), state.panic_exec)
+        };
+        let _active = ActiveExec { state: self.state.clone() };
+        if let Some(gate) = gate {
+            gate.hold().await;
+        }
+        assert!(!panic_exec, "injected fake exec panic");
         let args = &spec.argv[1..];
         Ok(match spec.argv[0].as_str() {
             "echo" => exited(0, format!("{}\n", args.join(" ")).into_bytes(), spec.max_output),
@@ -151,7 +190,10 @@ impl Runtime for FakeRuntime {
             "sleep" => {
                 let finish = tokio::select! {
                     () = tokio::time::sleep(spec.timeout) => ExecFinish::TimedOut,
-                    () = cancel.cancelled() => ExecFinish::Canceled,
+                    () = cancel.cancelled() => {
+                        self.state().canceled_execs += 1;
+                        ExecFinish::Canceled
+                    },
                 };
                 ExecOutcome { finish, stdout: Captured::default(), stderr: Captured::default() }
             }

@@ -46,14 +46,19 @@ API socket and a guest agent.
 Every flag value uses `--flag=value` so it can't be parsed as another flag,
 the command's argv follows `--`, and kilnd validates every value before it
 reaches kiln (kiln validates again). Timeouts and cancellation kill the
-`kiln exec` client; kiln's PID 1 notices the hangup and kills the command's
-process group. `kiln exec` is serial per sandbox, so kilnd queues executions
-per sandbox rather than letting them pile up in kiln's socket backlog.
+`kiln exec` client; kiln's PID 1 notices the hangup, kills every process in
+that command's per-execution cgroup, and finishes only after the cgroup is
+empty. The killed CLI cannot receive PID 1's reply, so kilnd independently
+waits for the host's `exec/cgroup.events` to report `populated 0` before it
+finalizes or unlocks the sandbox. This also contains descendants that changed
+process group or session. `kiln exec` is serial per sandbox, so kilnd queues
+executions per sandbox rather than letting them pile up in kiln's socket
+backlog.
 
-Two kiln changes came out of integrating this (kiln commits `852d906` and
-`3736329`): a killed exec client used to leave its command running, block
-later execs, and then take the whole sandbox down; and `kiln exec` used exit
-code 1 for its own failures, indistinguishable from the command's.
+The cumulative required kiln revision is `3b42552`. Earlier integration fixes
+made a killed exec client stop its command without taking down the sandbox and
+reserved exit code 125 for kiln failures; the per-execution cgroup closes the
+remaining escaped-descendant gap.
 
 ## State machine
 
@@ -67,7 +72,7 @@ code 1 for its own failures, indistinguishable from the command's.
 ```
 
 Executions: `RUNNING` → `EXITED` (with exit code) | `TIMED_OUT` | `CANCELED`
-(sandbox deleted, or daemon shutdown) | `FAILED` (backend error) |
+(caller disconnected, sandbox deleted, or daemon shutdown) | `FAILED` (backend error) |
 `INTERRUPTED` (found running at startup).
 
 A sandbox row is written as `CREATING` before `kiln create` runs, so a crash
@@ -77,7 +82,14 @@ backend ID is published as `READY`; if that write fails, kilnd first records
 `DELETING`, removes the backend, and records `FAILED`. Failed removal stays
 `DELETING`, retains the backend ID, counts against the active limit, and is
 retryable. An execution row is written before `kiln exec` runs and finished
-in one update afterwards.
+in one update afterwards. Once that row exists, a tracked supervisor owns the
+request, sandbox lock, backend task, output capture, and terminal update. The
+RPC is only a waiter: dropping it records the first cancellation reason and
+requests cancellation, but cannot abandon cleanup. A caller that disconnects
+while still queued is discarded before a row or backend process is created.
+If the terminal SQLite update fails, the supervisor keeps the lock and outcome
+and retries with bounded exponential backoff. Health is degraded and shutdown
+cannot claim a completed drain until that publication succeeds.
 
 ## Reconciliation
 
@@ -107,27 +119,32 @@ access goes through one mutex-guarded connection, and each statement is
 short. The active-sandbox cap is checked and the row inserted with no await in
 between, so concurrent creates can't overshoot it.
 
-Each sandbox has a slot holding an async exec lock and the running
-execution's cancel token. Delete marks the sandbox `DELETING`, cancels the
-running execution, waits for the lock, then runs `kiln rm`. Executions waiting
-behind the lock see `DELETING` and refuse.
+Each sandbox has a slot holding an async exec lock and the running execution's
+cancellation handle. Client disconnect, delete, and shutdown all record a
+first-wins reason through that handle before canceling its private token.
+Delete marks the sandbox `DELETING`, cancels the running execution, waits for
+the supervisor to finish and release the lock, then runs `kiln rm`.
+Executions waiting behind the lock see `DELETING` and refuse.
 
-Accepted create operations live in a task tracker owned by the manager. The
-RPC awaits a one-shot result but does not own or cancel the task. Validation,
-capacity admission and the `CREATING` insert happen inside that task before
-its first backend await, preserving the active-sandbox cap. Backend create is
-itself isolated so a panic can be recorded as `FAILED` when no backend ID was
-returned.
+Accepted create and exec operations live in a task tracker owned by the
+manager. The RPC awaits a one-shot result but does not own the task.
+Validation, capacity admission and registration happen synchronously before
+the public method's first await on the current-thread runtime, so shutdown
+cannot interleave between the serving check and tracker spawn. Backend work is
+isolated so a panic becomes a persisted failure instead of dropping operation
+state.
 
 ## Shutdown and restarts
 
 On SIGTERM or SIGINT, kilnd refuses new creates and execs and stops accepting
-connections. It lets in-flight requests finish for `--shutdown-grace-secs`
-(30), then cancels running executions (recorded as `CANCELED`), waits up to 10
-more seconds for RPC replies, and drains accepted create/compensation tasks
-before removing the socket and exiting. Sandboxes keep running. Forced
-termination can still interrupt an operation; startup reconciliation handles
-the state it can identify.
+connections. A fixed `--shutdown-grace-secs` deadline starts immediately and
+does not disappear if the transport exits early. At the deadline kilnd
+cancels running executions (recorded as `CANCELED`); after a fixed 10-second
+reply deadline it stops waiting for transport replies but continues draining
+accepted create, compensation, and execution supervisors before removing the
+socket and exiting. Thus the reply deadline does not bound owned cleanup.
+Sandboxes keep running. Forced termination can still interrupt an operation;
+startup reconciliation handles the state it can identify.
 
 The systemd unit uses `KillMode=process` because kiln's shims are forked from
 kilnd's cgroup and must survive daemon restarts. systemd logs "left-over
