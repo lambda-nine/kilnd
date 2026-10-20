@@ -4,15 +4,20 @@
 use std::future::Future;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt, chown};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use kilnd_api::v1::kilnd_service_server::KilndServiceServer;
-use tokio::net::UnixListener;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
+use tonic::transport::server::{Connected, UdsConnectInfo};
 use tracing::{info, warn};
 
 use crate::lock::ExclusiveFileLock;
@@ -25,6 +30,50 @@ use crate::service::Service;
 const FINAL_WAIT: Duration = Duration::from_secs(10);
 const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+struct AdmittedUnixStream {
+    stream: UnixStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Connected for AdmittedUnixStream {
+    type ConnectInfo = UdsConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.stream.connect_info()
+    }
+}
+
+impl AsyncRead for AdmittedUnixStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for AdmittedUnixStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FileIdentity {
     device: u64,
@@ -33,7 +82,10 @@ struct FileIdentity {
 
 impl FileIdentity {
     fn of(meta: &std::fs::Metadata) -> Self {
-        Self { device: meta.dev(), inode: meta.ino() }
+        Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+        }
     }
 
     fn matches(self, meta: &std::fs::Metadata) -> bool {
@@ -63,13 +115,17 @@ impl SocketPathGuard {
         }
         match std::fs::symlink_metadata(&self.path) {
             Ok(meta) if meta.file_type().is_socket() && self.identity.matches(&meta) => {
-                std::fs::remove_file(&self.path).with_context(|| format!("remove owned socket {}", self.path.display()))?;
+                std::fs::remove_file(&self.path)
+                    .with_context(|| format!("remove owned socket {}", self.path.display()))?;
             }
             Ok(_) => {
                 warn!(socket = %self.path.display(), "socket path was replaced; leaving replacement untouched");
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("inspect owned socket {}", self.path.display())),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("inspect owned socket {}", self.path.display()));
+            }
         }
         self.active = false;
         Ok(())
@@ -92,7 +148,11 @@ impl Drop for SocketPathGuard {
 /// also mean backlog pressure fail closed. Anything else is an error.
 pub async fn bind(path: &Path, gid: Option<u32>) -> Result<BoundSocket> {
     let dir = path.parent().context("socket path has no directory")?;
-    let (dir_mode, sock_mode) = if gid.is_some() { (0o750, 0o660) } else { (0o700, 0o600) };
+    let (dir_mode, sock_mode) = if gid.is_some() {
+        (0o750, 0o660)
+    } else {
+        (0o700, 0o600)
+    };
     if !dir.exists() {
         match std::fs::DirBuilder::new().mode(0o700).create(dir) {
             Ok(()) => {}
@@ -107,7 +167,11 @@ pub async fn bind(path: &Path, gid: Option<u32>) -> Result<BoundSocket> {
         bail!("{} is not a directory", dir.display());
     }
     if meta.uid() != euid {
-        bail!("{} must be owned by uid {euid}, found uid {}", dir.display(), meta.uid());
+        bail!(
+            "{} must be owned by uid {euid}, found uid {}",
+            dir.display(),
+            meta.uid()
+        );
     }
     if meta.permissions().mode() & 0o022 != 0 {
         bail!(
@@ -117,7 +181,8 @@ pub async fn bind(path: &Path, gid: Option<u32>) -> Result<BoundSocket> {
         );
     }
 
-    let directory_lock = ExclusiveFileLock::acquire(&dir.join(".kilnd.socket.lock"), "socket directory")?;
+    let directory_lock =
+        ExclusiveFileLock::acquire(&dir.join(".kilnd.socket.lock"), "socket directory")?;
     remove_stale_socket(path).await?;
 
     // A losing invocation must not alter an incumbent directory's access.
@@ -126,8 +191,10 @@ pub async fn bind(path: &Path, gid: Option<u32>) -> Result<BoundSocket> {
     chown(dir, None, gid).with_context(|| format!("chown {}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(dir_mode))?;
 
-    let listener = std::os::unix::net::UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
-    let socket_meta = std::fs::symlink_metadata(path).with_context(|| format!("inspect bound socket {}", path.display()))?;
+    let listener = std::os::unix::net::UnixListener::bind(path)
+        .with_context(|| format!("bind {}", path.display()))?;
+    let socket_meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect bound socket {}", path.display()))?;
     if !socket_meta.file_type().is_socket() {
         bail!("{} did not become a socket after bind", path.display());
     }
@@ -139,16 +206,25 @@ pub async fn bind(path: &Path, gid: Option<u32>) -> Result<BoundSocket> {
     };
     chown(path, None, gid).with_context(|| format!("chown {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(sock_mode))?;
-    listener.set_nonblocking(true).with_context(|| format!("make {} nonblocking", path.display()))?;
-    let listener = UnixListener::from_std(listener).with_context(|| format!("register {} with tokio", path.display()))?;
-    Ok(BoundSocket { listener, path_guard })
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("make {} nonblocking", path.display()))?;
+    let listener = UnixListener::from_std(listener)
+        .with_context(|| format!("register {} with tokio", path.display()))?;
+    Ok(BoundSocket {
+        listener,
+        path_guard,
+    })
 }
 
 async fn remove_stale_socket(path: &Path) -> Result<()> {
     remove_stale_socket_after_probe(path, || {}).await
 }
 
-async fn remove_stale_socket_after_probe(path: &Path, after_refused_probe: impl FnOnce()) -> Result<()> {
+async fn remove_stale_socket_after_probe(
+    path: &Path,
+    after_refused_probe: impl FnOnce(),
+) -> Result<()> {
     let first = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => meta,
         Ok(_) => bail!("{} exists and is not a socket", path.display()),
@@ -156,7 +232,8 @@ async fn remove_stale_socket_after_probe(path: &Path, after_refused_probe: impl 
         Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
     };
     let identity = FileIdentity::of(&first);
-    let probe = tokio::time::timeout(SOCKET_PROBE_TIMEOUT, tokio::net::UnixStream::connect(path)).await;
+    let probe =
+        tokio::time::timeout(SOCKET_PROBE_TIMEOUT, tokio::net::UnixStream::connect(path)).await;
     match probe {
         Ok(Ok(_)) => bail!("{} already has a live listener", path.display()),
         Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) && cfg!(target_os = "linux") => {
@@ -164,12 +241,16 @@ async fn remove_stale_socket_after_probe(path: &Path, after_refused_probe: impl 
             let current = std::fs::symlink_metadata(path)
                 .with_context(|| format!("recheck stale socket {}", path.display()))?;
             if !current.file_type().is_socket() || !identity.matches(&current) {
-                bail!("{} changed while checking whether it was stale", path.display());
+                bail!(
+                    "{} changed while checking whether it was stale",
+                    path.display()
+                );
             }
             // The socket-directory lock makes this compare-and-delete stable
             // between cooperating kilnd processes. POSIX has no atomic
             // compare-and-unlink primitive, so hostile root remains trusted.
-            std::fs::remove_file(path).with_context(|| format!("remove stale socket {}", path.display()))?;
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove stale socket {}", path.display()))?;
             Ok(())
         }
         Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) => Err(e).with_context(|| {
@@ -178,12 +259,25 @@ async fn remove_stale_socket_after_probe(path: &Path, after_refused_probe: impl 
                 path.display()
             )
         }),
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::symlink_metadata(path) {
-            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            _ => bail!("{} changed while checking whether it was stale", path.display()),
-        },
-        Ok(Err(e)) => Err(e).with_context(|| format!("probe existing socket {}; refusing to remove it", path.display())),
-        Err(_) => bail!("timed out probing existing socket {}; refusing to remove it", path.display()),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => bail!(
+                    "{} changed while checking whether it was stale",
+                    path.display()
+                ),
+            }
+        }
+        Ok(Err(e)) => Err(e).with_context(|| {
+            format!(
+                "probe existing socket {}; refusing to remove it",
+                path.display()
+            )
+        }),
+        Err(_) => bail!(
+            "timed out probing existing socket {}; refusing to remove it",
+            path.display()
+        ),
     }
 }
 
@@ -207,8 +301,12 @@ async fn serve_with_final_wait_owned<R: Runtime>(
     grace: Duration,
     final_wait: Duration,
 ) -> Result<()> {
-    let BoundSocket { listener, mut path_guard } = socket;
-    let result = serve_with_final_wait(manager.clone(), listener, shutdown, grace, final_wait).await;
+    let BoundSocket {
+        listener,
+        mut path_guard,
+    } = socket;
+    let result =
+        serve_with_final_wait(manager.clone(), listener, shutdown, grace, final_wait).await;
     let cleanup = path_guard.cleanup();
     // State ownership outlives transport shutdown, operation draining, and
     // conditional socket cleanup regardless of how the caller manages Arcs.
@@ -231,19 +329,47 @@ async fn serve_with_final_wait<R: Runtime>(
     grace: Duration,
     final_wait: Duration,
 ) -> Result<()> {
-    let incoming = UnixListenerStream::new(listener).map(|conn| {
-        match &conn {
-            Ok(stream) => match stream.peer_cred() {
-                Ok(c) => info!(uid = c.uid(), gid = c.gid(), pid = c.pid().unwrap_or(0), "client connected"),
+    let admission = manager.admission().clone();
+    let limits = manager.limits();
+    let max_streams = limits.max_streams_per_connection;
+    let service = KilndServiceServer::new(Service::new(manager.clone()))
+        .max_decoding_message_size(limits.max_request_bytes)
+        .max_encoding_message_size(limits.max_response_bytes);
+    let incoming = UnixListenerStream::new(listener).filter_map(move |conn| match conn {
+        Ok(stream) => {
+            let permit = admission.try_connection().ok()?;
+            match stream.peer_cred() {
+                Ok(c) => info!(
+                    uid = c.uid(),
+                    gid = c.gid(),
+                    pid = c.pid().unwrap_or(0),
+                    "client connected"
+                ),
                 Err(e) => warn!(error = %e, "client connected; peer credentials unavailable"),
-            },
-            Err(e) => warn!(error = %e, "accept failed"),
+            }
+            Some(Ok(AdmittedUnixStream {
+                stream,
+                _permit: permit,
+            }))
         }
-        conn
+        Err(e) => {
+            warn!(error = %e, "accept failed");
+            Some(Err(e))
+        }
     });
     let stop = CancellationToken::new();
     let server = tonic::transport::Server::builder()
-        .add_service(KilndServiceServer::new(Service::new(manager.clone())))
+        .max_concurrent_streams(Some(
+            u32::try_from(max_streams).expect("validated stream count fits u32"),
+        ))
+        .concurrency_limit_per_connection(max_streams)
+        .load_shed(true)
+        .initial_stream_window_size(Some(64 * 1024))
+        .initial_connection_window_size(Some(256 * 1024))
+        .http2_adaptive_window(Some(false))
+        .http2_max_header_list_size(Some(16 * 1024))
+        .max_frame_size(Some(16 * 1024))
+        .add_service(service)
         .serve_with_incoming_shutdown(incoming, stop.clone().cancelled_owned());
     tokio::pin!(server);
     tokio::pin!(shutdown);
@@ -253,7 +379,10 @@ async fn serve_with_final_wait<R: Runtime>(
         () = &mut shutdown => None,
     };
     let requested = server_result.is_none();
-    info!(grace_secs = grace.as_secs(), "shutting down: refusing new work, waiting for requests and owned operations");
+    info!(
+        grace_secs = grace.as_secs(),
+        "shutting down: refusing new work, waiting for requests and owned operations"
+    );
     manager.begin_shutdown();
     if requested {
         stop.cancel();
@@ -309,6 +438,76 @@ mod tests {
     use crate::runtime::fake::{FakeGate, FakeRuntime};
     use crate::store::Store;
 
+    async fn wait_connections(manager: &Manager<FakeRuntime>, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = manager.admission().snapshot().connections.current;
+                assert!(current <= 2, "connection capacity exceeded: {current}");
+                if current == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("connection permits did not reach expected use");
+    }
+
+    #[tokio::test]
+    async fn raw_connection_ceiling_closes_excess_and_recovers_fd_permits() {
+        use tokio::io::AsyncReadExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run/kilnd.sock");
+        let manager = Arc::new(Manager::new(
+            FakeRuntime::default(),
+            Store::open_in_memory().unwrap(),
+            Limits {
+                max_connections: 2,
+                ..Limits::default()
+            },
+        ));
+        let listener = bind(&path, None).await.unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            manager.clone(),
+            listener,
+            async {
+                let _ = stop_rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+        let first = UnixStream::connect(&path).await.unwrap();
+        wait_connections(&manager, 1).await;
+        let second = UnixStream::connect(&path).await.unwrap();
+        wait_connections(&manager, 2).await;
+        for rejected in 1..=8 {
+            let mut excess = UnixStream::connect(&path).await.unwrap();
+            let mut byte = [0];
+            let read = tokio::time::timeout(Duration::from_secs(5), excess.read(&mut byte))
+                .await
+                .expect("excess socket remained open");
+            assert!(
+                matches!(read, Ok(0) | Err(_)),
+                "rejected socket carried transport bytes"
+            );
+            let snapshot = manager.admission().snapshot().connections;
+            assert_eq!(snapshot.current, 2);
+            assert_eq!(snapshot.rejected, rejected);
+        }
+        drop((first, second));
+        wait_connections(&manager, 0).await;
+        let recovered = UnixStream::connect(&path).await.unwrap();
+        wait_connections(&manager, 1).await;
+        drop(recovered);
+        wait_connections(&manager, 0).await;
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn shutdown_drains_detached_compensation_beyond_final_rpc_wait() {
         let tmp = tempfile::tempdir().unwrap();
@@ -343,26 +542,50 @@ mod tests {
             Duration::from_millis(20),
         ));
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut server).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(100), &mut server)
+                .await
+                .is_err(),
             "server exited at its final RPC deadline while compensation was paused"
         );
         let state_error = Store::open(&state_dir)
             .err()
             .expect("state ownership was released before operation drain");
-        assert!(state_error.to_string().contains("state directory already owned"), "{state_error:#}");
+        assert!(
+            state_error
+                .to_string()
+                .contains("state directory already owned"),
+            "{state_error:#}"
+        );
         let socket_error = bind(&alternate, None)
             .await
             .err()
             .expect("socket ownership was released before operation drain");
-        assert!(socket_error.to_string().contains("socket directory already owned"), "{socket_error:#}");
+        assert!(
+            socket_error
+                .to_string()
+                .contains("socket directory already owned"),
+            "{socket_error:#}"
+        );
 
         remove_gate.release();
-        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
-        assert!(!socket.exists(), "graceful shutdown left its owned socket behind");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !socket.exists(),
+            "graceful shutdown left its owned socket behind"
+        );
         let store = Store::open(&state_dir).unwrap();
         let row = store.sandboxes(true).unwrap().remove(0);
         assert_eq!(row.state, SandboxState::Failed);
-        assert!(row.failure_reason.as_deref().unwrap().contains("backend removed"));
+        assert!(
+            row.failure_reason
+                .as_deref()
+                .unwrap()
+                .contains("backend removed")
+        );
         assert!(fake.state().sandboxes.is_empty());
         drop(store);
         let next = bind(&alternate, None).await.unwrap();
@@ -374,7 +597,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let fake = FakeRuntime::default();
-        let manager = Arc::new(Manager::new(fake.clone(), Store::open_in_memory().unwrap(), Limits::default()));
+        let manager = Arc::new(Manager::new(
+            fake.clone(),
+            Store::open_in_memory().unwrap(),
+            Limits::default(),
+        ));
         let sandbox = manager.create(CreateRequest::default()).await.unwrap();
         let gate = FakeGate::default();
         fake.state().exec_before_run = Some(gate.clone());
@@ -396,7 +623,10 @@ mod tests {
         // There is no transport connection to keep tonic alive. The grace
         // deadline must still request shutdown cancellation, while owned exec
         // cleanup keeps the server alive beyond the final reply deadline.
-        let BoundSocket { listener, path_guard: _path_guard } = bind(&socket, None).await.unwrap();
+        let BoundSocket {
+            listener,
+            path_guard: _path_guard,
+        } = bind(&socket, None).await.unwrap();
         let mut server = tokio::spawn(serve_with_final_wait(
             manager.clone(),
             listener,
@@ -405,16 +635,26 @@ mod tests {
             Duration::from_millis(20),
         ));
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut server).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(100), &mut server)
+                .await
+                .is_err(),
             "server exited while canceled exec cleanup was paused"
         );
         assert_eq!(manager.health().await.unwrap().running_executions, 1);
 
         gate.release();
-        let execution = tokio::time::timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap().unwrap();
+        let execution = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(execution.state, ExecutionState::Canceled);
         assert_eq!(execution.failure_reason.as_deref(), Some("kilnd shut down"));
-        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(fake.state().active_execs, 0);
     }
 
@@ -446,7 +686,13 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if manager.health().await.unwrap().detail.contains("finalization write") {
+                if manager
+                    .health()
+                    .await
+                    .unwrap()
+                    .detail
+                    .contains("finalization write")
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -455,7 +701,10 @@ mod tests {
         .await
         .expect("execution did not enter terminal-publication retry");
         let execution_id = manager.get(&sandbox.id, 1).unwrap().1[0].id.clone();
-        assert_eq!(manager.execution(&execution_id).unwrap().state, ExecutionState::Running);
+        assert_eq!(
+            manager.execution(&execution_id).unwrap().state,
+            ExecutionState::Running
+        );
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
 
@@ -468,22 +717,41 @@ mod tests {
             Duration::from_millis(20),
         ));
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut server).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(100), &mut server)
+                .await
+                .is_err(),
             "server exited while terminal publication was retrying"
         );
         let state_error = Store::open(&state_dir)
             .err()
             .expect("state ownership was released during terminal-publication retry");
-        assert!(state_error.to_string().contains("state directory already owned"), "{state_error:#}");
+        assert!(
+            state_error
+                .to_string()
+                .contains("state directory already owned"),
+            "{state_error:#}"
+        );
         let socket_error = bind(&alternate, None)
             .await
             .err()
             .expect("socket ownership was released during terminal-publication retry");
-        assert!(socket_error.to_string().contains("socket directory already owned"), "{socket_error:#}");
+        assert!(
+            socket_error
+                .to_string()
+                .contains("socket directory already owned"),
+            "{socket_error:#}"
+        );
 
         finish_rejection.store(false, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
-        assert!(!socket.exists(), "graceful shutdown left its owned socket behind");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !socket.exists(),
+            "graceful shutdown left its owned socket behind"
+        );
         let store = Store::open(&state_dir).unwrap();
         let execution = store.execution(&execution_id).unwrap().unwrap();
         assert_eq!(execution.state, ExecutionState::Exited);

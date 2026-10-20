@@ -41,19 +41,34 @@ pub struct Request<'a> {
     pub program: &'a Path,
     pub args: &'a [&'a OsStr],
     pub stdin: &'a [u8],
-    pub timeout: Duration,
+    pub deadline: tokio::time::Instant,
     pub max_output: usize,
 }
 
 pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Outcome> {
     if cancel.is_cancelled() {
-        return Ok(Outcome { finish: Finish::Canceled, stdout: Captured::default(), stderr: Captured::default() });
+        return Ok(Outcome {
+            finish: Finish::Canceled,
+            stdout: Captured::default(),
+            stderr: Captured::default(),
+        });
+    }
+    if tokio::time::Instant::now() >= req.deadline {
+        return Ok(Outcome {
+            finish: Finish::TimedOut,
+            stdout: Captured::default(),
+            stderr: Captured::default(),
+        });
     }
     let mut cmd = Command::new(req.program);
     cmd.args(req.args)
         .env_clear()
         .env("PATH", SAFE_PATH)
-        .stdin(if req.stdin.is_empty() { Stdio::null() } else { Stdio::piped() })
+        .stdin(if req.stdin.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -77,16 +92,8 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
     // Capture and stdin tasks must never detach from this operation. If the
     // run future is unexpectedly dropped (for example by a backend panic),
     // these wrappers abort the tasks and release their pipe handles.
-    let mut stdout = spawn_capture(
-        child.stdout.take(),
-        req.max_output,
-        stop_reading.clone(),
-    );
-    let mut stderr = spawn_capture(
-        child.stderr.take(),
-        req.max_output,
-        stop_reading.clone(),
-    );
+    let mut stdout = spawn_capture(child.stdout.take(), req.max_output, stop_reading.clone());
+    let mut stderr = spawn_capture(child.stderr.take(), req.max_output, stop_reading.clone());
     let writer = child.stdin.take().map(|mut pipe| {
         let data = req.stdin.to_vec();
         // A command that doesn't read its input gets EPIPE here; that's fine.
@@ -97,7 +104,7 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
 
     let finish = tokio::select! {
         status = child.wait() => status.map(Finish::Exited),
-        () = tokio::time::sleep(req.timeout) => {
+        () = tokio::time::sleep_until(req.deadline) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
             Ok(Finish::TimedOut)
@@ -128,10 +135,18 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
         }
     };
     let finish = finish?;
-    Ok(Outcome { finish, stdout, stderr })
+    Ok(Outcome {
+        finish,
+        stdout,
+        stderr,
+    })
 }
 
-fn spawn_capture<R>(pipe: Option<R>, max: usize, stop: CancellationToken) -> AbortOnDropHandle<Captured>
+fn spawn_capture<R>(
+    pipe: Option<R>,
+    max: usize,
+    stop: CancellationToken,
+) -> AbortOnDropHandle<Captured>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -140,7 +155,11 @@ where
 
 /// Keeps the first `max` bytes of a stream and counts the rest, reading to
 /// the end so the writer never blocks on a full pipe.
-async fn capture<R: AsyncRead + Unpin>(pipe: Option<R>, max: usize, stop: CancellationToken) -> Captured {
+async fn capture<R: AsyncRead + Unpin>(
+    pipe: Option<R>,
+    max: usize,
+    stop: CancellationToken,
+) -> Captured {
     let mut out = Captured::default();
     let Some(mut pipe) = pipe else { return out };
     let mut buf = vec![0u8; 16 * 1024];
@@ -177,7 +196,11 @@ mod tests {
     }
 
     impl AsyncRead for DropReader {
-        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
             Pin::new(&mut self.inner).poll_read(cx, buf)
         }
     }
@@ -190,7 +213,13 @@ mod tests {
 
     async fn sh(script: &str, stdin: &[u8], timeout: Duration, max_output: usize) -> Outcome {
         let args = [OsStr::new("-c"), OsStr::new(script)];
-        let req = Request { program: Path::new("/bin/sh"), args: &args, stdin, timeout, max_output };
+        let req = Request {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            stdin,
+            deadline: tokio::time::Instant::now() + timeout,
+            max_output,
+        };
         run(&req, &CancellationToken::new()).await.unwrap()
     }
 
@@ -203,7 +232,13 @@ mod tests {
 
     #[tokio::test]
     async fn captures_output_and_exit_code() {
-        let o = sh("echo out; echo err >&2; exit 3", b"", Duration::from_secs(10), 1024).await;
+        let o = sh(
+            "echo out; echo err >&2; exit 3",
+            b"",
+            Duration::from_secs(10),
+            1024,
+        )
+        .await;
         assert_eq!(code(&o), Some(3));
         assert_eq!(o.stdout.data, b"out\n");
         assert_eq!(o.stderr.data, b"err\n");
@@ -211,8 +246,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_expired_absolute_deadline_is_not_restarted_at_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned");
+        let script = format!("touch '{}'", marker.display());
+        let args = [OsStr::new("-c"), OsStr::new(&script)];
+        let req = Request {
+            program: Path::new("/bin/sh"),
+            args: &args,
+            stdin: b"",
+            deadline: tokio::time::Instant::now() - Duration::from_secs(1),
+            max_output: 10,
+        };
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(5), run(&req, &CancellationToken::new()))
+                .await
+                .expect("expired deadline restarted")
+                .unwrap();
+        assert!(matches!(outcome.finish, Finish::TimedOut));
+        assert!(
+            !marker.exists(),
+            "an already-expired request produced a side effect"
+        );
+    }
+
+    #[tokio::test]
     async fn bounds_output_but_counts_all_of_it() {
-        let o = sh("head -c 200000 /dev/zero", b"", Duration::from_secs(10), 1000).await;
+        let o = sh(
+            "head -c 200000 /dev/zero",
+            b"",
+            Duration::from_secs(10),
+            1000,
+        )
+        .await;
         assert_eq!(code(&o), Some(0));
         assert_eq!(o.stdout.data.len(), 1000);
         assert_eq!(o.stdout.total_bytes, 200_000);
@@ -227,8 +293,17 @@ mod tests {
 
     #[tokio::test]
     async fn clears_the_environment() {
-        let o = sh("echo \"${HOME:-unset}:$PATH\"", b"", Duration::from_secs(10), 1024).await;
-        assert_eq!(String::from_utf8_lossy(&o.stdout.data).trim(), format!("unset:{SAFE_PATH}"));
+        let o = sh(
+            "echo \"${HOME:-unset}:$PATH\"",
+            b"",
+            Duration::from_secs(10),
+            1024,
+        )
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout.data).trim(),
+            format!("unset:{SAFE_PATH}")
+        );
     }
 
     #[tokio::test]
@@ -247,7 +322,7 @@ mod tests {
             program: Path::new("/bin/sleep"),
             args: &args,
             stdin: b"",
-            timeout: Duration::from_secs(60),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(60),
             max_output: 1024,
         };
         let c = cancel.clone();
@@ -262,7 +337,13 @@ mod tests {
     #[tokio::test]
     async fn background_process_holding_pipes_does_not_hang() {
         let start = Instant::now();
-        let o = sh("sleep 30 & echo started", b"", Duration::from_secs(10), 1024).await;
+        let o = sh(
+            "sleep 30 & echo started",
+            b"",
+            Duration::from_secs(10),
+            1024,
+        )
+        .await;
         assert_eq!(code(&o), Some(0));
         assert_eq!(o.stdout.data, b"started\n");
         assert!(start.elapsed() < Duration::from_secs(5));
@@ -280,7 +361,10 @@ mod tests {
         let (reader, _writer) = tokio::io::duplex(64);
         let dropped = Arc::new(AtomicBool::new(false));
         let task = spawn_capture(
-            Some(DropReader { inner: reader, dropped: dropped.clone() }),
+            Some(DropReader {
+                inner: reader,
+                dropped: dropped.clone(),
+            }),
             1024,
             CancellationToken::new(),
         );
@@ -305,7 +389,7 @@ mod tests {
             program: Path::new("/bin/sh"),
             args: &args,
             stdin: b"",
-            timeout: Duration::from_secs(1),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(1),
             max_output: 1024,
         };
         let cancel = CancellationToken::new();
@@ -313,6 +397,9 @@ mod tests {
 
         let outcome = run(&req, &cancel).await.unwrap();
         assert!(matches!(outcome.finish, Finish::Canceled));
-        assert!(!marker.exists(), "pre-canceled process produced a side effect");
+        assert!(
+            !marker.exists(),
+            "pre-canceled process produced a side effect"
+        );
     }
 }

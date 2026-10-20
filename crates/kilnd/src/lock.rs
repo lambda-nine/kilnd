@@ -104,7 +104,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("owner.lock");
         let owner = ExclusiveFileLock::acquire(&path, "test resource").unwrap();
-        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
 
         drop(owner);
         let next = ExclusiveFileLock::acquire(&path, "test resource")

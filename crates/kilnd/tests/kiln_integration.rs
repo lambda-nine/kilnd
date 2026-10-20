@@ -21,21 +21,34 @@ fn enabled() -> bool {
         return false;
     }
     // SAFETY: geteuid has no preconditions.
-    assert_eq!(unsafe { libc::geteuid() }, 0, "the kiln integration test must run as root");
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "the kiln integration test must run as root"
+    );
     true
 }
 
 fn kiln() -> KilnRuntime {
-    KilnRuntime::new(PathBuf::from(std::env::var("KILN_BIN").unwrap_or_else(|_| "/usr/local/bin/kiln".into())))
+    KilnRuntime::new(PathBuf::from(
+        std::env::var("KILN_BIN").unwrap_or_else(|_| "/usr/local/bin/kiln".into()),
+    ))
 }
 
 fn exec(id: &str, argv: &[&str], timeout_ms: u32) -> ExecRequest {
-    ExecRequest { sandbox_id: id.into(), argv: argv.iter().map(|s| s.to_string()).collect(), stdin: vec![], timeout_ms }
+    ExecRequest {
+        sandbox_id: id.into(),
+        argv: argv.iter().map(|s| s.to_string()).collect(),
+        stdin: vec![],
+        timeout_ms,
+    }
 }
 
 fn exec_scope_populated(backend_id: &str) -> bool {
-    std::fs::read_to_string(format!("/sys/fs/cgroup/kiln/{backend_id}/exec/cgroup.events"))
-        .is_ok_and(|events| events.lines().any(|line| line == "populated 1"))
+    std::fs::read_to_string(format!(
+        "/sys/fs/cgroup/kiln/{backend_id}/exec/cgroup.events"
+    ))
+    .is_ok_and(|events| events.lines().any(|line| line == "populated 1"))
 }
 
 fn pipe_fd_count() -> usize {
@@ -54,63 +67,140 @@ async fn lifecycle_against_real_kiln() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let limits = Limits { max_output_bytes: 4096, ..Limits::default() };
-    let m = Arc::new(Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), limits));
+    let limits = Limits {
+        max_output_bytes: 4096,
+        ..Limits::default()
+    };
+    let m = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        limits,
+    ));
     m.reconcile().await.unwrap();
     assert!(m.health().await.unwrap().serving);
 
-    let req = CreateRequest { memory_bytes: 128 << 20, pids: 64, disk_bytes: 64 << 20, ..Default::default() };
+    let req = CreateRequest {
+        memory_bytes: 128 << 20,
+        pids: 64,
+        disk_bytes: 64 << 20,
+        ..Default::default()
+    };
     let s = m.create(req).await.unwrap();
     assert_eq!(s.state, SandboxState::Ready);
     let backend_id = s.backend_id.clone().unwrap();
     let listed = m.runtime().list().await.unwrap();
-    assert!(listed.iter().any(|b| b.id == backend_id), "kiln ls shows {backend_id}");
+    assert!(
+        listed.iter().any(|b| b.id == backend_id),
+        "kiln ls shows {backend_id}"
+    );
 
     // Output, exit codes and stdin.
-    let e = m.exec(exec(&s.id, &["sh", "-c", "echo out; echo err >&2; exit 3"], 10_000)).await.unwrap();
+    let e = m
+        .exec(exec(
+            &s.id,
+            &["sh", "-c", "echo out; echo err >&2; exit 3"],
+            10_000,
+        ))
+        .await
+        .unwrap();
     assert_eq!((e.state, e.exit_code), (ExecutionState::Exited, Some(3)));
-    assert_eq!((e.stdout.data.as_slice(), e.stderr.data.as_slice()), (&b"out\n"[..], &b"err\n"[..]));
-    let mut with_stdin = exec(&s.id, &["sh", "-c", "cat > /workspace/note && cat /workspace/note"], 10_000);
+    assert_eq!(
+        (e.stdout.data.as_slice(), e.stderr.data.as_slice()),
+        (&b"out\n"[..], &b"err\n"[..])
+    );
+    let mut with_stdin = exec(
+        &s.id,
+        &["sh", "-c", "cat > /workspace/note && cat /workspace/note"],
+        10_000,
+    );
     with_stdin.stdin = b"persisted".to_vec();
     assert_eq!(m.exec(with_stdin).await.unwrap().stdout.data, b"persisted");
-    let e = m.exec(exec(&s.id, &["cat", "/workspace/note"], 10_000)).await.unwrap();
-    assert_eq!(e.stdout.data, b"persisted", "state survives between executions");
+    let e = m
+        .exec(exec(&s.id, &["cat", "/workspace/note"], 10_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        e.stdout.data, b"persisted",
+        "state survives between executions"
+    );
 
     // Arguments are passed as a vector: shell syntax in one is just text.
-    let e = m.exec(exec(&s.id, &["echo", "$(id -u); touch /tmp/injected"], 10_000)).await.unwrap();
+    let e = m
+        .exec(exec(
+            &s.id,
+            &["echo", "$(id -u); touch /tmp/injected"],
+            10_000,
+        ))
+        .await
+        .unwrap();
     assert_eq!(e.stdout.data, b"$(id -u); touch /tmp/injected\n");
-    let e = m.exec(exec(&s.id, &["test", "-e", "/tmp/injected"], 10_000)).await.unwrap();
+    let e = m
+        .exec(exec(&s.id, &["test", "-e", "/tmp/injected"], 10_000))
+        .await
+        .unwrap();
     assert_eq!(e.exit_code, Some(1));
 
     // Bounded output.
-    let e = m.exec(exec(&s.id, &["head", "-c", "100000", "/dev/zero"], 10_000)).await.unwrap();
+    let e = m
+        .exec(exec(&s.id, &["head", "-c", "100000", "/dev/zero"], 10_000))
+        .await
+        .unwrap();
     assert_eq!((e.stdout.data.len(), e.stdout.total_bytes), (4096, 100_000));
 
     // A timeout kills the command inside the sandbox, including what it
     // started in the background, and the sandbox keeps serving.
     let start = Instant::now();
-    let e = m.exec(exec(&s.id, &["sh", "-c", "sleep 30 & sleep 30"], 1000)).await.unwrap();
+    let e = m
+        .exec(exec(&s.id, &["sh", "-c", "sleep 30 & sleep 30"], 1000))
+        .await
+        .unwrap();
     assert_eq!(e.state, ExecutionState::TimedOut);
     assert!(start.elapsed() < Duration::from_secs(10));
-    let e = m.exec(exec(&s.id, &["sh", "-c", "pgrep sleep || echo none"], 10_000)).await.unwrap();
-    assert_eq!(e.stdout.data, b"none\n", "the timed-out command was stopped");
+    let e = m
+        .exec(exec(
+            &s.id,
+            &["sh", "-c", "pgrep sleep || echo none"],
+            10_000,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        e.stdout.data, b"none\n",
+        "the timed-out command was stopped"
+    );
 
     // A missing program is the command's failure (127), not kiln's.
-    let e = m.exec(exec(&s.id, &["/no/such/program"], 10_000)).await.unwrap();
+    let e = m
+        .exec(exec(&s.id, &["/no/such/program"], 10_000))
+        .await
+        .unwrap();
     assert_eq!((e.state, e.exit_code), (ExecutionState::Exited, Some(127)));
 
     // Restart: a new manager over the same database keeps the sandbox.
     drop(m);
-    let m = Arc::new(Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), Limits::default()));
+    let m = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        Limits::default(),
+    ));
     let r = m.reconcile().await.unwrap();
     assert!(r.lost.is_empty(), "{r:?}");
     assert_eq!(m.get(&s.id, 0).unwrap().0.state, SandboxState::Ready);
-    assert_eq!(m.exec(exec(&s.id, &["true"], 10_000)).await.unwrap().exit_code, Some(0));
+    assert_eq!(
+        m.exec(exec(&s.id, &["true"], 10_000))
+            .await
+            .unwrap()
+            .exit_code,
+        Some(0)
+    );
 
     let d = m.delete(&s.id).await.unwrap();
     assert_eq!(d.state, SandboxState::Deleted);
     let listed = m.runtime().list().await.unwrap();
-    assert!(!listed.iter().any(|b| b.id == backend_id), "kiln rm removed {backend_id}");
+    assert!(
+        !listed.iter().any(|b| b.id == backend_id),
+        "kiln rm removed {backend_id}"
+    );
 }
 
 #[tokio::test]
@@ -120,10 +210,24 @@ async fn a_sandbox_killed_behind_kilnds_back_is_lost_after_reconcile() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let m = Arc::new(Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), Limits::default()));
-    let s = m.create(CreateRequest { memory_bytes: 64 << 20, disk_bytes: 16 << 20, ..Default::default() }).await.unwrap();
+    let m = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        Limits::default(),
+    ));
+    let s = m
+        .create(CreateRequest {
+            memory_bytes: 64 << 20,
+            disk_bytes: 16 << 20,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     // Remove it with kiln directly, as an operator or a reboot would.
-    m.runtime().remove(s.backend_id.as_ref().unwrap()).await.unwrap();
+    m.runtime()
+        .remove(s.backend_id.as_ref().unwrap())
+        .await
+        .unwrap();
 
     let r = m.reconcile().await.unwrap();
     assert_eq!(r.lost, vec![s.id.clone()]);
@@ -140,9 +244,18 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let m = Arc::new(Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), Limits::default()));
+    let m = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        Limits::default(),
+    ));
     let s = m
-        .create(CreateRequest { memory_bytes: 64 << 20, pids: 64, disk_bytes: 16 << 20, ..Default::default() })
+        .create(CreateRequest {
+            memory_bytes: 64 << 20,
+            pids: 64,
+            disk_bytes: 16 << 20,
+            ..Default::default()
+        })
         .await
         .unwrap();
     let backend_id = s.backend_id.clone().unwrap();
@@ -183,11 +296,31 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
     .await
     .expect("client-disconnected execution did not finalize");
     assert_eq!(execution.state, ExecutionState::Canceled);
-    assert_eq!(execution.failure_reason.as_deref(), Some("client disconnected"));
-    assert!(!exec_scope_populated(&backend_id), "execution cgroup still has descendants");
-    assert_eq!(pipe_fd_count(), baseline_pipes, "backend stdout/stderr pipe descriptors leaked");
+    assert_eq!(
+        execution.failure_reason.as_deref(),
+        Some("client disconnected")
+    );
+    assert!(
+        !exec_scope_populated(&backend_id),
+        "execution cgroup still has descendants"
+    );
+    assert_eq!(
+        pipe_fd_count(),
+        baseline_pipes,
+        "backend stdout/stderr pipe descriptors leaked"
+    );
 
-    let reuse = m.exec(exec(&s.id, &["sh", "-c", "pgrep sleep || echo none"], 10_000)).await.unwrap();
-    assert_eq!(reuse.stdout.data, b"none\n", "canceled descendants survived into the next exec");
+    let reuse = m
+        .exec(exec(
+            &s.id,
+            &["sh", "-c", "pgrep sleep || echo none"],
+            10_000,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        reuse.stdout.data, b"none\n",
+        "canceled descendants survived into the next exec"
+    );
     assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
 }

@@ -170,7 +170,9 @@ pub fn valid_id(kind: &str, id: &str) -> bool {
     id.len() == kind.len() + 17
         && id.starts_with(kind)
         && id.as_bytes()[kind.len()] == b'-'
-        && id[kind.len() + 1..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && id[kind.len() + 1..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]
@@ -183,7 +185,14 @@ mod tests {
         assert!(valid_id("sb", &id), "{id}");
         assert!(!valid_id("ex", &id));
         assert_ne!(id, new_id("sb"));
-        for bad in ["", "sb-", "sb-1234", "sb-1f3a9c0d5e7b2a4G", "sb_1f3a9c0d5e7b2a46", "sb-1f3a9c0d5e7b2a46/"] {
+        for bad in [
+            "",
+            "sb-",
+            "sb-1234",
+            "sb-1f3a9c0d5e7b2a4G",
+            "sb_1f3a9c0d5e7b2a46",
+            "sb-1f3a9c0d5e7b2a46/",
+        ] {
             assert!(!valid_id("sb", bad), "{bad}");
         }
     }

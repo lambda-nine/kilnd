@@ -15,7 +15,12 @@ fn manager_with(limits: Limits) -> (Arc<Manager<FakeRuntime>>, FakeRuntime) {
 }
 
 fn exec_req(id: &str, argv: &[&str]) -> ExecRequest {
-    ExecRequest { sandbox_id: id.into(), argv: argv.iter().map(|s| s.to_string()).collect(), stdin: vec![], timeout_ms: 0 }
+    ExecRequest {
+        sandbox_id: id.into(),
+        argv: argv.iter().map(|s| s.to_string()).collect(),
+        stdin: vec![],
+        timeout_ms: 0,
+    }
 }
 
 async fn drain(m: &Arc<Manager<FakeRuntime>>) {
@@ -23,6 +28,281 @@ async fn drain(m: &Arc<Manager<FakeRuntime>>) {
     tokio::time::timeout(Duration::from_secs(5), m.drain_operations())
         .await
         .expect("supervised operations did not drain");
+}
+
+async fn until(mut condition: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if condition() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        condition(),
+        "condition did not become true after bounded scheduler turns"
+    );
+}
+
+fn spawn_exec(
+    m: &Arc<Manager<FakeRuntime>>,
+    req: ExecRequest,
+) -> tokio::task::JoinHandle<Result<Execution>> {
+    let m = m.clone();
+    tokio::spawn(async move { m.exec(req).await })
+}
+
+#[tokio::test]
+async fn zero_queue_rejects_second_exec_before_row_or_backend() {
+    let (m, fake) = manager_with(Limits {
+        max_queued_execs_per_sandbox: 0,
+        ..Limits::default()
+    });
+    let sandbox = m.create(Default::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
+    let running = spawn_exec(&m, exec_req(&sandbox.id, &["echo", "first"]));
+    gate.entered().await;
+    assert!(
+        matches!(m.exec(exec_req(&sandbox.id, &["echo", "second"])).await, Err(Error::ResourceExhausted(message)) if message.contains("one running plus 0 queued"))
+    );
+    assert_eq!(fake.state().exec_calls.len(), 1);
+    assert_eq!(m.get(&sandbox.id, 100).unwrap().1.len(), 1);
+    assert_eq!(m.admission.snapshot().execs.current, 1);
+    gate.release();
+    running.await.unwrap().unwrap();
+    assert_eq!(m.admission.snapshot().execs.current, 0);
+}
+
+#[tokio::test]
+async fn slot_registry_prunes_deleted_sandbox_churn_without_replacing_live_slots() {
+    let (m, _) = manager();
+    for _ in 0..100 {
+        let sandbox = m.create(Default::default()).await.unwrap();
+        let first = m.slot(&sandbox.id);
+        let second = m.slot(&sandbox.id);
+        assert!(Arc::ptr_eq(&first, &second));
+        drop((first, second));
+        m.delete(&sandbox.id).await.unwrap();
+        assert!(
+            m.slots.lock().unwrap().len() <= 1,
+            "dead coordination entries accumulated"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_queue_slots_cancel_without_rows_and_recover_stdin() {
+    let (m, fake) = manager_with(Limits {
+        max_queued_execs_per_sandbox: 2,
+        max_queued_exec_stdin_bytes: 6,
+        ..Limits::default()
+    });
+    let sandbox = m.create(Default::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
+    let running = spawn_exec(&m, exec_req(&sandbox.id, &["echo", "first"]));
+    gate.entered().await;
+    let mut queued = Vec::new();
+    for _ in 0..2 {
+        let mut req = exec_req(&sandbox.id, &["cat"]);
+        req.stdin = vec![1; 3];
+        queued.push(spawn_exec(&m, req));
+    }
+    until(|| m.admission.snapshot().execs.current == 3).await;
+    assert_eq!(m.admission.snapshot().stdin.current, 6);
+    assert!(matches!(
+        m.exec(exec_req(&sandbox.id, &["echo", "fourth"])).await,
+        Err(Error::ResourceExhausted(_))
+    ));
+    for task in queued {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    until(|| m.admission.snapshot().execs.current == 1).await;
+    assert_eq!(m.admission.snapshot().stdin.current, 0);
+    assert_eq!(m.slot(&sandbox.id).outstanding_execs.available_permits(), 2);
+    assert_eq!(fake.state().exec_calls.len(), 1);
+    assert_eq!(m.get(&sandbox.id, 100).unwrap().1.len(), 1);
+    gate.release();
+    running.await.unwrap().unwrap();
+    let mut req = exec_req(&sandbox.id, &["cat"]);
+    req.stdin = vec![1; 6];
+    m.exec(req).await.unwrap();
+    assert_eq!(m.admission.snapshot().stdin.current, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn exec_deadline_includes_queue_and_runtime_uses_the_same_instant() {
+    let (m, fake) = manager();
+    let sandbox = m.create(Default::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
+    let running = spawn_exec(&m, exec_req(&sandbox.id, &["echo", "first"]));
+    gate.entered().await;
+    let mut req = exec_req(&sandbox.id, &["echo", "expired"]);
+    req.timeout_ms = 100;
+    let queued = spawn_exec(&m, req);
+    until(|| m.admission.snapshot().execs.current == 2).await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(matches!(
+        queued.await.unwrap(),
+        Err(Error::DeadlineExceeded(_))
+    ));
+    assert_eq!(fake.state().exec_calls.len(), 1);
+    assert_eq!(m.get(&sandbox.id, 100).unwrap().1.len(), 1);
+
+    let received = Instant::now();
+    let expected_deadline = received + Duration::from_millis(1000);
+    let mut req = exec_req(&sandbox.id, &["sleep"]);
+    req.timeout_ms = 1000;
+    let queued = tokio::spawn({
+        let m = m.clone();
+        async move { m.exec_received(req, received).await }
+    });
+    until(|| m.admission.snapshot().execs.current == 2).await;
+    tokio::time::advance(Duration::from_millis(800)).await;
+    gate.release();
+    until(|| fake.state().exec_calls.len() == 2).await;
+    assert_eq!(fake.state().exec_deadlines[1], expected_deadline);
+    running.await.unwrap().unwrap();
+    tokio::time::advance(Duration::from_millis(199)).await;
+    assert!(!queued.is_finished());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let execution = queued.await.unwrap().unwrap();
+    assert_eq!(execution.state, ExecutionState::TimedOut);
+    assert_eq!(
+        execution.timeout_ms, 1000,
+        "persist requested timeout, not remaining time"
+    );
+    assert_eq!(m.admission.snapshot().execs.current, 0);
+}
+
+#[tokio::test]
+async fn global_exec_and_stdin_limits_span_sandboxes_and_survive_cancel_and_panic() {
+    for stdin_bound in [false, true] {
+        let (m, fake) = manager_with(Limits {
+            max_concurrent_execs: if stdin_bound { 3 } else { 2 },
+            max_queued_exec_stdin_bytes: if stdin_bound { 4 } else { 6 },
+            ..Limits::default()
+        });
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(m.create(Default::default()).await.unwrap().id);
+        }
+        let first_gate = FakeGate::default();
+        fake.state().exec_before_run = Some(first_gate.clone());
+        let mut req = exec_req(&ids[0], &["sleep"]);
+        req.stdin = vec![1; 2];
+        let first = spawn_exec(&m, req);
+        first_gate.entered().await;
+        let second_gate = FakeGate::default();
+        fake.state().exec_before_run = Some(second_gate.clone());
+        fake.state().panic_exec = true;
+        let mut req = exec_req(&ids[1], &["sleep"]);
+        req.stdin = vec![1; 2];
+        let second = spawn_exec(&m, req);
+        second_gate.entered().await;
+        let mut req = exec_req(&ids[2], &["cat"]);
+        req.stdin = vec![1];
+        let error = m.exec(req).await.unwrap_err();
+        assert!(
+            matches!(error, Error::ResourceExhausted(ref message) if message.contains(if stdin_bound { "stdin" } else { "global Exec" }))
+        );
+        assert_eq!(m.admission.snapshot().execs.current, 2);
+        assert_eq!(m.admission.snapshot().stdin.current, 4);
+        assert_eq!(fake.state().exec_calls.len(), 2);
+        assert!(m.get(&ids[2], 100).unwrap().1.is_empty());
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            m.admission.snapshot().execs.current,
+            2,
+            "cleanup still owns canceled request"
+        );
+        first_gate.release();
+        second_gate.release();
+        assert_eq!(second.await.unwrap().unwrap().state, ExecutionState::Failed);
+        until(|| m.admission.snapshot().execs.current == 0).await;
+        assert_eq!(m.admission.snapshot().stdin.current, 0);
+        assert_eq!(fake.state().active_execs, 0);
+        fake.state().panic_exec = false;
+        m.exec(exec_req(&ids[2], &["echo", "recovered"]))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn health_is_single_flight_cached_and_caller_independent() {
+    let (m, fake) = manager();
+    let gate = FakeGate::default();
+    fake.state().version_gate = Some(gate.clone());
+    let mut callers = Vec::new();
+    for _ in 0..20 {
+        let m = m.clone();
+        callers.push(tokio::spawn(async move { m.health().await.unwrap() }));
+    }
+    gate.entered().await;
+    assert_eq!(fake.state().version_calls, 1);
+    assert_eq!(fake.state().active_version_calls, 1);
+    for caller in callers.drain(..5) {
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+    }
+    assert_eq!(fake.state().active_version_calls, 1);
+    gate.release();
+    let expected = m.health().await.unwrap();
+    for caller in callers {
+        assert_eq!(caller.await.unwrap(), expected);
+    }
+    assert!(expected.serving);
+    assert_eq!(fake.state().version_calls, 1);
+    fake.state().unavailable = true;
+    assert!(m.health().await.unwrap().serving);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert!(!m.health().await.unwrap().serving);
+    assert_eq!(fake.state().version_calls, 2);
+    fake.state().unavailable = false;
+    assert!(!m.health().await.unwrap().serving);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(m.health().await.unwrap().serving);
+    assert_eq!(fake.state().version_calls, 3);
+    m.begin_shutdown();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let shutdown = m.health().await.unwrap();
+    assert!(shutdown.shutting_down);
+    assert!(!shutdown.serving);
+    assert_eq!(shutdown.backend_version, "fake 1.0");
+    assert_eq!(fake.state().version_calls, 3);
+    m.drain_operations().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn health_timeout_and_panic_release_shared_probe_and_allow_retry() {
+    let (m, fake) = manager();
+    let gate = FakeGate::default();
+    fake.state().version_gate = Some(gate.clone());
+    let waiter = tokio::spawn({
+        let m = m.clone();
+        async move { m.health().await.unwrap() }
+    });
+    gate.entered().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let h = waiter.await.unwrap();
+    assert!(!h.serving);
+    assert!(h.detail.contains("timed out"));
+    assert_eq!(fake.state().active_version_calls, 0);
+    fake.state().panic_version = true;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let h = m.health().await.unwrap();
+    assert!(!h.serving);
+    assert!(h.detail.contains("task failed"));
+    assert_eq!(fake.state().active_version_calls, 0);
+    assert_eq!(fake.state().version_calls, 2);
+    fake.state().panic_version = false;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(m.health().await.unwrap().serving);
+    assert_eq!(fake.state().version_calls, 3);
 }
 
 #[tokio::test]
@@ -33,9 +313,15 @@ async fn create_fills_defaults_and_becomes_ready() {
     assert_eq!(s.backend, "fake");
     assert!(valid_id("sb", &s.id));
     let b = s.backend_id.clone().unwrap();
-    assert_eq!(fake.state().sandboxes.get(&b), Some(&BackendStatus::Running));
+    assert_eq!(
+        fake.state().sandboxes.get(&b),
+        Some(&BackendStatus::Running)
+    );
     let spec = &fake.state().created[0];
-    assert_eq!((spec.image.as_str(), spec.memory_bytes, spec.cpu_millis), ("alpine", 512 << 20, 1000));
+    assert_eq!(
+        (spec.image.as_str(), spec.memory_bytes, spec.cpu_millis),
+        ("alpine", 512 << 20, 1000)
+    );
     assert_eq!(m.get(&s.id, 0).unwrap().0, s);
 }
 
@@ -44,11 +330,20 @@ async fn create_failure_is_recorded_and_returned() {
     let (m, fake) = manager();
     fake.state().fail_create = Some("image \"nope\" is missing".into());
     let err = m.create(CreateRequest::default()).await.unwrap_err();
-    assert!(matches!(err, Error::Backend(ref msg) if msg.contains("is missing")), "{err}");
+    assert!(
+        matches!(err, Error::Backend(ref msg) if msg.contains("is missing")),
+        "{err}"
+    );
     let all = m.list(true).unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].state, SandboxState::Failed);
-    assert!(all[0].failure_reason.as_deref().unwrap().contains("is missing"));
+    assert!(
+        all[0]
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("is missing")
+    );
     // A failed sandbox can be cleared.
     let gone = m.delete(&all[0].id).await.unwrap();
     assert_eq!(gone.state, SandboxState::Deleted);
@@ -83,7 +378,10 @@ async fn dropping_the_waiter_before_backend_allocation_does_not_cancel_create() 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].state, SandboxState::Ready);
     assert_eq!(fake.state().sandboxes.len(), 1);
-    assert_eq!(rows[0].backend_id.as_ref(), fake.state().sandboxes.keys().next());
+    assert_eq!(
+        rows[0].backend_id.as_ref(),
+        fake.state().sandboxes.keys().next()
+    );
 }
 
 #[tokio::test]
@@ -129,7 +427,12 @@ async fn dropped_waiter_still_records_backend_failure() {
 
     let row = m.list(true).unwrap().remove(0);
     assert_eq!(row.state, SandboxState::Failed);
-    assert!(row.failure_reason.as_deref().unwrap().contains("injected create failure"));
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("injected create failure")
+    );
     assert!(fake.state().sandboxes.is_empty());
 }
 
@@ -154,7 +457,12 @@ async fn dropped_waiter_does_not_interrupt_publication_compensation() {
 
     let row = m.list(true).unwrap().remove(0);
     assert_eq!(row.state, SandboxState::Failed);
-    assert!(row.failure_reason.as_deref().unwrap().contains("backend removed"));
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("backend removed")
+    );
     let state = fake.state();
     assert!(state.sandboxes.is_empty());
     assert_eq!(state.remove_attempts.len(), 1);
@@ -171,12 +479,20 @@ async fn failed_publication_and_compensation_remain_retryable_and_counted() {
     let row = m.list(true).unwrap().remove(0);
     assert_eq!(row.state, SandboxState::Deleting);
     assert!(row.backend_id.is_some());
-    assert!(row.failure_reason.as_deref().unwrap().contains("cleanup failed"));
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("cleanup failed")
+    );
     assert_eq!(m.health().await.unwrap().active_sandboxes, 1);
     assert_eq!(fake.state().sandboxes.len(), 1);
 
     fake.state().fail_remove = false;
-    assert_eq!(m.delete(&row.id).await.unwrap().state, SandboxState::Deleted);
+    assert_eq!(
+        m.delete(&row.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
     assert!(fake.state().sandboxes.is_empty());
 }
 
@@ -196,27 +512,77 @@ async fn backend_create_panic_is_recorded_as_failed() {
 async fn create_validates_the_spec() {
     let (m, fake) = manager();
     let bad = [
-        CreateRequest { image: "../etc".into(), ..Default::default() },
-        CreateRequest { image: "-x".into(), ..Default::default() },
-        CreateRequest { memory_bytes: 1 << 40, ..Default::default() },
-        CreateRequest { cpu_millis: 100_000, ..Default::default() },
-        CreateRequest { pids: 1 << 20, ..Default::default() },
-        CreateRequest { disk_bytes: 1 << 50, ..Default::default() },
-        CreateRequest { network: Network::Allow(vec![]), ..Default::default() },
-        CreateRequest { network: Network::Allow(vec!["--net=full".into()]), ..Default::default() },
-        CreateRequest { network: Network::Allow(vec!["a b".into()]), ..Default::default() },
-        CreateRequest { writable_paths: vec!["/data".into()], ..Default::default() },
-        CreateRequest { read_only_root: true, writable_paths: vec!["data".into()], ..Default::default() },
-        CreateRequest { read_only_root: true, writable_paths: vec!["/a/../etc".into()], ..Default::default() },
-        CreateRequest { labels: [("".to_string(), "x".to_string())].into(), ..Default::default() },
-        CreateRequest { labels: [("k".to_string(), "a\nb".to_string())].into(), ..Default::default() },
+        CreateRequest {
+            image: "../etc".into(),
+            ..Default::default()
+        },
+        CreateRequest {
+            image: "-x".into(),
+            ..Default::default()
+        },
+        CreateRequest {
+            memory_bytes: 1 << 40,
+            ..Default::default()
+        },
+        CreateRequest {
+            cpu_millis: 100_000,
+            ..Default::default()
+        },
+        CreateRequest {
+            pids: 1 << 20,
+            ..Default::default()
+        },
+        CreateRequest {
+            disk_bytes: 1 << 50,
+            ..Default::default()
+        },
+        CreateRequest {
+            network: Network::Allow(vec![]),
+            ..Default::default()
+        },
+        CreateRequest {
+            network: Network::Allow(vec!["--net=full".into()]),
+            ..Default::default()
+        },
+        CreateRequest {
+            network: Network::Allow(vec!["a b".into()]),
+            ..Default::default()
+        },
+        CreateRequest {
+            writable_paths: vec!["/data".into()],
+            ..Default::default()
+        },
+        CreateRequest {
+            read_only_root: true,
+            writable_paths: vec!["data".into()],
+            ..Default::default()
+        },
+        CreateRequest {
+            read_only_root: true,
+            writable_paths: vec!["/a/../etc".into()],
+            ..Default::default()
+        },
+        CreateRequest {
+            labels: [("".to_string(), "x".to_string())].into(),
+            ..Default::default()
+        },
+        CreateRequest {
+            labels: [("k".to_string(), "a\nb".to_string())].into(),
+            ..Default::default()
+        },
     ];
     for req in bad {
         let shown = format!("{req:?}");
-        assert!(matches!(m.create(req).await, Err(Error::InvalidArgument(_))), "{shown}");
+        assert!(
+            matches!(m.create(req).await, Err(Error::InvalidArgument(_))),
+            "{shown}"
+        );
     }
     assert!(fake.state().created.is_empty());
-    assert!(m.list(true).unwrap().is_empty(), "invalid requests leave no record");
+    assert!(
+        m.list(true).unwrap().is_empty(),
+        "invalid requests leave no record"
+    );
 
     let ok = CreateRequest {
         network: Network::Allow(vec!["example.com:443".into(), "10.0.0.0/8".into()]),
@@ -230,10 +596,16 @@ async fn create_validates_the_spec() {
 
 #[tokio::test]
 async fn caps_active_sandboxes() {
-    let (m, _) = manager_with(Limits { max_sandboxes: 2, ..Limits::default() });
+    let (m, _) = manager_with(Limits {
+        max_sandboxes: 2,
+        ..Limits::default()
+    });
     let a = m.create(CreateRequest::default()).await.unwrap();
     m.create(CreateRequest::default()).await.unwrap();
-    assert!(matches!(m.create(CreateRequest::default()).await, Err(Error::ResourceExhausted(_))));
+    assert!(matches!(
+        m.create(CreateRequest::default()).await,
+        Err(Error::ResourceExhausted(_))
+    ));
     m.delete(&a.id).await.unwrap();
     m.create(CreateRequest::default()).await.unwrap();
 }
@@ -242,7 +614,10 @@ async fn caps_active_sandboxes() {
 async fn exec_records_the_result() {
     let (m, _) = manager();
     let s = m.create(CreateRequest::default()).await.unwrap();
-    let e = m.exec(exec_req(&s.id, &["echo", "hello", "world"])).await.unwrap();
+    let e = m
+        .exec(exec_req(&s.id, &["echo", "hello", "world"]))
+        .await
+        .unwrap();
     assert_eq!(e.state, ExecutionState::Exited);
     assert_eq!(e.exit_code, Some(0));
     assert_eq!(e.stdout.data, b"hello world\n");
@@ -256,7 +631,10 @@ async fn exec_records_the_result() {
     let mut req = exec_req(&s.id, &["cat"]);
     req.stdin = b"from stdin".to_vec();
     let e = m.exec(req).await.unwrap();
-    assert_eq!((e.stdout.data.as_slice(), e.stdin_bytes), (&b"from stdin"[..], 10));
+    assert_eq!(
+        (e.stdout.data.as_slice(), e.stdin_bytes),
+        (&b"from stdin"[..], 10)
+    );
 
     let (_, recent) = m.get(&s.id, 2).unwrap();
     assert_eq!(recent.len(), 2);
@@ -295,12 +673,18 @@ async fn closed_queued_exec_never_reaches_the_backend_or_store() {
         async move { m.exec(exec_req(&id, &["echo", "must-not-run"])).await }
     });
     tokio::task::yield_now().await;
-    assert!(!queued.is_finished(), "second exec should be queued behind the sandbox lock");
+    assert!(
+        !queued.is_finished(),
+        "second exec should be queued behind the sandbox lock"
+    );
     queued.abort();
     assert!(queued.await.unwrap_err().is_cancelled());
 
     gate.release();
-    assert_eq!(first.await.unwrap().unwrap().state, ExecutionState::TimedOut);
+    assert_eq!(
+        first.await.unwrap().unwrap().state,
+        ExecutionState::TimedOut
+    );
     drain(&m).await;
     assert_eq!(fake.state().exec_calls.len(), 1);
     assert_eq!(m.get(&s.id, 10).unwrap().1.len(), 1);
@@ -314,7 +698,13 @@ async fn backend_exec_panic_is_finalized_and_releases_the_sandbox_lock() {
 
     let failed = m.exec(exec_req(&s.id, &["echo", "panic"])).await.unwrap();
     assert_eq!(failed.state, ExecutionState::Failed);
-    assert!(failed.failure_reason.as_deref().unwrap().contains("panicked"));
+    assert!(
+        failed
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("panicked")
+    );
     assert!(failed.finished_at_ms.is_some());
     assert_eq!(fake.state().active_execs, 0);
 
@@ -329,7 +719,13 @@ async fn backend_exec_panic_is_finalized_and_releases_the_sandbox_lock() {
     gate.release();
     let failed = after_await.await.unwrap().unwrap();
     assert_eq!(failed.state, ExecutionState::Failed);
-    assert!(failed.failure_reason.as_deref().unwrap().contains("panicked"));
+    assert!(
+        failed
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("panicked")
+    );
     assert_eq!(fake.state().active_execs, 0);
 
     fake.state().panic_exec = false;
@@ -346,7 +742,11 @@ async fn finalization_failure_stays_owned_until_storage_recovers() {
     let waiter = tokio::spawn({
         let m = m.clone();
         let id = s.id.clone();
-        async move { m.exec(exec_req(&id, &["echo", "completed"])).await }
+        async move {
+            let mut req = exec_req(&id, &["echo", "completed"]);
+            req.stdin = vec![1; 3];
+            m.exec(req).await
+        }
     });
 
     while fake.state().active_execs != 0 || fake.state().exec_calls.is_empty() {
@@ -354,17 +754,27 @@ async fn finalization_failure_stays_owned_until_storage_recovers() {
     }
     tokio::task::yield_now().await;
     let execution_id = m.get(&s.id, 10).unwrap().1[0].id.clone();
-    assert!(!waiter.is_finished(), "terminal publication failure escaped the supervisor");
+    assert!(
+        !waiter.is_finished(),
+        "terminal publication failure escaped the supervisor"
+    );
     let health = m.health().await.unwrap();
     assert!(!health.serving);
     assert_eq!(health.running_executions, 1);
     assert!(health.detail.contains("finalization write"));
+    assert_eq!(
+        health.admission.execs.current, 1,
+        "ticket released during terminal write retry"
+    );
+    assert_eq!(health.admission.stdin.current, 3);
 
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     m.begin_shutdown();
     assert!(
-        tokio::time::timeout(Duration::from_millis(30), m.drain_operations()).await.is_err(),
+        tokio::time::timeout(Duration::from_millis(30), m.drain_operations())
+            .await
+            .is_err(),
         "shutdown reported a successful drain while terminal publication was failing"
     );
 
@@ -376,11 +786,16 @@ async fn finalization_failure_stays_owned_until_storage_recovers() {
     assert_eq!(execution.state, ExecutionState::Exited);
     assert_eq!(execution.stdout.data, b"completed\n");
     assert!(m.health().await.unwrap().detail.is_empty());
+    assert_eq!(m.admission.snapshot().execs.current, 0);
+    assert_eq!(m.admission.snapshot().stdin.current, 0);
 }
 
 #[tokio::test]
 async fn exec_output_is_bounded() {
-    let (m, _) = manager_with(Limits { max_output_bytes: 100, ..Limits::default() });
+    let (m, _) = manager_with(Limits {
+        max_output_bytes: 100,
+        ..Limits::default()
+    });
     let s = m.create(CreateRequest::default()).await.unwrap();
     let e = m.exec(exec_req(&s.id, &["spew", "5000"])).await.unwrap();
     assert_eq!(e.stdout.data.len(), 100);
@@ -399,12 +814,19 @@ async fn exec_times_out() {
     assert_eq!(e.exit_code, None);
     assert_eq!(e.timeout_ms, 50);
     // The sandbox stays usable.
-    assert_eq!(m.exec(exec_req(&s.id, &["echo"])).await.unwrap().state, ExecutionState::Exited);
+    assert_eq!(
+        m.exec(exec_req(&s.id, &["echo"])).await.unwrap().state,
+        ExecutionState::Exited
+    );
 }
 
 #[tokio::test]
 async fn exec_validates_requests() {
-    let (m, _) = manager_with(Limits { max_stdin_bytes: 4, max_argv_bytes: 16, ..Limits::default() });
+    let (m, _) = manager_with(Limits {
+        max_stdin_bytes: 4,
+        max_argv_bytes: 16,
+        ..Limits::default()
+    });
     let s = m.create(CreateRequest::default()).await.unwrap();
     let mut too_much_stdin = exec_req(&s.id, &["cat"]);
     too_much_stdin.stdin = b"12345".to_vec();
@@ -421,8 +843,19 @@ async fn exec_validates_requests() {
     ] {
         assert!(matches!(m.exec(req).await, Err(Error::InvalidArgument(_))));
     }
-    assert!(matches!(m.exec(exec_req("sb-0000000000000000", &["echo"])).await, Err(Error::NotFound(_))));
-    assert!(m.get(&s.id, 10).unwrap().1.is_empty(), "nothing was recorded");
+    assert!(matches!(
+        m.exec(exec_req("sb-0000000000000000", &["echo"])).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(
+        m.get(&s.id, 10).unwrap().1.is_empty(),
+        "nothing was recorded"
+    );
+    let mut req = exec_req(&s.id, &["echo"]);
+    req.argv.extend(std::iter::repeat_n(String::new(), 4096));
+    assert!(
+        matches!(m.exec(req).await, Err(Error::InvalidArgument(message)) if message.contains("4096 arguments"))
+    );
 }
 
 #[tokio::test]
@@ -434,7 +867,10 @@ async fn exec_into_a_vanished_sandbox_marks_it_lost() {
     assert!(e.failure_reason.unwrap().contains("not found"));
     let lost = m.get(&s.id, 0).unwrap().0;
     assert_eq!(lost.state, SandboxState::Lost);
-    assert!(matches!(m.exec(exec_req(&s.id, &["echo"])).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.exec(exec_req(&s.id, &["echo"])).await,
+        Err(Error::FailedPrecondition(_))
+    ));
     assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
 }
 
@@ -457,7 +893,10 @@ async fn delete_cancels_a_running_exec() {
     assert_eq!(e.state, ExecutionState::Canceled);
     assert_eq!(e.failure_reason.as_deref(), Some("sandbox deleted"));
     assert!(fake.state().sandboxes.is_empty());
-    assert!(matches!(m.exec(exec_req(&s.id, &["echo"])).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.exec(exec_req(&s.id, &["echo"])).await,
+        Err(Error::FailedPrecondition(_))
+    ));
 }
 
 #[tokio::test]
@@ -486,7 +925,10 @@ async fn first_recorded_delete_reason_wins_over_shutdown() {
 
     let execution = running.await.unwrap().unwrap();
     assert_eq!(execution.failure_reason.as_deref(), Some("sandbox deleted"));
-    assert_eq!(deleting.await.unwrap().unwrap().state, SandboxState::Deleted);
+    assert_eq!(
+        deleting.await.unwrap().unwrap().state,
+        SandboxState::Deleted
+    );
 }
 
 #[tokio::test]
@@ -512,7 +954,10 @@ async fn first_recorded_shutdown_reason_wins_over_delete() {
 
     let execution = running.await.unwrap().unwrap();
     assert_eq!(execution.failure_reason.as_deref(), Some("kilnd shut down"));
-    assert_eq!(deleting.await.unwrap().unwrap().state, SandboxState::Deleted);
+    assert_eq!(
+        deleting.await.unwrap().unwrap().state,
+        SandboxState::Deleted
+    );
 }
 
 #[tokio::test]
@@ -564,7 +1009,10 @@ async fn execs_in_one_sandbox_run_one_at_a_time() {
     let b = m.exec(exec_req(&s.id, &["echo"])).await.unwrap();
     let a = a.await.unwrap().unwrap();
     assert_eq!(a.state, ExecutionState::TimedOut);
-    assert!(b.started_at_ms >= a.finished_at_ms.unwrap(), "the second waited for the first");
+    assert!(
+        b.started_at_ms >= a.finished_at_ms.unwrap(),
+        "the second waited for the first"
+    );
 }
 
 #[tokio::test]
@@ -575,8 +1023,14 @@ async fn delete_is_idempotent_and_handles_a_gone_backend() {
     assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
     let again = m.delete(&s.id).await.unwrap();
     assert_eq!(again.state, SandboxState::Deleted);
-    assert!(matches!(m.delete("sb-0000000000000000").await, Err(Error::NotFound(_))));
-    assert!(matches!(m.delete("x").await, Err(Error::InvalidArgument(_))));
+    assert!(matches!(
+        m.delete("sb-0000000000000000").await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        m.delete("x").await,
+        Err(Error::InvalidArgument(_))
+    ));
 }
 
 #[tokio::test]
@@ -588,7 +1042,10 @@ async fn failed_delete_stays_deleting_and_can_be_retried() {
     let stuck = m.get(&s.id, 0).unwrap().0;
     assert_eq!(stuck.state, SandboxState::Deleting);
     assert!(stuck.failure_reason.unwrap().contains("delete failed"));
-    assert!(matches!(m.exec(exec_req(&s.id, &["echo"])).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.exec(exec_req(&s.id, &["echo"])).await,
+        Err(Error::FailedPrecondition(_))
+    ));
     fake.state().fail_remove = false;
     assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
 }
@@ -607,22 +1064,39 @@ async fn shutdown_refuses_new_work_and_cancels_executions() {
     }
     m.begin_shutdown();
     assert!(m.health().await.unwrap().shutting_down);
-    assert!(matches!(m.create(CreateRequest::default()).await, Err(Error::ShuttingDown)));
-    assert!(matches!(m.exec(exec_req(&s.id, &["echo"])).await, Err(Error::ShuttingDown)));
+    assert!(matches!(
+        m.create(CreateRequest::default()).await,
+        Err(Error::ShuttingDown)
+    ));
+    assert!(matches!(
+        m.exec(exec_req(&s.id, &["echo"])).await,
+        Err(Error::ShuttingDown)
+    ));
     m.cancel_executions();
     let e = running.await.unwrap().unwrap();
-    assert_eq!((e.state, e.failure_reason.as_deref()), (ExecutionState::Canceled, Some("kilnd shut down")));
+    assert_eq!(
+        (e.state, e.failure_reason.as_deref()),
+        (ExecutionState::Canceled, Some("kilnd shut down"))
+    );
     // The sandbox itself survives a daemon shutdown.
     assert_eq!(m.get(&s.id, 0).unwrap().0.state, SandboxState::Ready);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn health_reports_backend_trouble() {
     let (m, fake) = manager();
     let h = m.health().await.unwrap();
     assert!(h.serving);
-    assert_eq!((h.backend, h.backend_version.as_str()), ("fake", "fake 1.0"));
+    assert_eq!(
+        (h.backend, h.backend_version.as_str()),
+        ("fake", "fake 1.0")
+    );
     fake.state().unavailable = true;
+    assert!(
+        m.health().await.unwrap().serving,
+        "success remains cached for its TTL"
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
     let h = m.health().await.unwrap();
     assert!(!h.serving);
     assert!(h.detail.contains("unavailable"));
@@ -657,17 +1131,31 @@ async fn reconcile_repairs_state_and_is_repeatable() {
         failure_reason: None,
     };
     m.store.insert_sandbox(&crashed_create).unwrap();
-    let other_backend = Sandbox { id: new_id("sb"), backend: "firecracker".into(), ..crashed_create.clone() };
+    let other_backend = Sandbox {
+        id: new_id("sb"),
+        backend: "firecracker".into(),
+        ..crashed_create.clone()
+    };
     m.store.insert_sandbox(&other_backend).unwrap();
-    m.store.set_sandbox_state(&half_deleted.id, SandboxState::Deleting, None, None).unwrap();
-    m.store.set_sandbox_state(&half_deleted_gone.id, SandboxState::Deleting, None, None).unwrap();
-    let interrupted = Execution { id: new_id("ex"), state: ExecutionState::Running, ..running_exec };
+    m.store
+        .set_sandbox_state(&half_deleted.id, SandboxState::Deleting, None, None)
+        .unwrap();
+    m.store
+        .set_sandbox_state(&half_deleted_gone.id, SandboxState::Deleting, None, None)
+        .unwrap();
+    let interrupted = Execution {
+        id: new_id("ex"),
+        state: ExecutionState::Running,
+        ..running_exec
+    };
     m.store.insert_execution(&interrupted).unwrap();
     {
         let mut s = fake.state();
         s.sandboxes.remove(rebooted.backend_id.as_ref().unwrap());
-        s.sandboxes.insert(stale.backend_id.clone().unwrap(), BackendStatus::Stale);
-        s.sandboxes.remove(half_deleted_gone.backend_id.as_ref().unwrap());
+        s.sandboxes
+            .insert(stale.backend_id.clone().unwrap(), BackendStatus::Stale);
+        s.sandboxes
+            .remove(half_deleted_gone.backend_id.as_ref().unwrap());
     }
     let unmanaged = fake.insert(BackendStatus::Running);
     let unmanaged_stale = fake.insert(BackendStatus::Stale);
@@ -697,14 +1185,42 @@ async fn reconcile_repairs_state_and_is_repeatable() {
     assert_eq!(state(&half_deleted.id), SandboxState::Deleted);
     assert_eq!(state(&deleted.id), SandboxState::Deleted);
     assert_eq!(state(&crashed_create.id), SandboxState::Failed);
-    assert_eq!(state(&other_backend.id), SandboxState::Creating, "other backends' sandboxes are not touched");
-    assert_eq!(m.execution(&interrupted.id).unwrap().state, ExecutionState::Interrupted);
-    assert!(fake.state().sandboxes.contains_key(&unmanaged), "unmanaged sandboxes are left alone");
-    assert!(!fake.state().sandboxes.contains_key(half_deleted.backend_id.as_ref().unwrap()));
+    assert_eq!(
+        state(&other_backend.id),
+        SandboxState::Creating,
+        "other backends' sandboxes are not touched"
+    );
+    assert_eq!(
+        m.execution(&interrupted.id).unwrap().state,
+        ExecutionState::Interrupted
+    );
+    assert!(
+        fake.state().sandboxes.contains_key(&unmanaged),
+        "unmanaged sandboxes are left alone"
+    );
+    assert!(
+        !fake
+            .state()
+            .sandboxes
+            .contains_key(half_deleted.backend_id.as_ref().unwrap())
+    );
 
     let second = m.reconcile().await.unwrap();
-    assert_eq!(second, Reconciled { unmanaged: vec![unmanaged], ..Default::default() });
-    assert_eq!(m.exec(exec_req(&alive.id, &["echo", "still"])).await.unwrap().stdout.data, b"still\n");
+    assert_eq!(
+        second,
+        Reconciled {
+            unmanaged: vec![unmanaged],
+            ..Default::default()
+        }
+    );
+    assert_eq!(
+        m.exec(exec_req(&alive.id, &["echo", "still"]))
+            .await
+            .unwrap()
+            .stdout
+            .data,
+        b"still\n"
+    );
 }
 
 #[tokio::test]

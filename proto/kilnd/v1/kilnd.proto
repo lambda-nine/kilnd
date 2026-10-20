@@ -26,7 +26,9 @@ service KilndService {
   // Returns one sandbox and its most recent executions.
   rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
 
-  // Lists sandboxes, newest first.
+  // Stable newest-first pages with opaque continuation tokens. Legacy calls
+  // without page_size fail RESOURCE_EXHAUSTED rather than silently truncate
+  // when the complete list cannot fit the server's count or byte bounds.
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
 
   // Removes a sandbox. A running execution in it is canceled first.
@@ -34,7 +36,9 @@ service KilndService {
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
   // Runs a command in a ready sandbox and waits for it. Executions in one
-  // sandbox run one at a time, in arrival order. The command's own outcome
+  // sandbox run one at a time. Admission does not promise arrival order.
+  // The timeout includes queueing; expiry before a row exists returns
+  // DEADLINE_EXCEEDED. The command's own outcome
   // (any exit code, a timeout, cancellation) is a successful RPC whose
   // Execution says what happened; RPC errors mean the request was invalid or
   // the sandbox couldn't run it. Canceling the RPC discards a queued request
@@ -69,6 +73,28 @@ message HealthResponse {
   // Sandboxes not yet deleted, failed or lost.
   uint32 active_sandboxes = 7;
   uint32 running_executions = 8;
+  AdmissionStats admission = 9;
+}
+
+// Current use and cumulative admission rejections since daemon startup.
+message AdmissionStats {
+  uint64 max_connections = 1;
+  uint64 current_connections = 2;
+  uint64 rejected_connections = 3;
+  uint64 max_concurrent_rpcs = 4;
+  uint64 current_rpcs = 5;
+  uint64 rejected_rpcs = 6;
+  uint64 max_concurrent_health = 7;
+  uint64 current_health = 8;
+  uint64 rejected_health = 9;
+  uint64 max_concurrent_execs = 10;
+  uint64 current_execs = 11;
+  uint64 rejected_execs = 12;
+  uint64 max_queued_exec_stdin_bytes = 13;
+  uint64 current_stdin_bytes = 14;
+  uint64 rejected_stdin = 15;
+  uint64 max_queued_execs_per_sandbox = 16;
+  uint64 rejected_sandbox_execs = 17;
 }
 
 enum SandboxState {
@@ -169,10 +195,14 @@ message GetSandboxResponse {
 message ListSandboxesRequest {
   // Also return DELETED sandboxes.
   bool include_deleted = 1;
+  // Absent preserves complete-list semantics; present zero uses the default.
+  optional uint32 page_size = 2;
+  string page_token = 3;
 }
 
 message ListSandboxesResponse {
   repeated Sandbox sandboxes = 1;
+  string next_page_token = 2;
 }
 
 message DeleteSandboxRequest {
@@ -190,7 +220,8 @@ message ExecRequest {
   repeated string argv = 2;
   // Bytes for the command's standard input; empty means /dev/null.
   bytes stdin = 3;
-  // Zero means the daemon's default; values above its maximum are refused.
+  // Queue-inclusive budget. Zero means the daemon's default; values above
+  // its maximum are refused. Cleanup and finalization may finish later.
   uint32 timeout_ms = 4;
 }
 

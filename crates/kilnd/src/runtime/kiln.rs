@@ -12,7 +12,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::{BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
+use super::{
+    BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError,
+};
 use crate::model::{Network, SandboxSpec};
 use crate::process::{self, Finish};
 
@@ -34,21 +36,47 @@ pub struct KilnRuntime {
 
 impl KilnRuntime {
     pub fn new(bin: PathBuf) -> Self {
-        Self { bin, cgroup_root: PathBuf::from("/sys/fs/cgroup/kiln") }
+        Self {
+            bin,
+            cgroup_root: PathBuf::from("/sys/fs/cgroup/kiln"),
+        }
     }
 
     /// Runs a kiln subcommand that should exit 0, returning its stdout.
-    async fn call(&self, op: &str, args: &[String], timeout: Duration) -> Result<process::Outcome, RuntimeError> {
+    async fn call(
+        &self,
+        op: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<process::Outcome, RuntimeError> {
+        let cancel = CancellationToken::new();
+        self.call_until(op, args, Instant::now() + timeout, &cancel)
+            .await
+    }
+
+    async fn call_until(
+        &self,
+        op: &str,
+        args: &[String],
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<process::Outcome, RuntimeError> {
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-        let req = process::Request { program: &self.bin, args: &args, stdin: b"", timeout, max_output: CONTROL_OUTPUT };
-        let out = process::run(&req, &CancellationToken::new()).await?;
+        let req = process::Request {
+            program: &self.bin,
+            args: &args,
+            stdin: b"",
+            deadline,
+            max_output: CONTROL_OUTPUT,
+        };
+        let out = process::run(&req, cancel).await?;
         match out.finish {
             Finish::Exited(status) if status.success() => Ok(out),
             Finish::Exited(status) => Err(RuntimeError::Backend(format!(
                 "kiln {op} failed ({status}): {}",
                 summarize(&out.stderr.data)
             ))),
-            Finish::TimedOut => Err(RuntimeError::Backend(format!("kiln {op} timed out after {}s", timeout.as_secs()))),
+            Finish::TimedOut => Err(RuntimeError::Backend(format!("kiln {op} deadline expired"))),
             Finish::Canceled => Err(RuntimeError::Backend(format!("kiln {op} was canceled"))),
         }
     }
@@ -99,7 +127,10 @@ impl KilnRuntime {
 
     #[cfg(test)]
     fn with_cgroup_root(bin: PathBuf, cgroup_root: &Path) -> Self {
-        Self { bin, cgroup_root: cgroup_root.to_path_buf() }
+        Self {
+            bin,
+            cgroup_root: cgroup_root.to_path_buf(),
+        }
     }
 }
 
@@ -108,21 +139,36 @@ impl Runtime for KilnRuntime {
         "kiln"
     }
 
-    async fn version(&self) -> Result<String, RuntimeError> {
-        let out = self.call("--version", &["--version".into()], QUERY_TIMEOUT).await?;
+    async fn version(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<String, RuntimeError> {
+        let out = self
+            .call_until("--version", &["--version".into()], deadline, cancel)
+            .await?;
         Ok(String::from_utf8_lossy(&out.stdout.data).trim().to_string())
     }
 
     async fn create(&self, spec: &SandboxSpec) -> Result<String, RuntimeError> {
-        let out = self.call("create", &create_args(spec), CREATE_TIMEOUT).await?;
+        let out = self
+            .call("create", &create_args(spec), CREATE_TIMEOUT)
+            .await?;
         let id = String::from_utf8_lossy(&out.stdout.data).trim().to_string();
         if !valid_kiln_id(&id) {
-            return Err(RuntimeError::Backend(format!("kiln create printed an unexpected ID {id:?}")));
+            return Err(RuntimeError::Backend(format!(
+                "kiln create printed an unexpected ID {id:?}"
+            )));
         }
         Ok(id)
     }
 
-    async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> Result<ExecOutcome, RuntimeError> {
+    async fn exec(
+        &self,
+        id: &str,
+        spec: &ExecSpec<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ExecOutcome, RuntimeError> {
         check_id(id)?;
         if cancel.is_cancelled() {
             return Ok(ExecOutcome {
@@ -137,7 +183,7 @@ impl Runtime for KilnRuntime {
             program: &self.bin,
             args: &args,
             stdin: spec.stdin,
-            timeout: spec.timeout,
+            deadline: spec.deadline,
             max_output: spec.max_output,
         };
         // Killing the `kiln exec` client asks kiln's PID 1 to tear down the
@@ -157,7 +203,11 @@ impl Runtime for KilnRuntime {
                     )));
                 }
                 Some(code) => ExecFinish::Exited(code),
-                None => return Err(RuntimeError::Backend(format!("kiln exec ended abnormally ({status})"))),
+                None => {
+                    return Err(RuntimeError::Backend(format!(
+                        "kiln exec ended abnormally ({status})"
+                    )));
+                }
             },
             Finish::TimedOut => {
                 self.wait_exec_cleanup(id).await?;
@@ -168,12 +218,19 @@ impl Runtime for KilnRuntime {
                 ExecFinish::Canceled
             }
         };
-        Ok(ExecOutcome { finish, stdout: out.stdout, stderr: out.stderr })
+        Ok(ExecOutcome {
+            finish,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
     }
 
     async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
         check_id(id)?;
-        match self.call("rm", &["rm".into(), id.into()], REMOVE_TIMEOUT).await {
+        match self
+            .call("rm", &["rm".into(), id.into()], REMOVE_TIMEOUT)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => {
                 if !self.is_known(id).await? {
@@ -206,7 +263,11 @@ pub fn create_args(spec: &SandboxSpec) -> Vec<String> {
         "create".to_string(),
         format!("--image={}", spec.image),
         format!("--memory={}", spec.memory_bytes),
-        format!("--cpus={}.{:03}", spec.cpu_millis / 1000, spec.cpu_millis % 1000),
+        format!(
+            "--cpus={}.{:03}",
+            spec.cpu_millis / 1000,
+            spec.cpu_millis % 1000
+        ),
         format!("--pids={}", spec.pids),
         format!("--disk={}", spec.disk_bytes),
     ];
@@ -217,7 +278,11 @@ pub fn create_args(spec: &SandboxSpec) -> Vec<String> {
     }
     if spec.read_only_root {
         args.push("--read-only".into());
-        args.extend(spec.writable_paths.iter().map(|p| format!("--writable={p}")));
+        args.extend(
+            spec.writable_paths
+                .iter()
+                .map(|p| format!("--writable={p}")),
+        );
     }
     args
 }
@@ -227,7 +292,12 @@ pub fn create_args(spec: &SandboxSpec) -> Vec<String> {
 /// sandboxes look missing.
 pub fn parse_ls(text: &str) -> Result<Vec<BackendSandbox>, RuntimeError> {
     let mut lines = text.lines();
-    if lines.next().map(str::split_whitespace).map(Iterator::collect::<Vec<_>>) != Some(vec!["ID", "STATUS", "SHIM"]) {
+    if lines
+        .next()
+        .map(str::split_whitespace)
+        .map(Iterator::collect::<Vec<_>>)
+        != Some(vec!["ID", "STATUS", "SHIM"])
+    {
         return Err(RuntimeError::Backend("unexpected kiln ls header".into()));
     }
     lines
@@ -235,28 +305,48 @@ pub fn parse_ls(text: &str) -> Result<Vec<BackendSandbox>, RuntimeError> {
         .map(|line| {
             let mut fields = line.split('\t');
             let (Some(id), Some(status)) = (fields.next(), fields.next()) else {
-                return Err(RuntimeError::Backend(format!("unexpected kiln ls line {line:?}")));
+                return Err(RuntimeError::Backend(format!(
+                    "unexpected kiln ls line {line:?}"
+                )));
             };
             let status = match status {
                 "running" => BackendStatus::Running,
                 "stale" => BackendStatus::Stale,
-                _ => return Err(RuntimeError::Backend(format!("unexpected kiln ls status {status:?}"))),
+                _ => {
+                    return Err(RuntimeError::Backend(format!(
+                        "unexpected kiln ls status {status:?}"
+                    )));
+                }
             };
             if !valid_kiln_id(id) {
-                return Err(RuntimeError::Backend(format!("unexpected kiln ls ID {id:?}")));
+                return Err(RuntimeError::Backend(format!(
+                    "unexpected kiln ls ID {id:?}"
+                )));
             }
-            Ok(BackendSandbox { id: id.to_string(), status })
+            Ok(BackendSandbox {
+                id: id.to_string(),
+                status,
+            })
         })
         .collect()
 }
 
 /// kiln IDs are hex digits and dashes, like `18de453339a8cc89-3762`.
 fn valid_kiln_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') && !id.starts_with('-')
+    !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        && !id.starts_with('-')
 }
 
 fn check_id(id: &str) -> Result<(), RuntimeError> {
-    if valid_kiln_id(id) { Ok(()) } else { Err(RuntimeError::Backend(format!("invalid kiln sandbox ID {id:?}"))) }
+    if valid_kiln_id(id) {
+        Ok(())
+    } else {
+        Err(RuntimeError::Backend(format!(
+            "invalid kiln sandbox ID {id:?}"
+        )))
+    }
 }
 
 fn exec_populated(events: &str) -> Option<bool> {
@@ -271,7 +361,14 @@ fn exec_populated(events: &str) -> Option<bool> {
 fn summarize(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let text = text.trim();
-    let tail: String = text.chars().rev().take(1000).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(1000)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     let line: String = tail
         .split('\n')
         .map(str::trim)
@@ -281,7 +378,11 @@ fn summarize(stderr: &[u8]) -> String {
         .chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect();
-    if line.is_empty() { "no error output".into() } else { line }
+    if line.is_empty() {
+        "no error output".into()
+    } else {
+        line
+    }
 }
 
 #[cfg(test)]
@@ -310,9 +411,20 @@ mod tests {
     fn create_args_use_flag_equals_value() {
         assert_eq!(
             create_args(&spec(Network::None)),
-            ["create", "--image=alpine", "--memory=67108864", "--cpus=0.500", "--pids=32", "--disk=16777216", "--net=none"]
+            [
+                "create",
+                "--image=alpine",
+                "--memory=67108864",
+                "--cpus=0.500",
+                "--pids=32",
+                "--disk=16777216",
+                "--net=none"
+            ]
         );
-        let mut s = spec(Network::Allow(vec!["example.com:443".into(), "--net=full".into()]));
+        let mut s = spec(Network::Allow(vec![
+            "example.com:443".into(),
+            "--net=full".into(),
+        ]));
         s.cpu_millis = 2000;
         s.read_only_root = true;
         s.writable_paths = vec!["/data".into()];
@@ -332,8 +444,14 @@ mod tests {
         assert_eq!(
             got,
             [
-                BackendSandbox { id: "18de-1".into(), status: BackendStatus::Running },
-                BackendSandbox { id: "ab-2".into(), status: BackendStatus::Stale },
+                BackendSandbox {
+                    id: "18de-1".into(),
+                    status: BackendStatus::Running
+                },
+                BackendSandbox {
+                    id: "ab-2".into(),
+                    status: BackendStatus::Stale
+                },
             ]
         );
         assert_eq!(parse_ls("ID\tSTATUS\tSHIM\n").unwrap(), []);
@@ -345,7 +463,10 @@ mod tests {
 
     #[test]
     fn summarizes_stderr_as_one_line() {
-        assert_eq!(summarize(b"Error: connect\n\nCaused by:\n    gone\n"), "Error: connect; Caused by:; gone");
+        assert_eq!(
+            summarize(b"Error: connect\n\nCaused by:\n    gone\n"),
+            "Error: connect; Caused by:; gone"
+        );
         assert_eq!(summarize(b"bad\x1b[31m"), "bad?[31m");
         assert_eq!(summarize(b""), "no error output");
     }
@@ -356,6 +477,39 @@ mod tests {
             assert!(check_id(id).is_err(), "{id:?}");
         }
         assert!(check_id("18de453339a8cc89-3762").is_ok());
+    }
+
+    #[tokio::test]
+    async fn version_deadline_reaps_the_backend_process_before_returning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("fake-kiln");
+        let pid_file = tmp.path().join("pid");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = KilnRuntime::new(bin);
+        let error = runtime
+            .version(
+                Instant::now() + Duration::from_millis(100),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline expired"));
+        let pid: libc::pid_t = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        // SAFETY: signal zero only tests whether the recorded process exists.
+        let rc = unsafe { libc::kill(pid, 0) };
+        assert_eq!(rc, -1, "version process {pid} still exists after timeout");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[tokio::test]
@@ -383,7 +537,12 @@ mod tests {
         let task_cancel = cancel.clone();
         let mut task = tokio::spawn(async move {
             let argv = vec!["sleep".to_string(), "30".to_string()];
-            let spec = ExecSpec { argv: &argv, stdin: b"", timeout: Duration::from_secs(30), max_output: 1024 };
+            let spec = ExecSpec {
+                argv: &argv,
+                stdin: b"",
+                deadline: Instant::now() + Duration::from_secs(30),
+                max_output: 1024,
+            };
             runtime.exec("abcd", &spec, &task_cancel).await
         });
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -396,11 +555,17 @@ mod tests {
 
         cancel.cancel();
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut task).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(100), &mut task)
+                .await
+                .is_err(),
             "runtime returned before kiln's execution cgroup was empty"
         );
         fs::write(&events, "populated 0\n").unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(outcome.finish, ExecFinish::Canceled);
     }
 }

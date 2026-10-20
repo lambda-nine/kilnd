@@ -24,7 +24,12 @@ const MAX_STDIN: u64 = 1 << 20;
 #[command(version, about = "Talk to kilnd over its Unix socket")]
 struct Cli {
     /// kilnd's API socket.
-    #[arg(long, env = "KILND_SOCKET", default_value = "/run/kilnd/kilnd.sock", global = true)]
+    #[arg(
+        long,
+        env = "KILND_SOCKET",
+        default_value = "/run/kilnd/kilnd.sock",
+        global = true
+    )]
     socket: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -129,7 +134,10 @@ enum Net {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     match runtime.block_on(run(cli)) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
@@ -143,9 +151,18 @@ async fn run(cli: Cli) -> Result<u8> {
     let mut client = connect(cli.socket.clone()).await?;
     match cli.command {
         Command::Health => {
-            let h = client.health(pb::HealthRequest {}).await.map_err(rpc)?.into_inner();
-            let status = pb::health_response::Status::try_from(h.status).map(|s| s.as_str_name()).unwrap_or("UNKNOWN");
-            println!("status:             {}", status.trim_start_matches("STATUS_").to_lowercase());
+            let h = client
+                .health(pb::HealthRequest {})
+                .await
+                .map_err(rpc)?
+                .into_inner();
+            let status = pb::health_response::Status::try_from(h.status)
+                .map(|s| s.as_str_name())
+                .unwrap_or("UNKNOWN");
+            println!(
+                "status:             {}",
+                status.trim_start_matches("STATUS_").to_lowercase()
+            );
             println!("version:            {}", h.version);
             println!("backend:            {} {}", h.backend, h.backend_version);
             println!("started:            {}", time(h.started_at_unix_ms));
@@ -154,7 +171,11 @@ async fn run(cli: Cli) -> Result<u8> {
             if !h.detail.is_empty() {
                 println!("detail:             {}", h.detail);
             }
-            Ok(if h.status == pb::health_response::Status::Serving as i32 { 0 } else { 1 })
+            Ok(if h.status == pb::health_response::Status::Serving as i32 {
+                0
+            } else {
+                1
+            })
         }
         Command::Create(args) => {
             let sandbox = create(&mut client, args).await?;
@@ -163,20 +184,28 @@ async fn run(cli: Cli) -> Result<u8> {
         }
         Command::Get { id, executions } => {
             let r = client
-                .get_sandbox(pb::GetSandboxRequest { id, execution_limit: executions })
+                .get_sandbox(pb::GetSandboxRequest {
+                    id,
+                    execution_limit: executions,
+                })
                 .await
                 .map_err(rpc)?
                 .into_inner();
             print_sandbox(&r.sandbox.context("response has no sandbox")?);
             if !r.recent_executions.is_empty() {
                 println!("executions:");
-                println!("  {:<19}  {:<11}  {:>4}  {:>8}  {:<20}  ARGV", "ID", "STATE", "EXIT", "STDOUT", "STARTED");
+                println!(
+                    "  {:<19}  {:<11}  {:>4}  {:>8}  {:<20}  ARGV",
+                    "ID", "STATE", "EXIT", "STDOUT", "STARTED"
+                );
                 for e in &r.recent_executions {
                     println!(
                         "  {:<19}  {:<11}  {:>4}  {:>8}  {:<20}  {}",
                         e.id,
                         execution_state(e.state),
-                        e.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                        e.exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "-".into()),
                         e.stdout.as_ref().map(|o| o.total_bytes).unwrap_or(0),
                         time(e.started_at_unix_ms),
                         shell_words(&e.argv)
@@ -186,18 +215,36 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(0)
         }
         Command::Ls { all } => {
-            let r = client.list_sandboxes(pb::ListSandboxesRequest { include_deleted: all }).await.map_err(rpc)?.into_inner();
-            println!("{:<19}  {:<8}  {:<7}  {:<22}  {:<20}  IMAGE", "ID", "STATE", "BACKEND", "BACKEND ID", "CREATED");
-            for s in &r.sandboxes {
-                println!(
-                    "{:<19}  {:<8}  {:<7}  {:<22}  {:<20}  {}",
-                    s.id,
-                    sandbox_state(s.state),
-                    s.backend,
-                    if s.backend_id.is_empty() { "-" } else { &s.backend_id },
-                    time(s.created_at_unix_ms),
-                    s.spec.as_ref().map(|s| s.image.as_str()).unwrap_or("")
-                );
+            println!(
+                "{:<19}  {:<8}  {:<7}  {:<22}  {:<20}  IMAGE",
+                "ID", "STATE", "BACKEND", "BACKEND ID", "CREATED"
+            );
+            let mut page_token = String::new();
+            loop {
+                let r = client
+                    .list_sandboxes(list_request(all, page_token))
+                    .await
+                    .map_err(rpc)?
+                    .into_inner();
+                for s in &r.sandboxes {
+                    println!(
+                        "{:<19}  {:<8}  {:<7}  {:<22}  {:<20}  {}",
+                        s.id,
+                        sandbox_state(s.state),
+                        s.backend,
+                        if s.backend_id.is_empty() {
+                            "-"
+                        } else {
+                            &s.backend_id
+                        },
+                        time(s.created_at_unix_ms),
+                        s.spec.as_ref().map(|s| s.image.as_str()).unwrap_or("")
+                    );
+                }
+                page_token = r.next_page_token;
+                if page_token.is_empty() {
+                    break;
+                }
             }
             Ok(0)
         }
@@ -225,7 +272,11 @@ async fn run(cli: Cli) -> Result<u8> {
             println!("timeout:  {} ms", e.timeout_ms);
             for (name, out) in [("stdout", &e.stdout), ("stderr", &e.stderr)] {
                 let out = out.clone().unwrap_or_default();
-                let note = if out.truncated { format!(", first {} kept", out.data.len()) } else { String::new() };
+                let note = if out.truncated {
+                    format!(", first {} kept", out.data.len())
+                } else {
+                    String::new()
+                };
                 println!("{name}:   {} bytes{note}", out.total_bytes);
                 for line in String::from_utf8_lossy(&out.data).lines() {
                     println!("  | {line}");
@@ -244,15 +295,36 @@ async fn run(cli: Cli) -> Result<u8> {
             println!("{} {}", s.id, sandbox_state(s.state));
             Ok(0)
         }
-        Command::Run { create: args, opts, argv } => {
+        Command::Run {
+            create: args,
+            opts,
+            argv,
+        } => {
             let sandbox = create(&mut client, args).await?;
             if opts.verbose {
-                eprintln!("kilndctl: sandbox {} ({} {})", sandbox.id, sandbox.backend, sandbox.backend_id);
+                eprintln!(
+                    "kilndctl: sandbox {} ({} {})",
+                    sandbox.id, sandbox.backend, sandbox.backend_id
+                );
             }
             let result = exec(&mut client, sandbox.id.clone(), argv, &opts).await;
-            client.delete_sandbox(pb::DeleteSandboxRequest { id: sandbox.id }).await.map_err(rpc)?;
+            client
+                .delete_sandbox(pb::DeleteSandboxRequest { id: sandbox.id })
+                .await
+                .map_err(rpc)?;
             result
         }
+    }
+}
+
+fn list_request(include_deleted: bool, page_token: String) -> pb::ListSandboxesRequest {
+    pb::ListSandboxesRequest {
+        include_deleted,
+        // Let the daemon choose a default that is never above its configured
+        // maximum. A hard-coded client page size would fail against a server
+        // intentionally configured with a smaller limit.
+        page_size: Some(0),
+        page_token,
     }
 }
 
@@ -274,7 +346,11 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
     let labels = a
         .label
         .iter()
-        .map(|l| l.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).context("labels are KEY=VALUE"))
+        .map(|l| {
+            l.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .context("labels are KEY=VALUE")
+        })
         .collect::<Result<_>>()?;
     let mode = match (a.net, a.allow.is_empty()) {
         (None | Some(Net::None), true) => pb::NetworkMode::None,
@@ -285,12 +361,20 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
     let spec = pb::SandboxSpec {
         image: a.image.unwrap_or_default(),
         limits: Some(pb::ResourceLimits {
-            memory_bytes: a.memory.as_deref().map(parse_size).transpose()?.unwrap_or(0),
+            memory_bytes: a
+                .memory
+                .as_deref()
+                .map(parse_size)
+                .transpose()?
+                .unwrap_or(0),
             cpu_millis: a.cpus.as_deref().map(parse_cpus).transpose()?.unwrap_or(0),
             pids: a.pids.unwrap_or(0),
             disk_bytes: a.disk.as_deref().map(parse_size).transpose()?.unwrap_or(0),
         }),
-        network: Some(pb::NetworkPolicy { mode: mode.into(), allow: a.allow }),
+        network: Some(pb::NetworkPolicy {
+            mode: mode.into(),
+            allow: a.allow,
+        }),
         read_only_root: a.read_only,
         writable_paths: a.writable,
         labels,
@@ -304,35 +388,75 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
         .context("response has no sandbox")
 }
 
-async fn exec(client: &mut KilndServiceClient<Channel>, id: String, argv: Vec<String>, opts: &ExecOpts) -> Result<u8> {
+async fn exec(
+    client: &mut KilndServiceClient<Channel>,
+    id: String,
+    argv: Vec<String>,
+    opts: &ExecOpts,
+) -> Result<u8> {
     let mut stdin = Vec::new();
     if opts.stdin {
-        std::io::stdin().take(MAX_STDIN + 1).read_to_end(&mut stdin)?;
+        std::io::stdin()
+            .take(MAX_STDIN + 1)
+            .read_to_end(&mut stdin)?;
         if stdin.len() as u64 > MAX_STDIN {
             bail!("stdin is larger than {MAX_STDIN} bytes");
         }
     }
-    let timeout_ms = opts.timeout.as_deref().map(parse_duration_ms).transpose()?.unwrap_or(0);
-    let e = client
-        .exec(pb::ExecRequest { sandbox_id: id, argv, stdin, timeout_ms })
-        .await
-        .map_err(rpc)?
+    let timeout_ms = opts
+        .timeout
+        .as_deref()
+        .map(parse_duration_ms)
+        .transpose()?
+        .unwrap_or(0);
+    let response = client
+        .exec(pb::ExecRequest {
+            sandbox_id: id,
+            argv,
+            stdin,
+            timeout_ms,
+        })
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(status) if status.code() == tonic::Code::DeadlineExceeded => {
+            eprintln!("kilndctl: deadline_exceeded: {}", status.message());
+            return Ok(EXIT_TIMED_OUT);
+        }
+        Err(status) => return Err(rpc(status)),
+    };
+    let e = response
         .into_inner()
         .execution
         .context("response has no execution")?;
-    let (out, err) = (e.stdout.clone().unwrap_or_default(), e.stderr.clone().unwrap_or_default());
+    let (out, err) = (
+        e.stdout.clone().unwrap_or_default(),
+        e.stderr.clone().unwrap_or_default(),
+    );
     std::io::stdout().write_all(&out.data)?;
     std::io::stdout().flush()?;
     std::io::stderr().write_all(&err.data)?;
     for (name, o) in [("stdout", &out), ("stderr", &err)] {
         if o.truncated {
-            eprintln!("kilndctl: {name} truncated: kept {} of {} bytes", o.data.len(), o.total_bytes);
+            eprintln!(
+                "kilndctl: {name} truncated: kept {} of {} bytes",
+                o.data.len(),
+                o.total_bytes
+            );
         }
     }
     let state = pb::ExecutionState::try_from(e.state).unwrap_or(pb::ExecutionState::Unspecified);
     if opts.verbose || state != pb::ExecutionState::Exited {
-        let reason = if e.failure_reason.is_empty() { String::new() } else { format!(": {}", e.failure_reason) };
-        eprintln!("kilndctl: execution {} {}{reason}", e.id, execution_state(e.state));
+        let reason = if e.failure_reason.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", e.failure_reason)
+        };
+        eprintln!(
+            "kilndctl: execution {} {}{reason}",
+            e.id,
+            execution_state(e.state)
+        );
     }
     Ok(match state {
         pb::ExecutionState::Exited => e.exit_code.unwrap_or(1).clamp(0, 255) as u8,
@@ -365,12 +489,25 @@ fn print_sandbox(s: &pb::Sandbox) {
             l.disk_bytes >> 20
         );
         let net = spec.network.clone().unwrap_or_default();
-        let mode = pb::NetworkMode::try_from(net.mode).map(|m| m.as_str_name()).unwrap_or("UNKNOWN");
-        println!("network:    {} {}", mode.trim_start_matches("NETWORK_MODE_").to_lowercase(), net.allow.join(" "));
+        let mode = pb::NetworkMode::try_from(net.mode)
+            .map(|m| m.as_str_name())
+            .unwrap_or("UNKNOWN");
+        println!(
+            "network:    {} {}",
+            mode.trim_start_matches("NETWORK_MODE_").to_lowercase(),
+            net.allow.join(" ")
+        );
         if spec.read_only_root {
-            println!("read-only:  yes, writable {}", spec.writable_paths.join(" "));
+            println!(
+                "read-only:  yes, writable {}",
+                spec.writable_paths.join(" ")
+            );
         }
-        let mut labels: Vec<_> = spec.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut labels: Vec<_> = spec
+            .labels
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
         labels.sort();
         if !labels.is_empty() {
             println!("labels:     {}", labels.join(" "));
@@ -380,18 +517,30 @@ fn print_sandbox(s: &pb::Sandbox) {
 
 fn sandbox_state(v: i32) -> String {
     pb::SandboxState::try_from(v)
-        .map(|s| s.as_str_name().trim_start_matches("SANDBOX_STATE_").to_lowercase())
+        .map(|s| {
+            s.as_str_name()
+                .trim_start_matches("SANDBOX_STATE_")
+                .to_lowercase()
+        })
         .unwrap_or_else(|_| format!("unknown({v})"))
 }
 
 fn execution_state(v: i32) -> String {
     pb::ExecutionState::try_from(v)
-        .map(|s| s.as_str_name().trim_start_matches("EXECUTION_STATE_").to_lowercase())
+        .map(|s| {
+            s.as_str_name()
+                .trim_start_matches("EXECUTION_STATE_")
+                .to_lowercase()
+        })
         .unwrap_or_else(|_| format!("unknown({v})"))
 }
 
 fn rpc(s: tonic::Status) -> anyhow::Error {
-    anyhow::anyhow!("{}: {}", format!("{:?}", s.code()).to_lowercase(), s.message())
+    anyhow::anyhow!(
+        "{}: {}",
+        format!("{:?}", s.code()).to_lowercase(),
+        s.message()
+    )
 }
 
 /// `512M`, `2G`, `65536`.
@@ -403,7 +552,8 @@ fn parse_size(s: &str) -> Result<u64> {
         _ => (s, 1),
     };
     let n: u64 = num.parse().with_context(|| format!("invalid size {s:?}"))?;
-    n.checked_mul(mult).with_context(|| format!("size {s:?} is too large"))
+    n.checked_mul(mult)
+        .with_context(|| format!("size {s:?} is too large"))
 }
 
 /// `0.5` → 500 thousandths of a core.
@@ -413,9 +563,20 @@ fn parse_cpus(s: &str) -> Result<u32> {
     if frac.len() > 3 || (whole.is_empty() && frac.is_empty()) {
         return Err(bad());
     }
-    let whole: u32 = if whole.is_empty() { 0 } else { whole.parse().map_err(|_| bad())? };
-    let frac: u32 = if frac.is_empty() { 0 } else { format!("{frac:0<3}").parse().map_err(|_| bad())? };
-    let millis = whole.checked_mul(1000).and_then(|w| w.checked_add(frac)).ok_or_else(bad)?;
+    let whole: u32 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().map_err(|_| bad())?
+    };
+    let frac: u32 = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<3}").parse().map_err(|_| bad())?
+    };
+    let millis = whole
+        .checked_mul(1000)
+        .and_then(|w| w.checked_add(frac))
+        .ok_or_else(bad)?;
     if millis == 0 {
         return Err(bad());
     }
@@ -433,15 +594,22 @@ fn parse_duration_ms(s: &str) -> Result<u32> {
     } else {
         (s, 1000)
     };
-    let n: u32 = num.parse().with_context(|| format!("invalid duration {s:?}"))?;
-    n.checked_mul(mult).filter(|&ms| ms > 0).with_context(|| format!("invalid duration {s:?}"))
+    let n: u32 = num
+        .parse()
+        .with_context(|| format!("invalid duration {s:?}"))?;
+    n.checked_mul(mult)
+        .filter(|&ms| ms > 0)
+        .with_context(|| format!("invalid duration {s:?}"))
 }
 
 /// An argv as a shell would need it typed, for display only.
 fn shell_words(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
-            if !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c)) {
+            if !a.is_empty()
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c))
+            {
                 a.clone()
             } else {
                 format!("'{}'", a.replace('\'', r"'\''"))
@@ -468,7 +636,12 @@ fn time(ms: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 #[cfg(test)]
@@ -516,5 +689,26 @@ mod tests {
     fn quotes_argv_for_display() {
         let argv = ["sh", "-c", "echo 'hi' > /tmp/x", ""].map(String::from);
         assert_eq!(shell_words(&argv), r#"sh -c 'echo '\''hi'\'' > /tmp/x' ''"#);
+    }
+
+    #[test]
+    fn list_uses_the_servers_bounded_page_default() {
+        assert_eq!(
+            list_request(true, "next".into()),
+            pb::ListSandboxesRequest {
+                include_deleted: true,
+                page_size: Some(0),
+                page_token: "next".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn deadline_errors_use_the_timeout_exit_code() {
+        assert_eq!(EXIT_TIMED_OUT, 124);
+        assert_eq!(
+            tonic::Status::deadline_exceeded("queued").code(),
+            tonic::Code::DeadlineExceeded
+        );
     }
 }

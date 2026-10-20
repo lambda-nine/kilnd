@@ -1,10 +1,11 @@
 #!/bin/sh
-# Opt-in privileged integration test: kilnd's manager against the installed
-# kiln CLI, with a temporary database. Run inside the VM as your user after
-# kiln's setup and scripts/install.sh:
+# Opt-in Linux integration tests: first a dedicated-child admission resource
+# soak, then kilnd's manager against the installed kiln CLI with a temporary
+# database. Run inside the VM as your user after kiln's setup and install:
 #   scripts/integration-test.sh
 set -eu
 cd "$(dirname "$0")/.."
+cargo test --locked -p kilnd --test admission_stress -- --ignored --test-threads=1 --nocapture
 bin=$(cargo test --locked -p kilnd --test kiln_integration --no-run --message-format=json \
     | python3 -I -c '
 import json, sys

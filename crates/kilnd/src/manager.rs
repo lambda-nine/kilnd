@@ -3,17 +3,20 @@
 //! translation on top of this.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use tokio::sync::oneshot;
-use tokio_util::task::TaskTracker;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
+use crate::admission::{Admission, AdmissionSnapshot};
 use crate::model::{
-    Captured, Execution, ExecutionState, Network, Sandbox, SandboxSpec, SandboxState, new_id, now_ms, valid_id,
+    Captured, Execution, ExecutionState, Network, Sandbox, SandboxSpec, SandboxState, new_id,
+    now_ms, valid_id,
 };
 use crate::runtime::{BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
 use crate::store::{ExecutionResult, Store};
@@ -36,6 +39,20 @@ pub struct Limits {
     pub max_output_bytes: usize,
     pub max_stdin_bytes: usize,
     pub max_argv_bytes: usize,
+    pub max_connections: usize,
+    pub max_concurrent_rpcs: usize,
+    pub max_concurrent_health: usize,
+    pub max_concurrent_execs: usize,
+    pub max_queued_execs_per_sandbox: usize,
+    pub max_queued_exec_stdin_bytes: usize,
+    pub max_streams_per_connection: usize,
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub max_list_page_size: u32,
+    pub max_list_response_bytes: usize,
+    pub health_probe_timeout: Duration,
+    pub health_success_cache: Duration,
+    pub health_failure_cache: Duration,
 }
 
 impl Default for Limits {
@@ -56,6 +73,20 @@ impl Default for Limits {
             max_output_bytes: 1 << 20,
             max_stdin_bytes: 1 << 20,
             max_argv_bytes: 256 << 10,
+            max_connections: 64,
+            max_concurrent_rpcs: 64,
+            max_concurrent_health: 4,
+            max_concurrent_execs: 32,
+            max_queued_execs_per_sandbox: 8,
+            max_queued_exec_stdin_bytes: 16 << 20,
+            max_streams_per_connection: 8,
+            max_request_bytes: 2 << 20,
+            max_response_bytes: 4 << 20,
+            max_list_page_size: 200,
+            max_list_response_bytes: 1 << 20,
+            health_probe_timeout: Duration::from_secs(2),
+            health_success_cache: Duration::from_secs(5),
+            health_failure_cache: Duration::from_secs(1),
         }
     }
 }
@@ -92,6 +123,8 @@ pub enum Error {
     FailedPrecondition(String),
     #[error("{0}")]
     ResourceExhausted(String),
+    #[error("{0}")]
+    DeadlineExceeded(String),
     #[error("kilnd is shutting down")]
     ShuttingDown,
     #[error("{0}")]
@@ -105,10 +138,32 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// Per-sandbox coordination: executions in one sandbox run one at a time
 /// (kiln's PID 1 serves them serially anyway), and delete can cancel the one
 /// running.
-#[derive(Default)]
 struct Slot {
     exec_lock: tokio::sync::Mutex<()>,
     running: Mutex<Option<Arc<ExecCancellation>>>,
+    outstanding_execs: Arc<Semaphore>,
+}
+
+impl Slot {
+    fn new(capacity: usize) -> Self {
+        Self {
+            exec_lock: tokio::sync::Mutex::new(()),
+            running: Mutex::new(None),
+            outstanding_execs: Arc::new(Semaphore::new(capacity)),
+        }
+    }
+}
+
+struct ExecTicket {
+    _global: OwnedSemaphorePermit,
+    _sandbox: OwnedSemaphorePermit,
+    _stdin: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Default)]
+struct HealthProbeState {
+    cached: Option<(Instant, std::result::Result<String, String>)>,
+    in_flight: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +193,10 @@ struct ExecCancellation {
 
 impl ExecCancellation {
     fn new() -> Self {
-        Self { token: CancellationToken::new(), reason: OnceLock::new() }
+        Self {
+            token: CancellationToken::new(),
+            reason: OnceLock::new(),
+        }
     }
 
     fn request(&self, reason: ExecCancelReason) {
@@ -156,7 +214,10 @@ pub struct Manager<R> {
     runtime: R,
     store: Store,
     limits: Limits,
-    slots: Mutex<HashMap<String, Arc<Slot>>>,
+    admission: Arc<Admission>,
+    health_probe: Mutex<HealthProbeState>,
+    health_changed: Notify,
+    slots: Mutex<HashMap<String, Weak<Slot>>>,
     /// Refuses new work once canceled.
     shutting_down: CancellationToken,
     /// Daemon-owned operations that must outlive the RPC waiting for them.
@@ -176,6 +237,7 @@ pub struct Health {
     pub started_at_ms: i64,
     pub active_sandboxes: u32,
     pub running_executions: u32,
+    pub admission: AdmissionSnapshot,
 }
 
 /// What startup reconciliation changed, for logs and tests.
@@ -199,6 +261,9 @@ impl<R: Runtime> Manager<R> {
         Self {
             runtime,
             store,
+            admission: Arc::new(Admission::new(&limits)),
+            health_probe: Mutex::new(HealthProbeState::default()),
+            health_changed: Notify::new(),
             limits,
             slots: Mutex::new(HashMap::new()),
             shutting_down: CancellationToken::new(),
@@ -216,12 +281,32 @@ impl<R: Runtime> Manager<R> {
         &self.limits
     }
 
+    pub(crate) fn admission(&self) -> &Arc<Admission> {
+        &self.admission
+    }
+
     fn slot(&self, id: &str) -> Arc<Slot> {
-        self.slots.lock().unwrap().entry(id.to_string()).or_default().clone()
+        let mut slots = self.slots.lock().unwrap();
+        slots.retain(|_, slot| slot.strong_count() != 0);
+        if let Some(slot) = slots.get(id).and_then(Weak::upgrade) {
+            return slot;
+        }
+        let slot = Arc::new(Slot::new(
+            self.limits
+                .max_queued_execs_per_sandbox
+                .checked_add(1)
+                .expect("queue capacity fits usize"),
+        ));
+        slots.insert(id.to_string(), Arc::downgrade(&slot));
+        slot
     }
 
     fn check_serving(&self) -> Result<()> {
-        if self.shutting_down.is_cancelled() { Err(Error::ShuttingDown) } else { Ok(()) }
+        if self.shutting_down.is_cancelled() {
+            Err(Error::ShuttingDown)
+        } else {
+            Ok(())
+        }
     }
 
     /// Brings the store in line with the backend. Run once at startup,
@@ -229,9 +314,18 @@ impl<R: Runtime> Manager<R> {
     /// removes a sandbox kilnd didn't create, and never marks anything lost
     /// unless the backend's list succeeded.
     pub async fn reconcile(&self) -> Result<Reconciled> {
-        let mut out = Reconciled { gc_removed: self.runtime.gc().await.map_err(backend)?, ..Default::default() };
-        let live: HashMap<String, BackendStatus> =
-            self.runtime.list().await.map_err(backend)?.into_iter().map(|s| (s.id, s.status)).collect();
+        let mut out = Reconciled {
+            gc_removed: self.runtime.gc().await.map_err(backend)?,
+            ..Default::default()
+        };
+        let live: HashMap<String, BackendStatus> = self
+            .runtime
+            .list()
+            .await
+            .map_err(backend)?
+            .into_iter()
+            .map(|s| (s.id, s.status))
+            .collect();
         let mut known = std::collections::HashSet::new();
 
         for s in self.store.sandboxes(true)? {
@@ -241,7 +335,8 @@ impl<R: Runtime> Manager<R> {
             if let Some(b) = &s.backend_id {
                 known.insert(b.clone());
             }
-            let alive = s.backend_id.as_ref().and_then(|b| live.get(b)) == Some(&BackendStatus::Running);
+            let alive =
+                s.backend_id.as_ref().and_then(|b| live.get(b)) == Some(&BackendStatus::Running);
             match (s.state, &s.backend_id) {
                 (SandboxState::Creating, None) => {
                     self.store.set_sandbox_state(
@@ -255,38 +350,63 @@ impl<R: Runtime> Manager<R> {
                 (SandboxState::Creating | SandboxState::Ready, Some(b)) => {
                     if alive {
                         if s.state == SandboxState::Creating {
-                            self.store.set_sandbox_state(&s.id, SandboxState::Ready, None, None)?;
+                            self.store
+                                .set_sandbox_state(&s.id, SandboxState::Ready, None, None)?;
                         }
                     } else {
-                        let reason = format!("backend sandbox {b} was gone at kilnd startup (host reboot or crashed shim)");
-                        self.store.set_sandbox_state(&s.id, SandboxState::Lost, None, Some(&reason))?;
+                        let reason = format!(
+                            "backend sandbox {b} was gone at kilnd startup (host reboot or crashed shim)"
+                        );
+                        self.store.set_sandbox_state(
+                            &s.id,
+                            SandboxState::Lost,
+                            None,
+                            Some(&reason),
+                        )?;
                         out.lost.push(s.id);
                     }
                 }
-                (SandboxState::Deleting, Some(b)) if live.contains_key(b) => match self.runtime.remove(b).await {
+                (SandboxState::Deleting, Some(b)) if live.contains_key(b) => match self
+                    .runtime
+                    .remove(b)
+                    .await
+                {
                     Ok(()) | Err(RuntimeError::NotFound(_)) => {
-                        self.store.set_sandbox_state(&s.id, SandboxState::Deleted, None, None)?;
+                        self.store
+                            .set_sandbox_state(&s.id, SandboxState::Deleted, None, None)?;
                         out.deleted.push(s.id);
                     }
                     Err(e) => {
                         let reason = format!("delete retry at startup failed: {e}");
-                        self.store.set_sandbox_state(&s.id, SandboxState::Deleting, None, Some(&reason))?;
+                        self.store.set_sandbox_state(
+                            &s.id,
+                            SandboxState::Deleting,
+                            None,
+                            Some(&reason),
+                        )?;
                         out.still_deleting.push(s.id);
                     }
                 },
                 (SandboxState::Deleting, _) => {
-                    self.store.set_sandbox_state(&s.id, SandboxState::Deleted, None, None)?;
+                    self.store
+                        .set_sandbox_state(&s.id, SandboxState::Deleted, None, None)?;
                     out.deleted.push(s.id);
                 }
                 (SandboxState::Ready, None) => {
-                    self.store.set_sandbox_state(&s.id, SandboxState::Lost, None, Some("ready sandbox had no backend ID"))?;
+                    self.store.set_sandbox_state(
+                        &s.id,
+                        SandboxState::Lost,
+                        None,
+                        Some("ready sandbox had no backend ID"),
+                    )?;
                     out.lost.push(s.id);
                 }
                 (SandboxState::Deleted | SandboxState::Failed | SandboxState::Lost, _) => {}
             }
         }
-        out.interrupted_executions =
-            self.store.interrupt_running_executions("kilnd stopped while the execution was running")?;
+        out.interrupted_executions = self
+            .store
+            .interrupt_running_executions("kilnd stopped while the execution was running")?;
         out.unmanaged = live.into_keys().filter(|b| !known.contains(b)).collect();
         out.unmanaged.sort();
         for b in &out.unmanaged {
@@ -295,8 +415,79 @@ impl<R: Runtime> Manager<R> {
         Ok(out)
     }
 
-    pub async fn health(&self) -> Result<Health> {
-        let (mut serving, backend_version, mut detail) = match self.runtime.version().await {
+    pub async fn health(self: &Arc<Self>) -> Result<Health> {
+        let probe = loop {
+            // Register before examining state so completion cannot be missed.
+            let changed = self.health_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.health_probe.lock().unwrap();
+                if self.shutting_down.is_cancelled() {
+                    break state
+                        .cached
+                        .as_ref()
+                        .map(|(_, result)| result.clone())
+                        .unwrap_or_else(|| Err("probe unavailable during shutdown".into()));
+                }
+                if let Some((completed, result)) = &state.cached {
+                    let ttl = if result.is_ok() {
+                        self.limits.health_success_cache
+                    } else {
+                        self.limits.health_failure_cache
+                    };
+                    if completed.elapsed() < ttl {
+                        break result.clone();
+                    }
+                }
+                if !state.in_flight {
+                    state.in_flight = true;
+                    let manager = self.clone();
+                    self.operations.spawn(async move {
+                        let deadline = Instant::now()
+                            .checked_add(manager.limits.health_probe_timeout)
+                            .expect("validated Health deadline fits the monotonic clock");
+                        let cancel = CancellationToken::new();
+                        let runtime_manager = manager.clone();
+                        let probe_cancel = cancel.clone();
+                        let mut task = tokio::spawn(async move {
+                            runtime_manager
+                                .runtime
+                                .version(deadline, &probe_cancel)
+                                .await
+                        });
+                        let result = tokio::select! {
+                            biased;
+                            joined = &mut task => match joined {
+                                Ok(result) => result.map_err(|error| error.to_string()),
+                                Err(error) => Err(format!("version probe task failed: {error}")),
+                            },
+                            () = tokio::time::sleep_until(deadline) => {
+                                cancel.cancel();
+                                let _ = task.await;
+                                Err("version probe timed out".into())
+                            },
+                            () = manager.shutting_down.cancelled() => {
+                                cancel.cancel();
+                                let _ = task.await;
+                                Err("version probe canceled during shutdown".into())
+                            },
+                        };
+                        {
+                            let mut state = manager.health_probe.lock().unwrap();
+                            state.cached = Some((Instant::now(), result));
+                            state.in_flight = false;
+                        }
+                        manager.health_changed.notify_waiters();
+                    });
+                }
+            }
+            tokio::select! {
+                () = &mut changed => {},
+                () = self.shutting_down.cancelled() => {},
+            }
+        };
+        let (mut serving, backend_version, mut detail) = match probe {
             Ok(v) => (true, v, String::new()),
             Err(e) => (false, String::new(), format!("backend: {e}")),
         };
@@ -306,10 +497,12 @@ impl<R: Runtime> Manager<R> {
             if !detail.is_empty() {
                 detail.push_str("; ");
             }
-            detail.push_str(&format!("{finalization_failures} execution finalization write(s) retrying"));
+            detail.push_str(&format!(
+                "{finalization_failures} execution finalization write(s) retrying"
+            ));
         }
         Ok(Health {
-            serving,
+            serving: serving && !self.shutting_down.is_cancelled(),
             shutting_down: self.shutting_down.is_cancelled(),
             backend: self.runtime.name(),
             backend_version,
@@ -317,6 +510,7 @@ impl<R: Runtime> Manager<R> {
             started_at_ms: self.started_at_ms,
             active_sandboxes: self.store.count_active_sandboxes()?,
             running_executions: self.store.count_running_executions()?,
+            admission: self.admission.snapshot(),
         })
     }
 
@@ -338,7 +532,11 @@ impl<R: Runtime> Manager<R> {
                 }
             }
         });
-        result_rx.await.map_err(|_| Error::Internal(anyhow::anyhow!("create supervisor stopped without a result")))?
+        result_rx.await.map_err(|_| {
+            Error::Internal(anyhow::anyhow!(
+                "create supervisor stopped without a result"
+            ))
+        })?
     }
 
     async fn create_owned(self: Arc<Self>, req: CreateRequest) -> Result<Sandbox> {
@@ -379,16 +577,35 @@ impl<R: Runtime> Manager<R> {
         let created = match backend_create.await {
             Ok(result) => result,
             Err(join) => {
-                let reason = if join.is_panic() { "backend create task panicked" } else { "backend create task was canceled" };
+                let reason = if join.is_panic() {
+                    "backend create task panicked"
+                } else {
+                    "backend create task was canceled"
+                };
                 warn!(sandbox = %sandbox.id, error = reason, "sandbox creation failed");
-                self.store.set_sandbox_state(&sandbox.id, SandboxState::Failed, None, Some(reason))?;
-                return Err(Error::Backend(format!("create sandbox {}: {reason}", sandbox.id)));
+                self.store.set_sandbox_state(
+                    &sandbox.id,
+                    SandboxState::Failed,
+                    None,
+                    Some(reason),
+                )?;
+                return Err(Error::Backend(format!(
+                    "create sandbox {}: {reason}",
+                    sandbox.id
+                )));
             }
         };
         match created {
             Ok(backend_id) => {
-                if let Err(e) = self.store.set_sandbox_state(&sandbox.id, SandboxState::Ready, Some(&backend_id), None) {
-                    return Err(self.compensate_failed_publication(&sandbox.id, &backend_id, e).await);
+                if let Err(e) = self.store.set_sandbox_state(
+                    &sandbox.id,
+                    SandboxState::Ready,
+                    Some(&backend_id),
+                    None,
+                ) {
+                    return Err(self
+                        .compensate_failed_publication(&sandbox.id, &backend_id, e)
+                        .await);
                 }
                 info!(sandbox = %sandbox.id, backend_id = %backend_id, "sandbox ready");
                 sandbox.backend_id = Some(backend_id);
@@ -398,8 +615,16 @@ impl<R: Runtime> Manager<R> {
             Err(e) => {
                 let reason = e.to_string();
                 warn!(sandbox = %sandbox.id, error = %reason, "sandbox creation failed");
-                self.store.set_sandbox_state(&sandbox.id, SandboxState::Failed, None, Some(&reason))?;
-                Err(Error::Backend(format!("create sandbox {}: {reason}", sandbox.id)))
+                self.store.set_sandbox_state(
+                    &sandbox.id,
+                    SandboxState::Failed,
+                    None,
+                    Some(&reason),
+                )?;
+                Err(Error::Backend(format!(
+                    "create sandbox {}: {reason}",
+                    sandbox.id
+                )))
             }
         }
     }
@@ -407,7 +632,12 @@ impl<R: Runtime> Manager<R> {
     /// A backend exists but READY could not be persisted. Publish cleanup
     /// intent before awaiting removal, then preserve any failed compensation
     /// as DELETING so it remains counted and retryable.
-    async fn compensate_failed_publication(&self, sandbox_id: &str, backend_id: &str, publication: anyhow::Error) -> Error {
+    async fn compensate_failed_publication(
+        &self,
+        sandbox_id: &str,
+        backend_id: &str,
+        publication: anyhow::Error,
+    ) -> Error {
         let slot = self.slot(sandbox_id);
         let _guard = slot.exec_lock.lock().await;
         let publication_reason = format!("record ready state failed: {publication:#}");
@@ -423,22 +653,31 @@ impl<R: Runtime> Manager<R> {
         match self.runtime.remove(backend_id).await {
             Ok(()) | Err(RuntimeError::NotFound(_)) => {
                 let reason = format!("{publication_reason}; backend removed");
-                if let Err(e) = self.store.set_sandbox_state(sandbox_id, SandboxState::Failed, Some(backend_id), Some(&reason)) {
+                if let Err(e) = self.store.set_sandbox_state(
+                    sandbox_id,
+                    SandboxState::Failed,
+                    Some(backend_id),
+                    Some(&reason),
+                ) {
                     warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %format!("{e:#}"), "backend removed but create failure could not be finalized");
                 }
-                self.slots.lock().unwrap().remove(sandbox_id);
                 warn!(sandbox = %sandbox_id, backend_id = %backend_id, "ready publication failed; removed backend sandbox");
                 Error::Internal(publication)
             }
             Err(cleanup) => {
                 let reason = format!("{publication_reason}; cleanup failed: {cleanup}");
-                if let Err(e) =
-                    self.store.set_sandbox_state(sandbox_id, SandboxState::Deleting, Some(backend_id), Some(&reason))
-                {
+                if let Err(e) = self.store.set_sandbox_state(
+                    sandbox_id,
+                    SandboxState::Deleting,
+                    Some(backend_id),
+                    Some(&reason),
+                ) {
                     warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %format!("{e:#}"), "create compensation failure could not be recorded");
                 }
                 warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %cleanup, "ready publication and compensation failed");
-                Error::Internal(anyhow::anyhow!("{publication_reason}; cleanup failed: {cleanup}"))
+                Error::Internal(anyhow::anyhow!(
+                    "{publication_reason}; cleanup failed: {cleanup}"
+                ))
             }
         }
     }
@@ -457,18 +696,36 @@ impl<R: Runtime> Manager<R> {
         Ok(self.store.sandboxes(include_deleted)?)
     }
 
+    pub(crate) fn list_page(
+        &self,
+        include_deleted: bool,
+        upper: Option<i64>,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<crate::store::SandboxPage> {
+        Ok(self
+            .store
+            .sandbox_page(include_deleted, upper, before, limit)?)
+    }
+
     pub fn execution(&self, id: &str) -> Result<Execution> {
         if !valid_id("ex", id) {
-            return Err(Error::InvalidArgument(format!("invalid execution ID {id:?}")));
+            return Err(Error::InvalidArgument(format!(
+                "invalid execution ID {id:?}"
+            )));
         }
-        self.store.execution(id)?.ok_or_else(|| Error::NotFound(format!("execution {id}")))
+        self.store
+            .execution(id)?
+            .ok_or_else(|| Error::NotFound(format!("execution {id}")))
     }
 
     fn load(&self, id: &str) -> Result<Sandbox> {
         if !valid_id("sb", id) {
             return Err(Error::InvalidArgument(format!("invalid sandbox ID {id:?}")));
         }
-        self.store.sandbox(id)?.ok_or_else(|| Error::NotFound(format!("sandbox {id}")))
+        self.store
+            .sandbox(id)?
+            .ok_or_else(|| Error::NotFound(format!("sandbox {id}")))
     }
 
     pub async fn delete(&self, id: &str) -> Result<Sandbox> {
@@ -478,11 +735,18 @@ impl<R: Runtime> Manager<R> {
             // Its backend ID isn't known yet. If kilnd crashed mid-create,
             // startup reconciliation has already moved it to FAILED.
             SandboxState::Creating => {
-                return Err(Error::FailedPrecondition(format!("sandbox {id} is still being created; retry")));
+                return Err(Error::FailedPrecondition(format!(
+                    "sandbox {id} is still being created; retry"
+                )));
             }
             _ => {}
         }
-        self.store.set_sandbox_state(id, SandboxState::Deleting, None, sandbox.failure_reason.as_deref())?;
+        self.store.set_sandbox_state(
+            id,
+            SandboxState::Deleting,
+            None,
+            sandbox.failure_reason.as_deref(),
+        )?;
         info!(sandbox = %id, "deleting sandbox");
         let slot = self.slot(id);
         if let Some(cancel) = &*slot.running.lock().unwrap() {
@@ -501,15 +765,18 @@ impl<R: Runtime> Manager<R> {
         };
         match result {
             Ok(()) => {
-                self.store.set_sandbox_state(id, SandboxState::Deleted, None, None)?;
-                self.slots.lock().unwrap().remove(id);
+                self.store
+                    .set_sandbox_state(id, SandboxState::Deleted, None, None)?;
+                // Queued requests still own this slot. Keep it stable until
+                // manager teardown rather than replacing its admission gate.
                 info!(sandbox = %id, "sandbox deleted");
                 Ok(self.load(id)?)
             }
             Err(e) => {
                 let reason = format!("delete failed: {e}");
                 warn!(sandbox = %id, error = %reason, "sandbox delete failed");
-                self.store.set_sandbox_state(id, SandboxState::Deleting, None, Some(&reason))?;
+                self.store
+                    .set_sandbox_state(id, SandboxState::Deleting, None, Some(&reason))?;
                 Err(Error::Backend(format!("delete sandbox {id}: {e}")))
             }
         }
@@ -519,29 +786,88 @@ impl<R: Runtime> Manager<R> {
     /// execution row exists, dropping this waiter requests cancellation but
     /// cannot drop backend cleanup, output capture or row finalization.
     pub async fn exec(self: &Arc<Self>, req: ExecRequest) -> Result<Execution> {
+        self.exec_received(req, Instant::now()).await
+    }
+
+    pub(crate) async fn exec_received(
+        self: &Arc<Self>,
+        req: ExecRequest,
+        received_at: Instant,
+    ) -> Result<Execution> {
         self.check_serving()?;
-        self.check_exec(&req)?;
+        let timeout = self.check_exec(&req)?;
+        let deadline = received_at
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidArgument("timeout deadline overflow".into()))?;
         let sandbox = self.load(&req.sandbox_id)?;
         ready(&sandbox)?;
+        let slot = self.slot(&sandbox.id);
+        let global = self.admission.try_exec().map_err(|_| {
+            Error::ResourceExhausted(format!(
+                "global Exec admission limit ({}) reached",
+                self.limits.max_concurrent_execs
+            ))
+        })?;
+        let outstanding = slot
+            .outstanding_execs
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                self.admission.reject_sandbox_exec();
+                Error::ResourceExhausted(format!(
+                    "sandbox Exec capacity reached (one running plus {} queued)",
+                    self.limits.max_queued_execs_per_sandbox
+                ))
+            })?;
+        let stdin = self.admission.try_stdin(req.stdin.len()).map_err(|_| {
+            Error::ResourceExhausted(format!(
+                "aggregate retained Exec stdin limit ({} bytes) reached",
+                self.limits.max_queued_exec_stdin_bytes
+            ))
+        })?;
+        let ticket = ExecTicket {
+            _global: global,
+            _sandbox: outstanding,
+            _stdin: stdin,
+        };
         // No await separates the admission check from tracker registration.
         // On the daemon's current-thread runtime, shutdown cannot close and
         // finish draining the tracker between these two operations.
         let (result_tx, result_rx) = oneshot::channel();
         let manager = Arc::clone(self);
         self.operations.spawn(async move {
-            manager.supervise_exec(req, result_tx).await;
+            manager
+                .supervise_exec(req, result_tx, slot, timeout, deadline, ticket)
+                .await;
         });
-        result_rx.await.map_err(|_| Error::Internal(anyhow::anyhow!("exec supervisor stopped without a result")))?
+        result_rx.await.map_err(|_| {
+            Error::Internal(anyhow::anyhow!("exec supervisor stopped without a result"))
+        })?
     }
 
-    async fn supervise_exec(self: Arc<Self>, req: ExecRequest, mut reply: oneshot::Sender<Result<Execution>>) {
-        let Some(result) = self.exec_owned(req, &mut reply).await else {
+    async fn supervise_exec(
+        self: Arc<Self>,
+        req: ExecRequest,
+        mut reply: oneshot::Sender<Result<Execution>>,
+        slot: Arc<Slot>,
+        timeout: Duration,
+        deadline: Instant,
+        _ticket: ExecTicket,
+    ) {
+        let Some(result) = self
+            .exec_owned(req, &mut reply, slot, timeout, deadline)
+            .await
+        else {
             return;
         };
         if let Err(result) = reply.send(result) {
             match result {
-                Ok(execution) => info!(execution = %execution.id, state = execution.state.as_str(), "exec RPC stopped waiting; supervised operation completed"),
-                Err(error) => warn!(error = %error, "exec RPC stopped waiting; supervised operation failed"),
+                Ok(execution) => {
+                    info!(execution = %execution.id, state = execution.state.as_str(), "exec RPC stopped waiting; supervised operation completed")
+                }
+                Err(error) => {
+                    warn!(error = %error, "exec RPC stopped waiting; supervised operation failed")
+                }
             }
         }
     }
@@ -554,11 +880,10 @@ impl<R: Runtime> Manager<R> {
         self: &Arc<Self>,
         req: ExecRequest,
         reply: &mut oneshot::Sender<Result<Execution>>,
+        slot: Arc<Slot>,
+        timeout: Duration,
+        deadline: Instant,
     ) -> Option<Result<Execution>> {
-        let timeout = match self.check_exec(&req) {
-            Ok(timeout) => timeout,
-            Err(error) => return Some(Err(error)),
-        };
         let sandbox = match self.load(&req.sandbox_id).and_then(|sandbox| {
             ready(&sandbox)?;
             Ok(sandbox)
@@ -566,7 +891,6 @@ impl<R: Runtime> Manager<R> {
             Ok(sandbox) => sandbox,
             Err(error) => return Some(Err(error)),
         };
-        let slot = self.slot(&sandbox.id);
         // A queued RPC that disappears must not run later. Bias cancellation
         // when the lock and closure become ready in the same scheduler turn.
         let _guard = tokio::select! {
@@ -576,11 +900,17 @@ impl<R: Runtime> Manager<R> {
                 return None;
             }
             () = self.shutting_down.cancelled() => return Some(Err(Error::ShuttingDown)),
+            () = tokio::time::sleep_until(deadline) => return Some(Err(Error::DeadlineExceeded("Exec deadline expired while queued".into()))),
             guard = slot.exec_lock.lock() => guard,
         };
         if reply.is_closed() {
             info!(sandbox = %sandbox.id, "queued exec RPC stopped waiting; discarding request");
             return None;
+        }
+        if Instant::now() >= deadline {
+            return Some(Err(Error::DeadlineExceeded(
+                "Exec deadline expired before execution started".into(),
+            )));
         }
         // The sandbox may have changed while this request waited its turn.
         let sandbox = match self.load(&req.sandbox_id).and_then(|sandbox| {
@@ -593,7 +923,11 @@ impl<R: Runtime> Manager<R> {
         };
         let backend_id = match sandbox.backend_id.clone() {
             Some(id) => id,
-            None => return Some(Err(Error::FailedPrecondition("sandbox has no backend ID".into()))),
+            None => {
+                return Some(Err(Error::FailedPrecondition(
+                    "sandbox has no backend ID".into(),
+                )));
+            }
         };
 
         let mut execution = Execution {
@@ -605,11 +939,16 @@ impl<R: Runtime> Manager<R> {
             failure_reason: None,
             started_at_ms: now_ms(),
             finished_at_ms: None,
-            timeout_ms: timeout.as_millis() as u32,
+            timeout_ms: u32::try_from(timeout.as_millis()).expect("validated timeout fits u32"),
             stdin_bytes: req.stdin.len() as u64,
             stdout: Captured::default(),
             stderr: Captured::default(),
         };
+        if Instant::now() >= deadline {
+            return Some(Err(Error::DeadlineExceeded(
+                "Exec deadline expired before row insertion".into(),
+            )));
+        }
         if let Err(error) = self.store.insert_execution(&execution) {
             return Some(Err(error.into()));
         }
@@ -634,8 +973,16 @@ impl<R: Runtime> Manager<R> {
                     stderr: Captured::default(),
                 });
             }
-            let spec = ExecSpec { argv: &argv, stdin: &stdin, timeout, max_output };
-            backend_manager.runtime.exec(&backend_id_for_task, &spec, &backend_cancel.token).await
+            let spec = ExecSpec {
+                argv: &argv,
+                stdin: &stdin,
+                deadline,
+                max_output,
+            };
+            backend_manager
+                .runtime
+                .exec(&backend_id_for_task, &spec, &backend_cancel.token)
+                .await
         });
         // Poll backend completion first so a late receiver drop cannot turn
         // an already-completed command into a cancellation. Once closure is
@@ -654,7 +1001,11 @@ impl<R: Runtime> Manager<R> {
         let (outcome, task_failure) = match joined {
             Ok(outcome) => (Some(outcome), None),
             Err(join) => {
-                let reason = if join.is_panic() { "backend exec task panicked" } else { "backend exec task was canceled" };
+                let reason = if join.is_panic() {
+                    "backend exec task panicked"
+                } else {
+                    "backend exec task was canceled"
+                };
                 warn!(sandbox = %sandbox.id, execution = %execution.id, error = reason, "exec backend task failed");
                 (None, Some(reason))
             }
@@ -662,16 +1013,28 @@ impl<R: Runtime> Manager<R> {
         let (state, exit_code, reason) = match &outcome {
             Some(Ok(o)) => match o.finish {
                 ExecFinish::Exited(code) => (ExecutionState::Exited, Some(code), None),
-                ExecFinish::TimedOut => {
-                    (ExecutionState::TimedOut, None, Some(format!("timed out after {} ms", timeout.as_millis())))
-                }
+                ExecFinish::TimedOut => (
+                    ExecutionState::TimedOut,
+                    None,
+                    Some(format!("timed out after {} ms", timeout.as_millis())),
+                ),
                 ExecFinish::Canceled => {
-                    let why = cancel.reason().map_or("backend canceled execution", ExecCancelReason::message);
+                    let why = cancel
+                        .reason()
+                        .map_or("backend canceled execution", ExecCancelReason::message);
                     (ExecutionState::Canceled, None, Some(why.to_string()))
                 }
             },
             Some(Err(e)) => (ExecutionState::Failed, None, Some(e.to_string())),
-            None => (ExecutionState::Failed, None, Some(task_failure.unwrap_or("backend exec task stopped").to_string())),
+            None => (
+                ExecutionState::Failed,
+                None,
+                Some(
+                    task_failure
+                        .unwrap_or("backend exec task stopped")
+                        .to_string(),
+                ),
+            ),
         };
         let empty = Captured::default();
         let (stdout, stderr) = match &outcome {
@@ -683,7 +1046,13 @@ impl<R: Runtime> Manager<R> {
         loop {
             match self.store.finish_execution(
                 &execution.id,
-                &ExecutionResult { state, exit_code, failure_reason: reason.as_deref(), stdout, stderr },
+                &ExecutionResult {
+                    state,
+                    exit_code,
+                    failure_reason: reason.as_deref(),
+                    stdout,
+                    stderr,
+                },
             ) {
                 Ok(()) => break,
                 Err(error) => {
@@ -739,7 +1108,13 @@ impl<R: Runtime> Manager<R> {
 
     /// Cancels every running execution; they finish as CANCELED.
     pub fn cancel_executions(&self) {
-        let slots: Vec<_> = self.slots.lock().unwrap().values().cloned().collect();
+        let slots: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
         for slot in slots {
             if let Some(cancel) = &*slot.running.lock().unwrap() {
                 cancel.request(ExecCancelReason::Shutdown);
@@ -748,15 +1123,25 @@ impl<R: Runtime> Manager<R> {
     }
 
     fn check_exec(&self, req: &ExecRequest) -> Result<Duration> {
+        if req.argv.len() > 4096 {
+            return Err(Error::InvalidArgument(
+                "argv exceeds the limit of 4096 arguments".into(),
+            ));
+        }
         if req.argv.is_empty() || req.argv[0].is_empty() {
             return Err(Error::InvalidArgument("argv must name a program".into()));
         }
         if req.argv.iter().any(|a| a.contains('\0')) {
-            return Err(Error::InvalidArgument("argv must not contain NUL bytes".into()));
+            return Err(Error::InvalidArgument(
+                "argv must not contain NUL bytes".into(),
+            ));
         }
         let size: usize = req.argv.iter().map(|a| a.len() + 1).sum();
         if size > self.limits.max_argv_bytes {
-            return Err(Error::InvalidArgument(format!("argv is {size} bytes; the limit is {}", self.limits.max_argv_bytes)));
+            return Err(Error::InvalidArgument(format!(
+                "argv is {size} bytes; the limit is {}",
+                self.limits.max_argv_bytes
+            )));
         }
         if req.stdin.len() > self.limits.max_stdin_bytes {
             return Err(Error::InvalidArgument(format!(
@@ -782,10 +1167,16 @@ impl<R: Runtime> Manager<R> {
     fn resolve_spec(&self, req: CreateRequest) -> Result<SandboxSpec> {
         let l = &self.limits;
         let invalid = |msg: String| Err(Error::InvalidArgument(msg));
-        let image = if req.image.is_empty() { l.default_image.clone() } else { req.image };
+        let image = if req.image.is_empty() {
+            l.default_image.clone()
+        } else {
+            req.image
+        };
         if image.len() > 128
             || image.starts_with(['.', '-'])
-            || !image.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            || !image
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
         {
             return invalid(format!("invalid image name {image:?}"));
         }
@@ -802,16 +1193,28 @@ impl<R: Runtime> Manager<R> {
             labels: req.labels,
         };
         if spec.memory_bytes > l.max_memory_bytes {
-            return invalid(format!("memory {} is above the limit of {}", spec.memory_bytes, l.max_memory_bytes));
+            return invalid(format!(
+                "memory {} is above the limit of {}",
+                spec.memory_bytes, l.max_memory_bytes
+            ));
         }
         if spec.cpu_millis > l.max_cpu_millis {
-            return invalid(format!("cpu {} millis is above the limit of {}", spec.cpu_millis, l.max_cpu_millis));
+            return invalid(format!(
+                "cpu {} millis is above the limit of {}",
+                spec.cpu_millis, l.max_cpu_millis
+            ));
         }
         if spec.pids > l.max_pids {
-            return invalid(format!("pids {} is above the limit of {}", spec.pids, l.max_pids));
+            return invalid(format!(
+                "pids {} is above the limit of {}",
+                spec.pids, l.max_pids
+            ));
         }
         if spec.disk_bytes > l.max_disk_bytes {
-            return invalid(format!("disk {} is above the limit of {}", spec.disk_bytes, l.max_disk_bytes));
+            return invalid(format!(
+                "disk {} is above the limit of {}",
+                spec.disk_bytes, l.max_disk_bytes
+            ));
         }
         if let Network::Allow(allow) = &spec.network {
             if allow.is_empty() || allow.len() > MAX_ALLOW {
@@ -821,7 +1224,9 @@ impl<R: Runtime> Manager<R> {
                 if a.is_empty()
                     || a.len() > 260
                     || a.starts_with('-')
-                    || !a.chars().all(|c| c.is_ascii_alphanumeric() || ".-_:/".contains(c))
+                    || !a
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || ".-_:/".contains(c))
                 {
                     return invalid(format!("invalid allowlist entry {a:?}"));
                 }
@@ -848,7 +1253,9 @@ impl<R: Runtime> Manager<R> {
         for (k, v) in &spec.labels {
             if k.is_empty()
                 || k.len() > 63
-                || !k.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+                || !k
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
                 || v.len() > 256
                 || v.chars().any(|c| c.is_control())
             {
@@ -863,7 +1270,11 @@ fn ready(s: &Sandbox) -> Result<()> {
     if s.state == SandboxState::Ready {
         Ok(())
     } else {
-        Err(Error::FailedPrecondition(format!("sandbox {} is {}, not ready", s.id, s.state.as_str())))
+        Err(Error::FailedPrecondition(format!(
+            "sandbox {} is {}, not ready",
+            s.id,
+            s.state.as_str()
+        )))
     }
 }
 

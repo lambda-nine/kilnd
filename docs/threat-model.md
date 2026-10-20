@@ -29,8 +29,17 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   The environment is cleared except for a fixed `PATH`. Inside the sandbox,
   argv is exec'd directly; `sh -c` happens only when the caller asks for it.
 - **Bounded resource use by callers.** Caps on active sandboxes, sandbox
-  limits, exec timeout, argv, stdin and stored output keep one client from
-  filling memory, disk or the database with a single request.
+  limits, queue-inclusive exec timeout, argv/argc, stdin and stored output
+  bound individual requests. Immediate admission caps connections, ordinary
+  RPCs, reserved Health RPCs, global and per-sandbox Exec requests, and their
+  aggregate retained stdin. Exec tickets remain owned through cleanup and
+  terminal publication. HTTP/2 streams, fixed windows, headers and frames are
+  bounded; generated codecs cap request/response messages. Service RPC permits
+  are acquired after decoding, so the connection/stream/message caps bound
+  simultaneous decoding, not the service semaphore alone. List has explicit
+  item and encoded-byte bounds; GetSandbox reads metadata without output BLOBs.
+  Health shares and caches one backend probe, with a bounded timeout and panic
+  isolation. See [defaults](architecture.md#limits-and-defaults).
 - **State integrity.** The database directory is root-only 0700. kilnd
   refuses one owned by another user or writable by group or others, takes its
   persistent instance lock before opening SQLite, and refuses a schema newer
@@ -51,6 +60,22 @@ one host UID range, seccomp is a denylist, and a kernel bug reachable from a
 sandbox compromises the host.
 
 ## Known gaps
+
+- **Capacity is not fairness or isolation.** An authorized caller can occupy
+  all bounded slots; there are no per-UID quotas or tenant scheduling. Slow
+  clients consume only bounded connection/stream slots but can deny
+  availability until disconnected. There is no body-progress or idle watchdog.
+  Raw connection rejection closes the transport and cannot guarantee a gRPC
+  status. Service permits end after response construction; transport caps
+  bound slots held during response backpressure. These are capacity bounds,
+  not measured allocator/RSS ceilings.
+- **Deadlines are not hard real time.** SQLite and filesystem work is
+  synchronous. Deadline delivery can be delayed by that work, and an expired
+  recorded execution retains admission until backend cleanup and terminal
+  publication finish. A queue-expired request has no row and returns
+  `DEADLINE_EXCEEDED`; an execution timeout returns successful `TIMED_OUT`
+  only after cleanup. A cached Health success can be up to 5 seconds old;
+  finalization failures still degrade every response immediately.
 
 - **Instance locks are cooperative.** Persistent `flock` files prevent
   cooperating kilnd processes from sharing a state or socket directory. They

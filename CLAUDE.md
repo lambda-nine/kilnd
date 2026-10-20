@@ -20,6 +20,8 @@ through its CLI. Read [README.md](README.md),
   handling, reconciliation, the socket or shutdown, in the VM after
   `scripts/install.sh`: `scripts/integration-test.sh`,
   `scripts/daemon-singleton-regressions.sh` and `scripts/smoke.sh`.
+  The integration script also runs the dedicated-child admission FD/RSS,
+  slow-client, queue and concurrent-Health stress regression.
 - **kiln stays in its own repository** (`~/Projects/lambda-nine/kiln`). Never
   copy its runtime code here. If kilnd exposes a kiln defect, fix it there,
   with its own test and commit.

@@ -27,7 +27,7 @@ testable without kiln, through the fake runtime.
 ## The runtime adapter
 
 `runtime::Runtime` is the only kiln-shaped seam: `create(spec) → backend id`,
-`exec(id, argv, stdin, timeout, max_output, cancel)`, `remove`, `list`, `gc`
+`exec(id, argv, stdin, deadline, max_output, cancel)`, `remove`, `list`, `gc`
 and `version`. The contract that matters most: when an exec times out or is
 canceled, the command must be stopped *inside* the sandbox and the sandbox
 left usable. A Firecracker backend would implement the same trait over its
@@ -54,6 +54,14 @@ finalizes or unlocks the sandbox. This also contains descendants that changed
 process group or session. `kiln exec` is serial per sandbox, so kilnd queues
 executions per sandbox rather than letting them pile up in kiln's socket
 backlog.
+
+Exec calculates one absolute Tokio deadline at handler receipt (or direct
+manager entry). Queueing and process setup consume that same budget; the
+runtime and process runner use `sleep_until(deadline)`. The row retains the
+original requested/default timeout. Expiry while queued creates no row or
+backend call and returns `DEADLINE_EXCEEDED`. Once a row exists, timeout
+produces a successful terminal `TIMED_OUT` execution after backend cleanup
+and SQLite publication. Cleanup is never timed out by the service.
 
 The cumulative required kiln revision is `3b42552`. Earlier integration fixes
 made a killed exec client stop its command without taking down the sandbox and
@@ -146,8 +154,12 @@ access goes through one mutex-guarded connection, and each statement is
 short. The active-sandbox cap is checked and the row inserted with no await in
 between, so concurrent creates can't overshoot it.
 
-Each sandbox has a slot holding an async exec lock and the running execution's
-cancellation handle. Client disconnect, delete, and shutdown all record a
+Each sandbox has a stable slot holding an async exec lock, an outstanding
+request semaphore (one running plus the configured queue capacity), and the
+running execution's cancellation handle. The registry stores weak references:
+a live slot is never replaced under queued requests, while dead entries are
+pruned on later slot access so create/delete churn does not grow memory.
+Client disconnect, delete, and shutdown all record a
 first-wins reason through that handle before canceling its private token.
 Delete marks the sandbox `DELETING`, cancels the running execution, waits for
 the supervisor to finish and release the lock, then runs `kiln rm`.
@@ -160,6 +172,82 @@ the public method's first await on the current-thread runtime, so shutdown
 cannot interleave between the serving check and tracker spawn. Backend work is
 isolated so a panic becomes a persisted failure instead of dropping operation
 state.
+
+Admission uses only immediate semaphore acquisition, with no global wait
+queue. Before an Exec supervisor is spawned it acquires global Exec,
+per-sandbox outstanding and aggregate stdin permits. Its ticket owns them
+through backend cleanup and successful terminal publication, even after the
+RPC disappears. Queued disconnect, shutdown or deadline expiry releases the
+ticket without inserting a row. Admission does not promise arrival order
+before the sandbox lock wait.
+
+Each accepted Unix stream owns a connection permit until the transport drops
+the stream. Accepting at capacity drops that socket immediately; at most one
+transient accepted descriptor exists beyond the cap. Only admitted peers are
+logged. Transport rejection is a close, with no guaranteed gRPC status.
+HTTP/2 has bounded streams, fixed 64 KiB stream / 256 KiB connection windows,
+16 KiB headers and frames, and disabled adaptive windows. Per-connection
+concurrency is limited with load shedding. Generated services cap decoded
+requests and encoded responses. After decoding, every handler immediately
+acquires an ordinary RPC or reserved Health RPC permit and holds it through
+manager waiting and response construction. Thus decoding precedes service
+admission; connection, stream and message caps bound that concurrent work.
+Response transport backpressure can still occupy bounded connection/stream
+slots after the handler returns.
+
+Health coalesces uncached callers into one tracked, daemon-owned version
+probe. A separate Tokio task isolates backend panics. Timeout signals
+cancellation to that task, and the runtime explicitly kills and waits for its
+child before singleflight ownership is released. Shutdown uses the same path.
+Completion caches a cloned success or error using a monotonic timestamp;
+success and failure TTLs differ. Caller cancellation cannot cancel the probe.
+Shutdown starts no probe and reports cached details when available.
+Finalization-write degradation is recomputed on every call, including cache
+hits. `HealthResponse.admission` reports configured maxima, current permits
+in use, and cumulative rejections for connections, ordinary RPCs, Health RPCs,
+global Exec admissions and retained stdin bytes.
+Per-sandbox queue capacity and its cumulative rejection count are reported
+separately from global Exec rejections.
+
+## Bounded history reads
+
+Schema v2 adds immutable positive `list_seq` values, a unique descending index,
+and a partial descending index excluding deleted sandboxes. The transactional
+v1 migration assigns sequences preserving its exact timestamp/ID ordering;
+new inserts allocate the next sequence in their INSERT under the connection
+mutex. Newer schemas are refused. Full internal lists for reconciliation also
+use this order.
+
+List pages capture the maximum matching sequence on the first page, fetch at
+most `limit + 1` rows, and continue strictly below the last returned sequence.
+Later inserts are excluded; updates do not move rows. This watermark is not a
+snapshot of metadata or deletion state across pages. Tokens are opaque to
+clients; the server accepts only canonical versioned ASCII tokens bound to the
+deleted filter and validates positive, ordered cursor ranges.
+
+Absent `page_size` with an empty token preserves complete-list semantics.
+Legacy calls exceeding the item or byte bounds fail `RESOURCE_EXHAUSTED`
+and instruct pagination, never silently truncate. Present zero uses
+`min(100, max_list_page_size)`; oversized requested counts are
+`INVALID_ARGUMENT`. Pages stop before the byte limit, including the final
+continuation token in encoded-size accounting; one item that cannot fit fails
+explicitly. `kilndctl ls` requests the server's bounded default and prints one
+header, then pages incrementally. GetSandbox selects recent execution metadata
+using empty BLOB literals for output; total byte columns and existing wire
+behavior remain.
+
+## Status policy
+
+| Condition | Result |
+|-----------|--------|
+| Full service RPC, Exec or retained-stdin admission budget | `RESOURCE_EXHAUSTED` |
+| Full raw connection budget | Transport close; no guaranteed gRPC status |
+| Generated codec request/response message cap | tonic `OUT_OF_RANGE` |
+| Queued Exec deadline expiry, before a row exists | `DEADLINE_EXCEEDED` |
+| Execution deadline after insertion | Successful `TIMED_OUT` execution after cleanup |
+| Malformed token, filter mismatch or oversized page size | `INVALID_ARGUMENT` |
+| List exceeds legacy bounds or one item cannot fit | `RESOURCE_EXHAUSTED` |
+| New create/Exec during shutdown | `UNAVAILABLE` |
 
 ## Shutdown and restarts
 
@@ -190,8 +278,31 @@ process" for each shim on restart; that is expected.
 | Output kept per stream | 1 MiB | `--max-output-bytes` |
 | Active sandboxes | 32 | `--max-sandboxes` |
 | stdin / argv per exec | 1 MiB / 256 KiB | (code) |
+| argc per exec | 4096 | (code) |
+| Admitted connections | 64 | `--max-connections` |
+| Ordinary RPC / Health handlers | 64 / 4 | `--max-concurrent-rpcs`, `--max-concurrent-health` |
+| Global Exec admissions | 32 | `--max-concurrent-execs` |
+| Queued Exec per sandbox | 8, plus one running | `--max-queued-execs-per-sandbox` |
+| Aggregate admitted Exec stdin | 16 MiB | `--max-queued-exec-stdin-bytes` |
+| Streams per connection | 8 | `--max-streams-per-connection` |
+| Request / response message | 2 MiB / 4 MiB | `--max-request-bytes`, `--max-response-bytes` |
+| Maximum List page / response | 200 items / 1 MiB | `--max-list-page-size`, `--max-list-response-bytes` |
+| Health probe timeout | 2 s | `--health-probe-timeout-secs` |
+| Health success / failure cache | 5 s / 1 s | `--health-success-cache-secs`, `--health-failure-cache-secs` |
 | Sandbox defaults | alpine, 512 MiB, 1 CPU, 128 pids, 1 GiB disk, no network | (code) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
+
+Startup validates limits before opening state or binding: required counts,
+bytes and times are nonzero (the per-sandbox queue may be zero), semaphore and
+stream conversions fit, the default timeout is at most the maximum and maximum
+milliseconds fit `u32`. Checked arithmetic enforces request capacity at least
+stdin + argv + 64 KiB and response capacity at least twice retained output +
+maximum argv + 64 KiB. List bytes cannot exceed response bytes, and pages are
+at most 1000.
+These are finite capacity bounds, not a hard-real-time guarantee: synchronous
+SQLite/filesystem work may block, slow clients may deny availability until
+disconnected, and authorized callers can monopolize capacity without tenant
+fairness or isolation. Durable history still grows without retention.
 
 ## Dependencies
 

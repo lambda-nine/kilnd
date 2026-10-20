@@ -43,6 +43,13 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   (directory 0750, socket 0660), per-execution timeouts that stop the command
   inside the sandbox, bounded output, stdin and argv, a cap on active
   sandboxes, graceful shutdown, and structured logs (text or JSON).
+- **Admission bounds:** 64 connections, 8 HTTP/2 streams per connection,
+  64 ordinary RPC handlers plus 4 reserved Health handlers, 2 MiB requests
+  and 4 MiB responses. Exec admits at most 32 running or queued requests
+  globally, one running plus 8 queued per sandbox, and 16 MiB of retained
+  stdin. Admission is immediate; a full budget returns `RESOURCE_EXHAUSTED`
+  (excess raw connections are closed). Slow callers can hold bounded slots.
+  Health exposes current use, maxima and rejection totals.
 - **Exclusive daemon ownership:** a persistent advisory lock in the state
   directory prevents a second process from opening the same database, while
   a separate socket-directory lock prevents endpoint takeover. Both are held
@@ -59,10 +66,27 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   cancellation, but kilnd waits for backend cleanup, drains output capture,
   records a terminal outcome, and only then releases the sandbox. A queued
   request canceled before it starts is discarded without an execution row.
+- **One Exec deadline:** the requested timeout includes queueing. Expiry
+  before row insertion returns `DEADLINE_EXCEEDED`; after insertion the RPC
+  returns a terminal `TIMED_OUT` execution after cleanup and publication,
+  which may finish after the deadline. Permits remain held through cleanup
+  and terminal-write retries.
+- **Bounded queries:** List supports opaque pagination tokens (200 items and
+  1 MiB per page by default); legacy complete-list calls fail explicitly
+  when they cannot fit. `kilndctl ls` prints pages incrementally. GetSandbox
+  reads recent execution metadata without loading captured output BLOBs.
+  Health shares one backend probe with a 2-second timeout, caching successes
+  for 5 seconds and failures for 1 second.
 - **`kilndctl`**, a small client covering the whole API.
 
 Sandboxes outlive kilnd: restarting or upgrading the daemon leaves them
 running, and reconciliation picks them up again.
+
+These bounds do not provide tenant fairness: authorized callers can monopolize
+capacity, including with slow connections. Messages decode before service RPC
+admission, under the connection, stream and message caps. SQLite/filesystem
+work is synchronous, and history still grows without retention. Defaults and
+flags are listed in [the architecture](docs/architecture.md#limits-and-defaults).
 
 ## Quick start (in kiln's Lima VM)
 
@@ -104,7 +128,7 @@ CI runs these with Rust 1.88 on Ubuntu 24.04. The privileged checks run by
 hand in the VM after `scripts/install.sh`:
 
 ```sh
-scripts/integration-test.sh   # the manager against real kiln, temporary database
+scripts/integration-test.sh   # real kiln plus dedicated-child admission FD/RSS stress
 scripts/daemon-singleton-regressions.sh # duplicate startup cannot disturb live work
 scripts/smoke.sh              # kilndctl → socket → service → kiln, checked in SQLite
 ```

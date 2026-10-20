@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use super::{BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
+use super::{
+    BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError,
+};
 use crate::model::{Captured, SandboxSpec};
 
 /// A deterministic one-shot pause for lifecycle tests. Tests wait for
@@ -27,13 +29,20 @@ pub struct FakeGate {
 
 impl Default for FakeGate {
     fn default() -> Self {
-        Self { entered: Arc::new(Semaphore::new(0)), release: Arc::new(Semaphore::new(0)) }
+        Self {
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
     }
 }
 
 impl FakeGate {
     pub async fn entered(&self) {
-        self.entered.acquire().await.expect("fake gate closed").forget();
+        self.entered
+            .acquire()
+            .await
+            .expect("fake gate closed")
+            .forget();
     }
 
     pub fn release(&self) {
@@ -42,7 +51,11 @@ impl FakeGate {
 
     async fn hold(&self) {
         self.entered.add_permits(1);
-        self.release.acquire().await.expect("fake gate closed").forget();
+        self.release
+            .acquire()
+            .await
+            .expect("fake gate closed")
+            .forget();
     }
 }
 
@@ -56,6 +69,11 @@ pub struct FakeState {
     pub remove_attempts: Vec<String>,
     /// Commands whose backend execution was entered, in order.
     pub exec_calls: Vec<Vec<String>>,
+    pub exec_deadlines: Vec<tokio::time::Instant>,
+    pub version_calls: u32,
+    pub active_version_calls: u32,
+    pub version_gate: Option<FakeGate>,
+    pub panic_version: bool,
     pub active_execs: u32,
     pub canceled_execs: u32,
     pub gc_runs: u32,
@@ -90,6 +108,17 @@ struct ActiveExec {
     state: Arc<Mutex<FakeState>>,
 }
 
+struct ActiveVersion(Arc<Mutex<FakeState>>);
+
+impl Drop for ActiveVersion {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_version_calls -= 1;
+    }
+}
+
 impl Drop for ActiveExec {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -122,7 +151,14 @@ impl FakeRuntime {
 fn exited(code: i32, stdout: Vec<u8>, max: usize) -> ExecOutcome {
     let total = stdout.len() as u64;
     let data = stdout[..stdout.len().min(max)].to_vec();
-    ExecOutcome { finish: ExecFinish::Exited(code), stdout: Captured { data, total_bytes: total }, stderr: Captured::default() }
+    ExecOutcome {
+        finish: ExecFinish::Exited(code),
+        stdout: Captured {
+            data,
+            total_bytes: total,
+        },
+        stderr: Captured::default(),
+    }
 }
 
 impl Runtime for FakeRuntime {
@@ -130,7 +166,27 @@ impl Runtime for FakeRuntime {
         "fake"
     }
 
-    async fn version(&self) -> Result<String, RuntimeError> {
+    async fn version(
+        &self,
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<String, RuntimeError> {
+        let (gate, panic_version) = {
+            let mut state = self.state();
+            state.version_calls += 1;
+            state.active_version_calls += 1;
+            (state.version_gate.take(), state.panic_version)
+        };
+        let _active = ActiveVersion(self.state.clone());
+        if let Some(gate) = gate {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(RuntimeError::Backend("version probe canceled".into())),
+                () = tokio::time::sleep_until(deadline) => return Err(RuntimeError::Backend("version probe timed out".into())),
+                () = gate.hold() => {}
+            }
+        }
+        assert!(!panic_version, "injected fake version panic");
         if self.state().unavailable {
             return Err(RuntimeError::Backend("fake backend unavailable".into()));
         }
@@ -160,7 +216,12 @@ impl Runtime for FakeRuntime {
         Ok(id)
     }
 
-    async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> Result<ExecOutcome, RuntimeError> {
+    async fn exec(
+        &self,
+        id: &str,
+        spec: &ExecSpec<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ExecOutcome, RuntimeError> {
         self.running(id)?;
         if cancel.is_cancelled() {
             self.state().canceled_execs += 1;
@@ -173,29 +234,63 @@ impl Runtime for FakeRuntime {
         let (gate, panic_exec) = {
             let mut state = self.state();
             state.exec_calls.push(spec.argv.to_vec());
+            state.exec_deadlines.push(spec.deadline);
             state.active_execs += 1;
             (state.exec_before_run.take(), state.panic_exec)
         };
-        let _active = ActiveExec { state: self.state.clone() };
+        let _active = ActiveExec {
+            state: self.state.clone(),
+        };
         if let Some(gate) = gate {
             gate.hold().await;
         }
         assert!(!panic_exec, "injected fake exec panic");
         let args = &spec.argv[1..];
         Ok(match spec.argv[0].as_str() {
-            "echo" => exited(0, format!("{}\n", args.join(" ")).into_bytes(), spec.max_output),
+            "echo" => exited(
+                0,
+                format!("{}\n", args.join(" ")).into_bytes(),
+                spec.max_output,
+            ),
             "cat" => exited(0, spec.stdin.to_vec(), spec.max_output),
-            "exit" => exited(args.first().and_then(|a| a.parse().ok()).unwrap_or(1), vec![], spec.max_output),
-            "spew" => exited(0, vec![b'x'; args.first().and_then(|a| a.parse().ok()).unwrap_or(0)], spec.max_output),
+            "exit" => exited(
+                args.first().and_then(|a| a.parse().ok()).unwrap_or(1),
+                vec![],
+                spec.max_output,
+            ),
+            "spew" => exited(
+                0,
+                vec![b'x'; args.first().and_then(|a| a.parse().ok()).unwrap_or(0)],
+                spec.max_output,
+            ),
+            "spew-both" => {
+                let total = args.first().and_then(|a| a.parse().ok()).unwrap_or(0);
+                let kept = total.min(spec.max_output);
+                ExecOutcome {
+                    finish: ExecFinish::Exited(0),
+                    stdout: Captured {
+                        data: vec![b'x'; kept],
+                        total_bytes: total as u64,
+                    },
+                    stderr: Captured {
+                        data: vec![b'y'; kept],
+                        total_bytes: total as u64,
+                    },
+                }
+            }
             "sleep" => {
                 let finish = tokio::select! {
-                    () = tokio::time::sleep(spec.timeout) => ExecFinish::TimedOut,
+                    () = tokio::time::sleep_until(spec.deadline) => ExecFinish::TimedOut,
                     () = cancel.cancelled() => {
                         self.state().canceled_execs += 1;
                         ExecFinish::Canceled
                     },
                 };
-                ExecOutcome { finish, stdout: Captured::default(), stderr: Captured::default() }
+                ExecOutcome {
+                    finish,
+                    stdout: Captured::default(),
+                    stderr: Captured::default(),
+                }
             }
             "vanish" => {
                 self.state().sandboxes.remove(id);
@@ -204,7 +299,10 @@ impl Runtime for FakeRuntime {
             _ => ExecOutcome {
                 finish: ExecFinish::Exited(127),
                 stdout: Captured::default(),
-                stderr: Captured { data: b"not found\n".to_vec(), total_bytes: 10 },
+                stderr: Captured {
+                    data: b"not found\n".to_vec(),
+                    total_bytes: 10,
+                },
             },
         })
     }
@@ -238,7 +336,13 @@ impl Runtime for FakeRuntime {
         if s.unavailable {
             return Err(RuntimeError::Backend("fake backend unavailable".into()));
         }
-        Ok(s.sandboxes.iter().map(|(id, status)| BackendSandbox { id: id.clone(), status: *status }).collect())
+        Ok(s.sandboxes
+            .iter()
+            .map(|(id, status)| BackendSandbox {
+                id: id.clone(),
+                status: *status,
+            })
+            .collect())
     }
 
     async fn gc(&self) -> Result<Vec<String>, RuntimeError> {
@@ -247,8 +351,12 @@ impl Runtime for FakeRuntime {
             return Err(RuntimeError::Backend("fake backend unavailable".into()));
         }
         s.gc_runs += 1;
-        let stale: Vec<String> =
-            s.sandboxes.iter().filter(|(_, st)| **st == BackendStatus::Stale).map(|(id, _)| id.clone()).collect();
+        let stale: Vec<String> = s
+            .sandboxes
+            .iter()
+            .filter(|(_, st)| **st == BackendStatus::Stale)
+            .map(|(id, _)| id.clone())
+            .collect();
         for id in &stale {
             s.sandboxes.remove(id);
         }

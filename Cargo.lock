@@ -520,9 +520,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "h2",
  "hyper-util",
  "kilnd-api",
  "libc",
+ "prost",
  "rusqlite",
  "serde",
  "serde_json",

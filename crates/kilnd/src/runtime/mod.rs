@@ -3,7 +3,7 @@
 //! implement the same trait.
 
 use std::future::Future;
-use std::time::Duration;
+use tokio::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
@@ -29,7 +29,7 @@ pub enum RuntimeError {
 pub struct ExecSpec<'a> {
     pub argv: &'a [String],
     pub stdin: &'a [u8],
-    pub timeout: Duration,
+    pub deadline: Instant,
     /// Bytes kept per output stream.
     pub max_output: usize,
 }
@@ -68,13 +68,22 @@ pub trait Runtime: Send + Sync + 'static {
     /// Short backend name stored with each sandbox, like "kiln".
     fn name(&self) -> &'static str;
 
-    fn version(&self) -> impl Future<Output = Result<String, RuntimeError>> + Send;
+    /// Returns the backend version. Deadline or cancellation must stop and
+    /// reap any subprocess before the future returns.
+    fn version(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> impl Future<Output = Result<String, RuntimeError>> + Send;
 
     /// Creates a fresh sandbox owned by this invocation, returning once it
     /// accepts commands. A successful call returns that new backend's ID.
     /// An error may be ambiguous if the backend made a resource before it
     /// lost the ability to report the ID.
-    fn create(&self, spec: &SandboxSpec) -> impl Future<Output = Result<String, RuntimeError>> + Send;
+    fn create(
+        &self,
+        spec: &SandboxSpec,
+    ) -> impl Future<Output = Result<String, RuntimeError>> + Send;
 
     /// Runs one command and waits for it. A pre-canceled token must be honored.
     /// When the timeout passes or `cancel` fires, the command and all of its

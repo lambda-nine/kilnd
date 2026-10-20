@@ -6,6 +6,19 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Adds finite connection/stream/message and RPC admission bounds, global and
+  per-sandbox Exec capacity with aggregate stdin permits, and queue-inclusive
+  absolute deadlines while preserving daemon-owned cleanup and publication.
+  Health exposes admission use/rejections and coalesces cached backend probes
+  with timeout and panic recovery. List gains bounded stable pagination with
+  opaque tokens, explicit legacy overflow errors and incremental CLI output;
+  SQLite schema v2 preserves legacy list order on migration. GetSandbox reads
+  execution metadata without fetching output BLOBs. New startup flags validate
+  capacity relationships before state or socket side effects. Health probe
+  timeout ownership now lasts through child reaping, idle sandbox admission
+  slots are reclaimed, and a dedicated Linux child harness measures FD/RSS
+  recovery under slow connections, queued stdin and concurrent Health.
+
 - `CreateSandbox` work is daemon-owned after acceptance: client cancellation
   no longer strands `CREATING` rows or live unrecorded backends, failed state
   publication is compensated and retryable, and shutdown drains accepted
