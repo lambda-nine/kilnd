@@ -279,4 +279,58 @@ message Execution {
   uint64 stdin_bytes = 10;
   Output stdout = 11;
   Output stderr = 12;
+  CommandStatus command_status = 13;
+  RuntimeDiagnostic runtime_error = 14;
+}
+
+message CommandStatus {
+  oneof termination {
+    int32 exit_code = 1;
+    SignalStatus signal = 2;
+  }
+}
+
+message SignalStatus {
+  uint32 number = 1;
+  bool core_dumped = 2;
+}
+
+enum RuntimeErrorKind {
+  RUNTIME_ERROR_KIND_UNSPECIFIED = 0;
+  RUNTIME_ERROR_KIND_INVALID_REQUEST = 1;
+  RUNTIME_ERROR_KIND_UNAVAILABLE = 2;
+  RUNTIME_ERROR_KIND_NOT_FOUND = 3;
+  RUNTIME_ERROR_KIND_INCOMPATIBLE = 4;
+  RUNTIME_ERROR_KIND_BUSY = 5;
+  RUNTIME_ERROR_KIND_LAUNCH_FAILED = 6;
+  RUNTIME_ERROR_KIND_IO = 7;
+  RUNTIME_ERROR_KIND_PROTOCOL = 8;
+  RUNTIME_ERROR_KIND_CLEANUP_FAILED = 9;
+  RUNTIME_ERROR_KIND_INTERNAL = 10;
+  RUNTIME_ERROR_KIND_STOPPED = 11;
+}
+
+enum RuntimeStage {
+  RUNTIME_STAGE_UNSPECIFIED = 0;
+  RUNTIME_STAGE_VALIDATE = 1;
+  RUNTIME_STAGE_CONNECT = 2;
+  RUNTIME_STAGE_REQUEST = 3;
+  RUNTIME_STAGE_PREPARE = 4;
+  RUNTIME_STAGE_FORK = 5;
+  RUNTIME_STAGE_ADMISSION = 6;
+  RUNTIME_STAGE_STDIO = 7;
+  RUNTIME_STAGE_EXEC = 8;
+  RUNTIME_STAGE_WAIT = 9;
+  RUNTIME_STAGE_CLEANUP = 10;
+  RUNTIME_STAGE_REPORT = 11;
+  RUNTIME_STAGE_CAPTURE = 12;
+  RUNTIME_STAGE_HANDSHAKE = 13;
+}
+
+message RuntimeDiagnostic {
+  RuntimeErrorKind kind = 1;
+  RuntimeStage stage = 2;
+  string message = 3;
+  optional string native_code = 4;
+  bool message_truncated = 5;
 }

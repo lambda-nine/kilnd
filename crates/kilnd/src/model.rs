@@ -130,6 +130,88 @@ impl Captured {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStatus {
+    Exited(i32),
+    Signaled { signal: i32, core_dumped: bool },
+}
+
+impl CommandStatus {
+    pub fn legacy_projection(&self) -> i32 {
+        match self {
+            Self::Exited(code) => *code,
+            Self::Signaled { signal, .. } => 128 + signal,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeErrorKind {
+    InvalidRequest,
+    Unavailable,
+    NotFound,
+    Incompatible,
+    Busy,
+    LaunchFailed,
+    Io,
+    Protocol,
+    CleanupFailed,
+    Internal,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStage {
+    None,
+    Validate,
+    Connect,
+    Request,
+    Prepare,
+    Fork,
+    Admission,
+    Stdio,
+    Exec,
+    Wait,
+    Cleanup,
+    Report,
+    Capture,
+    Handshake,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RuntimeDiagnostic {
+    pub kind: RuntimeErrorKind,
+    pub stage: RuntimeStage,
+    pub message: String,
+    pub native_code: Option<String>,
+    pub message_truncated: bool,
+}
+
+impl RuntimeDiagnostic {
+    pub fn new(kind: RuntimeErrorKind, stage: RuntimeStage, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        let message_truncated = message.len() > 2048;
+        if message_truncated {
+            let mut end = 2048;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+        Self {
+            kind,
+            stage,
+            message,
+            native_code: None,
+            message_truncated,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Execution {
     pub id: String,
@@ -137,6 +219,8 @@ pub struct Execution {
     pub argv: Vec<String>,
     pub state: ExecutionState,
     pub exit_code: Option<i32>,
+    pub command_status: Option<CommandStatus>,
+    pub runtime_error: Option<RuntimeDiagnostic>,
     pub failure_reason: Option<String>,
     pub started_at_ms: i64,
     pub finished_at_ms: Option<i64>,
@@ -178,6 +262,14 @@ pub fn valid_id(kind: &str, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_truncation_keeps_utf8_boundaries() {
+        let message = format!("{}é", "x".repeat(2047));
+        let d = RuntimeDiagnostic::new(RuntimeErrorKind::Io, RuntimeStage::Capture, message);
+        assert_eq!(d.message.len(), 2047);
+        assert!(d.message_truncated);
+    }
 
     #[test]
     fn ids_have_a_fixed_shape() {

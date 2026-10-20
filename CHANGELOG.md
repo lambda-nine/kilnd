@@ -6,6 +6,23 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Adds backend-neutral typed command termination and runtime diagnostics to
+  executions, the additive v1 API, schema 3, and kilndctl. Private machine
+  stdio/status sockets preserve binary evidence through failures, cleanup,
+  cancellation and reader panics; real exits 125/126/127 remain command results.
+  Strict capability validation gates startup, live sandboxes, Health and Exec;
+  create requires protocol 1. Requires persistent-exec v1 first supplied by kiln
+  `f3da4b5319566de4912ed617caf81d4eb8e50b6f`, with follow-up
+  `711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on `3b42552`.
+  v1/v2 stores migrate to v3 with unknown historical typed values; older
+  binaries refuse schema 3. Migration can precede startup capability failure.
+  Late status settlement preserves runtime failure/cleanup precedence over
+  cancellation, sandbox absence requires a bounded successful list observation,
+  signal numbers use uint32 on the API, and persisted native codes are bounded.
+  Presence observations require verified EOF on both CLI streams; bounded
+  control-command drainage retains completion/error evidence and the original
+  cancellation/deadline budget, preventing late inherited writers from implying absence.
+
 - Adds finite connection/stream/message and RPC admission bounds, global and
   per-sandbox Exec capacity with aggregate stdin permits, and queue-inclusive
   absolute deadlines while preserving daemon-owned cleanup and publication.

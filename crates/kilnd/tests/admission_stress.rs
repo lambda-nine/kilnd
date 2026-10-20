@@ -56,12 +56,16 @@ impl Runtime for StressRuntime {
         self.inner.create(spec).await
     }
 
-    async fn exec(
+    async fn validate_sandbox(
         &self,
         id: &str,
-        spec: &ExecSpec<'_>,
+        deadline: tokio::time::Instant,
         cancel: &CancellationToken,
-    ) -> Result<ExecOutcome, RuntimeError> {
+    ) -> Result<(), RuntimeError> {
+        self.inner.validate_sandbox(id, deadline, cancel).await
+    }
+
+    async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> ExecOutcome {
         self.inner.exec(id, spec, cancel).await
     }
 

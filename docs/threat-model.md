@@ -103,9 +103,19 @@ sandbox compromises the host.
   database is pruned, and there is no retention yet.
 - **The database grows without bound.** Deleted sandboxes and every
   execution are kept for history.
-- **kiln's own errors and command output share stderr.** When `kiln exec`
-  fails (exit 125), its message is mixed into the captured stderr. A command
-  that itself exits 125 is reported as a backend failure.
+- **Machine evidence has a private transport.** Four private Unix sockets
+  separate status and workload stdio from bounded CLI diagnostics. Workload
+  output cannot forge an outcome. Strict persistent-exec v1 decoding requires
+  one frame and EOF; malformed or missing replies trigger host cleanup.
+  Signal/core status and runtime failures remain separate, including real
+  command exits 125/126/127. Readers preserve observed binary bytes/counts on
+  error or panic and stay alive through the cleanup barrier. Captures settle
+  with an explicit EOF timeout after drainage; failures retain partial evidence.
+  CLI and every managed live sandbox must advertise required capabilities;
+  incompatible replacements and old PID 1 instances fail closed.
+  This requires persistent-exec v1 first supplied by kiln
+  `f3da4b5319566de4912ed617caf81d4eb8e50b6f`, with follow-up
+  `711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on `3b42552`.
 - **A daemon crash during `kiln create`** can leave a kiln sandbox whose
   backend ID was never returned to kilnd. Reconciliation logs it as unmanaged
   but doesn't remove it, since it can't tell it from one an operator made

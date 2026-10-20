@@ -12,10 +12,53 @@ use kilnd::runtime::fake::{FakeGate, FakeRuntime};
 use kilnd::store::Store;
 use kilnd_api::v1 as pb;
 use pb::kilnd_service_client::KilndServiceClient;
+use prost::Message;
 use tokio::net::UnixStream;
 use tonic::Code;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
+
+#[test]
+fn signal_number_is_uint32_in_generated_types_schema_and_wire() {
+    let _: u32 = pb::SignalStatus::default().number;
+    assert!(include_str!("../../../proto/kilnd/v1/kilnd.proto").contains("uint32 number = 1;"));
+    let status = pb::SignalStatus {
+        number: u32::MAX,
+        core_dumped: true,
+    };
+    assert_eq!(
+        pb::SignalStatus::decode(status.encode_to_vec().as_slice()).unwrap(),
+        status
+    );
+    let execution = kilnd::model::Execution {
+        id: "ex-signal".into(),
+        sandbox_id: "sb-signal".into(),
+        argv: vec![],
+        state: kilnd::model::ExecutionState::Exited,
+        exit_code: Some(192),
+        command_status: Some(kilnd::model::CommandStatus::Signaled {
+            signal: 64,
+            core_dumped: true,
+        }),
+        runtime_error: None,
+        failure_reason: None,
+        started_at_ms: 1,
+        finished_at_ms: Some(2),
+        timeout_ms: 1,
+        stdin_bytes: 0,
+        stdout: Default::default(),
+        stderr: Default::default(),
+    };
+    let converted = kilnd::service::execution_pb(execution);
+    let decoded = pb::Execution::decode(converted.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        decoded.command_status.unwrap().termination,
+        Some(pb::command_status::Termination::Signal(pb::SignalStatus {
+            number: 64u32,
+            core_dumped: true
+        }))
+    );
+}
 
 async fn client(path: PathBuf) -> KilndServiceClient<Channel> {
     let channel = Endpoint::try_from("http://kilnd.invalid")
@@ -27,6 +70,123 @@ async fn client(path: PathBuf) -> KilndServiceClient<Channel> {
         .await
         .unwrap();
     KilndServiceClient::new(channel)
+}
+
+#[tokio::test]
+async fn typed_outcomes_and_failed_binary_evidence_survive_api_store_and_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run/kilnd.sock");
+    let state = tmp.path().join("state");
+    let fake = FakeRuntime::default();
+    let mut saved = Vec::new();
+    let mut sandbox_id = String::new();
+    for phase in 0..2 {
+        let manager = Arc::new(Manager::new(
+            fake.clone(),
+            Store::open(&state).unwrap(),
+            Limits::default(),
+        ));
+        let listener = kilnd::server::bind(&socket, None).await.unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(kilnd::server::serve(
+            manager.clone(),
+            listener,
+            async {
+                let _ = stopped.await;
+            },
+            Duration::from_millis(100),
+        ));
+        let mut c = client(socket.clone()).await;
+        if phase == 0 {
+            sandbox_id = c
+                .create_sandbox(pb::CreateSandboxRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .sandbox
+                .unwrap()
+                .id;
+            for argv in [
+                vec!["exit", "125"],
+                vec!["exit", "143"],
+                vec!["signal", "15", "core"],
+                vec!["runtime-failure"],
+            ] {
+                let e = c
+                    .exec(pb::ExecRequest {
+                        sandbox_id: sandbox_id.clone(),
+                        argv: argv.into_iter().map(str::to_owned).collect(),
+                        timeout_ms: 5000,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .execution
+                    .unwrap();
+                saved.push(e);
+            }
+            assert_eq!(saved[0].exit_code, Some(125));
+            assert_eq!(
+                saved[0].command_status.as_ref().unwrap().termination,
+                Some(pb::command_status::Termination::ExitCode(125))
+            );
+            assert_eq!(
+                saved[1].command_status.as_ref().unwrap().termination,
+                Some(pb::command_status::Termination::ExitCode(143))
+            );
+            assert_eq!(
+                saved[2].command_status.as_ref().unwrap().termination,
+                Some(pb::command_status::Termination::Signal(pb::SignalStatus {
+                    number: 15,
+                    core_dumped: true
+                }))
+            );
+            let failure = &saved[3];
+            assert_eq!(failure.state, pb::ExecutionState::Failed as i32);
+            assert_eq!(failure.exit_code, None);
+            assert_eq!(
+                failure.runtime_error.as_ref().unwrap().kind,
+                pb::RuntimeErrorKind::Io as i32
+            );
+            assert_eq!(failure.stdout.as_ref().unwrap().data, b"\0\xffout");
+            assert_eq!(failure.stdout.as_ref().unwrap().total_bytes, 99);
+            assert_eq!(failure.stderr.as_ref().unwrap().data, b"\0\xfeerr");
+            assert_eq!(failure.stderr.as_ref().unwrap().total_bytes, 101);
+        }
+        for expected in &saved {
+            let got = c
+                .get_execution(pb::GetExecutionRequest {
+                    id: expected.id.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .execution
+                .unwrap();
+            assert_eq!(&got, expected);
+        }
+        let recent = c
+            .get_sandbox(pb::GetSandboxRequest {
+                id: sandbox_id.clone(),
+                execution_limit: 10,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .recent_executions;
+        assert_eq!(recent.len(), 4);
+        assert!(recent[0].stdout.as_ref().unwrap().data.is_empty());
+        for metadata in recent {
+            let full = saved.iter().find(|e| e.id == metadata.id).unwrap();
+            assert_eq!(metadata.command_status, full.command_status);
+            assert_eq!(metadata.runtime_error, full.runtime_error);
+        }
+        drop(c);
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        drop(manager);
+    }
 }
 
 #[tokio::test]

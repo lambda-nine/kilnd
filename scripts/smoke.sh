@@ -72,10 +72,29 @@ sql "SELECT state, IFNULL(exit_code, '-'), stdout_bytes, stdout_truncated, stder
 [ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id = '$id' AND state = 'timed_out'")" -eq 1 ] || fail "timeout not persisted"
 ctl get "$id"
 
+echo "   typed outcomes and binary evidence"
+[ "$(sql 'PRAGMA user_version')" -eq 3 ] || fail "expected schema 3"
+set +e
+ctl exec "$id" -- sh -c 'printf "\000\377out"; printf "\000\376err" >&2; exit 125' >/dev/null 2>/dev/null
+exit125=$?
+ctl exec "$id" -- sh -c 'exit 143' >/dev/null 2>/dev/null
+exit143=$?
+ctl exec "$id" -- sh -c 'kill -TERM $$' >/dev/null 2>/dev/null
+signal15=$?
+ctl exec "$id" -- /no/such/program >/dev/null 2>/dev/null
+launch_failure=$?
+set -e
+[ "$exit125:$exit143:$signal15" = '125:143:143' ] || fail "typed shell projections"
+[ "$launch_failure" -eq 125 ] || fail "missing executable must fail as runtime error"
+[ "$(sql "SELECT state || ':' || command_status_kind || ':' || command_status_value || ':' || hex(stdout) || ':' || hex(stderr) FROM executions WHERE sandbox_id='$id' AND exit_code=125")" = 'exited:exited:125:00FF6F7574:00FE657272' ] || fail "binary exit125 evidence"
+[ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id='$id' AND command_status_kind='signaled' AND command_status_value=15 AND exit_code=143")" -eq 1 ] || fail "signal15 not distinct from exit143"
+[ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id='$id' AND state='failed' AND exit_code IS NULL AND command_status_kind IS NULL AND json_extract(runtime_error,'$.kind')='launch_failed' AND json_extract(runtime_error,'$.stage')='exec'")" -eq 1 ] || fail "typed execvp failure"
+
 echo "4. Restarting kilnd keeps the sandbox"
 sudo systemctl restart kilnd
 wait_ready
 ctl get "$id" | grep -q '^state: *ready' || fail "sandbox not ready after restart"
+[ "$(sql "SELECT hex(stdout) || ':' || hex(stderr) FROM executions WHERE sandbox_id='$id' AND exit_code=125")" = '00FF6F7574:00FE657272' ] || fail "typed binary evidence lost on restart"
 [ "$(ctl exec "$id" -- cat /workspace/note)" = note ] || fail "sandbox state lost across restart"
 
 echo "5. Killing kilnd mid-exec interrupts the execution, not the sandbox"

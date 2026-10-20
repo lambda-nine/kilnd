@@ -27,7 +27,7 @@ testable without kiln, through the fake runtime.
 ## The runtime adapter
 
 `runtime::Runtime` is the only kiln-shaped seam: `create(spec) → backend id`,
-`exec(id, argv, stdin, deadline, max_output, cancel)`, `remove`, `list`, `gc`
+`exec(id, argv, stdin, deadline, max_output, cancel)`, `validate_sandbox`, `remove`, `list`, `gc`
 and `version`. The contract that matters most: when an exec times out or is
 canceled, the command must be stopped *inside* the sandbox and the sandbox
 left usable. A Firecracker backend would implement the same trait over its
@@ -37,11 +37,11 @@ API socket and a guest agent.
 
 | kilnd | kiln |
 |-------|------|
-| create | `kiln create --image=… --memory=… --cpus=… --pids=… --disk=… --net=…/--allow=… [--read-only --writable=…]`; stdout is the ID |
-| exec | `kiln exec ID -- ARGV…` with stdin/stdout/stderr as pipes; exit code is the command's, 125 means kiln failed |
+| create | `kiln create --require-exec-protocol=1 --image=… --memory=… --cpus=… --pids=… --disk=… --net=…/--allow=… [--read-only --writable=…]`; stdout is the ID |
+| exec | `kiln exec --protocol=1 --status-fd=N --stdin-fd=I --stdout-fd=O --stderr-fd=E ID -- ARGV…`; private status and workload streams |
 | delete | `kiln rm ID` |
 | reconcile | `kiln gc`, then `kiln ls` |
-| health | `kiln --version` |
+| health | `kiln capabilities --protocol=1` |
 
 Every flag value uses `--flag=value` so it can't be parsed as another flag,
 the command's argv follows `--`, and kilnd validates every value before it
@@ -63,10 +63,49 @@ backend call and returns `DEADLINE_EXCEEDED`. Once a row exists, timeout
 produces a successful terminal `TIMED_OUT` execution after backend cleanup
 and SQLite publication. Cleanup is never timed out by the service.
 
-The cumulative required kiln revision is `3b42552`. Earlier integration fixes
-made a killed exec client stop its command without taking down the sandbox and
-reserved exit code 125 for kiln failures; the per-execution cgroup closes the
-remaining escaped-descendant gap.
+The required persistent-exec protocol v1 was first supplied by kiln
+`f3da4b5319566de4912ed617caf81d4eb8e50b6f`, with follow-up
+`711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on `3b42552`.
+Both installed CLI and sandbox PID 1 capabilities are checked before each
+execution, within its existing deadline. Create requires
+`--require-exec-protocol=1`; there is no machine legacy fallback. Package and
+provenance strings aid diagnosis; capability frames decide compatibility.
+If an ID capability probe fails, a side-effect-free `ls` observation consumes
+the same absolute deadline. Only a successful complete list proving absence
+becomes NotFound/Handshake and marks the managed sandbox LOST. A listed old
+PID 1 stays Incompatible; failed or expired observations never imply absence.
+List absence evidence requires verified EOF on both CLI streams with no read,
+task or forced-stop error, untruncated UTF-8 stdout and a valid table. The
+generic runner retains internal completion metadata and prior captured bytes
+on failures. Its post-child drain polls completion before the original cancel,
+absolute deadline and 250 ms grace; drainage never grants a fresh deadline.
+An inherited writer that outlives that bound makes the observation inconclusive.
+
+The owned machine transport uses four private Unix stream socketpairs. Only
+their four child ends cross exec; workload stdio and the status stream are
+separate from bounded CLI stdout/stderr diagnostics. Workload output is binary
+and each stream retains its first configured bytes and exact observed count.
+Shared capture state survives reader errors and polling panics. The status
+codec requires one strict v1 frame and EOF (at most 2088 bytes), with a two
+second frame deadline starting at the first byte. CLI exit status is only a
+consistency check. Real exits 125, 126 and 127 remain command results; signal
+15 remains distinct from exit 143. Missing executables are LaunchFailed/Exec.
+
+An execution returns a finish result, optional observed command termination,
+and both captures. Completed without status becomes Internal/Report FAILED.
+Timeout/cancel and malformed, missing or untrusted status kill and reap the
+CLI and wait for the host cleanup barrier, unless trusted status proves
+NoChildStarted or Drained. After reaping, status gets up to two seconds to
+settle buffered bytes and EOF before deciding whether that barrier is needed.
+Trusted runtime diagnostics take precedence over cancellation/timeout,
+including PID 1 CleanupFailed. Late command status is retained alongside a
+won cancellation/timeout. Received malformed status is Protocol/Report;
+expected empty EOF after killing the CLI preserves cancellation/timeout.
+Host cleanup failure always wins. Readers remain active through that barrier;
+a separate two second capture settlement requires EOF afterwards. Capture
+failure without a prior failure is Io/Capture; cleanup failure overrides other outcomes with
+CleanupFailed/Cleanup. Previously observed status and bytes survive failures.
+Runtime::exec returns this evidence directly; non-exec methods retain Results.
 
 ## State machine
 
@@ -130,12 +169,15 @@ operators must not point independent daemons at the same kiln backend.
 
 At startup, after both ownership locks are held and the socket is reserved:
 
-1. `kiln gc` removes what dead shims left behind (kiln only touches sandboxes
-   whose shim is gone).
+1. Validate installed CLI capabilities before `kiln gc` removes what dead shims
+   left behind (kiln only touches sandboxes whose shim is gone).
 2. `kiln ls` lists what is alive. If it fails, kilnd refuses to start rather
    than guess.
-3. For each sandbox of this backend in the database: `READY`/`CREATING` with a
-   live backend stays (or becomes) `READY`; without one it becomes `LOST`;
+3. Validate every managed live `READY`/`CREATING` sandbox's PID 1 capabilities
+   before any durable reconciliation mutation. An incompatibility aborts startup
+   without marking it lost or removing its workspace. For each sandbox of this
+   backend in the database: `READY`/`CREATING` with a live backend stays (or
+   becomes) `READY`; without one it becomes `LOST`;
    `CREATING` without a backend ID becomes `FAILED`; `DELETING` is retried
    or completed.
 4. Executions still `RUNNING` become `INTERRUPTED`. Their `kiln exec` clients
@@ -217,6 +259,29 @@ v1 migration assigns sequences preserving its exact timestamp/ID ordering;
 new inserts allocate the next sequence in their INSERT under the connection
 mutex. Newer schemas are refused. Full internal lists for reconciliation also
 use this order.
+
+Schema v3 adds nullable command termination kind/value/core and bounded JSON
+runtime diagnostics. Persistence caps messages at 2048 UTF-8 bytes and native
+codes at 128 UTF-8 bytes, annotating native-code truncation in the message and
+truncation flag. Oversized backend values cannot wedge terminal publication.
+Terminal status, diagnostic, output, totals and timestamps
+publish in the same UPDATE and remain owned across publication retries.
+Full and metadata-only reads include typed evidence. v1 opens migrate through
+v2 to v3; v2 opens migrate to v3. Historical and restart-interrupted rows retain
+NULL typed evidence rather than inferring termination from a shell projection.
+Older schema-1/2 binaries refuse schema 3. Migration happens at store open and
+may precede startup capability failure; back up before upgrading.
+
+The API represents signal numbers as `uint32` and retains legacy `exit_code`
+only for EXITED, projecting signal termination as 128 + signal.
+`command_status` distinguishes that signal from
+an explicit exit with the same number. FAILED carries a runtime diagnostic;
+TIMED_OUT and CANCELED retain any observed termination without an exit code.
+`failure_reason` remains a human projection. Runtime stage `None` is preserved
+as JSON `none` and protobuf `RUNTIME_STAGE_UNSPECIFIED`. `kilndctl exec` and
+`kilndctl execution` write captured bytes first, then print signal, diagnostic
+and truncation details separately on stderr. Exec shell codes keep the legacy
+EXITED projection, 124 for timeout and 125 for other failures.
 
 List pages capture the maximum matching sequence on the first page, fetch at
 most `limit + 1` rows, and continue strictly below the last returned sequence.

@@ -7,10 +7,12 @@ use tokio::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{Captured, SandboxSpec};
+use crate::model::{Captured, CommandStatus, RuntimeDiagnostic, SandboxSpec};
 
 pub mod fake;
 pub mod kiln;
+mod kiln_process;
+mod kiln_protocol;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -24,6 +26,8 @@ pub enum RuntimeError {
     /// Running the backend at all failed (missing binary, I/O error).
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Incompatible(String),
 }
 
 pub struct ExecSpec<'a> {
@@ -34,17 +38,17 @@ pub struct ExecSpec<'a> {
     pub max_output: usize,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecFinish {
-    /// The command's exit code, or 128 + signal number.
-    Exited(i32),
+    Completed,
     TimedOut,
     Canceled,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecOutcome {
-    pub finish: ExecFinish,
+    pub finish: Result<ExecFinish, RuntimeDiagnostic>,
+    pub command_status: Option<CommandStatus>,
     pub stdout: Captured,
     pub stderr: Captured,
 }
@@ -85,6 +89,14 @@ pub trait Runtime: Send + Sync + 'static {
         spec: &SandboxSpec,
     ) -> impl Future<Output = Result<String, RuntimeError>> + Send;
 
+    /// Side-effect-free validation of an existing sandbox's execution protocol.
+    fn validate_sandbox(
+        &self,
+        id: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> impl Future<Output = Result<(), RuntimeError>> + Send;
+
     /// Runs one command and waits for it. A pre-canceled token must be honored.
     /// When the timeout passes or `cancel` fires, the command and all of its
     /// descendants must be stopped inside the sandbox, all I/O resources must
@@ -95,7 +107,7 @@ pub trait Runtime: Send + Sync + 'static {
         id: &str,
         spec: &ExecSpec<'_>,
         cancel: &CancellationToken,
-    ) -> impl Future<Output = Result<ExecOutcome, RuntimeError>> + Send;
+    ) -> impl Future<Output = ExecOutcome> + Send;
 
     /// Removes a sandbox and waits until its resources are released.
     fn remove(&self, id: &str) -> impl Future<Output = Result<(), RuntimeError>> + Send;

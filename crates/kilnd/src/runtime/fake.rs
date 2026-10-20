@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use super::{
     BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError,
 };
-use crate::model::{Captured, SandboxSpec};
+use crate::model::{
+    Captured, CommandStatus, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage, SandboxSpec,
+};
 
 /// A deterministic one-shot pause for lifecycle tests. Tests wait for
 /// `entered`, cancel a caller or begin shutdown, then explicitly `release`.
@@ -96,6 +98,7 @@ pub struct FakeState {
     pub remove_before_delete: Option<FakeGate>,
     /// When set, `list` and `version` fail, like a missing kiln binary.
     pub unavailable: bool,
+    pub incompatible_sandboxes: Vec<String>,
     next: u64,
 }
 
@@ -152,7 +155,8 @@ fn exited(code: i32, stdout: Vec<u8>, max: usize) -> ExecOutcome {
     let total = stdout.len() as u64;
     let data = stdout[..stdout.len().min(max)].to_vec();
     ExecOutcome {
-        finish: ExecFinish::Exited(code),
+        finish: Ok(ExecFinish::Completed),
+        command_status: Some(CommandStatus::Exited(code)),
         stdout: Captured {
             data,
             total_bytes: total,
@@ -216,20 +220,41 @@ impl Runtime for FakeRuntime {
         Ok(id)
     }
 
-    async fn exec(
+    async fn validate_sandbox(
         &self,
         id: &str,
-        spec: &ExecSpec<'_>,
-        cancel: &CancellationToken,
-    ) -> Result<ExecOutcome, RuntimeError> {
-        self.running(id)?;
+        _deadline: tokio::time::Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<(), RuntimeError> {
+        if self.state().incompatible_sandboxes.iter().any(|s| s == id) {
+            return Err(RuntimeError::Incompatible(format!(
+                "sandbox {id} incompatible"
+            )));
+        }
+        self.running(id)
+    }
+
+    async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> ExecOutcome {
+        if let Err(e) = self.running(id) {
+            return ExecOutcome {
+                finish: Err(RuntimeDiagnostic::new(
+                    RuntimeErrorKind::NotFound,
+                    RuntimeStage::Connect,
+                    e.to_string(),
+                )),
+                command_status: None,
+                stdout: Default::default(),
+                stderr: Default::default(),
+            };
+        }
         if cancel.is_cancelled() {
             self.state().canceled_execs += 1;
-            return Ok(ExecOutcome {
-                finish: ExecFinish::Canceled,
+            return ExecOutcome {
+                finish: Ok(ExecFinish::Canceled),
+                command_status: None,
                 stdout: Captured::default(),
                 stderr: Captured::default(),
-            });
+            };
         }
         let (gate, panic_exec) = {
             let mut state = self.state();
@@ -246,7 +271,7 @@ impl Runtime for FakeRuntime {
         }
         assert!(!panic_exec, "injected fake exec panic");
         let args = &spec.argv[1..];
-        Ok(match spec.argv[0].as_str() {
+        match spec.argv[0].as_str() {
             "echo" => exited(
                 0,
                 format!("{}\n", args.join(" ")).into_bytes(),
@@ -267,7 +292,8 @@ impl Runtime for FakeRuntime {
                 let total = args.first().and_then(|a| a.parse().ok()).unwrap_or(0);
                 let kept = total.min(spec.max_output);
                 ExecOutcome {
-                    finish: ExecFinish::Exited(0),
+                    finish: Ok(ExecFinish::Completed),
+                    command_status: Some(CommandStatus::Exited(0)),
                     stdout: Captured {
                         data: vec![b'x'; kept],
                         total_bytes: total as u64,
@@ -287,24 +313,62 @@ impl Runtime for FakeRuntime {
                     },
                 };
                 ExecOutcome {
-                    finish,
+                    finish: Ok(finish),
+                    command_status: None,
                     stdout: Captured::default(),
                     stderr: Captured::default(),
                 }
             }
             "vanish" => {
                 self.state().sandboxes.remove(id);
-                return Err(RuntimeError::NotFound(id.to_string()));
+                ExecOutcome {
+                    finish: Err(RuntimeDiagnostic::new(
+                        RuntimeErrorKind::NotFound,
+                        RuntimeStage::Connect,
+                        format!("sandbox {id} not found in backend"),
+                    )),
+                    command_status: None,
+                    stdout: Default::default(),
+                    stderr: Default::default(),
+                }
             }
+            "signal" => ExecOutcome {
+                command_status: Some(CommandStatus::Signaled {
+                    signal: args.first().and_then(|s| s.parse().ok()).unwrap_or(15),
+                    core_dumped: args.get(1).is_some_and(|s| s == "core"),
+                }),
+                ..exited(0, vec![], spec.max_output)
+            },
+            "invalid-completed" => ExecOutcome {
+                command_status: None,
+                ..exited(0, b"saved".to_vec(), spec.max_output)
+            },
+            "runtime-failure" => ExecOutcome {
+                finish: Err(RuntimeDiagnostic::new(
+                    RuntimeErrorKind::Io,
+                    RuntimeStage::Capture,
+                    "injected binary evidence failure",
+                )),
+                command_status: Some(CommandStatus::Exited(125)),
+                stdout: Captured {
+                    data: b"\0\xffout"[..5.min(spec.max_output)].to_vec(),
+                    total_bytes: 99,
+                },
+                stderr: Captured {
+                    data: b"\0\xfeerr"[..5.min(spec.max_output)].to_vec(),
+                    total_bytes: 101,
+                },
+            },
             _ => ExecOutcome {
-                finish: ExecFinish::Exited(127),
+                finish: Ok(ExecFinish::Completed),
+                command_status: Some(CommandStatus::Exited(127)),
                 stdout: Captured::default(),
                 stderr: Captured {
                     data: b"not found\n".to_vec(),
                     total_bytes: 10,
                 },
             },
-        })
+        }
     }
 
     async fn remove(&self, id: &str) -> Result<(), RuntimeError> {

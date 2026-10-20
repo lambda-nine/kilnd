@@ -15,8 +15,8 @@ use tracing::{info, warn};
 
 use crate::admission::{Admission, AdmissionSnapshot};
 use crate::model::{
-    Captured, Execution, ExecutionState, Network, Sandbox, SandboxSpec, SandboxState, new_id,
-    now_ms, valid_id,
+    Captured, CommandStatus, Execution, ExecutionState, Network, RuntimeDiagnostic,
+    RuntimeErrorKind, RuntimeStage, Sandbox, SandboxSpec, SandboxState, new_id, now_ms, valid_id,
 };
 use crate::runtime::{BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
 use crate::store::{ExecutionResult, Store};
@@ -314,6 +314,11 @@ impl<R: Runtime> Manager<R> {
     /// removes a sandbox kilnd didn't create, and never marks anything lost
     /// unless the backend's list succeeded.
     pub async fn reconcile(&self) -> Result<Reconciled> {
+        let cancel = CancellationToken::new();
+        self.runtime
+            .version(Instant::now() + self.limits.health_probe_timeout, &cancel)
+            .await
+            .map_err(backend)?;
         let mut out = Reconciled {
             gc_removed: self.runtime.gc().await.map_err(backend)?,
             ..Default::default()
@@ -327,8 +332,27 @@ impl<R: Runtime> Manager<R> {
             .map(|s| (s.id, s.status))
             .collect();
         let mut known = std::collections::HashSet::new();
-
-        for s in self.store.sandboxes(true)? {
+        let sandboxes = self.store.sandboxes(true)?;
+        // Check all candidates before any durable reconciliation mutation.
+        for s in &sandboxes {
+            if s.backend == self.runtime.name()
+                && matches!(s.state, SandboxState::Creating | SandboxState::Ready)
+            {
+                if let Some(id) = &s.backend_id {
+                    if live.get(id) == Some(&BackendStatus::Running) {
+                        self.runtime
+                            .validate_sandbox(
+                                id,
+                                Instant::now() + self.limits.health_probe_timeout,
+                                &cancel,
+                            )
+                            .await
+                            .map_err(backend)?;
+                    }
+                }
+            }
+        }
+        for s in sandboxes {
             if s.backend != self.runtime.name() {
                 continue;
             }
@@ -936,6 +960,8 @@ impl<R: Runtime> Manager<R> {
             argv: req.argv,
             state: ExecutionState::Running,
             exit_code: None,
+            command_status: None,
+            runtime_error: None,
             failure_reason: None,
             started_at_ms: now_ms(),
             finished_at_ms: None,
@@ -967,11 +993,12 @@ impl<R: Runtime> Manager<R> {
         let backend_cancel = cancel.clone();
         let mut backend = tokio::spawn(async move {
             if backend_cancel.token.is_cancelled() {
-                return Ok(ExecOutcome {
-                    finish: ExecFinish::Canceled,
+                return ExecOutcome {
+                    finish: Ok(ExecFinish::Canceled),
+                    command_status: None,
                     stdout: Captured::default(),
                     stderr: Captured::default(),
-                });
+                };
             }
             let spec = ExecSpec {
                 argv: &argv,
@@ -998,8 +1025,8 @@ impl<R: Runtime> Manager<R> {
         };
         slot.running.lock().unwrap().take();
 
-        let (outcome, task_failure) = match joined {
-            Ok(outcome) => (Some(outcome), None),
+        let mut outcome = match joined {
+            Ok(outcome) => outcome,
             Err(join) => {
                 let reason = if join.is_panic() {
                     "backend exec task panicked"
@@ -1007,40 +1034,48 @@ impl<R: Runtime> Manager<R> {
                     "backend exec task was canceled"
                 };
                 warn!(sandbox = %sandbox.id, execution = %execution.id, error = reason, "exec backend task failed");
-                (None, Some(reason))
+                ExecOutcome {
+                    finish: Err(RuntimeDiagnostic::new(
+                        RuntimeErrorKind::Internal,
+                        RuntimeStage::Report,
+                        reason,
+                    )),
+                    command_status: None,
+                    stdout: Captured::default(),
+                    stderr: Captured::default(),
+                }
             }
         };
-        let (state, exit_code, reason) = match &outcome {
-            Some(Ok(o)) => match o.finish {
-                ExecFinish::Exited(code) => (ExecutionState::Exited, Some(code), None),
-                ExecFinish::TimedOut => (
-                    ExecutionState::TimedOut,
-                    None,
-                    Some(format!("timed out after {} ms", timeout.as_millis())),
-                ),
-                ExecFinish::Canceled => {
-                    let why = cancel
-                        .reason()
-                        .map_or("backend canceled execution", ExecCancelReason::message);
-                    (ExecutionState::Canceled, None, Some(why.to_string()))
-                }
-            },
-            Some(Err(e)) => (ExecutionState::Failed, None, Some(e.to_string())),
-            None => (
-                ExecutionState::Failed,
+        if outcome.finish == Ok(ExecFinish::Completed) && outcome.command_status.is_none() {
+            outcome.finish = Err(RuntimeDiagnostic::new(
+                RuntimeErrorKind::Internal,
+                RuntimeStage::Report,
+                "backend reported completion without command status",
+            ));
+        }
+        let (state, exit_code, reason) = match &outcome.finish {
+            Ok(ExecFinish::Completed) => (
+                ExecutionState::Exited,
+                outcome
+                    .command_status
+                    .as_ref()
+                    .map(CommandStatus::legacy_projection),
                 None,
-                Some(
-                    task_failure
-                        .unwrap_or("backend exec task stopped")
-                        .to_string(),
-                ),
             ),
+            Ok(ExecFinish::TimedOut) => (
+                ExecutionState::TimedOut,
+                None,
+                Some(format!("timed out after {} ms", timeout.as_millis())),
+            ),
+            Ok(ExecFinish::Canceled) => {
+                let why = cancel
+                    .reason()
+                    .map_or("backend canceled execution", ExecCancelReason::message);
+                (ExecutionState::Canceled, None, Some(why.to_string()))
+            }
+            Err(e) => (ExecutionState::Failed, None, Some(e.message.clone())),
         };
-        let empty = Captured::default();
-        let (stdout, stderr) = match &outcome {
-            Some(Ok(o)) => (&o.stdout, &o.stderr),
-            None | Some(Err(_)) => (&empty, &empty),
-        };
+        let (stdout, stderr) = (&outcome.stdout, &outcome.stderr);
         let mut retry_delay = Duration::from_millis(10);
         let mut finalization_degraded = false;
         loop {
@@ -1049,6 +1084,8 @@ impl<R: Runtime> Manager<R> {
                 &ExecutionResult {
                     state,
                     exit_code,
+                    command_status: outcome.command_status.as_ref(),
+                    runtime_error: outcome.finish.as_ref().err(),
                     failure_reason: reason.as_deref(),
                     stdout,
                     stderr,
@@ -1069,7 +1106,7 @@ impl<R: Runtime> Manager<R> {
         if finalization_degraded {
             self.finalization_failures.fetch_sub(1, Ordering::Relaxed);
         }
-        if matches!(&outcome, Some(Err(RuntimeError::NotFound(_)))) {
+        if matches!(&outcome.finish, Err(d) if d.kind == RuntimeErrorKind::NotFound) {
             let why = format!("backend sandbox {backend_id} disappeared during an execution");
             warn!(sandbox = %sandbox.id, "{why}");
             if let Err(error) = self.store.mark_sandbox_lost_if_ready(&sandbox.id, &why) {

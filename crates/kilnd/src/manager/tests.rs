@@ -642,6 +642,127 @@ async fn exec_records_the_result() {
 }
 
 #[tokio::test]
+async fn typed_status_and_failed_binary_evidence_survive_publication_retry() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let exit = m.exec(exec_req(&s.id, &["exit", "125"])).await.unwrap();
+    assert_eq!(exit.command_status, Some(CommandStatus::Exited(125)));
+    assert_eq!(exit.exit_code, Some(125));
+    assert!(exit.runtime_error.is_none());
+    let signal = m
+        .exec(exec_req(&s.id, &["signal", "15", "core"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        signal.command_status,
+        Some(CommandStatus::Signaled {
+            signal: 15,
+            core_dumped: true
+        })
+    );
+    assert_eq!(signal.exit_code, Some(143));
+    m.store.reject_execution_finishes().unwrap();
+    let task = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.exec(exec_req(&id, &["runtime-failure"])).await }
+    });
+    while fake.state().exec_calls.len() < 3 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let health = m.health().await.unwrap();
+            if !health.serving && health.detail.contains("finalization write") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal UPDATE was never rejected/degraded");
+    assert!(
+        !task.is_finished(),
+        "publication escaped while writes were rejected"
+    );
+    assert_eq!(m.admission.snapshot().execs.current, 1);
+    m.store.allow_execution_finishes().unwrap();
+    let failed = task.await.unwrap().unwrap();
+    assert_eq!(failed.state, ExecutionState::Failed);
+    assert_eq!(failed.exit_code, None);
+    assert_eq!(failed.command_status, Some(CommandStatus::Exited(125)));
+    assert_eq!(
+        failed.runtime_error.as_ref().unwrap().kind,
+        RuntimeErrorKind::Io
+    );
+    assert_eq!(
+        failed.stdout,
+        Captured {
+            data: b"\0\xffout".to_vec(),
+            total_bytes: 99
+        }
+    );
+    assert_eq!(
+        failed.stderr,
+        Captured {
+            data: b"\0\xfeerr".to_vec(),
+            total_bytes: 101
+        }
+    );
+    assert_eq!(m.execution(&failed.id).unwrap(), failed);
+    let metadata = &m.get(&s.id, 1).unwrap().1[0];
+    assert_eq!(metadata.command_status, failed.command_status);
+    assert_eq!(metadata.runtime_error, failed.runtime_error);
+}
+
+#[tokio::test]
+async fn completed_without_status_fails_without_losing_output() {
+    let (m, _) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let out = m
+        .exec(exec_req(&s.id, &["invalid-completed"]))
+        .await
+        .unwrap();
+    assert_eq!(out.state, ExecutionState::Failed);
+    assert_eq!(out.exit_code, None);
+    assert_eq!(out.stdout.data, b"saved");
+    let d = out.runtime_error.unwrap();
+    assert_eq!(
+        (d.kind, d.stage),
+        (RuntimeErrorKind::Internal, RuntimeStage::Report)
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_checks_all_live_capabilities_before_state_changes() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    fake.state()
+        .incompatible_sandboxes
+        .push(s.backend_id.clone().unwrap());
+    let mut interrupted = m.exec(exec_req(&s.id, &["true"])).await.unwrap();
+    interrupted.id = new_id("ex");
+    interrupted.state = ExecutionState::Running;
+    m.store.insert_execution(&interrupted).unwrap();
+    let before = m.store.sandboxes(true).unwrap();
+    assert!(m.reconcile().await.is_err());
+    assert_eq!(m.store.sandboxes(true).unwrap(), before);
+    assert_eq!(
+        m.execution(&interrupted.id).unwrap().state,
+        ExecutionState::Running
+    );
+    assert!(fake.state().removed.is_empty());
+    fake.state().unavailable = true;
+    let gc_runs = fake.state().gc_runs;
+    assert!(m.reconcile().await.is_err());
+    assert_eq!(
+        fake.state().gc_runs,
+        gc_runs,
+        "global validation must precede gc"
+    );
+}
+
+#[tokio::test]
 async fn an_unpolled_exec_does_nothing() {
     let (m, fake) = manager();
     let s = m.create(CreateRequest::default()).await.unwrap();

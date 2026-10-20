@@ -31,7 +31,8 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   code is not copied or linked.
 - **SQLite state** in `/var/lib/kilnd/kilnd.db` (directory 0700): sandboxes
   with their effective spec, backend ID, state, timestamps and failure
-  reason; executions with argv, state, exit code, failure reason, timeout,
+  reason; executions with argv, state, legacy exit code, typed termination,
+  runtime diagnostics, failure reason, timeout,
   timestamps, and stdout/stderr (first 1 MiB of each kept, total byte counts
   and a truncation flag).
 - **Startup reconciliation** with `kiln gc` and `kiln ls`: ready sandboxes
@@ -81,6 +82,14 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
 
 Sandboxes outlive kilnd: restarting or upgrading the daemon leaves them
 running, and reconciliation picks them up again.
+
+kilnd requires persistent-exec protocol v1 in both the installed kiln CLI and
+each sandbox PID 1. It checks capabilities before reconciliation and Exec;
+old sandbox instances require explicit recreation. Command bytes use private
+streams, so real exits 125/126/127 and signal termination remain distinct from
+runtime failures. Schema 3 stores this typed evidence; v1/v2 databases migrate
+at open and older binaries refuse the result. See [setup](docs/setup.md) before
+upgrading.
 
 These bounds do not provide tenant fairness: authorized callers can monopolize
 capacity, including with slow connections. Messages decode before service RPC

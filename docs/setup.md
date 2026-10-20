@@ -33,8 +33,14 @@ sudo scripts/setup-storage.sh       # XFS project quotas for --disk
 scripts/install.sh                  # /usr/local/bin/kiln, kiln-dns, kiln-metrics
 ```
 
-kilnd needs kiln at or after commit `3b42552` (per-execution cgroup teardown,
-PID 1 hardening, and exit code 125).
+kilnd requires persistent-exec protocol v1, first supplied by kiln commit
+`f3da4b5319566de4912ed617caf81d4eb8e50b6f`, with follow-up
+`711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on baseline `3b42552`.
+Install that exact compatible artifact, then check
+`kiln capabilities --protocol=1` (binary output). kilnd validates capabilities,
+rather than trusting `--version`. Existing sandboxes need compatible PID 1
+instances too; an old instance requires explicit recreation. An incompatible
+replacement CLI degrades Health and is rejected before workload launch.
 
 ## 3. kilnd in the VM
 
@@ -119,8 +125,12 @@ than the deadline. Tickets remain held while finalization retries.
 opaque `next_page_token` until empty, keeping `include_deleted` unchanged.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
-bounds. Schema v1 upgrades transactionally to v2 with stable list sequences;
-older binaries refuse the newer database, so keep a backup before upgrading.
+bounds. Schema v1 upgrades through v2 to v3; v2 upgrades to v3. Schema 3 stores
+typed termination and runtime diagnostics together with output and terminal
+state, while historical records retain unknown typed values. Schema-1/2
+binaries refuse schema 3, so keep a backup before upgrading. Store migration
+may occur before startup capability validation fails; installing an older
+daemon is not a database downgrade path.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart.

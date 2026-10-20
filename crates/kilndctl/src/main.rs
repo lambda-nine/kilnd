@@ -257,19 +257,24 @@ async fn run(cli: Cli) -> Result<u8> {
                 .into_inner()
                 .execution
                 .context("response has no execution")?;
-            println!("id:       {}", e.id);
-            println!("sandbox:  {}", e.sandbox_id);
-            println!("argv:     {}", shell_words(&e.argv));
-            println!("state:    {}", execution_state(e.state));
+            write_execution_streams(
+                &e,
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )?;
+            eprintln!("id:       {}", e.id);
+            eprintln!("sandbox:  {}", e.sandbox_id);
+            eprintln!("argv:     {}", shell_words(&e.argv));
+            eprintln!("state:    {}", execution_state(e.state));
             if let Some(code) = e.exit_code {
-                println!("exit:     {code}");
+                eprintln!("exit:     {code}");
             }
             if !e.failure_reason.is_empty() {
-                println!("reason:   {}", e.failure_reason);
+                eprintln!("reason:   {}", e.failure_reason);
             }
-            println!("started:  {}", time(e.started_at_unix_ms));
-            println!("finished: {}", time(e.finished_at_unix_ms));
-            println!("timeout:  {} ms", e.timeout_ms);
+            eprintln!("started:  {}", time(e.started_at_unix_ms));
+            eprintln!("finished: {}", time(e.finished_at_unix_ms));
+            eprintln!("timeout:  {} ms", e.timeout_ms);
             for (name, out) in [("stdout", &e.stdout), ("stderr", &e.stderr)] {
                 let out = out.clone().unwrap_or_default();
                 let note = if out.truncated {
@@ -277,10 +282,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 } else {
                     String::new()
                 };
-                println!("{name}:   {} bytes{note}", out.total_bytes);
-                for line in String::from_utf8_lossy(&out.data).lines() {
-                    println!("  | {line}");
-                }
+                eprintln!("{name}:   {} bytes{note}", out.total_bytes);
             }
             Ok(0)
         }
@@ -429,22 +431,11 @@ async fn exec(
         .into_inner()
         .execution
         .context("response has no execution")?;
-    let (out, err) = (
-        e.stdout.clone().unwrap_or_default(),
-        e.stderr.clone().unwrap_or_default(),
-    );
-    std::io::stdout().write_all(&out.data)?;
-    std::io::stdout().flush()?;
-    std::io::stderr().write_all(&err.data)?;
-    for (name, o) in [("stdout", &out), ("stderr", &err)] {
-        if o.truncated {
-            eprintln!(
-                "kilndctl: {name} truncated: kept {} of {} bytes",
-                o.data.len(),
-                o.total_bytes
-            );
-        }
-    }
+    write_execution_streams(
+        &e,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )?;
     let state = pb::ExecutionState::try_from(e.state).unwrap_or(pb::ExecutionState::Unspecified);
     if opts.verbose || state != pb::ExecutionState::Exited {
         let reason = if e.failure_reason.is_empty() {
@@ -463,6 +454,65 @@ async fn exec(
         pb::ExecutionState::TimedOut => EXIT_TIMED_OUT,
         _ => EXIT_FAILED,
     })
+}
+
+fn write_execution_streams(
+    e: &pb::Execution,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> std::io::Result<()> {
+    let empty = pb::Output::default();
+    let out = e.stdout.as_ref().unwrap_or(&empty);
+    let err = e.stderr.as_ref().unwrap_or(&empty);
+    stdout.write_all(&out.data)?;
+    stdout.flush()?;
+    stderr.write_all(&err.data)?;
+    stderr.flush()?;
+    if let Some(pb::command_status::Termination::Signal(signal)) = e
+        .command_status
+        .as_ref()
+        .and_then(|s| s.termination.as_ref())
+    {
+        writeln!(
+            stderr,
+            "kilndctl: terminated by signal {}{}",
+            signal.number,
+            if signal.core_dumped {
+                " (core dumped)"
+            } else {
+                ""
+            }
+        )?;
+    }
+    if let Some(d) = &e.runtime_error {
+        writeln!(
+            stderr,
+            "kilndctl: runtime {:?}/{:?}: {}{}{}",
+            pb::RuntimeErrorKind::try_from(d.kind).unwrap_or_default(),
+            pb::RuntimeStage::try_from(d.stage).unwrap_or_default(),
+            d.message,
+            d.native_code
+                .as_ref()
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default(),
+            if d.message_truncated {
+                " [truncated]"
+            } else {
+                ""
+            }
+        )?;
+    }
+    for (name, o) in [("stdout", out), ("stderr", err)] {
+        if o.truncated {
+            writeln!(
+                stderr,
+                "kilndctl: {name} truncated: kept {} of {} bytes",
+                o.data.len(),
+                o.total_bytes
+            )?;
+        }
+    }
+    stderr.flush()
 }
 
 fn print_sandbox(s: &pb::Sandbox) {
@@ -647,6 +697,53 @@ fn time(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_state_writes_binary_captures_before_typed_diagnostics() {
+        for state in [
+            pb::ExecutionState::Running,
+            pb::ExecutionState::Exited,
+            pb::ExecutionState::TimedOut,
+            pb::ExecutionState::Canceled,
+            pb::ExecutionState::Failed,
+            pb::ExecutionState::Interrupted,
+        ] {
+            let e = pb::Execution {
+                state: state as i32,
+                stdout: Some(pb::Output {
+                    data: b"\0\xffout".to_vec(),
+                    total_bytes: 99,
+                    truncated: true,
+                }),
+                stderr: Some(pb::Output {
+                    data: b"\0\xfeerr".to_vec(),
+                    total_bytes: 5,
+                    truncated: false,
+                }),
+                command_status: Some(pb::CommandStatus {
+                    termination: Some(pb::command_status::Termination::Signal(pb::SignalStatus {
+                        number: 15,
+                        core_dumped: true,
+                    })),
+                }),
+                runtime_error: Some(pb::RuntimeDiagnostic {
+                    kind: pb::RuntimeErrorKind::Io as i32,
+                    stage: pb::RuntimeStage::Capture as i32,
+                    message: "lost reader".into(),
+                    native_code: Some("errno:5".into()),
+                    message_truncated: false,
+                }),
+                ..Default::default()
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            write_execution_streams(&e, &mut out, &mut err).unwrap();
+            assert_eq!(out, b"\0\xffout");
+            assert!(err.starts_with(b"\0\xfeerrkilndctl: terminated by signal 15 (core dumped)\n"));
+            let diagnostics = String::from_utf8_lossy(&err[5..]);
+            assert!(diagnostics.contains("runtime Io/Capture: lost reader (errno:5)"));
+            assert!(diagnostics.contains("stdout truncated: kept 5 of 99 bytes"));
+        }
+    }
 
     #[test]
     fn parses_sizes() {

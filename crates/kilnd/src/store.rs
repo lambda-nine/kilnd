@@ -15,10 +15,18 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::lock::ExclusiveFileLock;
 use crate::model::{
-    Captured, Execution, ExecutionState, Sandbox, SandboxSpec, SandboxState, now_ms,
+    Captured, CommandStatus, Execution, ExecutionState, RuntimeDiagnostic, Sandbox, SandboxSpec,
+    SandboxState, now_ms,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+const MIGRATE_V3: &str = "
+ALTER TABLE executions ADD COLUMN command_status_kind TEXT;
+ALTER TABLE executions ADD COLUMN command_status_value INTEGER;
+ALTER TABLE executions ADD COLUMN command_core_dumped INTEGER;
+ALTER TABLE executions ADD COLUMN runtime_error TEXT;
+PRAGMA user_version = 3;";
 
 const SCHEMA: &str = "
 CREATE TABLE sandboxes (
@@ -54,7 +62,11 @@ CREATE TABLE executions (
     stdout_truncated INTEGER NOT NULL DEFAULT 0,
     stderr           BLOB NOT NULL DEFAULT x'',
     stderr_bytes     INTEGER NOT NULL DEFAULT 0,
-    stderr_truncated INTEGER NOT NULL DEFAULT 0
+    stderr_truncated INTEGER NOT NULL DEFAULT 0,
+    command_status_kind TEXT,
+    command_status_value INTEGER,
+    command_core_dumped INTEGER,
+    runtime_error TEXT
 );
 CREATE INDEX executions_sandbox ON executions (sandbox_id, started_at_ms);
 CREATE INDEX executions_state ON executions (state);
@@ -73,6 +85,8 @@ pub struct Store {
 pub struct ExecutionResult<'a> {
     pub state: ExecutionState,
     pub exit_code: Option<i32>,
+    pub command_status: Option<&'a CommandStatus>,
+    pub runtime_error: Option<&'a RuntimeDiagnostic>,
     pub failure_reason: Option<&'a str>,
     pub stdout: &'a Captured,
     pub stderr: &'a Captured,
@@ -142,7 +156,13 @@ impl Store {
                     CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);
                     CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';
                     PRAGMA user_version = 2;")?;
-                tx.commit().context("migrate schema v1 to v2")?;
+                tx.execute_batch(MIGRATE_V3)?;
+                tx.commit().context("migrate schema v1 to v3")?;
+            }
+            2 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch(MIGRATE_V3)?;
+                tx.commit().context("migrate schema v2 to v3")?;
             }
             SCHEMA_VERSION => {}
             v => bail!("database schema version {v} is newer than this kilnd ({SCHEMA_VERSION})"),
@@ -315,10 +335,46 @@ impl Store {
         if self.reject_execution_finishes.load(Ordering::SeqCst) {
             bail!("injected execution finalization failure");
         }
+        let (status_kind, status_value, core_dumped) = match r.command_status {
+            Some(CommandStatus::Exited(code)) => (Some("exited"), Some(*code), None),
+            Some(CommandStatus::Signaled {
+                signal,
+                core_dumped,
+            }) => (Some("signaled"), Some(*signal), Some(*core_dumped)),
+            None => (None, None, None),
+        };
+        // Bound diagnostics again at the persistence boundary.
+        let runtime_error = r
+            .runtime_error
+            .map(|d| {
+                let mut bounded = RuntimeDiagnostic::new(d.kind, d.stage, &d.message);
+                bounded.native_code = d.native_code.as_ref().map(|code| {
+                    let mut end = code.len().min(128);
+                    while !code.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    if end < code.len() {
+                        bounded = RuntimeDiagnostic::new(
+                            d.kind,
+                            d.stage,
+                            format!(
+                                "native_code truncated to 128 UTF-8 bytes; {}",
+                                bounded.message
+                            ),
+                        );
+                        bounded.message_truncated = true;
+                    }
+                    code[..end].to_owned()
+                });
+                bounded.message_truncated |= d.message_truncated;
+                serde_json::to_string(&bounded)
+            })
+            .transpose()?;
         let n = self.conn().execute(
             "UPDATE executions SET state = ?2, exit_code = ?3, failure_reason = ?4, finished_at_ms = ?5,
                  stdout = ?6, stdout_bytes = ?7, stdout_truncated = ?8,
-                 stderr = ?9, stderr_bytes = ?10, stderr_truncated = ?11
+                 stderr = ?9, stderr_bytes = ?10, stderr_truncated = ?11,
+                 command_status_kind = ?12, command_status_value = ?13, command_core_dumped = ?14, runtime_error = ?15
              WHERE id = ?1 AND state = 'running'",
             params![
                 id,
@@ -331,7 +387,7 @@ impl Store {
                 r.stdout.truncated(),
                 r.stderr.data,
                 r.stderr.total_bytes as i64,
-                r.stderr.truncated()
+                r.stderr.truncated(), status_kind, status_value, core_dumped, runtime_error
             ],
         )?;
         if n != 1 {
@@ -465,11 +521,13 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
 
 const EXECUTION_COLUMNS: &str =
     "id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
-    started_at_ms, finished_at_ms, stdout, stdout_bytes, stderr, stderr_bytes";
+    started_at_ms, finished_at_ms, stdout, stdout_bytes, stderr, stderr_bytes,
+    command_status_kind, command_status_value, command_core_dumped, runtime_error";
 
 const EXECUTION_METADATA_COLUMNS: &str =
     "id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
-    started_at_ms, finished_at_ms, x'', stdout_bytes, x'', stderr_bytes";
+    started_at_ms, finished_at_ms, x'', stdout_bytes, x'', stderr_bytes,
+    command_status_kind, command_status_value, command_core_dumped, runtime_error";
 
 fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
     let id: String = row.get(0)?;
@@ -483,6 +541,26 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
             state: ExecutionState::parse(&state)
                 .with_context(|| format!("execution {id}: unknown state {state:?}"))?,
             exit_code: row.get(4)?,
+            command_status: match (
+                row.get::<_, Option<String>>(14)?.as_deref(),
+                row.get::<_, Option<i32>>(15)?,
+                row.get::<_, Option<bool>>(16)?,
+            ) {
+                (None, None, None) => None,
+                (Some("exited"), Some(code), None) => Some(CommandStatus::Exited(code)),
+                (Some("signaled"), Some(signal), Some(core_dumped)) => {
+                    Some(CommandStatus::Signaled {
+                        signal,
+                        core_dumped,
+                    })
+                }
+                _ => bail!("execution {id}: invalid command status"),
+            },
+            runtime_error: row
+                .get::<_, Option<String>>(17)?
+                .map(|json| serde_json::from_str::<RuntimeDiagnostic>(&json))
+                .transpose()
+                .context("invalid runtime diagnostic")?,
             failure_reason: row.get(5)?,
             timeout_ms: row.get(6)?,
             stdin_bytes: row.get::<_, i64>(7)? as u64,
@@ -506,6 +584,180 @@ mod tests {
     use super::*;
     use crate::model::{Network, new_id};
     use std::collections::BTreeMap;
+
+    fn schema_v2() -> String {
+        SCHEMA.replace(",\n    command_status_kind TEXT,\n    command_status_value INTEGER,\n    command_core_dumped INTEGER,\n    runtime_error TEXT", "")
+    }
+
+    #[test]
+    fn fresh_v3_and_historical_v1_v2_keep_unknown_status_null() {
+        let fresh = Store::open_in_memory().unwrap();
+        assert_eq!(
+            fresh
+                .conn()
+                .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            3
+        );
+        for version in [1, 2] {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
+            let mut schema = schema_v2();
+            if version == 1 {
+                schema=schema.replace(",\n    list_seq       INTEGER NOT NULL","")
+                    .replace("CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);","")
+                    .replace("CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';","");
+            }
+            conn.execute_batch(&schema).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            let mut s = sandbox();
+            s.state = SandboxState::Ready;
+            let list_column = if version == 2 { ", list_seq" } else { "" };
+            let list_value = if version == 2 { ", 1" } else { "" };
+            conn.execute(&format!("INSERT INTO sandboxes (id,backend,state,spec,created_at_ms,updated_at_ms{list_column}) VALUES (?1,'fake','ready',?2,1,1{list_value})"),params![s.id,serde_json::to_string(&s.spec).unwrap()]).unwrap();
+            conn.execute("INSERT INTO executions (id,sandbox_id,argv,state,exit_code,timeout_ms,stdin_bytes,started_at_ms) VALUES ('old',?1,'[]','exited',143,1,0,1)",[&s.id]).unwrap();
+            conn.execute("INSERT INTO executions (id,sandbox_id,argv,state,timeout_ms,stdin_bytes,started_at_ms) VALUES ('running',?1,'[]','running',1,0,2)",[&s.id]).unwrap();
+            drop(conn);
+            let store = Store::open(tmp.path()).unwrap();
+            assert_eq!(
+                store
+                    .conn()
+                    .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                    .unwrap(),
+                3
+            );
+            let historical = store.execution("old").unwrap().unwrap();
+            assert_eq!(historical.exit_code, Some(143));
+            assert!(historical.command_status.is_none() && historical.runtime_error.is_none());
+            store.interrupt_running_executions("restart").unwrap();
+            let interrupted = store.execution("running").unwrap().unwrap();
+            assert_eq!(interrupted.state, ExecutionState::Interrupted);
+            assert!(interrupted.command_status.is_none() && interrupted.runtime_error.is_none());
+            drop(store);
+            let reopened = Store::open(tmp.path()).unwrap();
+            assert_eq!(reopened.execution("old").unwrap().unwrap(), historical);
+            assert_eq!(reopened.execution("running").unwrap().unwrap(), interrupted);
+        }
+    }
+
+    #[test]
+    fn typed_failure_binary_capture_and_utf8_bounded_diagnostic_reopen_atomically() {
+        use crate::model::{RuntimeErrorKind, RuntimeStage};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let s = sandbox();
+        store.insert_sandbox(&s).unwrap();
+        let e = execution(&s.id);
+        store.insert_execution(&e).unwrap();
+        let mut d = RuntimeDiagnostic::new(
+            RuntimeErrorKind::Io,
+            RuntimeStage::Capture,
+            "é".repeat(1025),
+        );
+        d.native_code = Some("errno:5".into());
+        assert_eq!(d.message.len(), 2048);
+        assert!(d.message_truncated);
+        let out = Captured {
+            data: b"\0\xffout".to_vec(),
+            total_bytes: 999,
+        };
+        let err = Captured {
+            data: b"\0\xfeerr".to_vec(),
+            total_bytes: 1001,
+        };
+        let status = CommandStatus::Signaled {
+            signal: 15,
+            core_dumped: true,
+        };
+        store
+            .finish_execution(
+                &e.id,
+                &ExecutionResult {
+                    state: ExecutionState::Failed,
+                    exit_code: None,
+                    command_status: Some(&status),
+                    runtime_error: Some(&d),
+                    failure_reason: Some(&d.message),
+                    stdout: &out,
+                    stderr: &err,
+                },
+            )
+            .unwrap();
+        let full = store.execution(&e.id).unwrap().unwrap();
+        let meta = store.recent_executions(&s.id, 1).unwrap().remove(0);
+        assert_eq!(meta.command_status, Some(status));
+        assert_eq!(meta.runtime_error, Some(d));
+        assert!(meta.stdout.data.is_empty());
+        assert_eq!(meta.stdout.total_bytes, 999);
+        assert_eq!(full.stdout, out);
+        assert_eq!(full.stderr, err);
+        drop(store);
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.execution(&e.id).unwrap().unwrap(), full);
+    }
+
+    #[test]
+    fn oversized_native_diagnostic_is_bounded_without_blocking_terminal_publication() {
+        use crate::model::{RuntimeErrorKind, RuntimeStage};
+        let store = Store::open_in_memory().unwrap();
+        let s = sandbox();
+        store.insert_sandbox(&s).unwrap();
+        for code in [
+            format!("{}é{}", "x".repeat(127), "é".repeat(100_000)),
+            "\0".repeat(200_000),
+        ] {
+            let e = execution(&s.id);
+            store.insert_execution(&e).unwrap();
+            let d = RuntimeDiagnostic {
+                kind: RuntimeErrorKind::Io,
+                stage: RuntimeStage::Capture,
+                message: "\0".repeat(20_000),
+                native_code: Some(code),
+                message_truncated: false,
+            };
+            store
+                .finish_execution(
+                    &e.id,
+                    &ExecutionResult {
+                        state: ExecutionState::Failed,
+                        exit_code: None,
+                        command_status: None,
+                        runtime_error: Some(&d),
+                        failure_reason: None,
+                        stdout: &Captured::default(),
+                        stderr: &Captured::default(),
+                    },
+                )
+                .unwrap();
+            let got = store
+                .execution(&e.id)
+                .unwrap()
+                .unwrap()
+                .runtime_error
+                .unwrap();
+            assert!(got.native_code.as_ref().unwrap().len() <= 128);
+            assert!(got.message.len() <= 2048);
+            assert!(got.message_truncated);
+            assert!(got.message.starts_with("native_code truncated"));
+            let json: String = store
+                .conn()
+                .query_row(
+                    "SELECT runtime_error FROM executions WHERE id=?1",
+                    [&e.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                json.len() <= 6 * (2048 + 128) + 256,
+                "JSON unexpectedly large: {}",
+                json.len()
+            );
+            assert_eq!(
+                store.recent_executions(&s.id, 1).unwrap()[0].runtime_error,
+                Some(got)
+            );
+        }
+    }
 
     fn sandbox() -> Sandbox {
         let now = now_ms();
@@ -539,6 +791,8 @@ mod tests {
             argv: vec!["sh".into(), "-c".into(), "echo 'hi'".into()],
             state: ExecutionState::Running,
             exit_code: None,
+            command_status: None,
+            runtime_error: None,
             failure_reason: None,
             started_at_ms: now_ms(),
             finished_at_ms: None,
@@ -550,10 +804,10 @@ mod tests {
     }
 
     #[test]
-    fn v1_disk_migration_preserves_legacy_order_and_reopens_as_v2() {
+    fn v1_disk_migration_preserves_legacy_order_and_reopens_as_v3() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let legacy = SCHEMA.replace(",\n    list_seq       INTEGER NOT NULL", "")
+        let legacy = SCHEMA.replace(",\n    command_status_kind TEXT,\n    command_status_value INTEGER,\n    command_core_dumped INTEGER,\n    runtime_error TEXT", "").replace(",\n    list_seq       INTEGER NOT NULL", "")
             .replace("CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);", "")
             .replace("CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';", "");
         let conn = Connection::open(temp.path().join("kilnd.db")).unwrap();
@@ -598,7 +852,7 @@ mod tests {
                 .conn()
                 .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             store
@@ -761,6 +1015,8 @@ mod tests {
         let result = ExecutionResult {
             state: ExecutionState::Exited,
             exit_code: Some(0),
+            command_status: Some(&CommandStatus::Exited(0)),
+            runtime_error: None,
             failure_reason: None,
             stdout: &out,
             stderr: &err,

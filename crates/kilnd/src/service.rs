@@ -385,7 +385,25 @@ pub fn execution_pb(e: Execution) -> pb::Execution {
         sandbox_id: e.sandbox_id,
         argv: e.argv,
         state: state.into(),
-        exit_code: e.exit_code,
+        exit_code: (e.state == ExecutionState::Exited)
+            .then_some(e.exit_code)
+            .flatten(),
+        command_status: e.command_status.map(|status| pb::CommandStatus {
+            termination: Some(match status {
+                crate::model::CommandStatus::Exited(code) => {
+                    pb::command_status::Termination::ExitCode(code)
+                }
+                crate::model::CommandStatus::Signaled {
+                    signal,
+                    core_dumped,
+                } => pb::command_status::Termination::Signal(pb::SignalStatus {
+                    // Runtime command status validates positive signal numbers.
+                    number: signal as u32,
+                    core_dumped,
+                }),
+            }),
+        }),
+        runtime_error: e.runtime_error.map(runtime_diagnostic_pb),
         failure_reason: e.failure_reason.unwrap_or_default(),
         started_at_unix_ms: e.started_at_ms,
         finished_at_unix_ms: e.finished_at_ms.unwrap_or(0),
@@ -393,6 +411,46 @@ pub fn execution_pb(e: Execution) -> pb::Execution {
         stdin_bytes: e.stdin_bytes,
         stdout: Some(output_pb(e.stdout)),
         stderr: Some(output_pb(e.stderr)),
+    }
+}
+
+fn runtime_diagnostic_pb(d: crate::model::RuntimeDiagnostic) -> pb::RuntimeDiagnostic {
+    use crate::model::{RuntimeErrorKind as K, RuntimeStage as S};
+    let kind = match d.kind {
+        K::InvalidRequest => pb::RuntimeErrorKind::InvalidRequest,
+        K::Unavailable => pb::RuntimeErrorKind::Unavailable,
+        K::NotFound => pb::RuntimeErrorKind::NotFound,
+        K::Incompatible => pb::RuntimeErrorKind::Incompatible,
+        K::Busy => pb::RuntimeErrorKind::Busy,
+        K::LaunchFailed => pb::RuntimeErrorKind::LaunchFailed,
+        K::Io => pb::RuntimeErrorKind::Io,
+        K::Protocol => pb::RuntimeErrorKind::Protocol,
+        K::CleanupFailed => pb::RuntimeErrorKind::CleanupFailed,
+        K::Internal => pb::RuntimeErrorKind::Internal,
+        K::Stopped => pb::RuntimeErrorKind::Stopped,
+    };
+    let stage = match d.stage {
+        S::None => pb::RuntimeStage::Unspecified,
+        S::Validate => pb::RuntimeStage::Validate,
+        S::Connect => pb::RuntimeStage::Connect,
+        S::Request => pb::RuntimeStage::Request,
+        S::Prepare => pb::RuntimeStage::Prepare,
+        S::Fork => pb::RuntimeStage::Fork,
+        S::Admission => pb::RuntimeStage::Admission,
+        S::Stdio => pb::RuntimeStage::Stdio,
+        S::Exec => pb::RuntimeStage::Exec,
+        S::Wait => pb::RuntimeStage::Wait,
+        S::Cleanup => pb::RuntimeStage::Cleanup,
+        S::Report => pb::RuntimeStage::Report,
+        S::Capture => pb::RuntimeStage::Capture,
+        S::Handshake => pb::RuntimeStage::Handshake,
+    };
+    pb::RuntimeDiagnostic {
+        kind: kind.into(),
+        stage: stage.into(),
+        message: d.message,
+        native_code: d.native_code,
+        message_truncated: d.message_truncated,
     }
 }
 

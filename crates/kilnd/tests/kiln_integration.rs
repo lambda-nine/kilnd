@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kilnd::manager::{CreateRequest, ExecRequest, Limits, Manager};
-use kilnd::model::{ExecutionState, SandboxState};
+use kilnd::model::{CommandStatus, ExecutionState, RuntimeErrorKind, RuntimeStage, SandboxState};
 use kilnd::runtime::Runtime;
 use kilnd::runtime::kiln::KilnRuntime;
 use kilnd::store::Store;
@@ -51,12 +51,15 @@ fn exec_scope_populated(backend_id: &str) -> bool {
     .is_ok_and(|events| events.lines().any(|line| line == "populated 1"))
 }
 
-fn pipe_fd_count() -> usize {
+fn io_fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd")
         .unwrap()
         .filter_map(Result::ok)
         .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-        .filter(|target| target.to_string_lossy().starts_with("pipe:["))
+        .filter(|target| {
+            let target = target.to_string_lossy();
+            target.starts_with("pipe:[") || target.starts_with("socket:[")
+        })
         .count()
 }
 
@@ -146,15 +149,85 @@ async fn lifecycle_against_real_kiln() {
         .await
         .unwrap();
     assert_eq!((e.stdout.data.len(), e.stdout.total_bytes), (4096, 100_000));
+    let e=m.exec(exec(&s.id,&["sh","-c","printf '\\000\\377'; head -c 100000 /dev/zero; { printf '\\000\\376'; head -c 100000 /dev/zero; } >&2"],10_000)).await.unwrap();
+    assert_eq!(
+        (
+            e.stdout.data.len(),
+            e.stdout.total_bytes,
+            e.stderr.data.len(),
+            e.stderr.total_bytes
+        ),
+        (4096, 100002, 4096, 100002)
+    );
+    assert_eq!(&e.stdout.data[..2], b"\0\xff");
+    assert_eq!(&e.stderr.data[..2], b"\0\xfe");
+    let exit125 = m
+        .exec(exec(
+            &s.id,
+            &[
+                "sh",
+                "-c",
+                "printf '\\000\\377out'; printf '\\000\\376err' >&2; exit 125",
+            ],
+            10_000,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        (exit125.state, exit125.exit_code),
+        (ExecutionState::Exited, Some(125))
+    );
+    assert_eq!(exit125.command_status, Some(CommandStatus::Exited(125)));
+    assert!(exit125.runtime_error.is_none());
+    assert_eq!(exit125.stdout.data, b"\0\xffout");
+    assert_eq!(exit125.stderr.data, b"\0\xfeerr");
+    let wire125 = kilnd::service::execution_pb(exit125.clone());
+    assert_eq!(
+        wire125.command_status.as_ref().unwrap().termination,
+        Some(kilnd_api::v1::command_status::Termination::ExitCode(125))
+    );
+    let exit143 = m
+        .exec(exec(&s.id, &["sh", "-c", "exit 143"], 10_000))
+        .await
+        .unwrap();
+    let signal15 = m
+        .exec(exec(&s.id, &["sh", "-c", "kill -TERM $$"], 10_000))
+        .await
+        .unwrap();
+    assert_eq!(exit143.exit_code, signal15.exit_code);
+    assert_eq!(exit143.command_status, Some(CommandStatus::Exited(143)));
+    assert_eq!(
+        signal15.command_status,
+        Some(CommandStatus::Signaled {
+            signal: 15,
+            core_dumped: false
+        })
+    );
 
     // A timeout kills the command inside the sandbox, including what it
     // started in the background, and the sandbox keeps serving.
     let start = Instant::now();
+    let baseline_io = io_fd_count();
     let e = m
-        .exec(exec(&s.id, &["sh", "-c", "sleep 30 & sleep 30"], 1000))
+        .exec(exec(
+            &s.id,
+            &[
+                "sh",
+                "-c",
+                "printf '\\000\\377out'; printf '\\000\\376err' >&2; sleep 30 & sleep 30",
+            ],
+            1000,
+        ))
         .await
         .unwrap();
     assert_eq!(e.state, ExecutionState::TimedOut);
+    assert_eq!(e.stdout.data, b"\0\xffout");
+    assert_eq!(e.stderr.data, b"\0\xfeerr");
+    assert_eq!(
+        io_fd_count(),
+        baseline_io,
+        "timeout leaked private sockets or CLI pipes"
+    );
     assert!(start.elapsed() < Duration::from_secs(10));
     let e = m
         .exec(exec(
@@ -169,12 +242,18 @@ async fn lifecycle_against_real_kiln() {
         "the timed-out command was stopped"
     );
 
-    // A missing program is the command's failure (127), not kiln's.
+    // PID1 reports execvp failure separately from a real command exit 127.
     let e = m
         .exec(exec(&s.id, &["/no/such/program"], 10_000))
         .await
         .unwrap();
-    assert_eq!((e.state, e.exit_code), (ExecutionState::Exited, Some(127)));
+    assert_eq!((e.state, e.exit_code), (ExecutionState::Failed, None));
+    let error = e.runtime_error.as_ref().unwrap();
+    assert_eq!(
+        (error.kind, error.stage),
+        (RuntimeErrorKind::LaunchFailed, RuntimeStage::Exec)
+    );
+    assert!(e.command_status.is_none());
 
     // Restart: a new manager over the same database keeps the sandbox.
     drop(m);
@@ -186,6 +265,16 @@ async fn lifecycle_against_real_kiln() {
     let r = m.reconcile().await.unwrap();
     assert!(r.lost.is_empty(), "{r:?}");
     assert_eq!(m.get(&s.id, 0).unwrap().0.state, SandboxState::Ready);
+    assert_eq!(m.execution(&exit125.id).unwrap(), exit125);
+    assert_eq!(
+        kilnd::service::execution_pb(m.execution(&exit125.id).unwrap()),
+        wire125
+    );
+    assert_eq!(
+        m.execution(&e.id).unwrap(),
+        e,
+        "failed exec evidence survives reopen"
+    );
     assert_eq!(
         m.exec(exec(&s.id, &["true"], 10_000))
             .await
@@ -259,14 +348,14 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
         .await
         .unwrap();
     let backend_id = s.backend_id.clone().unwrap();
-    let baseline_pipes = pipe_fd_count();
+    let baseline_pipes = io_fd_count();
     let waiter = tokio::spawn({
         let m = m.clone();
         let id = s.id.clone();
         async move {
             m.exec(exec(
                 &id,
-                &["sh", "-c", "setsid sh -c 'sleep 30 & wait' & sleep 30"],
+                &["sh", "-c", "printf '\\000\\377out'; printf '\\000\\376err' >&2; setsid sh -c 'sleep 30 & wait' & sleep 30"],
                 60_000,
             ))
             .await
@@ -296,6 +385,8 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
     .await
     .expect("client-disconnected execution did not finalize");
     assert_eq!(execution.state, ExecutionState::Canceled);
+    assert_eq!(execution.stdout.data, b"\0\xffout");
+    assert_eq!(execution.stderr.data, b"\0\xfeerr");
     assert_eq!(
         execution.failure_reason.as_deref(),
         Some("client disconnected")
@@ -305,7 +396,7 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
         "execution cgroup still has descendants"
     );
     assert_eq!(
-        pipe_fd_count(),
+        io_fd_count(),
         baseline_pipes,
         "backend stdout/stderr pipe descriptors leaked"
     );

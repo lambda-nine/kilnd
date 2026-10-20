@@ -19,8 +19,6 @@ in the products that consume the harness.
   can't hold capacity forever.
 - **Metrics:** request and execution counters and latencies next to kiln's
   `/metrics`.
-- **Separate kiln's errors from command output,** for example with a status
-  descriptor in `kiln exec`.
 
 ## 2. Sandbox pool
 

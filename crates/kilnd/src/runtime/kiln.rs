@@ -15,12 +15,16 @@ use tokio_util::sync::CancellationToken;
 use super::{
     BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError,
 };
+use super::{
+    kiln_process::{self, OwnedExec, Stop},
+    kiln_protocol as protocol,
+};
 use crate::model::{Network, SandboxSpec};
+use crate::model::{RuntimeDiagnostic, RuntimeErrorKind as Kind, RuntimeStage as Stage};
 use crate::process::{self, Finish};
 
-/// `kiln exec` exits with this when kiln itself failed rather than the
-/// command (kiln 3736329 and later).
-const EXEC_FAILED: i32 = 125;
+/// Capability negotiation, rather than package strings, gates compatibility.
+const PROTOCOL_REQUIREMENT: &str = "persistent-exec protocol v1 first supplied by kiln f3da4b5319566de4912ed617caf81d4eb8e50b6f (follow-up 711440db3167cdf3a90d3aad44623ce56c2d01b1; baseline 3b42552)";
 /// kiln's own output (IDs, `ls` tables, errors) is small.
 const CONTROL_OUTPUT: usize = 64 * 1024;
 const CREATE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -81,8 +85,94 @@ impl KilnRuntime {
         }
     }
 
-    async fn is_known(&self, id: &str) -> Result<bool, RuntimeError> {
-        Ok(self.list().await?.iter().any(|s| s.id == id))
+    async fn capabilities(
+        &self,
+        id: Option<&str>,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<protocol::Capabilities, RuntimeError> {
+        let mut args = vec!["capabilities".into(), "--protocol=1".into()];
+        if let Some(id) = id {
+            args.push(id.into());
+        }
+        let scope = id.map(|id| format!(" sandbox {id}")).unwrap_or_default();
+        let result = async {
+            let out = kiln_process::probe(
+                &self.bin,
+                &args,
+                deadline.min(Instant::now() + Duration::from_secs(2)),
+                cancel,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let observed = || {
+                format!(
+                    "observed CLI {:?}; stop {:?}{}; stdout {}; stderr {}",
+                    out.child_status,
+                    out.stop,
+                    if matches!(out.stop, Stop::TimedOut) {
+                        " (deadline expired)"
+                    } else {
+                        ""
+                    },
+                    summarize(&out.status.bytes),
+                    summarize(&out.stderr.captured.data)
+                )
+            };
+            if !matches!(out.stop, Stop::Exited)
+                || !out.child_status.is_some_and(|s| s.success())
+                || !out.status.eof
+                || out.status.error.is_some()
+            {
+                return Err(format!(
+                    "capability exchange failed ({}); {}",
+                    out.status
+                        .error
+                        .as_deref()
+                        .unwrap_or("missing EOF, deadline expired or nonzero CLI exit"),
+                    observed()
+                ));
+            }
+            let caps = protocol::capabilities(&out.status.bytes)
+                .map_err(|e| format!("{e}; {}", observed()))?;
+            caps.require_v1()?;
+            Ok::<_, String>(caps)
+        }
+        .await;
+        result.map_err(|e| {
+            RuntimeError::Incompatible(format!(
+                "{}{} requires {PROTOCOL_REQUIREMENT}: {e}",
+                self.bin.display(),
+                scope
+            ))
+        })
+    }
+
+    async fn list_until(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<BackendSandbox>, RuntimeError> {
+        let out = self
+            .call_until("ls", &["ls".into()], deadline, cancel)
+            .await?;
+        if out.stdout_completion != process::CaptureCompletion::Eof
+            || out.stderr_completion != process::CaptureCompletion::Eof
+        {
+            return Err(RuntimeError::Backend(format!(
+                "kiln ls observation was incomplete: stdout {:?}; stderr {:?}",
+                out.stdout_completion, out.stderr_completion
+            )));
+        }
+        if out.stdout.truncated() {
+            return Err(RuntimeError::Backend(
+                "kiln ls observation was truncated".into(),
+            ));
+        }
+        let text = std::str::from_utf8(&out.stdout.data).map_err(|e| {
+            RuntimeError::Backend(format!("kiln ls observation was not UTF-8: {e}"))
+        })?;
+        parse_ls(text)
     }
 
     /// A killed `kiln exec` client cannot receive PID 1's post-cleanup reply.
@@ -104,9 +194,6 @@ impl KilnRuntime {
                     }
                 },
                 Err(error) if error.kind() == ErrorKind::NotFound => {
-                    if !self.is_known(id).await? {
-                        return Err(RuntimeError::NotFound(id.to_string()));
-                    }
                     return Err(RuntimeError::Backend(format!(
                         "kiln cleanup barrier {} is missing; kiln 3b42552 or later is required",
                         events.display()
@@ -144,10 +231,41 @@ impl Runtime for KilnRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<String, RuntimeError> {
-        let out = self
-            .call_until("--version", &["--version".into()], deadline, cancel)
-            .await?;
-        Ok(String::from_utf8_lossy(&out.stdout.data).trim().to_string())
+        let caps = self.capabilities(None, deadline, cancel).await?;
+        Ok(format!(
+            "{}: {} {} (persistent-exec v1)",
+            self.bin.display(),
+            caps.package,
+            caps.provenance
+        ))
+    }
+
+    async fn validate_sandbox(
+        &self,
+        id: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(), RuntimeError> {
+        check_id(id)?;
+        match self.capabilities(Some(id), deadline, cancel).await {
+            Ok(_) => Ok(()),
+            Err(probe_error) => {
+                if cancel.is_cancelled() || Instant::now() >= deadline {
+                    return Err(RuntimeError::Incompatible(format!(
+                        "{probe_error}; sandbox presence was not observed: no remaining deadline/cancellation budget"
+                    )));
+                }
+                match self.list_until(deadline, cancel).await {
+                    Ok(sandboxes) if !sandboxes.iter().any(|sandbox| sandbox.id == id) => {
+                        Err(RuntimeError::NotFound(id.into()))
+                    }
+                    Ok(_) => Err(probe_error),
+                    Err(observation_error) => Err(RuntimeError::Incompatible(format!(
+                        "{probe_error}; sandbox presence could not be confirmed: {observation_error}"
+                    ))),
+                }
+            }
+        }
     }
 
     async fn create(&self, spec: &SandboxSpec) -> Result<String, RuntimeError> {
@@ -163,66 +281,200 @@ impl Runtime for KilnRuntime {
         Ok(id)
     }
 
-    async fn exec(
-        &self,
-        id: &str,
-        spec: &ExecSpec<'_>,
-        cancel: &CancellationToken,
-    ) -> Result<ExecOutcome, RuntimeError> {
-        check_id(id)?;
-        if cancel.is_cancelled() {
-            return Ok(ExecOutcome {
-                finish: ExecFinish::Canceled,
-                stdout: crate::model::Captured::default(),
-                stderr: crate::model::Captured::default(),
-            });
-        }
-        let mut args: Vec<&OsStr> = vec![OsStr::new("exec"), OsStr::new(id), OsStr::new("--")];
-        args.extend(spec.argv.iter().map(OsStr::new));
-        let req = process::Request {
-            program: &self.bin,
-            args: &args,
-            stdin: spec.stdin,
-            deadline: spec.deadline,
-            max_output: spec.max_output,
-        };
-        // Killing the `kiln exec` client asks kiln's PID 1 to tear down the
-        // command's per-execution cgroup. Because the killed client cannot
-        // receive PID 1's eventual reply, timeout and cancellation explicitly
-        // wait for the host cgroup to report empty before returning.
-        let out = process::run(&req, cancel).await?;
-        let finish = match out.finish {
-            Finish::Exited(status) => match status.code() {
-                Some(EXEC_FAILED) => {
-                    if !self.is_known(id).await? {
-                        return Err(RuntimeError::NotFound(id.to_string()));
-                    }
-                    return Err(RuntimeError::Backend(format!(
-                        "kiln exec failed: {}",
-                        summarize(&out.stderr.data)
-                    )));
-                }
-                Some(code) => ExecFinish::Exited(code),
-                None => {
-                    return Err(RuntimeError::Backend(format!(
-                        "kiln exec ended abnormally ({status})"
-                    )));
-                }
-            },
-            Finish::TimedOut => {
-                self.wait_exec_cleanup(id).await?;
-                ExecFinish::TimedOut
-            }
-            Finish::Canceled => {
-                self.wait_exec_cleanup(id).await?;
-                ExecFinish::Canceled
-            }
-        };
-        Ok(ExecOutcome {
+    async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> ExecOutcome {
+        let empty = |finish| ExecOutcome {
             finish,
-            stdout: out.stdout,
-            stderr: out.stderr,
-        })
+            command_status: None,
+            stdout: Default::default(),
+            stderr: Default::default(),
+        };
+        if let Err(e) = check_id(id) {
+            return empty(Err(RuntimeDiagnostic::new(
+                Kind::InvalidRequest,
+                Stage::Validate,
+                e.to_string(),
+            )));
+        }
+        let stopped = || {
+            if cancel.is_cancelled() {
+                Some(ExecFinish::Canceled)
+            } else if Instant::now() >= spec.deadline {
+                Some(ExecFinish::TimedOut)
+            } else {
+                None
+            }
+        };
+        if let Some(finish) = stopped() {
+            return empty(Ok(finish));
+        }
+        for global in [true, false] {
+            let validation = if global {
+                self.capabilities(None, spec.deadline, cancel)
+                    .await
+                    .map(|_| ())
+            } else {
+                self.validate_sandbox(id, spec.deadline, cancel).await
+            };
+            if let Err(e) = validation {
+                if let Some(finish) = stopped() {
+                    return empty(Ok(finish));
+                }
+                return empty(Err(RuntimeDiagnostic::new(
+                    match e {
+                        RuntimeError::NotFound(_) => Kind::NotFound,
+                        RuntimeError::Incompatible(_) => Kind::Incompatible,
+                        _ => Kind::Unavailable,
+                    },
+                    Stage::Handshake,
+                    e.to_string(),
+                )));
+            }
+        }
+        if let Some(finish) = stopped() {
+            return empty(Ok(finish));
+        }
+        let mut owner = match OwnedExec::spawn(&self.bin, id, spec) {
+            Ok(owner) => owner,
+            Err(e) => {
+                return empty(Err(RuntimeDiagnostic::new(
+                    Kind::Io,
+                    Stage::Prepare,
+                    e.to_string(),
+                )));
+            }
+        };
+        let mut stop = owner.supervise(spec.deadline, cancel).await;
+        // StatusReady means the reader is joined and its complete final bytes
+        // are immutable. Decode once here so malformed replies stop a hung CLI.
+        let mut decoded = None;
+        if matches!(stop, Stop::StatusReady) {
+            decoded = Some(decode_status(&owner.status()));
+            stop = match decoded.as_ref().expect("status decoded") {
+                Ok(_) => owner.supervise(spec.deadline, cancel).await,
+                Err(error) => Stop::Transport(error.clone()),
+            };
+        }
+        let reap_error = owner.kill_reap().await.err();
+        owner.settle_status().await;
+        let status = owner.status();
+        let decoded = decoded.unwrap_or_else(|| decode_status(&status));
+        let command_status = decoded
+            .as_ref()
+            .ok()
+            .and_then(|out| out.command_status.clone());
+        let trusted_cleanup = decoded.as_ref().is_ok_and(|out| {
+            matches!(
+                out.cleanup,
+                protocol::Cleanup::NoChildStarted | protocol::Cleanup::Drained
+            )
+        });
+        let mut host_protocol_failure = matches!(&stop, Stop::Transport(_))
+            || (matches!(&stop, Stop::Exited) && decoded.is_err());
+        let mut finish = match &stop {
+            Stop::StatusReady => Err(RuntimeDiagnostic::new(
+                Kind::Internal,
+                Stage::Report,
+                "status supervision did not advance to CLI completion",
+            )),
+            Stop::TimedOut | Stop::Canceled => match &decoded {
+                Ok(out) if out.diagnostic.is_some() => {
+                    Err(out.diagnostic.clone().expect("diagnostic present"))
+                }
+                // Killing the CLI normally closes an otherwise empty status
+                // socket. It does not turn a won cancellation into Protocol.
+                Err(error)
+                    if !status.bytes.is_empty()
+                        || !status.eof
+                        || status.error.as_deref() != Some("missing status frame") =>
+                {
+                    host_protocol_failure = true;
+                    Err(RuntimeDiagnostic::new(Kind::Protocol, Stage::Report, error))
+                }
+                _ => Ok(if matches!(stop, Stop::TimedOut) {
+                    ExecFinish::TimedOut
+                } else {
+                    ExecFinish::Canceled
+                }),
+            },
+            Stop::Panic => Err(RuntimeDiagnostic::new(
+                Kind::Internal,
+                Stage::Report,
+                "machine exec supervision panicked",
+            )),
+            Stop::Transport(e) => Err(RuntimeDiagnostic::new(Kind::Protocol, Stage::Report, e)),
+            Stop::Exited => match &decoded {
+                Ok(out) => out
+                    .diagnostic
+                    .clone()
+                    .map_or(Ok(ExecFinish::Completed), Err),
+                Err(e) => Err(RuntimeDiagnostic::new(
+                    Kind::Protocol,
+                    Stage::Report,
+                    e.clone(),
+                )),
+            },
+        };
+        if let Some(e) = reap_error {
+            finish = Err(RuntimeDiagnostic::new(Kind::Io, Stage::Wait, e.to_string()));
+        }
+        if !trusted_cleanup {
+            if let Err(e) = self.wait_exec_cleanup(id).await {
+                finish = Err(RuntimeDiagnostic::new(
+                    Kind::CleanupFailed,
+                    Stage::Cleanup,
+                    e.to_string(),
+                ));
+            }
+        }
+        // Readers remain alive during the entire cleanup barrier, then reach EOF.
+        let raw = owner.settle().await;
+        if matches!(stop, Stop::Exited)
+            && !matches!(&finish, Err(d) if d.kind == Kind::CleanupFailed)
+        {
+            if let Ok(out) = &decoded {
+                if raw.child_status.and_then(|s| s.code()) != Some(out.projection()) {
+                    host_protocol_failure = true;
+                    finish = Err(RuntimeDiagnostic::new(
+                        Kind::Protocol,
+                        Stage::Report,
+                        "CLI exit status disagrees with typed outcome",
+                    ));
+                }
+            }
+        }
+        if finish.is_ok() {
+            if let Some(error) = raw.stdout.error.as_ref().or(raw.stderr.error.as_ref()) {
+                finish = Err(RuntimeDiagnostic::new(Kind::Io, Stage::Capture, error));
+            }
+        }
+        if let Err(d) = &mut finish {
+            if host_protocol_failure && d.kind == Kind::Protocol {
+                let mut augmented = RuntimeDiagnostic::new(
+                    d.kind,
+                    d.stage,
+                    format!(
+                        "{}; CLI stdout: {}; CLI stderr: {}; status: {} bytes{}",
+                        d.message,
+                        summarize(&raw.cli_stdout.captured.data),
+                        summarize(&raw.cli_stderr.captured.data),
+                        raw.status.bytes.len(),
+                        raw.status
+                            .error
+                            .as_ref()
+                            .map(|e| format!(" ({e})"))
+                            .unwrap_or_default()
+                    ),
+                );
+                augmented.message_truncated |= d.message_truncated;
+                *d = augmented;
+            }
+        }
+        ExecOutcome {
+            finish,
+            command_status,
+            stdout: raw.stdout.captured,
+            stderr: raw.stderr.captured,
+        }
     }
 
     async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
@@ -233,7 +485,7 @@ impl Runtime for KilnRuntime {
         {
             Ok(_) => Ok(()),
             Err(e) => {
-                if !self.is_known(id).await? {
+                if !self.list().await?.iter().any(|s| s.id == id) {
                     return Err(RuntimeError::NotFound(id.to_string()));
                 }
                 Err(e)
@@ -242,8 +494,8 @@ impl Runtime for KilnRuntime {
     }
 
     async fn list(&self) -> Result<Vec<BackendSandbox>, RuntimeError> {
-        let out = self.call("ls", &["ls".into()], QUERY_TIMEOUT).await?;
-        parse_ls(&String::from_utf8_lossy(&out.stdout.data))
+        self.list_until(Instant::now() + QUERY_TIMEOUT, &CancellationToken::new())
+            .await
     }
 
     async fn gc(&self) -> Result<Vec<String>, RuntimeError> {
@@ -261,6 +513,7 @@ impl Runtime for KilnRuntime {
 pub fn create_args(spec: &SandboxSpec) -> Vec<String> {
     let mut args = vec![
         "create".to_string(),
+        "--require-exec-protocol=1".to_string(),
         format!("--image={}", spec.image),
         format!("--memory={}", spec.memory_bytes),
         format!(
@@ -357,6 +610,17 @@ fn exec_populated(events: &str) -> Option<bool> {
     })
 }
 
+fn decode_status(status: &kiln_process::StatusState) -> Result<protocol::Outcome, String> {
+    if status.eof && status.error.is_none() {
+        protocol::outcome(&status.bytes)
+    } else {
+        Err(status
+            .error
+            .clone()
+            .unwrap_or_else(|| "status EOF was not observed".into()))
+    }
+}
+
 /// The end of kiln's stderr as one printable line, for error messages.
 fn summarize(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
@@ -387,11 +651,806 @@ fn summarize(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::kiln_process::tests::fixture;
     use super::*;
+    use crate::model::CommandStatus;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+
+    fn fixture_runtime(tmp: &Path, body: &str) -> KilnRuntime {
+        let bin = tmp.join("kiln");
+        fixture(&bin, body);
+        let root = tmp.join("cgroup");
+        fs::create_dir_all(root.join("abcd/exec")).unwrap();
+        fs::write(root.join("abcd/exec/cgroup.events"), "populated 0\n").unwrap();
+        KilnRuntime::with_cgroup_root(bin, &root)
+    }
+
+    fn set_events(path: &Path, value: &str) {
+        // Kernel cgroup.events reads are coherent; model that with atomic replacement.
+        let next = path.with_extension("next");
+        fs::write(&next, value).unwrap();
+        fs::rename(next, path).unwrap();
+    }
+
+    fn failed_id_probe_runtime(
+        tmp: &Path,
+        present: bool,
+        ls_override: Option<&str>,
+    ) -> KilnRuntime {
+        let workload = tmp.join("workload");
+        let trace = tmp.join("calls");
+        let runtime = fixture_runtime(
+            tmp,
+            &format!("open({workload:?},'w').close()\nos.write(STATUS,EXIT125)\nsys.exit(125)"),
+        );
+        let listing = if present {
+            "ID\\tSTATUS\\tSHIM\\nabcd\\trunning\\t42\\n"
+        } else {
+            "ID\\tSTATUS\\tSHIM\\n"
+        };
+        let ls_body = ls_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("os.write(1,b'{listing}'); sys.exit(0)"));
+        let source=fs::read_to_string(&runtime.bin).unwrap().replace("if sys.argv[1]=='capabilities':",&format!("open({trace:?},'a').write(' '.join(sys.argv[1:])+'\\n')\nif sys.argv[1]=='create':\n    print('abcd')\n    sys.exit(0)\nif sys.argv[1]=='ls':\n    {ls_body}\nif sys.argv[1]=='capabilities' and len(sys.argv)>3:\n    os.write(2,b'ID capability unavailable: legacy PID1 or removed sandbox')\n    sys.exit(2)\nif sys.argv[1]=='capabilities':"));
+        fs::write(&runtime.bin, source).unwrap();
+        runtime
+    }
+
+    #[tokio::test]
+    async fn failed_id_probe_confirms_absence_but_preserves_incompatible_live_pid1() {
+        for present in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = failed_id_probe_runtime(tmp.path(), present, None);
+            let error = runtime
+                .validate_sandbox(
+                    "abcd",
+                    Instant::now() + Duration::from_secs(5),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            if present {
+                assert!(matches!(error, RuntimeError::Incompatible(_)));
+                assert!(error.to_string().contains("legacy PID1"));
+            } else {
+                assert!(matches!(error,RuntimeError::NotFound(ref id) if id=="abcd"));
+            }
+            let out = execute(&runtime).await;
+            let d = out.finish.unwrap_err();
+            assert_eq!(
+                (d.kind, d.stage),
+                (
+                    if present {
+                        Kind::Incompatible
+                    } else {
+                        Kind::NotFound
+                    },
+                    Stage::Handshake
+                )
+            );
+            assert!(!tmp.path().join("workload").exists());
+            let calls = fs::read_to_string(tmp.path().join("calls")).unwrap();
+            assert!(
+                calls.contains("capabilities --protocol=1\ncapabilities --protocol=1 abcd\nls\n")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_marks_only_confirmed_missing_sandbox_lost_before_exec() {
+        use crate::manager::{CreateRequest, ExecRequest, Limits, Manager};
+        use crate::model::{ExecutionState, SandboxState};
+        use crate::store::Store;
+        for present in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = failed_id_probe_runtime(tmp.path(), present, None);
+            let manager = Arc::new(Manager::new(
+                runtime,
+                Store::open_in_memory().unwrap(),
+                Limits::default(),
+            ));
+            let sandbox = manager.create(CreateRequest::default()).await.unwrap();
+            assert_eq!(sandbox.state, SandboxState::Ready);
+            let outcome = manager
+                .exec(ExecRequest {
+                    sandbox_id: sandbox.id.clone(),
+                    argv: vec!["must-not-launch".into()],
+                    stdin: vec![],
+                    timeout_ms: 5000,
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.state, ExecutionState::Failed);
+            assert_eq!(outcome.exit_code, None);
+            assert!(outcome.command_status.is_none());
+            assert_eq!(
+                outcome.runtime_error.as_ref().map(|d| (d.kind, d.stage)),
+                Some((
+                    if present {
+                        Kind::Incompatible
+                    } else {
+                        Kind::NotFound
+                    },
+                    Stage::Handshake
+                ))
+            );
+            assert_eq!(
+                manager.get(&sandbox.id, 1).unwrap().0.state,
+                if present {
+                    SandboxState::Ready
+                } else {
+                    SandboxState::Lost
+                }
+            );
+            assert!(!tmp.path().join("workload").exists());
+            manager.begin_shutdown();
+            manager.drain_operations().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_exit125_probes_capabilities_without_a_presence_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("calls");
+        let runtime = fixture_runtime(tmp.path(), "os.write(STATUS,EXIT125); sys.exit(125)");
+        let source = fs::read_to_string(&runtime.bin).unwrap().replace(
+            "if sys.argv[1]=='capabilities':",
+            &format!(
+                "open({trace:?},'a').write(sys.argv[1]+'\\n')\nif sys.argv[1]=='capabilities':"
+            ),
+        );
+        fs::write(&runtime.bin, source).unwrap();
+        let out = execute(&runtime).await;
+        assert_eq!(out.finish, Ok(ExecFinish::Completed));
+        assert_eq!(out.command_status, Some(CommandStatus::Exited(125)));
+        assert_eq!(
+            fs::read_to_string(trace).unwrap(),
+            "capabilities\ncapabilities\nexec\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_presence_observation_never_claims_not_found() {
+        for ls_body in [
+            "sys.exit(3)",
+            "os.write(1,b'malformed table'); sys.exit(0)",
+            "os.write(1,b'ID\\tSTATUS\\tSHIM\\n'+b'x'*70000); sys.exit(0)",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = failed_id_probe_runtime(tmp.path(), false, Some(ls_body));
+            let error = runtime
+                .validate_sandbox(
+                    "abcd",
+                    Instant::now() + Duration::from_secs(5),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, RuntimeError::Incompatible(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("presence could not be confirmed")
+            );
+            assert!(!tmp.path().join("workload").exists());
+        }
+    }
+
+    fn delayed_listing_runtime(tmp: &Path, hold_stderr: bool) -> KilnRuntime {
+        let done = tmp.join("late-writer-done");
+        let close_fd = if hold_stderr { 1 } else { 2 };
+        let (output_fd, late_bytes) = if hold_stderr {
+            (2, "late CLI diagnostic\\n")
+        } else {
+            (1, "abcd\\trunning\\t42\\n")
+        };
+        let body = format!(
+            "os.write(1,b'ID\\tSTATUS\\tSHIM\\n')\n    if os.fork()==0:\n        os.close({close_fd})\n        time.sleep(.8)\n        try:\n            os.write({output_fd},b'{late_bytes}')\n        except OSError:\n            pass\n        open({done:?},'w').close()\n        os._exit(0)\n    os._exit(0)"
+        );
+        failed_id_probe_runtime(tmp, true, Some(&body))
+    }
+
+    #[tokio::test]
+    async fn inherited_ls_writer_prevents_false_absence_after_header_only_success() {
+        for hold_stderr in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = delayed_listing_runtime(tmp.path(), hold_stderr);
+            let out = tokio::time::timeout(Duration::from_secs(2), execute(&runtime))
+                .await
+                .expect("incomplete ls observation was not bounded");
+            let diagnostic = out.finish.unwrap_err();
+            assert_eq!(
+                (diagnostic.kind, diagnostic.stage),
+                (Kind::Incompatible, Stage::Handshake)
+            );
+            assert!(
+                diagnostic
+                    .message
+                    .contains("kiln ls observation was incomplete")
+            );
+            assert!(
+                diagnostic
+                    .message
+                    .contains("250ms output drain grace expired")
+            );
+            assert!(!tmp.path().join("workload").exists());
+            wait_marker(&tmp.path().join("late-writer-done")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_keeps_ready_when_header_only_ls_has_an_inherited_writer() {
+        use crate::manager::{CreateRequest, ExecRequest, Limits, Manager};
+        use crate::model::{ExecutionState, SandboxState};
+        use crate::store::Store;
+        for hold_stderr in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = delayed_listing_runtime(tmp.path(), hold_stderr);
+            let manager = Arc::new(Manager::new(
+                runtime,
+                Store::open_in_memory().unwrap(),
+                Limits::default(),
+            ));
+            let sandbox = manager.create(CreateRequest::default()).await.unwrap();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                manager.exec(ExecRequest {
+                    sandbox_id: sandbox.id.clone(),
+                    argv: vec!["must-not-launch".into()],
+                    stdin: vec![],
+                    timeout_ms: 5000,
+                }),
+            )
+            .await
+            .expect("manager waited for the inherited ls writer")
+            .unwrap();
+            assert_eq!(outcome.state, ExecutionState::Failed);
+            assert!(outcome.command_status.is_none());
+            let diagnostic = outcome.runtime_error.unwrap();
+            assert_eq!(
+                (diagnostic.kind, diagnostic.stage),
+                (Kind::Incompatible, Stage::Handshake)
+            );
+            assert!(
+                diagnostic
+                    .message
+                    .contains("kiln ls observation was incomplete")
+            );
+            assert_eq!(
+                manager.get(&sandbox.id, 1).unwrap().0.state,
+                SandboxState::Ready
+            );
+            assert!(!tmp.path().join("workload").exists());
+            manager.begin_shutdown();
+            manager.drain_operations().await;
+            wait_marker(&tmp.path().join("late-writer-done")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn presence_observation_uses_original_deadline_and_cancellation_budget() {
+        for cancel_probe in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = tmp.path().join("ls-entered");
+            let runtime = failed_id_probe_runtime(
+                tmp.path(),
+                false,
+                Some(&format!(
+                    "open({marker:?},'w').close(); os.execl('/bin/sleep','sleep','30')"
+                )),
+            );
+            let cancel = CancellationToken::new();
+            let deadline = Instant::now() + Duration::from_secs(if cancel_probe { 5 } else { 1 });
+            let (result, ()) =
+                tokio::join!(runtime.validate_sandbox("abcd", deadline, &cancel), async {
+                    wait_marker(&marker).await;
+                    if cancel_probe {
+                        cancel.cancel();
+                    }
+                });
+            assert!(matches!(result, Err(RuntimeError::Incompatible(_))));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("presence could not be confirmed")
+            );
+            if !cancel_probe {
+                assert!(Instant::now() < deadline + Duration::from_secs(1));
+            }
+            assert!(!tmp.path().join("workload").exists());
+        }
+        for canceled in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = failed_id_probe_runtime(tmp.path(), false, None);
+            let cancel = CancellationToken::new();
+            let deadline = if canceled {
+                cancel.cancel();
+                Instant::now() + Duration::from_secs(5)
+            } else {
+                Instant::now() - Duration::from_secs(1)
+            };
+            assert!(matches!(
+                runtime.validate_sandbox("abcd", deadline, &cancel).await,
+                Err(RuntimeError::Incompatible(_))
+            ));
+            assert!(
+                !tmp.path().join("calls").exists(),
+                "probe or ls launched without budget"
+            );
+        }
+    }
+
+    async fn execute(runtime: &KilnRuntime) -> ExecOutcome {
+        let argv = vec!["--status-fd=999".into(), "ignored".into()];
+        runtime
+            .exec(
+                "abcd",
+                &ExecSpec {
+                    argv: &argv,
+                    stdin: b"",
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    max_output: 1024,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+    }
+
+    async fn wait_marker(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("fixture did not reach marker");
+    }
+
+    fn failure_frame(kind: u16, stage: u16, cleanup: u8, message: &str) -> Vec<u8> {
+        let mut bytes = super::super::kiln_protocol::tests::exit125();
+        bytes[12..16].copy_from_slice(&(24u32 + message.len() as u32).to_le_bytes());
+        bytes[16] = 2;
+        bytes[17] = 0;
+        bytes[18] = cleanup;
+        bytes[20..24].fill(0);
+        bytes[24..26].copy_from_slice(&kind.to_le_bytes());
+        bytes[26..28].copy_from_slice(&stage.to_le_bytes());
+        bytes[28..32].copy_from_slice(&5i32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&(message.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(message.as_bytes());
+        bytes
+    }
+
+    #[tokio::test]
+    async fn received_runtime_failure_wins_cancellation_and_timeout_while_cli_is_alive() {
+        for (timeout, kind, stage, cleanup) in
+            [(false, 6, 8, 1), (false, 9, 10, 0), (true, 9, 10, 0)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = tmp.path().join("ready");
+            let frame = failure_frame(kind, stage, cleanup, "trusted PID1 failure");
+            let runtime = fixture_runtime(
+                tmp.path(),
+                &format!(
+                    "os.write(OUT,b'\\x00out'); os.write(ERR,b'\\xfferr'); os.write(STATUS,bytes({frame:?})); os.close(STATUS); open({marker:?},'w').close(); time.sleep(30)"
+                ),
+            );
+            if cleanup == 1 {
+                fs::remove_file(runtime.cgroup_root.join("abcd/exec/cgroup.events")).unwrap();
+            }
+            let argv = vec!["ignored".into()];
+            let cancel = CancellationToken::new();
+            let spec = ExecSpec {
+                argv: &argv,
+                stdin: b"",
+                deadline: Instant::now() + Duration::from_secs(if timeout { 1 } else { 5 }),
+                max_output: 1024,
+            };
+            let (out, ()) = tokio::join!(runtime.exec("abcd", &spec, &cancel), async {
+                wait_marker(&marker).await;
+                if !timeout {
+                    cancel.cancel();
+                }
+            });
+            let d = out.finish.unwrap_err();
+            assert_eq!(
+                d.kind,
+                if kind == 9 {
+                    Kind::CleanupFailed
+                } else {
+                    Kind::LaunchFailed
+                }
+            );
+            assert_eq!(d.message, "trusted PID1 failure");
+            assert_eq!(d.native_code.as_deref(), Some("errno:5"));
+            assert_eq!(out.stdout.data, b"\0out");
+            assert_eq!(out.stderr.data, b"\xfferr");
+            assert!(out.command_status.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn late_failure_frame_settles_after_kill_and_retains_cleanup_proof() {
+        for (timeout, kind, stage, cleanup) in
+            [(false, 6, 8, 1), (false, 9, 10, 0), (true, 9, 10, 0)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = tmp.path().join("ready");
+            let frame = failure_frame(kind, stage, cleanup, "late PID1 failure");
+            let runtime = fixture_runtime(
+                tmp.path(),
+                &format!(
+                    "payload=bytes({frame:?})\nos.write(OUT,b'\\x00out'); os.write(ERR,b'\\xfferr')\nparent=os.getpid()\nif os.fork()==0:\n    while os.getppid()==parent: time.sleep(.002)\n    os.write(STATUS,payload[:10])\n    time.sleep(.05)\n    os.write(STATUS,payload[10:])\n    os.close(STATUS)\n    os._exit(0)\nopen({marker:?},'w').close()\ntime.sleep(30)"
+                ),
+            );
+            if cleanup == 1 {
+                fs::remove_file(runtime.cgroup_root.join("abcd/exec/cgroup.events")).unwrap();
+            }
+            let argv = vec!["ignored".into()];
+            let cancel = CancellationToken::new();
+            let spec = ExecSpec {
+                argv: &argv,
+                stdin: b"",
+                deadline: Instant::now() + Duration::from_secs(if timeout { 1 } else { 5 }),
+                max_output: 1024,
+            };
+            let (out, ()) = tokio::join!(runtime.exec("abcd", &spec, &cancel), async {
+                wait_marker(&marker).await;
+                if !timeout {
+                    cancel.cancel();
+                }
+            });
+            let d = out.finish.unwrap_err();
+            assert_eq!(
+                d.kind,
+                if kind == 9 {
+                    Kind::CleanupFailed
+                } else {
+                    Kind::LaunchFailed
+                }
+            );
+            assert_eq!(d.message, "late PID1 failure");
+            assert_eq!(d.native_code.as_deref(), Some("errno:5"));
+            assert_eq!(out.stdout.data, b"\0out");
+            assert_eq!(out.stderr.data, b"\xfferr");
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_exec_keeps_expected_empty_eof_but_rejects_received_malformed_status() {
+        for (status, expected) in [
+            ("b''", Ok(ExecFinish::Canceled)),
+            ("b'bad'", Err(Kind::Protocol)),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = tmp.path().join("ready");
+            let runtime = fixture_runtime(
+                tmp.path(),
+                &format!(
+                    "os.write(OUT,b'saved'); os.write(STATUS,{status}); open({marker:?},'w').close(); time.sleep(30)"
+                ),
+            );
+            let argv = vec!["ignored".into()];
+            let cancel = CancellationToken::new();
+            let spec = ExecSpec {
+                argv: &argv,
+                stdin: b"",
+                deadline: Instant::now() + Duration::from_secs(5),
+                max_output: 1024,
+            };
+            let (out, ()) = tokio::join!(runtime.exec("abcd", &spec, &cancel), async {
+                wait_marker(&marker).await;
+                cancel.cancel();
+            });
+            assert_eq!(out.finish.map_err(|d| d.kind), expected);
+            assert_eq!(out.stdout.data, b"saved");
+        }
+    }
+
+    #[tokio::test]
+    async fn late_command_proof_preserves_status_without_erasing_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ready");
+        let runtime = fixture_runtime(
+            tmp.path(),
+            &format!(
+                "parent=os.getpid()\nif os.fork()==0:\n    while os.getppid()==parent: time.sleep(.002)\n    os.write(STATUS,EXIT125)\n    os._exit(0)\nopen({marker:?},'w').close()\ntime.sleep(30)"
+            ),
+        );
+        fs::remove_file(runtime.cgroup_root.join("abcd/exec/cgroup.events")).unwrap();
+        let argv = vec!["ignored".into()];
+        let cancel = CancellationToken::new();
+        let spec = ExecSpec {
+            argv: &argv,
+            stdin: b"",
+            deadline: Instant::now() + Duration::from_secs(5),
+            max_output: 1024,
+        };
+        let (out, ()) = tokio::join!(runtime.exec("abcd", &spec, &cancel), async {
+            wait_marker(&marker).await;
+            cancel.cancel();
+        });
+        assert_eq!(out.finish, Ok(ExecFinish::Canceled));
+        assert_eq!(out.command_status, Some(CommandStatus::Exited(125)));
+    }
+
+    #[tokio::test]
+    async fn typed_exit125_exit143_signal15_and_bootstrap_failure() {
+        for (body, expected_status, expected_error) in [
+            (
+                "os.write(OUT,b'\\x00\\xffout'); os.write(ERR,b'\\x00\\xfeerr'); os.write(STATUS,EXIT125); sys.exit(125)",
+                Some(CommandStatus::Exited(125)),
+                None,
+            ),
+            (
+                "f=bytearray(EXIT125); f[20]=143; os.write(STATUS,f); sys.exit(143)",
+                Some(CommandStatus::Exited(143)),
+                None,
+            ),
+            (
+                "f=bytearray(EXIT125); f[17]=2; f[20]=15; os.write(STATUS,f); sys.exit(143)",
+                Some(CommandStatus::Signaled {
+                    signal: 15,
+                    core_dumped: false,
+                }),
+                None,
+            ),
+            (
+                "f=bytearray(EXIT125); f[16]=2; f[17]=0; f[20]=0; f[24]=6; f[26]=8; f[28]=2; os.write(OUT,b'prior'); os.write(STATUS,f); sys.exit(127)",
+                None,
+                Some((Kind::LaunchFailed, Stage::Exec)),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = fixture_runtime(tmp.path(), body);
+            let outcome = execute(&runtime).await;
+            assert_eq!(outcome.command_status, expected_status);
+            match expected_error {
+                None => assert_eq!(outcome.finish, Ok(ExecFinish::Completed)),
+                Some((kind, stage)) => {
+                    let e = outcome.finish.unwrap_err();
+                    assert_eq!((e.kind, e.stage), (kind, stage));
+                    assert_eq!(e.native_code.as_deref(), Some("errno:2"));
+                    assert_eq!(outcome.stdout.data, b"prior");
+                }
+            }
+            if expected_status == Some(CommandStatus::Exited(125)) {
+                assert_eq!(outcome.stdout.data, b"\0\xffout");
+                assert_eq!(outcome.stderr.data, b"\0\xfeerr");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_missing_trailing_unsupported_and_abnormal_cli_preserve_output() {
+        for status in [
+            "b''",
+            "b'bad'",
+            "EXIT125[:20]",
+            "EXIT125+b'x'",
+            "EXIT125+EXIT125",
+            "EXIT125[:8]+b'\\x02'+EXIT125[9:]",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = fixture_runtime(
+                tmp.path(),
+                &format!(
+                    "os.write(OUT,b'\\x00out'); os.write(ERR,b'\\xfferr'); os.write(2,b'CLI diagnostic'); os.write(STATUS,{status}); sys.exit(125)"
+                ),
+            );
+            let out = execute(&runtime).await;
+            assert_eq!(
+                out.finish.as_ref().unwrap_err().kind,
+                Kind::Protocol,
+                "{status}: {out:?}"
+            );
+            assert_eq!(out.stdout.data, b"\0out");
+            assert_eq!(out.stderr.data, b"\xfferr");
+        }
+        for ending in ["sys.exit(0)", "os.kill(os.getpid(),signal.SIGKILL)"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = fixture_runtime(
+                tmp.path(),
+                &format!("os.write(OUT,b'saved'); os.write(STATUS,EXIT125); {ending}"),
+            );
+            let out = execute(&runtime).await;
+            assert_eq!(out.finish.unwrap_err().kind, Kind::Protocol);
+            assert_eq!(out.command_status, Some(CommandStatus::Exited(125)));
+            assert_eq!(out.stdout.data, b"saved");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_status_kills_a_hung_cli_without_waiting_for_exec_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = fixture_runtime(
+            tmp.path(),
+            "os.write(OUT,b'saved'); os.write(STATUS,b'bad'); os.close(STATUS); time.sleep(30)",
+        );
+        let out = tokio::time::timeout(Duration::from_secs(2), execute(&runtime))
+            .await
+            .expect("malformed status waited for the execution deadline");
+        assert_eq!(out.finish.unwrap_err().kind, Kind::Protocol);
+        assert_eq!(out.stdout.data, b"saved");
+    }
+
+    #[tokio::test]
+    async fn capture_settlement_failure_keeps_observed_status_and_binary_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = fixture_runtime(
+            tmp.path(),
+            "os.write(OUT,b'\\x00\\xffout'); os.write(ERR,b'\\x00\\xfeerr'); os.write(STATUS,EXIT125); os.close(STATUS)\nif os.fork()==0:\n    time.sleep(3)\n    sys.exit(0)\nsys.exit(125)",
+        );
+        let out = execute(&runtime).await;
+        let d = out.finish.unwrap_err();
+        assert_eq!((d.kind, d.stage), (Kind::Io, Stage::Capture));
+        assert_eq!(out.command_status, Some(CommandStatus::Exited(125)));
+        assert_eq!(out.stdout.data, b"\0\xffout");
+        assert_eq!(out.stdout.total_bytes, 5);
+        assert_eq!(out.stderr.data, b"\0\xfeerr");
+        assert_eq!(out.stderr.total_bytes, 5);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+    }
+
+    #[tokio::test]
+    async fn old_cli_misleading_version_and_old_pid1_never_launch() {
+        for mode in ["legacy", "misleading", "old-pid1", "new-frame-version"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = tmp.path().join("workload");
+            let runtime = fixture_runtime(
+                tmp.path(),
+                &format!("open({marker:?},'w').close()\nos.write(STATUS,EXIT125)\nsys.exit(125)"),
+            );
+            let mut source = fs::read_to_string(&runtime.bin).unwrap();
+            source = match mode {
+                "legacy" => "#!/bin/sh\necho 'unknown capabilities' >&2\nexit 2\n".into(),
+                "misleading" => "#!/bin/sh\necho 'kiln 99.0 modern'\nexit 0\n".into(),
+                "old-pid1" => source.replace(
+                    "os.write(1,CAPS)",
+                    "os.write(1, CAPS if len(sys.argv)==3 else b'legacy PID1')",
+                ),
+                _ => source.replace(
+                    "os.write(1,CAPS)",
+                    "os.write(1, CAPS[:8]+b'\\x02'+CAPS[9:])",
+                ),
+            };
+            fs::write(&runtime.bin, source).unwrap();
+            let out = execute(&runtime).await;
+            let error = out.finish.unwrap_err();
+            assert_eq!(
+                (error.kind, error.stage),
+                (Kind::Incompatible, Stage::Handshake)
+            );
+            assert!(error.message.contains(runtime.bin.to_str().unwrap()));
+            if mode == "old-pid1" {
+                assert!(error.message.contains("sandbox abcd"));
+            }
+            assert!(!marker.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_canceled_and_expired_exec_never_probe_or_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("called");
+        let bin = tmp.path().join("kiln");
+        fs::write(
+            &bin,
+            format!("#!/bin/sh\ntouch '{marker}'\n", marker = marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = KilnRuntime::new(bin);
+        let argv = vec!["true".into()];
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut spec = ExecSpec {
+            argv: &argv,
+            stdin: b"",
+            deadline: Instant::now() + Duration::from_secs(5),
+            max_output: 1,
+        };
+        assert_eq!(
+            runtime.exec("abcd", &spec, &cancel).await.finish,
+            Ok(ExecFinish::Canceled)
+        );
+        spec.deadline = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            runtime
+                .exec("abcd", &spec, &CancellationToken::new())
+                .await
+                .finish,
+            Ok(ExecFinish::TimedOut)
+        );
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn create_requirement_rejects_old_replacement_before_resource_side_effect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("old-kiln");
+        let marker = tmp.path().join("resource");
+        fs::write(&bin,format!("#!/bin/sh\nfor arg do\n  if [ \"$arg\" = --require-exec-protocol=1 ]; then echo unsupported >&2; exit 2; fi\ndone\n: > '{marker}'\necho abcd\n",marker=marker.display())).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = KilnRuntime::new(bin);
+        assert!(runtime.create(&spec(Network::None)).await.is_err());
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn capability_frame_without_eof_is_incompatible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = fixture_runtime(tmp.path(), "sys.exit(0)");
+        let source = fs::read_to_string(&runtime.bin)
+            .unwrap()
+            .replace("os.write(1,CAPS)", "os.write(1,CAPS)\n    time.sleep(.5)");
+        fs::write(&runtime.bin, source).unwrap();
+        let error = runtime
+            .version(
+                Instant::now() + Duration::from_millis(100),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::Incompatible(_)));
+        assert!(error.to_string().contains("deadline expired"));
+    }
+
+    #[tokio::test]
+    async fn malformed_status_waits_for_cleanup_and_delayed_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = fixture_runtime(
+            tmp.path(),
+            "os.write(OUT,b'before')\nif os.fork()==0:\n    os.close(STATUS)\n    time.sleep(.4)\n    os.write(OUT,b'after')\n    sys.exit(0)\nos.write(STATUS,b'bad'); os.close(STATUS); sys.exit(125)",
+        );
+        let events = runtime.cgroup_root.join("abcd/exec/cgroup.events");
+        fs::write(&events, "populated 1\n").unwrap();
+        let start = Instant::now();
+        let (out, ()) = tokio::join!(execute(&runtime), async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            set_events(&events, "populated 0\n");
+        });
+        assert!(start.elapsed() >= Duration::from_millis(600));
+        assert_eq!(out.finish.unwrap_err().kind, Kind::Protocol);
+        assert_eq!(out.stdout.data, b"beforeafter");
+        assert_eq!(out.stdout.total_bytes, 11);
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_overrides_but_keeps_status_and_captures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = fixture_runtime(
+            tmp.path(),
+            "f=bytearray(EXIT125); f[16]=2; f[18]=0; f[24]=9; f[26]=10; os.write(OUT,b'saved'); os.write(STATUS,f); sys.exit(125)",
+        );
+        fs::remove_file(runtime.cgroup_root.join("abcd/exec/cgroup.events")).unwrap();
+        let out = execute(&runtime).await;
+        assert_eq!(
+            (
+                out.finish.as_ref().unwrap_err().kind,
+                out.finish.as_ref().unwrap_err().stage
+            ),
+            (Kind::CleanupFailed, Stage::Cleanup)
+        );
+        assert_eq!(out.command_status, Some(CommandStatus::Exited(125)));
+        assert_eq!(out.stdout.data, b"saved");
+    }
+
+    #[tokio::test]
+    async fn replacement_between_handshake_and_exec_rejects_before_workload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("workload");
+        let runtime = fixture_runtime(tmp.path(), &format!("open({marker:?},'w').close()"));
+        let source=fs::read_to_string(&runtime.bin).unwrap().replace("os.write(1,CAPS)",&format!("if len(sys.argv)>3:\n        open({:?},'w').write('#!/bin/sh\\necho old-binary-rejects-protocol >&2\\nexit 2\\n')\n    os.write(1,CAPS)",runtime.bin));
+        fs::write(&runtime.bin, source).unwrap();
+        let out = execute(&runtime).await;
+        assert_eq!(out.finish.unwrap_err().kind, Kind::Protocol);
+        assert!(!marker.exists());
+    }
 
     fn spec(network: Network) -> SandboxSpec {
         SandboxSpec {
@@ -413,6 +1472,7 @@ mod tests {
             create_args(&spec(Network::None)),
             [
                 "create",
+                "--require-exec-protocol=1",
                 "--image=alpine",
                 "--memory=67108864",
                 "--cpus=0.500",
@@ -501,7 +1561,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("deadline expired"));
+        assert!(error.to_string().contains("deadline expired"), "{error}");
         let pid: libc::pid_t = fs::read_to_string(pid_file).unwrap().parse().unwrap();
         // SAFETY: signal zero only tests whether the recorded process exists.
         let rc = unsafe { libc::kill(pid, 0) };
@@ -517,15 +1577,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("fake-kiln");
         let started = tmp.path().join("started");
-        fs::write(
+        super::super::kiln_process::tests::fixture(
             &bin,
-            format!(
-                "#!/bin/sh\nexec </dev/null >/dev/null 2>&1\n: > '{}'\nexec sleep 30\n",
-                started.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("open({started:?}, 'w').close()\ntime.sleep(30)"),
+        );
         let cgroup_root = tmp.path().join("cgroup");
         let exec_scope = cgroup_root.join("abcd/exec");
         fs::create_dir_all(&exec_scope).unwrap();
@@ -560,12 +1615,11 @@ mod tests {
                 .is_err(),
             "runtime returned before kiln's execution cgroup was empty"
         );
-        fs::write(&events, "populated 0\n").unwrap();
+        set_events(&events, "populated 0\n");
         let outcome = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
-        assert_eq!(outcome.finish, ExecFinish::Canceled);
+        assert_eq!(outcome.finish, Ok(ExecFinish::Canceled));
     }
 }
