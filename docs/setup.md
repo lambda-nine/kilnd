@@ -66,6 +66,7 @@ sudo sqlite3 /var/lib/kilnd/kilnd.db 'SELECT id, state, backend_id FROM sandboxe
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 scripts/integration-test.sh          # root, real kiln, temporary database
+scripts/daemon-singleton-regressions.sh # duplicate starts preserve active work
 scripts/smoke.sh                     # through the installed service
 ```
 
@@ -76,6 +77,12 @@ sandboxes you care about.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart.
+- **Ownership locks:** `kilnd.lock` and `.kilnd.socket.lock` are persistent
+  inode anchors, not stale PID files. Never remove them to fix contention;
+  stop the owning daemon and inspect its logs. A crash releases the kernel
+  locks automatically even though the files remain. Linux then recovers an
+  unchanged stale socket after a bounded refusal probe; ambiguous platforms
+  preserve it and require operator inspection.
 - **After a reboot,** sandboxes are gone (kiln's state is in tmpfs and
   cgroups). kilnd marks them `lost` at startup; delete them to clear the
   records.

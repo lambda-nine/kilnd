@@ -111,7 +111,16 @@ async fn run(args: Args) -> Result<()> {
         bail!("--default-timeout-secs is above --max-timeout-secs");
     }
 
+    if args.socket.parent() == Some(args.state_dir.as_path()) {
+        bail!("--socket directory and --state-dir must be different so socket access cannot widen state permissions");
+    }
+
+    // Store::open takes the state-directory lock before opening SQLite. Bind
+    // then takes the socket-directory lock and reserves the endpoint. Both
+    // ownership domains must be established before reconciliation mutates
+    // durable state or invokes kiln.
     let store = Store::open(&args.state_dir)?;
+    let socket = kilnd::server::bind(&args.socket, gid).await?;
     let manager = Arc::new(Manager::new(KilnRuntime::new(args.kiln.clone()), store, limits));
     let r = manager.reconcile().await.context("startup reconciliation")?;
     info!(
@@ -125,7 +134,6 @@ async fn run(args: Args) -> Result<()> {
         "reconciled with kiln"
     );
 
-    let listener = kilnd::server::bind(&args.socket, gid)?;
     info!(socket = %args.socket.display(), group = %args.socket_group, version = env!("CARGO_PKG_VERSION"), "serving");
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -135,8 +143,7 @@ async fn run(args: Args) -> Result<()> {
             _ = int.recv() => info!("SIGINT"),
         }
     };
-    let result = kilnd::server::serve(manager, listener, shutdown, Duration::from_secs(args.shutdown_grace_secs)).await;
-    let _ = std::fs::remove_file(&args.socket);
+    let result = kilnd::server::serve(manager, socket, shutdown, Duration::from_secs(args.shutdown_grace_secs)).await;
     info!("stopped");
     result
 }

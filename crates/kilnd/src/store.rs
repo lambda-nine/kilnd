@@ -2,14 +2,19 @@
 //! writer; the database lives in a root-only directory.
 
 use std::fs::DirBuilder;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::model::{Captured, Execution, ExecutionState, Sandbox, SandboxSpec, SandboxState, now_ms};
+use crate::lock::ExclusiveFileLock;
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -52,6 +57,11 @@ CREATE INDEX executions_state ON executions (state);
 
 pub struct Store {
     conn: Mutex<Connection>,
+    // Declared after the connection so SQLite closes before state ownership
+    // is released.
+    _instance_lock: Option<ExclusiveFileLock>,
+    #[cfg(test)]
+    reject_execution_finishes: Arc<AtomicBool>,
 }
 
 /// How an execution ended, written in one update.
@@ -65,27 +75,35 @@ pub struct ExecutionResult<'a> {
 
 impl Store {
     /// Opens or creates the database in `dir`, which is created 0700 if
-    /// missing and refused if anyone but its owner can write to it.
+    /// missing and refused if anyone but its owner can write to it. A
+    /// process-lifetime lock is acquired before SQLite is opened.
     pub fn open(dir: &Path) -> Result<Self> {
-        if !dir.exists() {
-            DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("create {}", dir.display()))?;
-        }
-        let meta = std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
-        if !meta.is_dir() {
-            bail!("{} is not a directory", dir.display());
-        }
-        if meta.permissions().mode() & 0o022 != 0 {
-            bail!("{} is writable by group or others; expected 0700", dir.display());
-        }
+        prepare_directory(dir)?;
+        let instance_lock = ExclusiveFileLock::acquire(&dir.join("kilnd.lock"), "state directory")?;
         let conn = Connection::open(dir.join("kilnd.db")).context("open database")?;
-        Self::init(conn)
+        Self::init(conn, Some(instance_lock))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, instance_lock: Option<ExclusiveFileLock>) -> Result<Self> {
+        // Move both resources into their final drop order before any
+        // fallible SQLite setup. This also makes initialization failures
+        // close SQLite before releasing state-directory ownership.
+        let store = Self {
+            conn: Mutex::new(conn),
+            _instance_lock: instance_lock,
+            #[cfg(test)]
+            reject_execution_finishes: Arc::new(AtomicBool::new(false)),
+        };
+        store.initialize()?;
+        Ok(store)
+    }
+
+    fn initialize(&self) -> Result<()> {
+        let conn = self.conn();
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
@@ -99,7 +117,7 @@ impl Store {
             SCHEMA_VERSION => {}
             v => bail!("database schema version {v} is newer than this kilnd ({SCHEMA_VERSION})"),
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(())
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -205,6 +223,10 @@ impl Store {
     }
 
     pub fn finish_execution(&self, id: &str, r: &ExecutionResult<'_>) -> Result<()> {
+        #[cfg(test)]
+        if self.reject_execution_finishes.load(Ordering::SeqCst) {
+            bail!("injected execution finalization failure");
+        }
         let n = self.conn().execute(
             "UPDATE executions SET state = ?2, exit_code = ?3, failure_reason = ?4, finished_at_ms = ?5,
                  stdout = ?6, stdout_bytes = ?7, stdout_truncated = ?8,
@@ -271,19 +293,19 @@ impl Store {
 
     #[cfg(test)]
     pub(crate) fn reject_execution_finishes(&self) -> Result<()> {
-        self.conn().execute_batch(
-            "CREATE TEMP TRIGGER reject_execution_finishes
-             BEFORE UPDATE OF state ON executions
-             WHEN OLD.state = 'running' AND NEW.state != 'running'
-             BEGIN SELECT RAISE(FAIL, 'injected execution finalization failure'); END;",
-        )?;
+        self.reject_execution_finishes.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn allow_execution_finishes(&self) -> Result<()> {
-        self.conn().execute_batch("DROP TRIGGER reject_execution_finishes")?;
+        self.reject_execution_finishes.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execution_finish_rejection_flag(&self) -> Arc<AtomicBool> {
+        self.reject_execution_finishes.clone()
     }
 
     /// Marks every execution still recorded as running as interrupted.
@@ -294,6 +316,25 @@ impl Store {
             params![reason, now_ms()],
         )?)
     }
+}
+
+fn prepare_directory(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let meta = std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if !meta.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    if meta.uid() != euid {
+        bail!("{} must be owned by uid {euid}, found uid {}", dir.display(), meta.uid());
+    }
+    if meta.permissions().mode() & 0o022 != 0 {
+        bail!("{} is writable by group or others; expected 0700", dir.display());
+    }
+    Ok(())
 }
 
 const SANDBOX_COLUMNS: &str =
@@ -504,6 +545,89 @@ mod tests {
     fn refuses_a_newer_schema() {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "user_version", 99).unwrap();
-        assert!(Store::init(conn).is_err());
+        assert!(Store::init(conn, None).is_err());
+    }
+
+    #[test]
+    fn failed_initialization_closes_sqlite_before_releasing_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let database = dir.join("kilnd.db");
+        let conn = Connection::open(&database).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; PRAGMA user_version=99;")
+            .unwrap();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let lock = ExclusiveFileLock::acquire(&dir.join("kilnd.lock"), "state directory")
+            .unwrap()
+            .with_drop_probe({
+                let observed = observed.clone();
+                move || {
+                    let contender = Connection::open(&database).unwrap();
+                    contender.busy_timeout(std::time::Duration::ZERO).unwrap();
+                    let sqlite_was_closed = contender.execute_batch("BEGIN EXCLUSIVE").is_ok();
+                    observed.store(if sqlite_was_closed { 1 } else { 2 }, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+
+        assert!(Store::init(conn, Some(lock)).is_err());
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "state ownership was released while the failed SQLite connection was still open"
+        );
+    }
+
+    #[test]
+    fn state_directory_has_one_owner_and_keeps_a_stable_lock_inode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let first = Store::open(&dir).unwrap();
+        let lock = dir.join("kilnd.lock");
+        let inode = std::fs::symlink_metadata(&lock).unwrap().ino();
+
+        let error = Store::open(&dir).err().expect("a second store acquired the same state directory");
+        assert!(error.to_string().contains("state directory already owned"), "{error:#}");
+        assert_eq!(std::fs::symlink_metadata(&lock).unwrap().ino(), inode);
+
+        drop(first);
+        let _next = Store::open(&dir).unwrap();
+        assert_eq!(std::fs::symlink_metadata(&lock).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn simultaneous_state_directory_starts_have_one_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut threads = Vec::new();
+
+        for _ in 0..2 {
+            let dir = dir.clone();
+            let start = start.clone();
+            let release = release.clone();
+            let tx = tx.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let store = Store::open(&dir);
+                let outcome = store.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+                tx.send(outcome).unwrap();
+                release.wait();
+                drop(store);
+            }));
+        }
+        drop(tx);
+
+        let outcomes: Vec<_> = (0..2).map(|_| rx.recv().unwrap()).collect();
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1, "{outcomes:?}");
+        let loser = outcomes.iter().find_map(|result| result.as_ref().err()).unwrap();
+        assert!(loser.contains("state directory already owned"), "{loser}");
+        release.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 }

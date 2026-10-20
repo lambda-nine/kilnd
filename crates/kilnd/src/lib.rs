@@ -9,3 +9,5 @@ pub mod runtime;
 pub mod server;
 pub mod service;
 pub mod store;
+
+mod lock;

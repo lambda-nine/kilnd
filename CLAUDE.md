@@ -18,7 +18,8 @@ through its CLI. Read [README.md](README.md),
   CI runs them with Rust 1.88 (the MSRV).
 - **Privileged checks** for anything touching the runtime adapter, process
   handling, reconciliation, the socket or shutdown, in the VM after
-  `scripts/install.sh`: `scripts/integration-test.sh` and `scripts/smoke.sh`.
+  `scripts/install.sh`: `scripts/integration-test.sh`,
+  `scripts/daemon-singleton-regressions.sh` and `scripts/smoke.sh`.
 - **kiln stays in its own repository** (`~/Projects/lambda-nine/kiln`). Never
   copy its runtime code here. If kilnd exposes a kiln defect, fix it there,
   with its own test and commit.

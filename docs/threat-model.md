@@ -16,9 +16,13 @@ file says what it protects, what it trusts, and what it doesn't try to do.
 
 - **Socket access.** `/run/kilnd` is `root:kilnd 0750` and the socket
   `root:kilnd 0660` (or root-only with `--socket-group ''`). kilnd refuses a
-  socket directory it doesn't own and won't replace anything at the socket
-  path except a stale socket. Each connection's uid, gid and pid are logged
-  from `SO_PEERCRED`. There is no per-call authorization beyond this.
+  socket directory it doesn't own, locks that directory before reconciliation,
+  and, on Linux, won't replace anything at the socket path except an unchanged
+  socket whose bounded connection probe returned `ECONNREFUSED`. Platforms
+  where refusal can also mean backlog pressure fail closed. Shutdown unlinks
+  the path only when its device and inode still match this instance. Each
+  connection's uid, gid and pid are logged from `SO_PEERCRED`. There is no
+  per-call authorization beyond this.
 - **No shell injection into the host.** kiln is spawned with an argument
   vector. Flag values use `--flag=value`, the command follows `--`, and
   images, allowlist entries, paths, labels and IDs are validated before use.
@@ -28,8 +32,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   limits, exec timeout, argv, stdin and stored output keep one client from
   filling memory, disk or the database with a single request.
 - **State integrity.** The database directory is root-only 0700. kilnd
-  refuses one writable by group or others, and refuses a schema newer than
-  it understands.
+  refuses one owned by another user or writable by group or others, takes its
+  persistent instance lock before opening SQLite, and refuses a schema newer
+  than it understands.
 - **No request-owned exec work.** After an execution row is recorded, a
   daemon supervisor owns backend cleanup, pipe capture and finalization even
   if the RPC disappears. kiln places each command in an execution cgroup;
@@ -47,6 +52,17 @@ sandbox compromises the host.
 
 ## Known gaps
 
+- **Instance locks are cooperative.** Persistent `flock` files prevent
+  cooperating kilnd processes from sharing a state or socket directory. They
+  do not protect against root, a lock-unaware old daemon, or a process that
+  deliberately ignores the locks. POSIX also has no atomic compare-and-unlink
+  by inode; trusted directory ownership and the socket-directory lock close
+  that race for supported instances. Stop old daemons before upgrading, and
+  never delete a lock file to clear contention.
+- **Socket reservation is not readiness.** The pathname is bound before
+  reconciliation so contenders cannot mutate state first. Connections may
+  wait until reconciliation finishes; use `Health`, not path existence, as
+  the readiness check.
 - **Terminal publication needs writable storage.** kilnd does not report an
   execution as successfully drained if its terminal update fails. It retains
   the outcome and sandbox lock, retries with bounded backoff, degrades health,

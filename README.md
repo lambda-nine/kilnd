@@ -43,6 +43,12 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   (directory 0750, socket 0660), per-execution timeouts that stop the command
   inside the sandbox, bounded output, stdin and argv, a cap on active
   sandboxes, graceful shutdown, and structured logs (text or JSON).
+- **Exclusive daemon ownership:** a persistent advisory lock in the state
+  directory prevents a second process from opening the same database, while
+  a separate socket-directory lock prevents endpoint takeover. Both are held
+  before startup reconciliation and through shutdown cleanup. A live listener
+  is never unlinked; on Linux, a stale socket is replaced after a bounded
+  probe. Platforms where refusal can also mean backlog pressure fail closed.
 - **Supervised creates:** after acceptance, `CreateSandbox` belongs to the
   daemon rather than the RPC future. A disconnected caller stops receiving
   the result, but creation still reaches `ready` or attempts compensation.
@@ -99,6 +105,7 @@ hand in the VM after `scripts/install.sh`:
 
 ```sh
 scripts/integration-test.sh   # the manager against real kiln, temporary database
+scripts/daemon-singleton-regressions.sh # duplicate startup cannot disturb live work
 scripts/smoke.sh              # kilndctl → socket → service → kiln, checked in SQLite
 ```
 

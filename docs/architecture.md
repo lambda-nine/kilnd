@@ -91,9 +91,36 @@ If the terminal SQLite update fails, the supervisor keeps the lock and outcome
 and retries with bounded exponential backoff. Health is degraded and shutdown
 cannot claim a completed drain until that publication succeeds.
 
+## Instance ownership
+
+Startup establishes two independent ownership domains before reconciliation:
+
+1. `Store::open` validates the state directory and takes a nonblocking
+   advisory lock on its persistent `kilnd.lock` file before opening SQLite.
+2. Socket binding takes a nonblocking advisory lock on the persistent
+   `.kilnd.socket.lock` in the socket directory. An existing socket is probed
+   with a bounded connection attempt: a successful connection is a live
+   owner. On Linux, `ECONNREFUSED` plus unchanged device/inode identifies a
+   stale endpoint. Platforms such as macOS, where refusal can also report a
+   full live backlog, preserve the path and fail closed. Every other
+   ambiguous result is also preserved and rejected.
+3. The new listener is bound and its pathname identity recorded. Only then
+   may reconciliation invoke kiln or update SQLite.
+
+The lock files are never unlinked. Their open descriptors are close-on-exec,
+so kiln children cannot retain ownership after kilnd exits. The bound socket
+is an RAII resource: graceful exit removes it only if the pathname still has
+the device and inode recorded at bind time. A replacement is left untouched.
+The socket-directory lock remains held while Chapter 7 supervisors drain,
+even if the transport listener has already closed.
+
+These are resource-scoped advisory locks, not a defense against hostile root.
+Separate state and socket directories can intentionally run another daemon;
+operators must not point independent daemons at the same kiln backend.
+
 ## Reconciliation
 
-At startup, before the socket is bound:
+At startup, after both ownership locks are held and the socket is reserved:
 
 1. `kiln gc` removes what dead shims left behind (kiln only touches sandboxes
    whose shim is gone).
@@ -144,7 +171,10 @@ reply deadline it stops waiting for transport replies but continues draining
 accepted create, compensation, and execution supervisors before removing the
 socket and exiting. Thus the reply deadline does not bound owned cleanup.
 Sandboxes keep running. Forced termination can still interrupt an operation;
-startup reconciliation handles the state it can identify.
+startup reconciliation handles the state it can identify. After all accepted
+operations drain, kilnd conditionally removes only its own socket inode and
+then releases the socket- and state-directory locks. A crash releases the
+kernel locks but can leave a stale socket for the next instance to probe.
 
 The systemd unit uses `KillMode=process` because kiln's shims are forked from
 kilnd's cgroup and must survive daemon restarts. systemd logs "left-over

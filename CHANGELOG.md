@@ -17,6 +17,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   transport reply deadline.
 - Requires kiln at or after `3b42552` for per-execution cgroup teardown and
   cumulative runtime hardening.
+- Startup now locks both the state and socket directories before
+  reconciliation, refuses live socket owners, replaces only positively stale
+  sockets on Linux, and conditionally removes only the socket inode this
+  instance bound. Ambiguous platforms fail closed. Duplicate starts cannot
+  interrupt active daemon-owned work.
 
 ## 0.1.0 - 2026-10-13
 
