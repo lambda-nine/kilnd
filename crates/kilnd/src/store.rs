@@ -601,6 +601,7 @@ mod tests {
         );
         for version in [1, 2] {
             let tmp = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
             let mut schema = schema_v2();
             if version == 1 {
@@ -644,6 +645,7 @@ mod tests {
     fn typed_failure_binary_capture_and_utf8_bounded_diagnostic_reopen_atomically() {
         use crate::model::{RuntimeErrorKind, RuntimeStage};
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let s = sandbox();
         store.insert_sandbox(&s).unwrap();
