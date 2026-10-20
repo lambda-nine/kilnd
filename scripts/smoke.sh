@@ -20,8 +20,15 @@ wait_ready() {
 }
 backend_of() { ctl get "$1" | awk '/^backend:/ {print $3}'; }
 created=()
+api_tmp=
 cleanup() {
     for s in "${created[@]}"; do sudo kilndctl rm "$s" >/dev/null 2>&1 || true; done
+    if [[ -n "$api_tmp" && -d "$api_tmp" ]]; then
+        rm -f "$api_tmp/exit125.out" "$api_tmp/exit125.err" \
+            "$api_tmp/signal15.out" "$api_tmp/signal15.err" \
+            "$api_tmp/launch.out" "$api_tmp/launch.err"
+        rmdir "$api_tmp"
+    fi
 }
 trap cleanup EXIT
 
@@ -89,6 +96,10 @@ set -e
 [ "$(sql "SELECT state || ':' || command_status_kind || ':' || command_status_value || ':' || hex(stdout) || ':' || hex(stderr) FROM executions WHERE sandbox_id='$id' AND exit_code=125")" = 'exited:exited:125:00FF6F7574:00FE657272' ] || fail "binary exit125 evidence"
 [ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id='$id' AND command_status_kind='signaled' AND command_status_value=15 AND exit_code=143")" -eq 1 ] || fail "signal15 not distinct from exit143"
 [ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id='$id' AND state='failed' AND exit_code IS NULL AND command_status_kind IS NULL AND json_extract(runtime_error,'$.kind')='launch_failed' AND json_extract(runtime_error,'$.stage')='exec'")" -eq 1 ] || fail "typed execvp failure"
+exit125_id=$(sql "SELECT id FROM executions WHERE sandbox_id='$id' AND exit_code=125")
+signal15_id=$(sql "SELECT id FROM executions WHERE sandbox_id='$id' AND command_status_kind='signaled' AND command_status_value=15")
+launch_id=$(sql "SELECT id FROM executions WHERE sandbox_id='$id' AND state='failed' AND json_extract(runtime_error,'$.kind')='launch_failed'")
+[ -n "$exit125_id" ] && [ -n "$signal15_id" ] && [ -n "$launch_id" ] || fail "typed execution IDs"
 
 echo "4. Restarting kilnd keeps the sandbox"
 sudo systemctl restart kilnd
@@ -96,6 +107,35 @@ wait_ready
 ctl get "$id" | grep -q '^state: *ready' || fail "sandbox not ready after restart"
 [ "$(sql "SELECT hex(stdout) || ':' || hex(stderr) FROM executions WHERE sandbox_id='$id' AND exit_code=125")" = '00FF6F7574:00FE657272' ] || fail "typed binary evidence lost on restart"
 [ "$(ctl exec "$id" -- cat /workspace/note)" = note ] || fail "sandbox state lost across restart"
+api_tmp=$(mktemp -d)
+ctl execution "$exit125_id" >"$api_tmp/exit125.out" 2>"$api_tmp/exit125.err"
+ctl execution "$signal15_id" >"$api_tmp/signal15.out" 2>"$api_tmp/signal15.err"
+ctl execution "$launch_id" >"$api_tmp/launch.out" 2>"$api_tmp/launch.err"
+python3 -I - "$api_tmp" <<'PY' || fail "typed API evidence after restart"
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+assert (root / "exit125.out").read_bytes() == b"\0\xffout"
+exit125 = (root / "exit125.err").read_bytes()
+assert exit125.startswith(b"\0\xfeerr")
+exit125_summary = exit125[5:].decode()
+assert "state:    exited" in exit125_summary
+assert "exit:     125" in exit125_summary
+assert "kilndctl: runtime" not in exit125_summary
+
+assert (root / "signal15.out").read_bytes() == b""
+signal15 = (root / "signal15.err").read_text()
+assert "kilndctl: terminated by signal 15" in signal15
+assert "state:    exited" in signal15
+assert "exit:     143" in signal15
+
+assert (root / "launch.out").read_bytes() == b""
+launch = (root / "launch.err").read_text()
+assert "kilndctl: runtime LaunchFailed/Exec:" in launch
+assert "state:    failed" in launch
+assert "exit:" not in launch
+PY
 
 echo "5. Killing kilnd mid-exec interrupts the execution, not the sandbox"
 ctl exec --timeout 60s "$id" -- sleep 30 >/dev/null 2>&1 &
