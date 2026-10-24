@@ -75,7 +75,12 @@ the same absolute deadline. Only a successful complete list proving absence
 becomes NotFound/Handshake and marks the managed sandbox LOST. A listed old
 PID 1 stays Incompatible; failed or expired observations never imply absence.
 List absence evidence requires verified EOF on both CLI streams with no read,
-task or forced-stop error, untruncated UTF-8 stdout and a valid table. The
+task or forced-stop error, untruncated CLI output and a valid table. The table
+must have its exact tab-separated header, a newline-terminated three-field
+record for every sandbox, valid unique IDs and numeric shim PIDs. A 64 KiB
+capture cutoff, partial final record, duplicate or extra field is an error
+before absence is considered. Even a syntactically complete list cannot prove
+absence while that sandbox's cgroup still exists. The
 generic runner retains internal completion metadata and prior captured bytes
 on failures. Its post-child drain polls completion before the original cancel,
 absolute deadline and 250 ms grace; drainage never grants a fresh deadline.
@@ -172,12 +177,17 @@ At startup, after both ownership locks are held and the socket is reserved:
 1. Validate installed CLI capabilities before `kiln gc` removes what dead shims
    left behind (kiln only touches sandboxes whose shim is gone).
 2. `kiln ls` lists what is alive. If it fails, kilnd refuses to start rather
-   than guess.
-3. Validate every managed live `READY`/`CREATING` sandbox's PID 1 capabilities
-   before any durable reconciliation mutation. An incompatibility aborts startup
-   without marking it lost or removing its workspace. For each sandbox of this
-   backend in the database: `READY`/`CREATING` with a live backend stays (or
-   becomes) `READY`; without one it becomes `LOST`;
+   than guess. EOF, capture bounds and every record are validated before the
+   table is parsed.
+3. Before any durable reconciliation mutation, validate every listed live
+   `READY`/`CREATING` sandbox and directly probe every managed backend omitted
+   from the list. A reachable omitted backend proves the listing incomplete;
+   an absent registry record is trusted only when its cgroup is also absent.
+   Incompatibility, conflicting evidence or an inconclusive probe aborts startup
+   without changing sandbox or execution rows. For each sandbox of this backend
+   in the database: `READY`/`CREATING` with a live backend stays (or becomes)
+   `READY`; with confirmed absence it becomes `LOST`; an exact backend that
+   reappears for a `LOST` row and passes validation becomes `READY` again;
    `CREATING` without a backend ID becomes `FAILED`; `DELETING` is retried
    or completed.
 4. Executions still `RUNNING` become `INTERRUPTED`. Their `kiln exec` clients

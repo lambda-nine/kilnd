@@ -244,6 +244,7 @@ pub struct Health {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Reconciled {
     pub gc_removed: Vec<String>,
+    pub recovered: Vec<String>,
     pub lost: Vec<String>,
     pub failed: Vec<String>,
     pub deleted: Vec<String>,
@@ -334,11 +335,19 @@ impl<R: Runtime> Manager<R> {
         let mut known = std::collections::HashSet::new();
         let sandboxes = self.store.sandboxes(true)?;
         // Check all candidates before any durable reconciliation mutation.
+        // A complete list is necessary but not sufficient absence evidence:
+        // independently probe any managed backend whose list record is
+        // missing (or no longer running). A reachable backend proves the list
+        // was incomplete, so startup must fail without changing the store.
         for s in &sandboxes {
-            if s.backend == self.runtime.name()
-                && matches!(s.state, SandboxState::Creating | SandboxState::Ready)
-            {
-                if let Some(id) = &s.backend_id {
+            if s.backend != self.runtime.name() {
+                continue;
+            }
+            let Some(id) = &s.backend_id else {
+                continue;
+            };
+            match s.state {
+                SandboxState::Creating | SandboxState::Ready => {
                     if live.get(id) == Some(&BackendStatus::Running) {
                         self.runtime
                             .validate_sandbox(
@@ -348,8 +357,56 @@ impl<R: Runtime> Manager<R> {
                             )
                             .await
                             .map_err(backend)?;
+                    } else {
+                        match self
+                            .runtime
+                            .validate_sandbox(
+                                id,
+                                Instant::now() + self.limits.health_probe_timeout,
+                                &cancel,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                return Err(Error::Backend(format!(
+                                    "backend listing did not report reachable managed sandbox {id} for {} as running",
+                                    s.id
+                                )));
+                            }
+                            Err(RuntimeError::NotFound(_)) => {}
+                            Err(error) => return Err(backend(error)),
+                        }
                     }
                 }
+                SandboxState::Deleting if !live.contains_key(id) => match self
+                    .runtime
+                    .validate_sandbox(
+                        id,
+                        Instant::now() + self.limits.health_probe_timeout,
+                        &cancel,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        return Err(Error::Backend(format!(
+                            "backend listing did not report reachable managed sandbox {id} for {} as present",
+                            s.id
+                        )));
+                    }
+                    Err(RuntimeError::NotFound(_)) => {}
+                    Err(error) => return Err(backend(error)),
+                },
+                SandboxState::Lost if live.get(id) == Some(&BackendStatus::Running) => {
+                    self.runtime
+                        .validate_sandbox(
+                            id,
+                            Instant::now() + self.limits.health_probe_timeout,
+                            &cancel,
+                        )
+                        .await
+                        .map_err(backend)?;
+                }
+                _ => {}
             }
         }
         for s in sandboxes {
@@ -424,6 +481,11 @@ impl<R: Runtime> Manager<R> {
                         Some("ready sandbox had no backend ID"),
                     )?;
                     out.lost.push(s.id);
+                }
+                (SandboxState::Lost, Some(_)) if alive => {
+                    self.store
+                        .set_sandbox_state(&s.id, SandboxState::Ready, None, None)?;
+                    out.recovered.push(s.id);
                 }
                 (SandboxState::Deleted | SandboxState::Failed | SandboxState::Lost, _) => {}
             }

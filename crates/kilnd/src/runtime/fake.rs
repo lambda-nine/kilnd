@@ -98,6 +98,10 @@ pub struct FakeState {
     pub remove_before_delete: Option<FakeGate>,
     /// When set, `list` and `version` fail, like a missing kiln binary.
     pub unavailable: bool,
+    /// Backend IDs deliberately omitted from `list` while direct validation
+    /// still observes them. Reconciliation tests use this to model an
+    /// incomplete but otherwise successful backend listing.
+    pub hidden_from_list: Vec<String>,
     pub incompatible_sandboxes: Vec<String>,
     next: u64,
 }
@@ -402,6 +406,7 @@ impl Runtime for FakeRuntime {
         }
         Ok(s.sandboxes
             .iter()
+            .filter(|(id, _)| !s.hidden_from_list.iter().any(|hidden| hidden == *id))
             .map(|(id, status)| BackendSandbox {
                 id: id.clone(),
                 status: *status,

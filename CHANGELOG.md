@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Startup reconciliation now fails closed on truncated, partial, duplicate or
+  contradictory backend listings. Omitted managed sandboxes require a direct
+  negative probe and absent cgroup before becoming `LOST`; exact backends that
+  provably reappear recover to `READY`. Reconciliation validates all evidence
+  before changing durable state and remains idempotent across restarts.
+
 - Adds backend-neutral typed command termination and runtime diagnostics to
   executions, the additive v1 API, schema 3, and kilndctl. Private machine
   stdio/status sockets preserve binary evidence through failures, cleanup,

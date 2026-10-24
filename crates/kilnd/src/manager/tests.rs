@@ -1352,3 +1352,76 @@ async fn reconcile_changes_nothing_when_the_backend_is_unavailable() {
     assert!(matches!(m.reconcile().await, Err(Error::Backend(_))));
     assert_eq!(m.get(&s.id, 0).unwrap().0.state, SandboxState::Ready);
 }
+
+#[tokio::test]
+async fn reconcile_rejects_a_listing_that_hides_a_reachable_managed_sandbox() {
+    let (m, fake) = manager();
+    let visible = m.create(CreateRequest::default()).await.unwrap();
+    let hidden = m.create(CreateRequest::default()).await.unwrap();
+    let mut interrupted = m.exec(exec_req(&visible.id, &["true"])).await.unwrap();
+    interrupted.id = new_id("ex");
+    interrupted.state = ExecutionState::Running;
+    m.store.insert_execution(&interrupted).unwrap();
+    fake.state()
+        .hidden_from_list
+        .push(hidden.backend_id.clone().unwrap());
+
+    let before = m.store.sandboxes(true).unwrap();
+    let error = m.reconcile().await.unwrap_err();
+    assert!(matches!(error, Error::Backend(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("listing did not report reachable")
+    );
+    assert_eq!(m.store.sandboxes(true).unwrap(), before);
+    assert_eq!(
+        m.execution(&interrupted.id).unwrap().state,
+        ExecutionState::Running,
+        "incomplete evidence must not partially reconcile executions"
+    );
+    assert_eq!(m.get(&hidden.id, 0).unwrap().0.state, SandboxState::Ready);
+}
+
+#[tokio::test]
+async fn a_provably_reappeared_backend_recovers_after_restart_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    let fake = FakeRuntime::default();
+    let sandbox = {
+        let manager = Arc::new(Manager::new(
+            fake.clone(),
+            Store::open(&state_dir).unwrap(),
+            Limits::default(),
+        ));
+        let sandbox = manager.create(CreateRequest::default()).await.unwrap();
+        manager
+            .store
+            .set_sandbox_state(
+                &sandbox.id,
+                SandboxState::Lost,
+                None,
+                Some("injected crash-era false absence"),
+            )
+            .unwrap();
+        sandbox
+    };
+
+    let manager = Arc::new(Manager::new(
+        fake,
+        Store::open(&state_dir).unwrap(),
+        Limits::default(),
+    ));
+    let first = manager.reconcile().await.unwrap();
+    assert_eq!(first.recovered, vec![sandbox.id.clone()]);
+    let recovered = manager.get(&sandbox.id, 0).unwrap().0;
+    assert_eq!(recovered.state, SandboxState::Ready);
+    assert_eq!(recovered.failure_reason, None);
+
+    let second = manager.reconcile().await.unwrap();
+    assert_eq!(second, Reconciled::default());
+    assert_eq!(
+        manager.get(&sandbox.id, 0).unwrap().0.state,
+        SandboxState::Ready
+    );
+}

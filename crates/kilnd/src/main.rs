@@ -172,6 +172,7 @@ async fn run(args: Args) -> Result<()> {
         .context("startup reconciliation")?;
     info!(
         gc_removed = r.gc_removed.len(),
+        recovered = r.recovered.len(),
         lost = r.lost.len(),
         failed = r.failed.len(),
         deleted = r.deleted.len(),

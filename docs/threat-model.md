@@ -111,6 +111,11 @@ sandbox compromises the host.
   command exits 125/126/127. Readers preserve observed binary bytes/counts on
   error or panic and stay alive through the cleanup barrier. Captures settle
   with an explicit EOF timeout after drainage; failures retain partial evidence.
+  Backend listings require clean EOF on both streams, no 64 KiB capture loss,
+  strict newline-terminated records, unique IDs and valid shim PIDs. Startup
+  directly probes omitted managed backends and checks their cgroup before
+  trusting absence, so a hidden registry record cannot turn a live sandbox
+  into `LOST`. A validated exact backend may recover `LOST` to `READY`.
   CLI and every managed live sandbox must advertise required capabilities;
   incompatible replacements and old PID 1 instances fail closed.
   This requires persistent-exec v1 first supplied by kiln

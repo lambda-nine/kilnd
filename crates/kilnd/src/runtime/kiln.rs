@@ -164,10 +164,12 @@ impl KilnRuntime {
                 out.stdout_completion, out.stderr_completion
             )));
         }
-        if out.stdout.truncated() {
-            return Err(RuntimeError::Backend(
-                "kiln ls observation was truncated".into(),
-            ));
+        if out.stdout.truncated() || out.stderr.truncated() {
+            return Err(RuntimeError::Backend(format!(
+                "kiln ls observation was truncated: stdout {}; stderr {}",
+                out.stdout.truncated(),
+                out.stderr.truncated()
+            )));
         }
         let text = std::str::from_utf8(&out.stdout.data).map_err(|e| {
             RuntimeError::Backend(format!("kiln ls observation was not UTF-8: {e}"))
@@ -257,7 +259,25 @@ impl Runtime for KilnRuntime {
                 }
                 match self.list_until(deadline, cancel).await {
                     Ok(sandboxes) if !sandboxes.iter().any(|sandbox| sandbox.id == id) => {
-                        Err(RuntimeError::NotFound(id.into()))
+                        if cancel.is_cancelled() || Instant::now() >= deadline {
+                            return Err(RuntimeError::Incompatible(format!(
+                                "{probe_error}; sandbox absence was not confirmed within the original deadline/cancellation budget"
+                            )));
+                        }
+                        let cgroup = self.cgroup_root.join(id);
+                        match tokio::fs::metadata(&cgroup).await {
+                            Ok(_) => Err(RuntimeError::Incompatible(format!(
+                                "{probe_error}; kiln ls omitted sandbox {id}, but its cgroup {} still exists",
+                                cgroup.display()
+                            ))),
+                            Err(error) if error.kind() == ErrorKind::NotFound => {
+                                Err(RuntimeError::NotFound(id.into()))
+                            }
+                            Err(error) => Err(RuntimeError::Incompatible(format!(
+                                "{probe_error}; sandbox presence could not be confirmed: inspect cgroup {}: {error}",
+                                cgroup.display()
+                            ))),
+                        }
                     }
                     Ok(_) => Err(probe_error),
                     Err(observation_error) => Err(RuntimeError::Incompatible(format!(
@@ -544,44 +564,61 @@ pub fn create_args(spec: &SandboxSpec) -> Vec<String> {
 /// Anything unexpected is an error, so a format change can't make live
 /// sandboxes look missing.
 pub fn parse_ls(text: &str) -> Result<Vec<BackendSandbox>, RuntimeError> {
-    let mut lines = text.lines();
-    if lines
-        .next()
-        .map(str::split_whitespace)
-        .map(Iterator::collect::<Vec<_>>)
-        != Some(vec!["ID", "STATUS", "SHIM"])
-    {
+    if !text.ends_with('\n') {
+        return Err(RuntimeError::Backend(
+            "kiln ls observation ended with a partial line".into(),
+        ));
+    }
+    let mut lines = text.split_terminator('\n');
+    if lines.next() != Some("ID\tSTATUS\tSHIM") {
         return Err(RuntimeError::Backend("unexpected kiln ls header".into()));
     }
-    lines
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            let mut fields = line.split('\t');
-            let (Some(id), Some(status)) = (fields.next(), fields.next()) else {
+    let mut seen = std::collections::HashSet::new();
+    let mut sandboxes = Vec::new();
+    for line in lines {
+        let mut fields = line.split('\t');
+        let (Some(id), Some(status), Some(shim), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(RuntimeError::Backend(format!(
+                "unexpected kiln ls line {line:?}"
+            )));
+        };
+        let status = match status {
+            "running" => BackendStatus::Running,
+            "stale" => BackendStatus::Stale,
+            _ => {
                 return Err(RuntimeError::Backend(format!(
-                    "unexpected kiln ls line {line:?}"
-                )));
-            };
-            let status = match status {
-                "running" => BackendStatus::Running,
-                "stale" => BackendStatus::Stale,
-                _ => {
-                    return Err(RuntimeError::Backend(format!(
-                        "unexpected kiln ls status {status:?}"
-                    )));
-                }
-            };
-            if !valid_kiln_id(id) {
-                return Err(RuntimeError::Backend(format!(
-                    "unexpected kiln ls ID {id:?}"
+                    "unexpected kiln ls status {status:?}"
                 )));
             }
-            Ok(BackendSandbox {
-                id: id.to_string(),
-                status,
-            })
-        })
-        .collect()
+        };
+        if !valid_kiln_id(id) {
+            return Err(RuntimeError::Backend(format!(
+                "unexpected kiln ls ID {id:?}"
+            )));
+        }
+        if !seen.insert(id) {
+            return Err(RuntimeError::Backend(format!(
+                "duplicate kiln ls ID {id:?}"
+            )));
+        }
+        let Ok(shim) = shim.parse::<u32>() else {
+            return Err(RuntimeError::Backend(format!(
+                "unexpected kiln ls shim PID {shim:?}"
+            )));
+        };
+        if shim == 0 || shim > i32::MAX as u32 {
+            return Err(RuntimeError::Backend(format!(
+                "unexpected kiln ls shim PID {shim}"
+            )));
+        }
+        sandboxes.push(BackendSandbox {
+            id: id.to_string(),
+            status,
+        });
+    }
+    Ok(sandboxes)
 }
 
 /// kiln IDs are hex digits and dashes, like `18de453339a8cc89-3762`.
@@ -686,6 +723,9 @@ mod tests {
             tmp,
             &format!("open({workload:?},'w').close()\nos.write(STATUS,EXIT125)\nsys.exit(125)"),
         );
+        if !present {
+            fs::remove_dir_all(runtime.cgroup_root.join("abcd")).unwrap();
+        }
         let listing = if present {
             "ID\\tSTATUS\\tSHIM\\nabcd\\trunning\\t42\\n"
         } else {
@@ -837,6 +877,43 @@ mod tests {
             );
             assert!(!tmp.path().join("workload").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn a_complete_listing_cannot_hide_an_existing_sandbox_cgroup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = failed_id_probe_runtime(
+            tmp.path(),
+            true,
+            Some("os.write(1,b'ID\\tSTATUS\\tSHIM\\n'); sys.exit(0)"),
+        );
+        let error = runtime
+            .validate_sandbox(
+                "abcd",
+                Instant::now() + Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::Incompatible(_)));
+        assert!(error.to_string().contains("kiln ls omitted sandbox abcd"));
+        assert!(error.to_string().contains("cgroup"));
+        assert!(!tmp.path().join("workload").exists());
+    }
+
+    #[tokio::test]
+    async fn list_rejects_output_beyond_the_64_kib_control_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body =
+            format!("os.write(1,b'ID\\tSTATUS\\tSHIM\\n'+b'a'*{CONTROL_OUTPUT}); sys.exit(0)");
+        let runtime = failed_id_probe_runtime(tmp.path(), false, Some(&body));
+        let error = runtime.list().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("kiln ls observation was truncated")
+        );
+        assert!(error.to_string().contains("stdout true"));
     }
 
     fn delayed_listing_runtime(tmp: &Path, hold_stderr: bool) -> KilnRuntime {
@@ -1500,7 +1577,7 @@ mod tests {
 
     #[test]
     fn parses_ls() {
-        let got = parse_ls("ID\tSTATUS\tSHIM\n18de-1\trunning\t42\nab-2\tstale\t\n").unwrap();
+        let got = parse_ls("ID\tSTATUS\tSHIM\n18de-1\trunning\t42\nab-2\tstale\t7\n").unwrap();
         assert_eq!(
             got,
             [
@@ -1519,6 +1596,11 @@ mod tests {
         assert!(parse_ls("NAME\tSTATE\n").is_err());
         assert!(parse_ls("ID\tSTATUS\tSHIM\nab-1\tzombie\t3\n").is_err());
         assert!(parse_ls("ID\tSTATUS\tSHIM\n../etc\trunning\t3\n").is_err());
+        assert!(parse_ls("ID\tSTATUS\tSHIM\nab-1\trunning\t3").is_err());
+        assert!(parse_ls("ID\tSTATUS\tSHIM\nab-1\trunning\n").is_err());
+        assert!(parse_ls("ID\tSTATUS\tSHIM\nab-1\trunning\t3\textra\n").is_err());
+        assert!(parse_ls("ID\tSTATUS\tSHIM\nab-1\trunning\tpid\n").is_err());
+        assert!(parse_ls("ID\tSTATUS\tSHIM\nab-1\trunning\t3\nab-1\trunning\t3\n").is_err());
     }
 
     #[test]

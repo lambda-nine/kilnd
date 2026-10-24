@@ -39,7 +39,11 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   the backend lost become `lost`, interrupted creates become `failed`,
   half-finished deletes are retried, executions cut off by a crash become
   `interrupted`. It never removes a sandbox it didn't create, never marks
-  anything lost if `kiln ls` failed, and running it twice changes nothing.
+  anything lost from failed, truncated, partial, duplicate, or otherwise
+  incomplete list evidence, and running it twice changes nothing. A managed
+  backend omitted from the list is probed directly and must also lack its
+  cgroup before absence is trusted. If the exact recorded backend later
+  reappears and passes capability validation, `lost` returns to `ready`.
 - **Operational limits:** root-owned socket usable by the `kilnd` group
   (directory 0750, socket 0660), per-execution timeouts that stop the command
   inside the sandbox, bounded output, stdin and argv, a cap on active

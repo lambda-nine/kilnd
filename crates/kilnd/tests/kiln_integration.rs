@@ -328,6 +328,159 @@ async fn a_sandbox_killed_behind_kilnds_back_is_lost_after_reconcile() {
 
 #[tokio::test]
 #[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn a_reappeared_backend_recovers_after_manager_restart_once() {
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    let sandbox = {
+        let manager = Arc::new(Manager::new(
+            kiln(),
+            Store::open(&state_dir).unwrap(),
+            Limits::default(),
+        ));
+        manager.reconcile().await.unwrap();
+        manager
+            .create(CreateRequest {
+                memory_bytes: 64 << 20,
+                disk_bytes: 16 << 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    };
+    {
+        let store = Store::open(&state_dir).unwrap();
+        store
+            .set_sandbox_state(
+                &sandbox.id,
+                SandboxState::Lost,
+                None,
+                Some("injected false absence before restart"),
+            )
+            .unwrap();
+    }
+
+    let manager = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&state_dir).unwrap(),
+        Limits::default(),
+    ));
+    let first = manager.reconcile().await.unwrap();
+    assert_eq!(first.recovered, vec![sandbox.id.clone()]);
+    assert_eq!(
+        manager.get(&sandbox.id, 0).unwrap().0.state,
+        SandboxState::Ready
+    );
+    assert!(manager.reconcile().await.unwrap().recovered.is_empty());
+    assert_eq!(
+        manager
+            .exec(exec(&sandbox.id, &["true"], 10_000))
+            .await
+            .unwrap()
+            .exit_code,
+        Some(0)
+    );
+    assert_eq!(
+        manager.delete(&sandbox.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+}
+
+#[tokio::test]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn hidden_registry_mount_does_not_mark_a_live_sandbox_lost() {
+    const CHILD: &str = "KILND_HIDDEN_REGISTRY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let state_dir = PathBuf::from(std::env::var_os("KILND_TEST_STATE").unwrap());
+        let empty = PathBuf::from(std::env::var_os("KILND_TEST_EMPTY").unwrap());
+        let status = std::process::Command::new("mount")
+            .args(["--bind", empty.to_str().unwrap(), "/var/lib/kiln/runs"])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "failed to hide the registry in child namespace"
+        );
+
+        let manager = Arc::new(Manager::new(
+            kiln(),
+            Store::open(&state_dir).unwrap(),
+            Limits::default(),
+        ));
+        let error = manager.reconcile().await.unwrap_err();
+        assert!(error.to_string().contains("cgroup"), "{error}");
+        let sandbox_id = std::env::var("KILND_TEST_SANDBOX").unwrap();
+        assert_eq!(
+            manager.get(&sandbox_id, 0).unwrap().0.state,
+            SandboxState::Ready
+        );
+        return;
+    }
+    if !enabled() {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    let empty = tmp.path().join("empty-registry");
+    std::fs::create_dir(&empty).unwrap();
+    let sandbox = {
+        let manager = Arc::new(Manager::new(
+            kiln(),
+            Store::open(&state_dir).unwrap(),
+            Limits::default(),
+        ));
+        manager.reconcile().await.unwrap();
+        manager
+            .create(CreateRequest {
+                memory_bytes: 64 << 20,
+                disk_bytes: 16 << 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    };
+
+    let output = std::process::Command::new("unshare")
+        .args([
+            "--mount",
+            "--propagation",
+            "private",
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            "--exact",
+            "hidden_registry_mount_does_not_mark_a_live_sandbox_lost",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("KILND_TEST_STATE", &state_dir)
+        .env("KILND_TEST_EMPTY", &empty)
+        .env("KILND_TEST_SANDBOX", &sandbox.id)
+        .output()
+        .unwrap();
+
+    let manager = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&state_dir).unwrap(),
+        Limits::default(),
+    ));
+    manager.reconcile().await.unwrap();
+    assert_eq!(
+        manager.delete(&sandbox.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+    assert!(
+        output.status.success(),
+        "hidden-registry child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
 async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
     if !enabled() {
         return;
