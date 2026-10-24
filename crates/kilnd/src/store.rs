@@ -232,6 +232,36 @@ impl Store {
         Ok(())
     }
 
+    /// Moves a sandbox to `state` only when its current state still matches
+    /// `expected`. A failed comparison leaves every column, including the
+    /// lifecycle timestamps, unchanged.
+    pub fn compare_and_set_sandbox_state(
+        &self,
+        id: &str,
+        expected: SandboxState,
+        state: SandboxState,
+        backend_id: Option<&str>,
+        failure_reason: Option<&str>,
+    ) -> Result<bool> {
+        let now = now_ms();
+        let deleted_at = (state == SandboxState::Deleted).then_some(now);
+        let n = self.conn().execute(
+            "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
+                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms)
+             WHERE id = ?1 AND state = ?7",
+            params![
+                id,
+                state.as_str(),
+                backend_id,
+                failure_reason,
+                now,
+                deleted_at,
+                expected.as_str()
+            ],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Marks a sandbox lost only if it is still READY. Delete publishes
     /// DELETING before waiting for a running exec, so a late NotFound result
     /// must not overwrite that cleanup intent.
@@ -1035,6 +1065,76 @@ mod tests {
                 .set_sandbox_state("sb-0000000000000000", SandboxState::Ready, None, None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn conditional_state_changes_do_not_rewrite_a_newer_terminal_state() {
+        let store = Store::open_in_memory().unwrap();
+        let s = sandbox();
+        store.insert_sandbox(&s).unwrap();
+        store
+            .set_sandbox_state(&s.id, SandboxState::Ready, Some("f00d-1"), None)
+            .unwrap();
+
+        assert!(
+            store
+                .compare_and_set_sandbox_state(
+                    &s.id,
+                    SandboxState::Ready,
+                    SandboxState::Deleting,
+                    None,
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compare_and_set_sandbox_state(
+                    &s.id,
+                    SandboxState::Ready,
+                    SandboxState::Deleting,
+                    None,
+                    Some("stale transition"),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .compare_and_set_sandbox_state(
+                    &s.id,
+                    SandboxState::Deleting,
+                    SandboxState::Deleted,
+                    None,
+                    None,
+                )
+                .unwrap()
+        );
+        let deleted = store.sandbox(&s.id).unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        assert!(
+            !store
+                .compare_and_set_sandbox_state(
+                    &s.id,
+                    SandboxState::Deleting,
+                    SandboxState::Deleting,
+                    None,
+                    Some("late failure"),
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compare_and_set_sandbox_state(
+                    &s.id,
+                    SandboxState::Deleting,
+                    SandboxState::Deleted,
+                    None,
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(store.sandbox(&s.id).unwrap().unwrap(), deleted);
     }
 
     #[test]

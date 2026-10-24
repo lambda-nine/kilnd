@@ -73,6 +73,85 @@ async fn client(path: PathBuf) -> KilndServiceClient<Channel> {
 }
 
 #[tokio::test]
+async fn many_socket_clients_share_one_serialized_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run/kilnd.sock");
+    let fake = FakeRuntime::default();
+    let manager = Arc::new(Manager::new(
+        fake.clone(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        Limits::default(),
+    ));
+    let listener = kilnd::server::bind(&socket, None).await.unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(kilnd::server::serve(
+        manager,
+        listener,
+        async {
+            let _ = stop_rx.await;
+        },
+        Duration::from_millis(200),
+    ));
+
+    let mut creator = client(socket.clone()).await;
+    let sandbox_id = creator
+        .create_sandbox(pb::CreateSandboxRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap()
+        .id;
+    let gate = FakeGate::default();
+    fake.state().remove_before_delete = Some(gate.clone());
+
+    let mut first_client = client(socket.clone()).await;
+    let first_id = sandbox_id.clone();
+    let first = tokio::spawn(async move {
+        first_client
+            .delete_sandbox(pb::DeleteSandboxRequest { id: first_id })
+            .await
+            .unwrap()
+            .into_inner()
+            .sandbox
+            .unwrap()
+    });
+    gate.entered().await;
+
+    let mut queued = Vec::new();
+    for _ in 0..31 {
+        let mut delete_client = client(socket.clone()).await;
+        let id = sandbox_id.clone();
+        queued.push(tokio::spawn(async move {
+            delete_client
+                .delete_sandbox(pb::DeleteSandboxRequest { id })
+                .await
+                .unwrap()
+                .into_inner()
+                .sandbox
+                .unwrap()
+        }));
+    }
+    tokio::task::yield_now().await;
+    gate.release();
+
+    let deleted = first.await.unwrap();
+    assert_eq!(deleted.state, pb::SandboxState::Deleted as i32);
+    for response in queued {
+        let response = response.await.unwrap();
+        assert_eq!(response.state, pb::SandboxState::Deleted as i32);
+        assert_eq!(response.deleted_at_unix_ms, deleted.deleted_at_unix_ms);
+        assert_eq!(response.updated_at_unix_ms, deleted.updated_at_unix_ms);
+    }
+    assert_eq!(fake.state().remove_attempts.len(), 1);
+    assert_eq!(fake.state().removed.len(), 1);
+
+    drop(creator);
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn typed_outcomes_and_failed_binary_evidence_survive_api_store_and_reopen() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run/kilnd.sock");

@@ -96,6 +96,9 @@ pub struct FakeState {
     pub exec_before_run: Option<FakeGate>,
     /// Optional one-shot pause before remove changes backend state.
     pub remove_before_delete: Option<FakeGate>,
+    /// Optional one-shot pause after remove changes backend state but before
+    /// it reports success.
+    pub remove_after_delete: Option<FakeGate>,
     /// When set, `list` and `version` fail, like a missing kiln binary.
     pub unavailable: bool,
     /// Backend IDs deliberately omitted from `list` while direct validation
@@ -400,15 +403,21 @@ impl Runtime for FakeRuntime {
         if let Some(gate) = gate {
             gate.hold().await;
         }
-        let mut s = self.state();
-        if !s.sandboxes.contains_key(id) {
-            return Err(RuntimeError::NotFound(id.to_string()));
+        let after = {
+            let mut s = self.state();
+            if !s.sandboxes.contains_key(id) {
+                return Err(RuntimeError::NotFound(id.to_string()));
+            }
+            if s.fail_remove {
+                return Err(RuntimeError::Backend("fake remove failed".into()));
+            }
+            s.sandboxes.remove(id);
+            s.removed.push(id.to_string());
+            s.remove_after_delete.take()
+        };
+        if let Some(gate) = after {
+            gate.hold().await;
         }
-        if s.fail_remove {
-            return Err(RuntimeError::Backend("fake remove failed".into()));
-        }
-        s.sandboxes.remove(id);
-        s.removed.push(id.to_string());
         Ok(())
     }
 

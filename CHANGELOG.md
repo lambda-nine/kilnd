@@ -6,6 +6,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Concurrent `DeleteSandbox` calls now share one serialized backend removal.
+  Delete reloads durable state after acquiring the sandbox lock, treats an
+  existing `DELETED` row as immutable success, and uses conditional state
+  transitions so stale results cannot rewrite deletion timestamps or move a
+  terminal row back to `DELETING`. Interrupted removals remain retryable on
+  either side of the backend side effect.
+
 - Output accounting now distinguishes an exact EOF-proven byte total from an
   observed lower bound when capture settlement stops early. Truncation records
   only bytes actually discarded by the retention bound and remains stable in

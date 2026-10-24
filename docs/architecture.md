@@ -216,8 +216,16 @@ pruned on later slot access so create/delete churn does not grow memory.
 Client disconnect, delete, and shutdown all record a
 first-wins reason through that handle before canceling its private token.
 Delete marks the sandbox `DELETING`, cancels the running execution, waits for
-the supervisor to finish and release the lock, then runs `kiln rm`.
-Executions waiting behind the lock see `DELETING` and refuse.
+the supervisor to finish and release the lock, reloads the row, then runs
+`kiln rm`. The caller holds a strong reference to the stable slot before it
+publishes delete intent, so queued deletes cannot acquire replacement locks.
+Only one caller invokes the backend; followers observe `DELETED` under the
+lock and return the existing row without changing its timestamps. Delete
+intent, completion and failure writes compare the expected state in the same
+SQLite statement, preventing a stale result from overwriting a newer terminal
+state. An interrupted or failed removal remains `DELETING`; a later call
+retries, and backend `NotFound` completes the row. Executions waiting behind
+the lock see `DELETING` and refuse.
 
 Accepted create and exec operations live in a task tracker owned by the
 manager. The RPC awaits a one-shot result but does not own the task.

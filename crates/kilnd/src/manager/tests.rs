@@ -1159,6 +1159,104 @@ async fn delete_is_idempotent_and_handles_a_gone_backend() {
 }
 
 #[tokio::test]
+async fn concurrent_deletes_remove_the_backend_once_and_preserve_deletion_time() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().remove_before_delete = Some(gate.clone());
+
+    let first = tokio::spawn({
+        let m = m.clone();
+        let id = s.id.clone();
+        async move { m.delete(&id).await }
+    });
+    gate.entered().await;
+    assert_eq!(m.get(&s.id, 0).unwrap().0.state, SandboxState::Deleting);
+
+    let mut queued = Vec::new();
+    for _ in 0..63 {
+        queued.push(tokio::spawn({
+            let m = m.clone();
+            let id = s.id.clone();
+            async move { m.delete(&id).await }
+        }));
+    }
+    until(|| {
+        m.slots
+            .lock()
+            .unwrap()
+            .get(&s.id)
+            .is_some_and(|slot| slot.strong_count() == 64)
+    })
+    .await;
+    gate.release();
+
+    assert_eq!(first.await.unwrap().unwrap().state, SandboxState::Deleted);
+    for delete in queued {
+        assert_eq!(delete.await.unwrap().unwrap().state, SandboxState::Deleted);
+    }
+
+    let deleted = m.get(&s.id, 0).unwrap().0;
+    let deleted_at = deleted.deleted_at_ms.unwrap();
+    let updated_at = deleted.updated_at_ms;
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let again = m.delete(&s.id).await.unwrap();
+    assert_eq!(again.deleted_at_ms, Some(deleted_at));
+    assert_eq!(again.updated_at_ms, updated_at);
+
+    let state = fake.state();
+    assert_eq!(state.remove_attempts.len(), 1);
+    assert_eq!(state.removed.len(), 1);
+}
+
+#[tokio::test]
+async fn delete_recovers_when_interrupted_on_either_side_of_backend_removal() {
+    let (m, fake) = manager();
+
+    let before = m.create(CreateRequest::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().remove_before_delete = Some(gate.clone());
+    let interrupted = tokio::spawn({
+        let m = m.clone();
+        let id = before.id.clone();
+        async move { m.delete(&id).await }
+    });
+    gate.entered().await;
+    interrupted.abort();
+    assert!(interrupted.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        m.get(&before.id, 0).unwrap().0.state,
+        SandboxState::Deleting
+    );
+    assert_eq!(
+        m.delete(&before.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+
+    let after = m.create(CreateRequest::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().remove_after_delete = Some(gate.clone());
+    let interrupted = tokio::spawn({
+        let m = m.clone();
+        let id = after.id.clone();
+        async move { m.delete(&id).await }
+    });
+    gate.entered().await;
+    interrupted.abort();
+    assert!(interrupted.await.unwrap_err().is_cancelled());
+    assert_eq!(m.get(&after.id, 0).unwrap().0.state, SandboxState::Deleting);
+    assert_eq!(
+        m.delete(&after.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+
+    let attempts = fake.state().remove_attempts.clone();
+    assert_eq!(attempts.iter().filter(|id| *id == "f00d-1").count(), 2);
+    assert_eq!(attempts.iter().filter(|id| *id == "f00d-2").count(), 2);
+    assert_eq!(fake.state().removed, ["f00d-1", "f00d-2"]);
+}
+
+#[tokio::test]
 async fn failed_delete_stays_deleting_and_can_be_retried() {
     let (m, fake) = manager();
     let s = m.create(CreateRequest::default()).await.unwrap();

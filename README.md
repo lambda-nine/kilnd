@@ -71,6 +71,12 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   cancellation, but kilnd waits for backend cleanup, drains output capture,
   records a terminal outcome, and only then releases the sandbox. A queued
   request canceled before it starts is discarded without an execution row.
+- **Serialized deletion:** concurrent `DeleteSandbox` callers share the
+  sandbox's coordination slot and one backend removal. State is reloaded under
+  that lock, `deleted` is immutable idempotent success, and conditional writes
+  prevent stale failures from restoring `deleting` or rewriting timestamps.
+  A call interrupted before or after backend removal leaves `deleting` for a
+  safe retry (including an already-gone backend).
 - **One Exec deadline:** the requested timeout includes queueing. Expiry
   before row insertion returns `DEADLINE_EXCEEDED`; after insertion the RPC
   returns a terminal `TIMED_OUT` execution after cleanup and publication,

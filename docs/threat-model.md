@@ -44,7 +44,11 @@ file says what it protects, what it trusts, and what it doesn't try to do.
 - **State integrity.** The database directory is root-only 0700. kilnd
   refuses one owned by another user or writable by group or others, takes its
   persistent instance lock before opening SQLite, and refuses a schema newer
-  than it understands.
+  than it understands. Per-sandbox deletion is serialized; the row is reloaded
+  after acquiring that lock and lifecycle writes compare their expected state,
+  so concurrent or stale delete results cannot rewrite `DELETED` timestamps or
+  resurrect `DELETING`. A backend side effect whose caller is interrupted is
+  reconciled by retry, treating an already-absent backend as success.
 - **No request-owned exec work.** After an execution row is recorded, a
   daemon supervisor owns backend cleanup, pipe capture and finalization even
   if the RPC disappears. kiln places each command in an execution cgroup;

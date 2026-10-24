@@ -814,33 +814,63 @@ impl<R: Runtime> Manager<R> {
             .ok_or_else(|| Error::NotFound(format!("sandbox {id}")))
     }
 
+    /// Publishes delete intent without allowing a stale caller to overwrite a
+    /// newer state. The loop only repeats when another writer won the state
+    /// comparison between our read and update.
+    fn prepare_delete(&self, id: &str, mut sandbox: Sandbox) -> Result<Sandbox> {
+        loop {
+            match sandbox.state {
+                SandboxState::Deleted | SandboxState::Deleting => return Ok(sandbox),
+                // Its backend ID isn't known yet. If kilnd crashed mid-create,
+                // startup reconciliation has already moved it to FAILED.
+                SandboxState::Creating => {
+                    return Err(Error::FailedPrecondition(format!(
+                        "sandbox {id} is still being created; retry"
+                    )));
+                }
+                expected @ (SandboxState::Ready | SandboxState::Failed | SandboxState::Lost) => {
+                    if self.store.compare_and_set_sandbox_state(
+                        id,
+                        expected,
+                        SandboxState::Deleting,
+                        None,
+                        sandbox.failure_reason.as_deref(),
+                    )? {
+                        return self.load(id);
+                    }
+                    sandbox = self.load(id)?;
+                }
+            }
+        }
+    }
+
     pub async fn delete(&self, id: &str) -> Result<Sandbox> {
         let sandbox = self.load(id)?;
-        match sandbox.state {
-            SandboxState::Deleted => return Ok(sandbox),
-            // Its backend ID isn't known yet. If kilnd crashed mid-create,
-            // startup reconciliation has already moved it to FAILED.
-            SandboxState::Creating => {
-                return Err(Error::FailedPrecondition(format!(
-                    "sandbox {id} is still being created; retry"
-                )));
-            }
-            _ => {}
+        if sandbox.state == SandboxState::Deleted {
+            return Ok(sandbox);
         }
-        self.store.set_sandbox_state(
-            id,
-            SandboxState::Deleting,
-            None,
-            sandbox.failure_reason.as_deref(),
-        )?;
-        info!(sandbox = %id, "deleting sandbox");
+        // Hold a strong reference before publishing DELETING so every caller
+        // that observes the transition reuses this exact coordination slot.
         let slot = self.slot(id);
+        let sandbox = self.prepare_delete(id, sandbox)?;
+        if sandbox.state == SandboxState::Deleted {
+            return Ok(sandbox);
+        }
+        info!(sandbox = %id, "deleting sandbox");
         if let Some(cancel) = &*slot.running.lock().unwrap() {
             cancel.request(ExecCancelReason::SandboxDeleted);
         }
         // Wait for a running execution to finish canceling; new ones see
         // DELETING and refuse.
         let _guard = slot.exec_lock.lock().await;
+
+        // Another delete may have completed while this caller waited. Reload
+        // under the lock so backend removal and all result transitions use
+        // current state rather than the caller's stale pre-lock snapshot.
+        let sandbox = self.prepare_delete(id, self.load(id)?)?;
+        if sandbox.state == SandboxState::Deleted {
+            return Ok(sandbox);
+        }
 
         let result = match &sandbox.backend_id {
             Some(b) => match self.runtime.remove(b).await {
@@ -851,8 +881,22 @@ impl<R: Runtime> Manager<R> {
         };
         match result {
             Ok(()) => {
-                self.store
-                    .set_sandbox_state(id, SandboxState::Deleted, None, None)?;
+                if !self.store.compare_and_set_sandbox_state(
+                    id,
+                    SandboxState::Deleting,
+                    SandboxState::Deleted,
+                    None,
+                    None,
+                )? {
+                    let current = self.load(id)?;
+                    if current.state == SandboxState::Deleted {
+                        return Ok(current);
+                    }
+                    return Err(Error::Internal(anyhow::anyhow!(
+                        "sandbox {id} changed from deleting to {} while backend removal completed",
+                        current.state.as_str()
+                    )));
+                }
                 // Queued requests still own this slot. Keep it stable until
                 // manager teardown rather than replacing its admission gate.
                 info!(sandbox = %id, "sandbox deleted");
@@ -861,8 +905,22 @@ impl<R: Runtime> Manager<R> {
             Err(e) => {
                 let reason = format!("delete failed: {e}");
                 warn!(sandbox = %id, error = %reason, "sandbox delete failed");
-                self.store
-                    .set_sandbox_state(id, SandboxState::Deleting, None, Some(&reason))?;
+                if !self.store.compare_and_set_sandbox_state(
+                    id,
+                    SandboxState::Deleting,
+                    SandboxState::Deleting,
+                    None,
+                    Some(&reason),
+                )? {
+                    let current = self.load(id)?;
+                    if current.state == SandboxState::Deleted {
+                        return Ok(current);
+                    }
+                    return Err(Error::Internal(anyhow::anyhow!(
+                        "sandbox {id} changed from deleting to {} while backend removal failed: {e}",
+                        current.state.as_str()
+                    )));
+                }
                 Err(Error::Backend(format!("delete sandbox {id}: {e}")))
             }
         }
