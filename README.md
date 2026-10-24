@@ -33,8 +33,8 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   with their effective spec, backend ID, state, timestamps and failure
   reason; executions with argv, state, legacy exit code, typed termination,
   runtime diagnostics, failure reason, timeout,
-  timestamps, and stdout/stderr (first 1 MiB of each kept, total byte counts
-  and a truncation flag).
+  timestamps, and stdout/stderr (first 1 MiB of each kept, observed byte
+  counts, total-certainty bits and truncation facts).
 - **Startup reconciliation** with `kiln gc` and `kiln ls`: ready sandboxes
   the backend lost become `lost`, interrupted creates become `failed`,
   half-finished deletes are retried, executions cut off by a crash become
@@ -79,7 +79,8 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
 - **Bounded queries:** List supports opaque pagination tokens (200 items and
   1 MiB per page by default); legacy complete-list calls fail explicitly
   when they cannot fit. `kilndctl ls` prints pages incrementally. GetSandbox
-  reads recent execution metadata without loading captured output BLOBs.
+  reads recent execution metadata without loading captured output BLOBs while
+  preserving byte totals, whether those totals are exact, and truncation facts.
   Health shares one backend probe with a 2-second timeout, caching successes
   for 5 seconds and failures for 1 second.
 - **`kilndctl`**, a small client covering the whole API.
@@ -91,9 +92,9 @@ kilnd requires persistent-exec protocol v1 in both the installed kiln CLI and
 each sandbox PID 1. It checks capabilities before reconciliation and Exec;
 old sandbox instances require explicit recreation. Command bytes use private
 streams, so real exits 125/126/127 and signal termination remain distinct from
-runtime failures. Schema 3 stores this typed evidence; v1/v2 databases migrate
-at open and older binaries refuse the result. See [setup](docs/setup.md) before
-upgrading.
+runtime failures. Schema 4 stores typed outcomes and truthful output-accounting
+evidence; v1/v2/v3 databases migrate at open and older binaries refuse the
+result. See [setup](docs/setup.md) before upgrading.
 
 These bounds do not provide tenant fairness: authorized callers can monopolize
 capacity, including with slow connections. Messages decode before service RPC

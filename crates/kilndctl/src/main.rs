@@ -206,7 +206,7 @@ async fn run(cli: Cli) -> Result<u8> {
                         e.exit_code
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "-".into()),
-                        e.stdout.as_ref().map(|o| o.total_bytes).unwrap_or(0),
+                        output_total(e.stdout.as_ref()),
                         time(e.started_at_unix_ms),
                         shell_words(&e.argv)
                     );
@@ -277,12 +277,17 @@ async fn run(cli: Cli) -> Result<u8> {
             eprintln!("timeout:  {} ms", e.timeout_ms);
             for (name, out) in [("stdout", &e.stdout), ("stderr", &e.stderr)] {
                 let out = out.clone().unwrap_or_default();
-                let note = if out.truncated {
+                let retained = if out.truncated {
                     format!(", first {} kept", out.data.len())
                 } else {
                     String::new()
                 };
-                eprintln!("{name}:   {} bytes{note}", out.total_bytes);
+                let total = if out.total_bytes_known {
+                    format!("{} bytes", out.total_bytes)
+                } else {
+                    format!("at least {} bytes; exact total unknown", out.total_bytes)
+                };
+                eprintln!("{name}:   {total}{retained}");
             }
             Ok(0)
         }
@@ -504,15 +509,38 @@ fn write_execution_streams(
     }
     for (name, o) in [("stdout", out), ("stderr", err)] {
         if o.truncated {
+            if o.total_bytes_known {
+                writeln!(
+                    stderr,
+                    "kilndctl: {name} truncated: kept {} of {} bytes",
+                    o.data.len(),
+                    o.total_bytes
+                )?;
+            } else {
+                writeln!(
+                    stderr,
+                    "kilndctl: {name} truncated: kept {} of at least {} observed bytes; exact total unknown",
+                    o.data.len(),
+                    o.total_bytes
+                )?;
+            }
+        } else if !o.total_bytes_known {
             writeln!(
                 stderr,
-                "kilndctl: {name} truncated: kept {} of {} bytes",
-                o.data.len(),
+                "kilndctl: {name} capture incomplete after {} observed bytes; exact total unknown",
                 o.total_bytes
             )?;
         }
     }
     stderr.flush()
+}
+
+fn output_total(output: Option<&pb::Output>) -> String {
+    match output {
+        None => "0".into(),
+        Some(output) if output.total_bytes_known => output.total_bytes.to_string(),
+        Some(output) => format!(">={}", output.total_bytes),
+    }
 }
 
 fn print_sandbox(s: &pb::Sandbox) {
@@ -714,11 +742,13 @@ mod tests {
                     data: b"\0\xffout".to_vec(),
                     total_bytes: 99,
                     truncated: true,
+                    total_bytes_known: false,
                 }),
                 stderr: Some(pb::Output {
                     data: b"\0\xfeerr".to_vec(),
                     total_bytes: 5,
                     truncated: false,
+                    total_bytes_known: true,
                 }),
                 command_status: Some(pb::CommandStatus {
                     termination: Some(pb::command_status::Termination::Signal(pb::SignalStatus {
@@ -741,7 +771,9 @@ mod tests {
             assert!(err.starts_with(b"\0\xfeerrkilndctl: terminated by signal 15 (core dumped)\n"));
             let diagnostics = String::from_utf8_lossy(&err[5..]);
             assert!(diagnostics.contains("runtime Io/Capture: lost reader (errno:5)"));
-            assert!(diagnostics.contains("stdout truncated: kept 5 of 99 bytes"));
+            assert!(diagnostics.contains(
+                "stdout truncated: kept 5 of at least 99 observed bytes; exact total unknown"
+            ));
         }
     }
 

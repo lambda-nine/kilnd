@@ -1058,8 +1058,8 @@ impl<R: Runtime> Manager<R> {
                 return ExecOutcome {
                     finish: Ok(ExecFinish::Canceled),
                     command_status: None,
-                    stdout: Captured::default(),
-                    stderr: Captured::default(),
+                    stdout: Captured::known_empty(),
+                    stderr: Captured::known_empty(),
                 };
             }
             let spec = ExecSpec {

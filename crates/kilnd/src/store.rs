@@ -19,7 +19,7 @@ use crate::model::{
     SandboxState, now_ms,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATE_V3: &str = "
 ALTER TABLE executions ADD COLUMN command_status_kind TEXT;
@@ -27,6 +27,11 @@ ALTER TABLE executions ADD COLUMN command_status_value INTEGER;
 ALTER TABLE executions ADD COLUMN command_core_dumped INTEGER;
 ALTER TABLE executions ADD COLUMN runtime_error TEXT;
 PRAGMA user_version = 3;";
+
+const MIGRATE_V4: &str = "
+ALTER TABLE executions ADD COLUMN stdout_total_bytes_known INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE executions ADD COLUMN stderr_total_bytes_known INTEGER NOT NULL DEFAULT 0;
+PRAGMA user_version = 4;";
 
 const SCHEMA: &str = "
 CREATE TABLE sandboxes (
@@ -60,9 +65,11 @@ CREATE TABLE executions (
     stdout           BLOB NOT NULL DEFAULT x'',
     stdout_bytes     INTEGER NOT NULL DEFAULT 0,
     stdout_truncated INTEGER NOT NULL DEFAULT 0,
+    stdout_total_bytes_known INTEGER NOT NULL DEFAULT 0,
     stderr           BLOB NOT NULL DEFAULT x'',
     stderr_bytes     INTEGER NOT NULL DEFAULT 0,
     stderr_truncated INTEGER NOT NULL DEFAULT 0,
+    stderr_total_bytes_known INTEGER NOT NULL DEFAULT 0,
     command_status_kind TEXT,
     command_status_value INTEGER,
     command_core_dumped INTEGER,
@@ -157,12 +164,19 @@ impl Store {
                     CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';
                     PRAGMA user_version = 2;")?;
                 tx.execute_batch(MIGRATE_V3)?;
-                tx.commit().context("migrate schema v1 to v3")?;
+                tx.execute_batch(MIGRATE_V4)?;
+                tx.commit().context("migrate schema v1 to v4")?;
             }
             2 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(MIGRATE_V3)?;
-                tx.commit().context("migrate schema v2 to v3")?;
+                tx.execute_batch(MIGRATE_V4)?;
+                tx.commit().context("migrate schema v2 to v4")?;
+            }
+            3 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch(MIGRATE_V4)?;
+                tx.commit().context("migrate schema v3 to v4")?;
             }
             SCHEMA_VERSION => {}
             v => bail!("database schema version {v} is newer than this kilnd ({SCHEMA_VERSION})"),
@@ -372,9 +386,9 @@ impl Store {
             .transpose()?;
         let n = self.conn().execute(
             "UPDATE executions SET state = ?2, exit_code = ?3, failure_reason = ?4, finished_at_ms = ?5,
-                 stdout = ?6, stdout_bytes = ?7, stdout_truncated = ?8,
-                 stderr = ?9, stderr_bytes = ?10, stderr_truncated = ?11,
-                 command_status_kind = ?12, command_status_value = ?13, command_core_dumped = ?14, runtime_error = ?15
+                 stdout = ?6, stdout_bytes = ?7, stdout_truncated = ?8, stdout_total_bytes_known = ?9,
+                 stderr = ?10, stderr_bytes = ?11, stderr_truncated = ?12, stderr_total_bytes_known = ?13,
+                 command_status_kind = ?14, command_status_value = ?15, command_core_dumped = ?16, runtime_error = ?17
              WHERE id = ?1 AND state = 'running'",
             params![
                 id,
@@ -385,9 +399,15 @@ impl Store {
                 r.stdout.data,
                 r.stdout.total_bytes as i64,
                 r.stdout.truncated(),
+                r.stdout.total_bytes_known,
                 r.stderr.data,
                 r.stderr.total_bytes as i64,
-                r.stderr.truncated(), status_kind, status_value, core_dumped, runtime_error
+                r.stderr.truncated(),
+                r.stderr.total_bytes_known,
+                status_kind,
+                status_value,
+                core_dumped,
+                runtime_error
             ],
         )?;
         if n != 1 {
@@ -521,12 +541,14 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
 
 const EXECUTION_COLUMNS: &str =
     "id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
-    started_at_ms, finished_at_ms, stdout, stdout_bytes, stderr, stderr_bytes,
+    started_at_ms, finished_at_ms, stdout, stdout_bytes, stdout_truncated, stdout_total_bytes_known,
+    stderr, stderr_bytes, stderr_truncated, stderr_total_bytes_known,
     command_status_kind, command_status_value, command_core_dumped, runtime_error";
 
 const EXECUTION_METADATA_COLUMNS: &str =
     "id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
-    started_at_ms, finished_at_ms, x'', stdout_bytes, x'', stderr_bytes,
+    started_at_ms, finished_at_ms, x'', stdout_bytes, stdout_truncated, stdout_total_bytes_known,
+    x'', stderr_bytes, stderr_truncated, stderr_total_bytes_known,
     command_status_kind, command_status_value, command_core_dumped, runtime_error";
 
 fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
@@ -542,9 +564,9 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
                 .with_context(|| format!("execution {id}: unknown state {state:?}"))?,
             exit_code: row.get(4)?,
             command_status: match (
-                row.get::<_, Option<String>>(14)?.as_deref(),
-                row.get::<_, Option<i32>>(15)?,
-                row.get::<_, Option<bool>>(16)?,
+                row.get::<_, Option<String>>(18)?.as_deref(),
+                row.get::<_, Option<i32>>(19)?,
+                row.get::<_, Option<bool>>(20)?,
             ) {
                 (None, None, None) => None,
                 (Some("exited"), Some(code), None) => Some(CommandStatus::Exited(code)),
@@ -557,7 +579,7 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
                 _ => bail!("execution {id}: invalid command status"),
             },
             runtime_error: row
-                .get::<_, Option<String>>(17)?
+                .get::<_, Option<String>>(21)?
                 .map(|json| serde_json::from_str::<RuntimeDiagnostic>(&json))
                 .transpose()
                 .context("invalid runtime diagnostic")?,
@@ -569,10 +591,14 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
             stdout: Captured {
                 data: row.get(10)?,
                 total_bytes: row.get::<_, i64>(11)? as u64,
+                truncated: row.get(12)?,
+                total_bytes_known: row.get(13)?,
             },
             stderr: Captured {
-                data: row.get(12)?,
-                total_bytes: row.get::<_, i64>(13)? as u64,
+                data: row.get(14)?,
+                total_bytes: row.get::<_, i64>(15)? as u64,
+                truncated: row.get(16)?,
+                total_bytes_known: row.get(17)?,
             },
             id: id.clone(),
         })
@@ -585,25 +611,41 @@ mod tests {
     use crate::model::{Network, new_id};
     use std::collections::BTreeMap;
 
+    fn schema_v3() -> String {
+        SCHEMA
+            .replace(
+                "\n    stdout_total_bytes_known INTEGER NOT NULL DEFAULT 0,",
+                "",
+            )
+            .replace(
+                "\n    stderr_total_bytes_known INTEGER NOT NULL DEFAULT 0,",
+                "",
+            )
+    }
+
     fn schema_v2() -> String {
-        SCHEMA.replace(",\n    command_status_kind TEXT,\n    command_status_value INTEGER,\n    command_core_dumped INTEGER,\n    runtime_error TEXT", "")
+        schema_v3().replace(",\n    command_status_kind TEXT,\n    command_status_value INTEGER,\n    command_core_dumped INTEGER,\n    runtime_error TEXT", "")
     }
 
     #[test]
-    fn fresh_v3_and_historical_v1_v2_keep_unknown_status_null() {
+    fn fresh_v4_and_historical_v1_v2_v3_keep_unknown_evidence() {
         let fresh = Store::open_in_memory().unwrap();
         assert_eq!(
             fresh
                 .conn()
                 .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            3
+            4
         );
-        for version in [1, 2] {
+        for version in [1, 2, 3] {
             let tmp = tempfile::tempdir().unwrap();
             std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
-            let mut schema = schema_v2();
+            let mut schema = if version == 3 {
+                schema_v3()
+            } else {
+                schema_v2()
+            };
             if version == 1 {
                 schema=schema.replace(",\n    list_seq       INTEGER NOT NULL","")
                     .replace("CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);","")
@@ -613,8 +655,8 @@ mod tests {
             conn.pragma_update(None, "user_version", version).unwrap();
             let mut s = sandbox();
             s.state = SandboxState::Ready;
-            let list_column = if version == 2 { ", list_seq" } else { "" };
-            let list_value = if version == 2 { ", 1" } else { "" };
+            let list_column = if version >= 2 { ", list_seq" } else { "" };
+            let list_value = if version >= 2 { ", 1" } else { "" };
             conn.execute(&format!("INSERT INTO sandboxes (id,backend,state,spec,created_at_ms,updated_at_ms{list_column}) VALUES (?1,'fake','ready',?2,1,1{list_value})"),params![s.id,serde_json::to_string(&s.spec).unwrap()]).unwrap();
             conn.execute("INSERT INTO executions (id,sandbox_id,argv,state,exit_code,timeout_ms,stdin_bytes,started_at_ms) VALUES ('old',?1,'[]','exited',143,1,0,1)",[&s.id]).unwrap();
             conn.execute("INSERT INTO executions (id,sandbox_id,argv,state,timeout_ms,stdin_bytes,started_at_ms) VALUES ('running',?1,'[]','running',1,0,2)",[&s.id]).unwrap();
@@ -625,11 +667,13 @@ mod tests {
                     .conn()
                     .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                     .unwrap(),
-                3
+                4
             );
             let historical = store.execution("old").unwrap().unwrap();
             assert_eq!(historical.exit_code, Some(143));
             assert!(historical.command_status.is_none() && historical.runtime_error.is_none());
+            assert!(!historical.stdout.total_bytes_known);
+            assert!(!historical.stderr.total_bytes_known);
             store.interrupt_running_executions("restart").unwrap();
             let interrupted = store.execution("running").unwrap().unwrap();
             assert_eq!(interrupted.state, ExecutionState::Interrupted);
@@ -662,10 +706,14 @@ mod tests {
         let out = Captured {
             data: b"\0\xffout".to_vec(),
             total_bytes: 999,
+            truncated: true,
+            total_bytes_known: false,
         };
         let err = Captured {
             data: b"\0\xfeerr".to_vec(),
             total_bytes: 1001,
+            truncated: true,
+            total_bytes_known: true,
         };
         let status = CommandStatus::Signaled {
             signal: 15,
@@ -691,6 +739,9 @@ mod tests {
         assert_eq!(meta.runtime_error, Some(d));
         assert!(meta.stdout.data.is_empty());
         assert_eq!(meta.stdout.total_bytes, 999);
+        assert!(meta.stdout.truncated());
+        assert!(!meta.stdout.total_bytes_known);
+        assert!(meta.stderr.total_bytes_known);
         assert_eq!(full.stdout, out);
         assert_eq!(full.stderr, err);
         drop(store);
@@ -806,10 +857,10 @@ mod tests {
     }
 
     #[test]
-    fn v1_disk_migration_preserves_legacy_order_and_reopens_as_v3() {
+    fn v1_disk_migration_preserves_legacy_order_and_reopens_as_v4() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let legacy = SCHEMA.replace(",\n    command_status_kind TEXT,\n    command_status_value INTEGER,\n    command_core_dumped INTEGER,\n    runtime_error TEXT", "").replace(",\n    list_seq       INTEGER NOT NULL", "")
+        let legacy = schema_v2().replace(",\n    list_seq       INTEGER NOT NULL", "")
             .replace("CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);", "")
             .replace("CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';", "");
         let conn = Connection::open(temp.path().join("kilnd.db")).unwrap();
@@ -854,7 +905,7 @@ mod tests {
                 .conn()
                 .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             store
@@ -1009,10 +1060,14 @@ mod tests {
         let out = Captured {
             data: b"hi\n".to_vec(),
             total_bytes: 3,
+            truncated: false,
+            total_bytes_known: true,
         };
         let err = Captured {
             data: b"ab".to_vec(),
             total_bytes: 900,
+            truncated: true,
+            total_bytes_known: true,
         };
         let result = ExecutionResult {
             state: ExecutionState::Exited,
@@ -1045,8 +1100,20 @@ mod tests {
             "lists leave output data out"
         );
         assert_eq!(recent[0].stdout.total_bytes, 3);
+        assert!(recent[0].stdout.total_bytes_known);
+        assert_eq!(
+            recent[0].stdout.truncated(),
+            got.stdout.truncated(),
+            "metadata projection must preserve the persisted truncation fact"
+        );
         assert!(recent[0].stderr.data.is_empty());
         assert_eq!(recent[0].stderr.total_bytes, 900);
+        assert!(recent[0].stderr.total_bytes_known);
+        assert_eq!(
+            recent[0].stderr.truncated(),
+            got.stderr.truncated(),
+            "metadata projection must preserve the persisted truncation fact"
+        );
     }
 
     #[test]

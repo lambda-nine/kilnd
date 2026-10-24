@@ -183,7 +183,8 @@ message CreateSandboxResponse {
 message GetSandboxRequest {
   string id = 1;
   // How many recent executions to return, newest first. Zero means 10; at
-  // most 100. Their output data is left out; use GetExecution for it.
+  // most 100. Output data is left out, but totals, certainty and truncation
+  // evidence are preserved; use GetExecution for retained bytes.
   uint32 execution_limit = 2;
 }
 
@@ -257,10 +258,15 @@ enum ExecutionState {
 message Output {
   // The first bytes of the stream, up to the limit.
   bytes data = 1;
-  // How many bytes the command wrote in total.
+  // Bytes observed by the daemon. This is the exact total only when
+  // total_bytes_known is true; otherwise it is a lower bound.
   uint64 total_bytes = 2;
-  // True when total_bytes exceeds the data kept.
+  // True when the retention limit discarded bytes the daemon observed.
+  // An unobserved tail is reported separately by total_bytes_known=false.
   bool truncated = 3;
+  // True only when capture reached clean EOF, proving total_bytes exact.
+  // False for historical rows and forced/error capture settlement.
+  bool total_bytes_known = 4;
 }
 
 message Execution {

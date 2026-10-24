@@ -19,7 +19,7 @@ use super::{
     kiln_process::{self, OwnedExec, Stop},
     kiln_protocol as protocol,
 };
-use crate::model::{Network, SandboxSpec};
+use crate::model::{Captured, Network, SandboxSpec};
 use crate::model::{RuntimeDiagnostic, RuntimeErrorKind as Kind, RuntimeStage as Stage};
 use crate::process::{self, Finish};
 
@@ -305,8 +305,8 @@ impl Runtime for KilnRuntime {
         let empty = |finish| ExecOutcome {
             finish,
             command_status: None,
-            stdout: Default::default(),
-            stderr: Default::default(),
+            stdout: Captured::known_empty(),
+            stderr: Captured::known_empty(),
         };
         if let Err(e) = check_id(id) {
             return empty(Err(RuntimeDiagnostic::new(
@@ -1368,8 +1368,10 @@ mod tests {
         assert_eq!(out.command_status, Some(CommandStatus::Exited(125)));
         assert_eq!(out.stdout.data, b"\0\xffout");
         assert_eq!(out.stdout.total_bytes, 5);
+        assert!(!out.stdout.total_bytes_known);
         assert_eq!(out.stderr.data, b"\0\xfeerr");
         assert_eq!(out.stderr.total_bytes, 5);
+        assert!(!out.stderr.total_bytes_known);
         tokio::time::sleep(Duration::from_millis(1100)).await;
     }
 
@@ -1495,6 +1497,7 @@ mod tests {
         assert_eq!(out.finish.unwrap_err().kind, Kind::Protocol);
         assert_eq!(out.stdout.data, b"beforeafter");
         assert_eq!(out.stdout.total_bytes, 11);
+        assert!(out.stdout.total_bytes_known);
     }
 
     #[tokio::test]

@@ -492,13 +492,16 @@ async fn capture<R: AsyncRead + Unpin>(mut pipe: R, max: usize, state: &Mutex<St
     loop {
         match pipe.read(&mut buf).await {
             Ok(0) => {
-                locked(state).eof = true;
+                let mut state = locked(state);
+                state.eof = true;
+                state.captured.total_bytes_known = true;
                 return;
             }
             Ok(n) => {
                 let mut state = locked(state);
                 state.captured.total_bytes += n as u64;
                 let room = max.saturating_sub(state.captured.data.len());
+                state.captured.truncated |= n > room;
                 state.captured.data.extend_from_slice(&buf[..n.min(room)]);
             }
             Err(e) => {
@@ -614,7 +617,9 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             raw.stdout.captured,
             Captured {
                 data: b"\0\xffx".to_vec(),
-                total_bytes: 200002
+                total_bytes: 200002,
+                truncated: true,
+                total_bytes_known: true,
             }
         );
         assert_eq!(raw.stderr.captured, raw.stdout.captured);
@@ -682,7 +687,9 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                 state.captured,
                 Captured {
                     data: b"\0\xffs".to_vec(),
-                    total_bytes: 7
+                    total_bytes: 7,
+                    truncated: true,
+                    total_bytes_known: false,
                 }
             );
             assert!(state.error.is_some());
@@ -832,7 +839,9 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             raw.stdout.captured,
             Captured {
                 data: b"pre".to_vec(),
-                total_bytes: 6
+                total_bytes: 6,
+                truncated: true,
+                total_bytes_known: false,
             }
         );
         assert!(raw.stdout.error.unwrap().contains("settlement"));

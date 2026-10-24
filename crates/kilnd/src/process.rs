@@ -125,8 +125,8 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
     if cancel.is_cancelled() {
         return Ok(Outcome {
             finish: Finish::Canceled,
-            stdout: Captured::default(),
-            stderr: Captured::default(),
+            stdout: Captured::known_empty(),
+            stderr: Captured::known_empty(),
             stdout_completion: CaptureCompletion::Stopped("request canceled before spawn"),
             stderr_completion: CaptureCompletion::Stopped("request canceled before spawn"),
         });
@@ -134,8 +134,8 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
     if tokio::time::Instant::now() >= req.deadline {
         return Ok(Outcome {
             finish: Finish::TimedOut,
-            stdout: Captured::default(),
-            stderr: Captured::default(),
+            stdout: Captured::known_empty(),
+            stderr: Captured::known_empty(),
             stdout_completion: CaptureCompletion::Stopped(
                 "execution deadline expired before spawn",
             ),
@@ -270,11 +270,9 @@ async fn capture<R: AsyncRead + Unpin>(pipe: Option<R>, max: usize, state: &Mute
     loop {
         let n = match pipe.read(&mut buf).await {
             Ok(0) => {
-                state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .completion
-                    .get_or_insert(CaptureCompletion::Eof);
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                state.captured.total_bytes_known = true;
+                state.completion.get_or_insert(CaptureCompletion::Eof);
                 return;
             }
             Ok(n) => n,
@@ -289,6 +287,7 @@ async fn capture<R: AsyncRead + Unpin>(pipe: Option<R>, max: usize, state: &Mute
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.captured.total_bytes += n as u64;
         let room = max.saturating_sub(state.captured.data.len());
+        state.captured.truncated |= n > room;
         state.captured.data.extend_from_slice(&buf[..n.min(room)]);
     }
 }
@@ -398,6 +397,7 @@ mod tests {
         assert_eq!(o.stdout.data.len(), 1000);
         assert_eq!(o.stdout.total_bytes, 200_000);
         assert!(o.stdout.truncated());
+        assert!(o.stdout.total_bytes_known);
     }
 
     #[tokio::test]
@@ -461,6 +461,9 @@ mod tests {
         .await;
         assert_eq!(code(&o), Some(0));
         assert_eq!(o.stdout.data, b"started\n");
+        assert!(!o.stdout.truncated());
+        assert!(!o.stdout.total_bytes_known);
+        assert!(!o.stderr.total_bytes_known);
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(
             o.stdout_completion,
@@ -558,7 +561,9 @@ mod tests {
                 captured,
                 Captured {
                     data: b"\0\xffs".to_vec(),
-                    total_bytes: 7
+                    total_bytes: 7,
+                    truncated: true,
+                    total_bytes_known: false,
                 }
             );
             if panic {
@@ -594,7 +599,9 @@ mod tests {
             (
                 Captured {
                     data: b"\0\xffs".to_vec(),
-                    total_bytes: 7
+                    total_bytes: 7,
+                    truncated: true,
+                    total_bytes_known: false,
                 },
                 CaptureCompletion::Stopped("250ms output drain grace expired")
             )
@@ -660,7 +667,9 @@ mod tests {
             (
                 Captured {
                     data: b"out".to_vec(),
-                    total_bytes: 3
+                    total_bytes: 3,
+                    truncated: false,
+                    total_bytes_known: true,
                 },
                 CaptureCompletion::Eof
             )
@@ -670,7 +679,9 @@ mod tests {
             (
                 Captured {
                     data: b"err".to_vec(),
-                    total_bytes: 3
+                    total_bytes: 3,
+                    truncated: false,
+                    total_bytes_known: true,
                 },
                 CaptureCompletion::Eof
             )

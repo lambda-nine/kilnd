@@ -125,12 +125,13 @@ than the deadline. Tickets remain held while finalization retries.
 opaque `next_page_token` until empty, keeping `include_deleted` unchanged.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
-bounds. Schema v1 upgrades through v2 to v3; v2 upgrades to v3. Schema 3 stores
-typed termination and runtime diagnostics together with output and terminal
-state, while historical records retain unknown typed values. Schema-1/2
-binaries refuse schema 3, so keep a backup before upgrading. Store migration
-may occur before startup capability validation fails; installing an older
-daemon is not a database downgrade path.
+bounds. Schema v1 upgrades through v2 and v3 to v4; v2/v3 also upgrade to v4.
+Schema 4 stores typed termination and runtime diagnostics together with output,
+terminal state, truncation facts and whether each byte total is exact.
+Historical records retain unknown typed values and unknown output-total
+certainty. Older binaries refuse schema 4, so keep a backup before upgrading.
+Store migration may occur before startup capability validation fails;
+installing an older daemon is not a database downgrade path.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart.

@@ -699,14 +699,18 @@ async fn typed_status_and_failed_binary_evidence_survive_publication_retry() {
         failed.stdout,
         Captured {
             data: b"\0\xffout".to_vec(),
-            total_bytes: 99
+            total_bytes: 99,
+            truncated: true,
+            total_bytes_known: false,
         }
     );
     assert_eq!(
         failed.stderr,
         Captured {
             data: b"\0\xfeerr".to_vec(),
-            total_bytes: 101
+            total_bytes: 101,
+            truncated: true,
+            total_bytes_known: false,
         }
     );
     assert_eq!(m.execution(&failed.id).unwrap(), failed);

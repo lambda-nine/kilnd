@@ -151,8 +151,12 @@ async fn typed_outcomes_and_failed_binary_evidence_survive_api_store_and_reopen(
             );
             assert_eq!(failure.stdout.as_ref().unwrap().data, b"\0\xffout");
             assert_eq!(failure.stdout.as_ref().unwrap().total_bytes, 99);
+            assert!(failure.stdout.as_ref().unwrap().truncated);
+            assert!(!failure.stdout.as_ref().unwrap().total_bytes_known);
             assert_eq!(failure.stderr.as_ref().unwrap().data, b"\0\xfeerr");
             assert_eq!(failure.stderr.as_ref().unwrap().total_bytes, 101);
+            assert!(failure.stderr.as_ref().unwrap().truncated);
+            assert!(!failure.stderr.as_ref().unwrap().total_bytes_known);
         }
         for expected in &saved {
             let got = c
@@ -181,6 +185,26 @@ async fn typed_outcomes_and_failed_binary_evidence_survive_api_store_and_reopen(
             let full = saved.iter().find(|e| e.id == metadata.id).unwrap();
             assert_eq!(metadata.command_status, full.command_status);
             assert_eq!(metadata.runtime_error, full.runtime_error);
+            assert_eq!(
+                metadata.stdout.as_ref().unwrap().truncated,
+                full.stdout.as_ref().unwrap().truncated,
+                "GetSandbox metadata changed stdout truncation"
+            );
+            assert_eq!(
+                metadata.stderr.as_ref().unwrap().truncated,
+                full.stderr.as_ref().unwrap().truncated,
+                "GetSandbox metadata changed stderr truncation"
+            );
+            assert_eq!(
+                metadata.stdout.as_ref().unwrap().total_bytes_known,
+                full.stdout.as_ref().unwrap().total_bytes_known,
+                "GetSandbox metadata changed stdout total certainty"
+            );
+            assert_eq!(
+                metadata.stderr.as_ref().unwrap().total_bytes_known,
+                full.stderr.as_ref().unwrap().total_bytes_known,
+                "GetSandbox metadata changed stderr total certainty"
+            );
         }
         drop(c);
         let _ = stop.send(());

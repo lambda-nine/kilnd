@@ -149,6 +149,8 @@ async fn lifecycle_against_real_kiln() {
         .await
         .unwrap();
     assert_eq!((e.stdout.data.len(), e.stdout.total_bytes), (4096, 100_000));
+    assert!(e.stdout.truncated());
+    assert!(e.stdout.total_bytes_known);
     let e=m.exec(exec(&s.id,&["sh","-c","printf '\\000\\377'; head -c 100000 /dev/zero; { printf '\\000\\376'; head -c 100000 /dev/zero; } >&2"],10_000)).await.unwrap();
     assert_eq!(
         (
@@ -161,6 +163,8 @@ async fn lifecycle_against_real_kiln() {
     );
     assert_eq!(&e.stdout.data[..2], b"\0\xff");
     assert_eq!(&e.stderr.data[..2], b"\0\xfe");
+    assert!(e.stdout.truncated() && e.stderr.truncated());
+    assert!(e.stdout.total_bytes_known && e.stderr.total_bytes_known);
     let exit125 = m
         .exec(exec(
             &s.id,

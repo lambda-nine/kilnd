@@ -89,12 +89,14 @@ An inherited writer that outlives that bound makes the observation inconclusive.
 The owned machine transport uses four private Unix stream socketpairs. Only
 their four child ends cross exec; workload stdio and the status stream are
 separate from bounded CLI stdout/stderr diagnostics. Workload output is binary
-and each stream retains its first configured bytes and exact observed count.
-Shared capture state survives reader errors and polling panics. The status
-codec requires one strict v1 frame and EOF (at most 2088 bytes), with a two
-second frame deadline starting at the first byte. CLI exit status is only a
-consistency check. Real exits 125, 126 and 127 remain command results; signal
-15 remains distinct from exit 143. Missing executables are LaunchFailed/Exec.
+and each stream retains its first configured bytes while counting every byte
+actually observed. EOF proves that count is the exact total; forced or failed
+settlement leaves it as a lower bound. Shared capture state survives reader
+errors and polling panics. The status codec requires one strict v1 frame and
+EOF (at most 2088 bytes), with a two second frame deadline starting at the
+first byte. CLI exit status is only a consistency check. Real exits 125, 126
+and 127 remain command results; signal 15 remains distinct from exit 143.
+Missing executables are LaunchFailed/Exec.
 
 An execution returns a finish result, optional observed command termination,
 and both captures. Completed without status becomes Internal/Report FAILED.
@@ -276,11 +278,15 @@ codes at 128 UTF-8 bytes, annotating native-code truncation in the message and
 truncation flag. Oversized backend values cannot wedge terminal publication.
 Terminal status, diagnostic, output, totals and timestamps
 publish in the same UPDATE and remain owned across publication retries.
-Full and metadata-only reads include typed evidence. v1 opens migrate through
-v2 to v3; v2 opens migrate to v3. Historical and restart-interrupted rows retain
-NULL typed evidence rather than inferring termination from a shell projection.
-Older schema-1/2 binaries refuse schema 3. Migration happens at store open and
-may precede startup capability failure; back up before upgrading.
+Full and metadata-only reads include typed evidence.
+
+Schema v4 adds one certainty bit per output stream. `total_bytes_known=true`
+means capture reached EOF, so `total_bytes` is exact; false means the count is
+only an observed lower bound. `truncated` independently records that observed
+bytes exceeded retained bytes. v1/v2/v3 opens migrate through v4, preserving
+historical typed evidence but leaving historical output totals unknown rather
+than asserting exactness. Older binaries refuse schema 4. Migration happens at
+store open and may precede startup capability failure; back up before upgrading.
 
 The API represents signal numbers as `uint32` and retains legacy `exit_code`
 only for EXITED, projecting signal termination as 128 + signal.
@@ -289,9 +295,9 @@ an explicit exit with the same number. FAILED carries a runtime diagnostic;
 TIMED_OUT and CANCELED retain any observed termination without an exit code.
 `failure_reason` remains a human projection. Runtime stage `None` is preserved
 as JSON `none` and protobuf `RUNTIME_STAGE_UNSPECIFIED`. `kilndctl exec` and
-`kilndctl execution` write captured bytes first, then print signal, diagnostic
-and truncation details separately on stderr. Exec shell codes keep the legacy
-EXITED projection, 124 for timeout and 125 for other failures.
+`kilndctl execution` write captured bytes first, then print signal, diagnostic,
+total-certainty and truncation details separately on stderr. Exec shell codes
+keep the legacy EXITED projection, 124 for timeout and 125 for other failures.
 
 List pages capture the maximum matching sequence on the first page, fetch at
 most `limit + 1` rows, and continue strictly below the last returned sequence.
@@ -308,8 +314,10 @@ and instruct pagination, never silently truncate. Present zero uses
 continuation token in encoded-size accounting; one item that cannot fit fails
 explicitly. `kilndctl ls` requests the server's bounded default and prints one
 header, then pages incrementally. GetSandbox selects recent execution metadata
-using empty BLOB literals for output; total byte columns and existing wire
-behavior remain.
+using empty BLOB literals for output while selecting persisted totals,
+certainty and truncation flags. Its worst case is 100 rows whose retained output
+could otherwise total 200 MiB; an isolated Linux child regression keeps the
+metadata result alive and enforces an RSS increase below 32 MiB.
 
 ## Status policy
 

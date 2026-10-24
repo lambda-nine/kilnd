@@ -70,6 +70,8 @@ set -e
 printf 'piped' | ctl exec --stdin "$id" -- cat | grep -qx piped || fail "stdin was not passed"
 ctl exec "$id" -- head -c 2000000 /dev/zero 2>&1 >/dev/null | grep -q 'stdout truncated: kept 1048576 of 2000000 bytes' \
     || fail "output was not bounded"
+[ "$(sql "SELECT stdout_bytes || ':' || stdout_truncated || ':' || stdout_total_bytes_known FROM executions WHERE sandbox_id = '$id' AND stdout_bytes = 2000000")" = '2000000:1:1' ] \
+    || fail "bounded output accounting was not exact and truncated"
 
 echo "   executions recorded in SQLite:"
 sql "SELECT state, IFNULL(exit_code, '-'), stdout_bytes, stdout_truncated, stderr_bytes, IFNULL(failure_reason, '')
@@ -80,7 +82,7 @@ sql "SELECT state, IFNULL(exit_code, '-'), stdout_bytes, stdout_truncated, stder
 ctl get "$id"
 
 echo "   typed outcomes and binary evidence"
-[ "$(sql 'PRAGMA user_version')" -eq 3 ] || fail "expected schema 3"
+[ "$(sql 'PRAGMA user_version')" -eq 4 ] || fail "expected schema 4"
 set +e
 ctl exec "$id" -- sh -c 'printf "\000\377out"; printf "\000\376err" >&2; exit 125' >/dev/null 2>/dev/null
 exit125=$?
@@ -148,6 +150,8 @@ wait || true
 wait_ready
 [ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id = '$id' AND state = 'interrupted'")" -eq 1 ] \
     || fail "killed execution not marked interrupted"
+[ "$(sql "SELECT stdout_total_bytes_known || ':' || stderr_total_bytes_known FROM executions WHERE sandbox_id = '$id' AND state = 'interrupted'")" = '0:0' ] \
+    || fail "interrupted output totals must remain unknown"
 [ "$(ctl exec --timeout 10s "$id" -- sh -c 'pgrep sleep || echo none')" = none ] \
     || fail "orphaned command still running after kilnd was killed"
 

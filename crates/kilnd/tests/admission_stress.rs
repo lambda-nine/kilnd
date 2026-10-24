@@ -1,8 +1,9 @@
-//! Opt-in Linux resource regression for Chapter 9. The parent test drives a
-//! dedicated child harness so `/proc` measurements describe only the daemon.
+//! Opt-in Linux resource regressions for Chapters 9 and 12. Parent tests drive
+//! dedicated child harnesses so `/proc` measurements stay isolated.
 
 #![cfg(target_os = "linux")]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -11,10 +12,12 @@ use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use kilnd::manager::{Limits, Manager};
-use kilnd::model::SandboxSpec;
+use kilnd::model::{
+    Captured, CommandStatus, Execution, ExecutionState, Network, Sandbox, SandboxSpec, SandboxState,
+};
 use kilnd::runtime::fake::FakeRuntime;
 use kilnd::runtime::{BackendSandbox, ExecOutcome, ExecSpec, Runtime, RuntimeError};
-use kilnd::store::Store;
+use kilnd::store::{ExecutionResult, Store};
 use kilnd_api::v1 as pb;
 use pb::kilnd_service_client::KilndServiceClient;
 use prost::Message;
@@ -26,6 +29,10 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 const CHILD_ENV: &str = "KILND_ADMISSION_STRESS_CHILD";
+const HISTORY_CHILD_ENV: &str = "KILND_HISTORY_RSS_CHILD";
+const HISTORY_ROOT_ENV: &str = "KILND_HISTORY_RSS_ROOT";
+const HISTORY_ROWS: usize = 100;
+const HISTORY_STREAM_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Default)]
 struct StressRuntime {
@@ -188,6 +195,130 @@ fn rss_bytes(pid: u32) -> u64 {
         .parse()
         .unwrap();
     kb * 1024
+}
+
+#[test]
+#[ignore = "Linux child harness; run the parent metadata-history resource test"]
+fn metadata_history_rss_child() {
+    if std::env::var_os(HISTORY_CHILD_ENV).is_none() {
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os(HISTORY_ROOT_ENV).unwrap());
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sandbox = Sandbox {
+        id: "sb-0000000000000001".into(),
+        state: SandboxState::Ready,
+        spec: SandboxSpec {
+            image: "alpine:latest".into(),
+            memory_bytes: 512 << 20,
+            cpu_millis: 1_000,
+            pids: 256,
+            disk_bytes: 2 << 30,
+            network: Network::None,
+            read_only_root: true,
+            writable_paths: Vec::new(),
+            labels: Default::default(),
+        },
+        backend: "fake".into(),
+        backend_id: Some("kiln-history".into()),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        deleted_at_ms: None,
+        failure_reason: None,
+    };
+    let capture = Captured {
+        data: vec![b'x'; HISTORY_STREAM_BYTES],
+        total_bytes: HISTORY_STREAM_BYTES as u64,
+        truncated: false,
+        total_bytes_known: true,
+    };
+    let status = CommandStatus::Exited(0);
+    let store = Store::open(&root).unwrap();
+    store.insert_sandbox(&sandbox).unwrap();
+    for sequence in 0..HISTORY_ROWS {
+        let execution = Execution {
+            id: format!("ex-{sequence:016x}"),
+            sandbox_id: sandbox.id.clone(),
+            argv: vec!["true".into()],
+            state: ExecutionState::Running,
+            exit_code: None,
+            command_status: None,
+            runtime_error: None,
+            failure_reason: None,
+            started_at_ms: sequence as i64,
+            finished_at_ms: None,
+            timeout_ms: 1_000,
+            stdin_bytes: 0,
+            stdout: Captured::default(),
+            stderr: Captured::default(),
+        };
+        store.insert_execution(&execution).unwrap();
+        store
+            .finish_execution(
+                &execution.id,
+                &ExecutionResult {
+                    state: ExecutionState::Exited,
+                    exit_code: Some(0),
+                    command_status: Some(&status),
+                    runtime_error: None,
+                    failure_reason: None,
+                    stdout: &capture,
+                    stderr: &capture,
+                },
+            )
+            .unwrap();
+    }
+    drop(store);
+    drop(capture);
+
+    let manager = Manager::new(
+        FakeRuntime::default(),
+        Store::open(&root).unwrap(),
+        Limits::default(),
+    );
+    let before = rss_bytes(std::process::id());
+    let (_, history) = manager.get(&sandbox.id, HISTORY_ROWS as u32).unwrap();
+    let after = rss_bytes(std::process::id());
+    let delta = after.saturating_sub(before);
+    assert_eq!(history.len(), HISTORY_ROWS);
+    assert!(history.iter().all(|execution| {
+        execution.stdout.data.is_empty()
+            && execution.stderr.data.is_empty()
+            && !execution.stdout.truncated()
+            && !execution.stderr.truncated()
+            && execution.stdout.total_bytes_known
+            && execution.stderr.total_bytes_known
+    }));
+    println!(
+        "GetSandbox metadata RSS: before={before} after={after} delta={delta}; omitted={} retained-output bytes",
+        HISTORY_ROWS * 2 * HISTORY_STREAM_BYTES
+    );
+    assert!(
+        delta < 32 << 20,
+        "metadata projection loaded output BLOBs: before={before} after={after} delta={delta}"
+    );
+    std::hint::black_box(history);
+}
+
+#[test]
+#[ignore = "Linux /proc stress; run scripts/integration-test.sh in the VM"]
+fn getsandbox_metadata_worst_case_does_not_load_output_blobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "metadata_history_rss_child",
+            "--nocapture",
+        ])
+        .env(HISTORY_CHILD_ENV, "1")
+        .env(HISTORY_ROOT_ENV, tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "metadata RSS child failed");
 }
 
 async fn wait_for(path: &Path, what: &str) {

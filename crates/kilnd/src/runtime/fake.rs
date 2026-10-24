@@ -158,14 +158,17 @@ impl FakeRuntime {
 fn exited(code: i32, stdout: Vec<u8>, max: usize) -> ExecOutcome {
     let total = stdout.len() as u64;
     let data = stdout[..stdout.len().min(max)].to_vec();
+    let truncated = total > data.len() as u64;
     ExecOutcome {
         finish: Ok(ExecFinish::Completed),
         command_status: Some(CommandStatus::Exited(code)),
         stdout: Captured {
             data,
             total_bytes: total,
+            truncated,
+            total_bytes_known: true,
         },
-        stderr: Captured::default(),
+        stderr: Captured::known_empty(),
     }
 }
 
@@ -247,8 +250,8 @@ impl Runtime for FakeRuntime {
                     e.to_string(),
                 )),
                 command_status: None,
-                stdout: Default::default(),
-                stderr: Default::default(),
+                stdout: Captured::known_empty(),
+                stderr: Captured::known_empty(),
             };
         }
         if cancel.is_cancelled() {
@@ -256,8 +259,8 @@ impl Runtime for FakeRuntime {
             return ExecOutcome {
                 finish: Ok(ExecFinish::Canceled),
                 command_status: None,
-                stdout: Captured::default(),
-                stderr: Captured::default(),
+                stdout: Captured::known_empty(),
+                stderr: Captured::known_empty(),
             };
         }
         let (gate, panic_exec) = {
@@ -301,10 +304,14 @@ impl Runtime for FakeRuntime {
                     stdout: Captured {
                         data: vec![b'x'; kept],
                         total_bytes: total as u64,
+                        truncated: kept < total,
+                        total_bytes_known: true,
                     },
                     stderr: Captured {
                         data: vec![b'y'; kept],
                         total_bytes: total as u64,
+                        truncated: kept < total,
+                        total_bytes_known: true,
                     },
                 }
             }
@@ -319,8 +326,8 @@ impl Runtime for FakeRuntime {
                 ExecOutcome {
                     finish: Ok(finish),
                     command_status: None,
-                    stdout: Captured::default(),
-                    stderr: Captured::default(),
+                    stdout: Captured::known_empty(),
+                    stderr: Captured::known_empty(),
                 }
             }
             "vanish" => {
@@ -332,8 +339,8 @@ impl Runtime for FakeRuntime {
                         format!("sandbox {id} not found in backend"),
                     )),
                     command_status: None,
-                    stdout: Default::default(),
-                    stderr: Default::default(),
+                    stdout: Captured::known_empty(),
+                    stderr: Captured::known_empty(),
                 }
             }
             "signal" => ExecOutcome {
@@ -357,19 +364,25 @@ impl Runtime for FakeRuntime {
                 stdout: Captured {
                     data: b"\0\xffout"[..5.min(spec.max_output)].to_vec(),
                     total_bytes: 99,
+                    truncated: 5.min(spec.max_output) < 99,
+                    total_bytes_known: false,
                 },
                 stderr: Captured {
                     data: b"\0\xfeerr"[..5.min(spec.max_output)].to_vec(),
                     total_bytes: 101,
+                    truncated: 5.min(spec.max_output) < 101,
+                    total_bytes_known: false,
                 },
             },
             _ => ExecOutcome {
                 finish: Ok(ExecFinish::Completed),
                 command_status: Some(CommandStatus::Exited(127)),
-                stdout: Captured::default(),
+                stdout: Captured::known_empty(),
                 stderr: Captured {
                     data: b"not found\n".to_vec(),
                     total_bytes: 10,
+                    truncated: false,
+                    total_bytes_known: true,
                 },
             },
         }

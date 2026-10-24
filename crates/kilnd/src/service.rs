@@ -368,6 +368,7 @@ fn output_pb(c: Captured) -> pb::Output {
         truncated: c.truncated(),
         total_bytes: c.total_bytes,
         data: c.data,
+        total_bytes_known: c.total_bytes_known,
     }
 }
 

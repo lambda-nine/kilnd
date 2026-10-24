@@ -117,16 +117,29 @@ impl ExecutionState {
     }
 }
 
-/// The first bytes of one output stream and how much there was in total.
+/// The first bytes observed from one output stream and its accounting evidence.
+///
+/// `total_bytes` is exact only when `total_bytes_known` is true. `truncated`
+/// records whether the retention limit discarded bytes that were actually
+/// observed; an unknown tail is represented independently.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Captured {
     pub data: Vec<u8>,
     pub total_bytes: u64,
+    pub truncated: bool,
+    pub total_bytes_known: bool,
 }
 
 impl Captured {
     pub fn truncated(&self) -> bool {
-        self.total_bytes > self.data.len() as u64
+        self.truncated
+    }
+
+    pub fn known_empty() -> Self {
+        Self {
+            total_bytes_known: true,
+            ..Self::default()
+        }
     }
 }
 

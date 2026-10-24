@@ -37,7 +37,8 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   bounded; generated codecs cap request/response messages. Service RPC permits
   are acquired after decoding, so the connection/stream/message caps bound
   simultaneous decoding, not the service semaphore alone. List has explicit
-  item and encoded-byte bounds; GetSandbox reads metadata without output BLOBs.
+  item and encoded-byte bounds; GetSandbox reads metadata without output BLOBs
+  and preserves persisted total-certainty and truncation evidence.
   Health shares and caches one backend probe, with a bounded timeout and panic
   isolation. See [defaults](architecture.md#limits-and-defaults).
 - **State integrity.** The database directory is root-only 0700. kilnd
@@ -110,7 +111,9 @@ sandbox compromises the host.
   Signal/core status and runtime failures remain separate, including real
   command exits 125/126/127. Readers preserve observed binary bytes/counts on
   error or panic and stay alive through the cleanup barrier. Captures settle
-  with an explicit EOF timeout after drainage; failures retain partial evidence.
+  with an explicit EOF timeout after drainage; failures retain partial evidence
+  as an observed lower bound instead of claiming an exact total. Truncation is
+  separately true only when observed bytes exceeded the retained prefix.
   Backend listings require clean EOF on both streams, no 64 KiB capture loss,
   strict newline-terminated records, unique IDs and valid shim PIDs. Startup
   directly probes omitted managed backends and checks their cgroup before

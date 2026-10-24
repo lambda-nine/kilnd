@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Output accounting now distinguishes an exact EOF-proven byte total from an
+  observed lower bound when capture settlement stops early. Truncation records
+  only bytes actually discarded by the retention bound and remains stable in
+  metadata-only reads. The additive v1 API exposes total certainty, schema 4
+  preserves it, and v1/v2/v3 rows migrate as unknown rather than inheriting an
+  unsupported exactness claim. GetSandbox projects persisted output metadata
+  without fetching BLOBs; an isolated Linux regression measures the advertised
+  100 executions with two 1 MiB streams each.
+
 - Startup reconciliation now fails closed on truncated, partial, duplicate or
   contradictory backend listings. Omitted managed sandboxes require a direct
   negative probe and absent cgroup before becoming `LOST`; exact backends that
@@ -20,8 +29,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   create requires protocol 1. Requires persistent-exec v1 first supplied by kiln
   `f3da4b5319566de4912ed617caf81d4eb8e50b6f`, with follow-up
   `711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on `3b42552`.
-  v1/v2 stores migrate to v3 with unknown historical typed values; older
-  binaries refuse schema 3. Migration can precede startup capability failure.
+  v1/v2 stores migrate through v3 with unknown historical typed values before
+  output accounting advances them to v4; older binaries refuse the current
+  schema. Migration can precede startup capability failure.
   Late status settlement preserves runtime failure/cleanup precedence over
   cancellation, sandbox absence requires a bounded successful list observation,
   signal numbers use uint32 on the API, and persisted native codes are bounded.
