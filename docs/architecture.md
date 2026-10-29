@@ -142,16 +142,48 @@ mid-create leaves evidence. Creation then belongs to a tracked daemon task,
 not the gRPC handler: disconnecting only drops the waiter. A successful
 backend ID is published as `READY`; if that write fails, kilnd first records
 `DELETING`, removes the backend, and records `FAILED`. Failed removal stays
-`DELETING`, retains the backend ID, counts against the active limit, and is
-retryable. An execution row is written before `kiln exec` runs and finished
-in one update afterwards. Once that row exists, a tracked supervisor owns the
-request, sandbox lock, backend task, output capture, and terminal update. The
-RPC is only a waiter: dropping it records the first cancellation reason and
-requests cancellation, but cannot abandon cleanup. A caller that disconnects
-while still queued is discarded before a row or backend process is created.
+`DELETING`, retains the backend ID, and counts against the retained reservation
+ceiling. It is retryable. An execution row is written before `kiln exec` runs
+and finished in one update afterwards. Once that row exists, a tracked
+supervisor owns the request, sandbox lock, backend task, output capture, and
+terminal update. The RPC is only a waiter: dropping it records the first
+cancellation reason and requests cancellation, but cannot abandon cleanup. A
+caller that disconnects while still queued is discarded before a row or
+backend process is created.
 If the terminal SQLite update fails, the supervisor keeps the lock and outcome
 and retries with bounded exponential backoff. Health is degraded and shutdown
 cannot claim a completed drain until that publication succeeds.
+
+### Node resource reservations
+
+Per-sandbox cgroups and quotas bound one workload but do not stop the control
+plane promising the same node capacity many times. Create therefore opens an
+SQLite `IMMEDIATE` transaction, parses every reserved row with checked
+arithmetic, checks sandbox count plus aggregate memory, PIDs and disk, and
+inserts the new `CREATING` row before committing. There is no in-memory permit
+to lose on cancellation, panic or restart.
+
+Reservations follow ownership evidence:
+
+- `CREATING`, `READY`, `DELETING` and `LOST` reserve the full effective spec.
+  `LOST` is retained because later reconciliation may restore the same backend
+  to `READY`.
+- `FAILED` without a backend ID remains reserved because `Runtime::create`
+  explicitly permits an ambiguous error after allocation. Delete takes a
+  complete backend listing and refuses release while any ID is unexplained.
+- Successful failed-publication compensation records `FAILED` with the exact
+  removed backend ID. That one `FAILED` shape releases immediately because
+  removal or `NotFound` was proven before the durable transition. Deleting
+  that historical row moves it directly to `DELETED` without touching a
+  backend that may since have reused the ID.
+- `DELETED` releases. A failed or interrupted delete remains `DELETING` and
+  cannot return capacity early.
+
+Budgets are configured promises, not live RSS or disk-use measurements.
+Health reports both limits and reservations. If an operator lowers a budget
+below surviving ownership, startup reconciliation still completes and the API
+remains available for Get/List/Delete. Health is `DEGRADED` and every new
+Create is rejected until cleanup returns all sums within their ceilings.
 
 ## Instance ownership
 
@@ -243,23 +275,26 @@ daemon PID before spawn, restores default HUP/INT/QUIT/TERM/PIPE dispositions,
 arms `PR_SET_PDEATHSIG`, then rechecks the parent PID before exec. The recheck
 closes the non-retroactive parent-death window; the current-thread runtime also
 keeps the forking thread alive for the daemon's lifetime. SQLite access goes
-through one mutex-guarded connection, and each statement is short. The active-
-sandbox cap is checked and the row inserted with no await in between, so
-concurrent creates can't overshoot it.
+through one mutex-guarded connection, and each statement is short. Sandbox
+count, memory, PID and disk reservation checks plus the `CREATING` insert share
+one `IMMEDIATE` transaction, so concurrent creates and external SQLite writers
+cannot split admission from durable ownership.
 
 Each sandbox has a stable slot holding an async exec lock, an outstanding
 request semaphore (one running plus the configured queue capacity), and the
 running execution's cancellation handle. The registry stores weak references:
 a live slot is never replaced under queued requests, while dead entries are
-pruned on later slot access so create/delete churn does not grow memory.
-Client disconnect, delete, and shutdown all record a
-first-wins reason through that handle before canceling its private token.
-Delete marks the sandbox `DELETING`, cancels the running execution, waits for
-the supervisor to finish and release the lock, reloads the row, then runs
-`kiln rm`. The caller holds a strong reference to the stable slot before it
-publishes delete intent, so queued deletes cannot acquire replacement locks.
-Only one caller invokes the backend; followers observe `DELETED` under the
-lock and return the existing row without changing its timestamps. Delete
+pruned on later slot access so create/delete churn does not grow memory. Client
+disconnect, delete, and shutdown all record a first-wins reason through that
+handle before canceling its private token.
+For a row that may still own a backend, Delete marks the sandbox `DELETING`,
+cancels the running execution, waits for the supervisor to finish and release
+the lock, reloads the row, then runs `kiln rm`. Compensated `FAILED` history
+moves atomically to `DELETED` without a backend call. The caller holds a strong
+reference to the stable slot before it publishes delete intent, so queued
+deletes cannot acquire replacement locks. Only one caller invokes the backend;
+followers observe `DELETED` under the lock and return the existing row without
+changing its timestamps. Delete
 intent, completion and failure writes compare the expected state in the same
 SQLite statement, preventing a stale result from overwriting a newer terminal
 state. An interrupted or failed removal remains `DELETING`; a later call
@@ -406,7 +441,10 @@ process" for each shim on restart; that is expected.
 | State | `/var/lib/kilnd/kilnd.db` | `--state-dir` |
 | Exec timeout | 60 s, max 1 h | `--default-timeout-secs`, `--max-timeout-secs` |
 | Output kept per stream | 1 MiB | `--max-output-bytes` |
-| Active sandboxes | 32 | `--max-sandboxes` |
+| Retained sandbox reservations | 32 | `--max-sandboxes` |
+| Reserved sandbox memory | 3 GiB | `--max-node-memory-bytes` |
+| Reserved sandbox PIDs | 2,048 | `--max-node-pids` |
+| Reserved sandbox disk | 16 GiB | `--max-node-disk-bytes` |
 | stdin / argv per exec | 1 MiB / 256 KiB | (code) |
 | argc per exec | 4096 | (code) |
 | Admitted connections | 64 | `--max-connections` |
@@ -428,7 +466,7 @@ stream conversions fit, the default timeout is at most the maximum and maximum
 milliseconds fit `u32`. Checked arithmetic enforces request capacity at least
 stdin + argv + 64 KiB and response capacity at least twice retained output +
 maximum argv + 64 KiB. List bytes cannot exceed response bytes, and pages are
-at most 1000.
+at most 1000. Each node budget must hold at least one default sandbox.
 These are finite capacity bounds, not a hard-real-time guarantee: synchronous
 SQLite/filesystem work may block, slow clients may deny availability until
 disconnected, and authorized callers can monopolize capacity without tenant

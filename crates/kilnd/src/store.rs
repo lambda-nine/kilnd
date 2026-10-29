@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params,
+};
 
 use crate::lock::ExclusiveFileLock;
 use crate::model::{
@@ -24,6 +26,15 @@ use crate::model::{
 };
 
 const SCHEMA_VERSION: i64 = 4;
+
+// A non-deleted row reserves capacity unless a successful compensation
+// recorded the exact removed backend ID on FAILED. FAILED without an ID stays
+// reserved because Runtime::create errors can be ambiguous.
+const RESERVED_SANDBOX_WHERE: &str =
+    "state != 'deleted' AND NOT (state = 'failed' AND backend_id IS NOT NULL)";
+// Only these lifecycle states can still explain a listed backend ID. In
+// particular, compensated FAILED must not hide a backend that reappeared.
+const OWNED_BACKEND_WHERE: &str = "state IN ('creating', 'ready', 'deleting', 'lost')";
 
 const MIGRATE_V3: &str = "
 ALTER TABLE executions ADD COLUMN command_status_kind TEXT;
@@ -115,6 +126,148 @@ pub struct SandboxPage {
     pub rows: Vec<SandboxPageRow>,
     pub upper_seq: i64,
     pub has_more: bool,
+}
+
+/// Aggregate resources promised to sandboxes whose lifecycle may still own a
+/// backend. This is reservation accounting, not measured live consumption.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SandboxResources {
+    pub sandboxes: u64,
+    pub memory_bytes: u64,
+    pub pids: u64,
+    pub disk_bytes: u64,
+}
+
+impl SandboxResources {
+    fn for_spec(spec: &SandboxSpec) -> Self {
+        Self {
+            sandboxes: 1,
+            memory_bytes: spec.memory_bytes,
+            pids: u64::from(spec.pids),
+            disk_bytes: spec.disk_bytes,
+        }
+    }
+
+    fn checked_add(self, other: Self) -> Result<Self> {
+        Ok(Self {
+            sandboxes: self
+                .sandboxes
+                .checked_add(other.sandboxes)
+                .context("sandbox reservation count overflow")?,
+            memory_bytes: self
+                .memory_bytes
+                .checked_add(other.memory_bytes)
+                .context("sandbox memory reservation overflow")?,
+            pids: self
+                .pids
+                .checked_add(other.pids)
+                .context("sandbox PID reservation overflow")?,
+            disk_bytes: self
+                .disk_bytes
+                .checked_add(other.disk_bytes)
+                .context("sandbox disk reservation overflow")?,
+        })
+    }
+}
+
+/// The durable node-wide reservation ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SandboxBudgets {
+    pub sandboxes: u64,
+    pub memory_bytes: u64,
+    pub pids: u64,
+    pub disk_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetExhausted {
+    pub resource: &'static str,
+    pub reserved: u64,
+    pub requested: u64,
+    pub limit: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveSandbox {
+    Inserted,
+    Exhausted(BudgetExhausted),
+}
+
+fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, list_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM sandboxes))",
+        params![
+            sandbox.id,
+            sandbox.backend,
+            sandbox.backend_id,
+            sandbox.state.as_str(),
+            serde_json::to_string(&sandbox.spec)?,
+            sandbox.failure_reason,
+            sandbox.created_at_ms,
+            sandbox.updated_at_ms,
+            sandbox.deleted_at_ms
+        ],
+    )?;
+    Ok(())
+}
+
+fn sandbox_resources(conn: &Connection) -> Result<SandboxResources> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT id, spec FROM sandboxes WHERE {RESERVED_SANDBOX_WHERE}"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut resources = SandboxResources::default();
+    for row in rows {
+        let (id, encoded) = row?;
+        let spec: SandboxSpec = serde_json::from_str(&encoded)
+            .with_context(|| format!("sandbox {id}: bad spec while accounting resources"))?;
+        resources = resources.checked_add(SandboxResources::for_spec(&spec))?;
+    }
+    Ok(resources)
+}
+
+fn exhausted_budget(
+    reserved: SandboxResources,
+    requested: SandboxResources,
+    budgets: SandboxBudgets,
+) -> Result<Option<BudgetExhausted>> {
+    for (resource, reserved, requested, limit) in [
+        (
+            "sandboxes",
+            reserved.sandboxes,
+            requested.sandboxes,
+            budgets.sandboxes,
+        ),
+        (
+            "memory bytes",
+            reserved.memory_bytes,
+            requested.memory_bytes,
+            budgets.memory_bytes,
+        ),
+        ("PIDs", reserved.pids, requested.pids, budgets.pids),
+        (
+            "disk bytes",
+            reserved.disk_bytes,
+            requested.disk_bytes,
+            budgets.disk_bytes,
+        ),
+    ] {
+        let total = reserved
+            .checked_add(requested)
+            .with_context(|| format!("{resource} reservation overflow"))?;
+        if total > limit {
+            return Ok(Some(BudgetExhausted {
+                resource,
+                reserved,
+                requested,
+                limit,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 impl Store {
@@ -259,22 +412,52 @@ impl Store {
     }
 
     pub fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, list_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM sandboxes))",
-            params![
-                s.id,
-                s.backend,
-                s.backend_id,
-                s.state.as_str(),
-                serde_json::to_string(&s.spec)?,
-                s.failure_reason,
-                s.created_at_ms,
-                s.updated_at_ms,
-                s.deleted_at_ms
-            ],
-        )?;
-        Ok(())
+        insert_sandbox(&self.conn(), s)
+    }
+
+    /// Atomically checks every durable node reservation and inserts the new
+    /// CREATING row. The IMMEDIATE transaction makes the sum-and-insert one
+    /// decision even if another SQLite writer ignores kilnd's instance lock.
+    pub fn reserve_sandbox(
+        &self,
+        s: &Sandbox,
+        budgets: SandboxBudgets,
+    ) -> Result<ReserveSandbox> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reserved = sandbox_resources(&tx)?;
+        let requested = SandboxResources::for_spec(&s.spec);
+        if let Some(exhausted) = exhausted_budget(reserved, requested, budgets)? {
+            return Ok(ReserveSandbox::Exhausted(exhausted));
+        }
+        insert_sandbox(&tx, s)?;
+        tx.commit()?;
+        Ok(ReserveSandbox::Inserted)
+    }
+
+    /// Reservations survive daemon restart because they are derived from the
+    /// lifecycle rows. LOST stays reserved because it may recover to READY;
+    /// FAILED without a backend ID stays reserved because Runtime::create
+    /// errors may be ambiguous after allocating an unreported backend.
+    /// FAILED with a backend ID is written only after compensation proved
+    /// that exact backend gone, so it releases capacity while retaining the
+    /// historical row. Explicit deletion resolves an ambiguous FAILED row.
+    pub fn sandbox_resources(&self) -> Result<SandboxResources> {
+        sandbox_resources(&self.conn())
+    }
+
+    /// Backend IDs that a nonterminal lifecycle row can still own. This is
+    /// deliberately narrower than reservations: ambiguous FAILED has no ID,
+    /// while compensated FAILED has an ID but proved it absent.
+    pub fn owned_backend_ids(&self, backend: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "SELECT backend_id FROM sandboxes
+             WHERE backend = ?1 AND backend_id IS NOT NULL AND {OWNED_BACKEND_WHERE}"
+        ))?;
+        let rows = statement.query_map([backend], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Moves a sandbox to `state`. `backend_id` is only written when given;
@@ -1480,6 +1663,116 @@ mod tests {
             4
         );
         assert!(!store.sandbox_page(false, None, None, 3).unwrap().has_more);
+    }
+
+    #[test]
+    fn node_reservations_are_atomic_and_only_deleted_releases_them() {
+        let store = Store::open_in_memory().unwrap();
+        let first = sandbox();
+        let budgets = SandboxBudgets {
+            sandboxes: 4,
+            memory_bytes: first.spec.memory_bytes,
+            pids: u64::from(first.spec.pids) * 4,
+            disk_bytes: first.spec.disk_bytes * 4,
+        };
+        assert_eq!(
+            store.reserve_sandbox(&first, budgets).unwrap(),
+            ReserveSandbox::Inserted
+        );
+        let expected = SandboxResources::for_spec(&first.spec);
+        assert_eq!(store.sandbox_resources().unwrap(), expected);
+
+        for state in [
+            SandboxState::Ready,
+            SandboxState::Lost,
+            SandboxState::Failed,
+            SandboxState::Deleting,
+        ] {
+            store
+                .set_sandbox_state(&first.id, state, None, Some("injected"))
+                .unwrap();
+            assert_eq!(
+                store.sandbox_resources().unwrap(),
+                expected,
+                "{state:?} released an ambiguous reservation"
+            );
+        }
+
+        let second = sandbox();
+        assert_eq!(
+            store.reserve_sandbox(&second, budgets).unwrap(),
+            ReserveSandbox::Exhausted(BudgetExhausted {
+                resource: "memory bytes",
+                reserved: first.spec.memory_bytes,
+                requested: second.spec.memory_bytes,
+                limit: budgets.memory_bytes,
+            })
+        );
+        assert!(store.sandbox(&second.id).unwrap().is_none());
+
+        store
+            .set_sandbox_state(&first.id, SandboxState::Deleted, None, None)
+            .unwrap();
+        assert_eq!(store.sandbox_resources().unwrap(), SandboxResources::default());
+        assert_eq!(
+            store.reserve_sandbox(&second, budgets).unwrap(),
+            ReserveSandbox::Inserted
+        );
+    }
+
+    #[test]
+    fn every_node_budget_is_checked_before_the_creating_insert() {
+        let first = sandbox();
+        let requested = SandboxResources::for_spec(&first.spec);
+        for (resource, budgets) in [
+            (
+                "sandboxes",
+                SandboxBudgets {
+                    sandboxes: 1,
+                    memory_bytes: requested.memory_bytes * 2,
+                    pids: requested.pids * 2,
+                    disk_bytes: requested.disk_bytes * 2,
+                },
+            ),
+            (
+                "memory bytes",
+                SandboxBudgets {
+                    sandboxes: 2,
+                    memory_bytes: requested.memory_bytes,
+                    pids: requested.pids * 2,
+                    disk_bytes: requested.disk_bytes * 2,
+                },
+            ),
+            (
+                "PIDs",
+                SandboxBudgets {
+                    sandboxes: 2,
+                    memory_bytes: requested.memory_bytes * 2,
+                    pids: requested.pids,
+                    disk_bytes: requested.disk_bytes * 2,
+                },
+            ),
+            (
+                "disk bytes",
+                SandboxBudgets {
+                    sandboxes: 2,
+                    memory_bytes: requested.memory_bytes * 2,
+                    pids: requested.pids * 2,
+                    disk_bytes: requested.disk_bytes,
+                },
+            ),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            store.reserve_sandbox(&first, budgets).unwrap();
+            let second = sandbox();
+            let result = store.reserve_sandbox(&second, budgets).unwrap();
+            assert!(
+                matches!(result, ReserveSandbox::Exhausted(e) if e.resource == resource),
+                "expected {resource}, got {result:?}"
+            );
+            assert!(store.sandbox(&second.id).unwrap().is_none());
+            assert_eq!(store.sandbox_resources().unwrap(), requested);
+        }
     }
 
     #[test]

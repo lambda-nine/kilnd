@@ -346,9 +346,143 @@ async fn create_failure_is_recorded_and_returned() {
             .unwrap()
             .contains("is missing")
     );
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        1,
+        "an ambiguous backend create error released its reservation"
+    );
     // A failed sandbox can be cleared.
     let gone = m.delete(&all[0].id).await.unwrap();
     assert_eq!(gone.state, SandboxState::Deleted);
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        0
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_failed_reservation_needs_a_clean_backend_listing_to_release() {
+    let (m, fake) = manager();
+    fake.state().fail_create = Some("ambiguous create error".into());
+    m.create(CreateRequest::default()).await.unwrap_err();
+    fake.state().fail_create = None;
+    let row = m.list(true).unwrap().remove(0);
+    let unexplained = fake.insert(BackendStatus::Running);
+    let mut compensated = row.clone();
+    compensated.id = new_id("sb");
+    compensated.backend_id = Some(unexplained.clone());
+    compensated.failure_reason = Some("prior compensation proved this ID absent".into());
+    m.store.insert_sandbox(&compensated).unwrap();
+
+    let error = m.delete(&row.id).await.unwrap_err();
+    assert!(
+        matches!(error, Error::FailedPrecondition(ref message) if message.contains(&unexplained) && message.contains("fake backend") && message.contains("configured backend")),
+        "{error}"
+    );
+    assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Failed);
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        1
+    );
+
+    fake.state().sandboxes.remove(&unexplained);
+    assert_eq!(m.delete(&row.id).await.unwrap().state, SandboxState::Deleted);
+    assert_eq!(
+        m.delete(&compensated.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved,
+        SandboxResources::default()
+    );
+}
+
+#[tokio::test]
+async fn reappeared_compensated_id_is_unmanaged_not_gc_owned_or_release_proof() {
+    let (m, fake) = manager();
+    fake.state().fail_create = Some("ambiguous create error".into());
+    m.create(CreateRequest::default()).await.unwrap_err();
+    fake.state().fail_create = None;
+    let ambiguous = m.list(true).unwrap().remove(0);
+
+    let reappeared = fake.insert(BackendStatus::Stale);
+    let mut compensated = ambiguous.clone();
+    compensated.id = new_id("sb");
+    compensated.backend_id = Some(reappeared.clone());
+    compensated.failure_reason = Some("prior compensation proved this ID absent".into());
+    m.store.insert_sandbox(&compensated).unwrap();
+
+    let reconciled = m.reconcile().await.unwrap();
+    assert_eq!(reconciled.unmanaged, vec![reappeared.clone()]);
+    assert!(reconciled.gc_removed.is_empty());
+    assert!(fake.state().gc_requests.is_empty());
+    assert!(fake.state().sandboxes.contains_key(&reappeared));
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        1,
+        "compensated history was charged as ownership"
+    );
+
+    assert_eq!(
+        m.delete(&compensated.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+    {
+        let state = fake.state();
+        assert!(
+            state.sandboxes.contains_key(&reappeared),
+            "deleting compensated history removed a reappeared unmanaged backend"
+        );
+        assert!(state.remove_attempts.is_empty());
+        assert!(state.gc_requests.is_empty());
+    }
+
+    let error = m.delete(&ambiguous.id).await.unwrap_err();
+    assert!(
+        matches!(error, Error::FailedPrecondition(ref message) if message.contains(&reappeared)),
+        "{error}"
+    );
+    fake.state().sandboxes.remove(&reappeared);
+    assert_eq!(
+        m.delete(&ambiguous.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+}
+
+#[tokio::test]
+async fn node_budget_reservation_is_atomic_while_create_is_in_flight() {
+    let (m, fake) = manager_with(Limits {
+        max_node_memory_bytes: 512 << 20,
+        max_node_pids: 128,
+        max_node_disk_bytes: 1 << 30,
+        ..Limits::default()
+    });
+    let gate = FakeGate::default();
+    fake.state().create_before_allocation = Some(gate.clone());
+    let first = tokio::spawn({
+        let m = m.clone();
+        async move { m.create(CreateRequest::default()).await }
+    });
+    gate.entered().await;
+
+    let rejected = m.create(CreateRequest::default()).await.unwrap_err();
+    assert!(
+        matches!(rejected, Error::ResourceExhausted(ref message) if message.contains("memory bytes")),
+        "{rejected}"
+    );
+    assert_eq!(m.list(true).unwrap().len(), 1);
+    let health = m.health().await.unwrap();
+    assert_eq!(health.node_resources.reserved.memory_bytes, 512 << 20);
+    assert_eq!(health.node_resources.rejected_creates, 1);
+
+    gate.release();
+    let first = first.await.unwrap().unwrap();
+    m.delete(&first.id).await.unwrap();
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved,
+        SandboxResources::default()
+    );
+    assert!(m.create(CreateRequest::default()).await.is_ok());
 }
 
 #[tokio::test]
@@ -459,15 +593,23 @@ async fn dropped_waiter_does_not_interrupt_publication_compensation() {
 
     let row = m.list(true).unwrap().remove(0);
     assert_eq!(row.state, SandboxState::Failed);
+    assert!(row.backend_id.is_some());
     assert!(
         row.failure_reason
             .as_deref()
             .unwrap()
             .contains("backend removed")
     );
-    let state = fake.state();
-    assert!(state.sandboxes.is_empty());
-    assert_eq!(state.remove_attempts.len(), 1);
+    {
+        let state = fake.state();
+        assert!(state.sandboxes.is_empty());
+        assert_eq!(state.remove_attempts.len(), 1);
+    }
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved,
+        SandboxResources::default(),
+        "proven successful compensation retained its reservation"
+    );
 }
 
 #[tokio::test]
@@ -488,6 +630,11 @@ async fn failed_publication_and_compensation_remain_retryable_and_counted() {
             .contains("cleanup failed")
     );
     assert_eq!(m.health().await.unwrap().active_sandboxes, 1);
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        1,
+        "failed compensation released a live backend reservation"
+    );
     assert_eq!(fake.state().sandboxes.len(), 1);
 
     fake.state().fail_remove = false;
@@ -496,6 +643,10 @@ async fn failed_publication_and_compensation_remain_retryable_and_counted() {
         SandboxState::Deleted
     );
     assert!(fake.state().sandboxes.is_empty());
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved,
+        SandboxResources::default()
+    );
 }
 
 #[tokio::test]
@@ -508,6 +659,11 @@ async fn backend_create_panic_is_recorded_as_failed() {
     assert_eq!(row.state, SandboxState::Failed);
     assert!(row.failure_reason.as_deref().unwrap().contains("panicked"));
     assert!(fake.state().sandboxes.is_empty());
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        1,
+        "an ambiguous backend panic released its reservation"
+    );
 }
 
 #[tokio::test]
@@ -668,7 +824,7 @@ async fn create_validates_the_spec() {
 }
 
 #[tokio::test]
-async fn caps_active_sandboxes() {
+async fn caps_retained_sandbox_reservations() {
     let (m, _) = manager_with(Limits {
         max_sandboxes: 2,
         ..Limits::default()
@@ -1596,6 +1752,129 @@ async fn reconcile_repairs_state_and_is_repeatable() {
 }
 
 #[tokio::test]
+async fn lowered_node_budgets_degrade_but_keep_cleanup_available() {
+    let fake = FakeRuntime::default();
+    let backend_id = fake.insert(BackendStatus::Running);
+    let store = Store::open_in_memory().unwrap();
+    let now = now_ms();
+    let sandbox = Sandbox {
+        id: new_id("sb"),
+        state: SandboxState::Ready,
+        spec: SandboxSpec {
+            image: "alpine".into(),
+            memory_bytes: 1 << 30,
+            cpu_millis: 1000,
+            pids: 256,
+            disk_bytes: 2 << 30,
+            network: Network::None,
+            read_only_root: false,
+            writable_paths: Vec::new(),
+            labels: BTreeMap::new(),
+        },
+        backend: "fake".into(),
+        backend_id: Some(backend_id),
+        created_at_ms: now,
+        updated_at_ms: now,
+        deleted_at_ms: None,
+        failure_reason: None,
+    };
+    store.insert_sandbox(&sandbox).unwrap();
+    let manager = Arc::new(Manager::new(
+        fake.clone(),
+        store,
+        Limits {
+            max_node_memory_bytes: 512 << 20,
+            max_node_pids: 128,
+            max_node_disk_bytes: 1 << 30,
+            ..Limits::default()
+        },
+    ));
+
+    manager.reconcile().await.unwrap();
+    let health = manager.health().await.unwrap();
+    assert!(!health.serving);
+    assert!(health.detail.contains("exceed configured budgets"));
+    assert_eq!(manager.get(&sandbox.id, 0).unwrap().0.state, SandboxState::Ready);
+    assert_eq!(manager.list(false).unwrap().len(), 1);
+    assert!(matches!(
+        manager.create(CreateRequest::default()).await,
+        Err(Error::ResourceExhausted(_))
+    ));
+
+    assert_eq!(
+        manager.delete(&sandbox.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+    let health = manager.health().await.unwrap();
+    assert!(health.serving, "{}", health.detail);
+    assert_eq!(health.node_resources.reserved, SandboxResources::default());
+}
+
+#[tokio::test]
+async fn restart_turns_creating_without_an_id_into_reserved_ambiguous_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        tmp.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let state_dir = tmp.path().join("state");
+    let fake = FakeRuntime::default();
+    let now = now_ms();
+    let crashed_create = Sandbox {
+        id: new_id("sb"),
+        state: SandboxState::Creating,
+        spec: SandboxSpec {
+            image: "alpine".into(),
+            memory_bytes: 512 << 20,
+            cpu_millis: 1000,
+            pids: 128,
+            disk_bytes: 1 << 30,
+            network: Network::None,
+            read_only_root: false,
+            writable_paths: Vec::new(),
+            labels: BTreeMap::new(),
+        },
+        backend: "fake".into(),
+        backend_id: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+        deleted_at_ms: None,
+        failure_reason: None,
+    };
+    {
+        let store = Store::open(&state_dir).unwrap();
+        store.insert_sandbox(&crashed_create).unwrap();
+        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+    }
+
+    let manager = Arc::new(Manager::new(
+        fake,
+        Store::open(&state_dir).unwrap(),
+        Limits::default(),
+    ));
+    let reconciled = manager.reconcile().await.unwrap();
+    assert_eq!(reconciled.failed, vec![crashed_create.id.clone()]);
+    let failed = manager.get(&crashed_create.id, 0).unwrap().0;
+    assert_eq!(failed.state, SandboxState::Failed);
+    assert!(failed.backend_id.is_none());
+    assert_eq!(
+        manager.health().await.unwrap().node_resources.reserved.sandboxes,
+        1,
+        "restart reconciliation released an ambiguous create"
+    );
+
+    assert_eq!(
+        manager.delete(&crashed_create.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+    assert_eq!(
+        manager.health().await.unwrap().node_resources.reserved,
+        SandboxResources::default()
+    );
+}
+
+#[tokio::test]
 async fn reconcile_changes_nothing_when_the_backend_is_unavailable() {
     let (m, fake) = manager();
     let s = m.create(CreateRequest::default()).await.unwrap();
@@ -1671,6 +1950,11 @@ async fn a_provably_reappeared_backend_recovers_after_restart_once() {
                 Some("injected crash-era false absence"),
             )
             .unwrap();
+        assert_eq!(
+            manager.store.sandbox_resources().unwrap().sandboxes,
+            1,
+            "LOST released capacity before possible recovery"
+        );
         sandbox
     };
 
@@ -1684,6 +1968,10 @@ async fn a_provably_reappeared_backend_recovers_after_restart_once() {
     let recovered = manager.get(&sandbox.id, 0).unwrap().0;
     assert_eq!(recovered.state, SandboxState::Ready);
     assert_eq!(recovered.failure_reason, None);
+    assert_eq!(
+        manager.health().await.unwrap().node_resources.reserved.sandboxes,
+        1
+    );
 
     let second = manager.reconcile().await.unwrap();
     assert_eq!(second, Reconciled::default());

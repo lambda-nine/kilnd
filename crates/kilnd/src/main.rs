@@ -39,9 +39,18 @@ struct Args {
     /// Bytes of stdout and of stderr kept per execution.
     #[arg(long, default_value_t = 1 << 20)]
     max_output_bytes: usize,
-    /// Sandboxes that may exist at once.
+    /// Durable sandbox reservations retained at once, including lost and ambiguous rows.
     #[arg(long, default_value_t = 32)]
     max_sandboxes: u32,
+    /// Aggregate memory promised to durably reserved sandboxes on this node.
+    #[arg(long, default_value_t = 3_u64 << 30)]
+    max_node_memory_bytes: u64,
+    /// Aggregate process/thread slots promised to durably reserved sandboxes.
+    #[arg(long, default_value_t = 2048)]
+    max_node_pids: u64,
+    /// Aggregate disk quota promised to durably reserved sandboxes on this node.
+    #[arg(long, default_value_t = 16_u64 << 30)]
+    max_node_disk_bytes: u64,
     /// Simultaneous admitted Unix connections; excess sockets are closed.
     #[arg(long, default_value_t = 64)]
     max_connections: usize,
@@ -211,6 +220,9 @@ fn validated_limits(args: &Args) -> Result<Limits> {
         max_timeout: Duration::from_secs(args.max_timeout_secs),
         max_output_bytes: args.max_output_bytes,
         max_sandboxes: args.max_sandboxes,
+        max_node_memory_bytes: args.max_node_memory_bytes,
+        max_node_pids: args.max_node_pids,
+        max_node_disk_bytes: args.max_node_disk_bytes,
         max_connections: args.max_connections,
         max_concurrent_rpcs: args.max_concurrent_rpcs,
         max_concurrent_health: args.max_concurrent_health,
@@ -285,6 +297,28 @@ fn validated_limits(args: &Args) -> Result<Limits> {
     }
     if limits.max_sandboxes == 0 {
         bail!("--max-sandboxes must be nonzero");
+    }
+    for (name, value) in [
+        ("max-node-memory-bytes", limits.max_node_memory_bytes),
+        ("max-node-pids", limits.max_node_pids),
+        ("max-node-disk-bytes", limits.max_node_disk_bytes),
+    ] {
+        if value == 0 {
+            bail!("--{name} must be nonzero");
+        }
+    }
+    for (name, default, node_limit) in [
+        (
+            "memory",
+            limits.default_memory_bytes,
+            limits.max_node_memory_bytes,
+        ),
+        ("pids", u64::from(limits.default_pids), limits.max_node_pids),
+        ("disk", limits.default_disk_bytes, limits.max_node_disk_bytes),
+    ] {
+        if default > node_limit {
+            bail!("default sandbox {name} {default} exceeds node budget {node_limit}");
+        }
     }
     if limits.default_timeout > limits.max_timeout {
         bail!("--default-timeout-secs is above --max-timeout-secs");
@@ -363,6 +397,9 @@ mod tests {
         assert_eq!(limits.max_connections, 64);
         assert_eq!(limits.max_request_bytes, 2 << 20);
         assert_eq!(limits.health_probe_timeout, Duration::from_secs(2));
+        assert_eq!(limits.max_node_memory_bytes, 3 << 30);
+        assert_eq!(limits.max_node_pids, 2048);
+        assert_eq!(limits.max_node_disk_bytes, 16 << 30);
         let args = Args::try_parse_from(["kilnd", "--max-queued-execs-per-sandbox", "0"]).unwrap();
         validated_limits(&args).unwrap();
 
@@ -391,6 +428,9 @@ mod tests {
             "--max-list-page-size",
             "--max-output-bytes",
             "--max-sandboxes",
+            "--max-node-memory-bytes",
+            "--max-node-pids",
+            "--max-node-disk-bytes",
             "--default-timeout-secs",
             "--max-timeout-secs",
             "--health-probe-timeout-secs",
@@ -435,6 +475,17 @@ mod tests {
             ("--max-list-response-bytes", "5000000", "must not exceed"),
             ("--max-timeout-secs", "4294968", "milliseconds must fit u32"),
             ("--default-timeout-secs", "3601", "above --max-timeout-secs"),
+            (
+                "--max-node-memory-bytes",
+                "536870911",
+                "default sandbox memory",
+            ),
+            ("--max-node-pids", "127", "default sandbox pids"),
+            (
+                "--max-node-disk-bytes",
+                "1073741823",
+                "default sandbox disk",
+            ),
         ] {
             let args = Args::try_parse_from(["kilnd", flag, value]).unwrap();
             assert!(

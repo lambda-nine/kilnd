@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add atomic, durable node-wide sandbox budgets for retained count, requested
+  memory, PIDs and disk. Create now checks all four sums and inserts
+  `CREATING` in one SQLite transaction; reservations survive cancellation,
+  panic, reconciliation and restart, and release only after proven backend
+  absence plus a durable terminal transition. LOST and ambiguous failed
+  creates remain charged, compensated creates recover capacity, and lowered
+  limits degrade Health while preserving Get/List/Delete for cleanup. Health,
+  kilndctl, CLI defaults, operator guidance and bounded real-runtime stress now
+  expose and verify the reservation contract.
+
 - Close backend subprocess inheritance gaps: every launcher now captures the
   parent PID before spawn, arms `PR_SET_PDEATHSIG`, and rechecks the parent
   before exec so death during the post-fork window cannot release an

@@ -56,15 +56,25 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   reappears and passes capability validation, `lost` returns to `ready`.
 - **Operational limits:** root-owned socket usable by the `kilnd` group
   (directory 0750, socket 0660), per-execution timeouts that stop the command
-  inside the sandbox, bounded output, stdin and argv, a cap on active
-  sandboxes, graceful shutdown, and structured logs (text or JSON).
+  inside the sandbox, bounded output, stdin and argv, a cap on durable sandbox
+  reservations, graceful shutdown, and structured logs (text or JSON).
+- **Durable node budgets:** one SQLite transaction sums every retained
+  sandbox reservation and inserts the `CREATING` row, so memory, PID and disk
+  promises cannot be overcommitted by concurrent creates. Defaults reserve at
+  most 3 GiB memory, 2,048 PIDs and 16 GiB disk for sandboxes. `LOST` remains
+  reserved because it can recover; ambiguous `FAILED` creates remain reserved
+  until deletion proves no unexplained backend exists. `DELETING` releases
+  only after backend absence is durably recorded. Health exposes limits,
+  reservations and rejection totals since daemon startup. Lowering limits
+  below existing ownership degrades Health and rejects creates while
+  Get/List/Delete stay available.
 - **Admission bounds:** 64 connections, 8 HTTP/2 streams per connection,
   64 ordinary RPC handlers plus 4 reserved Health handlers, 2 MiB requests
   and 4 MiB responses. Exec admits at most 32 running or queued requests
   globally, one running plus 8 queued per sandbox, and 16 MiB of retained
   stdin. Admission is immediate; a full budget returns `RESOURCE_EXHAUSTED`
   (excess raw connections are closed). Slow callers can hold bounded slots.
-  Health exposes current use, maxima and rejection totals.
+  Health exposes current use, maxima and rejection totals since daemon startup.
 - **Exclusive daemon ownership:** a persistent advisory lock in the state
   directory prevents a second process from opening the same database, while
   a separate socket-directory lock prevents endpoint takeover. Both are held
@@ -74,8 +84,10 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
 - **Supervised creates:** after acceptance, `CreateSandbox` belongs to the
   daemon rather than the RPC future. A disconnected caller stops receiving
   the result, but creation still reaches `ready` or attempts compensation.
-  Failed cleanup stays counted and retryable; shutdown drains this work
-  before exit.
+  Capacity reservation and the `CREATING` row are one durable transaction.
+  Failed cleanup stays counted and retryable; successful compensation releases
+  only after the exact backend is proven absent and the result is recorded.
+  Shutdown drains this work before exit.
 - **Supervised executions:** once an execution is recorded, it belongs to the
   daemon rather than the RPC future. A disconnected caller requests
   cancellation, but kilnd waits for backend cleanup, drains output capture,
@@ -85,10 +97,12 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   defaults before exec. On Linux it also arms `PR_SET_PDEATHSIG` and rechecks
   the parent PID, so a daemon death at any point in the fork/pre-exec window
   cannot leave an unsupervised backend client running.
-- **Serialized deletion:** concurrent `DeleteSandbox` callers share the
-  sandbox's coordination slot and one backend removal. State is reloaded under
-  that lock, `deleted` is immutable idempotent success, and conditional writes
-  prevent stale failures from restoring `deleting` or rewriting timestamps.
+- **Serialized deletion:** for rows that may still own a backend, concurrent
+  `DeleteSandbox` callers share the sandbox's coordination slot and one backend
+  removal. Compensated `failed` history moves directly to `deleted` without a
+  backend call. State is reloaded under that lock; `deleted` is immutable
+  idempotent success, and conditional writes prevent stale failures from
+  restoring `deleting` or rewriting timestamps.
   A call interrupted before or after backend removal leaves `deleting` for a
   safe retry (including an already-gone backend).
 - **One Exec deadline:** the requested timeout includes queueing. Expiry

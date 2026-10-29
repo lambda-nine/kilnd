@@ -337,6 +337,11 @@ async fn every_rpc_over_the_socket() {
     assert_eq!(admission.max_connections, 64);
     assert_eq!(admission.current_connections, 1);
     assert_eq!(admission.current_health, 1);
+    let resources = h.node_resources.unwrap();
+    assert_eq!(resources.max_memory_bytes, 3 << 30);
+    assert_eq!(resources.max_pids, 2048);
+    assert_eq!(resources.max_disk_bytes, 16 << 30);
+    assert_eq!(resources.reserved_sandboxes, 0);
 
     let spec = pb::SandboxSpec {
         limits: Some(pb::ResourceLimits {

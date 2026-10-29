@@ -3,7 +3,7 @@
 //! translation on top of this.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -19,7 +19,9 @@ use crate::model::{
     RuntimeErrorKind, RuntimeStage, Sandbox, SandboxSpec, SandboxState, new_id, now_ms, valid_id,
 };
 use crate::runtime::{BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
-use crate::store::{ExecutionResult, Store};
+use crate::store::{
+    ExecutionResult, ReserveSandbox, SandboxBudgets, SandboxResources, Store,
+};
 use crate::validation::{
     MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, validate_allowlist_entry, validate_argv,
     validate_image_name, validate_writable_path,
@@ -38,6 +40,9 @@ pub struct Limits {
     pub max_pids: u32,
     pub max_disk_bytes: u64,
     pub max_sandboxes: u32,
+    pub max_node_memory_bytes: u64,
+    pub max_node_pids: u64,
+    pub max_node_disk_bytes: u64,
     pub default_timeout: Duration,
     pub max_timeout: Duration,
     pub max_output_bytes: usize,
@@ -72,6 +77,9 @@ impl Default for Limits {
             max_pids: 4096,
             max_disk_bytes: 32 << 30,
             max_sandboxes: 32,
+            max_node_memory_bytes: 3 << 30,
+            max_node_pids: 2048,
+            max_node_disk_bytes: 16 << 30,
             default_timeout: Duration::from_secs(60),
             max_timeout: Duration::from_secs(3600),
             max_output_bytes: 1 << 20,
@@ -228,6 +236,8 @@ pub struct Manager<R> {
     operations: TaskTracker,
     /// Terminal execution writes currently retrying after a store failure.
     finalization_failures: AtomicU32,
+    /// Create requests rejected by the durable sandbox reservation budgets.
+    node_resource_rejections: AtomicU64,
     started_at_ms: i64,
 }
 
@@ -242,6 +252,14 @@ pub struct Health {
     pub active_sandboxes: u32,
     pub running_executions: u32,
     pub admission: AdmissionSnapshot,
+    pub node_resources: NodeResourceSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeResourceSnapshot {
+    pub limits: SandboxBudgets,
+    pub reserved: SandboxResources,
+    pub rejected_creates: u64,
 }
 
 /// What startup reconciliation changed, for logs and tests.
@@ -272,6 +290,7 @@ impl<R: Runtime> Manager<R> {
             shutting_down: CancellationToken::new(),
             operations: TaskTracker::new(),
             finalization_failures: AtomicU32::new(0),
+            node_resource_rejections: AtomicU64::new(0),
             started_at_ms: now_ms(),
         }
     }
@@ -286,6 +305,15 @@ impl<R: Runtime> Manager<R> {
 
     pub(crate) fn admission(&self) -> &Arc<Admission> {
         &self.admission
+    }
+
+    fn sandbox_budgets(&self) -> SandboxBudgets {
+        SandboxBudgets {
+            sandboxes: u64::from(self.limits.max_sandboxes),
+            memory_bytes: self.limits.max_node_memory_bytes,
+            pids: self.limits.max_node_pids,
+            disk_bytes: self.limits.max_node_disk_bytes,
+        }
     }
 
     fn slot(&self, id: &str) -> Arc<Slot> {
@@ -323,10 +351,14 @@ impl<R: Runtime> Manager<R> {
             .await
             .map_err(backend)?;
         let sandboxes = self.store.sandboxes(true)?;
-        let known: HashSet<String> = sandboxes
-            .iter()
-            .filter(|sandbox| sandbox.backend == self.runtime.name())
-            .filter_map(|sandbox| sandbox.backend_id.clone())
+        // Reconciliation may clean or explain only IDs whose lifecycle can
+        // still own a backend. A compensated FAILED row retained for history
+        // proved its former backend absent; if that ID reappears, it is
+        // unmanaged rather than permission to hide or garbage-collect it.
+        let known: HashSet<String> = self
+            .store
+            .owned_backend_ids(self.runtime.name())?
+            .into_iter()
             .collect();
         let before_gc: HashMap<String, BackendStatus> = self
             .runtime
@@ -618,6 +650,32 @@ impl<R: Runtime> Manager<R> {
                 "{finalization_failures} execution finalization write(s) retrying"
             ));
         }
+        let reserved = self.store.sandbox_resources()?;
+        let limits = self.sandbox_budgets();
+        let over_budget = [
+            ("sandboxes", reserved.sandboxes, limits.sandboxes),
+            (
+                "memory bytes",
+                reserved.memory_bytes,
+                limits.memory_bytes,
+            ),
+            ("PIDs", reserved.pids, limits.pids),
+            ("disk bytes", reserved.disk_bytes, limits.disk_bytes),
+        ]
+        .into_iter()
+        .filter(|(_, current, limit)| current > limit)
+        .map(|(resource, current, limit)| format!("{resource} {current}/{limit}"))
+        .collect::<Vec<_>>();
+        if !over_budget.is_empty() {
+            serving = false;
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(&format!(
+                "node sandbox reservations exceed configured budgets: {} (CreateSandbox is disabled until DeleteSandbox releases capacity)",
+                over_budget.join(", ")
+            ));
+        }
         Ok(Health {
             serving: serving && !self.shutting_down.is_cancelled(),
             shutting_down: self.shutting_down.is_cancelled(),
@@ -628,6 +686,11 @@ impl<R: Runtime> Manager<R> {
             active_sandboxes: self.store.count_active_sandboxes()?,
             running_executions: self.store.count_running_executions()?,
             admission: self.admission.snapshot(),
+            node_resources: NodeResourceSnapshot {
+                limits,
+                reserved,
+                rejected_creates: self.node_resource_rejections.load(Ordering::Relaxed),
+            },
         })
     }
 
@@ -659,12 +722,6 @@ impl<R: Runtime> Manager<R> {
     async fn create_owned(self: Arc<Self>, req: CreateRequest) -> Result<Sandbox> {
         self.check_serving()?;
         let spec = self.resolve_spec(req)?;
-        if self.store.count_active_sandboxes()? >= self.limits.max_sandboxes {
-            return Err(Error::ResourceExhausted(format!(
-                "at most {} sandboxes may be active",
-                self.limits.max_sandboxes
-            )));
-        }
         let now = now_ms();
         let mut sandbox = Sandbox {
             id: new_id("sb"),
@@ -678,8 +735,25 @@ impl<R: Runtime> Manager<R> {
             failure_reason: None,
         };
         // Recorded before the backend runs, so a crash mid-create leaves a
-        // trace for reconciliation.
-        self.store.insert_sandbox(&sandbox)?;
+        // trace for reconciliation. Count and all three resource sums are
+        // checked with this insert in one SQLite transaction.
+        match self
+            .store
+            .reserve_sandbox(&sandbox, self.sandbox_budgets())?
+        {
+            ReserveSandbox::Inserted => {}
+            ReserveSandbox::Exhausted(exhausted) => {
+                self.node_resource_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(Error::ResourceExhausted(format!(
+                    "node {} budget exhausted: {} reserved + {} requested exceeds limit {}",
+                    exhausted.resource,
+                    exhausted.reserved,
+                    exhausted.requested,
+                    exhausted.limit
+                )));
+            }
+        }
         info!(sandbox = %sandbox.id, image = %sandbox.spec.image, "creating sandbox");
         // Isolate a backend panic from the supervisor so the database still
         // reaches a terminal state. A backend that panics after making an
@@ -880,6 +954,34 @@ impl<R: Runtime> Manager<R> {
         if sandbox.state == SandboxState::Deleted {
             return Ok(sandbox);
         }
+        if sandbox.state == SandboxState::Failed {
+            if sandbox.backend_id.is_none() {
+                self.prove_ambiguous_failed_backend_absent(&sandbox).await?;
+            } else {
+                // FAILED with an ID is compensated history: removal or
+                // NotFound was already proven before that state was written.
+                // Never reassert ownership by entering DELETING or touching a
+                // backend that may since have reused the historical ID.
+                if self.store.compare_and_set_sandbox_state(
+                    id,
+                    SandboxState::Failed,
+                    SandboxState::Deleted,
+                    None,
+                    None,
+                )? {
+                    info!(sandbox = %id, "deleted compensated sandbox history");
+                    return self.load(id);
+                }
+                let current = self.load(id)?;
+                if current.state == SandboxState::Deleted {
+                    return Ok(current);
+                }
+                return Err(Error::Internal(anyhow::anyhow!(
+                    "compensated sandbox {id} changed from failed to {} while deletion completed",
+                    current.state.as_str()
+                )));
+            }
+        }
         // Hold a strong reference before publishing DELETING so every caller
         // that observes the transition reuses this exact coordination slot.
         let slot = self.slot(id);
@@ -955,6 +1057,37 @@ impl<R: Runtime> Manager<R> {
                 Err(Error::Backend(format!("delete sandbox {id}: {e}")))
             }
         }
+    }
+
+    /// A create error without a reported backend ID is explicitly ambiguous
+    /// in the Runtime contract. Do not let an ordinary API caller turn that
+    /// FAILED row into DELETED (and release its reservation) while any
+    /// unexplained backend could be the resource that create allocated.
+    async fn prove_ambiguous_failed_backend_absent(&self, sandbox: &Sandbox) -> Result<()> {
+        let known: HashSet<String> = self
+            .store
+            .owned_backend_ids(self.runtime.name())?
+            .into_iter()
+            .collect();
+        let mut unexplained: Vec<String> = self
+            .runtime
+            .list()
+            .await
+            .map_err(backend)?
+            .into_iter()
+            .filter(|candidate| !known.contains(&candidate.id))
+            .map(|candidate| candidate.id)
+            .collect();
+        unexplained.sort();
+        if unexplained.is_empty() {
+            return Ok(());
+        }
+        let candidates = unexplained.into_iter().take(4).collect::<Vec<_>>().join(", ");
+        Err(Error::FailedPrecondition(format!(
+            "cannot release the ambiguous reservation for failed sandbox {} while the {} backend has unexplained sandbox(es): {candidates}; resolve or remove those IDs with the configured backend, then retry DeleteSandbox",
+            sandbox.id,
+            self.runtime.name()
+        )))
     }
 
     /// Starts a daemon-owned execution and waits for its result. Once the

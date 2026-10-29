@@ -52,6 +52,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             active_sandboxes: h.active_sandboxes,
             running_executions: h.running_executions,
             admission: Some(admission_pb(h.admission)),
+            node_resources: Some(node_resources_pb(h.node_resources)),
         }))
     }
 
@@ -232,6 +233,20 @@ fn admission_pb(s: crate::admission::AdmissionSnapshot) -> pb::AdmissionStats {
         rejected_stdin: s.stdin.rejected,
         max_queued_execs_per_sandbox: s.max_queued_execs_per_sandbox,
         rejected_sandbox_execs: s.rejected_sandbox_execs,
+    }
+}
+
+fn node_resources_pb(s: crate::manager::NodeResourceSnapshot) -> pb::NodeResourceStats {
+    pb::NodeResourceStats {
+        max_sandboxes: s.limits.sandboxes,
+        reserved_sandboxes: s.reserved.sandboxes,
+        max_memory_bytes: s.limits.memory_bytes,
+        reserved_memory_bytes: s.reserved.memory_bytes,
+        max_pids: s.limits.pids,
+        reserved_pids: s.reserved.pids,
+        max_disk_bytes: s.limits.disk_bytes,
+        reserved_disk_bytes: s.reserved.disk_bytes,
+        rejected_creates: s.rejected_creates,
     }
 }
 

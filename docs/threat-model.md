@@ -31,9 +31,17 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   Newlines, Unicode and flag-like arguments stay literal; only NUL and the
   documented count/byte violations are rejected. See the
   [request validation contract](validation.md).
-- **Bounded resource use by callers.** Caps on active sandboxes, sandbox
-  limits, queue-inclusive exec timeout, argv/argc, stdin and stored output
-  bound individual requests. Immediate admission caps connections, ordinary
+- **Bounded resource use by callers.** One durable SQLite transaction reserves
+  sandbox count plus aggregate requested memory, PIDs and disk before it
+  inserts `CREATING`; cancellation, panic and restart cannot lose that promise.
+  `CREATING`, `READY`, `DELETING` and `LOST` reserve their full effective spec.
+  A create error without a backend ID is ambiguous and remains reserved until
+  a complete backend listing proves there are no unexplained IDs. Successful
+  compensation releases only after the exact backend is absent and the
+  terminal transition is durable. Lowered budgets reject Create but retain the
+  cleanup control plane. Per-sandbox limits, queue-inclusive exec timeout,
+  argv/argc, stdin and stored output also bound individual requests. Immediate
+  admission caps connections, ordinary
   RPCs, reserved Health RPCs, global and per-sandbox Exec requests, and their
   aggregate retained stdin. Exec tickets remain owned through cleanup and
   terminal publication. HTTP/2 streams, fixed windows, headers and frames are
@@ -91,6 +99,13 @@ sandbox compromises the host.
   status. Service permits end after response construction; transport caps
   bound slots held during response backpressure. These are capacity bounds,
   not measured allocator/RSS ceilings.
+- **Node budgets cover kilnd-managed promises, not all root activity.** A
+  trusted root user or direct `kiln` invocation can create unmanaged backends
+  outside these reservations. Such unexplained backends conservatively block
+  release of an ambiguous failed create but are not charged a fabricated spec.
+  Memory, PIDs and disk are reserved from requested effective sandbox limits;
+  they are not measurements of current RSS, task count or disk usage. CPU is
+  intentionally schedulable and may be overcommitted rather than reserved.
 - **Deadlines are not hard real time.** SQLite and filesystem work is
   synchronous. Deadline delivery can be delayed by that work, and an expired
   recorded execution retains admission until backend cleanup and terminal
@@ -146,12 +161,15 @@ sandbox compromises the host.
   `f3da4b5319566de4912ed617caf81d4eb8e50b6f`, with follow-up
   `711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on `3b42552`.
 - **A daemon crash during `kiln create`** can leave a kiln sandbox whose
-  backend ID was never returned to kilnd. Reconciliation logs it as unmanaged
-  but doesn't remove it, even after its shim becomes stale, since it can't
-  tell it from one an operator made with the CLI. Remove a live one with
-  `kiln rm ID` or a stale one with scoped `kiln gc ID`. Ordinary RPC
-  cancellation is not this case: accepted creates are daemon-owned and finish or compensate even
-  after the caller disconnects.
+  backend ID was never returned to kilnd. Reconciliation records the row as an
+  ambiguous `FAILED` reservation and logs the backend as unmanaged; it cannot
+  safely pair the two or remove an operator-created sandbox. Delete refuses to
+  release that reservation while a complete backend listing contains any
+  unexplained ID. A trusted operator must inspect the listing, remove or
+  resolve those IDs with the configured backend, and retry deletion. With the
+  kiln backend, use `kiln rm ID` for a live sandbox or scoped `kiln gc ID` for
+  a stale one. Ordinary RPC cancellation is not this case: accepted creates
+  are daemon-owned and finish or compensate after the caller disconnects.
 - **Group members are not isolated from each other.** Any member can exec in
   or delete any sandbox. Per-caller ownership belongs to the harness layer or
   a later API version.

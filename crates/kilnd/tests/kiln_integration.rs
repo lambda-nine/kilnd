@@ -578,3 +578,101 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
     );
     assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
 }
+
+#[tokio::test]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn node_reservations_bound_concurrent_real_creates_and_survive_restart() {
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state_dir = tmp.path().join("state");
+    let limits = Limits {
+        max_sandboxes: 8,
+        max_node_memory_bytes: 1 << 30,
+        max_node_pids: 256,
+        max_node_disk_bytes: 2 << 30,
+        ..Limits::default()
+    };
+    let manager = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&state_dir).unwrap(),
+        limits.clone(),
+    ));
+    manager.reconcile().await.unwrap();
+
+    let mut creates = Vec::new();
+    for _ in 0..8 {
+        let manager = manager.clone();
+        creates.push(tokio::spawn(async move {
+            manager
+                .create(CreateRequest {
+                    memory_bytes: 512 << 20,
+                    pids: 128,
+                    disk_bytes: 1 << 30,
+                    ..Default::default()
+                })
+                .await
+        }));
+    }
+    let mut sandboxes = Vec::new();
+    let mut rejected = 0;
+    for create in creates {
+        match create.await.unwrap() {
+            Ok(sandbox) => sandboxes.push(sandbox),
+            Err(kilnd::manager::Error::ResourceExhausted(_)) => rejected += 1,
+            Err(error) => panic!("unexpected create result: {error}"),
+        }
+    }
+    assert_eq!((sandboxes.len(), rejected), (2, 6));
+    let resources = manager.health().await.unwrap().node_resources;
+    assert_eq!(resources.reserved.memory_bytes, 1 << 30);
+    assert_eq!(resources.reserved.pids, 256);
+    assert_eq!(resources.reserved.disk_bytes, 2 << 30);
+    assert_eq!(resources.rejected_creates, 6);
+
+    drop(manager);
+    let manager = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&state_dir).unwrap(),
+        limits,
+    ));
+    manager.reconcile().await.unwrap();
+    assert_eq!(
+        manager.health().await.unwrap().node_resources.reserved.sandboxes,
+        2
+    );
+    assert!(matches!(
+        manager
+            .create(CreateRequest {
+                memory_bytes: 512 << 20,
+                pids: 128,
+                disk_bytes: 1 << 30,
+                ..Default::default()
+            })
+            .await,
+        Err(kilnd::manager::Error::ResourceExhausted(_))
+    ));
+
+    let removed = sandboxes.pop().unwrap();
+    manager.delete(&removed.id).await.unwrap();
+    sandboxes.push(
+        manager
+            .create(CreateRequest {
+                memory_bytes: 512 << 20,
+                pids: 128,
+                disk_bytes: 1 << 30,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+    );
+    for sandbox in sandboxes {
+        manager.delete(&sandbox.id).await.unwrap();
+    }
+    assert_eq!(
+        manager.health().await.unwrap().node_resources.reserved.sandboxes,
+        0
+    );
+}

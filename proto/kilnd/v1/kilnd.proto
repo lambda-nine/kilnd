@@ -59,7 +59,7 @@ message HealthResponse {
     STATUS_UNSPECIFIED = 0;
     // The daemon is serving and the backend answered.
     STATUS_SERVING = 1;
-    // The daemon is serving but the backend didn't answer; see detail.
+    // The daemon has an operator-visible problem; see detail.
     STATUS_DEGRADED = 2;
     // The daemon is shutting down and refuses new work.
     STATUS_SHUTTING_DOWN = 3;
@@ -74,6 +74,25 @@ message HealthResponse {
   uint32 active_sandboxes = 7;
   uint32 running_executions = 8;
   AdmissionStats admission = 9;
+  NodeResourceStats node_resources = 10;
+}
+
+// Durable capacity promised to owned or ambiguous sandbox rows. These are hard
+// reservation sums, not measured live consumption. FAILED without a backend ID
+// remains reserved because a create error may be ambiguous; compensated FAILED
+// with the exact removed backend ID releases. LOST remains reserved because
+// reconciliation may restore it to READY.
+message NodeResourceStats {
+  uint64 max_sandboxes = 1;
+  uint64 reserved_sandboxes = 2;
+  uint64 max_memory_bytes = 3;
+  uint64 reserved_memory_bytes = 4;
+  uint64 max_pids = 5;
+  uint64 reserved_pids = 6;
+  uint64 max_disk_bytes = 7;
+  uint64 reserved_disk_bytes = 8;
+  // Create requests rejected by these budgets since daemon startup.
+  uint64 rejected_creates = 9;
 }
 
 // Current use and cumulative admission rejections since daemon startup.

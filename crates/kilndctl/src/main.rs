@@ -168,6 +168,20 @@ async fn run(cli: Cli) -> Result<u8> {
             println!("started:            {}", time(h.started_at_unix_ms));
             println!("active sandboxes:   {}", h.active_sandboxes);
             println!("running executions: {}", h.running_executions);
+            if let Some(resources) = h.node_resources {
+                println!(
+                    "node reservations:   sandboxes {}/{}, memory {}/{} bytes, pids {}/{}, disk {}/{} bytes",
+                    resources.reserved_sandboxes,
+                    resources.max_sandboxes,
+                    resources.reserved_memory_bytes,
+                    resources.max_memory_bytes,
+                    resources.reserved_pids,
+                    resources.max_pids,
+                    resources.reserved_disk_bytes,
+                    resources.max_disk_bytes
+                );
+                println!("rejected creates:   {}", resources.rejected_creates);
+            }
             if !h.detail.is_empty() {
                 println!("detail:             {}", h.detail);
             }

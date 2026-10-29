@@ -92,6 +92,10 @@ The daemon's admission flags and defaults are:
 | `--max-queued-exec-stdin-bytes` | 16777216 (16 MiB) |
 | `--max-request-bytes`, `--max-response-bytes` | 2097152, 4194304 |
 | `--max-list-page-size`, `--max-list-response-bytes` | 200, 1048576 |
+| `--max-sandboxes` | 32 retained reservations |
+| `--max-node-memory-bytes` | 3221225472 (3 GiB) |
+| `--max-node-pids` | 2048 |
+| `--max-node-disk-bytes` | 17179869184 (16 GiB) |
 | `--health-probe-timeout-secs` | 2 |
 | `--health-success-cache-secs`, `--health-failure-cache-secs` | 5, 1 |
 
@@ -102,7 +106,12 @@ plus one must fit too. Request bytes must cover stdin + argv + 64 KiB, and
 response bytes must cover twice `--max-output-bytes`, maximum argv, and 64 KiB.
 List response bytes cannot exceed response bytes, and pages cannot exceed 1000
 items.
-Timeouts must be nonzero, the default cannot exceed the maximum, and the
+Each node budget must admit at least the default 512 MiB memory, 128 PIDs and
+1 GiB disk sandbox. The 16 GiB disk default intentionally leaves substantial
+headroom on the 40 GB development VM; deployments should set all four durable
+reservation limits for their own host capacity. CPU is intentionally
+schedulable and may be overcommitted rather than reserved. Timeouts must be
+nonzero, the default cannot exceed the maximum, and the
 maximum in milliseconds must fit `u32`. Invalid limits fail before opening
 SQLite or binding the socket.
 
@@ -113,7 +122,9 @@ cap. At 4096 arguments the largest accepted API argv therefore encodes to at
 most 274436 bytes. See the [validation contract](validation.md) for field
 grammars.
 
-Health reports admission maxima, current use and cumulative rejection totals;
+Health reports admission maxima, current use and cumulative rejection totals
+since daemon startup, plus durable sandbox count/memory/PID/disk reservations
+and node-budget-rejected creates since startup;
 backend probes are shared and cached, with a 2-second timeout. Ordinary and
 Health handlers have separate budgets. Full handler/Exec/stdin budgets return
 `RESOURCE_EXHAUSTED`; a full connection budget closes the socket without a
@@ -162,9 +173,20 @@ installing an older daemon is not a database downgrade path.
 - **After a reboot,** sandboxes are gone (kiln's state is in tmpfs and
   cgroups). kilnd marks them `lost` at startup; delete them to clear the
   records.
+- **Node budget cleanup:** `LOST` and a `FAILED` create with no backend ID keep
+  their durable reservation. If deleting an ambiguous `FAILED` row reports
+  unexplained backend IDs, inspect `sudo kiln ls`, remove a live unexplained
+  sandbox with `sudo kiln rm ID` or a stale one with `sudo kiln gc ID`, then
+  retry `sudo kilndctl rm ID`. Do not release capacity by editing SQLite.
+  Lowering configured budgets below surviving reservations degrades Health and
+  rejects new creates, but Get/List/Delete and reconciliation remain available
+  so the node can be brought back within budget.
 - **Logs:** `--log-format json` in the unit; `KILND_LOG=debug` for more.
 - **Stray kiln sandboxes** kilnd didn't create are logged at startup as
   unmanaged and left alone. Remove live ones with `sudo kiln rm ID`; remove
   stale ones explicitly with `sudo kiln gc ID`.
+- **Reservation boundary:** budgets cover promises made through kilnd. Trusted
+  root or direct `kiln` use can bypass them and must be included in deployment
+  headroom and operator accounting.
 - **Bare-metal Linux** works the same way: install kiln and kilnd, then
   enable the unit. Only the Lima VM has been tested.
