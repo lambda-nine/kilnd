@@ -33,7 +33,12 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   IDs, images, allowlists, writable paths, labels and literal argv. Invalid
   requests are rejected before a lifecycle row or backend invocation, and kiln
   independently enforces the backend-facing subset.
-- **SQLite state** in `/var/lib/kilnd/kilnd.db` (directory 0700): sandboxes
+- **SQLite state** in `/var/lib/kilnd/kilnd.db`: every hop of the absolute
+  state path, including nested absolute or relative symlink targets, is
+  resolved and trust-checked descriptor-relatively with a bounded link depth.
+  The final directory is pinned by descriptor and root-owned 0700. Existing
+  database, WAL, SHM and journal entries must be root-owned regular 0600 files
+  with one link; the main database is opened with SQLite `NOFOLLOW`. Sandboxes
   with their effective spec, backend ID, state, timestamps and failure
   reason; executions with argv, state, legacy exit code, typed termination,
   runtime diagnostics, failure reason, timeout,
@@ -155,7 +160,8 @@ hand in the VM after `scripts/install.sh`:
 ```sh
 scripts/integration-test.sh   # real kiln plus dedicated-child admission FD/RSS stress
 scripts/daemon-singleton-regressions.sh # duplicate startup cannot disturb live work
-scripts/smoke.sh              # kilndctl → socket → service → kiln, checked in SQLite
+scripts/state-path-regressions.sh # hostile state ancestors/files fail before reconciliation
+scripts/smoke.sh              # kilndctl → socket → service → kiln, checked through the API
 ```
 
 ## Layout

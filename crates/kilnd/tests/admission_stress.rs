@@ -304,6 +304,7 @@ fn metadata_history_rss_child() {
 #[ignore = "Linux /proc stress; run scripts/integration-test.sh in the VM"]
 fn getsandbox_metadata_worst_case_does_not_load_output_blobs() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--ignored",
@@ -560,6 +561,7 @@ async fn exec_cycle(
 #[ignore = "Linux /proc stress; run scripts/integration-test.sh in the VM"]
 async fn admission_resource_bounds_plateau_and_recover() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = tmp.path().to_path_buf();
     let socket = root.join("run/kilnd.sock");
     let child = Command::new(std::env::current_exe().unwrap())

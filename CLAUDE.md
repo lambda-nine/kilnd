@@ -19,7 +19,8 @@ through its CLI. Read [README.md](README.md),
 - **Privileged checks** for anything touching the runtime adapter, process
   handling, reconciliation, the socket or shutdown, in the VM after
   `scripts/install.sh`: `scripts/integration-test.sh`,
-  `scripts/daemon-singleton-regressions.sh` and `scripts/smoke.sh`.
+  `scripts/daemon-singleton-regressions.sh`,
+  `scripts/state-path-regressions.sh` and `scripts/smoke.sh`.
   The integration script also runs the dedicated-child admission FD/RSS,
   slow-client, queue and concurrent-Health stress regression.
 - **kiln stays in its own repository** (`~/Projects/lambda-nine/kiln`). Never

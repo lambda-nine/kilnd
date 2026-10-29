@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Harden persistent state setup: validate trusted path ancestors, require an
+  exact private state directory, resolve and validate every nested symlink hop
+  descriptor-relatively, acquire its lock relative to the pinned directory,
+  open SQLite with no-follow semantics, reject foreign-owned, permissive,
+  symlinked, non-regular or hard-linked database and sidecar entries, and
+  reject socket-parent aliases of state before permission changes or
+  reconciliation.
+
 - Define and enforce one API/backend validation contract for IDs, image and
   path fields, allowlists, labels and literal argv. Root writable/allowlist
   entries, malformed path components, empty `argv[0]`, NUL and excessive

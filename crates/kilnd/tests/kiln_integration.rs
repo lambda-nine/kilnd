@@ -5,6 +5,7 @@
 //! It uses its own temporary database, never /var/lib/kilnd, and removes
 //! every sandbox it creates.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -70,6 +71,7 @@ async fn lifecycle_against_real_kiln() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let limits = Limits {
         max_output_bytes: 4096,
         ..Limits::default()
@@ -303,6 +305,7 @@ async fn a_sandbox_killed_behind_kilnds_back_is_lost_after_reconcile() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let m = Arc::new(Manager::new(
         kiln(),
         Store::open(&tmp.path().join("state")).unwrap(),
@@ -337,6 +340,7 @@ async fn a_reappeared_backend_recovers_after_manager_restart_once() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_dir = tmp.path().join("state");
     let sandbox = {
         let manager = Arc::new(Manager::new(
@@ -427,6 +431,7 @@ async fn hidden_registry_mount_does_not_mark_a_live_sandbox_lost() {
     }
 
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_dir = tmp.path().join("state");
     let empty = tmp.path().join("empty-registry");
     std::fs::create_dir(&empty).unwrap();
@@ -490,6 +495,7 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let m = Arc::new(Manager::new(
         kiln(),
         Store::open(&tmp.path().join("state")).unwrap(),

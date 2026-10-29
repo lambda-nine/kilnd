@@ -2,7 +2,9 @@
 //! serve, and shut down gracefully.
 
 use std::future::Future;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt, chown};
+use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, chown};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,6 +26,7 @@ use crate::lock::ExclusiveFileLock;
 use crate::manager::Manager;
 use crate::runtime::Runtime;
 use crate::service::Service;
+use crate::store::prepare_socket_directory;
 
 /// How long to wait for in-flight requests after running executions were
 /// canceled, before exiting regardless.
@@ -106,6 +109,7 @@ struct SocketPathGuard {
     identity: FileIdentity,
     active: bool,
     _directory_lock: ExclusiveFileLock,
+    _directory: File,
 }
 
 impl SocketPathGuard {
@@ -147,24 +151,48 @@ impl Drop for SocketPathGuard {
 /// bounded connection probe proves it stale; platforms where refusal can
 /// also mean backlog pressure fail closed. Anything else is an error.
 pub async fn bind(path: &Path, gid: Option<u32>) -> Result<BoundSocket> {
+    bind_away_from(path, gid, None).await
+}
+
+/// Binds the API socket while refusing a directory whose device/inode is the
+/// pinned state directory. The identity check happens before socket-directory
+/// ownership or permission changes.
+pub async fn bind_away_from(
+    path: &Path,
+    gid: Option<u32>,
+    forbidden_directory: Option<(u64, u64)>,
+) -> Result<BoundSocket> {
+    bind_away_from_after_directory_check(path, gid, forbidden_directory, || {}).await
+}
+
+async fn bind_away_from_after_directory_check(
+    path: &Path,
+    gid: Option<u32>,
+    forbidden_directory: Option<(u64, u64)>,
+    after_directory_check: impl FnOnce(),
+) -> Result<BoundSocket> {
     let dir = path.parent().context("socket path has no directory")?;
+    let name = path.file_name().context("socket path has no filename")?;
     let (dir_mode, sock_mode) = if gid.is_some() {
         (0o750, 0o660)
     } else {
         (0o700, 0o600)
     };
-    if !dir.exists() {
-        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
-        }
-    }
-    let meta = std::fs::symlink_metadata(dir)?;
+    let directory = prepare_socket_directory(dir)?;
+    let socket_path = directory.path.join(name);
+    let meta = directory
+        .file
+        .metadata()
+        .with_context(|| format!("inspect pinned socket directory {}", dir.display()))?;
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
-    if !meta.is_dir() {
-        bail!("{} is not a directory", dir.display());
+    if directory.path == Path::new("/") {
+        bail!("socket directory must not be the filesystem root");
+    }
+    if forbidden_directory == Some((meta.dev(), meta.ino())) {
+        bail!(
+            "--socket directory and --state-dir must be different so socket access cannot widen state permissions"
+        );
     }
     if meta.uid() != euid {
         bail!(
@@ -180,32 +208,42 @@ pub async fn bind(path: &Path, gid: Option<u32>) -> Result<BoundSocket> {
             meta.permissions().mode() & 0o777
         );
     }
+    after_directory_check();
+    ensure_directory_path_identity(dir, &meta)?;
 
-    let directory_lock =
-        ExclusiveFileLock::acquire(&dir.join(".kilnd.socket.lock"), "socket directory")?;
-    remove_stale_socket(path).await?;
+    let lock_path = directory.path.join(".kilnd.socket.lock");
+    let directory_lock = ExclusiveFileLock::acquire_at(
+        &directory.file,
+        std::ffi::OsStr::new(".kilnd.socket.lock"),
+        &lock_path,
+        "socket directory",
+    )?;
+    remove_stale_socket(&socket_path).await?;
 
     // A losing invocation must not alter an incumbent directory's access.
     // Permission changes occur only after this process owns the directory
     // lock and has ruled out a live listener.
-    chown(dir, None, gid).with_context(|| format!("chown {}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(dir_mode))?;
+    set_directory_access(&directory.file, gid, dir_mode, &directory.path)?;
+    ensure_directory_path_identity(dir, &meta)?;
+    ensure_directory_path_identity(&directory.path, &meta)?;
 
-    let listener = std::os::unix::net::UnixListener::bind(path)
-        .with_context(|| format!("bind {}", path.display()))?;
-    let socket_meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("inspect bound socket {}", path.display()))?;
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .with_context(|| format!("bind {}", socket_path.display()))?;
+    let socket_meta = std::fs::symlink_metadata(&socket_path)
+        .with_context(|| format!("inspect bound socket {}", socket_path.display()))?;
     if !socket_meta.file_type().is_socket() {
         bail!("{} did not become a socket after bind", path.display());
     }
     let path_guard = SocketPathGuard {
-        path: path.to_path_buf(),
+        path: socket_path.clone(),
         identity: FileIdentity::of(&socket_meta),
         active: true,
         _directory_lock: directory_lock,
+        _directory: directory.file,
     };
-    chown(path, None, gid).with_context(|| format!("chown {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(sock_mode))?;
+    chown(&socket_path, None, gid)
+        .with_context(|| format!("chown {}", socket_path.display()))?;
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(sock_mode))?;
     listener
         .set_nonblocking(true)
         .with_context(|| format!("make {} nonblocking", path.display()))?;
@@ -215,6 +253,33 @@ pub async fn bind(path: &Path, gid: Option<u32>) -> Result<BoundSocket> {
         listener,
         path_guard,
     })
+}
+
+fn ensure_directory_path_identity(path: &Path, expected: &std::fs::Metadata) -> Result<()> {
+    let observed = std::fs::metadata(path)
+        .with_context(|| format!("recheck socket directory {}", path.display()))?;
+    if observed.dev() != expected.dev() || observed.ino() != expected.ino() {
+        bail!("socket directory {} changed while preparing bind", path.display());
+    }
+    Ok(())
+}
+
+fn set_directory_access(file: &File, gid: Option<u32>, mode: u32, path: &Path) -> Result<()> {
+    let unchanged_uid = !0 as libc::uid_t;
+    let target_gid = gid.map_or(!0 as libc::gid_t, |gid| gid as libc::gid_t);
+    // SAFETY: file is a live directory descriptor and -1 leaves an ownership
+    // field unchanged on POSIX systems.
+    if unsafe { libc::fchown(file.as_raw_fd(), unchanged_uid, target_gid) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("fchown {}", path.display()));
+    }
+    // SAFETY: file is a live directory descriptor and mode contains only
+    // permission bits.
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("fchmod {}", path.display()));
+    }
+    Ok(())
 }
 
 async fn remove_stale_socket(path: &Path) -> Result<()> {
@@ -433,6 +498,7 @@ async fn serve_with_final_wait<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::DirBuilderExt;
     use crate::manager::{CreateRequest, ExecRequest, Limits};
     use crate::model::{ExecutionState, SandboxState};
     use crate::runtime::fake::{FakeGate, FakeRuntime};
@@ -454,9 +520,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn socket_directory_aliases_cannot_widen_state_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = temp.path().join("state");
+        let store = Store::open(&state).unwrap();
+        let state_identity = store.state_directory_identity().unwrap().unwrap();
+        std::os::unix::fs::symlink(temp.path(), temp.path().join("alias")).unwrap();
+        let mut aliases = vec![
+            state.join("../state/kilnd.sock"),
+            temp.path().join("alias/state/kilnd.sock"),
+        ];
+        let canonical_state = std::fs::canonicalize(&state).unwrap();
+        if canonical_state != state {
+            aliases.push(canonical_state.join("kilnd.sock"));
+        }
+
+        for socket in aliases {
+            let error = bind_away_from(&socket, Some(1), Some(state_identity))
+                .await
+                .err()
+                .expect("socket alias to the state directory was accepted");
+            assert!(error.to_string().contains("must be different"), "{error:#}");
+            assert_eq!(
+                std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "rejected socket alias changed state-directory permissions"
+            );
+            assert!(!socket.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_directory_swap_cannot_redirect_lock_or_permissions_to_state() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let safe_root = temp.path().join("safe");
+        let state_root = temp.path().join("state-root");
+        std::fs::DirBuilder::new().mode(0o700).create(&safe_root).unwrap();
+        std::fs::DirBuilder::new().mode(0o700).create(&state_root).unwrap();
+        let safe_directory = safe_root.join("run");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&safe_directory)
+            .unwrap();
+        let state = state_root.join("run");
+        let store = Store::open(&state).unwrap();
+        let state_identity = store.state_directory_identity().unwrap().unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&safe_root, &alias).unwrap();
+        let socket = alias.join("run/kilnd.sock");
+
+        let error = bind_away_from_after_directory_check(
+            &socket,
+            Some(1),
+            Some(state_identity),
+            || {
+                std::fs::remove_file(&alias).unwrap();
+                std::os::unix::fs::symlink(&state_root, &alias).unwrap();
+            },
+        )
+        .await
+        .err()
+        .expect("replaced socket-directory alias was accepted");
+
+        assert!(error.to_string().contains("changed while preparing"), "{error:#}");
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for directory in [&state, &safe_directory] {
+            assert!(!directory.join(".kilnd.socket.lock").exists());
+            assert!(!directory.join("kilnd.sock").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn raw_connection_ceiling_closes_excess_and_recovers_fd_permits() {
         use tokio::io::AsyncReadExt;
         let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = temp.path().join("run/kilnd.sock");
         let manager = Arc::new(Manager::new(
             FakeRuntime::default(),
@@ -511,6 +654,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_drains_detached_compensation_beyond_final_rpc_wait() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let alternate = tmp.path().join("run/alternate.sock");
         let state_dir = tmp.path().join("state");
@@ -595,6 +739,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_without_transport_honors_grace_and_drains_exec_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let fake = FakeRuntime::default();
         let manager = Arc::new(Manager::new(
@@ -661,6 +806,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_holds_both_locks_while_terminal_execution_write_retries() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let alternate = tmp.path().join("run/alternate.sock");
         let state_dir = tmp.path().join("state");

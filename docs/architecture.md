@@ -157,16 +157,39 @@ cannot claim a completed drain until that publication succeeds.
 
 Startup establishes two independent ownership domains before reconciliation:
 
-1. `Store::open` validates the state directory and takes a nonblocking
-   advisory lock on its persistent `kilnd.lock` file before opening SQLite.
-2. Socket binding takes a nonblocking advisory lock on the persistent
+1. `Store::open` requires an absolute state path. It resolves every absolute
+   or relative symlink hop from pinned directory descriptors with
+   `fstatat(AT_SYMLINK_NOFOLLOW)` and `readlinkat`, bounds link depth, and
+   accepts only root/effective-uid-owned aliases. Directory traversal uses
+   `openat(O_DIRECTORY|O_NOFOLLOW)`; missing components are created with
+   descriptor-relative `mkdirat(0700)`. Ancestors
+   must be owned by root or the effective uid and cannot be group/other
+   writable unless they are sticky; the final directory must be owned by the
+   effective uid and exactly 0700. The final directory descriptor stays open
+   for the store lifetime.
+2. The persistent `kilnd.lock` is opened relative to that pinned directory
+   with `O_NOFOLLOW`, validated as a private single-link regular file, and
+   locked nonblocking before SQLite is opened.
+3. Existing `kilnd.db` and SQLite WAL/SHM/journal entries are opened
+   descriptor-relatively with `O_NOFOLLOW` and must be effective-uid-owned,
+   single-link regular files with mode 0600. A new database is tightened to
+   0600 before schema work. SQLite opens the main file with
+   `SQLITE_OPEN_NOFOLLOW`, and the pathname identity is checked before and
+   after open.
+4. The socket parent is trust-walked and pinned by descriptor. Its device/inode
+   is compared with the pinned state directory, its persistent lock is opened
+   descriptor-relatively, and group/mode changes use `fchown`/`fchmod` on the
+   pinned descriptor. The supplied and resolved path identities are rechecked
+   before binding. Lexical `..`, intermediate symlink and platform aliases
+   therefore cannot widen state access by naming or racing the socket parent.
+5. Socket binding takes a nonblocking advisory lock on the persistent
    `.kilnd.socket.lock` in the socket directory. An existing socket is probed
    with a bounded connection attempt: a successful connection is a live
    owner. On Linux, `ECONNREFUSED` plus unchanged device/inode identifies a
    stale endpoint. Platforms such as macOS, where refusal can also report a
    full live backlog, preserve the path and fail closed. Every other
    ambiguous result is also preserved and rejected.
-3. The new listener is bound and its pathname identity recorded. Only then
+6. The new listener is bound and its pathname identity recorded. Only then
    may reconciliation invoke kiln or update SQLite.
 
 The lock files are never unlinked. Their open descriptors are close-on-exec,

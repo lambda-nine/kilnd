@@ -160,7 +160,10 @@ async fn run(args: Args) -> Result<()> {
     // ownership domains must be established before reconciliation mutates
     // durable state or invokes kiln.
     let store = Store::open(&args.state_dir)?;
-    let socket = kilnd::server::bind(&args.socket, gid).await?;
+    let state_directory = store
+        .state_directory_identity()?
+        .context("on-disk store has no state-directory identity")?;
+    let socket = kilnd::server::bind_away_from(&args.socket, gid, Some(state_directory)).await?;
     let manager = Arc::new(Manager::new(
         KilnRuntime::new(args.kiln.clone()),
         store,

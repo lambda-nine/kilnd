@@ -44,10 +44,18 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   and preserves persisted total-certainty and truncation evidence.
   Health shares and caches one backend probe, with a bounded timeout and panic
   isolation. See [defaults](architecture.md#limits-and-defaults).
-- **State integrity.** The database directory is root-only 0700. kilnd
-  refuses one owned by another user or writable by group or others, takes its
-  persistent instance lock before opening SQLite, and refuses a schema newer
-  than it understands. Per-sandbox deletion is serialized; the row is reloaded
+- **State integrity.** The database path is absolute. kilnd resolves every
+  nested symlink hop descriptor-relatively, validates alias and ancestor
+  ownership plus non-writability, creates missing components without following
+  symlinks, and requires
+  the final directory to be root-owned 0700. It pins that directory, opens the
+  persistent instance lock relative to it, and validates the database plus
+  SQLite sidecars as root-owned regular 0600 single-link files. SQLite opens
+  the main file with `NOFOLLOW`; unsafe pre-created state is rejected before
+  socket binding or reconciliation. The resolved socket parent must also have
+  a different device/inode from the pinned state directory before its mode or
+  group can change. Newer schemas are refused. Per-sandbox
+  deletion is serialized; the row is reloaded
   after acquiring that lock and lifecycle writes compare their expected state,
   so concurrent or stale delete results cannot rewrite `DELETED` timestamps or
   resurrect `DELETING`. A backend side effect whose caller is interrupted is

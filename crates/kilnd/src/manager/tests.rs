@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1647,6 +1648,11 @@ async fn reconcile_rejects_a_listing_that_hides_a_reachable_managed_sandbox() {
 #[tokio::test]
 async fn a_provably_reappeared_backend_recovers_after_restart_once() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        tmp.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let state_dir = tmp.path().join("state");
     let fake = FakeRuntime::default();
     let sandbox = {

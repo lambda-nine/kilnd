@@ -73,6 +73,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 scripts/integration-test.sh          # dedicated admission stress, then root + real kiln
 scripts/daemon-singleton-regressions.sh # duplicate starts preserve active work
+scripts/state-path-regressions.sh    # ownership, mode, type, link and symlink defenses
 scripts/smoke.sh                     # through the installed service
 ```
 
@@ -142,6 +143,16 @@ installing an older daemon is not a database downgrade path.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart.
+- **State path:** `--state-dir` must be absolute. Its real ancestors must be
+  trusted and non-writable, and every nested symlink alias must be owned by
+  root (a root-owned sticky temporary directory is allowed). The final
+  directory must be root-owned 0700, and existing
+  `kilnd.db`, WAL, SHM or journal entries must be root-owned regular 0600 files
+  with one link. Do not move a database into place with permissive ownership,
+  use a symlink, or hard-link it; kilnd fails before reconciliation. systemd's
+  `StateDirectory=kilnd` and `StateDirectoryMode=0700` provide the supported
+  default path. The socket parent must resolve to a different directory inode;
+  `..`, symlink and platform aliases cannot be used to overlap it with state.
 - **Ownership locks:** `kilnd.lock` and `.kilnd.socket.lock` are persistent
   inode anchors, not stale PID files. Never remove them to fix contention;
   stop the owning daemon and inspect its logs. A crash releases the kernel

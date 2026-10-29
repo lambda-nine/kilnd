@@ -1,9 +1,13 @@
 //! SQLite state: one row per sandbox and per execution. kilnd is the only
 //! writer; the database lives in a root-only directory.
 
-use std::fs::DirBuilder;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::collections::VecDeque;
+use std::ffi::{CString, OsStr, OsString};
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
@@ -11,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 
 use crate::lock::ExclusiveFileLock;
 use crate::model::{
@@ -84,6 +88,9 @@ pub struct Store {
     // Declared after the connection so SQLite closes before state ownership
     // is released.
     _instance_lock: Option<ExclusiveFileLock>,
+    // Keeps the validated directory inode pinned until after SQLite and the
+    // instance lock close.
+    _state_directory: Option<File>,
     #[cfg(test)]
     reject_execution_finishes: Arc<AtomicBool>,
 }
@@ -111,27 +118,88 @@ pub struct SandboxPage {
 }
 
 impl Store {
-    /// Opens or creates the database in `dir`, which is created 0700 if
-    /// missing and refused if anyone but its owner can write to it. A
-    /// process-lifetime lock is acquired before SQLite is opened.
+    /// Opens or creates the database in `dir`. Existing path components are
+    /// validated before missing components are created descriptor-relatively;
+    /// the final directory must be owned by the effective uid and exactly
+    /// 0700. A process-lifetime lock is acquired before SQLite is opened.
     pub fn open(dir: &Path) -> Result<Self> {
-        prepare_directory(dir)?;
-        let instance_lock = ExclusiveFileLock::acquire(&dir.join("kilnd.lock"), "state directory")?;
-        let conn = Connection::open(dir.join("kilnd.db")).context("open database")?;
-        Self::init(conn, Some(instance_lock))
+        let directory = prepare_directory(dir)?;
+        let instance_lock = ExclusiveFileLock::acquire_at(
+            &directory.file,
+            OsStr::new("kilnd.lock"),
+            &directory.path.join("kilnd.lock"),
+            "state directory",
+        )?;
+        let database_path = directory.path.join("kilnd.db");
+        let expected_uid = unsafe { libc::geteuid() };
+        let existing = inspect_database_entry(
+            &directory.file,
+            OsStr::new("kilnd.db"),
+            &database_path,
+            expected_uid,
+        )?;
+        inspect_sqlite_sidecars(&directory, expected_uid)?;
+        let conn = Connection::open_with_flags(
+            &database_path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .context("open database without following symlinks")?;
+        let mut opened = open_entry_no_follow(
+            &directory.file,
+            OsStr::new("kilnd.db"),
+            &database_path,
+        )?
+        .context("SQLite did not create kilnd.db")?;
+        if existing.is_none() {
+            opened
+                .file
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("set {} to 0600", database_path.display()))?;
+            opened.refresh()?;
+        }
+        validate_database_entry(&opened, &database_path, expected_uid)?;
+        if let Some(existing) = existing
+            && existing.identity() != opened.identity()
+        {
+            bail!("{} changed while opening", database_path.display());
+        }
+        Self::init_with_directory(conn, Some(instance_lock), Some(directory.file))
     }
 
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?, None)
     }
 
+    /// Device/inode identity of the pinned on-disk state directory. In-memory
+    /// stores have no directory identity.
+    pub fn state_directory_identity(&self) -> Result<Option<(u64, u64)>> {
+        self._state_directory
+            .as_ref()
+            .map(|directory| {
+                directory
+                    .metadata()
+                    .map(|metadata| (metadata.dev(), metadata.ino()))
+                    .context("inspect pinned state directory")
+            })
+            .transpose()
+    }
+
     fn init(conn: Connection, instance_lock: Option<ExclusiveFileLock>) -> Result<Self> {
+        Self::init_with_directory(conn, instance_lock, None)
+    }
+
+    fn init_with_directory(
+        conn: Connection,
+        instance_lock: Option<ExclusiveFileLock>,
+        state_directory: Option<File>,
+    ) -> Result<Self> {
         // Move both resources into their final drop order before any
         // fallible SQLite setup. This also makes initialization failures
         // close SQLite before releasing state-directory ownership.
         let store = Self {
             conn: Mutex::new(conn),
             _instance_lock: instance_lock,
+            _state_directory: state_directory,
             #[cfg(test)]
             reject_execution_finishes: Arc::new(AtomicBool::new(false)),
         };
@@ -526,32 +594,393 @@ impl Store {
     }
 }
 
-fn prepare_directory(dir: &Path) -> Result<()> {
-    if !dir.exists() {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+pub(crate) struct PreparedDirectory {
+    pub(crate) path: PathBuf,
+    pub(crate) file: File,
+}
+
+struct OpenedEntry {
+    file: File,
+    metadata: std::fs::Metadata,
+}
+
+impl OpenedEntry {
+    fn refresh(&mut self) -> Result<()> {
+        self.metadata = self.file.metadata().context("inspect opened database")?;
+        Ok(())
     }
-    let meta = std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
+
+    fn identity(&self) -> (u64, u64) {
+        (self.metadata.dev(), self.metadata.ino())
+    }
+}
+
+fn prepare_directory(dir: &Path) -> Result<PreparedDirectory> {
+    let prepared = walk_trusted_directory(dir, true, true, "state")?;
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
-    if !meta.is_dir() {
-        bail!("{} is not a directory", dir.display());
+    validate_directory(
+        &prepared.file.metadata()?,
+        &prepared.path,
+        euid,
+        true,
+        "state",
+    )?;
+    Ok(prepared)
+}
+
+pub(crate) fn prepare_socket_directory(dir: &Path) -> Result<PreparedDirectory> {
+    walk_trusted_directory(dir, false, false, "socket")
+}
+
+fn walk_trusted_directory(
+    dir: &Path,
+    reject_parent: bool,
+    create_parents: bool,
+    resource: &str,
+) -> Result<PreparedDirectory> {
+    if !dir.is_absolute() {
+        bail!("{resource} directory must be absolute: {}", dir.display());
     }
-    if meta.uid() != euid {
+    let mut pending = VecDeque::new();
+    for component in dir.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => pending.push_back(PathStep::Normal(name.to_owned())),
+            Component::ParentDir if reject_parent => {
+                bail!("state directory must not contain '..': {}", dir.display());
+            }
+            Component::ParentDir => pending.push_back(PathStep::Parent),
+            Component::Prefix(_) => bail!("unsupported {resource} directory: {}", dir.display()),
+        }
+    }
+
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    let root = open_directory_path(Path::new("/"))?;
+    validate_directory(&root.metadata()?, Path::new("/"), euid, false, resource)?;
+    let mut directories = vec![root];
+    let mut resolved = PathBuf::from("/");
+    let mut followed_symlinks = 0;
+
+    while let Some(step) = pending.pop_front() {
+        match step {
+            PathStep::Root => {
+                directories.truncate(1);
+                resolved = PathBuf::from("/");
+            }
+            PathStep::Parent => {
+                if directories.len() > 1 {
+                    directories.pop();
+                    resolved.pop();
+                }
+            }
+            PathStep::Normal(name) => {
+                let path = resolved.join(&name);
+                let stat = match stat_at_no_follow(directories.last().unwrap(), &name) {
+                    Ok(stat) => Some(stat),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("inspect {resource} path {}", path.display()));
+                    }
+                };
+                if let Some(stat) = stat
+                    && stat.st_mode & libc::S_IFMT == libc::S_IFLNK
+                {
+                    if pending.is_empty() {
+                        bail!("{resource} directory must not be a symlink: {}", path.display());
+                    }
+                    if stat.st_uid != 0 && stat.st_uid != euid {
+                        bail!(
+                            "{resource} path symlink {} must be owned by root or uid {euid}, found uid {}",
+                            path.display(),
+                            stat.st_uid
+                        );
+                    }
+                    followed_symlinks += 1;
+                    if followed_symlinks > 40 {
+                        bail!("too many symlinks while resolving {resource} path {}", dir.display());
+                    }
+                    let target =
+                        read_link_at(directories.last().unwrap(), &name, &path, resource)?;
+                    let target_steps = path_steps(&target)?;
+                    for target_step in target_steps.into_iter().rev() {
+                        pending.push_front(target_step);
+                    }
+                    continue;
+                }
+
+                let next = match stat {
+                    Some(_) => open_directory_at(directories.last().unwrap(), &name)
+                        .with_context(|| {
+                            format!("open {resource} path {} without following symlinks", path.display())
+                        })?,
+                    None => {
+                        if !create_parents && !pending.is_empty() {
+                            bail!("socket directory parent does not exist: {}", path.display());
+                        }
+                        create_directory_at(directories.last().unwrap(), &name, &path)?;
+                        open_directory_at(directories.last().unwrap(), &name)
+                            .with_context(|| format!("open newly created {}", path.display()))?
+                    }
+                };
+                validate_directory(
+                    &next
+                        .metadata()
+                        .with_context(|| format!("inspect {}", path.display()))?,
+                    &path,
+                    euid,
+                    false,
+                    resource,
+                )?;
+                directories.push(next);
+                resolved.push(name);
+            }
+        }
+    }
+
+    let current = directories.pop().unwrap();
+    Ok(PreparedDirectory {
+        path: resolved,
+        file: current,
+    })
+}
+
+enum PathStep {
+    Root,
+    Parent,
+    Normal(OsString),
+}
+
+fn path_steps(path: &Path) -> Result<Vec<PathStep>> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::RootDir => Some(Ok(PathStep::Root)),
+            Component::CurDir => None,
+            Component::ParentDir => Some(Ok(PathStep::Parent)),
+            Component::Normal(name) => Some(Ok(PathStep::Normal(name.to_owned()))),
+            Component::Prefix(_) => Some(Err(anyhow::anyhow!(
+                "unsupported symlink target: {}",
+                path.display()
+            ))),
+        })
+        .collect()
+}
+
+fn stat_at_no_follow(directory: &File, name: &OsStr) -> std::io::Result<libc::stat> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "directory name contains NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory and name are live, stat is writable, and the flag
+    // makes the result describe the link itself rather than its target.
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstatat initialized stat on success.
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn read_link_at(directory: &File, name: &OsStr, path: &Path, resource: &str) -> Result<PathBuf> {
+    let name = CString::new(name.as_bytes()).context("symlink name contains NUL")?;
+    let mut capacity = 256;
+    loop {
+        let mut target = Vec::<u8>::with_capacity(capacity);
+        // SAFETY: directory and name are live and target has capacity bytes of
+        // writable storage. readlinkat does not append a terminator.
+        let length = unsafe {
+            libc::readlinkat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                target.as_mut_ptr().cast(),
+                capacity,
+            )
+        };
+        if length < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("read {resource} path symlink {}", path.display()));
+        }
+        let length = length as usize;
+        if length < capacity {
+            // SAFETY: readlinkat initialized exactly length bytes.
+            unsafe { target.set_len(length) };
+            return Ok(PathBuf::from(OsString::from_vec(target)));
+        }
+        capacity *= 2;
+        if capacity > 65_536 {
+            bail!("{resource} path symlink target is too long: {}", path.display());
+        }
+    }
+}
+
+fn validate_directory(
+    metadata: &std::fs::Metadata,
+    path: &Path,
+    euid: u32,
+    is_state_directory: bool,
+    resource: &str,
+) -> Result<()> {
+    if !metadata.is_dir() {
+        bail!("{} is not a directory", path.display());
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if is_state_directory {
+        if metadata.uid() != euid {
+            bail!(
+                "{resource} directory {} must be owned by uid {euid}, found uid {}",
+                path.display(),
+                metadata.uid()
+            );
+        }
+        if mode != 0o700 {
+            bail!(
+                "{resource} directory {} must have mode 0700, found {mode:04o}",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    if metadata.uid() != 0 && metadata.uid() != euid {
         bail!(
-            "{} must be owned by uid {euid}, found uid {}",
-            dir.display(),
-            meta.uid()
+            "{resource} path ancestor {} must be owned by root or uid {euid}, found uid {}",
+            path.display(),
+            metadata.uid()
         );
     }
-    if meta.permissions().mode() & 0o022 != 0 {
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
         bail!(
-            "{} is writable by group or others; expected 0700",
-            dir.display()
+            "{resource} path ancestor {} is writable by group or others without the sticky bit (mode {mode:04o})",
+            path.display(),
         );
+    }
+    Ok(())
+}
+
+fn open_directory_path(path: &Path) -> Result<File> {
+    let path = CString::new(path.as_os_str().as_bytes()).context("directory path contains NUL")?;
+    // SAFETY: path is NUL-terminated and flags are valid for open.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open filesystem root");
+    }
+    // SAFETY: open returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_directory_at(directory: &File, name: &OsStr) -> std::io::Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "directory name contains NUL"))?;
+    // SAFETY: directory is live, name is NUL-terminated, and flags are valid.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn create_directory_at(directory: &File, name: &OsStr, path: &Path) -> Result<()> {
+    let name = CString::new(name.as_bytes()).context("directory name contains NUL")?;
+    // SAFETY: directory and name are live and mode is valid for mkdirat.
+    if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error).with_context(|| format!("create {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn open_entry_no_follow(directory: &File, name: &OsStr, path: &Path) -> Result<Option<OpenedEntry>> {
+    let name = CString::new(name.as_bytes()).context("database filename contains NUL")?;
+    // O_NONBLOCK makes inspecting a pre-created FIFO fail safely rather than
+    // hanging startup. O_NOFOLLOW rejects a symbolic link before SQLite sees
+    // the path.
+    // SAFETY: directory and name are live and flags are valid for openat.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error)
+            .with_context(|| format!("inspect {} without following symlinks", path.display()));
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?;
+    Ok(Some(OpenedEntry { file, metadata }))
+}
+
+fn validate_database_entry(entry: &OpenedEntry, path: &Path, expected_uid: u32) -> Result<()> {
+    if !entry.metadata.is_file() {
+        bail!("{} must be a regular file", path.display());
+    }
+    if entry.metadata.uid() != expected_uid {
+        bail!(
+            "{} must be owned by uid {expected_uid}, found uid {}",
+            path.display(),
+            entry.metadata.uid()
+        );
+    }
+    let mode = entry.metadata.permissions().mode() & 0o7777;
+    if mode != 0o600 {
+        bail!("{} must have mode 0600, found {mode:04o}", path.display());
+    }
+    if entry.metadata.nlink() != 1 {
+        bail!("{} must have exactly one link", path.display());
+    }
+    Ok(())
+}
+
+fn inspect_database_entry(
+    directory: &File,
+    name: &OsStr,
+    path: &Path,
+    expected_uid: u32,
+) -> Result<Option<OpenedEntry>> {
+    let entry = open_entry_no_follow(directory, name, path)?;
+    if let Some(entry) = entry.as_ref() {
+        validate_database_entry(entry, path, expected_uid)?;
+    }
+    Ok(entry)
+}
+
+fn inspect_sqlite_sidecars(directory: &PreparedDirectory, expected_uid: u32) -> Result<()> {
+    for name in ["kilnd.db-wal", "kilnd.db-shm", "kilnd.db-journal"] {
+        inspect_database_entry(
+            &directory.file,
+            OsStr::new(name),
+            &directory.path.join(name),
+            expected_uid,
+        )?;
     }
     Ok(())
 }
@@ -651,6 +1080,7 @@ mod tests {
     use super::*;
     use crate::model::{Network, new_id};
     use std::collections::BTreeMap;
+    use std::os::unix::fs::DirBuilderExt;
 
     fn schema_v3() -> String {
         SCHEMA
@@ -702,6 +1132,11 @@ mod tests {
             conn.execute("INSERT INTO executions (id,sandbox_id,argv,state,exit_code,timeout_ms,stdin_bytes,started_at_ms) VALUES ('old',?1,'[]','exited',143,1,0,1)",[&s.id]).unwrap();
             conn.execute("INSERT INTO executions (id,sandbox_id,argv,state,timeout_ms,stdin_bytes,started_at_ms) VALUES ('running',?1,'[]','running',1,0,2)",[&s.id]).unwrap();
             drop(conn);
+            std::fs::set_permissions(
+                tmp.path().join("kilnd.db"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
             let store = Store::open(tmp.path()).unwrap();
             assert_eq!(
                 store
@@ -921,6 +1356,11 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         drop(conn);
+        std::fs::set_permissions(
+            temp.path().join("kilnd.db"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         {
             let store = Store::open(temp.path()).unwrap();
             assert_eq!(
@@ -1277,6 +1717,7 @@ mod tests {
     #[test]
     fn opens_a_private_directory_and_reopens() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let dir = tmp.path().join("state");
         let s = sandbox();
         {
@@ -1296,6 +1737,184 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(Store::open(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn refuses_a_non_private_state_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = Store::open(tmp.path()).err().expect("0755 state directory was accepted");
+        assert!(error.to_string().contains("0700"), "{error:#}");
+    }
+
+    #[test]
+    fn refuses_a_relative_or_symlinked_state_directory() {
+        let relative = Store::open(Path::new("relative-state"))
+            .err()
+            .expect("relative state directory was accepted");
+        assert!(relative.to_string().contains("absolute"), "{relative:#}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
+        let alias = tmp.path().join("state");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let symlink = Store::open(&alias)
+            .err()
+            .expect("symlinked state directory was accepted");
+        assert!(symlink.to_string().contains("symlink"), "{symlink:#}");
+    }
+
+    #[test]
+    fn resolves_every_trusted_symlink_hop_and_bounds_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
+        let state = target.join("state");
+        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        std::os::unix::fs::symlink("target", tmp.path().join("inner")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("inner"), tmp.path().join("outer")).unwrap();
+
+        let store = Store::open(&tmp.path().join("outer/state")).unwrap();
+        assert_eq!(
+            store.state_directory_identity().unwrap().unwrap(),
+            {
+                let metadata = std::fs::metadata(&state).unwrap();
+                (metadata.dev(), metadata.ino())
+            }
+        );
+        drop(store);
+
+        std::os::unix::fs::symlink("cycle-b", tmp.path().join("cycle-a")).unwrap();
+        std::os::unix::fs::symlink("cycle-a", tmp.path().join("cycle-b")).unwrap();
+        let cycle = Store::open(&tmp.path().join("cycle-a/state"))
+            .err()
+            .expect("symlink cycle was accepted");
+        assert!(cycle.to_string().contains("too many symlinks"), "{cycle:#}");
+    }
+
+    #[test]
+    fn metadata_checks_reject_foreign_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ancestor_path = tmp.path().to_path_buf();
+        let mut metadata = std::fs::metadata(&ancestor_path).unwrap();
+        if metadata.uid() == 0 {
+            ancestor_path.push("foreign");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&ancestor_path)
+                .unwrap();
+            std::os::unix::fs::chown(&ancestor_path, Some(1), None).unwrap();
+            metadata = std::fs::metadata(&ancestor_path).unwrap();
+        }
+        let ancestor = validate_directory(&metadata, &ancestor_path, 0, false, "state")
+            .expect_err("foreign-owned ancestor was accepted");
+        assert!(ancestor.to_string().contains("ancestor"), "{ancestor:#}");
+
+        let database = tmp.path().join("kilnd.db");
+        std::fs::File::create(&database).unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let file = std::fs::File::open(&database).unwrap();
+        let entry = OpenedEntry {
+            metadata: file.metadata().unwrap(),
+            file,
+        };
+        let foreign_uid = if entry.metadata.uid() == 0 { 1 } else { 0 };
+        let database_error = validate_database_entry(&entry, &database, foreign_uid)
+            .expect_err("foreign-owned database was accepted");
+        assert!(database_error.to_string().contains("owned"), "{database_error:#}");
+    }
+
+    #[test]
+    fn creates_a_private_database_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        drop(store);
+        let database = std::fs::symlink_metadata(tmp.path().join("kilnd.db")).unwrap();
+        assert!(database.is_file());
+        assert_eq!(database.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(database.nlink(), 1);
+    }
+
+    #[test]
+    fn refuses_a_database_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = tmp.path().join("state");
+        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        let target = tmp.path().join("forged.db");
+        std::fs::File::create(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, state.join("kilnd.db")).unwrap();
+
+        let error = Store::open(&state).err().expect("database symlink was followed");
+        assert!(error.to_string().contains("kilnd.db"), "{error:#}");
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn refuses_a_database_sidecar_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = tmp.path().join("state");
+        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        let target = tmp.path().join("forged-wal");
+        std::fs::File::create(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, state.join("kilnd.db-wal")).unwrap();
+
+        let error = Store::open(&state)
+            .err()
+            .expect("database sidecar symlink was followed");
+        assert!(error.to_string().contains("kilnd.db-wal"), "{error:#}");
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn refuses_a_non_regular_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = tmp.path().join("state");
+        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(state.join("kilnd.db"))
+            .unwrap();
+
+        let error = Store::open(&state).err().expect("database directory was accepted");
+        assert!(error.to_string().contains("kilnd.db"), "{error:#}");
+    }
+
+    #[test]
+    fn refuses_a_non_private_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = tmp.path().join("state");
+        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        let database = state.join("kilnd.db");
+        std::fs::File::create(&database).unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = Store::open(&state).err().expect("0644 database was accepted");
+        assert!(error.to_string().contains("0600"), "{error:#}");
+    }
+
+    #[test]
+    fn refuses_a_hard_linked_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = tmp.path().join("state");
+        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        let target = tmp.path().join("forged.db");
+        std::fs::File::create(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&target, state.join("kilnd.db")).unwrap();
+
+        let error = Store::open(&state).err().expect("hard-linked database was accepted");
+        assert!(error.to_string().contains("one link"), "{error:#}");
     }
 
     #[test]
@@ -1344,6 +1963,7 @@ mod tests {
     #[test]
     fn state_directory_has_one_owner_and_keeps_a_stable_lock_inode() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let dir = tmp.path().join("state");
         let first = Store::open(&dir).unwrap();
         let lock = dir.join("kilnd.lock");
@@ -1366,6 +1986,7 @@ mod tests {
     #[test]
     fn simultaneous_state_directory_starts_have_one_owner() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let dir = tmp.path().join("state");
         let start = std::sync::Arc::new(std::sync::Barrier::new(2));
         let release = std::sync::Arc::new(std::sync::Barrier::new(3));

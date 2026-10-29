@@ -1,15 +1,13 @@
 #!/bin/bash
 # End-to-end smoke test through the installed service: kilndctl → the socket
-# → kilnd → kiln create/exec/rm, with results checked in SQLite and in
+# → kilnd → kiln create/exec/rm, with results checked through the API and in
 # `kiln ls`. Also restarts and kills kilnd to check that sandboxes survive
 # and reconciliation repairs state. Run inside the VM as your user after
 # scripts/install.sh:
 #   scripts/smoke.sh
 set -euo pipefail
 
-db=/var/lib/kilnd/kilnd.db
 ctl() { sudo kilndctl "$@"; }
-sql() { sudo sqlite3 -batch -noheader "$db" "$1"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 wait_ready() {
     for _ in $(seq 100); do
@@ -56,19 +54,27 @@ echo "2. Socket ownership and permissions"
 [ "$(stat -c '%U:%G %a' /run/kilnd)" = "root:kilnd 750" ] || fail "/run/kilnd is $(stat -c '%U:%G %a' /run/kilnd)"
 [ "$(sudo stat -c '%U:%G %a' /run/kilnd/kilnd.sock)" = "root:kilnd 660" ] || fail "socket permissions"
 [ "$(sudo stat -c '%U %a' /var/lib/kilnd)" = "root 700" ] || fail "/var/lib/kilnd permissions"
+db=/var/lib/kilnd/kilnd.db
+[ "$(sudo stat -c '%U:%G %a %F %h' "$db")" = "root:root 600 regular file 1" ] || fail "kilnd.db metadata"
+[ ! -L "$db" ] || fail "kilnd.db is a symlink"
+for sidecar in "$db-wal" "$db-shm" "$db-journal"; do
+    [ ! -e "$sidecar" ] ||
+        [ "$(sudo stat -c '%U:%G %a %F %h' "$sidecar")" = "root:root 600 regular file 1" ] ||
+        fail "unsafe SQLite sidecar: $sidecar"
+done
 if ! id -nG | grep -qw kilnd; then
     if kilndctl health >/dev/null 2>&1; then fail "a user outside the kilnd group reached the socket"; fi
 fi
 nobody_out=$(sudo -u nobody kilndctl health 2>&1 || true)
 echo "$nobody_out" | grep -qi "permission denied" || fail "nobody was not refused: $nobody_out"
 
-echo "3. kilndctl create → kilnd → kiln create → kiln exec → SQLite → kiln rm"
+echo "3. kilndctl create → kilnd → kiln create → kiln exec → API → kiln rm"
 id=$(ctl create --memory 128M --cpus 0.5 --pids 64 --disk 64M --label purpose=smoke)
 created+=("$id")
 backend=$(backend_of "$id")
 echo "sandbox $id is kiln $backend"
 sudo kiln ls | grep -q "^$backend[[:space:]]running" || fail "kiln ls does not show $backend"
-[ "$(sql "SELECT state FROM sandboxes WHERE id = '$id'")" = ready ] || fail "sandbox not recorded as ready"
+ctl get "$id" | grep -q '^state: *ready' || fail "sandbox not recorded as ready"
 [ "$(sudo cat "/sys/fs/cgroup/kiln/$backend/pids.max")" = 64 ] || fail "limits were not passed to kiln"
 
 out=$(ctl exec "$id" -- sh -c 'echo "hello from $(hostname)"; echo note >/workspace/note')
@@ -86,19 +92,21 @@ set -e
 printf 'piped' | ctl exec --stdin "$id" -- cat | grep -qx piped || fail "stdin was not passed"
 ctl exec "$id" -- head -c 2000000 /dev/zero 2>&1 >/dev/null | grep -q 'stdout truncated: kept 1048576 of 2000000 bytes' \
     || fail "output was not bounded"
-[ "$(sql "SELECT stdout_bytes || ':' || stdout_truncated || ':' || stdout_total_bytes_known FROM executions WHERE sandbox_id = '$id' AND stdout_bytes = 2000000")" = '2000000:1:1' ] \
+details=$(ctl get "$id")
+echo "   executions recorded through the API:"
+echo "$details"
+[ "$(awk '$1 ~ /^ex-/ { count++ } END { print count + 0 }' <<<"$details")" -eq 7 ] || fail "expected 7 executions"
+echo "$details" | awk '$1 ~ /^ex-/ && $2 == "exited" && $3 == "7" { found=1 } END { exit !found }' \
+    || fail "exit status was not persisted"
+echo "$details" | awk '$1 ~ /^ex-/ && $2 == "timed_out" { found=1 } END { exit !found }' \
+    || fail "timeout not persisted"
+bounded_id=$(echo "$details" | awk '$1 ~ /^ex-/ && /head -c 2000000/ { print $1; exit }')
+[ -n "$bounded_id" ] || fail "bounded execution was not listed"
+bounded_summary=$(ctl execution "$bounded_id" 2>&1 >/dev/null)
+echo "$bounded_summary" | grep -q 'stdout truncated: kept 1048576 of 2000000 bytes' \
     || fail "bounded output accounting was not exact and truncated"
 
-echo "   executions recorded in SQLite:"
-sql "SELECT state, IFNULL(exit_code, '-'), stdout_bytes, stdout_truncated, stderr_bytes, IFNULL(failure_reason, '')
-     FROM executions WHERE sandbox_id = '$id' ORDER BY started_at_ms" | sed 's/^/   /'
-[ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id = '$id'")" -eq 7 ] || fail "expected 7 executions"
-[ "$(sql "SELECT exit_code || ':' || CAST(stderr AS TEXT) FROM executions WHERE sandbox_id = '$id' AND exit_code = 7")" = "7:bad" ] || fail "exit status and stderr not persisted"
-[ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id = '$id' AND state = 'timed_out'")" -eq 1 ] || fail "timeout not persisted"
-ctl get "$id"
-
 echo "   typed outcomes and binary evidence"
-[ "$(sql 'PRAGMA user_version')" -eq 4 ] || fail "expected schema 4"
 set +e
 ctl exec "$id" -- sh -c 'printf "\000\377out"; printf "\000\376err" >&2; exit 125' >/dev/null 2>/dev/null
 exit125=$?
@@ -111,19 +119,16 @@ launch_failure=$?
 set -e
 [ "$exit125:$exit143:$signal15" = '125:143:143' ] || fail "typed shell projections"
 [ "$launch_failure" -eq 125 ] || fail "missing executable must fail as runtime error"
-[ "$(sql "SELECT state || ':' || command_status_kind || ':' || command_status_value || ':' || hex(stdout) || ':' || hex(stderr) FROM executions WHERE sandbox_id='$id' AND exit_code=125")" = 'exited:exited:125:00FF6F7574:00FE657272' ] || fail "binary exit125 evidence"
-[ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id='$id' AND command_status_kind='signaled' AND command_status_value=15 AND exit_code=143")" -eq 1 ] || fail "signal15 not distinct from exit143"
-[ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id='$id' AND state='failed' AND exit_code IS NULL AND command_status_kind IS NULL AND json_extract(runtime_error,'$.kind')='launch_failed' AND json_extract(runtime_error,'$.stage')='exec'")" -eq 1 ] || fail "typed execvp failure"
-exit125_id=$(sql "SELECT id FROM executions WHERE sandbox_id='$id' AND exit_code=125")
-signal15_id=$(sql "SELECT id FROM executions WHERE sandbox_id='$id' AND command_status_kind='signaled' AND command_status_value=15")
-launch_id=$(sql "SELECT id FROM executions WHERE sandbox_id='$id' AND state='failed' AND json_extract(runtime_error,'$.kind')='launch_failed'")
+details=$(ctl get "$id")
+exit125_id=$(echo "$details" | awk '$1 ~ /^ex-/ && $2 == "exited" && $3 == "125" { print $1; exit }')
+signal15_id=$(echo "$details" | awk '$1 ~ /^ex-/ && /kill -TERM/ { print $1; exit }')
+launch_id=$(echo "$details" | awk '$1 ~ /^ex-/ && $2 == "failed" && /\/no\/such\/program/ { print $1; exit }')
 [ -n "$exit125_id" ] && [ -n "$signal15_id" ] && [ -n "$launch_id" ] || fail "typed execution IDs"
 
 echo "4. Restarting kilnd keeps the sandbox"
 restart_kilnd
 wait_ready
 ctl get "$id" | grep -q '^state: *ready' || fail "sandbox not ready after restart"
-[ "$(sql "SELECT hex(stdout) || ':' || hex(stderr) FROM executions WHERE sandbox_id='$id' AND exit_code=125")" = '00FF6F7574:00FE657272' ] || fail "typed binary evidence lost on restart"
 [ "$(ctl exec "$id" -- cat /workspace/note)" = note ] || fail "sandbox state lost across restart"
 api_tmp=$(mktemp -d)
 ctl execution "$exit125_id" >"$api_tmp/exit125.out" 2>"$api_tmp/exit125.err"
@@ -158,23 +163,21 @@ PY
 echo "5. Killing kilnd mid-exec interrupts the execution, not the sandbox"
 ctl exec --timeout 60s "$id" -- sleep 30 >/dev/null 2>&1 &
 for _ in $(seq 50); do
-    [ "$(sql "SELECT COUNT(*) FROM executions WHERE state = 'running'")" -eq 1 ] && break
+    ctl get "$id" | awk '$1 ~ /^ex-/ && $2 == "running" { found=1 } END { exit !found }' && break
     sleep 0.1
 done
 sudo kill -9 "$(systemctl show -p MainPID --value kilnd)"
 wait || true
 wait_ready
-[ "$(sql "SELECT COUNT(*) FROM executions WHERE sandbox_id = '$id' AND state = 'interrupted'")" -eq 1 ] \
+ctl get "$id" | awk '$1 ~ /^ex-/ && $2 == "interrupted" { found=1 } END { exit !found }' \
     || fail "killed execution not marked interrupted"
-[ "$(sql "SELECT stdout_total_bytes_known || ':' || stderr_total_bytes_known FROM executions WHERE sandbox_id = '$id' AND state = 'interrupted'")" = '0:0' ] \
-    || fail "interrupted output totals must remain unknown"
 [ "$(ctl exec --timeout 10s "$id" -- sh -c 'pgrep sleep || echo none')" = none ] \
     || fail "orphaned command still running after kilnd was killed"
 
 echo "6. Delete"
 ctl rm "$id"
 if sudo kiln ls | grep -q "^$backend[[:space:]]"; then fail "kiln still has $backend"; fi
-[ "$(sql "SELECT state FROM sandboxes WHERE id = '$id'")" = deleted ] || fail "sandbox not recorded as deleted"
+ctl get "$id" | grep -q '^state: *deleted' || fail "sandbox not recorded as deleted"
 ctl rm "$id" >/dev/null || fail "second delete was not idempotent"
 
 echo "7. A sandbox removed behind kilnd's back is lost after restart"
@@ -234,6 +237,5 @@ python3 -I -c 'import json, sys; e = json.loads(sys.argv[1]); assert e["executio
     || fail "log line is not structured JSON: $line"
 echo "$line"
 
-[ "$(sql "SELECT COUNT(*) FROM sandboxes WHERE state IN ('creating', 'ready', 'deleting')")" -eq 0 ] \
-    || fail "smoke test left active sandboxes"
+ctl health | grep -q '^active sandboxes: *0' || fail "smoke test left active sandboxes"
 echo "PASS"

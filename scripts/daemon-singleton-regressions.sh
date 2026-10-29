@@ -3,17 +3,23 @@
 # after installing this checkout. It leaves the installed service running.
 set -eu
 
-db=/var/lib/kilnd/kilnd.db
 socket=/run/kilnd/kilnd.sock
 tmp=$(mktemp -d /tmp/kilnd-singleton.XXXXXX)
+state_root=$(sudo mktemp -d /tmp/kilnd-singleton-state.XXXXXX)
+case "$state_root" in
+    /tmp/kilnd-singleton-state.*) ;;
+    *) echo "unexpected state fixture path: $state_root" >&2; exit 1 ;;
+esac
 sandbox=
 exec_pid=
 
 ctl() { sudo kilndctl "$@"; }
-sql() { sudo sqlite3 -batch -noheader "$db" "$1"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
+execution_state() {
+    ctl get "$sandbox" | awk -v id="$1" '$1 == id { print $2; exit }'
+}
 release_execution() {
-    backend=$(sql "SELECT backend_id FROM sandboxes WHERE id = '$sandbox'") || return 1
+    backend=$(ctl get "$sandbox" | awk '$1 == "backend:" { print $3; exit }') || return 1
     [ -n "$backend" ] || return 1
     cgroup="/sys/fs/cgroup/kiln/$backend/exec/cgroup.procs"
     pid=$(sudo sed -n '1p' "$cgroup") || return 1
@@ -27,6 +33,7 @@ cleanup() {
         wait "$exec_pid" >/dev/null 2>&1 || true
     fi
     if [ -n "$sandbox" ]; then ctl rm "$sandbox" >/dev/null 2>&1 || true; fi
+    sudo find "$state_root" -depth -delete >/dev/null 2>&1 || true
     sudo find "$tmp" -depth -delete >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
@@ -40,7 +47,7 @@ ctl exec "$sandbox" -- sh -c \
 exec_pid=$!
 running=
 for _ in $(seq 100); do
-    running=$(sql "SELECT id FROM executions WHERE sandbox_id = '$sandbox' AND state = 'running' LIMIT 1")
+    running=$(ctl get "$sandbox" | awk '$2 == "running" { print $1; exit }')
     [ -n "$running" ] && break
     sleep 0.05
 done
@@ -67,7 +74,7 @@ echo "3. Different state directory with the same socket is rejected before recon
 set +e
 sudo timeout 5s /usr/local/bin/kilnd \
     --kiln /usr/local/bin/kiln \
-    --state-dir "$tmp/other-state" \
+    --state-dir "$state_root/other-state" \
     --socket "$socket" \
     --socket-group kilnd >"$tmp/same-socket.log" 2>&1
 same_socket_rc=$?
@@ -80,14 +87,14 @@ echo "4. The incumbent and its active execution were untouched"
 [ "$(systemctl show -p MainPID --value kilnd)" = "$service_pid" ] || fail "incumbent service restarted"
 [ "$(sudo stat -Lc '%d:%i' "$socket")" = "$socket_identity" ] || fail "incumbent socket was replaced"
 [ "$(sudo stat -Lc '%d:%i' /var/lib/kilnd/kilnd.lock)" = "$state_lock_identity" ] || fail "state lock inode changed"
-[ "$(sql "SELECT state FROM executions WHERE id = '$running'")" = running ] || fail "active execution was changed"
+[ "$(execution_state "$running")" = running ] || fail "active execution was changed"
 ctl health >/dev/null
 
 release_execution || fail "could not release the synchronized execution"
 wait "$exec_pid"
 exec_pid=
 [ "$(cat "$tmp/exec.out")" = singleton-ok ] || fail "incumbent execution did not complete normally"
-[ "$(sql "SELECT state FROM executions WHERE id = '$running'")" = exited ] || fail "execution did not finish EXITED"
+[ "$(execution_state "$running")" = exited ] || fail "execution did not finish EXITED"
 ctl rm "$sandbox" >/dev/null
 sandbox=
 

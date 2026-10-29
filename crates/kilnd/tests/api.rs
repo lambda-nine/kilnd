@@ -75,6 +75,7 @@ async fn client(path: PathBuf) -> KilndServiceClient<Channel> {
 #[tokio::test]
 async fn many_socket_clients_share_one_serialized_delete() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = tmp.path().join("run/kilnd.sock");
     let fake = FakeRuntime::default();
     let manager = Arc::new(Manager::new(
@@ -154,6 +155,7 @@ async fn many_socket_clients_share_one_serialized_delete() {
 #[tokio::test]
 async fn typed_outcomes_and_failed_binary_evidence_survive_api_store_and_reopen() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = tmp.path().join("run/kilnd.sock");
     let state = tmp.path().join("state");
     let fake = FakeRuntime::default();
@@ -295,6 +297,7 @@ async fn typed_outcomes_and_failed_binary_evidence_survive_api_store_and_reopen(
 #[tokio::test]
 async fn every_rpc_over_the_socket() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = tmp.path().join("run/kilnd.sock");
     let fake = FakeRuntime::default();
     let manager = Arc::new(Manager::new(
@@ -502,6 +505,7 @@ async fn every_rpc_over_the_socket() {
 #[tokio::test]
 async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owned_work() {
     let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let path = temp.path().join("run/kilnd.sock");
     let fake = FakeRuntime::default();
     let manager = Arc::new(Manager::new(
@@ -566,6 +570,7 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
 #[tokio::test]
 async fn graceful_shutdown_cancels_running_executions_after_the_grace_period() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = tmp.path().join("run/kilnd.sock");
     let manager = Arc::new(Manager::new(
         FakeRuntime::default(),
@@ -615,6 +620,7 @@ async fn graceful_shutdown_cancels_running_executions_after_the_grace_period() {
 #[tokio::test]
 async fn canceling_a_tonic_exec_request_finalizes_and_releases_the_backend() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = tmp.path().join("run/kilnd.sock");
     let fake = FakeRuntime::default();
     let manager = Arc::new(Manager::new(
@@ -683,6 +689,7 @@ async fn canceling_a_tonic_exec_request_finalizes_and_releases_the_backend() {
 #[tokio::test]
 async fn graceful_shutdown_drains_a_create_after_its_rpc_disconnects() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = tmp.path().join("run/kilnd.sock");
     let fake = FakeRuntime::default();
     let gate = FakeGate::default();
@@ -771,6 +778,7 @@ fn bind_refuses_to_replace_a_regular_file() {
 #[test]
 fn bind_replaces_a_stale_socket_and_tightens_the_directory() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = tmp.path().join("run");
     std::fs::create_dir(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -833,6 +841,7 @@ fn bind_refuses_to_replace_a_live_socket() {
 #[tokio::test]
 async fn bind_preserves_a_live_listener_with_a_full_backlog() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = tmp.path().join("run");
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let path = dir.join("kilnd.sock");
@@ -887,6 +896,7 @@ async fn bind_preserves_a_live_listener_with_a_full_backlog() {
 #[test]
 fn socket_directory_has_one_owner_even_for_different_socket_names() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = tmp.path().join("run");
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let first_path = dir.join("first.sock");
@@ -920,6 +930,7 @@ fn socket_directory_has_one_owner_even_for_different_socket_names() {
 #[test]
 fn simultaneous_socket_directory_starts_have_one_owner() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = tmp.path().join("run");
     let paths = [dir.join("first.sock"), dir.join("second.sock")];
     let start = Arc::new(std::sync::Barrier::new(2));
@@ -964,6 +975,7 @@ fn simultaneous_socket_directory_starts_have_one_owner() {
 #[test]
 fn socket_cleanup_leaves_a_replacement_inode_untouched() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = tmp.path().join("run");
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let path = dir.join("kilnd.sock");
