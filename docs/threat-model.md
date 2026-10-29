@@ -69,7 +69,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   if the RPC disappears. kiln places each command in an execution cgroup;
   after killing the CLI, kilnd waits for that cgroup to report empty before
   releasing ownership. `kiln exec` clients also die with kilnd
-  (`PR_SET_PDEATHSIG`); interrupted executions are recovered at startup.
+  (`PR_SET_PDEATHSIG` with a post-arm parent-PID check); they restore standard
+  signal defaults before exec, and interrupted executions are recovered at
+  startup.
 
 ## What it relies on kiln for
 

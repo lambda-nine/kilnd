@@ -6,6 +6,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Close backend subprocess inheritance gaps: every launcher now captures the
+  parent PID before spawn, arms `PR_SET_PDEATHSIG`, and rechecks the parent
+  before exec so death during the post-fork window cannot release an
+  unsupervised client. Backend children also restore default HUP, INT, QUIT,
+  TERM and PIPE dispositions instead of preserving an ignored signal across
+  exec.
+
 - Harden persistent state setup: validate trusted path ancestors, require an
   exact private state directory, resolve and validate every nested symlink hop
   descriptor-relatively, acquire its lock relative to the pinned directory,

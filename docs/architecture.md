@@ -228,7 +228,8 @@ At startup, after both ownership locks are held and the socket is reserved:
    or completed.
 5. Executions still `RUNNING` for this backend become `INTERRUPTED`. Other
    backends' rows are untouched. Their `kiln exec` clients died with kilnd
-   (`PR_SET_PDEATHSIG`), so kiln already stopped the commands.
+   (`PR_SET_PDEATHSIG` plus a post-arm parent-PID check), so kiln already
+   stopped the commands even if the daemon died during child setup.
 6. Live or stale kiln sandboxes kilnd doesn't know are logged as unmanaged and
    left alone across repeated startup reconciliation and daemon shutdown.
 
@@ -237,11 +238,14 @@ Running it again changes nothing.
 ## Concurrency
 
 kilnd runs on tokio's current-thread runtime. There is little CPU work; most
-time is spent waiting on child processes. It also makes `PR_SET_PDEATHSIG`
-reliable, because the thread that forks lives as long as the daemon. SQLite
-access goes through one mutex-guarded connection, and each statement is
-short. The active-sandbox cap is checked and the row inserted with no await in
-between, so concurrent creates can't overshoot it.
+time is spent waiting on child processes. Every backend launcher captures the
+daemon PID before spawn, restores default HUP/INT/QUIT/TERM/PIPE dispositions,
+arms `PR_SET_PDEATHSIG`, then rechecks the parent PID before exec. The recheck
+closes the non-retroactive parent-death window; the current-thread runtime also
+keeps the forking thread alive for the daemon's lifetime. SQLite access goes
+through one mutex-guarded connection, and each statement is short. The active-
+sandbox cap is checked and the row inserted with no await in between, so
+concurrent creates can't overshoot it.
 
 Each sandbox has a stable slot holding an async exec lock, an outstanding
 request semaphore (one running plus the configured queue capacity), and the

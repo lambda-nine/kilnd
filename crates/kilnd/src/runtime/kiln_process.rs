@@ -21,7 +21,7 @@ use tokio_util::task::AbortOnDropHandle;
 use super::ExecSpec;
 use super::kiln_protocol::MAX_FRAME;
 use crate::model::Captured;
-use crate::process::SAFE_PATH;
+use crate::process::{SAFE_PATH, prepare_child};
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -83,15 +83,10 @@ pub async fn probe(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(target_os = "linux")]
-    // SAFETY: prctl is async-signal-safe and uses constant arguments.
+    let expected_parent = unsafe { libc::getpid() };
+    // SAFETY: prepare_child is restricted to async-signal-safe operations.
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        cmd.pre_exec(move || prepare_child(expected_parent));
     }
     if cancel.is_cancelled() || Instant::now() >= deadline {
         return Ok(ProbeResult {
@@ -261,6 +256,7 @@ impl OwnedExec {
             stdout_child.as_raw_fd(),
             stderr_child.as_raw_fd(),
         ];
+        let expected_parent = unsafe { libc::getpid() };
         let mut cmd = Command::new(bin);
         cmd.arg("exec")
             .arg("--protocol=1")
@@ -277,7 +273,7 @@ impl OwnedExec {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        // SAFETY: only async-signal-safe descriptor/prctl operations run after fork.
+        // SAFETY: only async-signal-safe descriptor/child setup operations run after fork.
         unsafe {
             cmd.pre_exec(move || {
                 for fd in fds {
@@ -285,11 +281,7 @@ impl OwnedExec {
                         return Err(io::Error::last_os_error());
                     }
                 }
-                #[cfg(target_os = "linux")]
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
+                prepare_child(expected_parent)
             });
         }
         let mut child = cmd.spawn()?;

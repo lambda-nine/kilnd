@@ -20,6 +20,44 @@ use crate::model::Captured;
 /// caller's variables never reach the backend.
 pub const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Shared post-fork setup for every backend process.
+///
+/// # Safety
+/// Runs between `fork` and `exec`; keep this limited to async-signal-safe
+/// operations and allocation-free error construction.
+pub(crate) unsafe fn prepare_child(expected_parent: libc::pid_t) -> io::Result<()> {
+    // Rust ignores SIGPIPE, and an embedding shell or service may ignore the
+    // standard lifecycle signals. Ignored dispositions survive exec, so give
+    // backend programs predictable Unix defaults.
+    for signal in [
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTERM,
+        libc::SIGPIPE,
+    ] {
+        // SAFETY: SIG_DFL installs no handler and every listed signal is valid.
+        if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl is async-signal-safe and uses constant arguments.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // PR_SET_PDEATHSIG is not retroactive. If the captured parent died
+        // between fork and prctl, refuse to exec an unsupervised backend.
+        if unsafe { libc::getppid() } != expected_parent {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = expected_parent;
+    Ok(())
+}
+
 /// How long to keep reading output after the program exits. Something it
 /// left running in the background may hold the pipes open indefinitely.
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -156,19 +194,10 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(target_os = "linux")]
-    // SAFETY: prctl is async-signal-safe, and the closure touches nothing
-    // else between fork and exec.
+    let expected_parent = unsafe { libc::getpid() };
+    // SAFETY: prepare_child is restricted to async-signal-safe operations.
     unsafe {
-        // If kilnd dies, its backend clients die too instead of running on
-        // unsupervised. kilnd runs on a current-thread runtime, so the thread
-        // that forks lives as long as the daemon.
-        cmd.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        cmd.pre_exec(move || prepare_child(expected_parent));
     }
     let mut child = cmd.spawn()?;
 
@@ -302,6 +331,157 @@ mod tests {
     use std::time::Instant;
     use tokio::io::{AsyncRead, ReadBuf};
 
+    #[cfg(target_os = "linux")]
+    struct IsolatedProcessGroup {
+        child: Option<std::process::Child>,
+        pgid: libc::pid_t,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl IsolatedProcessGroup {
+        fn spawn(test_name: &str, child_env: &str, fault_env: Option<&str>) -> io::Result<Self> {
+            use std::os::unix::process::CommandExt;
+
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args(["--exact", test_name, "--nocapture"])
+                .env(child_env, "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(fault_env) = fault_env {
+                command.env(fault_env, "1");
+            }
+            // SAFETY: setpgid is async-signal-safe and uses constant arguments.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let child = command.spawn()?;
+            let pgid = child.id() as libc::pid_t;
+            Ok(Self {
+                child: Some(child),
+                pgid,
+            })
+        }
+
+        fn wait_with_output(mut self, timeout: Duration) -> io::Result<std::process::Output> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if self.child.as_mut().unwrap().try_wait()?.is_some() {
+                    // Kill any descendant that survived a failing assertion before
+                    // reading captured pipes, then prove that the group disappeared.
+                    unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+                    let output = self.child.take().unwrap().wait_with_output()?;
+                    let group_deadline = Instant::now() + Duration::from_secs(1);
+                    loop {
+                        if unsafe { libc::kill(-self.pgid, 0) } == -1 {
+                            let error = io::Error::last_os_error();
+                            if error.raw_os_error() == Some(libc::ESRCH) {
+                                return Ok(output);
+                            }
+                            return Err(error);
+                        }
+                        if Instant::now() >= group_deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "isolated test process group survived cleanup",
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "isolated test subprocess exceeded its deadline",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for IsolatedProcessGroup {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_until(fd: libc::c_int, events: libc::c_short, deadline: Instant) -> io::Result<i16> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "pipe deadline expired",
+                ));
+            }
+            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let mut pollfd = libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if result > 0 {
+                return Ok(pollfd.revents);
+            }
+            if result == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "pipe deadline expired",
+                ));
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return Err(error);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reap_until(pid: libc::pid_t, deadline: Instant) -> io::Result<()> {
+        loop {
+            let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if result == pid {
+                return Ok(());
+            }
+            if result == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "child did not exit before its deadline",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn close_fds(fds: &[libc::c_int]) {
+        for fd in fds {
+            if *fd >= 0 {
+                unsafe { libc::close(*fd) };
+            }
+        }
+    }
+
     struct DropReader {
         inner: tokio::io::DuplexStream,
         dropped: Arc<AtomicBool>,
@@ -419,6 +599,222 @@ mod tests {
             String::from_utf8_lossy(&o.stdout.data).trim(),
             format!("unset:{SAFE_PATH}")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_death_during_pre_exec_never_releases_an_unsupervised_child() {
+        const CHILD: &str = "KILND_PDEATH_RACE_CHILD";
+        const FAIL: &str = "KILND_PDEATH_RACE_FAIL_BEFORE_READY";
+        const TEST_NAME: &str =
+            "process::tests::parent_death_during_pre_exec_never_releases_an_unsupervised_child";
+        if std::env::var_os(CHILD).is_none() {
+            let output = IsolatedProcessGroup::spawn(TEST_NAME, CHILD, None)
+                .unwrap()
+                .wait_with_output(Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            // An early grandchild failure must close readiness, fail promptly,
+            // and leave no paused supervisor or other process-group member.
+            let output = IsolatedProcessGroup::spawn(TEST_NAME, CHILD, Some(FAIL))
+                .unwrap()
+                .wait_with_output(Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "fault injection unexpectedly passed"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("grandchild exited before readiness"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let inject_failure = std::env::var_os(FAIL).is_some();
+
+        // Keep the deliberately orphaned grandchild waitable by this isolated
+        // test process so neither the passing nor failing path leaks a process.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        let mut ready = [-1; 2];
+        let mut release = [-1; 2];
+        let mut report = [-1; 2];
+        for pipe in [&mut ready, &mut release, &mut report] {
+            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        }
+
+        let supervisor = unsafe { libc::fork() };
+        assert!(supervisor >= 0);
+        if supervisor == 0 {
+            let child = unsafe { libc::fork() };
+            if child < 0 {
+                close_fds(&[
+                    ready[0], ready[1], release[0], release[1], report[0], report[1],
+                ]);
+                unsafe { libc::_exit(2) };
+            }
+            if child == 0 {
+                close_fds(&[ready[0], release[1], report[0]]);
+                if inject_failure {
+                    close_fds(&[ready[1], release[0], report[1]]);
+                    unsafe { libc::_exit(7) };
+                }
+                let expected_parent = unsafe { libc::getppid() };
+                let pid = unsafe { libc::getpid() };
+                if unsafe {
+                    libc::write(
+                        ready[1],
+                        (&pid as *const libc::pid_t).cast(),
+                        std::mem::size_of::<libc::pid_t>(),
+                    )
+                } != std::mem::size_of::<libc::pid_t>() as isize
+                {
+                    unsafe { libc::_exit(3) };
+                }
+                close_fds(&[ready[1]]);
+                let mut byte = 0u8;
+                if unsafe { libc::read(release[0], (&mut byte as *mut u8).cast(), 1) } != 1 {
+                    unsafe { libc::_exit(4) };
+                }
+                close_fds(&[release[0]]);
+                if unsafe { prepare_child(expected_parent) }.is_err() {
+                    close_fds(&[report[1]]);
+                    unsafe { libc::_exit(0) };
+                }
+                let reported = unsafe {
+                    libc::write(
+                        report[1],
+                        (&pid as *const libc::pid_t).cast(),
+                        std::mem::size_of::<libc::pid_t>(),
+                    )
+                } == std::mem::size_of::<libc::pid_t>() as isize;
+                close_fds(&[report[1]]);
+                if reported {
+                    unsafe { libc::pause() };
+                }
+                unsafe { libc::_exit(5) };
+            }
+            close_fds(&[
+                ready[0], ready[1], release[0], release[1], report[0], report[1],
+            ]);
+            unsafe { libc::pause() };
+            unsafe { libc::_exit(6) };
+        }
+
+        close_fds(&[ready[1], release[0], report[1]]);
+
+        let mut child = 0;
+        let ready_events = poll_until(
+            ready[0],
+            libc::POLLIN | libc::POLLHUP,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(
+            ready_events & libc::POLLIN != 0,
+            "grandchild exited before readiness"
+        );
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    ready[0],
+                    (&mut child as *mut libc::pid_t).cast(),
+                    std::mem::size_of::<libc::pid_t>(),
+                )
+            },
+            std::mem::size_of::<libc::pid_t>() as isize
+        );
+        close_fds(&[ready[0]]);
+        assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+        assert_eq!(
+            unsafe { libc::waitpid(supervisor, std::ptr::null_mut(), 0) },
+            supervisor
+        );
+        assert_eq!(
+            unsafe { libc::write(release[1], b"x".as_ptr().cast(), 1) },
+            1
+        );
+        close_fds(&[release[1]]);
+
+        let report_events = poll_until(
+            report[0],
+            libc::POLLIN | libc::POLLHUP,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        let survived = report_events & libc::POLLIN != 0;
+        close_fds(&[report[0]]);
+        if survived {
+            unsafe { libc::kill(child, libc::SIGKILL) };
+        }
+        if let Err(error) = reap_until(child, Instant::now() + Duration::from_secs(1)) {
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            let _ = reap_until(child, Instant::now() + Duration::from_secs(1));
+            panic!("failed to reap grandchild: {error}");
+        }
+        assert!(
+            !survived,
+            "child continued after its parent died before PR_SET_PDEATHSIG"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_setup_restores_default_signal_dispositions() {
+        const CHILD: &str = "KILND_SIGNAL_DISPOSITION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::child_setup_restores_default_signal_dispositions",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        for signal in [
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGPIPE,
+        ] {
+            assert_ne!(
+                unsafe { libc::signal(signal, libc::SIG_IGN) },
+                libc::SIG_ERR
+            );
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                let parent = unsafe { libc::getppid() };
+                if unsafe { prepare_child(parent) }.is_err() {
+                    unsafe { libc::_exit(2) };
+                }
+                unsafe { libc::raise(signal) };
+                unsafe { libc::_exit(3) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(libc::WIFSIGNALED(status));
+            assert_eq!(libc::WTERMSIG(status), signal);
+        }
     }
 
     #[tokio::test]

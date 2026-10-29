@@ -81,6 +81,10 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   cancellation, but kilnd waits for backend cleanup, drains output capture,
   records a terminal outcome, and only then releases the sandbox. A queued
   request canceled before it starts is discarded without an execution row.
+- **Supervised backend clients:** every subprocess restores standard signal
+  defaults before exec. On Linux it also arms `PR_SET_PDEATHSIG` and rechecks
+  the parent PID, so a daemon death at any point in the fork/pre-exec window
+  cannot leave an unsupervised backend client running.
 - **Serialized deletion:** concurrent `DeleteSandbox` callers share the
   sandbox's coordination slot and one backend removal. State is reloaded under
   that lock, `deleted` is immutable idempotent success, and conditional writes
