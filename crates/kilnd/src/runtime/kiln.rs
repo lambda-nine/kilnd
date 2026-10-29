@@ -518,13 +518,39 @@ impl Runtime for KilnRuntime {
             .await
     }
 
-    async fn gc(&self) -> Result<Vec<String>, RuntimeError> {
-        let out = self.call("gc", &["gc".into()], QUERY_TIMEOUT).await?;
-        Ok(String::from_utf8_lossy(&out.stderr.data)
-            .lines()
-            .filter_map(|l| l.strip_prefix("kiln: removed stale sandbox "))
-            .map(|id| id.trim().to_string())
-            .collect())
+    async fn gc(&self, ids: &[String]) -> Result<Vec<String>, RuntimeError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        for id in ids {
+            check_id(id)?;
+        }
+        let mut args = Vec::with_capacity(ids.len() + 1);
+        args.push("gc".to_string());
+        args.extend(ids.iter().cloned());
+        let out = self.call("gc", &args, QUERY_TIMEOUT).await?;
+        let requested: std::collections::HashSet<_> = ids.iter().map(String::as_str).collect();
+        let mut removed = Vec::new();
+        for line in String::from_utf8_lossy(&out.stderr.data).lines() {
+            let id = line
+                .strip_prefix("kiln: removed stale sandbox ")
+                .map(str::trim)
+                .ok_or_else(|| {
+                    RuntimeError::Backend(format!("kiln gc printed unexpected output {line:?}"))
+                })?;
+            if !requested.contains(id) {
+                return Err(RuntimeError::Backend(format!(
+                    "kiln gc removed sandbox {id} outside its requested scope"
+                )));
+            }
+            if removed.iter().any(|prior| prior == id) {
+                return Err(RuntimeError::Backend(format!(
+                    "kiln gc reported sandbox {id} more than once"
+                )));
+            }
+            removed.push(id.to_string());
+        }
+        Ok(removed)
     }
 }
 
@@ -914,6 +940,30 @@ mod tests {
                 .contains("kiln ls observation was truncated")
         );
         assert!(error.to_string().contains("stdout true"));
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_passes_and_enforces_an_explicit_id_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("gc-calls");
+        let runtime = fixture_runtime(tmp.path(), "sys.exit(0)");
+        let source = fs::read_to_string(&runtime.bin).unwrap().replace(
+            "if sys.argv[1]=='capabilities':",
+            &format!(
+                "if sys.argv[1]=='gc':\n    open({trace:?},'a').write(' '.join(sys.argv[1:])+'\\n')\n    os.write(2,b'kiln: removed stale sandbox abcd\\n')\n    sys.exit(0)\nif sys.argv[1]=='capabilities':"
+            ),
+        );
+        fs::write(&runtime.bin, source).unwrap();
+
+        assert!(runtime.gc(&[]).await.unwrap().is_empty());
+        assert_eq!(
+            runtime.gc(&["abcd".into(), "beef".into()]).await.unwrap(),
+            ["abcd"]
+        );
+        assert_eq!(fs::read_to_string(trace).unwrap(), "gc abcd beef\n");
+
+        let error = runtime.gc(&["beef".into()]).await.unwrap_err();
+        assert!(error.to_string().contains("outside its requested scope"));
     }
 
     fn delayed_listing_runtime(tmp: &Path, hold_stderr: bool) -> KilnRuntime {

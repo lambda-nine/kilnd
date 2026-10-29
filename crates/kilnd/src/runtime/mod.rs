@@ -116,7 +116,8 @@ pub trait Runtime: Send + Sync + 'static {
     /// create.
     fn list(&self) -> impl Future<Output = Result<Vec<BackendSandbox>, RuntimeError>> + Send;
 
-    /// Removes what dead sandboxes left behind. Must never touch a live one.
-    /// Returns the IDs it removed.
-    fn gc(&self) -> impl Future<Output = Result<Vec<String>, RuntimeError>> + Send;
+    /// Removes stale state only for the named backend sandboxes. An empty
+    /// scope is a no-op. Must never touch a live or unlisted sandbox. Returns
+    /// the IDs it removed.
+    fn gc(&self, ids: &[String]) -> impl Future<Output = Result<Vec<String>, RuntimeError>> + Send;
 }

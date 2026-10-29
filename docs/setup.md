@@ -146,6 +146,7 @@ installing an older daemon is not a database downgrade path.
   records.
 - **Logs:** `--log-format json` in the unit; `KILND_LOG=debug` for more.
 - **Stray kiln sandboxes** kilnd didn't create are logged at startup as
-  unmanaged and left alone. Remove them with `sudo kiln rm ID`.
+  unmanaged and left alone. Remove live ones with `sudo kiln rm ID`; remove
+  stale ones explicitly with `sudo kiln gc ID`.
 - **Bare-metal Linux** works the same way: install kiln and kilnd, then
   enable the unit. Only the Lima VM has been tested.

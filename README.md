@@ -35,11 +35,12 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   runtime diagnostics, failure reason, timeout,
   timestamps, and stdout/stderr (first 1 MiB of each kept, observed byte
   counts, total-certainty bits and truncation facts).
-- **Startup reconciliation** with `kiln gc` and `kiln ls`: ready sandboxes
-  the backend lost become `lost`, interrupted creates become `failed`,
-  half-finished deletes are retried, executions cut off by a crash become
-  `interrupted`. It never removes a sandbox it didn't create, never marks
-  anything lost from failed, truncated, partial, duplicate, or otherwise
+- **Startup reconciliation** with scoped `kiln gc ID...` and `kiln ls`:
+  ready sandboxes the backend lost become `lost`, interrupted creates become `failed`,
+  half-finished deletes are retried, and executions cut off by a crash become
+  `interrupted` only for the active backend. It passes only recorded stale
+  backend IDs to garbage collection. It never removes a sandbox it didn't
+  create, never marks anything lost from failed, truncated, partial, duplicate, or otherwise
   incomplete list evidence, and running it twice changes nothing. A managed
   backend omitted from the list is probed directly and must also lack its
   cgroup before absence is trusted. If the exact recorded backend later

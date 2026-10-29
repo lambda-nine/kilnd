@@ -84,8 +84,8 @@ impl Runtime for StressRuntime {
         self.inner.list().await
     }
 
-    async fn gc(&self) -> Result<Vec<String>, RuntimeError> {
-        self.inner.gc().await
+    async fn gc(&self, ids: &[String]) -> Result<Vec<String>, RuntimeError> {
+        self.inner.gc(ids).await
     }
 }
 

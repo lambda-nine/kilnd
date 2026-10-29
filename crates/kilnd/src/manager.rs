@@ -2,7 +2,7 @@
 //! records every transition in the store. The gRPC layer is a thin
 //! translation on top of this.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -320,9 +320,45 @@ impl<R: Runtime> Manager<R> {
             .version(Instant::now() + self.limits.health_probe_timeout, &cancel)
             .await
             .map_err(backend)?;
-        let mut out = Reconciled {
-            gc_removed: self.runtime.gc().await.map_err(backend)?,
-            ..Default::default()
+        let sandboxes = self.store.sandboxes(true)?;
+        let known: HashSet<String> = sandboxes
+            .iter()
+            .filter(|sandbox| sandbox.backend == self.runtime.name())
+            .filter_map(|sandbox| sandbox.backend_id.clone())
+            .collect();
+        let before_gc: HashMap<String, BackendStatus> = self
+            .runtime
+            .list()
+            .await
+            .map_err(backend)?
+            .into_iter()
+            .map(|s| (s.id, s.status))
+            .collect();
+        // Prove the initial listing complete before even scoped backend
+        // cleanup. A hidden reachable managed sandbox makes all evidence
+        // suspect, while an explicit stale record is itself cleanup evidence.
+        self.validate_reconciliation_evidence(&sandboxes, &before_gc, &cancel)
+            .await?;
+        let mut stale_owned: Vec<String> = before_gc
+            .iter()
+            .filter(|(id, status)| **status == BackendStatus::Stale && known.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        stale_owned.sort();
+        let gc_removed = if stale_owned.is_empty() {
+            Vec::new()
+        } else {
+            let removed = self.runtime.gc(&stale_owned).await.map_err(backend)?;
+            let requested: HashSet<_> = stale_owned.iter().cloned().collect();
+            let mut reported = HashSet::new();
+            for id in &removed {
+                if !requested.contains(id) || !reported.insert(id.clone()) {
+                    return Err(Error::Backend(format!(
+                        "backend garbage collection reported sandbox {id} outside its unique requested scope"
+                    )));
+                }
+            }
+            removed
         };
         let live: HashMap<String, BackendStatus> = self
             .runtime
@@ -332,89 +368,23 @@ impl<R: Runtime> Manager<R> {
             .into_iter()
             .map(|s| (s.id, s.status))
             .collect();
-        let mut known = std::collections::HashSet::new();
-        let sandboxes = self.store.sandboxes(true)?;
-        // Check all candidates before any durable reconciliation mutation.
-        // A complete list is necessary but not sufficient absence evidence:
-        // independently probe any managed backend whose list record is
-        // missing (or no longer running). A reachable backend proves the list
-        // was incomplete, so startup must fail without changing the store.
-        for s in &sandboxes {
-            if s.backend != self.runtime.name() {
-                continue;
-            }
-            let Some(id) = &s.backend_id else {
-                continue;
-            };
-            match s.state {
-                SandboxState::Creating | SandboxState::Ready => {
-                    if live.get(id) == Some(&BackendStatus::Running) {
-                        self.runtime
-                            .validate_sandbox(
-                                id,
-                                Instant::now() + self.limits.health_probe_timeout,
-                                &cancel,
-                            )
-                            .await
-                            .map_err(backend)?;
-                    } else {
-                        match self
-                            .runtime
-                            .validate_sandbox(
-                                id,
-                                Instant::now() + self.limits.health_probe_timeout,
-                                &cancel,
-                            )
-                            .await
-                        {
-                            Ok(()) => {
-                                return Err(Error::Backend(format!(
-                                    "backend listing did not report reachable managed sandbox {id} for {} as running",
-                                    s.id
-                                )));
-                            }
-                            Err(RuntimeError::NotFound(_)) => {}
-                            Err(error) => return Err(backend(error)),
-                        }
-                    }
-                }
-                SandboxState::Deleting if !live.contains_key(id) => match self
-                    .runtime
-                    .validate_sandbox(
-                        id,
-                        Instant::now() + self.limits.health_probe_timeout,
-                        &cancel,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        return Err(Error::Backend(format!(
-                            "backend listing did not report reachable managed sandbox {id} for {} as present",
-                            s.id
-                        )));
-                    }
-                    Err(RuntimeError::NotFound(_)) => {}
-                    Err(error) => return Err(backend(error)),
-                },
-                SandboxState::Lost if live.get(id) == Some(&BackendStatus::Running) => {
-                    self.runtime
-                        .validate_sandbox(
-                            id,
-                            Instant::now() + self.limits.health_probe_timeout,
-                            &cancel,
-                        )
-                        .await
-                        .map_err(backend)?;
-                }
-                _ => {}
-            }
+        self.validate_reconciliation_evidence(&sandboxes, &live, &cancel)
+            .await?;
+        if let Some(id) = stale_owned
+            .iter()
+            .find(|id| live.get(*id) == Some(&BackendStatus::Stale))
+        {
+            return Err(Error::Backend(format!(
+                "backend garbage collection left managed sandbox {id} stale"
+            )));
         }
+        let mut out = Reconciled {
+            gc_removed,
+            ..Default::default()
+        };
         for s in sandboxes {
             if s.backend != self.runtime.name() {
                 continue;
-            }
-            if let Some(b) = &s.backend_id {
-                known.insert(b.clone());
             }
             let alive =
                 s.backend_id.as_ref().and_then(|b| live.get(b)) == Some(&BackendStatus::Running);
@@ -490,15 +460,74 @@ impl<R: Runtime> Manager<R> {
                 (SandboxState::Deleted | SandboxState::Failed | SandboxState::Lost, _) => {}
             }
         }
-        out.interrupted_executions = self
-            .store
-            .interrupt_running_executions("kilnd stopped while the execution was running")?;
+        out.interrupted_executions = self.store.interrupt_running_executions_for_backend(
+            self.runtime.name(),
+            "kilnd stopped while the execution was running",
+        )?;
         out.unmanaged = live.into_keys().filter(|b| !known.contains(b)).collect();
         out.unmanaged.sort();
         for b in &out.unmanaged {
             warn!(backend_id = %b, "backend sandbox not created by kilnd; leaving it alone");
         }
         Ok(out)
+    }
+
+    async fn validate_reconciliation_evidence(
+        &self,
+        sandboxes: &[Sandbox],
+        live: &HashMap<String, BackendStatus>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        // Check all candidates before any durable reconciliation mutation.
+        // A complete list is necessary but not sufficient absence evidence:
+        // independently probe any managed backend whose list record is
+        // missing. A reachable backend proves the list was incomplete, so
+        // startup must fail without changing the store or cleaning anything.
+        for sandbox in sandboxes {
+            if sandbox.backend != self.runtime.name() {
+                continue;
+            }
+            let Some(id) = &sandbox.backend_id else {
+                continue;
+            };
+            match (sandbox.state, live.get(id)) {
+                (
+                    SandboxState::Creating | SandboxState::Ready | SandboxState::Lost,
+                    Some(BackendStatus::Running),
+                ) => {
+                    self.runtime
+                        .validate_sandbox(
+                            id,
+                            Instant::now() + self.limits.health_probe_timeout,
+                            cancel,
+                        )
+                        .await
+                        .map_err(backend)?;
+                }
+                (SandboxState::Creating | SandboxState::Ready | SandboxState::Deleting, None) => {
+                    match self
+                        .runtime
+                        .validate_sandbox(
+                            id,
+                            Instant::now() + self.limits.health_probe_timeout,
+                            cancel,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            return Err(Error::Backend(format!(
+                                "backend listing did not report reachable managed sandbox {id} for {} as present",
+                                sandbox.id
+                            )));
+                        }
+                        Err(RuntimeError::NotFound(_)) => {}
+                        Err(error) => return Err(backend(error)),
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     pub async fn health(self: &Arc<Self>) -> Result<Health> {

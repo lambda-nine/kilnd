@@ -1369,9 +1369,16 @@ async fn reconcile_repairs_state_and_is_repeatable() {
     let interrupted = Execution {
         id: new_id("ex"),
         state: ExecutionState::Running,
+        ..running_exec.clone()
+    };
+    let foreign_running = Execution {
+        id: new_id("ex"),
+        sandbox_id: other_backend.id.clone(),
+        state: ExecutionState::Running,
         ..running_exec
     };
     m.store.insert_execution(&interrupted).unwrap();
+    m.store.insert_execution(&foreign_running).unwrap();
     {
         let mut s = fake.state();
         s.sandboxes.remove(rebooted.backend_id.as_ref().unwrap());
@@ -1384,8 +1391,7 @@ async fn reconcile_repairs_state_and_is_repeatable() {
     let unmanaged_stale = fake.insert(BackendStatus::Stale);
 
     let first = m.reconcile().await.unwrap();
-    let mut gc_removed = vec![stale.backend_id.clone().unwrap(), unmanaged_stale];
-    gc_removed.sort();
+    let gc_removed = vec![stale.backend_id.clone().unwrap()];
     let mut lost = vec![rebooted.id.clone(), stale.id.clone()];
     lost.sort();
     let mut deleted_now = vec![half_deleted.id.clone(), half_deleted_gone.id.clone()];
@@ -1394,12 +1400,15 @@ async fn reconcile_repairs_state_and_is_repeatable() {
         v.sort();
         v
     };
-    assert_eq!(sorted(first.gc_removed.clone()), gc_removed);
+    assert_eq!(first.gc_removed, gc_removed);
     assert_eq!(sorted(first.lost.clone()), lost);
     assert_eq!(first.failed, vec![crashed_create.id.clone()]);
     assert_eq!(sorted(first.deleted.clone()), deleted_now);
     assert_eq!(first.interrupted_executions, 1);
-    assert_eq!(first.unmanaged, vec![unmanaged.clone()]);
+    assert_eq!(
+        first.unmanaged,
+        sorted(vec![unmanaged.clone(), unmanaged_stale.clone()])
+    );
 
     let state = |id: &str| m.get(id, 0).unwrap().0.state;
     assert_eq!(state(&alive.id), SandboxState::Ready);
@@ -1417,9 +1426,18 @@ async fn reconcile_repairs_state_and_is_repeatable() {
         m.execution(&interrupted.id).unwrap().state,
         ExecutionState::Interrupted
     );
+    assert_eq!(
+        m.execution(&foreign_running.id).unwrap().state,
+        ExecutionState::Running,
+        "another backend's execution is outside this manager's restart scope"
+    );
     assert!(
         fake.state().sandboxes.contains_key(&unmanaged),
         "unmanaged sandboxes are left alone"
+    );
+    assert!(
+        fake.state().sandboxes.contains_key(&unmanaged_stale),
+        "unmanaged stale sandboxes are outside kilnd's garbage-collection scope"
     );
     assert!(
         !fake
@@ -1427,12 +1445,17 @@ async fn reconcile_repairs_state_and_is_repeatable() {
             .sandboxes
             .contains_key(half_deleted.backend_id.as_ref().unwrap())
     );
+    assert_eq!(
+        fake.state().gc_requests,
+        [vec![stale.backend_id.clone().unwrap()]],
+        "garbage collection receives only stale IDs owned by this backend"
+    );
 
     let second = m.reconcile().await.unwrap();
     assert_eq!(
         second,
         Reconciled {
-            unmanaged: vec![unmanaged],
+            unmanaged: sorted(vec![unmanaged.clone(), unmanaged_stale.clone()]),
             ..Default::default()
         }
     );
@@ -1443,6 +1466,16 @@ async fn reconcile_repairs_state_and_is_repeatable() {
             .stdout
             .data,
         b"still\n"
+    );
+    m.begin_shutdown();
+    m.drain_operations().await;
+    let backend = fake.state();
+    assert!(backend.sandboxes.contains_key(&unmanaged));
+    assert!(backend.sandboxes.contains_key(&unmanaged_stale));
+    assert_eq!(
+        backend.gc_requests.len(),
+        1,
+        "shutdown must not run backend GC"
     );
 }
 
@@ -1460,6 +1493,7 @@ async fn reconcile_rejects_a_listing_that_hides_a_reachable_managed_sandbox() {
     let (m, fake) = manager();
     let visible = m.create(CreateRequest::default()).await.unwrap();
     let hidden = m.create(CreateRequest::default()).await.unwrap();
+    let stale = m.create(CreateRequest::default()).await.unwrap();
     let mut interrupted = m.exec(exec_req(&visible.id, &["true"])).await.unwrap();
     interrupted.id = new_id("ex");
     interrupted.state = ExecutionState::Running;
@@ -1467,6 +1501,9 @@ async fn reconcile_rejects_a_listing_that_hides_a_reachable_managed_sandbox() {
     fake.state()
         .hidden_from_list
         .push(hidden.backend_id.clone().unwrap());
+    fake.state()
+        .sandboxes
+        .insert(stale.backend_id.clone().unwrap(), BackendStatus::Stale);
 
     let before = m.store.sandboxes(true).unwrap();
     let error = m.reconcile().await.unwrap_err();
@@ -1483,6 +1520,13 @@ async fn reconcile_rejects_a_listing_that_hides_a_reachable_managed_sandbox() {
         "incomplete evidence must not partially reconcile executions"
     );
     assert_eq!(m.get(&hidden.id, 0).unwrap().0.state, SandboxState::Ready);
+    assert!(
+        fake.state()
+            .sandboxes
+            .contains_key(stale.backend_id.as_ref().unwrap()),
+        "scoped GC must wait until the whole listing is trusted"
+    );
+    assert!(fake.state().gc_requests.is_empty());
 }
 
 #[tokio::test]

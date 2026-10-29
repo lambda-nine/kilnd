@@ -27,7 +27,7 @@ testable without kiln, through the fake runtime.
 ## The runtime adapter
 
 `runtime::Runtime` is the only kiln-shaped seam: `create(spec) → backend id`,
-`exec(id, argv, stdin, deadline, max_output, cancel)`, `validate_sandbox`, `remove`, `list`, `gc`
+`exec(id, argv, stdin, deadline, max_output, cancel)`, `validate_sandbox`, `remove`, `list`, `gc(ids)`
 and `version`. The contract that matters most: when an exec times out or is
 canceled, the command must be stopped *inside* the sandbox and the sandbox
 left usable. A Firecracker backend would implement the same trait over its
@@ -40,7 +40,7 @@ API socket and a guest agent.
 | create | `kiln create --require-exec-protocol=1 --image=… --memory=… --cpus=… --pids=… --disk=… --net=…/--allow=… [--read-only --writable=…]`; stdout is the ID |
 | exec | `kiln exec --protocol=1 --status-fd=N --stdin-fd=I --stdout-fd=O --stderr-fd=E ID -- ARGV…`; private status and workload streams |
 | delete | `kiln rm ID` |
-| reconcile | `kiln gc`, then `kiln ls` |
+| reconcile | `kiln ls`, scoped `kiln gc ID...`, then `kiln ls` again |
 | health | `kiln capabilities --protocol=1` |
 
 Every flag value uses `--flag=value` so it can't be parsed as another flag,
@@ -176,26 +176,30 @@ operators must not point independent daemons at the same kiln backend.
 
 At startup, after both ownership locks are held and the socket is reserved:
 
-1. Validate installed CLI capabilities before `kiln gc` removes what dead shims
-   left behind (kiln only touches sandboxes whose shim is gone).
-2. `kiln ls` lists what is alive. If it fails, kilnd refuses to start rather
+1. Validate installed CLI capabilities, load this backend's recorded IDs, and
+   run `kiln ls`. If it fails, kilnd refuses to start rather
    than guess. EOF, capture bounds and every record are validated before the
    table is parsed.
-3. Before any durable reconciliation mutation, validate every listed live
-   `READY`/`CREATING` sandbox and directly probe every managed backend omitted
-   from the list. A reachable omitted backend proves the listing incomplete;
+2. Before any backend or durable reconciliation mutation, validate every
+   listed live `READY`/`CREATING` sandbox and directly probe every managed
+   backend omitted from the list. A reachable omitted backend proves the listing incomplete;
    an absent registry record is trusted only when its cgroup is also absent.
    Incompatibility, conflicting evidence or an inconclusive probe aborts startup
-   without changing sandbox or execution rows. For each sandbox of this backend
-   in the database: `READY`/`CREATING` with a live backend stays (or becomes)
+   without cleaning a backend or changing sandbox/execution rows.
+3. Pass only listed stale IDs that occur in this backend's database rows to
+   scoped garbage collection, then relist and revalidate. A stale unmanaged ID
+   is reported and retained. If a requested stale ID remains, startup fails.
+4. For each sandbox of this backend in the database, `READY`/`CREATING` with
+   a live backend stays (or becomes)
    `READY`; with confirmed absence it becomes `LOST`; an exact backend that
    reappears for a `LOST` row and passes validation becomes `READY` again;
    `CREATING` without a backend ID becomes `FAILED`; `DELETING` is retried
    or completed.
-4. Executions still `RUNNING` become `INTERRUPTED`. Their `kiln exec` clients
-   died with kilnd (`PR_SET_PDEATHSIG`), so kiln already stopped the commands.
-5. Live kiln sandboxes kilnd doesn't know are logged as unmanaged and left
-   alone.
+5. Executions still `RUNNING` for this backend become `INTERRUPTED`. Other
+   backends' rows are untouched. Their `kiln exec` clients died with kilnd
+   (`PR_SET_PDEATHSIG`), so kiln already stopped the commands.
+6. Live or stale kiln sandboxes kilnd doesn't know are logged as unmanaged and
+   left alone across repeated startup reconciliation and daemon shutdown.
 
 Running it again changes nothing.
 

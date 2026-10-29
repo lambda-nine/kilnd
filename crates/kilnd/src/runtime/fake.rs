@@ -79,6 +79,8 @@ pub struct FakeState {
     pub active_execs: u32,
     pub canceled_execs: u32,
     pub gc_runs: u32,
+    /// Explicit ID scopes passed to garbage collection, in call order.
+    pub gc_requests: Vec<Vec<String>>,
     /// When set, `create` fails with this message.
     pub fail_create: Option<String>,
     /// Panics before allocating a backend, for supervisor recovery tests.
@@ -436,17 +438,20 @@ impl Runtime for FakeRuntime {
             .collect())
     }
 
-    async fn gc(&self) -> Result<Vec<String>, RuntimeError> {
+    async fn gc(&self, ids: &[String]) -> Result<Vec<String>, RuntimeError> {
         let mut s = self.state();
         if s.unavailable {
             return Err(RuntimeError::Backend("fake backend unavailable".into()));
         }
         s.gc_runs += 1;
+        s.gc_requests.push(ids.to_vec());
         let stale: Vec<String> = s
             .sandboxes
             .iter()
-            .filter(|(_, st)| **st == BackendStatus::Stale)
-            .map(|(id, _)| id.clone())
+            .filter(|(id, st)| {
+                **st == BackendStatus::Stale && ids.iter().any(|requested| requested == *id)
+            })
+            .map(|(id, _)| id.to_string())
             .collect();
         for id in &stale {
             s.sandboxes.remove(id);

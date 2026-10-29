@@ -49,6 +49,10 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   so concurrent or stale delete results cannot rewrite `DELETED` timestamps or
   resurrect `DELETING`. A backend side effect whose caller is interrupted is
   reconciled by retry, treating an already-absent backend as success.
+  Startup garbage collection receives only stale backend IDs recorded in
+  kilnd's own rows; unmanaged live and stale sandboxes are retained. Restart
+  execution interruption is likewise joined through each sandbox and limited
+  to the active backend.
 - **No request-owned exec work.** After an execution row is recorded, a
   daemon supervisor owns backend cleanup, pipe capture and finalization even
   if the RPC disappears. kiln places each command in an execution cgroup;
@@ -130,9 +134,10 @@ sandbox compromises the host.
   `711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on `3b42552`.
 - **A daemon crash during `kiln create`** can leave a kiln sandbox whose
   backend ID was never returned to kilnd. Reconciliation logs it as unmanaged
-  but doesn't remove it, since it can't tell it from one an operator made
-  with the CLI. Remove it with `kiln rm`. Ordinary RPC cancellation is not
-  this case: accepted creates are daemon-owned and finish or compensate even
+  but doesn't remove it, even after its shim becomes stale, since it can't
+  tell it from one an operator made with the CLI. Remove a live one with
+  `kiln rm ID` or a stale one with scoped `kiln gc ID`. Ordinary RPC
+  cancellation is not this case: accepted creates are daemon-owned and finish or compensate even
   after the caller disconnects.
 - **Group members are not isolated from each other.** Any member can exec in
   or delete any sandbox. Per-caller ownership belongs to the harness layer or

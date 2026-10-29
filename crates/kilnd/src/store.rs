@@ -505,12 +505,23 @@ impl Store {
         self.reject_execution_finishes.clone()
     }
 
-    /// Marks every execution still recorded as running as interrupted.
-    /// Only valid at startup, before any new execution begins.
-    pub fn interrupt_running_executions(&self, reason: &str) -> Result<usize> {
+    /// Marks this backend's executions still recorded as running as
+    /// interrupted. Only valid at startup, before any new execution begins.
+    pub fn interrupt_running_executions_for_backend(
+        &self,
+        backend: &str,
+        reason: &str,
+    ) -> Result<usize> {
         Ok(self.conn().execute(
-            "UPDATE executions SET state = 'interrupted', failure_reason = ?1, finished_at_ms = ?2 WHERE state = 'running'",
-            params![reason, now_ms()],
+            "UPDATE executions
+             SET state = 'interrupted', failure_reason = ?2, finished_at_ms = ?3
+             WHERE state = 'running'
+               AND EXISTS (
+                   SELECT 1 FROM sandboxes
+                   WHERE sandboxes.id = executions.sandbox_id
+                     AND sandboxes.backend = ?1
+               )",
+            params![backend, reason, now_ms()],
         )?)
     }
 }
@@ -704,7 +715,9 @@ mod tests {
             assert!(historical.command_status.is_none() && historical.runtime_error.is_none());
             assert!(!historical.stdout.total_bytes_known);
             assert!(!historical.stderr.total_bytes_known);
-            store.interrupt_running_executions("restart").unwrap();
+            store
+                .interrupt_running_executions_for_backend("fake", "restart")
+                .unwrap();
             let interrupted = store.execution("running").unwrap().unwrap();
             assert_eq!(interrupted.state, ExecutionState::Interrupted);
             assert!(interrupted.command_status.is_none() && interrupted.runtime_error.is_none());
@@ -1227,17 +1240,38 @@ mod tests {
     }
 
     #[test]
-    fn interrupts_running_executions() {
+    fn interrupts_only_running_executions_for_the_selected_backend() {
         let store = Store::open_in_memory().unwrap();
         let s = sandbox();
         store.insert_sandbox(&s).unwrap();
         let e = execution(&s.id);
         store.insert_execution(&e).unwrap();
-        assert_eq!(store.interrupt_running_executions("restart").unwrap(), 1);
+        let mut other = sandbox();
+        other.id = new_id("sb");
+        other.backend = "firecracker".into();
+        store.insert_sandbox(&other).unwrap();
+        let foreign = execution(&other.id);
+        store.insert_execution(&foreign).unwrap();
+
+        assert_eq!(
+            store
+                .interrupt_running_executions_for_backend("fake", "restart")
+                .unwrap(),
+            1
+        );
         let got = store.execution(&e.id).unwrap().unwrap();
         assert_eq!(got.state, ExecutionState::Interrupted);
         assert_eq!(got.failure_reason.as_deref(), Some("restart"));
-        assert_eq!(store.interrupt_running_executions("restart").unwrap(), 0);
+        assert_eq!(
+            store.execution(&foreign.id).unwrap().unwrap().state,
+            ExecutionState::Running
+        );
+        assert_eq!(
+            store
+                .interrupt_running_executions_for_backend("fake", "restart")
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

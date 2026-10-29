@@ -18,17 +18,33 @@ wait_ready() {
     done
     fail "kilnd did not come back"
 }
+restart_kilnd() {
+    sudo systemctl reset-failed kilnd
+    sudo systemctl restart kilnd
+}
 backend_of() { ctl get "$1" | awk '/^backend:/ {print $3}'; }
 created=()
+backend_created=()
 api_tmp=
 cleanup() {
     for s in "${created[@]}"; do sudo kilndctl rm "$s" >/dev/null 2>&1 || true; done
+    for b in "${backend_created[@]}"; do
+        sudo kiln rm "$b" >/dev/null 2>&1 || sudo kiln gc "$b" >/dev/null 2>&1 || true
+    done
     if [[ -n "$api_tmp" && -d "$api_tmp" ]]; then
         rm -f "$api_tmp/exit125.out" "$api_tmp/exit125.err" \
             "$api_tmp/signal15.out" "$api_tmp/signal15.err" \
             "$api_tmp/launch.out" "$api_tmp/launch.err"
         rmdir "$api_tmp"
     fi
+}
+wait_backend_status() {
+    local id=$1 status=$2
+    for _ in $(seq 100); do
+        sudo kiln ls | grep -q "^$id[[:space:]]$status[[:space:]]" && return 0
+        sleep 0.1
+    done
+    fail "kiln did not report $id as $status"
 }
 trap cleanup EXIT
 
@@ -104,7 +120,7 @@ launch_id=$(sql "SELECT id FROM executions WHERE sandbox_id='$id' AND state='fai
 [ -n "$exit125_id" ] && [ -n "$signal15_id" ] && [ -n "$launch_id" ] || fail "typed execution IDs"
 
 echo "4. Restarting kilnd keeps the sandbox"
-sudo systemctl restart kilnd
+restart_kilnd
 wait_ready
 ctl get "$id" | grep -q '^state: *ready' || fail "sandbox not ready after restart"
 [ "$(sql "SELECT hex(stdout) || ':' || hex(stderr) FROM executions WHERE sandbox_id='$id' AND exit_code=125")" = '00FF6F7574:00FE657272' ] || fail "typed binary evidence lost on restart"
@@ -165,15 +181,52 @@ echo "7. A sandbox removed behind kilnd's back is lost after restart"
 lost=$(ctl create --memory 64M --disk 16M)
 created+=("$lost")
 sudo kiln rm "$(backend_of "$lost")"
-sudo systemctl restart kilnd
+restart_kilnd
 wait_ready
 ctl get "$lost" | grep -q '^state: *lost' || fail "sandbox not marked lost"
 ctl rm "$lost" >/dev/null
 
-echo "8. One-shot run"
+echo "8. Reconciliation and shutdown preserve unmanaged live and stale sandboxes"
+unmanaged_live=$(sudo kiln create --memory=64M --disk=16M)
+backend_created+=("$unmanaged_live")
+unmanaged_stale=$(sudo kiln create --memory=64M --disk=16M)
+backend_created+=("$unmanaged_stale")
+managed_stale=$(ctl create --memory 64M --disk 16M)
+created+=("$managed_stale")
+managed_backend=$(backend_of "$managed_stale")
+sudo kill -9 "$(sudo cat "/var/lib/kiln/runs/$unmanaged_stale/shim.pid")"
+sudo kill -9 "$(sudo cat "/var/lib/kiln/runs/$managed_backend/shim.pid")"
+wait_backend_status "$unmanaged_stale" stale
+wait_backend_status "$managed_backend" stale
+
+restart_kilnd
+wait_ready
+ctl get "$managed_stale" | grep -q '^state: *lost' || fail "managed stale sandbox not marked lost"
+if sudo kiln ls | grep -q "^$managed_backend[[:space:]]"; then
+    fail "managed stale backend survived scoped GC"
+fi
+wait_backend_status "$unmanaged_live" running
+wait_backend_status "$unmanaged_stale" stale
+
+restart_kilnd
+wait_ready
+wait_backend_status "$unmanaged_live" running
+wait_backend_status "$unmanaged_stale" stale
+sudo systemctl stop kilnd
+wait_backend_status "$unmanaged_live" running
+wait_backend_status "$unmanaged_stale" stale
+sudo systemctl reset-failed kilnd
+sudo systemctl start kilnd
+wait_ready
+
+sudo kiln rm "$unmanaged_live"
+sudo kiln gc "$unmanaged_stale"
+ctl rm "$managed_stale"
+
+echo "9. One-shot run"
 [ "$(ctl run --memory 64M --disk 16M -- echo one-shot)" = one-shot ] || fail "run"
 
-echo "9. Structured logs"
+echo "10. Structured logs"
 logs=$(sudo journalctl -u kilnd --since "-5min" --no-pager -o cat)
 line=$(grep '"message":"exec finished"' <<<"$logs" | tail -1)
 [ -n "$line" ] || fail "no JSON exec log lines"

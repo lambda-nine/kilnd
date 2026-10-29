@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Scope startup garbage collection to stale backend IDs recorded by kilnd,
+  preserving unmanaged live and stale sandboxes across reconciliation and
+  shutdown. Restart interruption now updates only executions joined to the
+  active backend's sandboxes.
+
 - Concurrent `DeleteSandbox` calls now share one serialized backend removal.
   Delete reloads durable state after acquiring the sandbox lock, treats an
   existing `DELETED` row as immutable success, and uses conditional state
