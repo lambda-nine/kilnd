@@ -6,6 +6,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Define and enforce one API/backend validation contract for IDs, image and
+  path fields, allowlists, labels and literal argv. Root writable/allowlist
+  entries, malformed path components, empty `argv[0]`, NUL and excessive
+  count/byte sizes now fail as client errors before persistence or backend
+  work; Unicode/newline and flag-like argv remain literal. kilnd also proves
+  accepted argv fits kiln's 1 MiB encoded transport frame.
+
 - Scope startup garbage collection to stale backend IDs recorded by kilnd,
   preserving unmanaged live and stale sandboxes across reconciliation and
   shutdown. Restart interruption now updates only executions joined to the

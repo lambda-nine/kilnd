@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -549,6 +550,26 @@ async fn create_validates_the_spec() {
             ..Default::default()
         },
         CreateRequest {
+            network: Network::Allow(vec!["/".into()]),
+            ..Default::default()
+        },
+        CreateRequest {
+            network: Network::Allow(vec!["example.com:0".into()]),
+            ..Default::default()
+        },
+        CreateRequest {
+            network: Network::Allow(vec!["10.0.0.1/33".into()]),
+            ..Default::default()
+        },
+        CreateRequest {
+            network: Network::Allow(vec!["bad..example".into()]),
+            ..Default::default()
+        },
+        CreateRequest {
+            network: Network::Allow(vec!["example.com".into(); 65]),
+            ..Default::default()
+        },
+        CreateRequest {
             writable_paths: vec!["/data".into()],
             ..Default::default()
         },
@@ -563,11 +584,48 @@ async fn create_validates_the_spec() {
             ..Default::default()
         },
         CreateRequest {
+            read_only_root: true,
+            writable_paths: vec!["/".into()],
+            ..Default::default()
+        },
+        CreateRequest {
+            read_only_root: true,
+            writable_paths: vec!["/a/./b".into()],
+            ..Default::default()
+        },
+        CreateRequest {
+            read_only_root: true,
+            writable_paths: vec!["/a//b".into()],
+            ..Default::default()
+        },
+        CreateRequest {
+            read_only_root: true,
+            writable_paths: vec!["/data/".into()],
+            ..Default::default()
+        },
+        CreateRequest {
+            read_only_root: true,
+            writable_paths: vec!["/data".into(); 17],
+            ..Default::default()
+        },
+        CreateRequest {
             labels: [("".to_string(), "x".to_string())].into(),
             ..Default::default()
         },
         CreateRequest {
             labels: [("k".to_string(), "a\nb".to_string())].into(),
+            ..Default::default()
+        },
+        CreateRequest {
+            labels: (0..33).map(|n| (format!("key-{n}"), "value".into())).collect(),
+            ..Default::default()
+        },
+        CreateRequest {
+            labels: [("k".repeat(64), "value".into())].into(),
+            ..Default::default()
+        },
+        CreateRequest {
+            labels: [("key".into(), "v".repeat(257))].into(),
             ..Default::default()
         },
     ];
@@ -587,11 +645,25 @@ async fn create_validates_the_spec() {
     let ok = CreateRequest {
         network: Network::Allow(vec!["example.com:443".into(), "10.0.0.0/8".into()]),
         read_only_root: true,
-        writable_paths: vec!["/data".into()],
+        writable_paths: vec!["/data".into(), "/workspace/雪".into()],
         labels: [("app.lambda-nine/owner".to_string(), "tests".to_string())].into(),
         ..Default::default()
     };
     assert_eq!(m.create(ok).await.unwrap().state, SandboxState::Ready);
+    let boundary = CreateRequest {
+        image: "i".repeat(128),
+        network: Network::Allow(vec!["example.com:65535".into(); 64]),
+        read_only_root: true,
+        writable_paths: (0..16).map(|n| format!("/data/{n}")).collect(),
+        labels: {
+            let mut labels: BTreeMap<String, String> =
+                (0..31).map(|n| (format!("key-{n}"), "value".into())).collect();
+            labels.insert("k".repeat(63), "v".repeat(256));
+            labels
+        },
+        ..Default::default()
+    };
+    assert_eq!(m.create(boundary).await.unwrap().state, SandboxState::Ready);
 }
 
 #[tokio::test]
@@ -981,6 +1053,49 @@ async fn exec_validates_requests() {
     assert!(
         matches!(m.exec(req).await, Err(Error::InvalidArgument(message)) if message.contains("4096 arguments"))
     );
+}
+
+#[tokio::test]
+async fn exec_accepts_exact_boundaries_and_preserves_literal_argv() {
+    let (m, fake) = manager_with(Limits {
+        max_argv_bytes: 8192,
+        ..Limits::default()
+    });
+    let sandbox = m.create(CreateRequest::default()).await.unwrap();
+    let literal = vec!["echo".into(), "雪\n--timeout=1".into(), String::new()];
+    let execution = m
+        .exec(ExecRequest {
+            sandbox_id: sandbox.id.clone(),
+            argv: literal.clone(),
+            stdin: Vec::new(),
+            timeout_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(execution.argv, literal);
+    assert_eq!(fake.state().exec_calls, [execution.argv]);
+
+    let exact = vec!["echo".into(), "x".repeat(8186)];
+    assert_eq!(exact.iter().map(|arg: &String| arg.len() + 1).sum::<usize>(), 8192);
+    m.exec(ExecRequest {
+        sandbox_id: sandbox.id.clone(),
+        argv: exact,
+        stdin: Vec::new(),
+        timeout_ms: 0,
+    })
+    .await
+    .unwrap();
+
+    let mut max_count = vec!["echo".into()];
+    max_count.extend(std::iter::repeat_n(String::new(), 4095));
+    m.exec(ExecRequest {
+        sandbox_id: sandbox.id,
+        argv: max_count,
+        stdin: Vec::new(),
+        timeout_ms: 0,
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

@@ -55,6 +55,14 @@ process group or session. `kiln exec` is serial per sandbox, so kilnd queues
 executions per sandbox rather than letting them pile up in kiln's socket
 backlog.
 
+The exact API/backend grammar and byte accounting are documented in the
+[request validation contract](validation.md). Create and Exec validate before
+inserting lifecycle rows or invoking the adapter. In particular, writable
+root and allowlist root are rejected, and argv is literal UTF-8 data rather
+than shell text. The configurable API argv limit counts bytes plus one per
+argument; a separate check proves the four-byte-count/four-byte-length kiln
+frame stays within its 1 MiB body limit.
+
 Exec calculates one absolute Tokio deadline at handler receipt (or direct
 manager entry). Queueing and process setup consume that same budget; the
 runtime and process runner use `sleep_until(deadline)`. The row retains the

@@ -29,6 +29,10 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   The kiln implementation runs the installed `kiln` CLI with argument vectors
   (never a shell), a cleared environment, timeouts and bounded output. kiln's
   code is not copied or linked.
+- **One validation contract** ([docs/validation.md](docs/validation.md)) for
+  IDs, images, allowlists, writable paths, labels and literal argv. Invalid
+  requests are rejected before a lifecycle row or backend invocation, and kiln
+  independently enforces the backend-facing subset.
 - **SQLite state** in `/var/lib/kilnd/kilnd.db` (directory 0700): sandboxes
   with their effective spec, backend ID, state, timestamps and failure
   reason; executions with argv, state, legacy exit code, typed termination,

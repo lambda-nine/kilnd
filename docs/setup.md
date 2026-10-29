@@ -105,6 +105,13 @@ Timeouts must be nonzero, the default cannot exceed the maximum, and the
 maximum in milliseconds must fit `u32`. Invalid limits fail before opening
 SQLite or binding the socket.
 
+The fixed 256 KiB argv limit counts UTF-8 bytes plus one separator per
+argument. The daemon also checks kiln's encoded persistent-exec body
+(four-byte argc plus a four-byte length per argument) against its fixed 1 MiB
+cap. At 4096 arguments the largest accepted API argv therefore encodes to at
+most 274436 bytes. See the [validation contract](validation.md) for field
+grammars.
+
 Health reports admission maxima, current use and cumulative rejection totals;
 backend probes are shared and cached, with a 2-second timeout. Ordinary and
 Health handlers have separate budgets. Full handler/Exec/stdin budgets return

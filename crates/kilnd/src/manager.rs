@@ -20,6 +20,10 @@ use crate::model::{
 };
 use crate::runtime::{BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
 use crate::store::{ExecutionResult, Store};
+use crate::validation::{
+    MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, validate_allowlist_entry, validate_argv,
+    validate_image_name, validate_writable_path,
+};
 
 /// Limits and defaults; see `Config` in main.rs for the flags that set them.
 #[derive(Clone, Debug)]
@@ -254,8 +258,6 @@ pub struct Reconciled {
 }
 
 const MAX_LABELS: usize = 32;
-const MAX_ALLOW: usize = 64;
-const MAX_WRITABLE: usize = 16;
 
 impl<R: Runtime> Manager<R> {
     pub fn new(runtime: R, store: Store, limits: Limits) -> Self {
@@ -1309,26 +1311,8 @@ impl<R: Runtime> Manager<R> {
     }
 
     fn check_exec(&self, req: &ExecRequest) -> Result<Duration> {
-        if req.argv.len() > 4096 {
-            return Err(Error::InvalidArgument(
-                "argv exceeds the limit of 4096 arguments".into(),
-            ));
-        }
-        if req.argv.is_empty() || req.argv[0].is_empty() {
-            return Err(Error::InvalidArgument("argv must name a program".into()));
-        }
-        if req.argv.iter().any(|a| a.contains('\0')) {
-            return Err(Error::InvalidArgument(
-                "argv must not contain NUL bytes".into(),
-            ));
-        }
-        let size: usize = req.argv.iter().map(|a| a.len() + 1).sum();
-        if size > self.limits.max_argv_bytes {
-            return Err(Error::InvalidArgument(format!(
-                "argv is {size} bytes; the limit is {}",
-                self.limits.max_argv_bytes
-            )));
-        }
+        validate_argv(&req.argv, self.limits.max_argv_bytes)
+            .map_err(Error::InvalidArgument)?;
         if req.stdin.len() > self.limits.max_stdin_bytes {
             return Err(Error::InvalidArgument(format!(
                 "stdin is {} bytes; the limit is {}",
@@ -1358,14 +1342,7 @@ impl<R: Runtime> Manager<R> {
         } else {
             req.image
         };
-        if image.len() > 128
-            || image.starts_with(['.', '-'])
-            || !image
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-        {
-            return invalid(format!("invalid image name {image:?}"));
-        }
+        validate_image_name(&image).map_err(Error::InvalidArgument)?;
         let pick = |v: u64, default: u64| if v == 0 { default } else { v };
         let spec = SandboxSpec {
             image,
@@ -1403,35 +1380,23 @@ impl<R: Runtime> Manager<R> {
             ));
         }
         if let Network::Allow(allow) = &spec.network {
-            if allow.is_empty() || allow.len() > MAX_ALLOW {
-                return invalid(format!("an allowlist needs 1 to {MAX_ALLOW} entries"));
+            if allow.is_empty() || allow.len() > MAX_ALLOWLIST_ENTRIES {
+                return invalid(format!(
+                    "an allowlist needs 1 to {MAX_ALLOWLIST_ENTRIES} entries"
+                ));
             }
             for a in allow {
-                if a.is_empty()
-                    || a.len() > 260
-                    || a.starts_with('-')
-                    || !a
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || ".-_:/".contains(c))
-                {
-                    return invalid(format!("invalid allowlist entry {a:?}"));
-                }
+                validate_allowlist_entry(a).map_err(Error::InvalidArgument)?;
             }
         }
         if !spec.writable_paths.is_empty() && !spec.read_only_root {
             return invalid("writable_paths needs read_only_root".into());
         }
-        if spec.writable_paths.len() > MAX_WRITABLE {
-            return invalid(format!("at most {MAX_WRITABLE} writable paths"));
+        if spec.writable_paths.len() > MAX_WRITABLE_PATHS {
+            return invalid(format!("at most {MAX_WRITABLE_PATHS} writable paths"));
         }
         for p in &spec.writable_paths {
-            if !p.starts_with('/')
-                || p.len() > 1024
-                || p.split('/').any(|part| part == "..")
-                || p.chars().any(|c| c.is_control())
-            {
-                return invalid(format!("invalid writable path {p:?}"));
-            }
+            validate_writable_path(p).map_err(Error::InvalidArgument)?;
         }
         if spec.labels.len() > MAX_LABELS {
             return invalid(format!("at most {MAX_LABELS} labels"));

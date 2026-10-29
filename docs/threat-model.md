@@ -28,6 +28,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   images, allowlist entries, paths, labels and IDs are validated before use.
   The environment is cleared except for a fixed `PATH`. Inside the sandbox,
   argv is exec'd directly; `sh -c` happens only when the caller asks for it.
+  Newlines, Unicode and flag-like arguments stay literal; only NUL and the
+  documented count/byte violations are rejected. See the
+  [request validation contract](validation.md).
 - **Bounded resource use by callers.** Caps on active sandboxes, sandbox
   limits, queue-inclusive exec timeout, argv/argc, stdin and stored output
   bound individual requests. Immediate admission caps connections, ordinary

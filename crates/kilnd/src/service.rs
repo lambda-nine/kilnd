@@ -465,6 +465,67 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn invalid_create_contract_is_a_client_error_without_side_effects() {
+        let fake = FakeRuntime::default();
+        let manager = Arc::new(Manager::new(
+            fake.clone(),
+            Store::open_in_memory().unwrap(),
+            Limits::default(),
+        ));
+        let service = Service::new(manager.clone());
+        let invalid = [
+            pb::SandboxSpec {
+                network: Some(pb::NetworkPolicy {
+                    mode: pb::NetworkMode::Allowlist.into(),
+                    allow: vec!["/".into()],
+                }),
+                ..Default::default()
+            },
+            pb::SandboxSpec {
+                read_only_root: true,
+                writable_paths: vec!["/".into()],
+                ..Default::default()
+            },
+        ];
+        for spec in invalid {
+            let error = service
+                .create_sandbox(Request::new(pb::CreateSandboxRequest {
+                    spec: Some(spec),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+        assert!(manager.list(true).unwrap().is_empty());
+        assert!(fake.state().created.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_exec_contract_is_a_client_error_without_side_effects() {
+        let fake = FakeRuntime::default();
+        let manager = Arc::new(Manager::new(
+            fake.clone(),
+            Store::open_in_memory().unwrap(),
+            Limits::default(),
+        ));
+        let sandbox = manager.create(CreateRequest::default()).await.unwrap();
+        let service = Service::new(manager.clone());
+        for argv in [vec![], vec![String::new()], vec!["echo".into(), "a\0b".into()]] {
+            let error = service
+                .exec(Request::new(pb::ExecRequest {
+                    sandbox_id: sandbox.id.clone(),
+                    argv,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+        assert!(manager.get(&sandbox.id, 100).unwrap().1.is_empty());
+        assert!(fake.state().exec_calls.is_empty());
+    }
+
+    #[tokio::test]
     async fn rpc_admission_recovers_on_cancellation_error_and_completion() {
         let fake = FakeRuntime::default();
         let gate = FakeGate::default();

@@ -127,7 +127,9 @@ enum NetworkMode {
 
 message NetworkPolicy {
   NetworkMode mode = 1;
-  // With NETWORK_MODE_ALLOWLIST: HOST[:PORT] or IP[/PREFIX][:PORT].
+  // With NETWORK_MODE_ALLOWLIST: 1–64 ASCII HOST[:PORT] or
+  // IPv4[/PREFIX][:PORT] entries, each at most 260 bytes. Ports are 1–65535;
+  // prefixes are 0–32. See docs/validation.md for the hostname grammar.
   repeated string allow = 2;
 }
 
@@ -143,19 +145,25 @@ message ResourceLimits {
 }
 
 message SandboxSpec {
-  // Root filesystem image name. Empty means the daemon's default.
+  // Root filesystem image name. Empty means the daemon's default. Effective
+  // names are 1–128 ASCII alphanumeric, '-', '_' or '.', and do not start
+  // with '-' or '.'.
   string image = 1;
   ResourceLimits limits = 2;
   NetworkPolicy network = 3;
   // Writes are denied outside the backend's scratch paths and writable_paths.
   bool read_only_root = 4;
-  // Absolute paths that stay writable with read_only_root.
+  // Absolute UTF-8 paths that stay writable with read_only_root. At most 16,
+  // each at most 1024 bytes; '/', control characters, and empty, '.' or '..'
+  // components are invalid.
   repeated string writable_paths = 5;
-  // Caller-defined tags, stored and returned as given.
+  // At most 32 caller-defined tags, stored and returned as given. Keys are
+  // 1–63 ASCII bytes; values are at most 256 UTF-8 bytes without controls.
   map<string, string> labels = 6;
 }
 
 message Sandbox {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string id = 1;
   SandboxState state = 2;
   // The effective spec, with defaults filled in.
@@ -181,6 +189,7 @@ message CreateSandboxResponse {
 }
 
 message GetSandboxRequest {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string id = 1;
   // How many recent executions to return, newest first. Zero means 10; at
   // most 100. Output data is left out, but totals, certainty and truncation
@@ -207,6 +216,7 @@ message ListSandboxesResponse {
 }
 
 message DeleteSandboxRequest {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string id = 1;
 }
 
@@ -215,9 +225,13 @@ message DeleteSandboxResponse {
 }
 
 message ExecRequest {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string sandbox_id = 1;
-  // Program and arguments, passed as an argument vector, never through a
-  // shell. Run `sh -c` explicitly for shell syntax.
+  // 1–4096 UTF-8 arguments; argv[0] is nonempty. NUL is invalid. Newlines,
+  // other controls, Unicode, flag-like values and later empty arguments are
+  // literal data, never host-shell syntax. Run `sh -c` explicitly for shell
+  // parsing. The configurable byte limit counts UTF-8 bytes plus one per
+  // argument; accepted requests must also fit kiln's 1 MiB encoded frame.
   repeated string argv = 2;
   // Bytes for the command's standard input; empty means /dev/null.
   bytes stdin = 3;
@@ -231,6 +245,7 @@ message ExecResponse {
 }
 
 message GetExecutionRequest {
+  // `ex-` followed by exactly 16 lowercase hexadecimal digits.
   string id = 1;
 }
 
@@ -270,7 +285,9 @@ message Output {
 }
 
 message Execution {
+  // `ex-` followed by exactly 16 lowercase hexadecimal digits.
   string id = 1;
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string sandbox_id = 2;
   repeated string argv = 3;
   ExecutionState state = 4;
