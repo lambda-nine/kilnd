@@ -52,6 +52,16 @@ fn exec_scope_populated(backend_id: &str) -> bool {
     .is_ok_and(|events| events.lines().any(|line| line == "populated 1"))
 }
 
+// A second exec would queue behind the command under test. Inspect PID 1's
+// root through /proc so readiness is observed before requesting cancellation.
+fn workspace_marker_exists(backend_id: &str, marker: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/fs/cgroup/kiln/{backend_id}/cgroup.procs"))
+        .unwrap()
+        .lines()
+        .any(|pid| std::fs::metadata(format!("/proc/{pid}/root/workspace/{marker}"))
+            .is_ok_and(|metadata| metadata.len() > 0))
+}
+
 fn io_fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd")
         .unwrap()
@@ -522,7 +532,17 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
         async move {
             m.exec(exec(
                 &id,
-                &["sh", "-c", "printf '\\000\\377out'; printf '\\000\\376err' >&2; setsid sh -c 'sleep 30 & wait' & sleep 30"],
+                &["sh", "-c", r#"
+                    setsid sh -c '
+                        sleep 30 & child=$!
+                        kill -0 "$child" || exit 91
+                        printf "\000\377out"
+                        printf "\000\376err" >&2
+                        echo "$child" >/workspace/cancel-ready
+                        wait
+                    ' &
+                    wait
+                "#],
                 60_000,
             ))
             .await
@@ -530,12 +550,13 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
     });
 
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !exec_scope_populated(&backend_id) {
+        while !workspace_marker_exists(&backend_id, "cancel-ready") {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("detached descendant never entered the exec cgroup");
+    .expect("detached child never proved readiness after setsid and live child creation");
+    assert!(exec_scope_populated(&backend_id));
     let execution_id = m.get(&s.id, 1).unwrap().1[0].id.clone();
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
@@ -554,6 +575,8 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
     assert_eq!(execution.state, ExecutionState::Canceled);
     assert_eq!(execution.stdout.data, b"\0\xffout");
     assert_eq!(execution.stderr.data, b"\0\xfeerr");
+    assert!(execution.stdout.total_bytes_known && execution.stderr.total_bytes_known,
+        "both workload streams must reach real EOF before cancellation completes");
     assert_eq!(
         execution.failure_reason.as_deref(),
         Some("client disconnected")

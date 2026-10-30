@@ -6,6 +6,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Make detached-child cancellation coverage wait for a marker written after
+  successful setsid and live child creation. Verify both workload streams
+  reach EOF, descendants disappear, and the sandbox remains reusable.
+
 - Reject exec-capable CLIs lacking scoped `gc ID...` before reconciliation and
   workload launch, including on an empty database. A complete, bounded
   `gc --help` usage check supplements v1 capability frames without global GC.
