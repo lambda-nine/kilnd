@@ -460,3 +460,125 @@ async fn stdio_handoff_waits_for_installed_descriptors_before_closing_sent_endpo
     error_peer.read_to_end(&mut bytes).await.unwrap();
     assert_eq!(bytes, b"err");
 }
+
+#[tokio::test]
+async fn non_exec_wire_deadlines_and_cancellation_reap_children_without_false_evidence() {
+    use crate::model::{Network, SandboxSpec};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{Instant, timeout};
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("kiln");
+    let pid_file = temp.path().join("pid");
+    let trace = temp.path().join("calls");
+    std::fs::write(&bin, format!(r#"#!/usr/bin/python3
+import os,sys,time
+CAPS=bytes.fromhex('4b494c4e45584f00010002001d0000001f000000010001000500080000000000302e312e306769742074657374')
+if sys.argv[1]=='capabilities':
+    os.write(1,CAPS); sys.exit(0)
+if sys.argv[1:]==['gc','--help']:
+    print('Usage: kiln gc [ID]...'); sys.exit(0)
+open({trace:?},'a').write(sys.argv[1]+'\n')
+open({pid_file:?},'w').write(str(os.getpid()))
+time.sleep(30)
+"#)).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = temp.path().join("helper.sock");
+    let uid = unsafe { libc::geteuid() };
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(serve(
+        tokio::net::UnixListener::bind(&path).unwrap(),
+        uid,
+        bin,
+        stop.clone(),
+    ));
+    let spec = SandboxSpec {
+        image: "alpine".into(),
+        memory_bytes: 64 << 20,
+        cpu_millis: 1000,
+        pids: 64,
+        disk_bytes: 16 << 20,
+        network: Network::None,
+        read_only_root: false,
+        writable_paths: vec![],
+        labels: Default::default(),
+    };
+    for cancel in [false, true] {
+        for operation in [
+            KilnRequest::Create { spec: spec.clone() },
+            KilnRequest::Rm { id: "abcd".into() },
+            KilnRequest::Ls,
+            KilnRequest::Gc {
+                ids: vec!["abcd".into()],
+            },
+        ] {
+            let create = matches!(operation, KilnRequest::Create { .. });
+            let timeout_ms = if cancel { 5000 } else { 1000 };
+            let request = Request {
+                version: VERSION,
+                timeout_ms,
+                deadline_ns: monotonic_ns().unwrap() + u64::from(timeout_ms) * 1_000_000,
+                operation: Operation::Kiln(operation),
+            };
+            let mut control = UnixStream::connect(&path).await.unwrap();
+            fds::send(&control, &[]).await.unwrap();
+            write_frame(&mut control, &request).await.unwrap();
+            assert!(fds::receive(&control).await.unwrap().is_empty());
+            let began = timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                        break pid.parse::<i32>().unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if cancel {
+                control.write_u8(1).await.unwrap();
+            }
+            let end = Instant::now() + Duration::from_secs(2);
+            // In the deadline case the raw client deliberately sends NO cancel
+            // and keeps control open. The wire deadline itself must stop work.
+            let response: Response = timeout(Duration::from_secs(2), read_frame(&mut control))
+                .await
+                .expect("wire bound was replaced by internal timeout")
+                .unwrap();
+            match response {
+                Response::Error {
+                    definitely_not_created,
+                    ..
+                } => assert!(
+                    !definitely_not_created || !create,
+                    "invoked create falsely proved pre-allocation failure"
+                ),
+                response => panic!("interrupted operation claimed success: {response:?}"),
+            }
+            assert_eq!(
+                unsafe { libc::kill(began, 0) },
+                -1,
+                "child survived its response"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            assert!(
+                timeout(
+                    end.saturating_duration_since(Instant::now()),
+                    control.read_u8()
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            std::fs::remove_file(&pid_file).unwrap();
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(trace).unwrap(),
+        "create\nrm\nls\ngc\n".repeat(2)
+    );
+    stop.cancel();
+    server.await.unwrap().unwrap();
+}

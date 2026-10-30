@@ -51,18 +51,6 @@ impl DirectKilnRuntime {
         }
     }
 
-    /// Runs a kiln subcommand that should exit 0, returning its stdout.
-    async fn call(
-        &self,
-        op: &str,
-        args: &[String],
-        timeout: Duration,
-    ) -> Result<process::Outcome, RuntimeError> {
-        let cancel = CancellationToken::new();
-        self.call_until(op, args, Instant::now() + timeout, &cancel)
-            .await
-    }
-
     async fn call_until(
         &self,
         op: &str,
@@ -205,11 +193,12 @@ impl DirectKilnRuntime {
         Ok(())
     }
 
-    async fn list_until(
+    pub(crate) async fn list_until(
         &self,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<Vec<BackendSandbox>, RuntimeError> {
+        let deadline = deadline.min(Instant::now() + QUERY_TIMEOUT);
         let out = self
             .call_until("ls", &["ls".into()], deadline, cancel)
             .await?;
@@ -275,12 +264,13 @@ impl DirectKilnRuntime {
     /// its exit status is evidence only if it advertised that contract. Failing
     /// this gate proves no create process started; from the spawn attempt on,
     /// only `create_result`'s exact evidence is definite.
-    async fn create_until(
+    pub(crate) async fn create_until(
         &self,
         spec: &SandboxSpec,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<String, CreateFailure> {
+        let deadline = deadline.min(Instant::now() + CREATE_TIMEOUT);
         self.capabilities(None, deadline.min(Instant::now() + QUERY_TIMEOUT), cancel)
             .await
             .map_err(CreateFailure::definitely_not_created)?;
@@ -288,6 +278,77 @@ impl DirectKilnRuntime {
             .run_control(&create_args(spec), deadline, cancel)
             .await?;
         create_result(&out)
+    }
+
+    pub(crate) async fn remove_until(
+        &self,
+        id: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(), RuntimeError> {
+        let deadline = deadline.min(Instant::now() + REMOVE_TIMEOUT);
+        check_id(id)?;
+        let removal = self
+            .call_until("rm", &["rm".into(), id.into()], deadline, cancel)
+            .await;
+        // A successful rm or a list omission alone does not prove that the
+        // exact sandbox released its resources. Reuse startup's direct probe,
+        // complete listing and absent-cgroup standard on every release path.
+        match self
+            .validate_sandbox(id, deadline.min(Instant::now() + QUERY_TIMEOUT), cancel)
+            .await
+        {
+            Err(RuntimeError::NotFound(_)) => removal
+                .map(|_| ())
+                .map_err(|_| RuntimeError::NotFound(id.to_string())),
+            Ok(()) => Err(RuntimeError::Backend(format!(
+                "kiln rm {id} did not prove absence: exact backend is still reachable"
+            ))),
+            Err(e) => Err(RuntimeError::Backend(format!(
+                "kiln rm {id} did not prove absence: {e}"
+            ))),
+        }
+    }
+
+    pub(crate) async fn gc_until(
+        &self,
+        ids: &[String],
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let deadline = deadline.min(Instant::now() + QUERY_TIMEOUT);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        for id in ids {
+            check_id(id)?;
+        }
+        let mut args = Vec::with_capacity(ids.len() + 1);
+        args.push("gc".to_string());
+        args.extend(ids.iter().cloned());
+        let out = self.call_until("gc", &args, deadline, cancel).await?;
+        let requested: std::collections::HashSet<_> = ids.iter().map(String::as_str).collect();
+        let mut removed = Vec::new();
+        for line in String::from_utf8_lossy(&out.stderr.data).lines() {
+            let id = line
+                .strip_prefix("kiln: removed stale sandbox ")
+                .map(str::trim)
+                .ok_or_else(|| {
+                    RuntimeError::Backend(format!("kiln gc printed unexpected output {line:?}"))
+                })?;
+            if !requested.contains(id) {
+                return Err(RuntimeError::Backend(format!(
+                    "kiln gc removed sandbox {id} outside its requested scope"
+                )));
+            }
+            if removed.iter().any(|prior| prior == id) {
+                return Err(RuntimeError::Backend(format!(
+                    "kiln gc reported sandbox {id} more than once"
+                )));
+            }
+            removed.push(id.to_string());
+        }
+        Ok(removed)
     }
 
     #[cfg(test)]
@@ -567,31 +628,12 @@ impl Runtime for DirectKilnRuntime {
     }
 
     async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
-        check_id(id)?;
-        let removal = self
-            .call("rm", &["rm".into(), id.into()], REMOVE_TIMEOUT)
-            .await;
-        // A successful rm or a list omission alone does not prove that the
-        // exact sandbox released its resources. Reuse startup's direct probe,
-        // complete listing and absent-cgroup standard on every release path.
-        match self
-            .validate_sandbox(
-                id,
-                Instant::now() + QUERY_TIMEOUT,
-                &CancellationToken::new(),
-            )
-            .await
-        {
-            Err(RuntimeError::NotFound(_)) => removal
-                .map(|_| ())
-                .map_err(|_| RuntimeError::NotFound(id.to_string())),
-            Ok(()) => Err(RuntimeError::Backend(format!(
-                "kiln rm {id} did not prove absence: exact backend is still reachable"
-            ))),
-            Err(e) => Err(RuntimeError::Backend(format!(
-                "kiln rm {id} did not prove absence: {e}"
-            ))),
-        }
+        self.remove_until(
+            id,
+            Instant::now() + REMOVE_TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
     }
 
     async fn list(&self) -> Result<Vec<BackendSandbox>, RuntimeError> {
@@ -600,38 +642,12 @@ impl Runtime for DirectKilnRuntime {
     }
 
     async fn gc(&self, ids: &[String]) -> Result<Vec<String>, RuntimeError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        for id in ids {
-            check_id(id)?;
-        }
-        let mut args = Vec::with_capacity(ids.len() + 1);
-        args.push("gc".to_string());
-        args.extend(ids.iter().cloned());
-        let out = self.call("gc", &args, QUERY_TIMEOUT).await?;
-        let requested: std::collections::HashSet<_> = ids.iter().map(String::as_str).collect();
-        let mut removed = Vec::new();
-        for line in String::from_utf8_lossy(&out.stderr.data).lines() {
-            let id = line
-                .strip_prefix("kiln: removed stale sandbox ")
-                .map(str::trim)
-                .ok_or_else(|| {
-                    RuntimeError::Backend(format!("kiln gc printed unexpected output {line:?}"))
-                })?;
-            if !requested.contains(id) {
-                return Err(RuntimeError::Backend(format!(
-                    "kiln gc removed sandbox {id} outside its requested scope"
-                )));
-            }
-            if removed.iter().any(|prior| prior == id) {
-                return Err(RuntimeError::Backend(format!(
-                    "kiln gc reported sandbox {id} more than once"
-                )));
-            }
-            removed.push(id.to_string());
-        }
-        Ok(removed)
+        self.gc_until(
+            ids,
+            Instant::now() + QUERY_TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
     }
 }
 

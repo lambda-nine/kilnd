@@ -6,6 +6,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Honor non-Exec helper wire deadlines and cancellation through create, remove,
+  list and scoped GC, capped by their internal limits; share the remaining
+  removal budget with absence probes and preserve ambiguous create evidence.
+
 - Fix the helper stdio handoff ordering race on macOS: private protocol v3
   retains sent endpoints until recvmsg receipt, preventing premature output EOF
   and helper EPIPE. A deterministic regression forces send-before-receive;

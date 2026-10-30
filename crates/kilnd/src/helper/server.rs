@@ -161,7 +161,7 @@ async fn dispatch(
             }
         }
         KilnRequest::Create { spec } => runtime
-            .create(&spec)
+            .create_until(&spec, deadline, cancel)
             .await
             .map(Response::Created)
             .unwrap_or_else(|e| Response::Error {
@@ -174,17 +174,17 @@ async fn dispatch(
                 },
             }),
         KilnRequest::Rm { id } => runtime
-            .remove(&id)
+            .remove_until(&id, deadline, cancel)
             .await
             .map(|_| Response::Removed)
             .unwrap_or_else(|e| error(e.into())),
         KilnRequest::Ls => runtime
-            .list()
+            .list_until(deadline, cancel)
             .await
             .map(|rows| Response::Listed(rows.into_iter().map(Into::into).collect()))
             .unwrap_or_else(|e| error(e.into())),
         KilnRequest::Gc { ids } => runtime
-            .gc(&ids)
+            .gc_until(&ids, deadline, cancel)
             .await
             .map(Response::Collected)
             .unwrap_or_else(|e| error(e.into())),

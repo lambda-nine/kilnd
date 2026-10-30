@@ -84,9 +84,13 @@ are at most 64 active connections/operations. Excess connections close. Slow
 clients consume bounded slots. Stdio readers continue counting after the
 retained prefix reaches its limit.
 
-The root runtime owns create/remove cleanup independently of a disconnected
-client. Accepted creates retain the existing 120-second gate/create bound;
-removals retain a 60-second remove plus 30-second absence probe. Exec honors
+The root runtime retains ownership through child termination, reaping and
+capture settlement after deadline or cancellation. Create, remove, list and GC
+honor the original wire deadline and cancellation, capped at 120, 60, 30 and 30
+seconds respectively. Remove's absence probe shares that deadline/token (and
+has at most 30 seconds); cancellation or expiry cannot prove absence and cannot
+release a reservation. A canceled create after invocation remains ambiguous
+unless the existing typed pre-allocation evidence proves otherwise. Exec honors
 its deadline/cancellation, kills and reaps the CLI, and waits for the existing
 execution-cgroup cleanup barrier before returning. Cancellation never abandons
 that barrier. The client waits for the reply, with per-operation transport allowances: Exec 70 seconds for cleanup, Create
