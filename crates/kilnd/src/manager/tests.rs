@@ -2291,3 +2291,20 @@ async fn a_provably_reappeared_backend_recovers_after_restart_once() {
         SandboxState::Ready
     );
 }
+
+#[tokio::test]
+async fn output_policy_keeps_live_reply_but_discards_durable_bytes() {
+    use crate::retention::OutputStorage;
+    for mode in [OutputStorage::Metadata, OutputStorage::None] {
+        let mut limits = Limits::default();
+        limits.retention.output_storage = mode;
+        let manager = Arc::new(Manager::new(FakeRuntime::default(), Store::open_in_memory().unwrap(), limits));
+        let sandbox = manager.create(Default::default()).await.unwrap();
+        let live = manager.exec(ExecRequest { sandbox_id: sandbox.id, argv: vec!["echo".into(), "secret".into()], stdin: vec![], timeout_ms: 0 }).await.unwrap();
+        assert_eq!(live.stdout.data, b"secret\n");
+        let stored = manager.execution(&live.id).unwrap();
+        assert!(stored.stdout.data.is_empty());
+        assert_eq!(stored.stdout.total_bytes, if mode == OutputStorage::Metadata { 7 } else { 0 });
+        assert_eq!(stored.stdout.total_bytes_known, mode == OutputStorage::Metadata);
+    }
+}

@@ -15,17 +15,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params,
-};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::lock::ExclusiveFileLock;
 use crate::model::{
     Captured, CommandStatus, CreateCertainty, Execution, ExecutionState, RuntimeDiagnostic,
     Sandbox, SandboxSpec, SandboxState, now_ms,
 };
+use crate::retention::{OutputStorage, Pruned, Retention};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
+
+const MIGRATE_V6: &str =
+    "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
+INSERT INTO history_sequence VALUES (1, (SELECT COALESCE(MAX(list_seq), 0) FROM sandboxes));
+PRAGMA user_version = 6;";
 
 // A non-deleted row reserves capacity unless FAILED proves no backend remains:
 // a successful compensation recorded the exact removed backend ID, or the
@@ -56,6 +60,8 @@ ALTER TABLE sandboxes ADD COLUMN create_certainty TEXT NOT NULL DEFAULT 'allocat
 PRAGMA user_version = 5;";
 
 const SCHEMA: &str = "
+CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
+INSERT INTO history_sequence VALUES (1, 0);
 CREATE TABLE sandboxes (
     id             TEXT PRIMARY KEY,
     backend        TEXT NOT NULL,
@@ -202,9 +208,14 @@ pub enum ReserveSandbox {
 }
 
 fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
+    // The counter survives retention, so an old page watermark excludes new inserts.
+    conn.execute(
+        "UPDATE history_sequence SET value = value + 1 WHERE id = 1",
+        [],
+    )?;
     conn.execute(
         "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, list_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM sandboxes))",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, (SELECT value FROM history_sequence WHERE id = 1))",
         params![
             sandbox.id,
             sandbox.backend,
@@ -306,12 +317,9 @@ impl Store {
             OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .context("open database without following symlinks")?;
-        let mut opened = open_entry_no_follow(
-            &directory.file,
-            OsStr::new("kilnd.db"),
-            &database_path,
-        )?
-        .context("SQLite did not create kilnd.db")?;
+        let mut opened =
+            open_entry_no_follow(&directory.file, OsStr::new("kilnd.db"), &database_path)?
+                .context("SQLite did not create kilnd.db")?;
         if existing.is_none() {
             opened
                 .file
@@ -396,6 +404,7 @@ impl Store {
                 tx.execute_batch(MIGRATE_V3)?;
                 tx.execute_batch(MIGRATE_V4)?;
                 tx.execute_batch(MIGRATE_V5)?;
+                tx.execute_batch(MIGRATE_V6)?;
                 tx.commit().context("migrate schema v1 to v5")?;
             }
             2 => {
@@ -403,18 +412,26 @@ impl Store {
                 tx.execute_batch(MIGRATE_V3)?;
                 tx.execute_batch(MIGRATE_V4)?;
                 tx.execute_batch(MIGRATE_V5)?;
+                tx.execute_batch(MIGRATE_V6)?;
                 tx.commit().context("migrate schema v2 to v5")?;
             }
             3 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(MIGRATE_V4)?;
                 tx.execute_batch(MIGRATE_V5)?;
+                tx.execute_batch(MIGRATE_V6)?;
                 tx.commit().context("migrate schema v3 to v5")?;
             }
             4 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(MIGRATE_V5)?;
+                tx.execute_batch(MIGRATE_V6)?;
                 tx.commit().context("migrate schema v4 to v5")?;
+            }
+            5 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch(MIGRATE_V6)?;
+                tx.commit().context("migrate schema v5 to v6")?;
             }
             SCHEMA_VERSION => {}
             v => bail!("database schema version {v} is newer than this kilnd ({SCHEMA_VERSION})"),
@@ -435,11 +452,7 @@ impl Store {
     /// Atomically checks every durable node reservation and inserts the new
     /// CREATING row. The IMMEDIATE transaction makes the sum-and-insert one
     /// decision even if another SQLite writer ignores kilnd's instance lock.
-    pub fn reserve_sandbox(
-        &self,
-        s: &Sandbox,
-        budgets: SandboxBudgets,
-    ) -> Result<ReserveSandbox> {
+    pub fn reserve_sandbox(&self, s: &Sandbox, budgets: SandboxBudgets) -> Result<ReserveSandbox> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let reserved = sandbox_resources(&tx)?;
@@ -665,6 +678,15 @@ impl Store {
     }
 
     pub fn finish_execution(&self, id: &str, r: &ExecutionResult<'_>) -> Result<()> {
+        self.finish_execution_with_storage(id, r, OutputStorage::Full)
+    }
+
+    pub fn finish_execution_with_storage(
+        &self,
+        id: &str,
+        r: &ExecutionResult<'_>,
+        storage: OutputStorage,
+    ) -> Result<()> {
         #[cfg(test)]
         if self.reject_execution_finishes.load(Ordering::SeqCst) {
             bail!("injected execution finalization failure");
@@ -704,6 +726,19 @@ impl Store {
                 serde_json::to_string(&bounded)
             })
             .transpose()?;
+        let empty = Captured::default();
+        let (stdout, stderr) = if storage == OutputStorage::None {
+            (&empty, &empty)
+        } else {
+            (r.stdout, r.stderr)
+        };
+        let output = |c: &Captured| {
+            if storage == OutputStorage::Full {
+                c.data.clone()
+            } else {
+                Vec::new()
+            }
+        };
         let n = self.conn().execute(
             "UPDATE executions SET state = ?2, exit_code = ?3, failure_reason = ?4, finished_at_ms = ?5,
                  stdout = ?6, stdout_bytes = ?7, stdout_truncated = ?8, stdout_total_bytes_known = ?9,
@@ -716,14 +751,14 @@ impl Store {
                 r.exit_code,
                 r.failure_reason,
                 now_ms(),
-                r.stdout.data,
-                r.stdout.total_bytes as i64,
-                r.stdout.truncated(),
-                r.stdout.total_bytes_known,
-                r.stderr.data,
-                r.stderr.total_bytes as i64,
-                r.stderr.truncated(),
-                r.stderr.total_bytes_known,
+                output(stdout),
+                stdout.total_bytes as i64,
+                stdout.truncated(),
+                stdout.total_bytes_known,
+                output(stderr),
+                stderr.total_bytes as i64,
+                stderr.truncated(),
+                stderr.total_bytes_known,
                 status_kind,
                 status_value,
                 core_dumped,
@@ -734,6 +769,47 @@ impl Store {
             bail!("execution {id} is not running");
         }
         Ok(())
+    }
+
+    /// One atomic prune: terminal executions, then terminal uncharged sandbox
+    /// history and its terminal children. Unknown states and unfinished rows stay.
+    pub fn prune(&self, policy: &Retention, now: i64) -> Result<Pruned> {
+        let cutoff = |secs: u64| -> Result<i64> {
+            let ms = secs
+                .checked_mul(1000)
+                .and_then(|n| i64::try_from(n).ok())
+                .context("retention age exceeds timestamp range")?;
+            Ok(now.saturating_sub(ms))
+        };
+        let execution_cutoff = cutoff(policy.execution_max_age_secs)?;
+        let sandbox_cutoff = cutoff(policy.sandbox_max_age_secs)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let terminal = "state IN ('exited','timed_out','canceled','failed','interrupted') AND finished_at_ms IS NOT NULL";
+        let mut result = Pruned {
+            executions: tx.execute(&format!("DELETE FROM executions WHERE id IN (
+                SELECT id FROM (SELECT id, finished_at_ms, ROW_NUMBER() OVER (ORDER BY finished_at_ms DESC, rowid DESC) AS n
+                FROM executions WHERE {terminal}) WHERE finished_at_ms <= ?1 OR n > ?2)"),
+                params![execution_cutoff, policy.execution_max_count])?,
+            sandboxes: 0,
+        };
+        tx.execute_batch("CREATE TEMP TABLE retention_sandboxes (id TEXT PRIMARY KEY);")?;
+        tx.execute(&format!("INSERT INTO retention_sandboxes
+            SELECT id FROM (SELECT id, updated_at_ms, ROW_NUMBER() OVER (ORDER BY updated_at_ms DESC, list_seq DESC) AS n
+            FROM sandboxes WHERE state IN ('deleted','failed') AND NOT ({RESERVED_SANDBOX_WHERE})
+            AND NOT EXISTS (SELECT 1 FROM executions WHERE sandbox_id = sandboxes.id AND NOT ({terminal})))
+            WHERE updated_at_ms <= ?1 OR n > ?2"), params![sandbox_cutoff, policy.sandbox_max_count])?;
+        result.executions += tx.execute(
+            "DELETE FROM executions WHERE sandbox_id IN (SELECT id FROM retention_sandboxes)",
+            [],
+        )?;
+        result.sandboxes = tx.execute(
+            "DELETE FROM sandboxes WHERE id IN (SELECT id FROM retention_sandboxes)",
+            [],
+        )?;
+        tx.execute_batch("DROP TABLE retention_sandboxes;")?;
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn execution(&self, id: &str) -> Result<Option<Execution>> {
@@ -930,8 +1006,9 @@ fn walk_trusted_directory(
                     Ok(stat) => Some(stat),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                     Err(error) => {
-                        return Err(error)
-                            .with_context(|| format!("inspect {resource} path {}", path.display()));
+                        return Err(error).with_context(|| {
+                            format!("inspect {resource} path {}", path.display())
+                        });
                     }
                 };
                 if let Some(stat) = stat
@@ -961,10 +1038,14 @@ fn walk_trusted_directory(
                 }
 
                 let next = match stat {
-                    Some(_) => open_directory_at(directories.last().unwrap(), &name)
-                        .with_context(|| {
-                            format!("open {resource} path {} without following symlinks", path.display())
-                        })?,
+                    Some(_) => open_directory_at(directories.last().unwrap(), &name).with_context(
+                        || {
+                            format!(
+                                "open {resource} path {} without following symlinks",
+                                path.display()
+                            )
+                        },
+                    )?,
                     None => {
                         if !create_parents && !pending.is_empty() {
                             bail!("socket directory parent does not exist: {}", path.display());
@@ -1018,8 +1099,12 @@ fn path_steps(path: &Path) -> Result<Vec<PathStep>> {
 }
 
 fn stat_at_no_follow(directory: &File, name: &OsStr) -> std::io::Result<libc::stat> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "directory name contains NUL"))?;
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "directory name contains NUL",
+        )
+    })?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: directory and name are live, stat is writable, and the flag
     // makes the result describe the link itself rather than its target.
@@ -1130,8 +1215,12 @@ fn open_directory_path(path: &Path) -> Result<File> {
 }
 
 fn open_directory_at(directory: &File, name: &OsStr) -> std::io::Result<File> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "directory name contains NUL"))?;
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "directory name contains NUL",
+        )
+    })?;
     // SAFETY: directory is live, name is NUL-terminated, and flags are valid.
     let fd = unsafe {
         libc::openat(
@@ -1159,7 +1248,11 @@ fn create_directory_at(directory: &File, name: &OsStr, path: &Path) -> Result<()
     Ok(())
 }
 
-fn open_entry_no_follow(directory: &File, name: &OsStr, path: &Path) -> Result<Option<OpenedEntry>> {
+fn open_entry_no_follow(
+    directory: &File,
+    name: &OsStr,
+    path: &Path,
+) -> Result<Option<OpenedEntry>> {
     let name = CString::new(name.as_bytes()).context("database filename contains NUL")?;
     // O_NONBLOCK makes inspecting a pre-created FIFO fail safely rather than
     // hanging startup. O_NOFOLLOW rejects a symbolic link before SQLite sees
@@ -1335,10 +1428,190 @@ mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::DirBuilderExt;
 
+    #[test]
+    fn retention_keeps_reservations_and_unfinished_evidence() {
+        let store = Store::open_in_memory().unwrap();
+        let mut ids = Vec::new();
+        for (state, backend, certainty) in [
+            (
+                SandboxState::Creating,
+                None,
+                CreateCertainty::AllocationAmbiguous,
+            ),
+            (
+                SandboxState::Ready,
+                Some("ab1"),
+                CreateCertainty::AllocationAmbiguous,
+            ),
+            (
+                SandboxState::Deleting,
+                Some("ab2"),
+                CreateCertainty::AllocationAmbiguous,
+            ),
+            (
+                SandboxState::Lost,
+                Some("ab3"),
+                CreateCertainty::AllocationAmbiguous,
+            ),
+            (
+                SandboxState::Failed,
+                None,
+                CreateCertainty::AllocationAmbiguous,
+            ),
+            (
+                SandboxState::Failed,
+                None,
+                CreateCertainty::DefinitelyNotCreated,
+            ),
+            (
+                SandboxState::Failed,
+                Some("ab4"),
+                CreateCertainty::AllocationAmbiguous,
+            ),
+            (
+                SandboxState::Deleted,
+                None,
+                CreateCertainty::AllocationAmbiguous,
+            ),
+        ] {
+            let mut sb = sandbox();
+            sb.state = state;
+            sb.backend_id = backend.map(str::to_owned);
+            sb.create_certainty = certainty;
+            store.insert_sandbox(&sb).unwrap();
+            ids.push(sb.id);
+        }
+        // Even otherwise removable history must keep a non-terminal child.
+        let pending = execution(&ids[7]);
+        store.insert_execution(&pending).unwrap();
+        let before = store.sandbox_resources().unwrap();
+        let policy = Retention {
+            execution_max_count: 0,
+            sandbox_max_count: 0,
+            ..Retention::default()
+        };
+        let result = store.prune(&policy, now_ms()).unwrap();
+        assert_eq!(result.sandboxes, 2);
+        assert_eq!(store.sandbox_resources().unwrap(), before);
+        for id in &ids[..5] {
+            assert!(store.sandbox(id).unwrap().is_some());
+        }
+        assert!(store.sandbox(&ids[7]).unwrap().is_some());
+        assert!(store.execution(&pending.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn retention_age_count_and_watermark_survive_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        let sb = sandbox();
+        store.insert_sandbox(&sb).unwrap();
+        let mut ids = Vec::new();
+        for time in [1, 8000, 9000, 10000] {
+            let e = execution(&sb.id);
+            store.insert_execution(&e).unwrap();
+            store
+                .conn()
+                .execute(
+                    "UPDATE executions SET state='exited', finished_at_ms=?2 WHERE id=?1",
+                    params![e.id, time],
+                )
+                .unwrap();
+            ids.push(e.id);
+        }
+        let policy = Retention {
+            execution_max_age_secs: 5,
+            execution_max_count: 2,
+            ..Retention::default()
+        };
+        assert_eq!(store.prune(&policy, 10000).unwrap().executions, 2);
+        assert!(store.execution(&ids[1]).unwrap().is_none());
+        assert!(store.execution(&ids[2]).unwrap().is_some());
+        store
+            .conn()
+            .execute("UPDATE executions SET finished_at_ms=1", [])
+            .unwrap();
+        assert_eq!(store.prune(&policy, 10000).unwrap().executions, 2);
+        let upper = store.sandbox_page(true, None, None, 10).unwrap().upper_seq;
+        store
+            .set_sandbox_state(&sb.id, SandboxState::Deleted, None, None)
+            .unwrap();
+        let zero = Retention {
+            sandbox_max_count: 0,
+            ..policy
+        };
+        assert_eq!(store.prune(&zero, 10000).unwrap().sandboxes, 1);
+        drop(store);
+        let store = Store::reopen_after_restart(&dir);
+        store.insert_sandbox(&sandbox()).unwrap();
+        assert!(
+            store
+                .sandbox_page(true, Some(upper), None, 10)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn output_storage_modes_keep_truthful_metadata() {
+        for mode in [
+            OutputStorage::Full,
+            OutputStorage::Metadata,
+            OutputStorage::None,
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let sb = sandbox();
+            store.insert_sandbox(&sb).unwrap();
+            let e = execution(&sb.id);
+            store.insert_execution(&e).unwrap();
+            let capture = Captured {
+                data: b"secret".to_vec(),
+                total_bytes: 20,
+                total_bytes_known: true,
+                truncated: true,
+            };
+            store
+                .finish_execution_with_storage(
+                    &e.id,
+                    &ExecutionResult {
+                        state: ExecutionState::Exited,
+                        exit_code: Some(0),
+                        command_status: Some(&CommandStatus::Exited(0)),
+                        runtime_error: None,
+                        failure_reason: None,
+                        stdout: &capture,
+                        stderr: &capture,
+                    },
+                    mode,
+                )
+                .unwrap();
+            let got = store.execution(&e.id).unwrap().unwrap();
+            assert_eq!(
+                got.stdout.data,
+                if mode == OutputStorage::Full {
+                    b"secret".to_vec()
+                } else {
+                    vec![]
+                }
+            );
+            if mode == OutputStorage::None {
+                assert_eq!(got.stdout.total_bytes, 0);
+                assert!(!got.stdout.total_bytes_known);
+                assert!(!got.stdout.truncated());
+            } else {
+                assert_eq!(got.stdout.total_bytes, 20);
+                assert!(got.stdout.total_bytes_known && got.stdout.truncated());
+            }
+        }
+    }
+
     fn schema_v4() -> String {
-        let start = SCHEMA.find(",\n    create_certainty").unwrap();
-        let end = start + SCHEMA[start..].find("\n);").unwrap();
-        format!("{}{}", &SCHEMA[..start], &SCHEMA[end..])
+        let schema = SCHEMA.replace("CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);\nINSERT INTO history_sequence VALUES (1, 0);\n", "");
+        let start = schema.find(",\n    create_certainty").unwrap();
+        let end = start + schema[start..].find("\n);").unwrap();
+        format!("{}{}", &schema[..start], &schema[end..])
     }
 
     fn schema_v3() -> String {
@@ -1625,10 +1898,25 @@ mod tests {
         let spec = serde_json::to_string(&sandbox().spec).unwrap();
         for (seq, (id, state, backend_id, reason)) in [
             // Reads exactly like a preflight failure, but no typed result exists.
-            ("sb-preflight", "failed", None, Some("kiln create failed (exit status: 124): image \"nope\" is missing")),
+            (
+                "sb-preflight",
+                "failed",
+                None,
+                Some("kiln create failed (exit status: 124): image \"nope\" is missing"),
+            ),
             ("sb-claim", "failed", None, Some("definitely_not_created")),
-            ("sb-panic", "failed", None, Some("backend create task panicked")),
-            ("sb-compensated", "failed", Some("ab-1"), Some("backend removed")),
+            (
+                "sb-panic",
+                "failed",
+                None,
+                Some("backend create task panicked"),
+            ),
+            (
+                "sb-compensated",
+                "failed",
+                Some("ab-1"),
+                Some("backend removed"),
+            ),
             ("sb-creating", "creating", None, None),
             ("sb-ready", "ready", Some("ab-2"), None),
             ("sb-deleting", "deleting", None, None),
@@ -1665,7 +1953,7 @@ mod tests {
                     .conn()
                     .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                     .unwrap(),
-                5
+                SCHEMA_VERSION
             );
         }
     }
@@ -1758,9 +2046,19 @@ mod tests {
             assert!(conn.execute("UPDATE sandboxes SET create_certainty = 'definitely_not_created'", []).is_err());
             assert!(conn.execute("UPDATE sandboxes SET create_certainty = 'other'", []).is_err());
             drop(conn);
-            store.fail_create_definitely(&s.id, "image missing").unwrap();
-            for state in [SandboxState::Creating, SandboxState::Ready, SandboxState::Deleting, SandboxState::Lost] {
-                assert!(store.set_sandbox_state(&s.id, state, None, None).is_err(), "{state:?}");
+            store
+                .fail_create_definitely(&s.id, "image missing")
+                .unwrap();
+            for state in [
+                SandboxState::Creating,
+                SandboxState::Ready,
+                SandboxState::Deleting,
+                SandboxState::Lost,
+            ] {
+                assert!(
+                    store.set_sandbox_state(&s.id, state, None, None).is_err(),
+                    "{state:?}"
+                );
             }
             assert!(store.set_sandbox_state(&s.id, SandboxState::Failed, Some("ab-1"), None).is_err());
             let row = store.sandbox(&s.id).unwrap().unwrap();

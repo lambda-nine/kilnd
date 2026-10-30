@@ -119,8 +119,8 @@ sandbox compromises the host.
 - **Failed creates retain history without consuming budget.** Rows released by
   typed proof, like `DELETED` rows and compensated `FAILED` rows, are not bounded
   by the node budgets. An authorized caller can grow the database and the default
-  listing by repeating a preflight failure until the rows are deleted. Durable
-  history has no retention limit yet; see the roadmap.
+  listing by repeating a preflight failure until the rows are deleted. Eligible terminal
+  history is now bounded by configurable retention; charged rows stay.
   Memory, PIDs and disk are reserved from requested effective sandbox limits;
   they are not measurements of current RSS, task count or disk usage. CPU is
   intentionally schedulable and may be overcommitted rather than reserved.
@@ -153,11 +153,15 @@ sandbox compromises the host.
   waits for `Runtime::exec`; a backend that never acknowledges cancellation
   can delay delete or shutdown indefinitely. The supported kiln backend
   returns only after its per-execution cgroup is empty and pipes are clean.
-- **Output is stored as-is.** Up to 1 MiB of each stream per execution goes
-  into SQLite. Secrets a command prints are persisted (root-only) until the
-  database is pruned, and there is no retention yet.
-- **The database grows without bound.** Deleted sandboxes and every
-  execution are kept for history.
+- **Output is stored as-is in the default `full` mode.** `metadata` is
+  recommended: counts, certainty and truncation facts survive without output
+  bytes. `none` discards that output evidence too. Retention bounds eligible
+  terminal history by age and count; charged or unfinished work is never
+  pruned. Pruning frees SQLite pages, not secure erasure of DB/WAL/backups.
+  Argv, diagnostics and labels can also contain secrets. There is deliberately
+  no regex secret redaction: it gives false confidence for arbitrary encoded,
+  split or unfamiliar credentials. The planned credential broker should keep
+  credentials out of sandbox-visible data in the first place.
 - **Machine evidence has a private transport.** Four private Unix sockets
   separate status and workload stdio from bounded CLI diagnostics. Workload
   output cannot forge an outcome. Strict persistent-exec v1 decoding requires

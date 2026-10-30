@@ -29,6 +29,7 @@ use crate::validation::{
 /// Limits and defaults; see `Config` in main.rs for the flags that set them.
 #[derive(Clone, Debug)]
 pub struct Limits {
+    pub retention: crate::retention::Retention,
     pub default_image: String,
     pub default_memory_bytes: u64,
     pub default_cpu_millis: u32,
@@ -66,6 +67,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            retention: crate::retention::Retention::default(),
             default_image: "alpine".into(),
             default_memory_bytes: 512 << 20,
             default_cpu_millis: 1000,
@@ -292,6 +294,10 @@ impl<R: Runtime> Manager<R> {
             node_resource_rejections: AtomicU64::new(0),
             started_at_ms: now_ms(),
         }
+    }
+
+    pub fn prune(&self) -> Result<crate::retention::Pruned> {
+        Ok(self.store.prune(&self.limits.retention, now_ms())?)
     }
 
     pub fn runtime(&self) -> &R {
@@ -1343,7 +1349,7 @@ impl<R: Runtime> Manager<R> {
         let mut retry_delay = Duration::from_millis(10);
         let mut finalization_degraded = false;
         loop {
-            match self.store.finish_execution(
+            match self.store.finish_execution_with_storage(
                 &execution.id,
                 &ExecutionResult {
                     state,
@@ -1354,6 +1360,7 @@ impl<R: Runtime> Manager<R> {
                     stdout,
                     stderr,
                 },
+                self.limits.retention.output_storage,
             ) {
                 Ok(()) => break,
                 Err(error) => {
@@ -1391,6 +1398,10 @@ impl<R: Runtime> Manager<R> {
             Ok(None) => return Some(Err(Error::Internal(anyhow::anyhow!("execution vanished")))),
             Err(error) => return Some(Err(error.into())),
         };
+        // Retention is a storage policy. The waiting caller still receives the
+        // captured bytes, even when history keeps metadata or no output.
+        execution.stdout = outcome.stdout;
+        execution.stderr = outcome.stderr;
         Some(Ok(execution))
     }
 

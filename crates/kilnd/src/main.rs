@@ -39,6 +39,19 @@ struct Args {
     /// Bytes of stdout and of stderr kept per execution.
     #[arg(long, default_value_t = 1 << 20)]
     max_output_bytes: usize,
+    /// Persist captured bytes, metadata only (recommended), or no output evidence.
+    #[arg(long, value_enum, default_value_t = kilnd::retention::OutputStorage::Full)]
+    output_storage: kilnd::retention::OutputStorage,
+    #[arg(long, default_value_t = 604800)]
+    execution_max_age_secs: u64,
+    #[arg(long, default_value_t = 10000)]
+    execution_max_count: u32,
+    #[arg(long, default_value_t = 604800)]
+    deleted_sandbox_max_age_secs: u64,
+    #[arg(long, default_value_t = 1000)]
+    deleted_sandbox_max_count: u32,
+    #[arg(long, default_value_t = 60)]
+    prune_interval_secs: u64,
     /// Durable sandbox reservations retained at once, including lost and ambiguous rows.
     #[arg(long, default_value_t = 32)]
     max_sandboxes: u32,
@@ -194,6 +207,22 @@ async fn run(args: Args) -> Result<()> {
         "reconciled with kiln"
     );
 
+    manager.prune().context("startup history prune")?;
+    let prune_manager = manager.clone();
+    let prune_cancel = tokio_util::sync::CancellationToken::new();
+    let stop_prune = prune_cancel.clone();
+    let prune_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(args.prune_interval_secs));
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = stop_prune.cancelled() => break,
+                _ = interval.tick() => if let Err(error) = prune_manager.prune() {
+                    error!(%error, "history prune failed");
+                }
+            }
+        }
+    });
     info!(socket = %args.socket.display(), group = %args.socket_group, version = env!("CARGO_PKG_VERSION"), "serving");
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -210,12 +239,34 @@ async fn run(args: Args) -> Result<()> {
         Duration::from_secs(args.shutdown_grace_secs),
     )
     .await;
+    prune_cancel.cancel();
+    prune_task.await.context("join history pruner")?;
     info!("stopped");
     result
 }
 
 fn validated_limits(args: &Args) -> Result<Limits> {
+    for age in [
+        args.execution_max_age_secs,
+        args.deleted_sandbox_max_age_secs,
+    ] {
+        if age
+            .checked_mul(1000)
+            .and_then(|n| i64::try_from(n).ok())
+            .is_none()
+        {
+            bail!("retention age exceeds timestamp range");
+        }
+    }
     let limits = Limits {
+        retention: kilnd::retention::Retention {
+            execution_max_age_secs: args.execution_max_age_secs,
+            execution_max_count: args.execution_max_count,
+            sandbox_max_age_secs: args.deleted_sandbox_max_age_secs,
+            sandbox_max_count: args.deleted_sandbox_max_count,
+            prune_interval_secs: args.prune_interval_secs,
+            output_storage: args.output_storage,
+        },
         default_timeout: Duration::from_secs(args.default_timeout_secs),
         max_timeout: Duration::from_secs(args.max_timeout_secs),
         max_output_bytes: args.max_output_bytes,
@@ -284,6 +335,7 @@ fn validated_limits(args: &Args) -> Result<Limits> {
         ("health-success-cache-secs", args.health_success_cache_secs),
         ("health-failure-cache-secs", args.health_failure_cache_secs),
         ("shutdown-grace-secs", args.shutdown_grace_secs),
+        ("prune-interval-secs", args.prune_interval_secs),
     ] {
         if value == 0 {
             bail!("--{name} must be nonzero");
@@ -314,7 +366,11 @@ fn validated_limits(args: &Args) -> Result<Limits> {
             limits.max_node_memory_bytes,
         ),
         ("pids", u64::from(limits.default_pids), limits.max_node_pids),
-        ("disk", limits.default_disk_bytes, limits.max_node_disk_bytes),
+        (
+            "disk",
+            limits.default_disk_bytes,
+            limits.max_node_disk_bytes,
+        ),
     ] {
         if default > node_limit {
             bail!("default sandbox {name} {default} exceeds node budget {node_limit}");

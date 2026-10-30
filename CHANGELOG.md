@@ -1,5 +1,7 @@
 # Changelog
 
+- Add startup/periodic age and count retention with reservation protection and full/metadata/none output storage.
+
 Notable changes to kilnd. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0, any minor release may change the CLI or on-disk layout. The
 `kilnd.v1` API only gains fields and RPCs.

@@ -207,3 +207,23 @@ scripts/smoke.sh              # kilndctl → socket → service → kiln, checke
 
 Copyright 2026 Stephen Estrada. Licensed under the
 [Apache License, Version 2.0](LICENSE).
+
+## History retention
+
+History is pruned at startup and every `--prune-interval-secs` (60 by default).
+Terminal executions have a seven day / 10,000 row limit (`--execution-max-age-secs`,
+`--execution-max-count`). Deleted sandboxes and uncharged failed creates have a
+seven day / 1,000 row limit (`--deleted-sandbox-max-age-secs`,
+`--deleted-sandbox-max-count`). The first limit reached expires history; zero
+age/count keeps none of the eligible history. Reserved or nonterminal sandbox
+rows and unfinished executions never expire. Removing sandbox history removes
+its terminal execution history too. SQLite reuses freed pages; pruning does not
+securely erase old bytes from the DB, WAL, backups or storage.
+
+`--output-storage full|metadata|none` controls future durable output. `full` is
+the compatibility default; **`metadata` is recommended**, keeping observed byte
+counts, certainty and capture truncation facts without stdout/stderr bytes.
+`none` keeps neither output bytes nor output evidence (zero counts with unknown
+totals). The immediate Exec response still carries captured output. Other
+execution metadata, argv, labels and diagnostics can contain secrets. Changing
+mode does not scrub historical rows or backups.
