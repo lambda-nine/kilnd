@@ -24,7 +24,7 @@ use crate::model::{RuntimeDiagnostic, RuntimeErrorKind as Kind, RuntimeStage as 
 use crate::process::{self, Finish};
 
 /// Capability negotiation, rather than package strings, gates compatibility.
-const PROTOCOL_REQUIREMENT: &str = "persistent-exec protocol v1 first supplied by kiln f3da4b5319566de4912ed617caf81d4eb8e50b6f (follow-up 711440db3167cdf3a90d3aad44623ce56c2d01b1; baseline 3b42552)";
+const PROTOCOL_REQUIREMENT: &str = "persistent-exec protocol v1 and scoped gc ID... (minimum kiln 40d9aa5003205d4c171e1b3eca61e9868064e98b)";
 /// kiln's own output (IDs, `ls` tables, errors) is small.
 const CONTROL_OUTPUT: usize = 64 * 1024;
 const CREATE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -136,6 +136,9 @@ impl KilnRuntime {
             let caps = protocol::capabilities(&out.status.bytes)
                 .map_err(|e| format!("{e}; {}", observed()))?;
             caps.require_v1()?;
+            if id.is_none() {
+                self.require_scoped_gc(deadline, cancel).await?;
+            }
             Ok::<_, String>(caps)
         }
         .await;
@@ -146,6 +149,30 @@ impl KilnRuntime {
                 scope
             ))
         })
+    }
+
+    /// Scoped GC predates a capability feature bit. Check its advertised CLI
+    /// grammar without invoking collection, including on an empty database.
+    async fn require_scoped_gc(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        let out = self.call_until("gc --help", &["gc".into(), "--help".into()], deadline, cancel)
+            .await.map_err(|e| format!("scoped gc capability check failed: {e}"))?;
+        if out.stdout_completion != process::CaptureCompletion::Eof
+            || out.stderr_completion != process::CaptureCompletion::Eof
+            || out.stdout.truncated()
+            || out.stderr.truncated()
+        {
+            return Err("scoped gc capability check received incomplete help output".into());
+        }
+        let text = std::str::from_utf8(&out.stdout.data)
+            .map_err(|e| format!("scoped gc help is not UTF-8: {e}"))?;
+        if !text.lines().any(|line| line.starts_with("Usage: ") && line.ends_with(" gc [ID]...")) {
+            return Err("scoped gc ID... is required; install kiln 40d9aa500320 or later with scoped GC support (global GC is never used)".into());
+        }
+        Ok(())
     }
 
     async fn list_until(
@@ -929,7 +956,7 @@ mod tests {
             assert!(!tmp.path().join("workload").exists());
             let calls = fs::read_to_string(tmp.path().join("calls")).unwrap();
             assert!(
-                calls.contains("capabilities --protocol=1\ncapabilities --protocol=1 abcd\nls\n")
+                calls.contains("capabilities --protocol=1\ngc --help\ncapabilities --protocol=1 abcd\nls\n")
             );
         }
     }
@@ -1003,7 +1030,7 @@ mod tests {
         assert_eq!(out.command_status, Some(CommandStatus::Exited(125)));
         assert_eq!(
             fs::read_to_string(trace).unwrap(),
-            "capabilities\ncapabilities\nexec\n"
+            "capabilities\ngc\ncapabilities\nexec\n"
         );
     }
 
@@ -1637,6 +1664,36 @@ mod tests {
         let runtime = KilnRuntime::new(bin);
         assert!(runtime.create(&spec(Network::None)).await.is_err());
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn scoped_gc_compatibility_rejects_legacy_cli_before_reconciliation() {
+        use crate::manager::{Limits, Manager};
+        use crate::store::Store;
+        for help in ["Usage: kiln gc\n", "Usage: kiln gc [ID]...\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = fixture_runtime(tmp.path(), "sys.exit(0)");
+            let trace = tmp.path().join("calls");
+            let source = fs::read_to_string(&runtime.bin).unwrap().replace(
+                "if sys.argv[1]=='capabilities':",
+                &format!("open({trace:?},'a').write(' '.join(sys.argv[1:])+'\\n')\nif sys.argv[1]=='gc' and sys.argv[2:]==['--help']:\n    print({help:?},end='')\n    sys.exit(0)\nif sys.argv[1]=='capabilities':"),
+            );
+            fs::write(&runtime.bin, source).unwrap();
+            let result = runtime.version(Instant::now() + QUERY_TIMEOUT, &CancellationToken::new()).await;
+            if help.contains("[ID]...") {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(error, RuntimeError::Incompatible(_)));
+                assert!(error.to_string().contains("scoped gc"), "{error}");
+                let manager = Manager::new(runtime, Store::open_in_memory().unwrap(), Limits::default());
+                assert!(manager.reconcile().await.is_err());
+                assert!(manager.list(true).unwrap().is_empty());
+            }
+            let calls = fs::read_to_string(trace).unwrap();
+            assert!(calls.contains("gc --help\n"));
+            assert!(calls.lines().all(|call| call == "capabilities --protocol=1" || call == "gc --help"));
+        }
     }
 
     #[tokio::test]

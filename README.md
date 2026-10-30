@@ -125,7 +125,9 @@ Sandboxes outlive kilnd: restarting or upgrading the daemon leaves them
 running, and reconciliation picks them up again.
 
 kilnd requires persistent-exec protocol v1 in both the installed kiln CLI and
-each sandbox PID 1. It checks capabilities before reconciliation and Exec;
+each sandbox PID 1, plus CLI support for scoped `gc ID...` (minimum kiln
+`40d9aa500320`). It checks capabilities and complete `gc --help` usage before
+reconciliation and Exec;
 old sandbox instances require explicit recreation. Command bytes use private
 streams, so real exits 125/126/127 and signal termination remain distinct from
 runtime failures. Schema 4 stores typed outcomes and truthful output-accounting

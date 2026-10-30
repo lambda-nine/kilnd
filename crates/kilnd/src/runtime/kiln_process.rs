@@ -576,6 +576,9 @@ EXIT125=bytes.fromhex('4b494c4e45584f000100010018000000010102007d000000000000000
 if sys.argv[1]=='capabilities':
     os.write(1,CAPS)
     sys.exit(0)
+if sys.argv[1:]==['gc','--help']:
+    print('Usage: kiln gc [ID]...')
+    sys.exit(0)
 fds={{a.split('=')[0]:int(a.split('=')[1]) for a in sys.argv[2:7]}}
 STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds['--stderr-fd']
 {body}

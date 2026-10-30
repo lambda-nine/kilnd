@@ -71,9 +71,11 @@ backend call and returns `DEADLINE_EXCEEDED`. Once a row exists, timeout
 produces a successful terminal `TIMED_OUT` execution after backend cleanup
 and SQLite publication. Cleanup is never timed out by the service.
 
-The required persistent-exec protocol v1 was first supplied by kiln
-`f3da4b5319566de4912ed617caf81d4eb8e50b6f`, with follow-up
-`711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on `3b42552`.
+The required persistent-exec v1 plus scoped GC interface first coexist in
+kiln `40d9aa5003205d4c171e1b3eca61e9868064e98b`. The older `711440db3167`
+exec-protocol artifact lacks scoped GC and is refused. CLI capability validation
+also requires complete, bounded `gc --help` output advertising `gc [ID]...`,
+within the caller's deadline. It never invokes global GC to test compatibility.
 Both installed CLI and sandbox PID 1 capabilities are checked before each
 execution, within its existing deadline. Create requires
 `--require-exec-protocol=1`; there is no machine legacy fallback. Package and

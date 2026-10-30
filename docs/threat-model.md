@@ -159,9 +159,11 @@ sandbox compromises the host.
   into `LOST`. A validated exact backend may recover `LOST` to `READY`.
   CLI and every managed live sandbox must advertise required capabilities;
   incompatible replacements and old PID 1 instances fail closed.
-  This requires persistent-exec v1 first supplied by kiln
-  `f3da4b5319566de4912ed617caf81d4eb8e50b6f`, with follow-up
-  `711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on `3b42552`.
+  This requires persistent-exec v1 plus scoped `gc ID...`, first combined in
+  kiln `40d9aa5003205d4c171e1b3eca61e9868064e98b`. The older `711440db3167`
+  artifact lacks scoped GC and is refused before reconciliation, even with an
+  empty database. Complete `gc --help` usage supplements the protocol capability
+  frame; compatibility validation never invokes global garbage collection.
 - **A daemon crash during `kiln create`** can leave a kiln sandbox whose
   backend ID was never returned to kilnd. Reconciliation records the row as an
   ambiguous `FAILED` reservation and logs the backend as unmanaged; it cannot

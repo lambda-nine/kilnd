@@ -33,12 +33,13 @@ sudo scripts/setup-storage.sh       # XFS project quotas for --disk
 scripts/install.sh                  # /usr/local/bin/kiln, kiln-dns, kiln-metrics
 ```
 
-kilnd requires persistent-exec protocol v1, first supplied by kiln commit
-`f3da4b5319566de4912ed617caf81d4eb8e50b6f`, with follow-up
-`711440db3167cdf3a90d3aad44623ce56c2d01b1`, based on baseline `3b42552`.
-Install that exact compatible artifact, then check
-`kiln capabilities --protocol=1` (binary output). kilnd validates capabilities,
-rather than trusting `--version`. Existing sandboxes need compatible PID 1
+kilnd requires persistent-exec protocol v1 and scoped `gc ID...`. The minimum
+kiln revision providing both is `40d9aa5003205d4c171e1b3eca61e9868064e98b`.
+`711440db3167` has the exec protocol but lacks scoped GC and is refused.
+Install a compatible artifact, then check `kiln capabilities --protocol=1`
+(binary output) and `kiln gc --help` (usage must advertise `[ID]...`). kilnd
+checks both interfaces before reconciliation and workload launch rather than
+trusting `--version`; it never falls back to global garbage collection. Existing sandboxes need compatible PID 1
 instances too; an old instance requires explicit recreation. An incompatible
 replacement CLI degrades Health and is rejected before workload launch.
 

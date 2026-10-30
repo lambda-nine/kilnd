@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Reject exec-capable CLIs lacking scoped `gc ID...` before reconciliation and
+  workload launch, including on an empty database. A complete, bounded
+  `gc --help` usage check supplements v1 capability frames without global GC.
+  Minimum companion kiln is `40d9aa5003205d4c171e1b3eca61e9868064e98b`;
+  the previously advertised `711440db3167` is insufficient.
+
 - Recheck compensated history on every Delete state reload, including after
   waiting for create compensation. Queued deletion cannot remove a replacement
   using the old backend ID or temporarily reserve compensated history again.
