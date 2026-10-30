@@ -16,6 +16,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 - Honor non-Exec helper wire deadlines and cancellation through create, remove,
   list and scoped GC, capped by their internal limits; share the remaining
   removal budget with absence probes and preserve ambiguous create evidence.
+  Wire-level regressions cover timeout without client cancellation and child reaping.
 
 - Fix the helper stdio handoff ordering race on macOS: private protocol v3
   retains sent endpoints until recvmsg receipt, preventing premature output EOF

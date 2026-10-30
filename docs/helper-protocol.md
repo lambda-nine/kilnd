@@ -110,7 +110,8 @@ validators. Those shared modules and the installed kiln CLI remain part of
 the privileged trusted computing base and must be included in audits; counting
 only the helper binary's entry point would understate it.
 
-The Phase 0 root audit surface is 3,444 physical production lines (including
+At `d79341d` (before the receipt and control-deadline fixes), the Phase 0 root
+audit surface is 3,444 physical production lines (including
 comments and blanks): 889 in the entry point, server, framing, descriptor
 handling, per-syscall socket I/O and typed protocol; 833 in the shared direct adapter; 1,108 in shared
 process supervision and kiln protocol; and 614 in shared validation, model and

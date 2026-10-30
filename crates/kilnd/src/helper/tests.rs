@@ -526,8 +526,10 @@ time.sleep(30)
             assert!(fds::receive(&control).await.unwrap().is_empty());
             let began = timeout(Duration::from_secs(2), async {
                 loop {
-                    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-                        break pid.parse::<i32>().unwrap();
+                    if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                        && let Ok(pid) = pid.parse::<i32>()
+                    {
+                        break pid;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
