@@ -449,9 +449,13 @@ keep the legacy EXITED projection, 124 for timeout and 125 for other failures.
 List pages capture the maximum matching sequence on the first page, fetch at
 most `limit + 1` rows, and continue strictly below the last returned sequence.
 Later inserts are excluded; updates do not move rows. This watermark is not a
-snapshot of metadata or deletion state across pages. Tokens are opaque to
-clients; the server accepts only canonical versioned ASCII tokens bound to the
-deleted filter and validates positive, ordered cursor ranges.
+snapshot of metadata or deletion state across pages. Tokens are bounded plaintext cursors, not opaque. They encode the version,
+deleted filter, caller uid, global upper sequence and last sequence. The server
+validates canonical ASCII and positive, ordered cursor ranges and binds the
+cursor to the caller uid and filter. Clients should return the token unchanged.
+Global sequence gaps can reveal counts of other callers' sandbox inserts over
+an interval, though foreign IDs, specs and output stay hidden. Tokens are not
+authenticated or encrypted and do not provide a confidentiality boundary.
 
 Absent `page_size` with an empty token preserves complete-list semantics.
 Legacy calls exceeding the item or byte bounds fail `RESOURCE_EXHAUSTED`

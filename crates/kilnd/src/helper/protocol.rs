@@ -56,13 +56,13 @@ impl Request {
     pub fn validate(&self, fds: usize) -> Result<(), String> {
         let Operation::Kiln(op) = &self.operation;
         let exec = matches!(op, KilnRequest::Exec { .. });
-        if self.version != 1
+        if self.version != 2
             || self.timeout_ms == 0
             || self.timeout_ms > if exec { 3_600_000 } else { 120_000 }
         {
             return Err("unsupported version or timeout".into());
         }
-        if fds != if exec { 3 } else { 0 } {
+        if fds != 0 {
             return Err("wrong descriptor count".into());
         }
         match op {

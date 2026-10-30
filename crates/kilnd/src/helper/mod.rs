@@ -3,6 +3,7 @@ mod client;
 mod fds;
 pub(crate) mod protocol;
 mod server;
+mod socket;
 pub(crate) use client::Client;
 use serde::{Serialize, de::DeserializeOwned};
 pub use server::serve;

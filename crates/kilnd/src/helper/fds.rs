@@ -39,7 +39,13 @@ pub async fn send(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
                     );
                 }
             }
-            let rc = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+            let rc = unsafe {
+                libc::sendmsg(
+                    stream.as_raw_fd(),
+                    &msg,
+                    libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                )
+            };
             if rc == 1 {
                 Ok(())
             } else if rc < 0 {
@@ -66,9 +72,9 @@ pub async fn receive(stream: &UnixStream) -> io::Result<Vec<OwnedFd>> {
             msg.msg_control = control.as_mut_ptr().cast();
             msg.msg_controllen = size_of::<[usize; 16]>() as _;
             #[cfg(target_os = "linux")]
-            let flags = libc::MSG_CMSG_CLOEXEC;
+            let flags = libc::MSG_CMSG_CLOEXEC | libc::MSG_DONTWAIT;
             #[cfg(not(target_os = "linux"))]
-            let flags = 0;
+            let flags = libc::MSG_DONTWAIT;
             let rc = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, flags) };
             if rc < 0 {
                 return Err(io::Error::last_os_error());

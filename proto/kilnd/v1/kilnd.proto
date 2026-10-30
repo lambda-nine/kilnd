@@ -26,7 +26,7 @@ service KilndService {
   // Returns one sandbox and its most recent executions.
   rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
 
-  // Stable newest-first pages with opaque continuation tokens. Legacy calls
+  // Stable newest-first pages with bounded continuation cursors. Legacy calls
   // without page_size fail RESOURCE_EXHAUSTED rather than silently truncate
   // when the complete list cannot fit the server's count or byte bounds.
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);

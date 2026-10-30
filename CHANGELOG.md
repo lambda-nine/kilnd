@@ -6,6 +6,17 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix PH0-1 root-helper availability: private protocol v2 creates stdio pairs in
+  the helper and passes only peer endpoints to kilnd, rejecting all inbound
+  descriptors. Per-syscall nonblocking socket I/O protects deadlines and the
+  listener against mutable flags and backpressure; Linux regressions exercise
+  flag mutation, stalled stdin and cancellation. Upgrade daemon/helper together.
+- Restore PH0-2 helper systemd address-family, personality, realtime and
+  kernel-log filters with ambient CAP_SETUID for UID-map setup. Installed
+  regressions require Seccomp 2 and exact effective/bounding capability masks.
+- Clarify PH0-3: API page tokens are bounded plaintext cursors whose global
+  sequence gaps can reveal cross-caller insertion counts; they are not opaque.
+
 - Add startup/periodic age and count retention with reservation protection and full/metadata/none output storage.
 
 - Run kilnd as its unprivileged system account with no capabilities; isolate

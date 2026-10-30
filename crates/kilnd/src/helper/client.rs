@@ -3,7 +3,7 @@ use super::{fds, read_frame, write_frame};
 use crate::model::{Captured, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage};
 use crate::runtime::{ExecFinish, ExecOutcome, ExecSpec};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,14 +23,14 @@ impl Client {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> io::Result<Response> {
-        self.exchange(operation, deadline, cancel, Vec::new()).await
+        self.exchange(operation, deadline, cancel, None).await
     }
     async fn exchange(
         &self,
         operation: KilnRequest,
         deadline: Instant,
         cancel: &CancellationToken,
-        descriptors: Vec<OwnedFd>,
+        stdio: Option<tokio::sync::oneshot::Sender<Vec<OwnedFd>>>,
     ) -> io::Result<Response> {
         if cancel.is_cancelled() || Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -60,14 +60,12 @@ impl Client {
         };
         let response_deadline = deadline + allowance;
         let request = Request {
-            version: 1,
+            version: 2,
             deadline_ns,
             timeout_ms: u32::try_from(remaining).map_err(io::Error::other)?,
             operation: Operation::Kiln(operation),
         };
-        request
-            .validate(descriptors.len())
-            .map_err(io::Error::other)?;
+        request.validate(0).map_err(io::Error::other)?;
         let mut stream = timeout_at(
             deadline.min(Instant::now() + Duration::from_secs(2)),
             UnixStream::connect(&self.path),
@@ -78,8 +76,7 @@ impl Client {
             return Err(io::Error::other("helper is not root"));
         }
         timeout_at(deadline, async {
-            let raw: Vec<_> = descriptors.iter().map(AsRawFd::as_raw_fd).collect();
-            fds::send(&stream, &raw).await?;
+            fds::send(&stream, &[]).await?;
 
             write_frame(&mut stream, &request).await
         })
@@ -88,9 +85,19 @@ impl Client {
         let (mut reader, mut writer) = stream.into_split();
         let result = {
             let response = async {
-                timeout_at(response_deadline, read_frame(&mut reader))
-                    .await
-                    .map_err(io::Error::other)?
+                timeout_at(response_deadline, async {
+                    let descriptors = fds::receive(reader.as_ref()).await?;
+                    if descriptors.len() != if stdio.is_some() { 3 } else { 0 } {
+                        return Err(io::Error::other("wrong helper descriptor count"));
+                    }
+                    if let Some(tx) = stdio {
+                        tx.send(descriptors)
+                            .map_err(|_| io::Error::other("stdio receiver closed"))?;
+                    }
+                    read_frame(&mut reader).await
+                })
+                .await
+                .map_err(io::Error::other)?
             };
             tokio::pin!(response);
             tokio::select! {
@@ -140,22 +147,28 @@ impl Client {
             stderr: observed_err.lock().unwrap().clone(),
         };
         let operation = async {
-            let (mut input, input_fd) = UnixStream::pair()?;
-            let (mut output, output_fd) = UnixStream::pair()?;
-            let (mut error, error_fd) = UnixStream::pair()?;
-            let descriptors: Vec<OwnedFd> = vec![
-                input_fd.into_std()?.into(),
-                output_fd.into_std()?.into(),
-                error_fd.into_std()?.into(),
-            ];
+            let (tx, rx) = tokio::sync::oneshot::channel();
             let request = KilnRequest::Exec {
                 id: id.into(),
                 argv: spec.argv.to_vec(),
                 stdin_bytes: spec.stdin.len(),
                 max_output: spec.max_output,
             };
-            let exchange = self.exchange(request, spec.deadline, cancel, descriptors);
+            let exchange = self.exchange(request, spec.deadline, cancel, Some(tx));
             let io_work = async {
+                let descriptors = rx.await.map_err(io::Error::other)?;
+                let mut streams = descriptors.into_iter();
+                let mut next = || {
+                    fds::socket(
+                        streams
+                            .next()
+                            .ok_or_else(|| io::Error::other("missing helper stdio"))?,
+                        self.expected_uid,
+                    )
+                };
+                let mut input = next()?;
+                let mut output = next()?;
+                let mut error = next()?;
                 input.write_all(spec.stdin).await?;
                 input.shutdown().await?;
                 tokio::try_join!(

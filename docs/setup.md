@@ -168,7 +168,7 @@ than the deadline. Tickets remain held while finalization retries.
 
 `kilndctl ls` follows pages and prints incrementally. Other clients should set
 `page_size` (present zero means the server default, normally 100) and pass the
-opaque `next_page_token` until empty, keeping `include_deleted` and the calling
+bounded `next_page_token` until empty, keeping `include_deleted` and the calling
 uid unchanged. Tokens do not survive the schema 7 upgrade: restart the listing.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte

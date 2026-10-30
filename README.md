@@ -121,7 +121,7 @@ API callers can control only their own sandboxes; root can control all of them. 
   returns a terminal `TIMED_OUT` execution after cleanup and publication,
   which may finish after the deadline. Permits remain held through cleanup
   and terminal-write retries.
-- **Bounded queries:** List supports opaque pagination tokens (200 items and
+- **Bounded queries:** List supports bounded pagination cursors (200 items and
   1 MiB per page by default); legacy complete-list calls fail explicitly
   when they cannot fit. `kilndctl ls` prints pages incrementally. GetSandbox
   reads recent execution metadata without loading captured output BLOBs while

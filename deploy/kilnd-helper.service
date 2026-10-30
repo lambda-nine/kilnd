@@ -23,10 +23,13 @@ InaccessiblePaths=-/dev/kmsg -/proc/kmsg
 ReadWritePaths=/var/lib/kiln /run/kiln /sys/fs/cgroup /proc/sys/net/ipv4/ip_forward
 # Namespace/mount setup, network policy, UID maps, quota setup and cleanup.
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
-# Inherited systemd seccomp filters break kiln's UID-map setup in the supported
-# VM (EPERM). This includes RestrictAddressFamilies, LockPersonality,
-# RestrictRealtime and ProtectKernelLogs. Keep filtering in unprivileged kilnd;
-# kiln installs the sandbox syscall policy after namespace setup.
+# With explicit User=root, systemd's seccomp credential transition otherwise
+# drops effective CAP_SETUID; retain it for kiln's UID-map setup.
+AmbientCapabilities=CAP_SETUID
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+LockPersonality=yes
+RestrictRealtime=yes
+ProtectKernelLogs=yes
 # Namespace creation, syscall policy and privilege dropping are kiln's job.
 # Do not use PrivateNetwork/ProtectControlGroups/RestrictNamespaces here.
 

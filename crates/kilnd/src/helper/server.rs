@@ -1,15 +1,16 @@
 use super::protocol::*;
-use super::{fds, read_frame, write_frame};
+use super::{fds, read_frame, socket::Socket, write_frame};
 use crate::model::CreateCertainty;
 use crate::runtime::{ExecFinish, ExecSpec, Runtime, kiln_direct::DirectKilnRuntime};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 /// Listener ownership is supplied by systemd's root-owned socket unit. The
@@ -40,7 +41,7 @@ pub async fn serve(
         let stop = shutdown.child_token();
         tasks.spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle(stream, uid, runtime, stop).await {
+            if let Err(error) = handle(stream, runtime, stop).await {
                 tracing::warn!(%error, "helper request failed");
                 #[cfg(test)]
                 eprintln!("helper request error: {error}");
@@ -53,18 +54,18 @@ pub async fn serve(
 }
 
 async fn handle(
-    mut stream: UnixStream,
-    uid: u32,
+    stream: UnixStream,
     runtime: Arc<DirectKilnRuntime>,
     cancel: CancellationToken,
 ) -> io::Result<()> {
-    let (request, descriptors) = timeout(Duration::from_secs(2), async {
-        let descriptors = fds::receive(&stream).await?;
+    let mut stream = Socket(stream);
+    let request = timeout(Duration::from_secs(2), async {
+        let descriptors = fds::receive(&stream.0).await?;
         let request: Request = read_frame(&mut stream).await?;
         request
             .validate(descriptors.len())
             .map_err(io::Error::other)?;
-        Ok::<_, io::Error>((request, descriptors))
+        Ok::<_, io::Error>(request)
     })
     .await
     .map_err(io::Error::other)??;
@@ -73,15 +74,34 @@ async fn handle(
         return Err(io::Error::other("invalid monotonic deadline"));
     }
     let deadline = Instant::now() + Duration::from_nanos(remaining);
-    let (mut reader, mut writer) = stream.into_split();
-    let operation = dispatch(
-        request.operation,
-        descriptors,
-        uid,
-        &runtime,
-        deadline,
-        &cancel,
-    );
+    // Only the opposite endpoints cross SCM_RIGHTS. Never share an open file
+    // description for any endpoint on which the helper performs I/O.
+    let mut stdio = None;
+    timeout(Duration::from_secs(2), async {
+        if matches!(request.operation, Operation::Kiln(KilnRequest::Exec { .. })) {
+            let (input, input_peer) = UnixStream::pair()?;
+            let (output, output_peer) = UnixStream::pair()?;
+            let (error, error_peer) = UnixStream::pair()?;
+            fds::send(
+                &stream.0,
+                &[
+                    input_peer.as_raw_fd(),
+                    output_peer.as_raw_fd(),
+                    error_peer.as_raw_fd(),
+                ],
+            )
+            .await?;
+            stdio = Some([Socket(input), Socket(output), Socket(error)]);
+            // Drop our copies of the sent endpoints before reading stdin.
+        } else {
+            fds::send(&stream.0, &[]).await?;
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await
+    .map_err(io::Error::other)??;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let operation = dispatch(request.operation, stdio, &runtime, deadline, &cancel);
     tokio::pin!(operation);
     let response = tokio::select! {
         result = &mut operation => result?,
@@ -96,8 +116,7 @@ async fn handle(
 
 async fn dispatch(
     operation: Operation,
-    descriptors: Vec<std::os::fd::OwnedFd>,
-    uid: u32,
+    stdio: Option<[Socket; 3]>,
     runtime: &DirectKilnRuntime,
     deadline: Instant,
     cancel: &CancellationToken,
@@ -158,34 +177,17 @@ async fn dispatch(
             stdin_bytes,
             max_output,
         } => {
-            let mut streams = descriptors.into_iter();
-            let mut input = fds::socket(
-                streams
-                    .next()
-                    .ok_or_else(|| io::Error::other("missing stdin"))?,
-                uid,
-            )?;
-            let mut stdout = fds::socket(
-                streams
-                    .next()
-                    .ok_or_else(|| io::Error::other("missing stdout"))?,
-                uid,
-            )?;
-            let mut stderr = fds::socket(
-                streams
-                    .next()
-                    .ok_or_else(|| io::Error::other("missing stderr"))?,
-                uid,
-            )?;
+            let [mut input, mut stdout, mut stderr] =
+                stdio.ok_or_else(|| io::Error::other("missing helper stdio"))?;
             let mut stdin = Vec::new();
-            timeout(
-                Duration::from_secs(2),
-                (&mut input)
-                    .take((MAX_STDIN + 1) as u64)
-                    .read_to_end(&mut stdin),
-            )
-            .await
-            .map_err(io::Error::other)??;
+            let mut bounded_input = (&mut input).take((MAX_STDIN + 1) as u64);
+            tokio::select! {
+                result = timeout_at(
+                    deadline.min(Instant::now() + Duration::from_secs(2)),
+                    bounded_input.read_to_end(&mut stdin),
+                ) => { result.map_err(io::Error::other)??; },
+                _ = cancel.cancelled() => return Err(io::Error::other("stdin canceled")),
+            }
             if stdin.len() != stdin_bytes {
                 return Err(io::Error::other(format!(
                     "stdin size mismatch: expected {stdin_bytes}, observed {}",

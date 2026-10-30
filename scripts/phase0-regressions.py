@@ -113,11 +113,12 @@ try:
     helper_pid=run(['systemctl','show','-p','MainPID','--value','kilnd-helper']).stdout.strip()
     helper_status=dict(line.split(':',1) for line in open(f'/proc/{helper_pid}/status') if ':' in line)
     assert int(helper_status['NoNewPrivs'])==1
-    # Systemd seccomp filters inherited by kiln break its UID-map write. The
-    # successful real Create/Exec above guards namespace setup under this unit.
-    assert int(helper_status['Seccomp'])==0, helper_status['Seccomp']
+    assert int(helper_status['Seccomp'])==2, helper_status['Seccomp']
+    for field in ('CapEff','CapPrm','CapBnd'):
+        assert int(helper_status[field].strip(),16)==0x2010eb, (field,helper_status[field])
+    assert int(helper_status['CapAmb'].strip(),16)==0x80, helper_status['CapAmb']
     before=len(os.listdir(f'/proc/{helper_pid}/fd'))
-    valid={'version':1,'timeout_ms':1000,'deadline_ns':time.monotonic_ns()+1_000_000_000,'operation':{'kiln':'ls'}}
+    valid={'version':2,'timeout_ms':1000,'deadline_ns':time.monotonic_ns()+1_000_000_000,'operation':{'kiln':'ls'}}
     body=json.dumps(valid).encode()
     helper_probe(body,uid=USERS[0]); helper_probe(body,uid='root')
     for _ in range(16):
@@ -125,13 +126,15 @@ try:
         helper_probe(b'',uid='kilnd',size=(2<<20)+1)
         req={**valid,'deadline_ns':time.monotonic_ns()+1_000_000_000,'operation':{'kiln':{'rm':{'id':'../escape'}}}}
         helper_probe(json.dumps(req).encode(),uid='kilnd')
-        req['operation']={'kiln':{'exec':{'id':'abcd','argv':['true'],'stdin_bytes':0,'max_output':1024}}}
+        req['operation']={'kiln':{'exec':{'id':'abcd','argv':['true'],'stdin_bytes':0,'max_output':0}}}
         helper_probe(json.dumps(req).encode(),uid='kilnd')
+        req['operation']['kiln']['exec']['max_output']=1024
         helper_probe(json.dumps(req).encode(),uid='kilnd',descriptors=(1,2,3))
         helper_probe(json.dumps(req).encode(),uid='kilnd',descriptors=(1,2,3,4))
     assert run(['systemctl','show','-p','MainPID','--value','kilnd-helper']).stdout.strip()==helper_pid
     eventually(lambda: len(os.listdir(f'/proc/{helper_pid}/fd')) <= before+1)
     ctl('health')
+    run(['python3','-I',os.path.join(os.path.dirname(__file__),'helper-blocking-fd.py')],uid='kilnd')
     print('4. Periodic retention and metadata output', flush=True)
     first=start_aux('first')
     sb=ctl('create','--memory','64M','--disk','16M',aux=True).stdout.strip(); IDS.append(sb)

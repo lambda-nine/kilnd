@@ -7,7 +7,7 @@ use tokio::net::UnixStream;
 
 #[test]
 fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
-    let valid: serde_json::Value = serde_json::json!({"version":1,"timeout_ms":1000,"deadline_ns":1,"operation":{"kiln":{"rm":{"id":"ab"}}}});
+    let valid: serde_json::Value = serde_json::json!({"version":2,"timeout_ms":1000,"deadline_ns":1,"operation":{"kiln":{"rm":{"id":"ab"}}}});
     assert!(serde_json::from_value::<Request>(valid.clone()).is_ok());
     let mut unknown_top = valid.clone();
     unknown_top["program"] = "/bin/sh".into();
@@ -22,7 +22,7 @@ fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
         );
     }
     let mut req = Request {
-        version: 1,
+        version: 2,
         deadline_ns: 1,
         timeout_ms: 1000,
         operation: Operation::Kiln(KilnRequest::Ls),
@@ -46,7 +46,152 @@ fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
         stdin_bytes: 0,
         max_output: 1,
     });
+    assert!(req.validate(0).is_err());
+    req.operation = Operation::Kiln(KilnRequest::Exec {
+        id: "ab".into(),
+        argv: vec!["true".into()],
+        stdin_bytes: 32,
+        max_output: 1024,
+    });
+    assert!(req.validate(0).is_ok());
     assert!(req.validate(3).is_err());
+    req.version = 1;
+    assert!(req.validate(0).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn received_peer_flag_mutation_cannot_stall_listener_or_deadline() {
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{Instant, timeout};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("helper.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let stop = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(serve(
+        listener,
+        uid,
+        temp.path().join("missing"),
+        stop.clone(),
+    ));
+    let mut control = UnixStream::connect(&path).await.unwrap();
+    fds::send(&control, &[]).await.unwrap();
+    let request = Request {
+        version: 2,
+        timeout_ms: 300,
+        deadline_ns: monotonic_ns().unwrap() + 300_000_000,
+        operation: Operation::Kiln(KilnRequest::Exec {
+            id: "abcd".into(),
+            argv: vec!["true".into()],
+            stdin_bytes: 32,
+            max_output: 1024,
+        }),
+    };
+    write_frame(&mut control, &request).await.unwrap();
+    let descriptors = fds::receive(&control).await.unwrap();
+    assert_eq!(descriptors.len(), 3);
+    for fd in &descriptors {
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) },
+            0
+        );
+    }
+    assert_eq!(
+        unsafe {
+            libc::send(
+                descriptors[0].as_raw_fd(),
+                [b'A'; 32].as_ptr().cast(),
+                32,
+                libc::MSG_DONTWAIT,
+            )
+        },
+        32
+    );
+    let client = Client {
+        path,
+        expected_uid: uid,
+    };
+    timeout(
+        Duration::from_millis(200),
+        client.call(
+            KilnRequest::Ls,
+            Instant::now() + Duration::from_secs(1),
+            &tokio_util::sync::CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("another request stalled")
+    .unwrap();
+    assert!(
+        timeout(Duration::from_millis(700), control.read_u8())
+            .await
+            .expect("stdin deadline stalled")
+            .is_err()
+    );
+    // The malicious peers remain open through both assertions.
+    drop(descriptors);
+    stop.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn per_syscall_io_survives_even_shared_endpoint_flag_mutation() {
+    use tokio::io::AsyncReadExt;
+    let (helper, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    helper.set_nonblocking(true).unwrap();
+    let retained = helper.try_clone().unwrap();
+    let mut socket = socket::Socket(UnixStream::from_std(helper).unwrap());
+    // A watchdog releases any accidentally blocking syscall so a regression
+    // fails the test instead of hanging the test runner indefinitely.
+    let release = peer.try_clone().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if rx.recv_timeout(Duration::from_secs(3)).is_err() {
+            release.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+    });
+    retained.set_nonblocking(false).unwrap();
+    std::io::Write::write_all(&mut peer, &[b'A'; 32]).unwrap();
+    socket.read_exact(&mut [0; 32]).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), socket.read_u8())
+            .await
+            .is_err()
+    );
+    // Saturate the outgoing queue without consuming any bytes at the peer.
+    let bytes = [0u8; 8192];
+    loop {
+        let n = unsafe {
+            libc::send(
+                retained.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            break;
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), socket.write_all(&bytes))
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_millis(50), socket.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    tx.send(()).unwrap();
+    watchdog.join().unwrap();
 }
 
 #[tokio::test]

@@ -30,6 +30,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   root (uid 0) pass; a foreign ID is `NOT_FOUND`, the same as a missing one, and
   page tokens are bound to the uid. A connection whose credentials cannot be read
   is `UNAUTHENTICATED`, never root. Rows older than schema 7 belong to root.
+  Tokens are bounded plaintext cursors, not opaque: their global creation
+  sequence gaps can reveal counts of other callers' inserts over an interval.
+  They reveal no foreign IDs, specs or output and do not bypass ownership.
   Health is open to anyone who can reach the socket and reports node-wide
   aggregates.
 - **No shell injection into the host.** kiln is spawned with an argument
@@ -219,7 +222,7 @@ sandbox compromises the host.
 - **The service account is trusted.** kilnd refuses root and runs with no
   capabilities. Its request/SQLite bugs do not directly execute in a root
   process. Root is reachable only through the [typed helper surface](helper-protocol.md):
-  six kiln verbs, bounded frames and descriptor-only stdio, independent
+  six kiln verbs, bounded frames and helper-created descriptor-only stdio, independent
   validation, no shell, fixed executable/argv and a cleared environment. The
   helper socket is root-owned and checks the exact service UID; sandbox UIDs,
   root and ordinary group members are rejected before parsing. The daemon
@@ -229,3 +232,15 @@ sandbox compromises the host.
   protocol modules, installed kiln and the kernel remain privileged trusted
   code. This is a smaller root entry point, not protection against bugs in
   that trusted runtime or shared kernel.
+
+The helper retains its own stdio endpoints and sends only their opposite
+endpoints to kilnd. The daemon cannot change the helper endpoints' open file
+status flags through SCM_RIGHTS. Per-syscall `MSG_DONTWAIT` on every helper
+socket read/write and non-waiting AF_UNIX shutdown also protect its
+current-thread listener from caller-induced blocking I/O. Stdin deadline,
+cancellation and output-transfer bounds remain active under hostile flag
+changes/backpressure. An attacker can still exhaust the 64 bounded helper
+slots; this does not add fairness or protection from synchronous trusted
+runtime/filesystem stalls. The root helper keeps systemd's address-family,
+personality, realtime and kernel-log filters with ambient CAP_SETUID for
+kiln's UID-map setup; see the [protocol](helper-protocol.md).
