@@ -152,7 +152,8 @@ than the deadline. Tickets remain held while finalization retries.
 
 `kilndctl ls` follows pages and prints incrementally. Other clients should set
 `page_size` (present zero means the server default, normally 100) and pass the
-opaque `next_page_token` until empty, keeping `include_deleted` unchanged.
+opaque `next_page_token` until empty, keeping `include_deleted` and the calling
+uid unchanged. Tokens do not survive the schema 7 upgrade: restart the listing.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
 bounds. Every older schema upgrades in order through to v5. Schema 5 stores
@@ -164,6 +165,10 @@ charged, even one whose text describes a missing image. Older binaries refuse
 schema 5, so keep a backup before upgrading.
 Store migration may occur before startup capability validation fails;
 installing an older daemon is not a database downgrade path.
+
+Schema 7 records each sandbox's owner and assigns every existing row to root.
+After upgrading, non-root callers no longer see sandboxes they created earlier;
+use root to inspect or delete them. Older binaries refuse schema 7.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart.

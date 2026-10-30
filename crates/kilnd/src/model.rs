@@ -110,6 +110,9 @@ pub struct Sandbox {
     pub deleted_at_ms: Option<i64>,
     pub failure_reason: Option<String>,
     pub create_certainty: CreateCertainty,
+    /// The creating caller's kernel-reported uid, fixed for the row's life.
+    /// Rows older than schema 7 belong to root.
+    pub owner_uid: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

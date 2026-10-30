@@ -1935,6 +1935,7 @@ async fn reconcile_repairs_state_and_is_repeatable() {
         deleted_at_ms: None,
         failure_reason: None,
         create_certainty: CreateCertainty::AllocationAmbiguous,
+        owner_uid: 0,
     };
     m.store.insert_sandbox(&crashed_create).unwrap();
     let other_backend = Sandbox {
@@ -2089,6 +2090,7 @@ async fn lowered_node_budgets_degrade_but_keep_cleanup_available() {
         deleted_at_ms: None,
         failure_reason: None,
         create_certainty: CreateCertainty::AllocationAmbiguous,
+        owner_uid: 0,
     };
     store.insert_sandbox(&sandbox).unwrap();
     let manager = Arc::new(Manager::new(
@@ -2150,6 +2152,7 @@ async fn restart_turns_creating_without_an_id_into_reserved_ambiguous_failed() {
         deleted_at_ms: None,
         failure_reason: None,
         create_certainty: CreateCertainty::AllocationAmbiguous,
+        owner_uid: 0,
     };
     {
         let store = Store::open(&state_dir).unwrap();

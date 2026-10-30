@@ -19,7 +19,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::server::{Connected, UdsConnectInfo};
+use tonic::transport::server::Connected;
 use tracing::{info, warn};
 
 use crate::lock::ExclusiveFileLock;
@@ -33,16 +33,25 @@ use crate::store::prepare_socket_directory;
 const FINAL_WAIT: Duration = Duration::from_secs(10);
 const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Who the kernel says connected, attached to every request on the connection.
+/// Clients cannot set request extensions, and `None` means the kernel gave no
+/// answer: the service refuses such a caller rather than assuming an identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerIdentity {
+    pub uid: Option<u32>,
+}
+
 struct AdmittedUnixStream {
     stream: UnixStream,
+    peer: PeerIdentity,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Connected for AdmittedUnixStream {
-    type ConnectInfo = UdsConnectInfo;
+    type ConnectInfo = PeerIdentity;
 
     fn connect_info(&self) -> Self::ConnectInfo {
-        self.stream.connect_info()
+        self.peer
     }
 }
 
@@ -403,17 +412,26 @@ async fn serve_with_final_wait<R: Runtime>(
     let incoming = UnixListenerStream::new(listener).filter_map(move |conn| match conn {
         Ok(stream) => {
             let permit = admission.try_connection().ok()?;
-            match stream.peer_cred() {
-                Ok(c) => info!(
-                    uid = c.uid(),
-                    gid = c.gid(),
-                    pid = c.pid().unwrap_or(0),
-                    "client connected"
-                ),
-                Err(e) => warn!(error = %e, "client connected; peer credentials unavailable"),
-            }
+            // The socket's credentials are fixed at connect, so this one read
+            // is what the log shows and what every request is authorized as.
+            let uid = match stream.peer_cred() {
+                Ok(c) => {
+                    info!(
+                        uid = c.uid(),
+                        gid = c.gid(),
+                        pid = c.pid().unwrap_or(0),
+                        "client connected"
+                    );
+                    Some(c.uid())
+                }
+                Err(e) => {
+                    warn!(error = %e, "client connected; peer credentials unavailable");
+                    None
+                }
+            };
             Some(Ok(AdmittedUnixStream {
                 stream,
+                peer: PeerIdentity { uid },
                 _permit: permit,
             }))
         }

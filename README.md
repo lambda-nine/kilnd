@@ -58,6 +58,11 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   (directory 0750, socket 0660), per-execution timeouts that stop the command
   inside the sandbox, bounded output, stdin and argv, a cap on durable sandbox
   reservations, graceful shutdown, and structured logs (text or JSON).
+- **Per-caller ownership:** each sandbox records the uid the kernel reports for
+  the connection that created it. Group members can see and control only their
+  own sandboxes and executions; anything else looks missing. Root sees everything,
+  including sandboxes from before schema 7, which belong to root. The kilnd
+  process and its account are trusted. There are no per-user quotas yet.
 - **Durable node budgets:** one SQLite transaction sums every retained
   sandbox reservation and inserts the `CREATING` row, so memory, PID and disk
   promises cannot be overcommitted by concurrent creates. Defaults reserve at
@@ -138,8 +143,8 @@ runtime failures. Schema 5 stores typed outcomes, truthful output-accounting
 evidence and create certainty; older databases migrate at open, every existing
 row stays ambiguous, and older binaries refuse the result. See [setup](docs/setup.md) before upgrading.
 
-These bounds do not provide tenant fairness: authorized callers can monopolize
-capacity, including with slow connections. Messages decode before service RPC
+These bounds do not provide tenant fairness: authorized callers share one set
+of node budgets and can monopolize capacity, including with slow connections. Messages decode before service RPC
 admission, under the connection, stream and message caps. SQLite/filesystem
 work is synchronous, and history still grows without retention. Defaults and
 flags are listed in [the architecture](docs/architecture.md#limits-and-defaults).
@@ -171,7 +176,8 @@ sudo kilndctl run -- echo one-shot      # create, exec, delete
 ```
 
 Add yourself to the `kilnd` group (`sudo usermod -aG kilnd $USER`, then log
-in again) to use `kilndctl` without sudo.
+in again) to use `kilndctl` without sudo. Without sudo you see only the sandboxes
+you created, so one made with `sudo` above stays visible only to root.
 
 ## Checks
 

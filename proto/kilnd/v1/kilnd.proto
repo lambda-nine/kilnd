@@ -198,6 +198,9 @@ message Sandbox {
   int64 deleted_at_unix_ms = 8;
   // Why it is FAILED or LOST, or why the last delete attempt failed.
   string failure_reason = 9;
+  // The uid of the local caller that created it. Fixed at creation. Only this
+  // uid and root (0) can see or use the sandbox; older sandboxes belong to root.
+  uint32 owner_uid = 10;
 }
 
 message CreateSandboxRequest {

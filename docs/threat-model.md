@@ -7,8 +7,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
 
 | Who | Trusted with |
 |-----|--------------|
-| root on the host | everything |
-| members of the `kilnd` group | full use of the API: create, run any command in, and delete any sandbox kilnd manages. Treat membership as near-root on a dev box. |
+| root on the host | everything, including every caller's sandboxes through the API |
+| the kilnd process and its account | everything kilnd manages. Ownership is enforced inside kilnd, so whoever controls that process or its state directory bypasses it. |
+| members of the `kilnd` group | create sandboxes, and see, run commands in, and delete only the ones they created. Sandboxes share one kernel and kiln is experimental isolation, so still treat membership as near-root on a dev box. |
 | code inside a sandbox | nothing on the host. It is contained by kiln (namespaces, cgroups, seccomp, Landlock, nftables), not by kilnd. |
 | other local users | nothing. They can't reach the socket. |
 
@@ -21,8 +22,16 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   socket whose bounded connection probe returned `ECONNREFUSED`. Platforms
   where refusal can also mean backlog pressure fail closed. Shutdown unlinks
   the path only when its device and inode still match this instance. Each
-  connection's uid, gid and pid are logged from `SO_PEERCRED`. There is no
-  per-call authorization beyond this.
+  connection's uid, gid and pid are logged from `SO_PEERCRED`.
+- **Per-caller ownership.** Create records the connection's kernel-reported uid
+  as the sandbox's immutable owner. Get, Exec, Delete, GetExecution and List
+  authorize that uid before any backend call, admission or stored-output read,
+  and List filters in SQLite before limits and continuation. Only the owner and
+  root (uid 0) pass; a foreign ID is `NOT_FOUND`, the same as a missing one, and
+  page tokens are bound to the uid. A connection whose credentials cannot be read
+  is `UNAUTHENTICATED`, never root. Rows older than schema 7 belong to root.
+  Health is open to anyone who can reach the socket and reports node-wide
+  aggregates.
 - **No shell injection into the host.** kiln is spawned with an argument
   vector. Flag values use `--flag=value`, the command follows `--`, and
   images, allowlist entries, paths, labels and IDs are validated before use.
@@ -197,11 +206,15 @@ sandbox compromises the host.
   can investigate and remove stray resources, but an empty listing and a retry
   alone cannot return this capacity. Ordinary RPC cancellation is not this case: accepted creates
   are daemon-owned and finish or compensate after the caller disconnects.
-- **Group members are not isolated from each other.** Any member can exec in
-  or delete any sandbox. Per-caller ownership belongs to the harness layer or
-  a later API version.
-- **No API authentication beyond Unix permissions,** and no TLS, by design:
-  the socket is local. Remote access would need an authenticated proxy.
+- **Ownership is not resource isolation between group members.** It stops them
+  from reaching each other's sandboxes through the API, but they share one kernel,
+  one set of node budgets and one retention count, so one member can exhaust
+  capacity or age out history for the others. There are no per-user quotas yet.
+  Everyone with the same uid is one caller, and a connection keeps its connecting
+  uid even if its descriptor is passed to another process.
+- **No API authentication beyond Unix permissions and the peer uid,** and no TLS,
+  by design: the socket is local. Remote access would need an authenticated proxy,
+  which would appear to kilnd as a single uid.
 - **kilnd runs as root,** because kiln does. A bug in kilnd's request handling
   is a bug in a root process; the attack surface is the socket, reachable
   only by root and the `kilnd` group.

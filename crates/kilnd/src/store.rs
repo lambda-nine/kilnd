@@ -24,7 +24,7 @@ use crate::model::{
 };
 use crate::retention::{OutputStorage, Pruned, Retention};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -59,6 +59,13 @@ const MIGRATE_V5: &str = "
 ALTER TABLE sandboxes ADD COLUMN create_certainty TEXT NOT NULL DEFAULT 'allocation_ambiguous' CHECK (create_certainty = 'allocation_ambiguous' OR (create_certainty = 'definitely_not_created' AND backend_id IS NULL AND state IN ('failed', 'deleted')));
 PRAGMA user_version = 5;";
 
+// Never inferred from history or the upgrading caller: every existing row
+// belongs to root. Keep this column and index identical to SCHEMA.
+const MIGRATE_V7: &str = "
+ALTER TABLE sandboxes ADD COLUMN owner_uid INTEGER NOT NULL DEFAULT 0 CHECK (owner_uid BETWEEN 0 AND 4294967295);
+CREATE INDEX sandboxes_owner_list_seq ON sandboxes (owner_uid, list_seq DESC);
+PRAGMA user_version = 7;";
+
 const SCHEMA: &str = "
 CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
 INSERT INTO history_sequence VALUES (1, 0);
@@ -73,12 +80,14 @@ CREATE TABLE sandboxes (
     updated_at_ms  INTEGER NOT NULL,
     deleted_at_ms  INTEGER,
     list_seq       INTEGER NOT NULL,
-    create_certainty TEXT NOT NULL DEFAULT 'allocation_ambiguous' CHECK (create_certainty = 'allocation_ambiguous' OR (create_certainty = 'definitely_not_created' AND backend_id IS NULL AND state IN ('failed', 'deleted')))
+    create_certainty TEXT NOT NULL DEFAULT 'allocation_ambiguous' CHECK (create_certainty = 'allocation_ambiguous' OR (create_certainty = 'definitely_not_created' AND backend_id IS NULL AND state IN ('failed', 'deleted'))),
+    owner_uid INTEGER NOT NULL DEFAULT 0 CHECK (owner_uid BETWEEN 0 AND 4294967295)
 );
 CREATE UNIQUE INDEX sandboxes_backend_id ON sandboxes (backend, backend_id) WHERE backend_id IS NOT NULL;
 CREATE INDEX sandboxes_state ON sandboxes (state);
 CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);
 CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';
+CREATE INDEX sandboxes_owner_list_seq ON sandboxes (owner_uid, list_seq DESC);
 
 CREATE TABLE executions (
     id               TEXT PRIMARY KEY,
@@ -214,8 +223,8 @@ fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
         [],
     )?;
     conn.execute(
-        "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, list_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, (SELECT value FROM history_sequence WHERE id = 1))",
+        "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, owner_uid, list_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, (SELECT value FROM history_sequence WHERE id = 1))",
         params![
             sandbox.id,
             sandbox.backend,
@@ -226,7 +235,8 @@ fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
             sandbox.created_at_ms,
             sandbox.updated_at_ms,
             sandbox.deleted_at_ms,
-            sandbox.create_certainty.as_str()
+            sandbox.create_certainty.as_str(),
+            sandbox.owner_uid
         ],
     )?;
     Ok(())
@@ -405,7 +415,8 @@ impl Store {
                 tx.execute_batch(MIGRATE_V4)?;
                 tx.execute_batch(MIGRATE_V5)?;
                 tx.execute_batch(MIGRATE_V6)?;
-                tx.commit().context("migrate schema v1 to v5")?;
+                tx.execute_batch(MIGRATE_V7)?;
+                tx.commit().context("migrate schema v1 to v7")?;
             }
             2 => {
                 let tx = conn.transaction()?;
@@ -413,25 +424,34 @@ impl Store {
                 tx.execute_batch(MIGRATE_V4)?;
                 tx.execute_batch(MIGRATE_V5)?;
                 tx.execute_batch(MIGRATE_V6)?;
-                tx.commit().context("migrate schema v2 to v5")?;
+                tx.execute_batch(MIGRATE_V7)?;
+                tx.commit().context("migrate schema v2 to v7")?;
             }
             3 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(MIGRATE_V4)?;
                 tx.execute_batch(MIGRATE_V5)?;
                 tx.execute_batch(MIGRATE_V6)?;
-                tx.commit().context("migrate schema v3 to v5")?;
+                tx.execute_batch(MIGRATE_V7)?;
+                tx.commit().context("migrate schema v3 to v7")?;
             }
             4 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(MIGRATE_V5)?;
                 tx.execute_batch(MIGRATE_V6)?;
-                tx.commit().context("migrate schema v4 to v5")?;
+                tx.execute_batch(MIGRATE_V7)?;
+                tx.commit().context("migrate schema v4 to v7")?;
             }
             5 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(MIGRATE_V6)?;
-                tx.commit().context("migrate schema v5 to v6")?;
+                tx.execute_batch(MIGRATE_V7)?;
+                tx.commit().context("migrate schema v5 to v7")?;
+            }
+            6 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch(MIGRATE_V7)?;
+                tx.commit().context("migrate schema v6 to v7")?;
             }
             SCHEMA_VERSION => {}
             v => bail!("database schema version {v} is newer than this kilnd ({SCHEMA_VERSION})"),
@@ -603,7 +623,7 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
-    /// A stable insertion watermark, bounded fetch, and exclusive cursor.
+    /// Every owner's sandboxes, as root sees them.
     pub fn sandbox_page(
         &self,
         include_deleted: bool,
@@ -611,33 +631,52 @@ impl Store {
         before_seq: Option<i64>,
         limit: u32,
     ) -> Result<SandboxPage> {
+        self.sandbox_page_owned(include_deleted, upper_seq, before_seq, limit, None)
+    }
+
+    /// A stable insertion watermark, bounded fetch, and exclusive cursor.
+    /// `owner` is `None` for every owner or one exact uid. It filters in SQL,
+    /// before the watermark, LIMIT and `has_more` can observe another owner.
+    pub fn sandbox_page_owned(
+        &self,
+        include_deleted: bool,
+        upper_seq: Option<i64>,
+        before_seq: Option<i64>,
+        limit: u32,
+        owner: Option<u32>,
+    ) -> Result<SandboxPage> {
         let conn = self.conn();
         let filter = if include_deleted {
             ""
         } else {
             "state != 'deleted' AND "
         };
+        let owned = if owner.is_some() {
+            "owner_uid = ?1 AND "
+        } else {
+            "?1 IS NULL AND "
+        };
         let upper_seq = match upper_seq {
             Some(upper) => upper,
             None => conn.query_row(
-                &format!("SELECT COALESCE(MAX(list_seq), 0) FROM sandboxes WHERE {filter}1"),
-                [],
+                &format!("SELECT COALESCE(MAX(list_seq), 0) FROM sandboxes WHERE {filter}{owned}1"),
+                [owner],
                 |row| row.get(0),
             )?,
         };
         let before = if before_seq.is_some() {
-            "AND list_seq < ?2"
+            "AND list_seq < ?3"
         } else {
-            "AND ?2 IS NULL"
+            "AND ?3 IS NULL"
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT {SANDBOX_COLUMNS}, list_seq FROM sandboxes
-            WHERE {filter}list_seq <= ?1 {before} ORDER BY list_seq DESC LIMIT ?3"
+            WHERE {filter}{owned}list_seq <= ?2 {before} ORDER BY list_seq DESC LIMIT ?4"
         ))?;
         let rows = stmt.query_map(
-            params![upper_seq, before_seq, i64::from(limit) + 1],
+            params![owner, upper_seq, before_seq, i64::from(limit) + 1],
             |row| {
-                let list_seq = row.get(10)?;
+                let list_seq = row.get(11)?;
                 Ok(sandbox_row(row)?.map(|sandbox| SandboxPageRow { sandbox, list_seq }))
             },
         )?;
@@ -821,6 +860,18 @@ impl Store {
             )
             .optional()?
             .transpose()
+    }
+
+    /// Which sandbox an execution belongs to, read without its output.
+    pub fn execution_sandbox_id(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT sandbox_id FROM executions WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// The newest `limit` executions of a sandbox, without their output data.
@@ -1327,7 +1378,7 @@ fn inspect_sqlite_sidecars(directory: &PreparedDirectory, expected_uid: u32) -> 
     Ok(())
 }
 
-const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty";
+const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, owner_uid";
 
 /// Row decoding errors are reported per row rather than as SQLite errors.
 fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
@@ -1350,6 +1401,7 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
             created_at_ms: row.get(6)?,
             updated_at_ms: row.get(7)?,
             deleted_at_ms: row.get(8)?,
+            owner_uid: row.get(10)?,
             id: id.clone(),
         })
     })())
@@ -1607,8 +1659,24 @@ mod tests {
         }
     }
 
+    fn schema_v6() -> String {
+        SCHEMA
+            .replace(
+                ",\n    owner_uid INTEGER NOT NULL DEFAULT 0 CHECK (owner_uid BETWEEN 0 AND 4294967295)",
+                "",
+            )
+            .replace(
+                "CREATE INDEX sandboxes_owner_list_seq ON sandboxes (owner_uid, list_seq DESC);\n",
+                "",
+            )
+    }
+
+    fn schema_v5() -> String {
+        schema_v6().replace("CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);\nINSERT INTO history_sequence VALUES (1, 0);\n", "")
+    }
+
     fn schema_v4() -> String {
-        let schema = SCHEMA.replace("CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);\nINSERT INTO history_sequence VALUES (1, 0);\n", "");
+        let schema = schema_v5();
         let start = schema.find(",\n    create_certainty").unwrap();
         let end = start + schema[start..].find("\n);").unwrap();
         format!("{}{}", &schema[..start], &schema[end..])
@@ -1849,6 +1917,7 @@ mod tests {
             deleted_at_ms: None,
             failure_reason: None,
             create_certainty: CreateCertainty::AllocationAmbiguous,
+            owner_uid: 0,
         }
     }
 
@@ -1889,6 +1958,372 @@ mod tests {
             .next()
             .unwrap();
         assert!(SCHEMA.contains(column), "{column}");
+    }
+
+    #[test]
+    fn v7_column_and_index_match_the_migration_exactly() {
+        let column = MIGRATE_V7
+            .split("ADD COLUMN ")
+            .nth(1)
+            .unwrap()
+            .split(";\n")
+            .next()
+            .unwrap();
+        assert!(SCHEMA.contains(column), "{column}");
+        let index = MIGRATE_V7
+            .lines()
+            .find(|l| l.starts_with("CREATE INDEX"))
+            .unwrap();
+        assert!(SCHEMA.contains(index), "{index}");
+    }
+
+    /// The schema exactly as that version created it.
+    fn schema_at(version: i64) -> String {
+        match version {
+            1 => schema_v2()
+                .replace(",\n    list_seq       INTEGER NOT NULL", "")
+                .replace("CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);", "")
+                .replace("CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';", ""),
+            2 => schema_v2(),
+            3 => schema_v3(),
+            4 => schema_v4(),
+            5 => schema_v5(),
+            6 => schema_v6(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn disk_database_at(dir: &Path, version: i64) -> Connection {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        conn.execute_batch(&schema_at(version)).unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+        conn
+    }
+
+    fn release_database(conn: Connection, dir: &Path) {
+        drop(conn);
+        std::fs::set_permissions(dir.join("kilnd.db"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+
+    fn column_descriptions(conn: &Connection) -> Vec<(String, String, bool, Option<String>)> {
+        conn.prepare("SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('sandboxes') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn sandbox_index_sql(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'sandboxes' AND sql IS NOT NULL ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn every_older_schema_gives_history_to_root_and_keeps_its_evidence() {
+        let fresh = Store::open_in_memory().unwrap();
+        let owner_column = |conn: &Connection| {
+            column_descriptions(conn)
+                .into_iter()
+                .find(|column| column.0 == "owner_uid")
+        };
+        let (fresh_owner, fresh_indexes) = {
+            let conn = fresh.conn();
+            (owner_column(&conn), sandbox_index_sql(&conn))
+        };
+        assert!(fresh_owner.is_some());
+        for version in 1..=6 {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = disk_database_at(tmp.path(), version);
+            let spec = serde_json::to_string(&sandbox().spec).unwrap();
+            let list_column = if version >= 2 { ", list_seq" } else { "" };
+            let certainty_column = if version >= 5 {
+                ", create_certainty"
+            } else {
+                ""
+            };
+            for (seq, (id, state, backend_id, certainty)) in [
+                ("sb-ready", "ready", Some("ab-1"), "allocation_ambiguous"),
+                ("sb-ambiguous", "failed", None, "allocation_ambiguous"),
+                (
+                    "sb-compensated",
+                    "failed",
+                    Some("ab-2"),
+                    "allocation_ambiguous",
+                ),
+                ("sb-definite", "failed", None, "definitely_not_created"),
+                ("sb-deleted", "deleted", None, "allocation_ambiguous"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // A definite row cannot predate the marker's schema.
+                if version < 5 && certainty == "definitely_not_created" {
+                    continue;
+                }
+                let list_value = if version >= 2 {
+                    format!(", {}", seq + 1)
+                } else {
+                    String::new()
+                };
+                let certainty_value = if version >= 5 {
+                    format!(", '{certainty}'")
+                } else {
+                    String::new()
+                };
+                conn.execute(
+                    &format!("INSERT INTO sandboxes (id,backend,backend_id,state,spec,created_at_ms,updated_at_ms{list_column}{certainty_column}) VALUES (?1,'fake',?2,?3,?4,?5,?5{list_value}{certainty_value})"),
+                    params![id, backend_id, state, spec, seq as i64 + 1],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO executions (id,sandbox_id,argv,state,exit_code,timeout_ms,stdin_bytes,started_at_ms,stdout,stdout_bytes) VALUES ('ex-old','sb-ready','[\"echo\"]','exited',0,1,0,1,x'6b657074',4)",
+                [],
+            )
+            .unwrap();
+            // Retention may have advanced the counter past every surviving row.
+            if version == 6 {
+                conn.execute("UPDATE history_sequence SET value = 40", [])
+                    .unwrap();
+            }
+            let expected_rows = if version >= 5 { 5 } else { 4 };
+            // ambiguous FAILED and READY stay charged; the rest released capacity.
+            let expected_reserved = 2;
+            release_database(conn, tmp.path());
+            for _reopen in 0..2 {
+                let store = Store::reopen_after_restart(tmp.path());
+                {
+                    let conn = store.conn();
+                    assert_eq!(
+                        conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                            .unwrap(),
+                        SCHEMA_VERSION
+                    );
+                    assert_eq!(owner_column(&conn), fresh_owner, "v{version}");
+                    assert_eq!(sandbox_index_sql(&conn), fresh_indexes, "v{version}");
+                }
+                let rows = store.sandboxes(true).unwrap();
+                assert_eq!(rows.len(), expected_rows, "v{version}");
+                assert!(rows.iter().all(|row| row.owner_uid == 0), "v{version}");
+                for row in &rows {
+                    let definite = row.id == "sb-definite";
+                    assert_eq!(
+                        row.create_certainty,
+                        if definite {
+                            CreateCertainty::DefinitelyNotCreated
+                        } else {
+                            CreateCertainty::AllocationAmbiguous
+                        },
+                        "v{version} {}",
+                        row.id
+                    );
+                }
+                assert_eq!(
+                    store.sandbox_resources().unwrap().sandboxes,
+                    expected_reserved,
+                    "v{version}"
+                );
+                let kept = store.execution("ex-old").unwrap().unwrap();
+                assert_eq!(kept.sandbox_id, "sb-ready");
+                assert_eq!(kept.stdout.data, b"kept");
+                // Only root can see history; no other uid inherited anything.
+                assert_eq!(
+                    store.sandbox_page(true, None, None, 10).unwrap().rows.len(),
+                    expected_rows
+                );
+                assert!(
+                    store
+                        .sandbox_page_owned(true, None, None, 10, Some(1001))
+                        .unwrap()
+                        .rows
+                        .is_empty()
+                );
+            }
+            let store = Store::reopen_after_restart(tmp.path());
+            let mut inserted = sandbox();
+            inserted.owner_uid = 1001;
+            store.insert_sandbox(&inserted).unwrap();
+            let page = store
+                .sandbox_page_owned(true, None, None, 10, Some(1001))
+                .unwrap();
+            assert_eq!(page.rows[0].sandbox.id, inserted.id);
+            if version == 6 {
+                assert_eq!(page.rows[0].list_seq, 41);
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_owner_migration_rolls_back_the_whole_upgrade() {
+        for version in [4, 5, 6] {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = disk_database_at(tmp.path(), version);
+            // Collides only with the last step, after every earlier one ran.
+            conn.execute_batch("CREATE INDEX sandboxes_owner_list_seq ON sandboxes (state);")
+                .unwrap();
+            release_database(conn, tmp.path());
+            assert!(Store::open(tmp.path()).is_err(), "v{version}");
+
+            let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
+            assert_eq!(
+                conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                    .unwrap(),
+                version
+            );
+            let columns = column_descriptions(&conn);
+            assert!(!columns.iter().any(|c| c.0 == "owner_uid"), "v{version}");
+            assert_eq!(
+                columns.iter().any(|c| c.0 == "create_certainty"),
+                version >= 5,
+                "v{version}"
+            );
+            let sequences: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'history_sequence'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(sequences == 1, version >= 6, "v{version}");
+
+            // Removing the obstacle lets the same database upgrade normally.
+            conn.execute_batch("DROP INDEX sandboxes_owner_list_seq;")
+                .unwrap();
+            drop(conn);
+            let store = Store::reopen_after_restart(tmp.path());
+            assert!(store.sandboxes(true).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn owner_round_trips_every_uid_and_never_follows_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let mut ids = Vec::new();
+        for uid in [0, 1001, i32::MAX as u32 + 1, u32::MAX] {
+            let mut s = sandbox();
+            s.owner_uid = uid;
+            store.insert_sandbox(&s).unwrap();
+            assert_eq!(store.sandbox(&s.id).unwrap().unwrap(), s);
+            ids.push((s.id, uid));
+        }
+        for (id, _) in &ids {
+            store
+                .set_sandbox_state(id, SandboxState::Ready, Some(id), None)
+                .unwrap();
+            store
+                .set_sandbox_state(id, SandboxState::Deleted, None, None)
+                .unwrap();
+        }
+        drop(store);
+        let store = Store::reopen_after_restart(tmp.path());
+        for (id, uid) in ids {
+            assert_eq!(store.sandbox(&id).unwrap().unwrap().owner_uid, uid);
+        }
+        let conn = store.conn();
+        let spec = serde_json::to_string(&sandbox().spec).unwrap();
+        for bad in ["-1", "4294967296", "'root'", "NULL"] {
+            assert!(
+                conn.execute(
+                    &format!("INSERT INTO sandboxes (id,backend,state,spec,created_at_ms,updated_at_ms,list_seq,owner_uid) VALUES ('sb-bad','fake','ready',?1,1,1,1000,{bad})"),
+                    [&spec],
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_pages_filter_before_the_watermark_limit_and_has_more() {
+        let store = Store::open_in_memory().unwrap();
+        // list_seq:  1     2     3   4     5     6   7
+        let owners = [1001, 1002, 0, 1001, 1002, 0, 1001];
+        let mut ids = Vec::new();
+        for owner_uid in owners {
+            let mut s = sandbox();
+            s.owner_uid = owner_uid;
+            store.insert_sandbox(&s).unwrap();
+            ids.push(s.id);
+        }
+        let page = |deleted, upper, before, limit, owner| {
+            let page = store
+                .sandbox_page_owned(deleted, upper, before, limit, owner)
+                .unwrap();
+            let seqs: Vec<i64> = page.rows.iter().map(|r| r.list_seq).collect();
+            (seqs, page.upper_seq, page.has_more)
+        };
+        assert_eq!(
+            page(false, None, None, 2, Some(1002)),
+            (vec![5, 2], 5, false)
+        );
+        assert_eq!(page(false, None, None, 1, Some(1002)), (vec![5], 5, true));
+        assert_eq!(
+            page(false, Some(5), Some(5), 1, Some(1002)),
+            (vec![2], 5, false)
+        );
+        assert_eq!(page(false, None, None, 10, Some(1003)), (vec![], 0, false));
+        // Some(0) is exactly root's own rows; None is everyone's, which only
+        // the root caller is ever given.
+        assert_eq!(page(false, None, None, 10, Some(0)), (vec![6, 3], 6, false));
+        assert_eq!(page(false, None, None, 2, None), (vec![7, 6], 7, true));
+
+        // A deleted newest row leaves the watermark to the newest visible one,
+        // as it does for root, but include_deleted still counts it.
+        store
+            .set_sandbox_state(&ids[4], SandboxState::Deleted, None, None)
+            .unwrap();
+        assert_eq!(page(false, None, None, 10, Some(1002)), (vec![2], 2, false));
+        assert_eq!(
+            page(true, None, None, 10, Some(1002)),
+            (vec![5, 2], 5, false)
+        );
+        assert_eq!(page(false, None, None, 10, None).1, 7);
+
+        // The bounded walk reads the caller's index entries, not the node's.
+        let conn = store.conn();
+        for filter in ["", "state != 'deleted' AND "] {
+            let plan: String = conn
+                .query_row(
+                    &format!("EXPLAIN QUERY PLAN SELECT id FROM sandboxes WHERE {filter}owner_uid = 1 AND list_seq <= 9 ORDER BY list_seq DESC LIMIT 3"),
+                    [],
+                    |row| row.get(3),
+                )
+                .unwrap();
+            assert!(plan.contains("sandboxes_owner_list_seq"), "{plan}");
+        }
+    }
+
+    #[test]
+    fn execution_parent_lookup_does_not_read_the_execution_row() {
+        let store = Store::open_in_memory().unwrap();
+        let s = sandbox();
+        store.insert_sandbox(&s).unwrap();
+        let e = execution(&s.id);
+        store.insert_execution(&e).unwrap();
+        assert_eq!(
+            store.execution_sandbox_id(&e.id).unwrap().as_deref(),
+            Some(s.id.as_str())
+        );
+        assert_eq!(store.execution_sandbox_id("ex-missing").unwrap(), None);
+        // Undecodable contents prove the lookup never touches them.
+        store
+            .conn()
+            .execute("UPDATE executions SET argv = 'not json', stdout = 1", [])
+            .unwrap();
+        assert!(store.execution(&e.id).is_err());
+        assert_eq!(
+            store.execution_sandbox_id(&e.id).unwrap().as_deref(),
+            Some(s.id.as_str())
+        );
     }
 
     #[test]

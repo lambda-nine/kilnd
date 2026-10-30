@@ -414,6 +414,17 @@ before an upgrade stay charged. Every older version migrates through v5, and
 older binaries refuse schema 5. Migration happens at store open and may precede
 startup capability failure; back up before upgrading.
 
+Schema v7 adds immutable `sandboxes.owner_uid` and an `(owner_uid, list_seq DESC)`
+index. Every older version migrates through v7 in one transaction, and historical
+rows belong to root rather than whoever runs the upgrade. The accept path reads
+`peer_cred()` once and attaches the uid to every request on the connection. The
+service authorizes before the manager's backend and admission paths, and
+GetExecution reads only `executions.sandbox_id` until the parent sandbox passes.
+Non-root List filters in SQLite, so the watermark, LIMIT and `has_more` never see
+other owners. The canonical `v2:<deleted>:<uid>:<upper>:<last>` page token has
+fixed-width fields, keeping the byte-bound accounting exact. Internal
+reconciliation still reads every row.
+
 The API represents signal numbers as `uint32` and retains legacy `exit_code`
 only for EXITED, projecting signal termination as 128 + signal.
 `command_status` distinguishes that signal from

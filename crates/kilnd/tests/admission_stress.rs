@@ -228,6 +228,7 @@ fn metadata_history_rss_child() {
         deleted_at_ms: None,
         failure_reason: None,
         create_certainty: Default::default(),
+        owner_uid: 0,
     };
     let capture = Captured {
         data: vec![b'x'; HISTORY_STREAM_BYTES],

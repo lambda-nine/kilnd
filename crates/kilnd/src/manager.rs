@@ -698,17 +698,27 @@ impl<R: Runtime> Manager<R> {
         })
     }
 
-    /// Starts a daemon-owned create and waits for its result. Dropping this
-    /// waiter does not cancel the operation: once admitted, the supervisor
-    /// always publishes the backend ID or compensates by removing it.
+    /// A trusted in-process create, owned by root. The RPC service uses
+    /// [`Self::create_owned`] with the caller's kernel-reported uid instead.
     pub async fn create(self: &Arc<Self>, req: CreateRequest) -> Result<Sandbox> {
+        self.create_owned(req, 0).await
+    }
+
+    /// Starts a daemon-owned create for `owner_uid` and waits for its result.
+    /// Dropping this waiter does not cancel the operation: once admitted, the
+    /// supervisor always publishes the backend ID or compensates by removing it.
+    pub async fn create_owned(
+        self: &Arc<Self>,
+        req: CreateRequest,
+        owner_uid: u32,
+    ) -> Result<Sandbox> {
         // No await separates this check from task registration, so shutdown
         // cannot close and drain the tracker before an accepted task exists.
         self.check_serving()?;
         let (result_tx, result_rx) = oneshot::channel();
         let manager = Arc::clone(self);
         self.operations.spawn(async move {
-            let result = manager.create_owned(req).await;
+            let result = manager.create_supervised(req, owner_uid).await;
             if let Err(result) = result_tx.send(result) {
                 match result {
                     Ok(sandbox) => info!(sandbox = %sandbox.id, "create RPC stopped waiting; supervised operation completed"),
@@ -723,7 +733,11 @@ impl<R: Runtime> Manager<R> {
         })?
     }
 
-    async fn create_owned(self: Arc<Self>, req: CreateRequest) -> Result<Sandbox> {
+    async fn create_supervised(
+        self: Arc<Self>,
+        req: CreateRequest,
+        owner_uid: u32,
+    ) -> Result<Sandbox> {
         self.check_serving()?;
         let spec = self.resolve_spec(req)?;
         let now = now_ms();
@@ -738,6 +752,7 @@ impl<R: Runtime> Manager<R> {
             deleted_at_ms: None,
             failure_reason: None,
             create_certainty: CreateCertainty::AllocationAmbiguous,
+            owner_uid,
         };
         // Recorded before the backend runs, so a crash mid-create leaves a
         // trace for reconciliation. Count and all three resource sums are
@@ -756,7 +771,7 @@ impl<R: Runtime> Manager<R> {
                 )));
             }
         }
-        info!(sandbox = %sandbox.id, image = %sandbox.spec.image, "creating sandbox");
+        info!(sandbox = %sandbox.id, image = %sandbox.spec.image, owner_uid, "creating sandbox");
         // Isolate a backend panic from the supervisor so the database still
         // reaches a terminal state. A backend that panics after making an
         // external resource but before returning its ID remains ambiguous by
@@ -897,16 +912,18 @@ impl<R: Runtime> Manager<R> {
         Ok(self.store.sandboxes(include_deleted)?)
     }
 
-    pub(crate) fn list_page(
+    /// `owner` is `None` for root, which sees every sandbox, or one exact uid.
+    pub(crate) fn list_page_owned(
         &self,
         include_deleted: bool,
         upper: Option<i64>,
         before: Option<i64>,
         limit: u32,
+        owner: Option<u32>,
     ) -> Result<crate::store::SandboxPage> {
         Ok(self
             .store
-            .sandbox_page(include_deleted, upper, before, limit)?)
+            .sandbox_page_owned(include_deleted, upper, before, limit, owner)?)
     }
 
     pub fn execution(&self, id: &str) -> Result<Execution> {
@@ -918,6 +935,35 @@ impl<R: Runtime> Manager<R> {
         self.store
             .execution(id)?
             .ok_or_else(|| Error::NotFound(format!("execution {id}")))
+    }
+
+    /// The sandbox, if `uid` may use it. A foreign sandbox fails exactly like a
+    /// missing one, so callers cannot probe for other users' IDs. Owners never
+    /// change, so this answer still holds for an operation that queues after it.
+    pub(crate) fn authorize(&self, id: &str, uid: u32) -> Result<Sandbox> {
+        let sandbox = self.load(id)?;
+        if !may_use(&sandbox, uid) {
+            return Err(Error::NotFound(format!("sandbox {id}")));
+        }
+        Ok(sandbox)
+    }
+
+    /// Decides access from the parent sandbox without reading stored output. A
+    /// foreign execution fails exactly like a missing one and never names its
+    /// parent.
+    pub(crate) fn authorize_execution(&self, id: &str, uid: u32) -> Result<()> {
+        if !valid_id("ex", id) {
+            return Err(Error::InvalidArgument(format!(
+                "invalid execution ID {id:?}"
+            )));
+        }
+        let not_found = || Error::NotFound(format!("execution {id}"));
+        let sandbox_id = self.store.execution_sandbox_id(id)?.ok_or_else(not_found)?;
+        let sandbox = self.store.sandbox(&sandbox_id)?.ok_or_else(not_found)?;
+        if !may_use(&sandbox, uid) {
+            return Err(not_found());
+        }
+        Ok(())
     }
 
     fn load(&self, id: &str) -> Result<Sandbox> {
@@ -1554,6 +1600,11 @@ fn ready(s: &Sandbox) -> Result<()> {
 
 fn backend(e: RuntimeError) -> Error {
     Error::Backend(e.to_string())
+}
+
+/// The owner and root may use a sandbox; nobody else may.
+fn may_use(sandbox: &Sandbox, uid: u32) -> bool {
+    uid == 0 || sandbox.owner_uid == uid
 }
 
 #[cfg(test)]

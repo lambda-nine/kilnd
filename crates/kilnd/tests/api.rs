@@ -60,6 +60,11 @@ fn signal_number_is_uint32_in_generated_types_schema_and_wire() {
     );
 }
 
+/// The uid the kernel reports for this test's own socket connections.
+fn test_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
 async fn client(path: PathBuf) -> KilndServiceClient<Channel> {
     let channel = Endpoint::try_from("http://kilnd.invalid")
         .unwrap()
@@ -623,6 +628,142 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
 }
 
 #[tokio::test]
+async fn ownership_comes_from_the_kernel_credentials_of_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = tmp.path().join("run/kilnd.sock");
+    let fake = FakeRuntime::default();
+    let manager = Arc::new(Manager::new(
+        fake.clone(),
+        Store::open_in_memory().unwrap(),
+        Limits::default(),
+    ));
+    let listener = kilnd::server::bind(&socket, None).await.unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(kilnd::server::serve(
+        manager.clone(),
+        listener,
+        async {
+            let _ = stop_rx.await;
+        },
+        Duration::from_millis(200),
+    ));
+    let mut c = client(socket.clone()).await;
+
+    let mine = c
+        .create_sandbox(pb::CreateSandboxRequest { spec: None })
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_eq!(mine.owner_uid, test_uid());
+    assert_eq!(
+        pb::Sandbox::decode(mine.encode_to_vec().as_slice())
+            .unwrap()
+            .owner_uid,
+        test_uid()
+    );
+    let execution = c
+        .exec(pb::ExecRequest {
+            sandbox_id: mine.id.clone(),
+            argv: vec!["echo".into(), "mine".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .execution
+        .unwrap();
+    assert_eq!(
+        c.get_execution(pb::GetExecutionRequest { id: execution.id })
+            .await
+            .unwrap()
+            .into_inner()
+            .execution
+            .unwrap()
+            .stdout
+            .unwrap()
+            .data,
+        b"mine\n"
+    );
+
+    // Whichever uid runs this test, another uid's rows behave accordingly.
+    let foreign_uid = test_uid().wrapping_add(1);
+    let foreign = manager
+        .create_owned(Default::default(), foreign_uid)
+        .await
+        .unwrap();
+    let foreign_execution = manager
+        .exec(kilnd::manager::ExecRequest {
+            sandbox_id: foreign.id.clone(),
+            argv: vec!["echo".into(), "theirs".into()],
+            stdin: vec![],
+            timeout_ms: 0,
+        })
+        .await
+        .unwrap();
+    let listed: Vec<String> = c
+        .list_sandboxes(pb::ListSandboxesRequest {
+            page_size: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .sandboxes
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    let get = c
+        .get_sandbox(pb::GetSandboxRequest {
+            id: foreign.id.clone(),
+            execution_limit: 0,
+        })
+        .await;
+    let read = c
+        .get_execution(pb::GetExecutionRequest {
+            id: foreign_execution.id,
+        })
+        .await;
+    if test_uid() == 0 {
+        assert_eq!(listed, [foreign.id.clone(), mine.id.clone()]);
+        get.unwrap();
+        read.unwrap();
+    } else {
+        assert_eq!(listed, std::slice::from_ref(&mine.id));
+        assert_eq!(get.unwrap_err().code(), Code::NotFound);
+        assert_eq!(read.unwrap_err().code(), Code::NotFound);
+        assert_eq!(
+            c.exec(pb::ExecRequest {
+                sandbox_id: foreign.id.clone(),
+                argv: vec!["echo".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            Code::NotFound
+        );
+        assert_eq!(
+            c.delete_sandbox(pb::DeleteSandboxRequest {
+                id: foreign.id.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            Code::NotFound
+        );
+        assert_eq!(fake.state().exec_calls.len(), 2);
+        assert!(fake.state().remove_attempts.is_empty());
+    }
+
+    stop_tx.send(()).unwrap();
+    drop(c);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn graceful_shutdown_cancels_running_executions_after_the_grace_period() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -632,7 +773,10 @@ async fn graceful_shutdown_cancels_running_executions_after_the_grace_period() {
         Store::open_in_memory().unwrap(),
         Limits::default(),
     ));
-    let sandbox = manager.create(Default::default()).await.unwrap();
+    let sandbox = manager
+        .create_owned(Default::default(), test_uid())
+        .await
+        .unwrap();
     let listener = kilnd::server::bind(&socket, None).await.unwrap();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(kilnd::server::serve(
@@ -683,7 +827,10 @@ async fn canceling_a_tonic_exec_request_finalizes_and_releases_the_backend() {
         Store::open_in_memory().unwrap(),
         Limits::default(),
     ));
-    let sandbox = manager.create(Default::default()).await.unwrap();
+    let sandbox = manager
+        .create_owned(Default::default(), test_uid())
+        .await
+        .unwrap();
     let gate = FakeGate::default();
     fake.state().exec_before_run = Some(gate.clone());
     let listener = kilnd::server::bind(&socket, None).await.unwrap();

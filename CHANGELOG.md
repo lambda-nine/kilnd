@@ -8,6 +8,18 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add durable per-caller ownership. Create records the connection's
+  kernel-reported uid as an immutable `Sandbox.owner_uid` (field 10). Get, Exec,
+  Delete, GetExecution and List are limited to the owner and root; a foreign
+  sandbox or execution returns `NOT_FOUND` exactly like a missing one, and a
+  connection without credentials gets `UNAUTHENTICATED`. Schema 7 assigns every
+  existing row to root, so group members lose access to sandboxes created before
+  the upgrade. List filtering happens in SQLite before limits, watermark and
+  continuation. Page tokens are now `v2` and bound to the caller's uid, so
+  `v1` tokens held across the upgrade fail with `INVALID_ARGUMENT`; restart the
+  listing. Older binaries refuse schema 7. Node budgets stay shared: there are
+  no per-user quotas yet.
+
 - Stop definite pre-allocation create failures from permanently consuming node
   budgets. `Runtime::create` now returns a typed `CreateFailure`; ordinary errors
   convert to `AllocationAmbiguous` and only an explicit constructor claims
