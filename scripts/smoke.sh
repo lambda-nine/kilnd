@@ -109,15 +109,15 @@ wait_ready
 ctl health
 
 echo "2. Socket ownership and permissions"
-[ "$(stat -c '%U:%G %a' /run/kilnd)" = "root:kilnd 750" ] || fail "/run/kilnd is $(stat -c '%U:%G %a' /run/kilnd)"
-[ "$(sudo stat -c '%U:%G %a' /run/kilnd/kilnd.sock)" = "root:kilnd 660" ] || fail "socket permissions"
-[ "$(sudo stat -c '%U %a' /var/lib/kilnd)" = "root 700" ] || fail "/var/lib/kilnd permissions"
+[ "$(stat -c '%U:%G %a' /run/kilnd)" = "kilnd:kilnd 750" ] || fail "/run/kilnd is $(stat -c '%U:%G %a' /run/kilnd)"
+[ "$(sudo stat -c '%U:%G %a' /run/kilnd/kilnd.sock)" = "kilnd:kilnd 660" ] || fail "socket permissions"
+[ "$(sudo stat -c '%U %a' /var/lib/kilnd)" = "kilnd 700" ] || fail "/var/lib/kilnd permissions"
 db=/var/lib/kilnd/kilnd.db
-[ "$(sudo stat -c '%U:%G %a %F %h' "$db")" = "root:root 600 regular file 1" ] || fail "kilnd.db metadata"
+[ "$(sudo stat -c '%U:%G %a %F %h' "$db")" = "kilnd:kilnd 600 regular file 1" ] || fail "kilnd.db metadata"
 [ ! -L "$db" ] || fail "kilnd.db is a symlink"
 for sidecar in "$db-wal" "$db-shm" "$db-journal"; do
     [ ! -e "$sidecar" ] ||
-        [ "$(sudo stat -c '%U:%G %a %F %h' "$sidecar")" = "root:root 600 regular file 1" ] ||
+        [ "$(sudo stat -c '%U:%G %a %F %h' "$sidecar")" = "kilnd:kilnd 600 regular file 1" ] ||
         fail "unsafe SQLite sidecar: $sidecar"
 done
 if ! id -nG | grep -qw kilnd; then

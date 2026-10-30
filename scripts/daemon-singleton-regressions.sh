@@ -10,6 +10,7 @@ case "$state_root" in
     /tmp/kilnd-singleton-state.*) ;;
     *) echo "unexpected state fixture path: $state_root" >&2; exit 1 ;;
 esac
+sudo chown kilnd:kilnd "$state_root"
 sandbox=
 exec_pid=
 
@@ -59,8 +60,7 @@ state_lock_identity=$(sudo stat -Lc '%d:%i' /var/lib/kilnd/kilnd.lock)
 
 echo "2. Same state directory with a different socket is rejected before bind"
 set +e
-sudo timeout 5s /usr/local/bin/kilnd \
-    --kiln /usr/local/bin/kiln \
+sudo -u kilnd timeout 5s /usr/local/bin/kilnd \
     --state-dir /var/lib/kilnd \
     --socket "$tmp/alternate.sock" \
     --socket-group '' >"$tmp/same-state.log" 2>&1
@@ -72,8 +72,7 @@ grep -q 'state directory already owned' "$tmp/same-state.log" || fail "same-stat
 
 echo "3. Different state directory with the same socket is rejected before reconciliation"
 set +e
-sudo timeout 5s /usr/local/bin/kilnd \
-    --kiln /usr/local/bin/kiln \
+sudo -u kilnd timeout 5s /usr/local/bin/kilnd \
     --state-dir "$state_root/other-state" \
     --socket "$socket" \
     --socket-group kilnd >"$tmp/same-socket.log" 2>&1

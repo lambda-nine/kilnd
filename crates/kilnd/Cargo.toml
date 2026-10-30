@@ -1,5 +1,6 @@
 [package]
 name = "kilnd"
+default-run = "kilnd"
 description = "Control daemon for kiln sandboxes, serving gRPC over a Unix socket"
 version.workspace = true
 edition.workspace = true

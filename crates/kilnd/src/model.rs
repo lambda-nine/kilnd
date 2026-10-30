@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// What a caller asked for, with every default filled in. Stored as JSON in
 /// the `sandboxes.spec` column.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxSpec {
     pub image: String,
     pub memory_bytes: u64,

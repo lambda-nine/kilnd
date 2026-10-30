@@ -2311,3 +2311,28 @@ async fn output_policy_keeps_live_reply_but_discards_durable_bytes() {
         assert_eq!(stored.stdout.total_bytes_known, mode == OutputStorage::Metadata);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn health_deadline_releases_waiters_while_cleanup_stays_owned() {
+    let (manager, fake) = manager();
+    let active = FakeGate::default();
+    let cleanup = FakeGate::default();
+    fake.state().version_gate = Some(active.clone());
+    fake.state().version_cleanup_gate = Some(cleanup.clone());
+    let waiter = tokio::spawn({ let manager = manager.clone(); async move { manager.health().await.unwrap() } });
+    active.entered().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    cleanup.entered().await;
+    let health = waiter.await.unwrap();
+    assert!(!health.serving && health.detail.contains("timed out"));
+    assert_eq!(fake.state().active_version_calls, 1);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(!manager.health().await.unwrap().serving);
+    assert_eq!(fake.state().version_calls, 1);
+    manager.begin_shutdown();
+    let mut drain = tokio::spawn({ let manager = manager.clone(); async move { manager.drain_operations().await } });
+    assert!(tokio::time::timeout(Duration::from_millis(1), &mut drain).await.is_err());
+    cleanup.release();
+    drain.await.unwrap();
+    assert_eq!(fake.state().active_version_calls, 0);
+}

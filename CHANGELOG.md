@@ -8,6 +8,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Run kilnd as its unprivileged system account with no capabilities; isolate
+  validated kiln operations in a root socket-activated helper. Pass Exec stdio
+  as descriptors, authenticate both peers, preserve cleanup evidence, and
+  harden both systemd services. See docs/helper-protocol.md.
+
 - Add durable per-caller ownership. Create records the connection's
   kernel-reported uid as an immutable `Sandbox.owner_uid` (field 10). Get, Exec,
   Delete, GetExecution and List are limited to the owner and root; a foreign

@@ -1,0 +1,15 @@
+[Unit]
+Description=Private kilnd privilege-helper socket
+After=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/kilnd-helper/helper.sock
+SocketUser=root
+SocketGroup=kilnd
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+Backlog=64
+
+[Install]
+WantedBy=sockets.target

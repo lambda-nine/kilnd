@@ -13,6 +13,8 @@ pub use crate::model::CreateCertainty;
 
 pub mod fake;
 pub mod kiln;
+#[doc(hidden)]
+pub mod kiln_direct;
 mod kiln_process;
 mod kiln_protocol;
 

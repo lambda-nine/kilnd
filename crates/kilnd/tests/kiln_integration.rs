@@ -16,7 +16,7 @@ use kilnd::model::{
     SandboxState,
 };
 use kilnd::runtime::Runtime;
-use kilnd::runtime::kiln::KilnRuntime;
+use kilnd::runtime::kiln_direct::DirectKilnRuntime as KilnRuntime;
 use kilnd::store::Store;
 
 fn enabled() -> bool {

@@ -572,6 +572,13 @@ impl<R: Runtime> Manager<R> {
         Ok(())
     }
 
+    // Wake API waiters at the probe deadline, while the tracked operation keeps
+    // owning cleanup. in_flight remains true, so no replacement probe can start.
+    fn publish_health_failure_while_draining(&self, message: &str) {
+        self.health_probe.lock().unwrap().cached = Some((Instant::now(), Err(message.into())));
+        self.health_changed.notify_waiters();
+    }
+
     pub async fn health(self: &Arc<Self>) -> Result<Health> {
         let probe = loop {
             // Register before examining state so completion cannot be missed.
@@ -593,7 +600,7 @@ impl<R: Runtime> Manager<R> {
                     } else {
                         self.limits.health_failure_cache
                     };
-                    if completed.elapsed() < ttl {
+                    if completed.elapsed() < ttl || (state.in_flight && result.is_err()) {
                         break result.clone();
                     }
                 }
@@ -621,11 +628,13 @@ impl<R: Runtime> Manager<R> {
                             },
                             () = tokio::time::sleep_until(deadline) => {
                                 cancel.cancel();
+                                manager.publish_health_failure_while_draining("version probe timed out");
                                 let _ = task.await;
                                 Err("version probe timed out".into())
                             },
                             () = manager.shutting_down.cancelled() => {
                                 cancel.cancel();
+                                manager.publish_health_failure_while_draining("version probe canceled during shutdown");
                                 let _ = task.await;
                                 Err("version probe canceled during shutdown".into())
                             },

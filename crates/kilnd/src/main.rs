@@ -27,9 +27,9 @@ struct Args {
     /// Directory for the SQLite database (created 0700).
     #[arg(long, default_value = "/var/lib/kilnd")]
     state_dir: PathBuf,
-    /// The kiln binary (absolute path).
-    #[arg(long, default_value = "/usr/local/bin/kiln")]
-    kiln: PathBuf,
+    /// Private root-helper Unix socket (absolute path).
+    #[arg(long, default_value = "/run/kilnd-helper/helper.sock")]
+    helper_socket: PathBuf,
     /// Execution timeout when a request gives none, in seconds.
     #[arg(long, default_value_t = 60)]
     default_timeout_secs: u64,
@@ -158,14 +158,11 @@ fn main() -> ExitCode {
 async fn run(args: Args) -> Result<()> {
     let limits = validated_limits(&args)?;
     // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } != 0 {
-        bail!("kilnd must run as root: kiln needs root to create sandboxes");
+    if unsafe { libc::geteuid() } == 0 {
+        bail!("kilnd refuses root; run as the kilnd system user behind kilnd-helper");
     }
-    if !args.kiln.is_absolute() || !args.kiln.is_file() {
-        bail!(
-            "--kiln must be an absolute path to the kiln binary, got {}",
-            args.kiln.display()
-        );
+    if !args.helper_socket.is_absolute() {
+        bail!("--helper-socket must be absolute");
     }
     let gid = match args.socket_group.as_str() {
         "" => None,
@@ -187,7 +184,7 @@ async fn run(args: Args) -> Result<()> {
         .context("on-disk store has no state-directory identity")?;
     let socket = kilnd::server::bind_away_from(&args.socket, gid, Some(state_directory)).await?;
     let manager = Arc::new(Manager::new(
-        KilnRuntime::new(args.kiln.clone()),
+        KilnRuntime::new(args.helper_socket.clone()),
         store,
         limits,
     ));
@@ -410,6 +407,8 @@ fn validated_limits(args: &Args) -> Result<Limits> {
     if limits.max_list_page_size == 0 || limits.max_list_page_size > 1000 {
         bail!("--max-list-page-size must be between 1 and 1000");
     }
+    if args.max_timeout_secs > 3600 { bail!("--max-timeout-secs exceeds helper maximum of 3600"); }
+    if args.max_output_bytes > (1 << 20) { bail!("--max-output-bytes exceeds helper maximum of 1 MiB"); }
     Ok(limits)
 }
 

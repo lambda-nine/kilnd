@@ -76,6 +76,7 @@ pub struct FakeState {
     pub version_calls: u32,
     pub active_version_calls: u32,
     pub version_gate: Option<FakeGate>,
+    pub version_cleanup_gate: Option<FakeGate>,
     pub panic_version: bool,
     pub active_execs: u32,
     pub canceled_execs: u32,
@@ -201,11 +202,16 @@ impl Runtime for FakeRuntime {
         };
         let _active = ActiveVersion(self.state.clone());
         if let Some(gate) = gate {
-            tokio::select! {
+            let error = tokio::select! {
                 biased;
-                () = cancel.cancelled() => return Err(RuntimeError::Backend("version probe canceled".into())),
-                () = tokio::time::sleep_until(deadline) => return Err(RuntimeError::Backend("version probe timed out".into())),
-                () = gate.hold() => {}
+                () = cancel.cancelled() => Some("version probe canceled"),
+                () = tokio::time::sleep_until(deadline) => Some("version probe timed out"),
+                () = gate.hold() => None,
+            };
+            if let Some(error) = error {
+                let cleanup = self.state().version_cleanup_gate.take();
+                if let Some(cleanup) = cleanup { cleanup.hold().await; }
+                return Err(RuntimeError::Backend(error.into()));
             }
         }
         assert!(!panic_version, "injected fake version panic");
