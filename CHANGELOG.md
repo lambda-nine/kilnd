@@ -6,6 +6,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Isolate the lock CLOEXEC regression in a dedicated child so unrelated parallel
+  forks cannot transiently retain its lock and cause a false inheritance failure.
+
 - Remove unneeded AF_INET6 from the helper's supported IPv4-resolver deployment;
   retain AF_INET for hostname allowlists and AF_NETLINK for networking/nft, and
   assert the exact installed address-family set in the lifecycle regression.

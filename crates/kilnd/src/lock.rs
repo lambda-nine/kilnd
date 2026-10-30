@@ -197,6 +197,23 @@ mod tests {
 
     #[test]
     fn lock_descriptor_is_closed_across_exec() {
+        // A fork in another parallel test temporarily inherits every open FD
+        // until its exec. Check CLOEXEC in a fresh process where only this
+        // test can fork after acquiring the ownership lock.
+        const CHILD: &str = "KILND_LOCK_CLOEXEC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lock::tests::lock_descriptor_is_closed_across_exec",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("owner.lock");
         let owner = ExclusiveFileLock::acquire(&path, "test resource").unwrap();
