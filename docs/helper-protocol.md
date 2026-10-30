@@ -76,8 +76,10 @@ client. Accepted creates retain the existing 120-second gate/create bound;
 removals retain a 60-second remove plus 30-second absence probe. Exec honors
 its deadline/cancellation, kills and reaps the CLI, and waits for the existing
 execution-cgroup cleanup barrier before returning. Cancellation never abandons
-that barrier. The client waits for the reply, with a final transport bound
-covering the backend cleanup allowance. A failed helper exchange is an
+that barrier. The client waits for the reply, with per-operation transport allowances: Exec 70 seconds for cleanup, Create
+five seconds, capability probes one second and other controls two seconds.
+Health publishes its deadline failure while owned probe cleanup keeps draining,
+without admitting a replacement probe. A failed helper exchange is an
 ambiguous create failure, or an Exec CleanupFailed result retaining already observed output prefixes; it cannot claim
 allocation absence, exact output totals, or successful execution.
 
@@ -91,6 +93,14 @@ validators. Those shared modules and the installed kiln CLI remain part of
 the privileged trusted computing base and must be included in audits; counting
 only the helper binary's entry point would understate it.
 
+The Phase 0 root audit surface is 3,329 physical production lines (including
+comments and blanks): 774 in the new entry point, server, framing, descriptor
+handling and typed protocol; 833 in the shared direct adapter; 1,108 in shared
+process supervision and kiln protocol; and 614 in shared validation, model and
+runtime contract. Test modules are excluded; small inline test hooks are counted
+conservatively. The unprivileged helper client/adapter adds 367 lines. Libraries,
+installed kiln, nft and the kernel are additional trusted code.
+
 The service account and daemon are trusted to enforce per-caller ownership and
 resource reservations. A compromised daemon can invoke every allowed helper
 operation against kiln backends, including unmanaged IDs. The helper is not a
@@ -101,16 +111,32 @@ kernel or kiln privilege-escalation bug. Root remains fully trusted.
 A daemon crash closes its control connection; the helper cancels an active
 Exec and completes cleanup. A helper crash kills its direct CLI clients via
 parent-death signals; kiln PID 1 performs command cleanup on client loss.
-Detached sandbox shims survive helper restarts (`KillMode=process`), while the
-unprivileged daemon uses ordinary control-group shutdown. A helper transport
+Detached sandbox shims survive helper restarts (`KillMode=process`), and the
+unprivileged daemon preserves legacy shims from pre-helper upgrades. A helper transport
 failure reports failure, never reusable-success evidence. Startup reconciles
 interrupted execution rows and applies the existing strict backend observations.
 A create interrupted before its backend ID is durably published remains an
 ambiguous, charged reservation, including if the helper completed allocation.
 
-The helper's systemd sandbox leaves only kiln state, runtime network state,
-cgroupfs and the required IP-forwarding sysctl writable. Its capability set
+The helper's systemd mount restrictions mark system files, `/dev`, `/proc/sys`
+and `/sys` read-only, with writable exceptions for kiln state, runtime network
+state, cgroupfs and the IP-forwarding sysctl. Mount read-only flags do not
+prevent writes through device nodes or every process API; those are constrained
+by fixed operations and the capability set. The helper retains CAP_SYS_ADMIN
+for kiln's namespace/mount work and can undo mount restrictions if compromised;
+these restrictions reduce ordinary write paths, not the authority of trusted root. Its capability set
 covers namespace/mount/quota, networking, UID maps, ownership and cleanup. It
 cannot use the daemon unit's namespace/cgroup restrictions: kiln needs those
 operations. Both units use NoNewPrivileges and ProtectSystem=strict. The daemon
 has no capabilities and cannot reach kiln's root-owned data or networking state.
+
+The helper deliberately has no inherited systemd seccomp filter. On the tested
+VM, each of `RestrictAddressFamilies`, `LockPersonality`, `RestrictRealtime`
+and `ProtectKernelLogs` independently makes kiln's write to the child's
+`/proc/PID/uid_map` fail with EPERM, even with all capabilities retained.
+Removing these filters while retaining NoNewPrivileges, the eight listed
+capabilities and mount restrictions permits setup. Kernel log files are hidden
+with InaccessiblePaths instead. The unprivileged daemon keeps its syscall
+restrictions; kiln installs its own sandbox syscall policy after namespace
+setup. The installed-service regression checks successful Create/Exec and the
+helper's NoNewPrivs/Seccomp status to catch this interaction.

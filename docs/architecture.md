@@ -6,15 +6,15 @@
  harness (later): agent loop, memory, tool registry, LLM provider
         │  gRPC kilnd.v1 over /run/kilnd/kilnd.sock
  ┌──────▼──────────────────────────────────────────────────────┐
- │ kilnd (root, one per node, current-thread tokio runtime)    │
+ │ kilnd (UID kilnd, no capabilities, current-thread tokio runtime)    │
  │  service.rs   proto ⇄ model translation, error → gRPC code  │
  │  manager.rs   validation, state machine, per-sandbox locks, │
  │               reconciliation, shutdown                      │
  │  store.rs     SQLite (WAL, synchronous=FULL)                │
- │  runtime/     Runtime trait; kiln.rs (CLI), fake.rs (tests) │
+ │  runtime/     Runtime trait; kiln.rs (helper client), fake.rs (tests) │
  │  process.rs   argv spawn, timeout, cancel, bounded capture  │
  └──────┬──────────────────────────────────────────────────────┘
-        │  argv: kiln create|exec|ls|rm|gc   (env cleared, PATH fixed)
+        │  typed IPC + stdio FDs → root helper → fixed kiln argv
  ┌──────▼──────────────────────────────────────────────────────┐
  │ kiln CLI → detached shim per sandbox → kiln-init (PID 1)    │
  └─────────────────────────────────────────────────────────────┘
@@ -33,7 +33,12 @@ canceled, the command must be stopped *inside* the sandbox and the sandbox
 left usable. A Firecracker backend would implement the same trait over its
 API socket and a guest agent.
 
-`KilnRuntime` drives the installed CLI:
+`KilnRuntime` talks only to the root helper. The helper revalidates typed
+requests and uses `DirectKilnRuntime` in `runtime/kiln_direct.rs` to drive the
+installed CLI. The direct adapter is also used by root-only integration tests.
+The Runtime trait is unchanged. See the [private protocol](helper-protocol.md).
+
+The helper maps these operations to fixed argv:
 
 | kilnd | kiln |
 |-------|------|
@@ -48,7 +53,7 @@ the command's argv follows `--`, and kilnd validates every value before it
 reaches kiln (kiln validates again). Timeouts and cancellation kill the
 `kiln exec` client; kiln's PID 1 notices the hangup, kills every process in
 that command's per-execution cgroup, and finishes only after the cgroup is
-empty. The killed CLI cannot receive PID 1's reply, so kilnd independently
+empty. The killed CLI cannot receive PID 1's reply, so the root helper independently
 waits for the host's `exec/cgroup.events` to report `populated 0` before it
 finalizes or unlocks the sandbox. This also contains descendants that changed
 process group or session. `kiln exec` is serial per sandbox, so kilnd queues
@@ -298,9 +303,11 @@ At startup, after both ownership locks are held and the socket is reserved:
    typed result died with the daemon; `FAILED` is left as it is, keeping its
    certainty marker; `DELETING` is retried or completed.
 5. Executions still `RUNNING` for this backend become `INTERRUPTED`. Other
-   backends' rows are untouched. Their `kiln exec` clients died with kilnd
-   (`PR_SET_PDEATHSIG` plus a post-arm parent-PID check), so kiln already
-   stopped the commands even if the daemon died during child setup.
+   backends' rows are untouched. Daemon disconnect requests helper-owned Exec
+   cancellation; helper death kills CLI clients through `PR_SET_PDEATHSIG` and
+   its post-arm parent-PID check. Startup protocol/absence observations fail
+   closed if a backend cannot validate while old cleanup is still in progress.
+
 6. Live or stale kiln sandboxes kilnd doesn't know are logged as unmanaged and
    left alone across repeated startup reconciliation and daemon shutdown.
 
@@ -308,12 +315,12 @@ Running it again changes nothing.
 
 ## Concurrency
 
-kilnd runs on tokio's current-thread runtime. There is little CPU work; most
-time is spent waiting on child processes. Every backend launcher captures the
-daemon PID before spawn, restores default HUP/INT/QUIT/TERM/PIPE dispositions,
+Both kilnd and its helper use tokio's current-thread runtime. The daemon
+waits on IPC; the helper waits on child processes. Every privileged backend
+launcher captures the helper PID before spawn, restores default HUP/INT/QUIT/TERM/PIPE dispositions,
 arms `PR_SET_PDEATHSIG`, then rechecks the parent PID before exec. The recheck
 closes the non-retroactive parent-death window; the current-thread runtime also
-keeps the forking thread alive for the daemon's lifetime. SQLite access goes
+keeps the forking thread alive for the helper's lifetime. SQLite access goes
 through one mutex-guarded connection, and each statement is short. Sandbox
 count, memory, PID and disk reservation checks plus the `CREATING` insert share
 one `IMMEDIATE` transaction, so concurrent creates and external SQLite writers
@@ -374,7 +381,10 @@ Health coalesces uncached callers into one tracked, daemon-owned version
 probe. A separate Tokio task isolates backend panics. Timeout signals
 cancellation to that task, and the runtime explicitly kills and waits for its
 child before singleflight ownership is released. Shutdown uses the same path.
-Completion caches a cloned success or error using a monotonic timestamp;
+A deadline publishes a failure to waiting Health callers while tracked cleanup
+continues. No replacement probe starts until cleanup finishes, and callers
+continue receiving that failure even after its normal cache TTL. Completion
+caches a cloned success or error using a monotonic timestamp;
 success and failure TTLs differ. Caller cancellation cannot cancel the probe.
 Shutdown starts no probe and reports cached details when available.
 Finalization-write degradation is recomputed on every call, including cache
@@ -484,16 +494,25 @@ operations drain, kilnd conditionally removes only its own socket inode and
 then releases the socket- and state-directory locks. A crash releases the
 kernel locks but can leave a stale socket for the next instance to probe.
 
-The systemd unit uses `KillMode=process` because kiln's shims are forked from
-kilnd's cgroup and must survive daemon restarts. systemd logs "left-over
-process" for each shim on restart; that is expected.
+The API daemon uses `KillMode=process` to preserve legacy shims started by
+pre-helper root daemons; fresh deployments have no daemon child CLI processes.
+The root helper uses `KillMode=process` because kiln's detached shims live in
+its service cgroup and must survive helper restarts. systemd may report those
+leftover shims. Both units have NoNewPrivileges and ProtectSystem=strict; the
+daemon has an empty capability set and the helper has only kiln's required
+namespace, mount, quota, network, ownership and cleanup capabilities.
 
 ## Limits and defaults
 
 | Setting | Default | Flag |
 |---------|---------|------|
 | Socket | `/run/kilnd/kilnd.sock`, group `kilnd` | `--socket`, `--socket-group` |
-| State | `/var/lib/kilnd/kilnd.db` | `--state-dir` |
+| State | `/var/lib/kilnd/kilnd.db`, owner `kilnd`, directory 0700 / files 0600 | `--state-dir` |
+| Root helper | `/run/kilnd-helper/helper.sock` | `--helper-socket` |
+| Terminal execution history | 7 days / 10,000 rows | `--execution-max-age-secs`, `--execution-max-count` |
+| Deleted / uncharged failed sandbox history | 7 days / 1,000 rows | `--deleted-sandbox-max-age-secs`, `--deleted-sandbox-max-count` |
+| History prune interval | 60 s, plus startup | `--prune-interval-secs` |
+| Durable output mode | `full`; `metadata` recommended; `none` drops evidence too | `--output-storage` |
 | Exec timeout | 60 s, max 1 h | `--default-timeout-secs`, `--max-timeout-secs` |
 | Output kept per stream | 1 MiB | `--max-output-bytes` |
 | Retained sandbox reservations | 32 | `--max-sandboxes` |
@@ -525,7 +544,14 @@ at most 1000. Each node budget must hold at least one default sandbox.
 These are finite capacity bounds, not a hard-real-time guarantee: synchronous
 SQLite/filesystem work may block, slow clients may deny availability until
 disconnected, and authorized callers can monopolize capacity without tenant
-fairness or isolation. Durable history still grows without retention.
+fairness or isolation. Terminal history has age/count retention. Pruning never removes a charged or
+nonterminal sandbox, or an unfinished execution; deleting sandbox history
+removes only terminal children. Zero age/count expires all eligible rows.
+Freed pages are reused, not securely erased. Schema 6 adds a durable listing
+sequence counter so pruning cannot make new inserts reuse an old page watermark.
+Metadata output storage retains original counts/certainty/truncation facts,
+while none drops output evidence; the immediate Exec response still returns
+captured output. Policies affect future writes and do not scrub past history.
 
 ## Dependencies
 

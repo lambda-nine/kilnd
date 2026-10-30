@@ -5,11 +5,21 @@ one before and keeps the rule that the harness talks to sandboxes only
 through the kilnd API. Product-specific code (Idea Marathon and others) stays
 in the products that consume the harness.
 
-## 1. Control-plane hardening (next)
+## Phase 0: control-plane privilege gate (done)
 
-- **Retention:** prune executions, deleted sandboxes and uncharged failed
-  creates by age and count;
-  an option to keep output metadata only.
+- [x] **(a) Retention:** startup/periodic age and count limits for terminal
+  executions and deleted/uncharged failed sandbox history; full/metadata/none
+  output storage. Charged and unfinished rows are protected.
+- [x] **(b) Per-caller ownership:** durable kernel peer UID, additive
+  `Sandbox.owner_uid`, owner/root authorization and filtered pagination.
+- [x] **(c) Privilege split:** unprivileged kilnd with no capabilities, behind
+  the typed root helper, descriptor stdio and hardened systemd services.
+
+The root surface and remaining trusted code are described in the
+[helper protocol](helper-protocol.md) and [threat model](threat-model.md).
+
+## 1. Control-plane features (next)
+
 - **Streaming exec:** a server-streaming `ExecStream` for long commands and
   live output, alongside the bounded unary `Exec`.
 - **Idempotent create:** a client request ID so a retried `CreateSandbox`
@@ -46,6 +56,8 @@ A separate crate or service that talks to kilnd over `kilnd.v1`:
 - The loop: model → tool calls → kilnd → results → model, with step and
   cost limits, cancellation, and one sandbox per session (delete on exit).
 - API keys from the vault or environment, never from sandbox output.
+- A credential broker outside tool sandboxes, so tools can make authorized
+  requests without seeing provider credentials. No regex output redaction.
 
 ## 5. Harness: memory
 

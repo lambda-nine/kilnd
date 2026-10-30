@@ -20,7 +20,8 @@ through its CLI. Read [README.md](README.md),
   handling, reconciliation, the socket or shutdown, in the VM after
   `scripts/install.sh`: `scripts/integration-test.sh`,
   `scripts/daemon-singleton-regressions.sh`,
-  `scripts/state-path-regressions.sh` and `scripts/smoke.sh`.
+  `scripts/state-path-regressions.sh`,
+  `sudo python3 -I scripts/phase0-regressions.py` and `scripts/smoke.sh`.
   The integration script also runs the dedicated-child admission FD/RSS,
   slow-client, queue and concurrent-Health stress regression.
 - **kiln stays in its own repository** (`~/Projects/lambda-nine/kiln`). Never
@@ -38,3 +39,14 @@ through its CLI. Read [README.md](README.md),
   release, needs Stephen's explicit approval.
 - **Security wording:** kiln is experimental shared-kernel isolation, not a
   boundary for hostile multi-tenant workloads.
+
+## Privilege boundary
+
+Production kilnd refuses root and runs as the non-login `kilnd` account, with
+no capabilities. Only `kilnd-helper` runs root, using its typed private socket
+protocol (`docs/helper-protocol.md`). Keep helper validators, fd constraints,
+deadlines, peer UID checks and shared process/cleanup evidence fail-closed.
+`KilnRuntime` is a helper client; `DirectKilnRuntime` is for the helper and
+privileged adapter tests. API callers must never supply host executable paths,
+flags or environment to the helper. Future backends get separate validated
+enum variants; the Runtime trait stays backend-neutral.

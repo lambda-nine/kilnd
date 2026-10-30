@@ -6,7 +6,7 @@ serves a versioned gRPC API on a Unix socket. It is the runtime control plane
 the future agent harness will sit on; there is no LLM code here.
 
 ```
-kilndctl ──gRPC over /run/kilnd/kilnd.sock──▶ kilnd ──argv──▶ kiln create / exec / ls / rm / gc
+kilndctl ──gRPC over /run/kilnd/kilnd.sock──▶ kilnd ──typed Unix IPC──▶ root kilnd-helper ──argv──▶ kiln
                                                │
                                                └──▶ /var/lib/kilnd/kilnd.db (SQLite)
 ```
@@ -16,8 +16,9 @@ kilndctl ──gRPC over /run/kilnd/kilnd.sock──▶ kilnd ──argv──�
 kilnd inherits kiln's boundary: kiln is **experimental, shared-kernel**
 isolation, reviewed adversarially by AI models but not audited. Do not use
 kilnd or kiln as a security boundary for hostile multi-tenant workloads.
-kilnd runs as root, and anyone who can reach its socket can run commands in
-sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
+kilnd runs as the unprivileged `kilnd` system account with no capabilities.
+The root helper accepts only validated kiln operations from that service UID.
+API callers can control only their own sandboxes; root can control all of them. See [docs/threat-model.md](docs/threat-model.md).
 
 ## What it does
 
@@ -26,7 +27,7 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   `Exec` and `GetExecution`. Nothing in it is kiln-specific, so a microVM
   backend can implement the same API.
 - **Runtime adapter trait** ([crates/kilnd/src/runtime/mod.rs](crates/kilnd/src/runtime/mod.rs)).
-  The kiln implementation runs the installed `kiln` CLI with argument vectors
+  The kiln implementation calls a private root helper, which runs the installed `kiln` CLI with argument vectors
   (never a shell), a cleared environment, timeouts and bounded output. kiln's
   code is not copied or linked.
 - **One validation contract** ([docs/validation.md](docs/validation.md)) for
@@ -36,8 +37,8 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
 - **SQLite state** in `/var/lib/kilnd/kilnd.db`: every hop of the absolute
   state path, including nested absolute or relative symlink targets, is
   resolved and trust-checked descriptor-relatively with a bounded link depth.
-  The final directory is pinned by descriptor and root-owned 0700. Existing
-  database, WAL, SHM and journal entries must be root-owned regular 0600 files
+  The final directory is pinned by descriptor and owned by `kilnd` with mode 0700. Existing
+  database, WAL, SHM and journal entries must be `kilnd`-owned regular 0600 files
   with one link; the main database is opened with SQLite `NOFOLLOW`. Sandboxes
   with their effective spec, backend ID, state, timestamps and failure
   reason; executions with argv, state, legacy exit code, typed termination,
@@ -54,7 +55,7 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   backend omitted from the list is probed directly and must also lack its
   cgroup before absence is trusted. If the exact recorded backend later
   reappears and passes capability validation, `lost` returns to `ready`.
-- **Operational limits:** root-owned socket usable by the `kilnd` group
+- **Operational limits:** `kilnd`-owned API socket usable by the `kilnd` group
   (directory 0750, socket 0660), per-execution timeouts that stop the command
   inside the sandbox, bounded output, stdin and argv, a cap on durable sandbox
   reservations, graceful shutdown, and structured logs (text or JSON).
@@ -139,14 +140,16 @@ capabilities and complete `gc --help` usage before reconciliation, Create and
 Exec. Sandboxes whose PID 1 predates `0x10` keep working;
 older sandbox instances without protocol v1 require explicit recreation. Command bytes use private
 streams, so real exits 125/126/127 and signal termination remain distinct from
-runtime failures. Schema 5 stores typed outcomes, truthful output-accounting
-evidence and create certainty; older databases migrate at open, every existing
-row stays ambiguous, and older binaries refuse the result. See [setup](docs/setup.md) before upgrading.
+runtime failures. Schema 7 stores typed outcomes, truthful output-accounting evidence, create
+certainty and creator UID. Older databases migrate at open: historical create
+certainty stays ambiguous and historical ownership becomes root. Older binaries
+refuse the result. See [setup](docs/setup.md) before upgrading.
 
 These bounds do not provide tenant fairness: authorized callers share one set
 of node budgets and can monopolize capacity, including with slow connections. Messages decode before service RPC
 admission, under the connection, stream and message caps. SQLite/filesystem
-work is synchronous, and history still grows without retention. Defaults and
+work is synchronous. Terminal history has age/count retention; charged and
+unfinished rows remain protected. Defaults and
 flags are listed in [the architecture](docs/architecture.md#limits-and-defaults).
 
 ## Quick start (in kiln's Lima VM)
@@ -157,13 +160,13 @@ Full instructions: [docs/setup.md](docs/setup.md).
 # on the Mac
 git clone https://github.com/lambda-nine/kiln ~/Projects/lambda-nine/kiln
 git clone https://github.com/lambda-nine/kilnd ~/Projects/lambda-nine/kilnd
-git -C ~/Projects/lambda-nine/kiln checkout --detach e48f0e785ad484d0b2947897f6d48d0756059d7e
+git -C ~/Projects/lambda-nine/kiln checkout --detach 00d61c546db7aa67ad283d10c2ca6165ca5f8166
 cd ~/Projects/lambda-nine/kiln && limactl create --name=kiln lima.yaml && limactl start kiln
 
 # in the VM, once: kiln itself (see kiln's README), then kilnd
 limactl shell --workdir ~/Projects/lambda-nine/kilnd kiln
 sudo apt-get install -y protobuf-compiler sqlite3
-scripts/install.sh                      # kilnd + kilndctl, kilnd group, systemd service
+scripts/install.sh                      # daemon + helper + CLI, service account and hardened units
 
 sudo kilndctl health
 id=$(sudo kilndctl create --memory 256M --pids 64 --disk 256M --label owner=me)
@@ -194,6 +197,7 @@ hand in the VM after `scripts/install.sh`:
 scripts/integration-test.sh   # real kiln plus dedicated-child admission FD/RSS stress
 scripts/daemon-singleton-regressions.sh # duplicate startup cannot disturb live work
 scripts/state-path-regressions.sh # hostile state ancestors/files fail before reconciliation
+sudo python3 -I scripts/phase0-regressions.py # real UID ownership, helper, privilege and retention checks
 scripts/smoke.sh              # kilndctl → socket → service → kiln, checked through the API
 ```
 
@@ -205,7 +209,7 @@ scripts/smoke.sh              # kilndctl → socket → service → kiln, checke
 | `crates/kilnd-api` | Generated Rust types and gRPC stubs |
 | `crates/kilnd` | The daemon: manager, store, runtime adapters, server |
 | `crates/kilndctl` | The client |
-| `deploy/kilnd.service` | systemd unit |
+| `deploy/` | Hardened daemon/helper services, private socket and tmpfiles |
 | `scripts/` | Install, integration test, smoke test |
 | `docs/` | [Architecture](docs/architecture.md), [threat model](docs/threat-model.md), [setup](docs/setup.md), [roadmap](docs/roadmap.md) |
 
@@ -213,6 +217,17 @@ scripts/smoke.sh              # kilndctl → socket → service → kiln, checke
 
 Copyright 2026 Stephen Estrada. Licensed under the
 [Apache License, Version 2.0](LICENSE).
+
+## Privilege boundary
+
+The API socket is `kilnd:kilnd 0660` in `/run/kilnd` (0750); state stays
+private to `kilnd` (0700 directory, 0600 DB/sidecars). `--helper-socket` defaults
+to `/run/kilnd-helper/helper.sock`, `root:kilnd 0660` in a root-owned 0750
+directory. Only the service UID passes the helper's peer check, including
+rejecting root and ordinary API group members. `kilnd` refuses to run as root.
+The helper checks the daemon's typed request again, uses fixed argv and a
+cleared environment, and owns the existing CLI cleanup barriers. The daemon
+checks that its helper peer is root. See the [protocol and threat analysis](docs/helper-protocol.md).
 
 ## History retention
 

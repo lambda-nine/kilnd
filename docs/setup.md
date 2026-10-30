@@ -1,9 +1,10 @@
 # Setting up kilnd
 
-kilnd runs where kiln runs: Linux 6.8+ with cgroups v2, as root. On a Mac
+kilnd runs where kiln runs: Linux 6.8+ with cgroups v2. The daemon runs
+as the unprivileged `kilnd` system account; only `kilnd-helper` runs as root. On a Mac
 that means kiln's Lima VM (Ubuntu 24.04, aarch64). These steps take a fresh
 Mac to a working kilnd; they were run on the Mac mini (Estradas-Mac-mini)
-on 2026-10-13.
+on 2026-10-13, with the Phase 0 service split revalidated on 2026-10-30.
 
 ## 1. Mac prerequisites
 
@@ -27,7 +28,7 @@ Follow kiln's README "Dev setup (macOS)". The part kilnd needs:
 ```sh
 cd ~/Projects/lambda-nine/kiln
 git fetch origin
-git checkout --detach e48f0e785ad484d0b2947897f6d48d0756059d7e  # tested companion
+git checkout --detach 00d61c546db7aa67ad283d10c2ca6165ca5f8166  # tested Phase 0 companion
 limactl create --name=kiln lima.yaml && limactl start kiln
 limactl shell --workdir "$PWD" kiln
 sudo scripts/fetch-alpine.sh        # the "alpine" image
@@ -43,7 +44,7 @@ including `40d9aa5003205d4c171e1b3eca61e9868064e98b` and
 `46d84bdfe13e331f047e70e38848f7d74bcd2872`, which lack `0x10`: upgrade kiln
 before kilnd, or kilnd refuses to start. Sandboxes those revisions already
 started keep working; only the installed CLI needs the new feature.
-The tested companion is `e48f0e785ad484d0b2947897f6d48d0756059d7e`: install, integration, smoke and every
+The tested Phase 0 companion is `00d61c546db7aa67ad283d10c2ca6165ca5f8166`: install, integration, smoke and every
 kilnd regression script passed against that immutable pin.
 Install a compatible artifact, then check `kiln capabilities --protocol=1`
 (binary output) and `kiln gc --help` (usage must advertise `[ID]...`). kilnd
@@ -63,18 +64,31 @@ echo 'export CARGO_TARGET_DIR=$HOME/.cache/kilnd-target' >> ~/.profile && . ~/.p
 scripts/install.sh
 ```
 
-`scripts/install.sh` builds release binaries, installs `/usr/local/bin/kilnd`
-and `/usr/local/bin/kilndctl`, creates the `kilnd` system group, installs and
-starts `kilnd.service`. To use the socket without sudo:
+`scripts/install.sh` builds and installs `kilnd`, `kilnd-helper` and
+`kilndctl`, creates the non-login `kilnd` account/group, and installs the
+hardened daemon/helper services plus the helper socket and tmpfiles config.
+It stops the daemon before validating and transferring old root-owned state
+and API runtime-directory entries to the service account. Unsafe links,
+ownership, modes or unexpected entries abort the transfer; originals are
+never copied into a broader directory. The installer requires root through
+sudo; the installed daemon refuses to run as root. `--helper-socket` replaces
+the old daemon `--kiln` flag. The helper alone has a root-controlled `--kiln`
+path, defaulting to the pinned `/usr/local/bin/kiln`.
+
+The API socket is `kilnd:kilnd 0660` under `/run/kilnd` (0750). The helper is
+`root:kilnd 0660` under `/run/kilnd-helper` (0750) and checks the exact service
+UID, rejecting other group members and root. Do not grant callers access to
+the `kilnd` account itself. See [helper protocol and trust](helper-protocol.md). To use the socket without sudo:
 `sudo usermod -aG kilnd $USER`, then open a new shell.
 
 Check it:
 
 ```sh
 sudo kilndctl health
-systemctl status kilnd
-journalctl -u kilnd -o cat -f        # one JSON object per line
-sudo sqlite3 /var/lib/kilnd/kilnd.db 'SELECT id, state, backend_id FROM sandboxes'
+systemctl status kilnd kilnd-helper kilnd-helper.socket
+journalctl -u kilnd -u kilnd-helper -o cat -f        # one JSON object per line
+# Use the API for live inspection; stop kilnd before opening its SQLite DB.
+sudo kilndctl ls --all
 ```
 
 ## 4. Tests
@@ -85,6 +99,7 @@ cargo clippy --locked --all-targets -- -D warnings
 scripts/integration-test.sh          # dedicated admission stress, then root + real kiln
 scripts/daemon-singleton-regressions.sh # duplicate starts preserve active work
 scripts/state-path-regressions.sh    # ownership, mode, type, link and symlink defenses
+sudo python3 -I scripts/phase0-regressions.py # real peer UIDs, helper, privilege, retention
 scripts/smoke.sh                     # through the installed service
 ```
 
@@ -143,7 +158,8 @@ guaranteed gRPC status. tonic message-size cap failures use `OUT_OF_RANGE`.
 Messages decode before handler admission under connection/stream/message
 caps. Slow authorized clients can monopolize those bounded slots; there is no
 tenant fairness, and synchronous SQLite/filesystem operations are not hard
-real time. History still grows without retention.
+real time. Terminal history is bounded by age/count retention; charged and
+unfinished rows stay. See [history retention](../README.md#history-retention).
 
 An Exec timeout includes queueing. Expiry before row insertion returns
 `DEADLINE_EXCEEDED`; expiry afterwards returns a successful terminal
@@ -156,13 +172,13 @@ opaque `next_page_token` until empty, keeping `include_deleted` and the calling
 uid unchanged. Tokens do not survive the schema 7 upgrade: restart the listing.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
-bounds. Every older schema upgrades in order through to v5. Schema 5 stores
+bounds. Every older schema upgrades in order through v7. Schema 5 introduced
 typed termination and runtime diagnostics together with output, terminal state,
 truncation facts and whether each byte total is exact, plus each sandbox's
 create certainty. Historical records retain unknown typed values and unknown
 output-total certainty, and every existing no-ID `FAILED` row stays ambiguous and
 charged, even one whose text describes a missing image. Older binaries refuse
-schema 5, so keep a backup before upgrading.
+the current schema, so keep a backup before upgrading.
 Store migration may occur before startup capability validation fails;
 installing an older daemon is not a database downgrade path.
 
@@ -174,9 +190,9 @@ use root to inspect or delete them. Older binaries refuse schema 7.
   restart.
 - **State path:** `--state-dir` must be absolute. Its real ancestors must be
   trusted and non-writable, and every nested symlink alias must be owned by
-  root (a root-owned sticky temporary directory is allowed). The final
-  directory must be root-owned 0700, and existing
-  `kilnd.db`, WAL, SHM or journal entries must be root-owned regular 0600 files
+  root or the service UID (a trusted sticky temporary directory is allowed).
+  The final directory must be `kilnd`-owned 0700, and existing
+  `kilnd.db`, WAL, SHM or journal entries must be `kilnd`-owned regular 0600 files
   with one link. Do not move a database into place with permissive ownership,
   use a symlink, or hard-link it; kilnd fails before reconciliation. systemd's
   `StateDirectory=kilnd` and `StateDirectoryMode=0700` provide the supported
@@ -203,6 +219,15 @@ use root to inspect or delete them. Older binaries refuse schema 7.
   Lowering configured budgets below surviving reservations degrades Health and
   rejects new creates, but Get/List/Delete and reconciliation remain available
   so the node can be brought back within budget.
+- **Output history:** `--output-storage=metadata` is recommended; `full` is
+  the compatibility default, while `none` drops output evidence as well.
+  Use `systemctl edit kilnd` with an empty `ExecStart=` followed by the full
+  replacement command to change flags. Execution history defaults to 7 days /
+  10,000 rows; deleted and uncharged failed sandbox history to 7 days / 1,000
+  rows. Startup and periodic pruning apply both age and count limits. Zero
+  age/count expires all eligible rows, never charged/unfinished rows. Mode
+  changes affect future writes only; pruning is not secure erasure of SQLite
+  pages, WAL or backups. Argv, labels and diagnostics may still contain secrets.
 - **Logs:** `--log-format json` in the unit; `KILND_LOG=debug` for more.
 - **Stray kiln sandboxes** kilnd didn't create are logged at startup as
   unmanaged and left alone. Remove live ones with `sudo kiln rm ID`; remove
@@ -211,4 +236,4 @@ use root to inspect or delete them. Older binaries refuse schema 7.
   root or direct `kiln` use can bypass them and must be included in deployment
   headroom and operator accounting.
 - **Bare-metal Linux** works the same way: install kiln and kilnd, then
-  enable the unit. Only the Lima VM has been tested.
+  enable both services and the helper socket. Only the Lima VM has been tested.

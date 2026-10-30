@@ -15,8 +15,8 @@ file says what it protects, what it trusts, and what it doesn't try to do.
 
 ## Boundaries kilnd enforces
 
-- **Socket access.** `/run/kilnd` is `root:kilnd 0750` and the socket
-  `root:kilnd 0660` (or root-only with `--socket-group ''`). kilnd refuses a
+- **Socket access.** `/run/kilnd` is `kilnd:kilnd 0750` and the socket
+  `kilnd:kilnd 0660` (or service-user-only with `--socket-group ''`). kilnd refuses a
   socket directory it doesn't own, locks that directory before reconciliation,
   and, on Linux, won't replace anything at the socket path except an unchanged
   socket whose bounded connection probe returned `ECONNREFUSED`. Platforms
@@ -25,7 +25,7 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   connection's uid, gid and pid are logged from `SO_PEERCRED`.
 - **Per-caller ownership.** Create records the connection's kernel-reported uid
   as the sandbox's immutable owner. Get, Exec, Delete, GetExecution and List
-  authorize that uid before any backend call, admission or stored-output read,
+  authorize that uid before backend execution, Exec admission or stored-output reads,
   and List filters in SQLite before limits and continuation. Only the owner and
   root (uid 0) pass; a foreign ID is `NOT_FOUND`, the same as a missing one, and
   page tokens are bound to the uid. A connection whose credentials cannot be read
@@ -69,9 +69,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   nested symlink hop descriptor-relatively, validates alias and ancestor
   ownership plus non-writability, creates missing components without following
   symlinks, and requires
-  the final directory to be root-owned 0700. It pins that directory, opens the
+  the final directory to be owned by the service UID `kilnd`, mode 0700. It pins that directory, opens the
   persistent instance lock relative to it, and validates the database plus
-  SQLite sidecars as root-owned regular 0600 single-link files. SQLite opens
+  SQLite sidecars as `kilnd`-owned regular 0600 single-link files. SQLite opens
   the main file with `NOFOLLOW`; unsafe pre-created state is rejected before
   socket binding or reconciliation. The resolved socket parent must also have
   a different device/inode from the pinned state directory before its mode or
@@ -88,9 +88,10 @@ file says what it protects, what it trusts, and what it doesn't try to do.
 - **No request-owned exec work.** After an execution row is recorded, a
   daemon supervisor owns backend cleanup, pipe capture and finalization even
   if the RPC disappears. kiln places each command in an execution cgroup;
-  after killing the CLI, kilnd waits for that cgroup to report empty before
-  releasing ownership. `kiln exec` clients also die with kilnd
-  (`PR_SET_PDEATHSIG` with a post-arm parent-PID check); they restore standard
+  the root helper waits for that cgroup to report empty after killing the CLI
+  before acknowledging cleanup to kilnd. Daemon connection loss requests
+  cancellation and helper-owned cleanup; CLI clients die with the helper
+  (`PR_SET_PDEATHSIG` with a post-arm parent-PID check). They restore standard
   signal defaults before exec, and interrupted executions are recovered at
   startup.
 
@@ -169,7 +170,7 @@ sandbox compromises the host.
   pruned. Pruning frees SQLite pages, not secure erasure of DB/WAL/backups.
   Argv, diagnostics and labels can also contain secrets. There is deliberately
   no regex secret redaction: it gives false confidence for arbitrary encoded,
-  split or unfamiliar credentials. The planned credential broker should keep
+  split or unfamiliar credentials. The [planned credential broker](roadmap.md#4-harness-anthropic-provider-and-agent-loop) should keep
   credentials out of sandbox-visible data in the first place.
 - **Machine evidence has a private transport.** Four private Unix sockets
   separate status and workload stdio from bounded CLI diagnostics. Workload
@@ -193,7 +194,7 @@ sandbox compromises the host.
   are refused before reconciliation, even with an empty database; a live PID 1
   only needs the execution bits. Complete `gc --help` usage supplements the protocol capability
   frame; compatibility validation never invokes global garbage collection.
-  The tested companion is kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`; see setup for the immutable
+  The tested Phase 0 companion is kiln `00d61c546db7aa67ad283d10c2ca6165ca5f8166`; see setup for the immutable
   installation pin.
 - **A daemon crash during `kiln create`** can leave a kiln sandbox whose
   backend ID was never returned to kilnd. So can a CLI that dies or misreports
@@ -215,6 +216,16 @@ sandbox compromises the host.
 - **No API authentication beyond Unix permissions and the peer uid,** and no TLS,
   by design: the socket is local. Remote access would need an authenticated proxy,
   which would appear to kilnd as a single uid.
-- **kilnd runs as root,** because kiln does. A bug in kilnd's request handling
-  is a bug in a root process; the attack surface is the socket, reachable
-  only by root and the `kilnd` group.
+- **The service account is trusted.** kilnd refuses root and runs with no
+  capabilities. Its request/SQLite bugs do not directly execute in a root
+  process. Root is reachable only through the [typed helper surface](helper-protocol.md):
+  six kiln verbs, bounded frames and descriptor-only stdio, independent
+  validation, no shell, fixed executable/argv and a cleared environment. The
+  helper socket is root-owned and checks the exact service UID; sandbox UIDs,
+  root and ordinary group members are rejected before parsing. The daemon
+  checks that the helper peer is root. A compromised service account can call
+  those operations for any kiln backend, including unmanaged ones: per-caller
+  policy lives in kilnd. The helper and its shared direct adapter/process/
+  protocol modules, installed kiln and the kernel remain privileged trusted
+  code. This is a smaller root entry point, not protection against bugs in
+  that trusted runtime or shared kernel.
