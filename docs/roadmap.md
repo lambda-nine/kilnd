@@ -7,7 +7,8 @@ in the products that consume the harness.
 
 ## 1. Control-plane hardening (next)
 
-- **Retention:** prune executions and deleted sandboxes by age and count;
+- **Retention:** prune executions, deleted sandboxes and uncharged failed
+  creates by age and count;
   an option to keep output metadata only.
 - **Streaming exec:** a server-streaming `ExecStream` for long commands and
   live output, alongside the bounded unary `Exec`.

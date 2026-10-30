@@ -15,8 +15,9 @@ use tracing::{info, warn};
 
 use crate::admission::{Admission, AdmissionSnapshot};
 use crate::model::{
-    Captured, CommandStatus, Execution, ExecutionState, Network, RuntimeDiagnostic,
-    RuntimeErrorKind, RuntimeStage, Sandbox, SandboxSpec, SandboxState, new_id, now_ms, valid_id,
+    Captured, CommandStatus, CreateCertainty, Execution, ExecutionState, Network,
+    RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage, Sandbox, SandboxSpec, SandboxState, new_id,
+    now_ms, valid_id,
 };
 use crate::runtime::{BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
 use crate::store::{ExecutionResult, ReserveSandbox, SandboxBudgets, SandboxResources, Store};
@@ -730,6 +731,7 @@ impl<R: Runtime> Manager<R> {
             updated_at_ms: now,
             deleted_at_ms: None,
             failure_reason: None,
+            create_certainty: CreateCertainty::AllocationAmbiguous,
         };
         // Recorded before the backend runs, so a crash mid-create leaves a
         // trace for reconciliation. Count and all three resource sums are
@@ -797,15 +799,23 @@ impl<R: Runtime> Manager<R> {
                 sandbox.state = SandboxState::Ready;
                 Ok(self.store.sandbox(&sandbox.id)?.unwrap_or(sandbox))
             }
-            Err(e) => {
-                let reason = e.to_string();
-                warn!(sandbox = %sandbox.id, error = %reason, "sandbox creation failed");
-                self.store.set_sandbox_state(
-                    &sandbox.id,
-                    SandboxState::Failed,
-                    None,
-                    Some(&reason),
-                )?;
+            Err(failure) => {
+                let reason = failure.error().to_string();
+                warn!(sandbox = %sandbox.id, error = %reason, certainty = failure.certainty().as_str(), "sandbox creation failed");
+                // Capacity is released only by the durable certainty update.
+                // If it fails, this returns with the row still CREATING and
+                // charged, and restart turns it into an ambiguous FAILED.
+                match failure.certainty() {
+                    CreateCertainty::DefinitelyNotCreated => {
+                        self.store.fail_create_definitely(&sandbox.id, &reason)?
+                    }
+                    CreateCertainty::AllocationAmbiguous => self.store.set_sandbox_state(
+                        &sandbox.id,
+                        SandboxState::Failed,
+                        None,
+                        Some(&reason),
+                    )?,
+                }
                 Err(Error::Backend(format!(
                     "create sandbox {}: {reason}",
                     sandbox.id
@@ -919,6 +929,7 @@ impl<R: Runtime> Manager<R> {
     fn prepare_delete(&self, id: &str, mut sandbox: Sandbox) -> Result<Sandbox> {
         loop {
             if sandbox.backend_id.is_none()
+                && sandbox.create_certainty == CreateCertainty::AllocationAmbiguous
                 && !matches!(sandbox.state, SandboxState::Deleted | SandboxState::Creating)
             {
                 return Err(self.ambiguous_reservation_error(&sandbox));
@@ -933,10 +944,12 @@ impl<R: Runtime> Manager<R> {
                     )));
                 }
                 SandboxState::Failed => {
-                    // The no-ID case was refused above. With an ID this is
+                    // The ambiguous no-ID case was refused above. What is
+                    // left never touches the backend: with an ID this is
                     // compensated history, including when compensation ended
-                    // while Delete waited for the coordination lock. Never
-                    // reassert ownership of the historical backend ID.
+                    // while Delete waited for the coordination lock, so never
+                    // reassert ownership of the historical backend ID. Without
+                    // one, the typed create result proved nothing was allocated.
                     if self.store.compare_and_set_sandbox_state(
                         id,
                         SandboxState::Failed,
@@ -1047,8 +1060,8 @@ impl<R: Runtime> Manager<R> {
     }
 
     /// The ordinary listing is not an inventory of hidden/unpublished
-    /// resources. No current Runtime operation can prove absence without an
-    /// ID, so an ambiguous reservation must stay charged, even on an empty list.
+    /// resources. Only a typed create result can prove absence without an ID,
+    /// so an ambiguous reservation must stay charged, even on an empty list.
     fn ambiguous_reservation_error(&self, sandbox: &Sandbox) -> Error {
         Error::FailedPrecondition(format!(
             "cannot release the ambiguous reservation for failed sandbox {}: no backend ID was reported; the {} backend listing cannot account for hidden or unpublished resources; authoritative resource reconciliation is required and is not currently supported",

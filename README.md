@@ -65,6 +65,9 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   reserved because it can recover; ambiguous `FAILED` creates remain reserved
   because no current operation can account for hidden resources without an ID.
   Delete refuses to release those ambiguous rows, even with an empty listing.
+  A create the backend proves failed before allocating anything, such as a
+  missing image, releases as it durably becomes `FAILED`, and Delete retires
+  that row without touching the backend.
   `DELETING` releases only after an exact-ID negative probe, complete list
   absence and cgroup absence are durably recorded. Health exposes limits,
   reservations and rejection totals since daemon startup. Lowering limits
@@ -125,14 +128,15 @@ Sandboxes outlive kilnd: restarting or upgrading the daemon leaves them
 running, and reconciliation picks them up again.
 
 kilnd requires persistent-exec protocol v1 in both the installed kiln CLI and
-each sandbox PID 1, plus CLI support for scoped `gc ID...` (minimum kiln
-`40d9aa500320`). It checks capabilities and complete `gc --help` usage before
-reconciliation and Exec;
-old sandbox instances require explicit recreation. Command bytes use private
+each sandbox PID 1, plus CLI support for scoped `gc ID...` and persistent-create
+certainty (capability feature `0x10`, minimum kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`). It checks
+capabilities and complete `gc --help` usage before reconciliation, Create and
+Exec. Sandboxes whose PID 1 predates `0x10` keep working;
+older sandbox instances without protocol v1 require explicit recreation. Command bytes use private
 streams, so real exits 125/126/127 and signal termination remain distinct from
-runtime failures. Schema 4 stores typed outcomes and truthful output-accounting
-evidence; v1/v2/v3 databases migrate at open and older binaries refuse the
-result. See [setup](docs/setup.md) before upgrading.
+runtime failures. Schema 5 stores typed outcomes, truthful output-accounting
+evidence and create certainty; older databases migrate at open, every existing
+row stays ambiguous, and older binaries refuse the result. See [setup](docs/setup.md) before upgrading.
 
 These bounds do not provide tenant fairness: authorized callers can monopolize
 capacity, including with slow connections. Messages decode before service RPC
@@ -148,7 +152,7 @@ Full instructions: [docs/setup.md](docs/setup.md).
 # on the Mac
 git clone https://github.com/lambda-nine/kiln ~/Projects/lambda-nine/kiln
 git clone https://github.com/lambda-nine/kilnd ~/Projects/lambda-nine/kilnd
-git -C ~/Projects/lambda-nine/kiln checkout --detach 46d84bdfe13e331f047e70e38848f7d74bcd2872
+git -C ~/Projects/lambda-nine/kiln checkout --detach e48f0e785ad484d0b2947897f6d48d0756059d7e
 cd ~/Projects/lambda-nine/kiln && limactl create --name=kiln lima.yaml && limactl start kiln
 
 # in the VM, once: kiln itself (see kiln's README), then kilnd

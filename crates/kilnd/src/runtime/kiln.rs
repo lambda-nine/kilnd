@@ -13,7 +13,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError,
+    BackendSandbox, BackendStatus, CreateFailure, ExecFinish, ExecOutcome, ExecSpec, Runtime,
+    RuntimeError,
 };
 use super::{
     kiln_process::{self, OwnedExec, Stop},
@@ -24,7 +25,11 @@ use crate::model::{RuntimeDiagnostic, RuntimeErrorKind as Kind, RuntimeStage as 
 use crate::process::{self, Finish};
 
 /// Capability negotiation, rather than package strings, gates compatibility.
-const PROTOCOL_REQUIREMENT: &str = "persistent-exec protocol v1 and scoped gc ID... (minimum kiln 40d9aa5003205d4c171e1b3eca61e9868064e98b)";
+const CLI_REQUIREMENT: &str =
+    "persistent-exec protocol v1, scoped gc ID... and persistent-create certainty (feature 0x10)";
+const SANDBOX_REQUIREMENT: &str = "persistent-exec protocol v1";
+/// `kiln create` exits with this only for failures known before it allocates.
+const CREATE_PREFLIGHT_FAILED: i32 = 124;
 /// kiln's own output (IDs, `ls` tables, errors) is small.
 const CONTROL_OUTPUT: usize = 64 * 1024;
 const CREATE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -65,15 +70,7 @@ impl KilnRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<process::Outcome, RuntimeError> {
-        let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-        let req = process::Request {
-            program: &self.bin,
-            args: &args,
-            stdin: b"",
-            deadline,
-            max_output: CONTROL_OUTPUT,
-        };
-        let out = process::run(&req, cancel).await?;
+        let out = self.run_control(args, deadline, cancel).await?;
         match out.finish {
             Finish::Exited(status) if status.success() => Ok(out),
             Finish::Exited(status) => Err(RuntimeError::Backend(format!(
@@ -83,6 +80,23 @@ impl KilnRuntime {
             Finish::TimedOut => Err(RuntimeError::Backend(format!("kiln {op} deadline expired"))),
             Finish::Canceled => Err(RuntimeError::Backend(format!("kiln {op} was canceled"))),
         }
+    }
+
+    async fn run_control(
+        &self,
+        args: &[String],
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> std::io::Result<process::Outcome> {
+        let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+        let req = process::Request {
+            program: &self.bin,
+            args: &args,
+            stdin: b"",
+            deadline,
+            max_output: CONTROL_OUTPUT,
+        };
+        process::run(&req, cancel).await
     }
 
     async fn capabilities(
@@ -137,14 +151,20 @@ impl KilnRuntime {
                 .map_err(|e| format!("{e}; {}", observed()))?;
             caps.require_v1()?;
             if id.is_none() {
+                caps.require_create_certainty()?;
                 self.require_scoped_gc(deadline, cancel).await?;
             }
             Ok::<_, String>(caps)
         }
         .await;
         result.map_err(|e| {
+            let requirement = if id.is_some() {
+                SANDBOX_REQUIREMENT
+            } else {
+                CLI_REQUIREMENT
+            };
             RuntimeError::Incompatible(format!(
-                "{}{} requires {PROTOCOL_REQUIREMENT}: {e}",
+                "{}{} requires {requirement}: {e}",
                 self.bin.display(),
                 scope
             ))
@@ -251,6 +271,25 @@ impl KilnRuntime {
         }
     }
 
+    /// Revalidates the installed CLI immediately before each create, because
+    /// its exit status is evidence only if it advertised that contract. Failing
+    /// this gate proves no create process started; from the spawn attempt on,
+    /// only `create_result`'s exact evidence is definite.
+    async fn create_until(
+        &self,
+        spec: &SandboxSpec,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<String, CreateFailure> {
+        self.capabilities(None, deadline.min(Instant::now() + QUERY_TIMEOUT), cancel)
+            .await
+            .map_err(CreateFailure::definitely_not_created)?;
+        let out = self
+            .run_control(&create_args(spec), deadline, cancel)
+            .await?;
+        create_result(&out)
+    }
+
     #[cfg(test)]
     fn with_cgroup_root(bin: PathBuf, cgroup_root: &Path) -> Self {
         Self {
@@ -325,17 +364,13 @@ impl Runtime for KilnRuntime {
         }
     }
 
-    async fn create(&self, spec: &SandboxSpec) -> Result<String, RuntimeError> {
-        let out = self
-            .call("create", &create_args(spec), CREATE_TIMEOUT)
-            .await?;
-        let id = String::from_utf8_lossy(&out.stdout.data).trim().to_string();
-        if !valid_kiln_id(&id) {
-            return Err(RuntimeError::Backend(format!(
-                "kiln create printed an unexpected ID {id:?}"
-            )));
-        }
-        Ok(id)
+    async fn create(&self, spec: &SandboxSpec) -> Result<String, CreateFailure> {
+        self.create_until(
+            spec,
+            Instant::now() + CREATE_TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
     }
 
     async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> ExecOutcome {
@@ -600,6 +635,44 @@ impl Runtime for KilnRuntime {
     }
 }
 
+/// Interprets a completed create attempt. The contract is the exit status of
+/// the direct child, never its diagnostics: a preflight failure happens before
+/// any ID exists or any descendant is forked, so printed output or a surviving
+/// holder of its pipes contradicts exit 124 and leaves the failure ambiguous.
+fn create_result(out: &process::Outcome) -> Result<String, CreateFailure> {
+    let status = match &out.finish {
+        Finish::Exited(status) => status,
+        Finish::TimedOut => {
+            return Err(RuntimeError::Backend("kiln create deadline expired".into()).into());
+        }
+        Finish::Canceled => {
+            return Err(RuntimeError::Backend("kiln create was canceled".into()).into());
+        }
+    };
+    if status.success() {
+        let id = String::from_utf8_lossy(&out.stdout.data).trim().to_string();
+        if !valid_kiln_id(&id) {
+            return Err(RuntimeError::Backend(format!(
+                "kiln create printed an unexpected ID {id:?}"
+            ))
+            .into());
+        }
+        return Ok(id);
+    }
+    let error = RuntimeError::Backend(format!(
+        "kiln create failed ({status}): {}",
+        summarize(&out.stderr.data)
+    ));
+    if status.code() == Some(CREATE_PREFLIGHT_FAILED)
+        && out.stdout.total_bytes == 0
+        && out.stdout_completion == process::CaptureCompletion::Eof
+        && out.stderr_completion == process::CaptureCompletion::Eof
+    {
+        return Err(CreateFailure::definitely_not_created(error));
+    }
+    Err(error.into())
+}
+
 /// `kiln create` flags for a spec. Every value uses the `--flag=value` form,
 /// so a value can never be read as another flag.
 pub fn create_args(spec: &SandboxSpec) -> Vec<String> {
@@ -763,6 +836,7 @@ mod tests {
     use super::super::kiln_process::tests::fixture;
     use super::*;
     use crate::model::CommandStatus;
+    use crate::runtime::CreateCertainty;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1661,16 +1735,271 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    /// `capabilities_v1` advertises only the execution bits globally. Every
+    /// call is traced; `body` is the whole `create` branch of the fixture.
+    fn create_fixture(tmp: &Path, capabilities_v1: bool, body: &str) -> KilnRuntime {
+        let runtime = fixture_runtime(tmp, "sys.exit(0)");
+        let trace = tmp.join("calls");
+        let mut source = fs::read_to_string(&runtime.bin).unwrap().replace(
+            "if sys.argv[1]=='capabilities':",
+            &format!(
+                "open({trace:?},'a').write(' '.join(sys.argv[1:])+'\\n')\nif sys.argv[1]=='ls':\n    os.write(1,b'ID\\tSTATUS\\tSHIM\\n'); sys.exit(0)\nif sys.argv[1]=='create':\n    {body}\nif sys.argv[1]=='capabilities':"
+            ),
+        );
+        if capabilities_v1 {
+            source = source.replace("os.write(1,CAPS)", "os.write(1,CAPS[:16]+b'\\x0f'+CAPS[17:])");
+        }
+        fs::write(&runtime.bin, source).unwrap();
+        runtime
+    }
+
+    fn calls(tmp: &Path) -> Vec<String> {
+        fs::read_to_string(tmp.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(|call| call.split(' ').next().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn trusted_create_exit_124_is_definite_after_the_feature_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = create_fixture(
+            tmp.path(),
+            false,
+            "os.write(2,b'image missing'); sys.exit(124)",
+        );
+        let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+        assert_eq!(failure.certainty(), CreateCertainty::DefinitelyNotCreated);
+        assert!(failure.to_string().contains("image missing"), "{failure}");
+        // The gate runs for this exact create, then the flagged create follows.
+        let trace = fs::read_to_string(tmp.path().join("calls")).unwrap();
+        assert!(
+            trace.starts_with(
+                "capabilities --protocol=1\ngc --help\ncreate --require-exec-protocol=1 "
+            ),
+            "{trace}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_other_create_failure_stays_ambiguous() {
+        for body in [
+            // Generic and nearby statuses, including text that claims certainty.
+            "sys.exit(1)",
+            "sys.exit(123)",
+            "sys.exit(125)",
+            "os.write(2,b'definitely not created: preflight exit 124'); sys.exit(1)",
+            // Signals, including one whose shell projection could be mistaken.
+            "os.kill(os.getpid(),signal.SIGKILL)",
+            "os.kill(os.getpid(),signal.SIGTERM)",
+            // Malformed success, including a success that prints a real-looking
+            // failure and an ID followed by junk.
+            "sys.exit(0)",
+            "print('not a kiln id'); sys.exit(0)",
+            "print('abcd'); print('abcd'); sys.exit(0)",
+            "os.write(2,b'image missing'); sys.exit(0)",
+            // Exit 124 contradicted by an ID or by a descendant holding output.
+            "print('abcd'); sys.exit(124)",
+            "os.write(1,b'x'); sys.exit(124)",
+            "\n    if os.fork()==0:\n        time.sleep(.6)\n        os._exit(0)\n    sys.exit(124)",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = create_fixture(tmp.path(), false, body);
+            let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+            assert_eq!(
+                failure.certainty(),
+                CreateCertainty::AllocationAmbiguous,
+                "{body}: {failure}"
+            );
+            assert!(calls(tmp.path()).contains(&"create".to_string()), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_succeeds_with_the_unchanged_id_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = create_fixture(tmp.path(), false, "print('18de453339a8cc89-3762'); sys.exit(0)");
+        assert_eq!(
+            runtime.create(&spec(Network::None)).await.unwrap(),
+            "18de453339a8cc89-3762"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unspawnable_create_after_the_gate_stays_ambiguous() {
+        // The attempt began: this is not separable from a wait failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("kiln");
+        let runtime = create_fixture(tmp.path(), false, "sys.exit(0)");
+        let source = fs::read_to_string(&bin).unwrap().replace(
+            "if sys.argv[1:]==['gc','--help']:",
+            &format!("if sys.argv[1:]==['gc','--help']:\n    os.remove({bin:?})"),
+        );
+        fs::write(&bin, source).unwrap();
+        let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+        assert!(matches!(failure.error(), RuntimeError::Io(_)), "{failure}");
+        assert_eq!(failure.certainty(), CreateCertainty::AllocationAmbiguous);
+    }
+
+    #[tokio::test]
+    async fn create_deadline_and_cancellation_stay_ambiguous_and_reap_the_child() {
+        for cancel_create in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = tmp.path().join("create-entered");
+            let pid_file = tmp.path().join("pid");
+            let runtime = create_fixture(
+                tmp.path(),
+                false,
+                &format!(
+                    "open({pid_file:?},'w').write(str(os.getpid())); open({marker:?},'w').close(); time.sleep(30)"
+                ),
+            );
+            let cancel = CancellationToken::new();
+            let deadline = Instant::now() + Duration::from_secs(if cancel_create { 20 } else { 1 });
+            let sandbox_spec = spec(Network::None);
+            let (result, ()) = tokio::join!(
+                runtime.create_until(&sandbox_spec, deadline, &cancel),
+                async {
+                    wait_marker(&marker).await;
+                    if cancel_create {
+                        cancel.cancel();
+                    }
+                }
+            );
+            let failure = result.unwrap_err();
+            assert_eq!(failure.certainty(), CreateCertainty::AllocationAmbiguous);
+            assert!(Instant::now() < deadline + Duration::from_secs(1));
+            let pid: libc::pid_t = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+            // SAFETY: signal zero only tests whether the recorded process exists.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "create child survived");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_gate_is_definite_only_because_no_create_process_started() {
+        // A legacy CLI cannot have exit 124 trusted, or even be asked to create.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = create_fixture(tmp.path(), true, "print('abcd'); sys.exit(124)");
+        let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+        assert_eq!(failure.certainty(), CreateCertainty::DefinitelyNotCreated);
+        assert!(matches!(failure.error(), RuntimeError::Incompatible(_)));
+        assert!(failure.to_string().contains("0x10"), "{failure}");
+        assert_eq!(calls(tmp.path()), ["capabilities"]);
+
+        // A spent budget refuses before launching even the capability probe.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = create_fixture(tmp.path(), false, "print('abcd'); sys.exit(0)");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let failure = runtime
+            .create_until(&spec(Network::None), Instant::now() + QUERY_TIMEOUT, &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.certainty(), CreateCertainty::DefinitelyNotCreated);
+        assert!(calls(tmp.path()).is_empty());
+    }
+
     #[tokio::test]
     async fn create_requirement_rejects_old_replacement_before_resource_side_effect() {
+        // The gate passes, then a binary without the flag replaces the CLI.
         let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("old-kiln");
         let marker = tmp.path().join("resource");
-        fs::write(&bin,format!("#!/bin/sh\nfor arg do\n  if [ \"$arg\" = --require-exec-protocol=1 ]; then echo unsupported >&2; exit 2; fi\ndone\n: > '{marker}'\necho abcd\n",marker=marker.display())).unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        let runtime = KilnRuntime::new(bin);
-        assert!(runtime.create(&spec(Network::None)).await.is_err());
+        let runtime = create_fixture(
+            tmp.path(),
+            false,
+            &format!(
+                "\n    if '--require-exec-protocol=1' in sys.argv:\n        os.write(2,b'unexpected argument'); sys.exit(2)\n    open({marker:?},'w').close(); print('abcd'); sys.exit(0)"
+            ),
+        );
+        let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+        assert_eq!(failure.certainty(), CreateCertainty::AllocationAmbiguous);
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn global_gate_requires_certainty_but_live_pid1_does_not() {
+        use crate::manager::{Limits, Manager};
+        use crate::store::Store;
+        // An old PID 1 only advertises the execution bits and stays usable.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = create_fixture(tmp.path(), false, "sys.exit(1)");
+        let source = fs::read_to_string(&runtime.bin).unwrap().replace(
+            "os.write(1,CAPS)",
+            "os.write(1,CAPS if len(sys.argv)==3 else CAPS[:16]+b'\\x0f'+CAPS[17:])",
+        );
+        fs::write(&runtime.bin, source).unwrap();
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + QUERY_TIMEOUT;
+        runtime.version(deadline, &cancel).await.unwrap();
+        runtime.validate_sandbox("abcd", deadline, &cancel).await.unwrap();
+
+        // A CLI without the bit is refused before reconciliation looks at
+        // anything, and a usable-looking per-ID frame cannot substitute for it.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = create_fixture(tmp.path(), true, "sys.exit(1)");
+        let error = runtime.version(deadline, &cancel).await.unwrap_err();
+        assert!(matches!(error, RuntimeError::Incompatible(_)), "{error}");
+        assert!(error.to_string().contains("0x10"), "{error}");
+        let manager = Manager::new(runtime, Store::open_in_memory().unwrap(), Limits::default());
+        assert!(manager.reconcile().await.is_err());
+        assert_eq!(calls(tmp.path()).last().unwrap(), "capabilities");
+        assert!(!calls(tmp.path()).contains(&"ls".to_string()));
+        assert!(!calls(tmp.path()).contains(&"gc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn manager_releases_only_a_trusted_exit_124_across_restart() {
+        use crate::manager::{CreateRequest, Error, Limits, Manager};
+        use crate::model::SandboxState;
+        use crate::store::Store;
+        for (body, definite) in [
+            ("os.write(2,b'image missing'); sys.exit(124)", true),
+            ("os.write(2,b'image missing'); sys.exit(1)", false),
+            ("print('not an id'); sys.exit(0)", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let state = tmp.path().join("state");
+            let bin = create_fixture(tmp.path(), false, body).bin.clone();
+            let root = tmp.path().join("cgroup");
+            let limits = Limits {
+                max_sandboxes: 1,
+                ..Limits::default()
+            };
+            let manager = Arc::new(Manager::new(
+                KilnRuntime::with_cgroup_root(bin.clone(), &root),
+                Store::open(&state).unwrap(),
+                limits.clone(),
+            ));
+            manager.create(CreateRequest::default()).await.unwrap_err();
+            let id = manager.list(true).unwrap().remove(0).id;
+            drop(manager);
+
+            let manager = Arc::new(Manager::new(
+                KilnRuntime::with_cgroup_root(bin, &root),
+                Store::reopen_after_restart(&state),
+                limits,
+            ));
+            let reconciled = manager.reconcile().await.unwrap();
+            assert_eq!(reconciled, Default::default());
+            let row = manager.get(&id, 0).unwrap().0;
+            assert_eq!((row.state, row.backend_id), (SandboxState::Failed, None));
+            let reserved = manager.health().await.unwrap().node_resources.reserved;
+            assert_eq!(reserved.sandboxes, u64::from(!definite), "{body}");
+            if definite {
+                let deleted = manager.delete(&id).await.unwrap();
+                assert_eq!(deleted.state, SandboxState::Deleted);
+                assert!(!calls(tmp.path()).contains(&"rm".to_string()));
+            } else {
+                assert!(matches!(
+                    manager.delete(&id).await,
+                    Err(Error::FailedPrecondition(_))
+                ));
+                let next = manager.create(CreateRequest::default()).await.unwrap_err();
+                assert!(matches!(next, Error::ResourceExhausted(_)), "{next}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1889,9 +2218,10 @@ mod tests {
         .unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         let runtime = KilnRuntime::new(bin);
+        // Long enough for the fixture to record its PID on a loaded machine.
         let error = runtime
             .version(
-                Instant::now() + Duration::from_millis(100),
+                Instant::now() + Duration::from_secs(1),
                 &CancellationToken::new(),
             )
             .await

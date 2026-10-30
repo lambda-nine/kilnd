@@ -732,6 +732,245 @@ async fn backend_create_panic_is_recorded_as_failed() {
     );
 }
 
+fn on_disk(dir: &std::path::Path, fake: &FakeRuntime, limits: &Limits) -> Arc<Manager<FakeRuntime>> {
+    Arc::new(Manager::new(
+        fake.clone(),
+        Store::reopen_after_restart(dir),
+        limits.clone(),
+    ))
+}
+
+fn state_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state = tmp.path().join("state");
+    (tmp, state)
+}
+
+async fn reserved(m: &Arc<Manager<FakeRuntime>>) -> u64 {
+    m.health().await.unwrap().node_resources.reserved.sandboxes
+}
+
+#[tokio::test]
+async fn definite_create_failure_releases_its_budget_and_survives_restart() {
+    let (_tmp, state) = state_dir();
+    let limits = Limits {
+        max_sandboxes: 2,
+        ..Limits::default()
+    };
+    let fake = FakeRuntime::default();
+    fake.state().fail_create_definitely = Some("image missing before allocation".into());
+
+    let m = on_disk(&state, &fake, &limits);
+    // More failures than the budget holds: none is charged or exhausts it.
+    for _ in 0..3 {
+        let error = m.create(CreateRequest::default()).await.unwrap_err();
+        assert!(
+            matches!(error, Error::Backend(ref message) if message.contains("image missing")),
+            "{error}"
+        );
+    }
+    assert_eq!(reserved(&m).await, 0);
+    assert_eq!(m.health().await.unwrap().node_resources.rejected_creates, 0);
+    drop(m);
+
+    let m = on_disk(&state, &fake, &limits);
+    assert_eq!(m.reconcile().await.unwrap(), Reconciled::default());
+    let rows = m.list(false).unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
+        assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
+        assert!(row.failure_reason.as_deref().unwrap().contains("image missing"));
+    }
+    assert_eq!(reserved(&m).await, 0);
+
+    // The whole budget really is available again.
+    fake.state().fail_create_definitely = None;
+    let first = m.create(CreateRequest::default()).await.unwrap();
+    let second = m.create(CreateRequest::default()).await.unwrap();
+    assert!(matches!(
+        m.create(CreateRequest::default()).await,
+        Err(Error::ResourceExhausted(_))
+    ));
+
+    // Delete only retires history: no backend call, no effect on live capacity.
+    for row in &rows {
+        let deleted = m.delete(&row.id).await.unwrap();
+        assert_eq!(deleted.state, SandboxState::Deleted);
+        assert!(deleted.deleted_at_ms.is_some());
+        assert_eq!(m.delete(&row.id).await.unwrap(), deleted);
+    }
+    assert!(fake.state().remove_attempts.is_empty());
+    assert_eq!(fake.state().gc_runs, 0);
+    assert_eq!(reserved(&m).await, 2);
+    assert!(fake.state().sandboxes.contains_key(first.backend_id.as_ref().unwrap()));
+    assert!(fake.state().sandboxes.contains_key(second.backend_id.as_ref().unwrap()));
+}
+
+#[tokio::test]
+async fn definite_failure_is_not_released_when_its_durable_update_fails() {
+    let (_tmp, state) = state_dir();
+    let limits = Limits {
+        max_sandboxes: 1,
+        ..Limits::default()
+    };
+    let fake = FakeRuntime::default();
+    fake.state().fail_create_definitely = Some("image missing".into());
+    let store = Store::open(&state).unwrap();
+    store.reject_failed_updates().unwrap();
+    let m = Arc::new(Manager::new(fake.clone(), store, limits.clone()));
+
+    let error = m.create(CreateRequest::default()).await.unwrap_err();
+    assert!(matches!(error, Error::Internal(_)), "{error}");
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!(row.state, SandboxState::Creating);
+    assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
+    assert_eq!(reserved(&m).await, 1);
+    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.create(CreateRequest::default()).await,
+        Err(Error::ResourceExhausted(_))
+    ));
+    drop(m);
+
+    // Without the durable marker the typed result is gone: restart is ambiguous.
+    let m = on_disk(&state, &fake, &limits);
+    assert_eq!(m.reconcile().await.unwrap().failed, std::slice::from_ref(&row.id));
+    let row = m.get(&row.id, 0).unwrap().0;
+    assert_eq!(row.state, SandboxState::Failed);
+    assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
+    assert_eq!(reserved(&m).await, 1);
+    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+}
+
+#[tokio::test]
+async fn ambiguous_post_allocation_failure_stays_charged_across_restart() {
+    let (_tmp, state) = state_dir();
+    let limits = Limits {
+        max_sandboxes: 1,
+        ..Limits::default()
+    };
+    let fake = FakeRuntime::default();
+    fake.state().fail_create_after_allocation = Some("lost the ID after allocating".into());
+    let m = on_disk(&state, &fake, &limits);
+    m.create(CreateRequest::default()).await.unwrap_err();
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
+    assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
+    let leaked: Vec<String> = fake.state().sandboxes.keys().cloned().collect();
+    assert_eq!(leaked.len(), 1);
+    drop(m);
+
+    let m = on_disk(&state, &fake, &limits);
+    // The leak is visible but unowned; it is neither adopted nor removed.
+    assert_eq!(m.reconcile().await.unwrap().unmanaged, leaked);
+    assert_eq!(reserved(&m).await, 1);
+    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+    assert!(fake.state().remove_attempts.is_empty());
+    assert!(fake.state().sandboxes.contains_key(&leaked[0]));
+
+    // Even an entirely clean backend cannot release it.
+    fake.state().sandboxes.clear();
+    drop(m);
+    let m = on_disk(&state, &fake, &limits);
+    assert_eq!(m.reconcile().await.unwrap(), Reconciled::default());
+    assert_eq!(reserved(&m).await, 1);
+    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+    fake.state().fail_create_after_allocation = None;
+    assert!(matches!(
+        m.create(CreateRequest::default()).await,
+        Err(Error::ResourceExhausted(_))
+    ));
+}
+
+#[tokio::test]
+async fn create_panic_stays_charged_across_restart() {
+    let (_tmp, state) = state_dir();
+    let limits = Limits {
+        max_sandboxes: 1,
+        ..Limits::default()
+    };
+    let fake = FakeRuntime::default();
+    {
+        let mut backend = fake.state();
+        backend.panic_create = true;
+        // A panic must not inherit a definite result the backend never returned.
+        backend.fail_create_definitely = Some("unreached".into());
+    }
+    let m = on_disk(&state, &fake, &limits);
+    let error = m.create(CreateRequest::default()).await.unwrap_err();
+    assert!(matches!(error, Error::Backend(ref message) if message.contains("panicked")));
+    let id = m.list(true).unwrap().remove(0).id;
+    drop(m);
+
+    fake.state().panic_create = false;
+    let m = on_disk(&state, &fake, &limits);
+    assert_eq!(m.reconcile().await.unwrap(), Reconciled::default());
+    let row = m.get(&id, 0).unwrap().0;
+    assert_eq!((row.state, row.create_certainty), (SandboxState::Failed, CreateCertainty::AllocationAmbiguous));
+    assert_eq!(reserved(&m).await, 1);
+    assert!(matches!(m.delete(&id).await, Err(Error::FailedPrecondition(_))));
+}
+
+#[tokio::test]
+async fn definite_failure_holds_its_reservation_until_published_even_without_a_waiter() {
+    let (m, fake) = manager_with(Limits {
+        max_sandboxes: 1,
+        ..Limits::default()
+    });
+    let gate = FakeGate::default();
+    {
+        let mut state = fake.state();
+        state.create_before_allocation = Some(gate.clone());
+        state.fail_create_definitely = Some("image missing".into());
+    }
+    let waiter = tokio::spawn({
+        let m = m.clone();
+        async move { m.create(CreateRequest::default()).await }
+    });
+    gate.entered().await;
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!(row.state, SandboxState::Creating);
+    assert_eq!(reserved(&m).await, 1);
+    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+
+    gate.release();
+    drain(&m).await;
+    assert_eq!(reserved(&m).await, 0);
+    assert_eq!(m.delete(&row.id).await.unwrap().state, SandboxState::Deleted);
+    assert!(fake.state().remove_attempts.is_empty());
+}
+
+#[tokio::test]
+async fn delete_of_a_definite_failure_never_reaches_the_backend_after_any_reload() {
+    let (m, fake) = manager();
+    fake.state().fail_create_definitely = Some("image missing".into());
+    m.create(CreateRequest::default()).await.unwrap_err();
+    let row = m.list(true).unwrap().remove(0);
+    // A replacement must not be touched, and listing it proves nothing either way.
+    let unrelated = fake.insert(BackendStatus::Running);
+
+    // Concurrent callers: the state comparison has one winner, both see DELETED.
+    let (first, second) = tokio::join!(m.delete(&row.id), m.delete(&row.id));
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(first.state, SandboxState::Deleted);
+    assert_eq!(first, second);
+
+    // A caller holding the pre-delete snapshot, as after waiting for the
+    // coordination lock, reloads rather than rewriting the terminal row.
+    let again = m.prepare_delete(&row.id, row.clone()).unwrap();
+    assert_eq!(again, first);
+    assert_eq!(again.create_certainty, CreateCertainty::DefinitelyNotCreated);
+
+    let backend = fake.state();
+    assert!(backend.remove_attempts.is_empty());
+    assert!(backend.sandboxes.contains_key(&unrelated));
+}
+
 #[tokio::test]
 async fn create_validates_the_spec() {
     let (m, fake) = manager();
@@ -1072,7 +1311,7 @@ async fn an_unpolled_exec_does_nothing() {
     assert!(fake.state().exec_calls.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn closed_queued_exec_never_reaches_the_backend_or_store() {
     let (m, fake) = manager();
     let s = m.create(CreateRequest::default()).await.unwrap();
@@ -1085,14 +1324,17 @@ async fn closed_queued_exec_never_reaches_the_backend_or_store() {
         let m = m.clone();
         async move { m.exec(first_req).await }
     });
-    gate.entered().await;
+    // A real 1 ms deadline could expire before the readiness gate on a loaded
+    // host, leaving this test waiting forever. Control time around admission.
+    tokio::time::timeout(Duration::from_secs(5), gate.entered()).await
+        .expect("first exec did not reach its backend gate");
 
     let queued = tokio::spawn({
         let m = m.clone();
         let id = s.id.clone();
         async move { m.exec(exec_req(&id, &["echo", "must-not-run"])).await }
     });
-    tokio::task::yield_now().await;
+    until(|| m.admission.snapshot().execs.current == 2).await;
     assert!(
         !queued.is_finished(),
         "second exec should be queued behind the sandbox lock"
@@ -1100,6 +1342,8 @@ async fn closed_queued_exec_never_reaches_the_backend_or_store() {
     queued.abort();
     assert!(queued.await.unwrap_err().is_cancelled());
 
+    until(|| m.admission.snapshot().execs.current == 1).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
     gate.release();
     assert_eq!(
         first.await.unwrap().unwrap().state,
@@ -1690,6 +1934,7 @@ async fn reconcile_repairs_state_and_is_repeatable() {
         updated_at_ms: now,
         deleted_at_ms: None,
         failure_reason: None,
+        create_certainty: CreateCertainty::AllocationAmbiguous,
     };
     m.store.insert_sandbox(&crashed_create).unwrap();
     let other_backend = Sandbox {
@@ -1843,6 +2088,7 @@ async fn lowered_node_budgets_degrade_but_keep_cleanup_available() {
         updated_at_ms: now,
         deleted_at_ms: None,
         failure_reason: None,
+        create_certainty: CreateCertainty::AllocationAmbiguous,
     };
     store.insert_sandbox(&sandbox).unwrap();
     let manager = Arc::new(Manager::new(
@@ -1903,6 +2149,7 @@ async fn restart_turns_creating_without_an_id_into_reserved_ambiguous_failed() {
         updated_at_ms: now,
         deleted_at_ms: None,
         failure_reason: None,
+        create_certainty: CreateCertainty::AllocationAmbiguous,
     };
     {
         let store = Store::open(&state_dir).unwrap();
@@ -1912,7 +2159,7 @@ async fn restart_turns_creating_without_an_id_into_reserved_ambiguous_failed() {
 
     let manager = Arc::new(Manager::new(
         fake,
-        Store::open(&state_dir).unwrap(),
+        Store::reopen_after_restart(&state_dir),
         Limits::default(),
     ));
     let reconciled = manager.reconcile().await.unwrap();
@@ -2018,7 +2265,7 @@ async fn a_provably_reappeared_backend_recovers_after_restart_once() {
 
     let manager = Arc::new(Manager::new(
         fake,
-        Store::open(&state_dir).unwrap(),
+        Store::reopen_after_restart(&state_dir),
         Limits::default(),
     ));
     let first = manager.reconcile().await.unwrap();

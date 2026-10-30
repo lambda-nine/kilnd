@@ -366,7 +366,30 @@ ctl rm "$managed_stale"
 echo "11. One-shot run"
 [ "$(ctl run --memory 64M --disk 16M -- echo one-shot)" = one-shot ] || fail "run"
 
-echo "12. Structured logs"
+echo "12. A preflight create failure releases its reservation, including across restart"
+node_reservations() { ctl health | awk '/^node reservations:/ { print $3, $4 }'; }
+reserved_before=$(node_reservations)
+backends_before=$(sudo kiln ls)
+if missing_out=$(ctl create --image kilnd-smoke-definitely-missing --memory 64M --disk 16M 2>&1); then
+    created+=("$missing_out")
+    fail "missing-image create succeeded"
+fi
+missing_id=$(grep -oE 'sb-[0-9a-f]+' <<<"$missing_out" | sed -n 1p)
+[ -n "$missing_id" ] || fail "missing-image create did not name its row: $missing_out"
+created+=("$missing_id")
+check_released_failure() {
+    ctl get "$missing_id" | grep -q '^state: *failed' || fail "missing-image row is not failed"
+    [ "$(node_reservations)" = "$reserved_before" ] || fail "missing-image create stayed charged"
+    [ "$(sudo kiln ls)" = "$backends_before" ] || fail "missing-image create changed the backend"
+}
+check_released_failure
+restart_kilnd
+wait_ready
+check_released_failure
+ctl rm "$missing_id" >/dev/null || fail "missing-image row could not be deleted"
+ctl get "$missing_id" | grep -q '^state: *deleted' || fail "missing-image row is not deleted"
+
+echo "13. Structured logs"
 logs=$(sudo journalctl -u kilnd --since "-5min" --no-pager -o cat)
 line=$(grep '"message":"exec finished"' <<<"$logs" | tail -1)
 [ -n "$line" ] || fail "no JSON exec log lines"

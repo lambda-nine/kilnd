@@ -6,6 +6,20 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Stop definite pre-allocation create failures from permanently consuming node
+  budgets. `Runtime::create` now returns a typed `CreateFailure`; ordinary errors
+  convert to `AllocationAmbiguous` and only an explicit constructor claims
+  `DefinitelyNotCreated`. The kiln adapter claims it only when its pre-create
+  capability gate fails, or for direct-child exit status 124 with empty stdout
+  and complete output EOF. Schema 5 adds a durable `create_certainty` written
+  atomically with `FAILED`; every historical row stays ambiguous. Definite rows
+  are uncharged and Delete retires them with no backend call; a failed durable
+  update, panic, crash or other error stays charged across restart. The installed
+  CLI must now advertise capability feature `0x10` (kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`);
+  live PID 1 instances need only the execution bits. Privileged suites cover
+  real missing-image and private-allowlist preflight failures and a real
+  post-allocation failure.
+
 - Collapse nested runtime conditionals using let chains supported by Rust 1.88,
   keeping strict Clippy clean on both MSRV 1.88 and Rust 1.99.
 

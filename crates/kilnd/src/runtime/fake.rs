@@ -15,7 +15,8 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BackendSandbox, BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError,
+    BackendSandbox, BackendStatus, CreateFailure, ExecFinish, ExecOutcome, ExecSpec, Runtime,
+    RuntimeError,
 };
 use crate::model::{
     Captured, CommandStatus, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage, SandboxSpec,
@@ -81,8 +82,13 @@ pub struct FakeState {
     pub gc_runs: u32,
     /// Explicit ID scopes passed to garbage collection, in call order.
     pub gc_requests: Vec<Vec<String>>,
-    /// When set, `create` fails with this message.
+    /// When set, `create` fails ambiguously with this message before allocating.
     pub fail_create: Option<String>,
+    /// When set, `create` proves it failed before allocating anything.
+    pub fail_create_definitely: Option<String>,
+    /// When set, `create` allocates a backend, then fails without reporting
+    /// its ID.
+    pub fail_create_after_allocation: Option<String>,
     /// Panics before allocating a backend, for supervisor recovery tests.
     pub panic_create: bool,
     /// Panics after the optional exec gate. Without a gate this is before the
@@ -209,7 +215,7 @@ impl Runtime for FakeRuntime {
         Ok("fake 1.0".into())
     }
 
-    async fn create(&self, spec: &SandboxSpec) -> Result<String, RuntimeError> {
+    async fn create(&self, spec: &SandboxSpec) -> Result<String, CreateFailure> {
         let before = self.state().create_before_allocation.take();
         if let Some(gate) = before {
             gate.hold().await;
@@ -217,13 +223,21 @@ impl Runtime for FakeRuntime {
         let (id, after) = {
             let mut s = self.state();
             assert!(!s.panic_create, "injected fake create panic");
+            if let Some(msg) = &s.fail_create_definitely {
+                return Err(CreateFailure::definitely_not_created(RuntimeError::Backend(
+                    msg.clone(),
+                )));
+            }
             if let Some(msg) = &s.fail_create {
-                return Err(RuntimeError::Backend(msg.clone()));
+                return Err(RuntimeError::Backend(msg.clone()).into());
             }
             s.created.push(spec.clone());
             s.next += 1;
             let id = format!("f00d-{}", s.next);
             s.sandboxes.insert(id.clone(), BackendStatus::Running);
+            if let Some(msg) = &s.fail_create_after_allocation {
+                return Err(RuntimeError::Backend(msg.clone()).into());
+            }
             (id, s.create_after_allocation.take())
         };
         if let Some(gate) = after {

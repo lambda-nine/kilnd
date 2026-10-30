@@ -571,7 +571,7 @@ pub(super) mod tests {
     pub fn fixture(path: &Path, body: &str) {
         std::fs::write(path, format!(r#"#!/usr/bin/python3
 import os,sys,time,signal,socket
-CAPS=bytes.fromhex('4b494c4e45584f00010002001d0000000f000000010001000500080000000000302e312e306769742074657374')
+CAPS=bytes.fromhex('4b494c4e45584f00010002001d0000001f000000010001000500080000000000302e312e306769742074657374')
 EXIT125=bytes.fromhex('4b494c4e45584f000100010018000000010102007d00000000000000000000000000000000000000')
 if sys.argv[1]=='capabilities':
     os.write(1,CAPS)

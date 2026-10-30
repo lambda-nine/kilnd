@@ -9,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{Captured, CommandStatus, RuntimeDiagnostic, SandboxSpec};
 
+pub use crate::model::CreateCertainty;
+
 pub mod fake;
 pub mod kiln;
 mod kiln_process;
@@ -28,6 +30,50 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Incompatible(String),
+}
+
+/// A create that returned no backend ID. The fields are private so an ordinary
+/// error can only become `AllocationAmbiguous`: claiming that nothing was
+/// allocated takes the explicit constructor and the evidence behind it.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct CreateFailure {
+    certainty: CreateCertainty,
+    error: RuntimeError,
+}
+
+impl CreateFailure {
+    /// Use only with proof that no backend resource exists or can appear
+    /// later because of this call. kilnd releases the reservation on this.
+    pub fn definitely_not_created(error: RuntimeError) -> Self {
+        Self {
+            certainty: CreateCertainty::DefinitelyNotCreated,
+            error,
+        }
+    }
+
+    pub fn certainty(&self) -> CreateCertainty {
+        self.certainty
+    }
+
+    pub fn error(&self) -> &RuntimeError {
+        &self.error
+    }
+}
+
+impl From<RuntimeError> for CreateFailure {
+    fn from(error: RuntimeError) -> Self {
+        Self {
+            certainty: CreateCertainty::AllocationAmbiguous,
+            error,
+        }
+    }
+}
+
+impl From<std::io::Error> for CreateFailure {
+    fn from(error: std::io::Error) -> Self {
+        RuntimeError::from(error).into()
+    }
 }
 
 pub struct ExecSpec<'a> {
@@ -82,12 +128,13 @@ pub trait Runtime: Send + Sync + 'static {
 
     /// Creates a fresh sandbox owned by this invocation, returning once it
     /// accepts commands. A successful call returns that new backend's ID.
-    /// An error may be ambiguous if the backend made a resource before it
-    /// lost the ability to report the ID.
+    /// A failure is `AllocationAmbiguous` unless the implementation can prove
+    /// otherwise: the backend may have made a resource before it lost the
+    /// ability to report the ID.
     fn create(
         &self,
         spec: &SandboxSpec,
-    ) -> impl Future<Output = Result<String, RuntimeError>> + Send;
+    ) -> impl Future<Output = Result<String, CreateFailure>> + Send;
 
     /// Side-effect-free validation of an existing sandbox's execution protocol.
     fn validate_sandbox(
@@ -120,4 +167,23 @@ pub trait Runtime: Send + Sync + 'static {
     /// scope is a no-op. Must never touch a live or unlisted sandbox. Returns
     /// the IDs it removed.
     fn gc(&self, ids: &[String]) -> impl Future<Output = Result<Vec<String>, RuntimeError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_errors_default_to_ambiguous_and_definite_is_explicit() {
+        let ordinary = CreateFailure::from(RuntimeError::Backend("image missing".into()));
+        assert_eq!(ordinary.certainty(), CreateCertainty::AllocationAmbiguous);
+        assert_eq!(ordinary.to_string(), "image missing");
+        let io = CreateFailure::from(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(io.certainty(), CreateCertainty::AllocationAmbiguous);
+        assert!(matches!(io.error(), RuntimeError::Io(_)));
+        let definite =
+            CreateFailure::definitely_not_created(RuntimeError::Backend("no image".into()));
+        assert_eq!(definite.certainty(), CreateCertainty::DefinitelyNotCreated);
+        assert_eq!(definite.to_string(), "no image");
+    }
 }

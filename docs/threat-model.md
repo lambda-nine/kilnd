@@ -35,9 +35,11 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   sandbox count plus aggregate requested memory, PIDs and disk before it
   inserts `CREATING`; cancellation, panic and restart cannot lose that promise.
   `CREATING`, `READY`, `DELETING` and `LOST` reserve their full effective spec.
-  A create error without a backend ID is ambiguous and remains reserved until
-  authoritative reconciliation can account for hidden resources. Ordinary
-  listing absence never releases it; that reconciliation is not yet supported.
+  A create failure without a backend ID is ambiguous and remains reserved until
+  authoritative reconciliation can account for hidden resources, unless the
+  runtime returned typed proof that nothing was allocated and that result is
+  durably recorded. Ordinary listing absence never releases it; that
+  reconciliation is not yet supported.
   Successful
   compensation releases only after the exact backend is absent and the
   terminal transition is durable. Lowered budgets reject Create but retain the
@@ -106,6 +108,19 @@ sandbox compromises the host.
   outside these reservations. Ambiguous no-ID creates remain charged even
   after all listed backends are removed; unexplained backends are not charged
   a fabricated spec.
+- **Create certainty trusts the installed kiln CLI.** kilnd releases a
+  reservation on exit status 124 from a CLI that advertised feature `0x10`, with
+  no stdout and both pipes at EOF. It never parses diagnostics. The CLI is
+  already trusted root-owned software that runs every sandbox; a kiln that broke
+  this contract, or a replacement that advertised the feature falsely, could
+  leave an unaccounted backend outside the budget. `--require-exec-protocol=1`
+  stops a legacy binary swapped in after the gate. Anything else, including a
+  crash before the marker is durable, fails closed and stays charged.
+- **Failed creates retain history without consuming budget.** Rows released by
+  typed proof, like `DELETED` rows and compensated `FAILED` rows, are not bounded
+  by the node budgets. An authorized caller can grow the database and the default
+  listing by repeating a preflight failure until the rows are deleted. Durable
+  history has no retention limit yet; see the roadmap.
   Memory, PIDs and disk are reserved from requested effective sandbox limits;
   they are not measurements of current RSS, task count or disk usage. CPU is
   intentionally schedulable and may be overcommitted rather than reserved.
@@ -160,15 +175,16 @@ sandbox compromises the host.
   into `LOST`. A validated exact backend may recover `LOST` to `READY`.
   CLI and every managed live sandbox must advertise required capabilities;
   incompatible replacements and old PID 1 instances fail closed.
-  This requires persistent-exec v1 plus scoped `gc ID...`, first combined in
-  kiln `40d9aa5003205d4c171e1b3eca61e9868064e98b`. The older `711440db3167`
-  artifact lacks scoped GC and is refused before reconciliation, even with an
-  empty database. Complete `gc --help` usage supplements the protocol capability
+  This requires persistent-exec v1 plus scoped `gc ID...` and persistent-create
+  certainty (feature `0x10`), first combined in kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`. Older CLIs
+  are refused before reconciliation, even with an empty database; a live PID 1
+  only needs the execution bits. Complete `gc --help` usage supplements the protocol capability
   frame; compatibility validation never invokes global garbage collection.
-  The tested companion is kiln `46d84bdfe13e331f047e70e38848f7d74bcd2872`
-  from `review/breakit-fixes`; see setup for the immutable installation pin.
+  The tested companion is kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`; see setup for the immutable
+  installation pin.
 - **A daemon crash during `kiln create`** can leave a kiln sandbox whose
-  backend ID was never returned to kilnd. Reconciliation records the row as an
+  backend ID was never returned to kilnd. So can a CLI that dies or misreports
+  after allocating. Reconciliation records the crashed row as an
   ambiguous `FAILED` reservation and logs the backend as unmanaged; it cannot
   safely pair the two or remove an operator-created sandbox. Delete refuses to
   release that reservation even when the ordinary listing is empty, because

@@ -16,7 +16,9 @@ use kilnd::model::{
     Captured, CommandStatus, Execution, ExecutionState, Network, Sandbox, SandboxSpec, SandboxState,
 };
 use kilnd::runtime::fake::FakeRuntime;
-use kilnd::runtime::{BackendSandbox, ExecOutcome, ExecSpec, Runtime, RuntimeError};
+use kilnd::runtime::{
+    BackendSandbox, CreateFailure, ExecOutcome, ExecSpec, Runtime, RuntimeError,
+};
 use kilnd::store::{ExecutionResult, Store};
 use kilnd_api::v1 as pb;
 use pb::kilnd_service_client::KilndServiceClient;
@@ -59,7 +61,7 @@ impl Runtime for StressRuntime {
         }
     }
 
-    async fn create(&self, spec: &SandboxSpec) -> Result<String, RuntimeError> {
+    async fn create(&self, spec: &SandboxSpec) -> Result<String, CreateFailure> {
         self.inner.create(spec).await
     }
 
@@ -225,6 +227,7 @@ fn metadata_history_rss_child() {
         updated_at_ms: 1,
         deleted_at_ms: None,
         failure_reason: None,
+        create_certainty: Default::default(),
     };
     let capture = Captured {
         data: vec![b'x'; HISTORY_STREAM_BYTES],

@@ -21,17 +21,17 @@ use rusqlite::{
 
 use crate::lock::ExclusiveFileLock;
 use crate::model::{
-    Captured, CommandStatus, Execution, ExecutionState, RuntimeDiagnostic, Sandbox, SandboxSpec,
-    SandboxState, now_ms,
+    Captured, CommandStatus, CreateCertainty, Execution, ExecutionState, RuntimeDiagnostic,
+    Sandbox, SandboxSpec, SandboxState, now_ms,
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
-// A non-deleted row reserves capacity unless a successful compensation
-// recorded the exact removed backend ID on FAILED. FAILED without an ID stays
-// reserved because Runtime::create errors can be ambiguous.
-const RESERVED_SANDBOX_WHERE: &str =
-    "state != 'deleted' AND NOT (state = 'failed' AND backend_id IS NOT NULL)";
+// A non-deleted row reserves capacity unless FAILED proves no backend remains:
+// a successful compensation recorded the exact removed backend ID, or the
+// runtime's typed result durably recorded that nothing was ever allocated.
+// Every other FAILED without an ID stays reserved as ambiguous.
+const RESERVED_SANDBOX_WHERE: &str = "state != 'deleted' AND NOT (state = 'failed' AND (backend_id IS NOT NULL OR create_certainty = 'definitely_not_created'))";
 // Only these lifecycle states can still explain a listed backend ID. In
 // particular, compensated FAILED must not hide a backend that reappeared.
 const OWNED_BACKEND_WHERE: &str = "state IN ('creating', 'ready', 'deleting', 'lost')";
@@ -48,6 +48,13 @@ ALTER TABLE executions ADD COLUMN stdout_total_bytes_known INTEGER NOT NULL DEFA
 ALTER TABLE executions ADD COLUMN stderr_total_bytes_known INTEGER NOT NULL DEFAULT 0;
 PRAGMA user_version = 4;";
 
+// Never inferred from history: every existing row becomes ambiguous, whatever
+// its failure text says. The CHECK keeps the marker off any row that could own
+// a backend. Keep this column definition identical to SCHEMA.
+const MIGRATE_V5: &str = "
+ALTER TABLE sandboxes ADD COLUMN create_certainty TEXT NOT NULL DEFAULT 'allocation_ambiguous' CHECK (create_certainty = 'allocation_ambiguous' OR (create_certainty = 'definitely_not_created' AND backend_id IS NULL AND state IN ('failed', 'deleted')));
+PRAGMA user_version = 5;";
+
 const SCHEMA: &str = "
 CREATE TABLE sandboxes (
     id             TEXT PRIMARY KEY,
@@ -59,7 +66,8 @@ CREATE TABLE sandboxes (
     created_at_ms  INTEGER NOT NULL,
     updated_at_ms  INTEGER NOT NULL,
     deleted_at_ms  INTEGER,
-    list_seq       INTEGER NOT NULL
+    list_seq       INTEGER NOT NULL,
+    create_certainty TEXT NOT NULL DEFAULT 'allocation_ambiguous' CHECK (create_certainty = 'allocation_ambiguous' OR (create_certainty = 'definitely_not_created' AND backend_id IS NULL AND state IN ('failed', 'deleted')))
 );
 CREATE UNIQUE INDEX sandboxes_backend_id ON sandboxes (backend, backend_id) WHERE backend_id IS NOT NULL;
 CREATE INDEX sandboxes_state ON sandboxes (state);
@@ -195,8 +203,8 @@ pub enum ReserveSandbox {
 
 fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
     conn.execute(
-        "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, list_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM sandboxes))",
+        "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, list_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM sandboxes))",
         params![
             sandbox.id,
             sandbox.backend,
@@ -206,7 +214,8 @@ fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
             sandbox.failure_reason,
             sandbox.created_at_ms,
             sandbox.updated_at_ms,
-            sandbox.deleted_at_ms
+            sandbox.deleted_at_ms,
+            sandbox.create_certainty.as_str()
         ],
     )?;
     Ok(())
@@ -386,18 +395,26 @@ impl Store {
                     PRAGMA user_version = 2;")?;
                 tx.execute_batch(MIGRATE_V3)?;
                 tx.execute_batch(MIGRATE_V4)?;
-                tx.commit().context("migrate schema v1 to v4")?;
+                tx.execute_batch(MIGRATE_V5)?;
+                tx.commit().context("migrate schema v1 to v5")?;
             }
             2 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(MIGRATE_V3)?;
                 tx.execute_batch(MIGRATE_V4)?;
-                tx.commit().context("migrate schema v2 to v4")?;
+                tx.execute_batch(MIGRATE_V5)?;
+                tx.commit().context("migrate schema v2 to v5")?;
             }
             3 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(MIGRATE_V4)?;
-                tx.commit().context("migrate schema v3 to v4")?;
+                tx.execute_batch(MIGRATE_V5)?;
+                tx.commit().context("migrate schema v3 to v5")?;
+            }
+            4 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch(MIGRATE_V5)?;
+                tx.commit().context("migrate schema v4 to v5")?;
             }
             SCHEMA_VERSION => {}
             v => bail!("database schema version {v} is newer than this kilnd ({SCHEMA_VERSION})"),
@@ -438,7 +455,8 @@ impl Store {
     /// Reservations survive daemon restart because they are derived from the
     /// lifecycle rows. LOST stays reserved because it may recover to READY;
     /// FAILED without a backend ID stays reserved because Runtime::create
-    /// errors may be ambiguous after allocating an unreported backend.
+    /// errors may be ambiguous after allocating an unreported backend, unless
+    /// `fail_create_definitely` recorded typed proof that nothing was allocated.
     /// FAILED with a backend ID is written only after compensation proved
     /// that exact backend gone, so it releases capacity while retaining the
     /// historical row. Ambiguous no-ID failures require authoritative resource
@@ -514,6 +532,26 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Publishes a typed no-allocation result: FAILED and its marker are one
+    /// durable update, which is the moment capacity is released. On any error
+    /// the row keeps its reservation, and restart treats it as ambiguous.
+    pub fn fail_create_definitely(&self, id: &str, failure_reason: &str) -> Result<()> {
+        let n = self.conn().execute(
+            "UPDATE sandboxes SET state = 'failed', create_certainty = ?2, failure_reason = ?3, updated_at_ms = ?4
+             WHERE id = ?1 AND state = 'creating' AND backend_id IS NULL",
+            params![
+                id,
+                CreateCertainty::DefinitelyNotCreated.as_str(),
+                failure_reason,
+                now_ms()
+            ],
+        )?;
+        if n != 1 {
+            bail!("sandbox {id} is not a CREATING row without a backend ID");
+        }
+        Ok(())
+    }
+
     /// Marks a sandbox lost only if it is still READY. Delete publishes
     /// DELETING before waiting for a running exec, so a late NotFound result
     /// must not overwrite that cleanup intent.
@@ -586,7 +624,7 @@ impl Store {
         let rows = stmt.query_map(
             params![upper_seq, before_seq, i64::from(limit) + 1],
             |row| {
-                let list_seq = row.get(9)?;
+                let list_seq = row.get(10)?;
                 Ok(sandbox_row(row)?.map(|sandbox| SandboxPageRow { sandbox, list_seq }))
             },
         )?;
@@ -728,6 +766,22 @@ impl Store {
         )?)
     }
 
+    /// Opens `dir` again after a simulated restart. The instance lock belongs
+    /// to its open file description, so a backend spawn on another test thread
+    /// holds a copy between fork and exec. Tests wait out that brief window.
+    #[cfg(test)]
+    pub(crate) fn reopen_after_restart(dir: &Path) -> Self {
+        for _ in 0..1000 {
+            match Self::open(dir) {
+                Err(error) if error.to_string().contains("state directory already owned") => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                opened => return opened.unwrap(),
+            }
+        }
+        panic!("{} stayed owned after restart", dir.display());
+    }
+
     #[cfg(test)]
     pub(crate) fn reject_ready_updates(&self) -> Result<()> {
         self.conn().execute_batch(
@@ -735,6 +789,17 @@ impl Store {
              BEFORE UPDATE OF state ON sandboxes
              WHEN NEW.state = 'ready'
              BEGIN SELECT RAISE(FAIL, 'injected ready publication failure'); END;",
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reject_failed_updates(&self) -> Result<()> {
+        self.conn().execute_batch(
+            "CREATE TEMP TRIGGER reject_failed_updates
+             BEFORE UPDATE OF state ON sandboxes
+             WHEN NEW.state = 'failed'
+             BEGIN SELECT RAISE(FAIL, 'injected failed publication failure'); END;",
         )?;
         Ok(())
     }
@@ -1169,15 +1234,19 @@ fn inspect_sqlite_sidecars(directory: &PreparedDirectory, expected_uid: u32) -> 
     Ok(())
 }
 
-const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms";
+const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty";
 
 /// Row decoding errors are reported per row rather than as SQLite errors.
 fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
     let state: String = row.get(3)?;
     let spec: String = row.get(4)?;
     let id: String = row.get(0)?;
+    let create_certainty: String = row.get(9)?;
     Ok((|| {
         Ok(Sandbox {
+            create_certainty: CreateCertainty::parse(&create_certainty).with_context(|| {
+                format!("sandbox {id}: unknown create certainty {create_certainty:?}")
+            })?,
             state: SandboxState::parse(&state)
                 .with_context(|| format!("sandbox {id}: unknown state {state:?}"))?,
             spec: serde_json::from_str::<SandboxSpec>(&spec)
@@ -1266,8 +1335,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::DirBuilderExt;
 
+    fn schema_v4() -> String {
+        let start = SCHEMA.find(",\n    create_certainty").unwrap();
+        let end = start + SCHEMA[start..].find("\n);").unwrap();
+        format!("{}{}", &SCHEMA[..start], &SCHEMA[end..])
+    }
+
     fn schema_v3() -> String {
-        SCHEMA
+        schema_v4()
             .replace(
                 "\n    stdout_total_bytes_known INTEGER NOT NULL DEFAULT 0,",
                 "",
@@ -1283,14 +1358,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v4_and_historical_v1_v2_v3_keep_unknown_evidence() {
+    fn fresh_v5_and_historical_v1_v2_v3_keep_unknown_evidence() {
         let fresh = Store::open_in_memory().unwrap();
         assert_eq!(
             fresh
                 .conn()
                 .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            4
+            SCHEMA_VERSION
         );
         for version in [1, 2, 3] {
             let tmp = tempfile::tempdir().unwrap();
@@ -1327,7 +1402,11 @@ mod tests {
                     .conn()
                     .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                     .unwrap(),
-                4
+                SCHEMA_VERSION
+            );
+            assert_eq!(
+                store.sandboxes(true).unwrap()[0].create_certainty,
+                CreateCertainty::AllocationAmbiguous
             );
             let historical = store.execution("old").unwrap().unwrap();
             assert_eq!(historical.exit_code, Some(143));
@@ -1341,7 +1420,7 @@ mod tests {
             assert_eq!(interrupted.state, ExecutionState::Interrupted);
             assert!(interrupted.command_status.is_none() && interrupted.runtime_error.is_none());
             drop(store);
-            let reopened = Store::open(tmp.path()).unwrap();
+            let reopened = Store::reopen_after_restart(tmp.path());
             assert_eq!(reopened.execution("old").unwrap().unwrap(), historical);
             assert_eq!(reopened.execution("running").unwrap().unwrap(), interrupted);
         }
@@ -1407,7 +1486,7 @@ mod tests {
         assert_eq!(full.stdout, out);
         assert_eq!(full.stderr, err);
         drop(store);
-        let store = Store::open(tmp.path()).unwrap();
+        let store = Store::reopen_after_restart(tmp.path());
         assert_eq!(store.execution(&e.id).unwrap().unwrap(), full);
     }
 
@@ -1496,6 +1575,7 @@ mod tests {
             updated_at_ms: now,
             deleted_at_ms: None,
             failure_reason: None,
+            create_certainty: CreateCertainty::AllocationAmbiguous,
         }
     }
 
@@ -1518,8 +1598,180 @@ mod tests {
         }
     }
 
+    fn v4_database(dir: &Path) -> Connection {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        conn.execute_batch(&schema_v4()).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn
+    }
+
     #[test]
-    fn v1_disk_migration_preserves_legacy_order_and_reopens_as_v4() {
+    fn v5_column_matches_the_migration_exactly() {
+        let column = MIGRATE_V5
+            .split("ADD COLUMN ")
+            .nth(1)
+            .unwrap()
+            .split(";\n")
+            .next()
+            .unwrap();
+        assert!(SCHEMA.contains(column), "{column}");
+    }
+
+    #[test]
+    fn v4_migration_makes_every_historical_row_ambiguous_whatever_its_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = v4_database(tmp.path());
+        let spec = serde_json::to_string(&sandbox().spec).unwrap();
+        for (seq, (id, state, backend_id, reason)) in [
+            // Reads exactly like a preflight failure, but no typed result exists.
+            ("sb-preflight", "failed", None, Some("kiln create failed (exit status: 124): image \"nope\" is missing")),
+            ("sb-claim", "failed", None, Some("definitely_not_created")),
+            ("sb-panic", "failed", None, Some("backend create task panicked")),
+            ("sb-compensated", "failed", Some("ab-1"), Some("backend removed")),
+            ("sb-creating", "creating", None, None),
+            ("sb-ready", "ready", Some("ab-2"), None),
+            ("sb-deleting", "deleting", None, None),
+            ("sb-lost", "lost", Some("ab-3"), None),
+            ("sb-deleted", "deleted", None, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO sandboxes (id,backend,backend_id,state,spec,failure_reason,created_at_ms,updated_at_ms,list_seq) VALUES (?1,'fake',?2,?3,?4,?5,1,1,?6)",
+                params![id, backend_id, state, spec, reason, seq as i64 + 1],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        std::fs::set_permissions(
+            tmp.path().join("kilnd.db"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        for _reopen in 0..2 {
+            let store = Store::reopen_after_restart(tmp.path());
+            let rows = store.sandboxes(true).unwrap();
+            assert_eq!(rows.len(), 9);
+            assert!(
+                rows.iter()
+                    .all(|row| row.create_certainty == CreateCertainty::AllocationAmbiguous)
+            );
+            // Everything but compensated FAILED and DELETED stays charged.
+            assert_eq!(store.sandbox_resources().unwrap().sandboxes, 7);
+            assert_eq!(
+                store
+                    .conn()
+                    .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                    .unwrap(),
+                5
+            );
+        }
+    }
+
+    #[test]
+    fn definite_create_failure_is_one_durable_update_that_releases_the_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let s = sandbox();
+        {
+            let store = Store::open(tmp.path()).unwrap();
+            store.insert_sandbox(&s).unwrap();
+            assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+            store.fail_create_definitely(&s.id, "image missing").unwrap();
+        }
+        let store = Store::reopen_after_restart(tmp.path());
+        let failed = store.sandbox(&s.id).unwrap().unwrap();
+        assert_eq!(failed.state, SandboxState::Failed);
+        assert_eq!(failed.create_certainty, CreateCertainty::DefinitelyNotCreated);
+        assert_eq!(failed.failure_reason.as_deref(), Some("image missing"));
+        assert_eq!(store.sandbox_resources().unwrap(), SandboxResources::default());
+        assert!(store.owned_backend_ids("fake").unwrap().is_empty());
+        // Terminal history keeps the marker without any effect on accounting.
+        assert!(
+            store
+                .compare_and_set_sandbox_state(
+                    &s.id,
+                    SandboxState::Failed,
+                    SandboxState::Deleted,
+                    None,
+                    None
+                )
+                .unwrap()
+        );
+        let deleted = store.sandbox(&s.id).unwrap().unwrap();
+        assert_eq!(deleted.create_certainty, CreateCertainty::DefinitelyNotCreated);
+        assert_eq!(store.sandbox_resources().unwrap(), SandboxResources::default());
+    }
+
+    #[test]
+    fn definite_marker_applies_only_to_a_creating_row_without_a_backend_id() {
+        let store = Store::open_in_memory().unwrap();
+        let mut allocated = sandbox();
+        allocated.backend_id = Some("ab-1".into());
+        store.insert_sandbox(&allocated).unwrap();
+        let mut ready = sandbox();
+        ready.state = SandboxState::Ready;
+        store.insert_sandbox(&ready).unwrap();
+        for id in [&allocated.id, &ready.id, &"sb-missing".to_string()] {
+            assert!(store.fail_create_definitely(id, "reason").is_err());
+        }
+        for row in store.sandboxes(true).unwrap() {
+            assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
+            assert_ne!(row.state, SandboxState::Failed);
+        }
+        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 2);
+    }
+
+    #[test]
+    fn failed_definite_publication_changes_nothing_and_stays_charged() {
+        let store = Store::open_in_memory().unwrap();
+        let s = sandbox();
+        store.insert_sandbox(&s).unwrap();
+        store.reject_failed_updates().unwrap();
+        store.fail_create_definitely(&s.id, "image missing").unwrap_err();
+        let row = store.sandbox(&s.id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxState::Creating);
+        assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
+        assert_eq!(row.failure_reason, None);
+        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+    }
+
+    #[test]
+    fn schema_refuses_a_definite_marker_on_any_row_that_could_own_a_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = v4_database(tmp.path());
+        drop(conn);
+        std::fs::set_permissions(
+            tmp.path().join("kilnd.db"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        for store in [
+            Store::open_in_memory().unwrap(),
+            Store::open(tmp.path()).unwrap(),
+        ] {
+            let s = sandbox();
+            store.insert_sandbox(&s).unwrap();
+            let conn = store.conn();
+            assert!(conn.execute("UPDATE sandboxes SET create_certainty = 'definitely_not_created'", []).is_err());
+            assert!(conn.execute("UPDATE sandboxes SET create_certainty = 'other'", []).is_err());
+            drop(conn);
+            store.fail_create_definitely(&s.id, "image missing").unwrap();
+            for state in [SandboxState::Creating, SandboxState::Ready, SandboxState::Deleting, SandboxState::Lost] {
+                assert!(store.set_sandbox_state(&s.id, state, None, None).is_err(), "{state:?}");
+            }
+            assert!(store.set_sandbox_state(&s.id, SandboxState::Failed, Some("ab-1"), None).is_err());
+            let row = store.sandbox(&s.id).unwrap().unwrap();
+            assert_eq!(row.state, SandboxState::Failed);
+            assert_eq!(row.backend_id, None);
+            assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
+        }
+    }
+
+    #[test]
+    fn v1_disk_migration_preserves_legacy_order_and_reopens_as_current() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let legacy = schema_v2().replace(",\n    list_seq       INTEGER NOT NULL", "")
@@ -1566,13 +1818,13 @@ mod tests {
                 .collect();
             assert_eq!(seqs, [1, 2, 3, 4]);
         }
-        let store = Store::open(temp.path()).unwrap();
+        let store = Store::reopen_after_restart(temp.path());
         assert_eq!(
             store
                 .conn()
                 .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
                 .unwrap(),
-            4
+            SCHEMA_VERSION
         );
         assert_eq!(
             store
@@ -2022,7 +2274,7 @@ mod tests {
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        let store = Store::open(&dir).unwrap();
+        let store = Store::reopen_after_restart(&dir);
         assert_eq!(store.sandbox(&s.id).unwrap().unwrap(), s);
     }
 
@@ -2273,7 +2525,7 @@ mod tests {
         assert_eq!(std::fs::symlink_metadata(&lock).unwrap().ino(), inode);
 
         drop(first);
-        let _next = Store::open(&dir).unwrap();
+        let _next = Store::reopen_after_restart(&dir);
         assert_eq!(std::fs::symlink_metadata(&lock).unwrap().ino(), inode);
     }
 

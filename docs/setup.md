@@ -27,7 +27,7 @@ Follow kiln's README "Dev setup (macOS)". The part kilnd needs:
 ```sh
 cd ~/Projects/lambda-nine/kiln
 git fetch origin
-git checkout --detach 46d84bdfe13e331f047e70e38848f7d74bcd2872  # tested companion
+git checkout --detach e48f0e785ad484d0b2947897f6d48d0756059d7e  # tested companion
 limactl create --name=kiln lima.yaml && limactl start kiln
 limactl shell --workdir "$PWD" kiln
 sudo scripts/fetch-alpine.sh        # the "alpine" image
@@ -36,12 +36,15 @@ unset CARGO_TARGET_DIR              # kiln's installer uses target/release
 scripts/install.sh                  # /usr/local/bin/kiln, kiln-dns, kiln-metrics
 ```
 
-kilnd requires persistent-exec protocol v1 and scoped `gc ID...`. The minimum
-kiln revision providing both is `40d9aa5003205d4c171e1b3eca61e9868064e98b`.
-`711440db3167` has the exec protocol but lacks scoped GC and is refused.
-The tested companion is `46d84bdfe13e331f047e70e38848f7d74bcd2872` on
-`review/breakit-fixes`: install, integration, smoke and every kilnd regression
-script passed against that immutable pin on 2026-10-30.
+kilnd requires persistent-exec protocol v1, scoped `gc ID...` and
+persistent-create certainty (capability feature `0x10`). The minimum kiln
+revision providing all three is `e48f0e785ad484d0b2947897f6d48d0756059d7e`. Older revisions are refused,
+including `40d9aa5003205d4c171e1b3eca61e9868064e98b` and
+`46d84bdfe13e331f047e70e38848f7d74bcd2872`, which lack `0x10`: upgrade kiln
+before kilnd, or kilnd refuses to start. Sandboxes those revisions already
+started keep working; only the installed CLI needs the new feature.
+The tested companion is `e48f0e785ad484d0b2947897f6d48d0756059d7e`: install, integration, smoke and every
+kilnd regression script passed against that immutable pin.
 Install a compatible artifact, then check `kiln capabilities --protocol=1`
 (binary output) and `kiln gc --help` (usage must advertise `[ID]...`). kilnd
 checks both interfaces before reconciliation and workload launch rather than
@@ -152,11 +155,13 @@ than the deadline. Tickets remain held while finalization retries.
 opaque `next_page_token` until empty, keeping `include_deleted` unchanged.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
-bounds. Schema v1 upgrades through v2 and v3 to v4; v2/v3 also upgrade to v4.
-Schema 4 stores typed termination and runtime diagnostics together with output,
-terminal state, truncation facts and whether each byte total is exact.
-Historical records retain unknown typed values and unknown output-total
-certainty. Older binaries refuse schema 4, so keep a backup before upgrading.
+bounds. Every older schema upgrades in order through to v5. Schema 5 stores
+typed termination and runtime diagnostics together with output, terminal state,
+truncation facts and whether each byte total is exact, plus each sandbox's
+create certainty. Historical records retain unknown typed values and unknown
+output-total certainty, and every existing no-ID `FAILED` row stays ambiguous and
+charged, even one whose text describes a missing image. Older binaries refuse
+schema 5, so keep a backup before upgrading.
 Store migration may occur before startup capability validation fails;
 installing an older daemon is not a database downgrade path.
 
@@ -181,8 +186,10 @@ installing an older daemon is not a database downgrade path.
 - **After a reboot,** sandboxes are gone (kiln's state is in tmpfs and
   cgroups). kilnd marks them `lost` at startup; delete them to clear the
   records.
-- **Node budget cleanup:** `LOST` and a `FAILED` create with no backend ID keep
-  their durable reservation. Known-ID deletion requires a negative exact-ID
+- **Node budget cleanup:** a create that kiln proves failed before allocating
+  anything, such as a missing image, is charged nothing once it is `FAILED`;
+  delete it to clear the record. `LOST` and every other `FAILED` create with no
+  backend ID keep their durable reservation. Known-ID deletion requires a negative exact-ID
   probe, a complete list omitting the ID and absent cgroup. Delete refuses a
   no-ID ambiguous `FAILED` row even after stray resources have been removed:
   ordinary listings cannot account for hidden resources, and authoritative

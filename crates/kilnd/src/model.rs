@@ -69,6 +69,35 @@ impl SandboxState {
     }
 }
 
+/// What a failed create proved about backend allocation. Only the runtime's
+/// typed result can establish `DefinitelyNotCreated`; every other path,
+/// including all rows older than schema 5, stays `AllocationAmbiguous`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CreateCertainty {
+    /// The backend proved the failure preceded any allocation.
+    DefinitelyNotCreated,
+    /// A backend may exist without kilnd knowing its ID.
+    #[default]
+    AllocationAmbiguous,
+}
+
+impl CreateCertainty {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DefinitelyNotCreated => "definitely_not_created",
+            Self::AllocationAmbiguous => "allocation_ambiguous",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "definitely_not_created" => Self::DefinitelyNotCreated,
+            "allocation_ambiguous" => Self::AllocationAmbiguous,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sandbox {
     pub id: String,
@@ -80,6 +109,7 @@ pub struct Sandbox {
     pub updated_at_ms: i64,
     pub deleted_at_ms: Option<i64>,
     pub failure_reason: Option<String>,
+    pub create_certainty: CreateCertainty,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

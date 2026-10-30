@@ -721,7 +721,7 @@ mod tests {
             !socket.exists(),
             "graceful shutdown left its owned socket behind"
         );
-        let store = Store::open(&state_dir).unwrap();
+        let store = Store::reopen_after_restart(&state_dir);
         let row = store.sandboxes(true).unwrap().remove(0);
         assert_eq!(row.state, SandboxState::Failed);
         assert!(
@@ -898,7 +898,7 @@ mod tests {
             !socket.exists(),
             "graceful shutdown left its owned socket behind"
         );
-        let store = Store::open(&state_dir).unwrap();
+        let store = Store::reopen_after_restart(&state_dir);
         let execution = store.execution(&execution_id).unwrap().unwrap();
         assert_eq!(execution.state, ExecutionState::Exited);
         assert_eq!(execution.stdout.data, b"completed\n");

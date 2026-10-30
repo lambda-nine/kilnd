@@ -3,6 +3,8 @@ use crate::model::{CommandStatus, RuntimeDiagnostic, RuntimeErrorKind, RuntimeSt
 
 pub const MAX_FRAME: usize = 2088;
 const HEADER: usize = 16;
+/// `kiln create` reserves exit status 124 for failures known before allocation.
+const FEATURE_CREATE_CERTAINTY: u32 = 0x10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cleanup {
@@ -55,6 +57,18 @@ impl Capabilities {
                 self.private_version,
                 self.package,
                 self.provenance
+            ));
+        }
+        Ok(())
+    }
+
+    /// Required of the installed CLI, which is what allocates new sandboxes.
+    /// A live sandbox's PID 1 never creates, so older ones stay compatible.
+    pub fn require_create_certainty(&self) -> Result<(), String> {
+        if self.features & FEATURE_CREATE_CERTAINTY == 0 {
+            return Err(format!(
+                "required persistent-create certainty feature {FEATURE_CREATE_CERTAINTY:#x}; observed {:#x} ({} {})",
+                self.features, self.package, self.provenance
             ));
         }
         Ok(())
@@ -333,6 +347,22 @@ pub(super) mod tests {
         let mut frame = caps();
         frame[16] = 7;
         assert!(capabilities(&frame).unwrap().require_v1().is_err());
+    }
+
+    #[test]
+    fn create_certainty_is_a_separate_additive_feature() {
+        for (features, v1, certainty) in [
+            (0x0f, true, false),
+            (0x1f, true, true),
+            (0x10, false, true),
+            (0xff, true, true),
+        ] {
+            let mut f = caps();
+            f[16] = features;
+            let c = capabilities(&f).unwrap();
+            assert_eq!(c.require_v1().is_ok(), v1, "{features:#x}");
+            assert_eq!(c.require_create_certainty().is_ok(), certainty, "{features:#x}");
+        }
     }
 
     #[test]

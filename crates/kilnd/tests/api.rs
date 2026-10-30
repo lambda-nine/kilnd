@@ -498,6 +498,56 @@ async fn every_rpc_over_the_socket() {
     assert_eq!(err.code(), Code::Internal);
     assert!(err.message().contains("no image"));
 
+    // The wire contract is unchanged for a definite failure; only Health's
+    // reservations and DeleteSandbox's result show its release.
+    let charged = c
+        .health(pb::HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .node_resources
+        .unwrap()
+        .reserved_sandboxes;
+    {
+        let mut backend = fake.state();
+        backend.fail_create = None;
+        backend.fail_create_definitely = Some("image missing".into());
+    }
+    let err = c
+        .create_sandbox(pb::CreateSandboxRequest { spec: None })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Internal);
+    assert!(err.message().contains("image missing"));
+    assert_eq!(
+        c.health(pb::HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .node_resources
+            .unwrap()
+            .reserved_sandboxes,
+        charged
+    );
+    let id = c
+        .list_sandboxes(pb::ListSandboxesRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .sandboxes
+        .into_iter()
+        .find(|sandbox| sandbox.failure_reason.contains("image missing"))
+        .unwrap()
+        .id;
+    let deleted = c
+        .delete_sandbox(pb::DeleteSandboxRequest { id })
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_eq!(deleted.state, pb::SandboxState::Deleted as i32);
+
     drop(c);
     stop_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), server)

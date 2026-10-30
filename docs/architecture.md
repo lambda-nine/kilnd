@@ -37,7 +37,7 @@ API socket and a guest agent.
 
 | kilnd | kiln |
 |-------|------|
-| create | `kiln create --require-exec-protocol=1 --image=… --memory=… --cpus=… --pids=… --disk=… --net=…/--allow=… [--read-only --writable=…]`; stdout is the ID |
+| create | `kiln create --require-exec-protocol=1 --image=… --memory=… --cpus=… --pids=… --disk=… --net=…/--allow=… [--read-only --writable=…]`; stdout is the ID, exit 124 means a failure known before allocation |
 | exec | `kiln exec --protocol=1 --status-fd=N --stdin-fd=I --stdout-fd=O --stderr-fd=E ID -- ARGV…`; private status and workload streams |
 | delete | `kiln rm ID` |
 | reconcile | `kiln ls`, scoped `kiln gc ID...`, then `kiln ls` again |
@@ -71,16 +71,20 @@ backend call and returns `DEADLINE_EXCEEDED`. Once a row exists, timeout
 produces a successful terminal `TIMED_OUT` execution after backend cleanup
 and SQLite publication. Cleanup is never timed out by the service.
 
-The required persistent-exec v1 plus scoped GC interface first coexist in
-kiln `40d9aa5003205d4c171e1b3eca61e9868064e98b`. The older `711440db3167`
-exec-protocol artifact lacks scoped GC and is refused. CLI capability validation
+The installed CLI must advertise persistent-exec v1 (features `0xf`) plus
+persistent-create certainty (feature `0x10`), and support scoped GC. They first
+coexist in kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`. Older artifacts, including
+`40d9aa5003205d4c171e1b3eca61e9868064e98b`, which first combined v1 with scoped
+GC, are refused. CLI capability validation
 also requires complete, bounded `gc --help` output advertising `gc [ID]...`,
 within the caller's deadline. It never invokes global GC to test compatibility.
-Privileged verification uses kiln `46d84bdfe13e331f047e70e38848f7d74bcd2872`
-(`review/breakit-fixes`); setup pins that tested companion.
+Privileged verification uses kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`; setup pins that tested companion.
 Both installed CLI and sandbox PID 1 capabilities are checked before each
-execution, within its existing deadline. Create requires
-`--require-exec-protocol=1`; there is no machine legacy fallback. Package and
+execution, within its existing deadline. A live PID 1 is only asked for the
+execution bits: it never allocates, so a sandbox started by an older CLI stays
+usable. Create revalidates the CLI and requires
+`--require-exec-protocol=1`, so a legacy binary swapped in after that gate
+refuses before allocating; there is no machine legacy fallback. Package and
 provenance strings aid diagnosis; capability frames decide compatibility.
 If an ID capability probe fails, a side-effect-free `ls` observation consumes
 the same absolute deadline. Only a successful complete list proving absence
@@ -143,7 +147,9 @@ Executions: `RUNNING` → `EXITED` (with exit code) | `TIMED_OUT` | `CANCELED`
 
 A sandbox row is written as `CREATING` before `kiln create` runs, so a crash
 mid-create leaves evidence. Creation then belongs to a tracked daemon task,
-not the gRPC handler: disconnecting only drops the waiter. A successful
+not the gRPC handler: disconnecting only drops the waiter. A failure records
+`FAILED` with what the runtime proved about allocation (see
+[Node resource reservations](#node-resource-reservations)). A successful
 backend ID is published as `READY`; if that write fails, kilnd first records
 `DELETING`, removes the backend, and records `FAILED`. Failed removal stays
 `DELETING`, retains the backend ID, and counts against the retained reservation
@@ -172,11 +178,20 @@ Reservations follow ownership evidence:
 - `CREATING`, `READY`, `DELETING` and `LOST` reserve the full effective spec.
   `LOST` is retained because later reconciliation may restore the same backend
   to `READY`.
-- `FAILED` without a backend ID remains reserved because `Runtime::create`
-  explicitly permits an ambiguous error after allocation. Delete refuses to
-  release it even with an empty listing: no current Runtime operation can
-  account for hidden or unpublished resources without the ID. Authoritative
-  resource reconciliation would be needed to release this reservation.
+- `FAILED` without a backend ID remains reserved by default, because
+  `Runtime::create` failures are `AllocationAmbiguous` unless proven otherwise.
+  This covers every ordinary error, panics, task cancellation, a crash during
+  create and every row older than schema 5. Delete refuses to release it even
+  with an empty listing: no current Runtime operation can account for hidden or
+  unpublished resources without the ID. Authoritative resource reconciliation
+  would be needed to release this reservation.
+- `FAILED` with the durable `definitely_not_created` marker releases. Only the
+  explicit `CreateFailure::definitely_not_created` constructor can produce it,
+  and one SQLite update writes the state and marker together, so there is no
+  moment of released-but-unrecorded capacity. If that update fails the row stays
+  `CREATING` and charged, and restart makes it ambiguous. Delete moves the row
+  to `DELETED` without any backend call. A column `CHECK` keeps the marker off
+  any row with a backend ID or a state that could own one.
 - Successful failed-publication compensation records `FAILED` with the exact
   removed backend ID. That one `FAILED` shape releases immediately because
   removal or `NotFound` was proven before the durable transition. The kiln
@@ -187,6 +202,20 @@ Reservations follow ownership evidence:
   reload, including after waiting behind the create compensator's lock.
 - `DELETED` releases. A failed or interrupted delete remains `DELETING` and
   cannot return capacity early.
+
+The kiln adapter claims `definitely_not_created` in exactly two cases, and never
+from diagnostics text:
+
+- The capability gate that precedes every create failed, so no create process
+  started.
+- `kiln create`, from a CLI that just advertised feature `0x10`, completed as
+  the direct child with exit status exactly 124, which kiln reserves for
+  failures known before `new_id` (validation, configuration, image preflight).
+  It must also have printed nothing to stdout and left both output pipes at
+  EOF: an ID or a surviving descendant contradicts that claim.
+
+From the spawn attempt on, everything else stays ambiguous: any other status, a
+signal, a malformed success, deadline, cancellation, spawn or wait I/O failure.
 
 Budgets are configured promises, not live RSS or disk-use measurements.
 Health reports both limits and reservations. If an operator lowers a budget
@@ -265,8 +294,9 @@ At startup, after both ownership locks are held and the socket is reserved:
    a live backend stays (or becomes)
    `READY`; with confirmed absence it becomes `LOST`; an exact backend that
    reappears for a `LOST` row and passes validation becomes `READY` again;
-   `CREATING` without a backend ID becomes `FAILED`; `DELETING` is retried
-   or completed.
+   `CREATING` without a backend ID becomes an ambiguous `FAILED`, since any
+   typed result died with the daemon; `FAILED` is left as it is, keeping its
+   certainty marker; `DELETING` is retried or completed.
 5. Executions still `RUNNING` for this backend become `INTERRUPTED`. Other
    backends' rows are untouched. Their `kiln exec` clients died with kilnd
    (`PR_SET_PDEATHSIG` plus a post-arm parent-PID check), so kiln already
@@ -376,8 +406,13 @@ means capture reached EOF, so `total_bytes` is exact; false means the count is
 only an observed lower bound. `truncated` independently records that observed
 bytes exceeded retained bytes. v1/v2/v3 opens migrate through v4, preserving
 historical typed evidence but leaving historical output totals unknown rather
-than asserting exactness. Older binaries refuse schema 4. Migration happens at
-store open and may precede startup capability failure; back up before upgrading.
+than asserting exactness.
+
+Schema v5 adds `sandboxes.create_certainty`. Every historical row migrates as
+`allocation_ambiguous`, whatever its failure text says, so failures recorded
+before an upgrade stay charged. Every older version migrates through v5, and
+older binaries refuse schema 5. Migration happens at store open and may precede
+startup capability failure; back up before upgrading.
 
 The API represents signal numbers as `uint32` and retains legacy `exit_code`
 only for EXITED, projecting signal termination as 128 + signal.

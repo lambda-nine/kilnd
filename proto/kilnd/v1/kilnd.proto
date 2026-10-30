@@ -79,8 +79,9 @@ message HealthResponse {
 
 // Durable capacity promised to owned or ambiguous sandbox rows. These are hard
 // reservation sums, not measured live consumption. FAILED without a backend ID
-// remains reserved because a create error may be ambiguous; compensated FAILED
-// with the exact removed backend ID releases. LOST remains reserved because
+// remains reserved because a create error may be ambiguous, unless the backend
+// proved the failure preceded any allocation; that FAILED and compensated FAILED
+// with the exact removed backend ID release. LOST remains reserved because
 // reconciliation may restore it to READY.
 message NodeResourceStats {
   uint64 max_sandboxes = 1;

@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kilnd::manager::{CreateRequest, ExecRequest, Limits, Manager};
-use kilnd::model::{CommandStatus, ExecutionState, RuntimeErrorKind, RuntimeStage, SandboxState};
+use kilnd::model::{
+    CommandStatus, CreateCertainty, ExecutionState, Network, RuntimeErrorKind, RuntimeStage,
+    SandboxState,
+};
 use kilnd::runtime::Runtime;
 use kilnd::runtime::kiln::KilnRuntime;
 use kilnd::store::Store;
@@ -784,4 +787,256 @@ async fn node_reservations_bound_concurrent_real_creates_and_survive_restart() {
         manager.health().await.unwrap().node_resources.reserved.sandboxes,
         0
     );
+}
+
+// A budget one small sandbox fills exactly, so any leaked charge is visible.
+fn one_small_sandbox() -> (Limits, CreateRequest) {
+    (
+        Limits {
+            max_sandboxes: 1,
+            max_node_memory_bytes: 128 << 20,
+            max_node_pids: 64,
+            max_node_disk_bytes: 64 << 20,
+            ..Limits::default()
+        },
+        CreateRequest {
+            memory_bytes: 128 << 20,
+            pids: 64,
+            disk_bytes: 64 << 20,
+            ..Default::default()
+        },
+    )
+}
+
+async fn listed_ids(manager: &Manager<KilnRuntime>) -> Vec<String> {
+    let mut ids: Vec<String> = manager
+        .runtime()
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|sandbox| sandbox.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+// What an allocation would leave behind, beyond the listing it could miss.
+fn kiln_host_state() -> Vec<Vec<String>> {
+    ["/sys/fs/cgroup/kiln", "/var/lib/kiln/runs"]
+        .iter()
+        .map(|dir| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn real_kiln_preflight_failures_release_reservations_across_restart() {
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state_dir = tmp.path().join("state");
+    let (limits, request) = one_small_sandbox();
+    let manager = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&state_dir).unwrap(),
+        limits.clone(),
+    ));
+    manager.reconcile().await.unwrap();
+    let host_before = kiln_host_state();
+    let listed_before = listed_ids(&manager).await;
+
+    // Both pass kilnd's validation and fail inside kiln before it picks an ID.
+    let preflight_failures = [
+        CreateRequest {
+            image: "kilnd-regression-definitely-missing".into(),
+            ..request.clone()
+        },
+        CreateRequest {
+            network: Network::Allow(vec!["10.0.0.1:443".into()]),
+            ..request.clone()
+        },
+    ];
+    for failing in &preflight_failures {
+        // Twice: a retained charge would turn the second into ResourceExhausted.
+        for _ in 0..2 {
+            let error = manager.create(failing.clone()).await.unwrap_err();
+            assert!(
+                matches!(error, kilnd::manager::Error::Backend(_)),
+                "{error}"
+            );
+        }
+    }
+    assert_eq!(listed_ids(&manager).await, listed_before);
+    assert_eq!(kiln_host_state(), host_before);
+    assert_eq!(
+        manager.health().await.unwrap().node_resources.reserved,
+        Default::default()
+    );
+
+    drop(manager);
+    let manager = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&state_dir).unwrap(),
+        limits,
+    ));
+    let reconciled = manager.reconcile().await.unwrap();
+    assert!(reconciled.failed.is_empty() && reconciled.lost.is_empty());
+    let rows = manager.list(false).unwrap();
+    assert_eq!(rows.len(), 2 * preflight_failures.len());
+    for row in &rows {
+        assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
+        assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
+    }
+    assert_eq!(
+        manager.health().await.unwrap().node_resources.reserved,
+        Default::default()
+    );
+
+    // The whole budget is still usable, and retiring the history leaves that
+    // live sandbox alone.
+    let live = manager.create(request).await.unwrap();
+    let backend_id = live.backend_id.clone().unwrap();
+    for row in &rows {
+        assert_eq!(
+            manager.delete(&row.id).await.unwrap().state,
+            SandboxState::Deleted
+        );
+    }
+    assert!(listed_ids(&manager).await.contains(&backend_id));
+    assert_eq!(
+        manager
+            .health()
+            .await
+            .unwrap()
+            .node_resources
+            .reserved
+            .sandboxes,
+        1
+    );
+    manager.delete(&live.id).await.unwrap();
+    assert_eq!(listed_ids(&manager).await, listed_before);
+    assert_eq!(kiln_host_state(), host_before);
+}
+
+// kilnd can no longer see the backend this test leaks on purpose.
+struct RemoveCapturedBackend(PathBuf);
+
+impl Drop for RemoveCapturedBackend {
+    fn drop(&mut self) {
+        if let Ok(id) = std::fs::read_to_string(&self.0)
+            && !id.trim().is_empty()
+        {
+            let _ = std::process::Command::new(kiln_bin())
+                .args(["rm", id.trim()])
+                .status();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn real_kiln_post_allocation_failure_stays_charged_across_restart() {
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state_dir = tmp.path().join("state");
+    let captured = tmp.path().join("backend-id");
+    let _cleanup = RemoveCapturedBackend(captured.clone());
+    // Allocates for real, then loses the result the way a dying CLI would.
+    let wrapper = tmp.path().join("kiln-loses-its-result");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = create ]; then\n    '{real}' \"$@\" >'{captured}' || exit 99\n    echo 'lost after allocation' >&2\n    exit 1\nfi\nexec '{real}' \"$@\"\n",
+            real = kiln_bin().display(),
+            captured = captured.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (limits, request) = one_small_sandbox();
+    let manager = Arc::new(Manager::new(
+        KilnRuntime::new(wrapper.clone()),
+        Store::open(&state_dir).unwrap(),
+        limits.clone(),
+    ));
+    manager.reconcile().await.unwrap();
+
+    let error = manager.create(request.clone()).await.unwrap_err();
+    assert!(
+        matches!(&error, kilnd::manager::Error::Backend(message) if message.contains("lost after allocation")),
+        "{error}"
+    );
+    let row = manager.list(true).unwrap().remove(0);
+    assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
+    assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
+    let backend_id = std::fs::read_to_string(&captured)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    drop(manager);
+    let manager = Arc::new(Manager::new(
+        KilnRuntime::new(wrapper),
+        Store::open(&state_dir).unwrap(),
+        limits,
+    ));
+    // The hidden backend is visible but unowned: not adopted, not removed.
+    assert!(
+        manager
+            .reconcile()
+            .await
+            .unwrap()
+            .unmanaged
+            .contains(&backend_id)
+    );
+    assert_eq!(
+        manager
+            .health()
+            .await
+            .unwrap()
+            .node_resources
+            .reserved
+            .sandboxes,
+        1
+    );
+    assert!(matches!(
+        manager.delete(&row.id).await,
+        Err(kilnd::manager::Error::FailedPrecondition(_))
+    ));
+    assert!(matches!(
+        manager.create(request).await,
+        Err(kilnd::manager::Error::ResourceExhausted(_))
+    ));
+    assert!(listed_ids(&manager).await.contains(&backend_id));
+
+    // An operator's own cleanup is no evidence kilnd can use either.
+    kiln().remove(&backend_id).await.unwrap();
+    manager.reconcile().await.unwrap();
+    assert_eq!(
+        manager
+            .health()
+            .await
+            .unwrap()
+            .node_resources
+            .reserved
+            .sandboxes,
+        1
+    );
+    assert!(matches!(
+        manager.delete(&row.id).await,
+        Err(kilnd::manager::Error::FailedPrecondition(_))
+    ));
 }
