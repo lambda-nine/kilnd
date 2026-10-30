@@ -6,6 +6,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Remove unneeded AF_INET6 from the helper's supported IPv4-resolver deployment;
+  retain AF_INET for hostname allowlists and AF_NETLINK for networking/nft, and
+  assert the exact installed address-family set in the lifecycle regression.
+
 - Honor non-Exec helper wire deadlines and cancellation through create, remove,
   list and scoped GC, capped by their internal limits; share the remaining
   removal budget with absence probes and preserve ambiguous create evidence.
@@ -20,7 +24,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   descriptors. Per-syscall nonblocking socket I/O protects deadlines and the
   listener against mutable flags and backpressure; Linux regressions exercise
   flag mutation, stalled stdin and cancellation. Upgrade daemon/helper together.
-- Preserve IPv4/IPv6 host DNS resolution for hostname allowlists under the
+- Preserve IPv4 host DNS resolution for hostname allowlists under the
   restored address-family filter; exercise full-network and hostname Create/Exec.
 - Restore PH0-2 helper systemd address-family, personality, realtime and
   kernel-log filters with ambient CAP_SETUID for UID-map setup. Installed

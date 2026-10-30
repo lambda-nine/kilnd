@@ -27,7 +27,7 @@ CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_CHOW
 # drops effective CAP_SETUID; retain it for kiln's UID-map setup.
 AmbientCapabilities=CAP_SETUID
 # Control/stdio, network setup, and libc hostname resolution for allowlists.
-RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET
 LockPersonality=yes
 RestrictRealtime=yes
 ProtectKernelLogs=yes

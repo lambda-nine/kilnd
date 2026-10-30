@@ -148,10 +148,12 @@ operations. Both units use NoNewPrivileges and ProtectSystem=strict. The daemon
 has no capabilities and cannot reach kiln's root-owned data or networking state.
 
 The helper inherits systemd seccomp filters for `RestrictAddressFamilies=AF_UNIX
-AF_NETLINK AF_INET AF_INET6`, `LockPersonality`, `RestrictRealtime` and `ProtectKernelLogs`.
-AF_UNIX serves control/stdio; AF_NETLINK supports kiln's network setup. AF_INET
-and AF_INET6 are needed by libc hostname resolution for allowlists (including
-IPv6 host resolvers even though sandbox allowlists are IPv4). With
+AF_NETLINK AF_INET`, `LockPersonality`, `RestrictRealtime` and `ProtectKernelLogs`.
+AF_UNIX serves control/stdio; AF_NETLINK supports kiln's network setup and nft.
+AF_INET permits libc DNS resolution through the supported VM's IPv4 resolver.
+AF_INET6 is excluded: kiln rejects IPv6 destinations and retains only public
+IPv4 hostname answers for its nft policy. Hosts using only an IPv6 DNS resolver
+must configure an IPv4-reachable resolver for this deployment. With
 explicit `User=root`, systemd 255's seccomp credential transition drops effective
 CAP_SETUID unless `AmbientCapabilities=CAP_SETUID` preserves it for UID-map
 writes. The bounding/effective/permitted mask remains `0x2010eb`, ambient is

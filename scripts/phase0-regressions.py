@@ -118,6 +118,8 @@ try:
     helper_status=dict(line.split(':',1) for line in open(f'/proc/{helper_pid}/status') if ':' in line)
     assert int(helper_status['NoNewPrivs'])==1
     assert int(helper_status['Seccomp'])==2, helper_status['Seccomp']
+    families=run(['systemctl','show','-p','RestrictAddressFamilies','--value','kilnd-helper']).stdout.split()
+    assert set(families)=={'AF_UNIX','AF_NETLINK','AF_INET'}, families
     for field in ('CapEff','CapPrm','CapBnd'):
         assert int(helper_status[field].strip(),16)==0x2010eb, (field,helper_status[field])
     assert int(helper_status['CapAmb'].strip(),16)==0x80, helper_status['CapAmb']
