@@ -6,6 +6,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Recheck compensated history on every Delete state reload, including after
+  waiting for create compensation. Queued deletion cannot remove a replacement
+  using the old backend ID or temporarily reserve compensated history again.
+
 - Require exact-backend absence evidence after both successful and failed
   removal, including failed-publication compensation. A live direct probe or
   surviving cgroup keeps the row and its reservation retryable. Ambiguous

@@ -644,6 +644,41 @@ async fn dropped_waiter_does_not_interrupt_publication_compensation() {
 }
 
 #[tokio::test]
+async fn delete_queued_behind_compensation_preserves_reused_historical_id() {
+    let (m, fake) = manager();
+    m.store.reject_ready_updates().unwrap();
+    let gate = FakeGate::default();
+    fake.state().remove_after_delete = Some(gate.clone());
+    let creator = tokio::spawn({
+        let m = m.clone();
+        async move { m.create(CreateRequest::default()).await }
+    });
+    gate.entered().await;
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!(row.state, SandboxState::Deleting);
+    let backend_id = row.backend_id.unwrap();
+    assert!(!fake.state().sandboxes.contains_key(&backend_id));
+    let deletion = m.delete(&row.id);
+    tokio::pin!(deletion);
+    // Poll Delete to the held coordination lock, without a scheduling sleep.
+    tokio::select! {
+        biased;
+        result = &mut deletion => panic!("delete unexpectedly finished: {result:?}"),
+        () = std::future::ready(()) => {},
+    }
+    fake.state().sandboxes.insert(backend_id.clone(), BackendStatus::Running);
+    gate.release();
+    assert!(creator.await.unwrap().is_err());
+    assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Failed);
+    assert_eq!(m.health().await.unwrap().node_resources.reserved.sandboxes, 0);
+    assert_eq!(deletion.await.unwrap().state, SandboxState::Deleted);
+    assert_eq!(fake.state().remove_attempts, [backend_id.clone()]);
+    assert!(fake.state().sandboxes.contains_key(&backend_id));
+    assert_eq!(m.health().await.unwrap().node_resources.reserved.sandboxes, 0);
+    assert_eq!(m.delete(&row.id).await.unwrap().state, SandboxState::Deleted);
+}
+
+#[tokio::test]
 async fn failed_publication_and_compensation_remain_retryable_and_counted() {
     let (m, fake) = manager();
     m.store.reject_ready_updates().unwrap();

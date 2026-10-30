@@ -932,7 +932,23 @@ impl<R: Runtime> Manager<R> {
                         "sandbox {id} is still being created; retry"
                     )));
                 }
-                expected @ (SandboxState::Ready | SandboxState::Failed | SandboxState::Lost) => {
+                SandboxState::Failed => {
+                    // The no-ID case was refused above. With an ID this is
+                    // compensated history, including when compensation ended
+                    // while Delete waited for the coordination lock. Never
+                    // reassert ownership of the historical backend ID.
+                    if self.store.compare_and_set_sandbox_state(
+                        id,
+                        SandboxState::Failed,
+                        SandboxState::Deleted,
+                        None,
+                        None,
+                    )? {
+                        return self.load(id);
+                    }
+                    sandbox = self.load(id)?;
+                }
+                expected @ (SandboxState::Ready | SandboxState::Lost) => {
                     if self.store.compare_and_set_sandbox_state(
                         id,
                         expected,
@@ -952,34 +968,6 @@ impl<R: Runtime> Manager<R> {
         let sandbox = self.load(id)?;
         if sandbox.state == SandboxState::Deleted {
             return Ok(sandbox);
-        }
-        if sandbox.state == SandboxState::Failed {
-            if sandbox.backend_id.is_none() {
-                return Err(self.ambiguous_reservation_error(&sandbox));
-            } else {
-                // FAILED with an ID is compensated history: removal or
-                // NotFound was already proven before that state was written.
-                // Never reassert ownership by entering DELETING or touching a
-                // backend that may since have reused the historical ID.
-                if self.store.compare_and_set_sandbox_state(
-                    id,
-                    SandboxState::Failed,
-                    SandboxState::Deleted,
-                    None,
-                    None,
-                )? {
-                    info!(sandbox = %id, "deleted compensated sandbox history");
-                    return self.load(id);
-                }
-                let current = self.load(id)?;
-                if current.state == SandboxState::Deleted {
-                    return Ok(current);
-                }
-                return Err(Error::Internal(anyhow::anyhow!(
-                    "compensated sandbox {id} changed from failed to {} while deletion completed",
-                    current.state.as_str()
-                )));
-            }
         }
         // Hold a strong reference before publishing DELETING so every caller
         // that observes the transition reuses this exact coordination slot.

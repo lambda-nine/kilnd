@@ -179,7 +179,8 @@ Reservations follow ownership evidence:
   adapter requires a negative exact-ID probe, a complete list omitting that
   ID and an absent cgroup after both successful and failed `rm`. Deleting
   that historical row moves it directly to `DELETED` without touching a
-  backend that may since have reused the ID.
+  backend that may since have reused the ID. This rule is checked on every
+  reload, including after waiting behind the create compensator's lock.
 - `DELETED` releases. A failed or interrupted delete remains `DELETING` and
   cannot return capacity early.
 
