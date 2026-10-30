@@ -26,22 +26,29 @@ Follow kiln's README "Dev setup (macOS)". The part kilnd needs:
 
 ```sh
 cd ~/Projects/lambda-nine/kiln
+git fetch origin
+git checkout --detach 46d84bdfe13e331f047e70e38848f7d74bcd2872  # tested companion
 limactl create --name=kiln lima.yaml && limactl start kiln
 limactl shell --workdir "$PWD" kiln
 sudo scripts/fetch-alpine.sh        # the "alpine" image
 sudo scripts/setup-storage.sh       # XFS project quotas for --disk
+unset CARGO_TARGET_DIR              # kiln's installer uses target/release
 scripts/install.sh                  # /usr/local/bin/kiln, kiln-dns, kiln-metrics
 ```
 
 kilnd requires persistent-exec protocol v1 and scoped `gc ID...`. The minimum
 kiln revision providing both is `40d9aa5003205d4c171e1b3eca61e9868064e98b`.
 `711440db3167` has the exec protocol but lacks scoped GC and is refused.
+The tested companion is `46d84bdfe13e331f047e70e38848f7d74bcd2872` on
+`review/breakit-fixes`: install, integration, smoke and every kilnd regression
+script passed against that immutable pin on 2026-10-30.
 Install a compatible artifact, then check `kiln capabilities --protocol=1`
 (binary output) and `kiln gc --help` (usage must advertise `[ID]...`). kilnd
 checks both interfaces before reconciliation and workload launch rather than
 trusting `--version`; it never falls back to global garbage collection.
-Existing sandboxes need compatible PID 1 instances too; an old instance requires explicit recreation. An incompatible
-replacement CLI degrades Health and is rejected before workload launch.
+Existing sandboxes need compatible PID 1 instances too; an old instance
+requires explicit recreation. An incompatible replacement CLI degrades Health
+and is rejected before workload launch.
 
 ## 3. kilnd in the VM
 

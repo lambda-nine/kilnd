@@ -148,6 +148,7 @@ Full instructions: [docs/setup.md](docs/setup.md).
 # on the Mac
 git clone https://github.com/lambda-nine/kiln ~/Projects/lambda-nine/kiln
 git clone https://github.com/lambda-nine/kilnd ~/Projects/lambda-nine/kilnd
+git -C ~/Projects/lambda-nine/kiln checkout --detach 46d84bdfe13e331f047e70e38848f7d74bcd2872
 cd ~/Projects/lambda-nine/kiln && limactl create --name=kiln lima.yaml && limactl start kiln
 
 # in the VM, once: kiln itself (see kiln's README), then kilnd

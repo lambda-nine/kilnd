@@ -22,7 +22,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   workload launch, including on an empty database. A complete, bounded
   `gc --help` usage check supplements v1 capability frames without global GC.
   Minimum companion kiln is `40d9aa5003205d4c171e1b3eca61e9868064e98b`;
-  the previously advertised `711440db3167` is insufficient.
+  the previously advertised `711440db3167` is insufficient. Privileged suites
+  pass with tested kiln `46d84bdfe13e331f047e70e38848f7d74bcd2872`
+  (`review/breakit-fixes`), now pinned in setup and the quick start.
 
 - Recheck compensated history on every Delete state reload, including after
   waiting for create compensation. Queued deletion cannot remove a replacement

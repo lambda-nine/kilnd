@@ -165,6 +165,8 @@ sandbox compromises the host.
   artifact lacks scoped GC and is refused before reconciliation, even with an
   empty database. Complete `gc --help` usage supplements the protocol capability
   frame; compatibility validation never invokes global garbage collection.
+  The tested companion is kiln `46d84bdfe13e331f047e70e38848f7d74bcd2872`
+  from `review/breakit-fixes`; see setup for the immutable installation pin.
 - **A daemon crash during `kiln create`** can leave a kiln sandbox whose
   backend ID was never returned to kilnd. Reconciliation records the row as an
   ambiguous `FAILED` reservation and logs the backend as unmanaged; it cannot

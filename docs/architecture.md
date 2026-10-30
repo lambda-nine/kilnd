@@ -76,6 +76,8 @@ kiln `40d9aa5003205d4c171e1b3eca61e9868064e98b`. The older `711440db3167`
 exec-protocol artifact lacks scoped GC and is refused. CLI capability validation
 also requires complete, bounded `gc --help` output advertising `gc [ID]...`,
 within the caller's deadline. It never invokes global GC to test compatibility.
+Privileged verification uses kiln `46d84bdfe13e331f047e70e38848f7d74bcd2872`
+(`review/breakit-fixes`); setup pins that tested companion.
 Both installed CLI and sandbox PID 1 capabilities are checked before each
 execution, within its existing deadline. Create requires
 `--require-exec-protocol=1`; there is no machine legacy fallback. Package and
