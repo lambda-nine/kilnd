@@ -24,7 +24,23 @@ backend_of() { ctl get "$1" | awk '/^backend:/ {print $3}'; }
 created=()
 backend_created=()
 api_tmp=
+exec_client=
+eof_probe_dir=
+service_needs_start=false
 cleanup() {
+    if [ -n "$exec_client" ]; then
+        sudo kill -TERM "$exec_client" 2>/dev/null || true
+        for _ in $(seq 20); do
+            sudo kill -0 "$exec_client" 2>/dev/null || break
+            sleep 0.1
+        done
+        sudo kill -KILL "$exec_client" 2>/dev/null || true
+        wait "$exec_client" 2>/dev/null || true
+    fi
+    if [ -n "$eof_probe_dir" ]; then rm -rf "$eof_probe_dir"; fi
+    if $service_needs_start; then
+        sudo timeout --kill-after=5s 60s systemctl restart kilnd >/dev/null 2>&1 || true
+    fi
     for s in "${created[@]}"; do sudo kilndctl rm "$s" >/dev/null 2>&1 || true; done
     for b in "${backend_created[@]}"; do
         sudo kiln rm "$b" >/dev/null 2>&1 || sudo kiln gc "$b" >/dev/null 2>&1 || true
@@ -45,6 +61,48 @@ wait_backend_status() {
     fail "kiln did not report $id as $status"
 }
 trap cleanup EXIT
+
+running_execution() {
+    ctl get "$id" | awk '$1 ~ /^ex-/ && $2 == "running" { print $1; exit }'
+}
+# Inspect the persistent init's root through /proc: another exec would queue
+# behind the running command, and its output is not stored until it finishes.
+marker_exists() {
+    local pid
+    while read -r pid; do
+        if sudo test -s "/proc/$pid/root/workspace/$1"; then return 0; fi
+    done < <(sudo cat "/sys/fs/cgroup/kiln/$backend/cgroup.procs")
+    return 1
+}
+wait_running() {
+    for _ in $(seq 100); do
+        if [ -n "$(running_execution)" ] \
+            && marker_exists "$1"; then return 0; fi
+        sleep 0.1
+    done
+    fail "exec did not reach its detached-descendant marker: $1"
+}
+start_detached_exec() {
+    local script
+    script=$(cat <<'SH'
+setsid sh -c 'sleep 120 & child=$!; kill -0 "$child" || exit 91; echo "$child" >"$1"; wait' sh "$1" &
+sleep 120
+SH
+)
+    sudo -n timeout --kill-after=5s 90s kilndctl exec --timeout 120s "$id" -- sh -c "$script" sh "/workspace/$1" \
+        </dev/null >/dev/null 2>&1 &
+    exec_client=$!
+}
+wait_exec_client() {
+    for _ in $(seq 100); do
+        sudo kill -0 "$exec_client" 2>/dev/null || break
+        sleep 0.1
+    done
+    if sudo kill -0 "$exec_client" 2>/dev/null; then fail "exec client did not exit"; fi
+    client_status=0
+    wait "$exec_client" || client_status=$?
+    exec_client=
+}
 
 echo "1. Health"
 wait_ready
@@ -83,11 +141,22 @@ out=$(ctl exec "$id" -- sh -c 'echo "hello from $(hostname)"; echo note >/worksp
 set +e
 ctl exec "$id" -- sh -c 'echo bad >&2; exit 7' 2>/dev/null
 code=$?
-ctl exec --timeout 1s "$id" -- sh -c 'sleep 30 & sleep 30' 2>/dev/null
+timeout_out=$(ctl exec --timeout 1s "$id" -- sh -c '
+    rm -f /workspace/timeout-ready
+    setsid sh -c '\''sleep 30 & child=$!; kill -0 "$child" || exit 91; echo "$child" >/workspace/timeout-ready; wait'\'' &
+    for attempt in $(seq 100); do
+        [ -s /workspace/timeout-ready ] && break
+        sleep 0.01
+    done
+    [ -s /workspace/timeout-ready ] || exit 90
+    echo detached-ready
+    sleep 30
+' 2>/dev/null)
 timeout_code=$?
 set -e
 [ "$code" -eq 7 ] || fail "exit code $code, expected 7"
 [ "$timeout_code" -eq 124 ] || fail "timeout exit $timeout_code, expected 124"
+[ "$timeout_out" = detached-ready ] || fail "timeout did not start its setsid descendant"
 [ "$(ctl exec "$id" -- sh -c 'pgrep sleep || echo none')" = none ] || fail "timed-out command still running"
 printf 'piped' | ctl exec --stdin "$id" -- cat | grep -qx piped || fail "stdin was not passed"
 ctl exec "$id" -- head -c 2000000 /dev/zero 2>&1 >/dev/null | grep -q 'stdout truncated: kept 1048576 of 2000000 bytes' \
@@ -125,7 +194,46 @@ signal15_id=$(echo "$details" | awk '$1 ~ /^ex-/ && /kill -TERM/ { print $1; exi
 launch_id=$(echo "$details" | awk '$1 ~ /^ex-/ && $2 == "failed" && /\/no\/such\/program/ { print $1; exit }')
 [ -n "$exit125_id" ] && [ -n "$signal15_id" ] && [ -n "$launch_id" ] || fail "typed execution IDs"
 
-echo "4. Restarting kilnd keeps the sandbox"
+echo "4. Leader exit stops nohup/setsid descendants and closes inherited output"
+# Drive kiln directly so kilnd's bounded drain cannot hide a missing EOF.
+eof_probe_dir=$(mktemp -d)
+mkfifo "$eof_probe_dir/output.fifo"
+sudo -n kiln exec "$backend" -- sh -c '
+    rm -f /workspace/leader-exit-ready
+    nohup setsid sh -c '\''
+        sleep 30 & child=$!
+        kill -0 "$child" || exit 91
+        echo detached-stdout
+        echo detached-stderr >&2
+        echo "$child" >/workspace/leader-exit-ready
+        wait
+    '\'' &
+    for attempt in $(seq 100); do
+        [ -s /workspace/leader-exit-ready ] && break
+        sleep 0.01
+    done
+    [ -s /workspace/leader-exit-ready ] || exit 90
+    echo leader-exit
+    exit 23
+' </dev/null >"$eof_probe_dir/output.fifo" 2>&1 &
+exec_client=$!
+# Keep the deadline armed until the reader sees EOF, even if the CLI has
+# already exited while a leaked descendant still holds the FIFO open.
+reader_status=0
+timeout --kill-after=2s 5s cat "$eof_probe_dir/output.fifo" >"$eof_probe_dir/output" || reader_status=$?
+[ "$reader_status" -eq 0 ] || fail "inherited-output reader status $reader_status, expected 0"
+wait_exec_client
+[ "$client_status" -eq 23 ] || fail "normal-exit status $client_status, expected 23"
+marker_exists leader-exit-ready || fail "normal exit did not start its setsid descendant"
+for line in detached-stdout detached-stderr leader-exit; do
+    grep -qx "$line" "$eof_probe_dir/output" || fail "missing normal-exit output $line"
+done
+[ "$(ctl exec --timeout 10s "$id" -- sh -c 'pgrep sleep || echo none')" = none ] \
+    || fail "normal leader exit left a detached descendant"
+rm -rf "$eof_probe_dir"
+eof_probe_dir=
+
+echo "5. Restarting kilnd keeps the sandbox"
 restart_kilnd
 wait_ready
 ctl get "$id" | grep -q '^state: *ready' || fail "sandbox not ready after restart"
@@ -160,27 +268,56 @@ assert "state:    failed" in launch
 assert "exit:" not in launch
 PY
 
-echo "5. Killing kilnd mid-exec interrupts the execution, not the sandbox"
-ctl exec --timeout 60s "$id" -- sleep 30 >/dev/null 2>&1 &
-for _ in $(seq 50); do
-    ctl get "$id" | awk '$1 ~ /^ex-/ && $2 == "running" { found=1 } END { exit !found }' && break
-    sleep 0.1
+echo "6. Graceful kilnd shutdown cancels descendants after the configured grace"
+start_detached_exec shutdown-ready
+wait_running shutdown-ready
+shutdown_exec=$(running_execution)
+main_pid=$(systemctl show -p MainPID --value kilnd)
+[ "$main_pid" -gt 0 ] || fail "kilnd has no MainPID"
+service_needs_start=true
+sudo kill -TERM "$main_pid"
+# The installed unit's grace is 30 seconds, with a final 10-second wait.
+for _ in $(seq 250); do
+    [ "$(systemctl show -p MainPID --value kilnd)" != "$main_pid" ] && break
+    sleep 0.2
 done
-sudo kill -9 "$(systemctl show -p MainPID --value kilnd)"
-wait || true
+[ "$(systemctl show -p MainPID --value kilnd)" = 0 ] || fail "kilnd did not exit after graceful shutdown"
+[ "$(systemctl show -p ExecMainStatus --value kilnd)" = 0 ] || fail "kilnd did not exit cleanly"
+wait_exec_client
+[ "$client_status" -eq 125 ] || fail "canceled exec client status $client_status, expected 125"
+sudo systemctl start kilnd
 wait_ready
-ctl get "$id" | awk '$1 ~ /^ex-/ && $2 == "interrupted" { found=1 } END { exit !found }' \
-    || fail "killed execution not marked interrupted"
+service_needs_start=false
+summary=$(ctl execution "$shutdown_exec" 2>&1 >/dev/null)
+grep -q '^state: *canceled$' <<<"$summary" && grep -q '^reason: *kilnd shut down$' <<<"$summary" \
+    || fail "graceful shutdown was not recorded as canceled"
+[ "$(ctl exec --timeout 10s "$id" -- sh -c 'pgrep sleep || echo none')" = none ] \
+    || fail "graceful shutdown left a detached descendant"
+[ "$(ctl exec --timeout 10s "$id" -- cat /workspace/note)" = note ] || fail "sandbox unusable after graceful shutdown"
+
+echo "7. Abrupt kilnd death interrupts the execution, not the sandbox"
+start_detached_exec abrupt-ready
+wait_running abrupt-ready
+interrupted_exec=$(running_execution)
+main_pid=$(systemctl show -p MainPID --value kilnd)
+[ "$main_pid" -gt 0 ] || fail "kilnd has no MainPID"
+service_needs_start=true
+sudo kill -KILL "$main_pid"
+wait_exec_client
+wait_ready
+service_needs_start=false
+summary=$(ctl execution "$interrupted_exec" 2>&1 >/dev/null)
+grep -q '^state: *interrupted$' <<<"$summary" || fail "killed execution not marked interrupted"
 [ "$(ctl exec --timeout 10s "$id" -- sh -c 'pgrep sleep || echo none')" = none ] \
     || fail "orphaned command still running after kilnd was killed"
 
-echo "6. Delete"
+echo "8. Delete"
 ctl rm "$id"
 if sudo kiln ls | grep -q "^$backend[[:space:]]"; then fail "kiln still has $backend"; fi
 ctl get "$id" | grep -q '^state: *deleted' || fail "sandbox not recorded as deleted"
 ctl rm "$id" >/dev/null || fail "second delete was not idempotent"
 
-echo "7. A sandbox removed behind kilnd's back is lost after restart"
+echo "9. A sandbox removed behind kilnd's back is lost after restart"
 lost=$(ctl create --memory 64M --disk 16M)
 created+=("$lost")
 sudo kiln rm "$(backend_of "$lost")"
@@ -189,7 +326,7 @@ wait_ready
 ctl get "$lost" | grep -q '^state: *lost' || fail "sandbox not marked lost"
 ctl rm "$lost" >/dev/null
 
-echo "8. Reconciliation and shutdown preserve unmanaged live and stale sandboxes"
+echo "10. Reconciliation and shutdown preserve unmanaged live and stale sandboxes"
 unmanaged_live=$(sudo kiln create --memory=64M --disk=16M)
 backend_created+=("$unmanaged_live")
 unmanaged_stale=$(sudo kiln create --memory=64M --disk=16M)
@@ -226,10 +363,10 @@ sudo kiln rm "$unmanaged_live"
 sudo kiln gc "$unmanaged_stale"
 ctl rm "$managed_stale"
 
-echo "9. One-shot run"
+echo "11. One-shot run"
 [ "$(ctl run --memory 64M --disk 16M -- echo one-shot)" = one-shot ] || fail "run"
 
-echo "10. Structured logs"
+echo "12. Structured logs"
 logs=$(sudo journalctl -u kilnd --since "-5min" --no-pager -o cat)
 line=$(grep '"message":"exec finished"' <<<"$logs" | tail -1)
 [ -n "$line" ] || fail "no JSON exec log lines"

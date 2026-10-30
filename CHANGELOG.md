@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Preserve containment regression coverage from `review/exec-tree-containment`:
+  timeout readiness, normal leader exit with nohup/setsid descendants, raw CLI
+  stdout/stderr EOF, private output EOF, graceful shutdown and abrupt daemon
+  death. The smoke uses the current API for durable outcome checks.
+
 - Make detached-child cancellation coverage wait for a marker written after
   successful setsid and live child creation. Verify both workload streams
   reach EOF, descendants disappear, and the sandbox remains reusable.
