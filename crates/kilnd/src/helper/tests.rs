@@ -7,7 +7,7 @@ use tokio::net::UnixStream;
 
 #[test]
 fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
-    let valid: serde_json::Value = serde_json::json!({"version":2,"timeout_ms":1000,"deadline_ns":1,"operation":{"kiln":{"rm":{"id":"ab"}}}});
+    let valid: serde_json::Value = serde_json::json!({"version":3,"timeout_ms":1000,"deadline_ns":1,"operation":{"kiln":{"rm":{"id":"ab"}}}});
     assert!(serde_json::from_value::<Request>(valid.clone()).is_ok());
     let mut unknown_top = valid.clone();
     unknown_top["program"] = "/bin/sh".into();
@@ -22,7 +22,7 @@ fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
         );
     }
     let mut req = Request {
-        version: 2,
+        version: VERSION,
         deadline_ns: 1,
         timeout_ms: 1000,
         operation: Operation::Kiln(KilnRequest::Ls),
@@ -55,8 +55,10 @@ fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
     });
     assert!(req.validate(0).is_ok());
     assert!(req.validate(3).is_err());
-    req.version = 1;
-    assert!(req.validate(0).is_err());
+    for version in [1, 2] {
+        req.version = version;
+        assert!(req.validate(0).is_err());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -78,7 +80,7 @@ async fn received_peer_flag_mutation_cannot_stall_listener_or_deadline() {
     let mut control = UnixStream::connect(&path).await.unwrap();
     fds::send(&control, &[]).await.unwrap();
     let request = Request {
-        version: 2,
+        version: VERSION,
         timeout_ms: 300,
         deadline_ns: monotonic_ns().unwrap() + 300_000_000,
         operation: Operation::Kiln(KilnRequest::Exec {
@@ -90,6 +92,7 @@ async fn received_peer_flag_mutation_cannot_stall_listener_or_deadline() {
     };
     write_frame(&mut control, &request).await.unwrap();
     let descriptors = fds::receive(&control).await.unwrap();
+    control.write_u8(STDIO_RECEIVED).await.unwrap();
     assert_eq!(descriptors.len(), 3);
     for fd in &descriptors {
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
@@ -400,4 +403,60 @@ async fn stalled_capability_exchange_has_a_control_cleanup_bound() {
     canceled_rx.await.unwrap();
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn stdio_handoff_waits_for_installed_descriptors_before_closing_sent_endpoints() {
+    use std::future::Future;
+    use std::task::Poll;
+    use tokio::io::AsyncReadExt;
+    let (helper, mut client) = UnixStream::pair().unwrap();
+    helper.writable().await.unwrap();
+    let mut control = socket::Socket(helper);
+    let handoff = server::handoff_stdio(&mut control);
+    tokio::pin!(handoff);
+    // Force send-before-receive: polling to Pending sends the envelope, then
+    // must retain all peers while waiting for receipt. No sleeps or scheduling
+    // assumptions, and a missing receipt barrier fails on every OS.
+    std::future::poll_fn(|cx| {
+        assert!(
+            handoff.as_mut().poll(cx).is_pending(),
+            "handoff closed peers before receipt"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    let received = fds::receive(&client).await.unwrap();
+    assert_eq!(received.len(), 3);
+    std::future::poll_fn(|cx| {
+        assert!(
+            handoff.as_mut().poll(cx).is_pending(),
+            "handoff accepted no receipt"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    client.write_u8(STDIO_RECEIVED).await.unwrap();
+    let [mut input, mut output, mut error] = handoff.await.unwrap();
+    let mut received = received
+        .into_iter()
+        .map(|fd| fds::socket(fd, unsafe { libc::geteuid() }).unwrap());
+    let mut input_peer = received.next().unwrap();
+    let mut output_peer = received.next().unwrap();
+    let mut error_peer = received.next().unwrap();
+    input_peer.write_all(b"in").await.unwrap();
+    input_peer.shutdown().await.unwrap();
+    let mut bytes = Vec::new();
+    input.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"in");
+    output.write_all(b"out").await.unwrap();
+    output.shutdown().await.unwrap();
+    error.write_all(b"err").await.unwrap();
+    error.shutdown().await.unwrap();
+    bytes.clear();
+    output_peer.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"out");
+    bytes.clear();
+    error_peer.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"err");
 }

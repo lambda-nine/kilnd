@@ -31,6 +31,10 @@ async fn write_frame(
     stream.write_all(&bytes).await
 }
 
+fn io_stage(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{stage}: {error}"))
+}
+
 #[cfg(test)]
 mod tests;
 

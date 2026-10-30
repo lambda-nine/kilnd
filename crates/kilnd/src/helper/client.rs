@@ -60,7 +60,7 @@ impl Client {
         };
         let response_deadline = deadline + allowance;
         let request = Request {
-            version: 2,
+            version: VERSION,
             deadline_ns,
             timeout_ms: u32::try_from(remaining).map_err(io::Error::other)?,
             operation: Operation::Kiln(operation),
@@ -86,15 +86,31 @@ impl Client {
         let result = {
             let response = async {
                 timeout_at(response_deadline, async {
-                    let descriptors = fds::receive(reader.as_ref()).await?;
+                    let descriptors = fds::receive(reader.as_ref())
+                        .await
+                        .map_err(|e| super::io_stage("stdio envelope", e))?;
                     if descriptors.len() != if stdio.is_some() { 3 } else { 0 } {
                         return Err(io::Error::other("wrong helper descriptor count"));
                     }
                     if let Some(tx) = stdio {
+                        // The helper retains its copies until recvmsg has installed
+                        // ours. Closing an in-flight Unix socket on Darwin can
+                        // otherwise deliver premature EOF on the received endpoint.
+                        loop {
+                            reader.as_ref().writable().await?;
+                            match reader.as_ref().try_write(&[STDIO_RECEIVED]) {
+                                Ok(1) => break,
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                                Err(e) => return Err(e),
+                                _ => return Err(io::Error::other("short stdio acknowledgment")),
+                            }
+                        }
                         tx.send(descriptors)
                             .map_err(|_| io::Error::other("stdio receiver closed"))?;
                     }
-                    read_frame(&mut reader).await
+                    read_frame(&mut reader)
+                        .await
+                        .map_err(|e| super::io_stage("response frame", e))
                 })
                 .await
                 .map_err(io::Error::other)?
@@ -169,11 +185,25 @@ impl Client {
                 let mut input = next()?;
                 let mut output = next()?;
                 let mut error = next()?;
-                input.write_all(spec.stdin).await?;
-                input.shutdown().await?;
+                input
+                    .write_all(spec.stdin)
+                    .await
+                    .map_err(|e| super::io_stage("stdin write", e))?;
+                input
+                    .shutdown()
+                    .await
+                    .map_err(|e| super::io_stage("stdin shutdown", e))?;
                 tokio::try_join!(
-                    read_output(&mut output, spec.max_output, &observed_out),
-                    read_output(&mut error, spec.max_output, &observed_err)
+                    async {
+                        read_output(&mut output, spec.max_output, &observed_out)
+                            .await
+                            .map_err(|e| super::io_stage("stdout drain", e))
+                    },
+                    async {
+                        read_output(&mut error, spec.max_output, &observed_err)
+                            .await
+                            .map_err(|e| super::io_stage("stderr drain", e))
+                    }
                 )?;
                 Ok::<_, io::Error>(())
             };

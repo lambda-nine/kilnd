@@ -122,7 +122,7 @@ try:
         assert int(helper_status[field].strip(),16)==0x2010eb, (field,helper_status[field])
     assert int(helper_status['CapAmb'].strip(),16)==0x80, helper_status['CapAmb']
     before=len(os.listdir(f'/proc/{helper_pid}/fd'))
-    valid={'version':2,'timeout_ms':1000,'deadline_ns':time.monotonic_ns()+1_000_000_000,'operation':{'kiln':'ls'}}
+    valid={'version':3,'timeout_ms':1000,'deadline_ns':time.monotonic_ns()+1_000_000_000,'operation':{'kiln':'ls'}}
     body=json.dumps(valid).encode()
     helper_probe(body,uid=USERS[0]); helper_probe(body,uid='root')
     for _ in range(16):

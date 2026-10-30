@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix the helper stdio handoff ordering race on macOS: private protocol v3
+  retains sent endpoints until recvmsg receipt, preventing premature output EOF
+  and helper EPIPE. A deterministic regression forces send-before-receive;
+  daemon and helper must be upgraded together.
+
 - Fix PH0-1 root-helper availability: private protocol v2 creates stdio pairs in
   the helper and passes only peer endpoints to kilnd, rejecting all inbound
   descriptors. Per-syscall nonblocking socket I/O protects deadlines and the

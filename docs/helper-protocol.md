@@ -9,7 +9,7 @@ connections whose kernel peer UID equals the configured `kilnd` account's UID,
 including rejecting root connections. API group membership alone grants no
 helper access. The daemon verifies that its helper peer is root.
 
-The helper accepts a private v2 typed request enum. Its outer `operation` enum
+The helper accepts a private v3 typed request enum. Its outer `operation` enum
 has one `kiln` variant; a future backend needs a separately validated variant.
 There are no Firecracker requests today. No request chooses an executable,
 host path, environment, arbitrary kiln flags, or shell text. The root-owned
@@ -28,15 +28,21 @@ After validating the request, the helper sends its own `0x4b` envelope: zero
 descriptors for other operations, exactly three for Exec in stdin/stdout/stderr
 order. The helper creates three anonymous connected AF_UNIX SOCK_STREAM pairs,
 keeps one endpoint of each, and passes only the opposite endpoint to kilnd.
-It drops its copies of the sent endpoints before stdio starts. The client
+The client acknowledges receipt with one byte `0x4b` on the control socket,
+after recvmsg installs all three descriptors. Until that receipt, the helper
+retains its copies of the sent endpoints without performing I/O on them. It
+then drops those copies before stdio starts. This closes a Darwin ordering race:
+closing the last installed descriptor while a Unix endpoint is still in flight
+can deliver premature EOF to the receiver. The handoff, including the receipt,
+is bounded by two seconds. Cancellation or EOF instead of a receipt aborts it. The client
 requires anonymous connected streams with root peer credentials. Each pair's
 two endpoints have distinct open file descriptions: changing `O_NONBLOCK` on
-kilnd's endpoint cannot affect the endpoint the helper uses. Version 1 requests
+kilnd's endpoint cannot affect the endpoint the helper uses. Version 1 and 2 requests
 are refused; daemon and helper must be upgraded together.
 
 The caller's marker is followed by a four-byte big-endian nonzero JSON length,
 then exactly that many request bytes (before the helper sends its envelope). Frames are limited to 2 MiB; request fields and enums are typed and
-unknown fields are refused. The request has `version: 2`, `timeout_ms`, and
+unknown fields are refused. The request has `version: 3`, `timeout_ms`, and
 `operation`, plus an absolute `deadline_ns` from CLOCK_MONOTONIC. The helper
 checks that this deadline fits the declared timeout and preserves it across
 connection setup. The response uses the same length framing and a typed result,

@@ -7,6 +7,9 @@ use crate::validation::{
 };
 use serde::{Deserialize, Serialize};
 
+pub const VERSION: u8 = 3;
+pub const STDIO_RECEIVED: u8 = 0x4b;
+
 pub const MAX_FRAME: usize = 2 << 20;
 pub const MAX_STDIN: usize = 1 << 20;
 pub const MAX_OUTPUT: usize = 1 << 20;
@@ -56,7 +59,7 @@ impl Request {
     pub fn validate(&self, fds: usize) -> Result<(), String> {
         let Operation::Kiln(op) = &self.operation;
         let exec = matches!(op, KilnRequest::Exec { .. });
-        if self.version != 2
+        if self.version != VERSION
             || self.timeout_ms == 0
             || self.timeout_ms > if exec { 3_600_000 } else { 120_000 }
         {

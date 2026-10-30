@@ -2,7 +2,7 @@
 """PH0-1: hostile descriptor flags/backpressure cannot stall the root helper.
 
 Run as kilnd against the installed service. Derived from the Daybreak Phase 0
-PoC; both the legacy descriptor injection and the v2 handoff are exercised.
+PoC; both the legacy descriptor injection and the v3 handoff are exercised.
 No sandbox is needed for the stdin/deadline attack.
 """
 import array
@@ -16,7 +16,7 @@ import time
 HELPER = '/run/kilnd-helper/helper.sock'
 
 
-def request(operation, timeout_ms=1000, passed=(), version=2):
+def request(operation, timeout_ms=1000, passed=(), version=3):
     control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     control.settimeout(4)
     control.connect(HELPER)
@@ -39,6 +39,8 @@ def handoff(control, count):
         values = array.array('i'); values.frombytes(data)
         descriptors.extend(values)
     assert len(descriptors) == count, descriptors
+    if count:
+        control.sendall(b'K')
     return [socket.socket(fileno=fd) for fd in descriptors]
 
 
@@ -116,7 +118,7 @@ def main():
     # The old injection is refused, for both the old and current version.
     pairs = [socket.socketpair() for _ in range(3)]
     try:
-        for version in (1, 2):
+        for version in (1, 2, 3):
             with request(operation, passed=[p[0] for p in pairs], version=version) as control:
                 try:
                     assert control.recv(1) == b''
@@ -128,7 +130,7 @@ def main():
             for endpoint in pair:
                 endpoint.close()
 
-    # Repeat with the v2 endpoints after SCM_RIGHTS receipt. None is the
+    # Repeat with the v3 endpoints after SCM_RIGHTS receipt. None is the
     # helper's own open file description. Hold stdin open beyond its deadline.
     for cancel in (False, True):
         with request(operation, timeout_ms=600) as control:

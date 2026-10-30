@@ -79,20 +79,11 @@ async fn handle(
     let mut stdio = None;
     timeout(Duration::from_secs(2), async {
         if matches!(request.operation, Operation::Kiln(KilnRequest::Exec { .. })) {
-            let (input, input_peer) = UnixStream::pair()?;
-            let (output, output_peer) = UnixStream::pair()?;
-            let (error, error_peer) = UnixStream::pair()?;
-            fds::send(
-                &stream.0,
-                &[
-                    input_peer.as_raw_fd(),
-                    output_peer.as_raw_fd(),
-                    error_peer.as_raw_fd(),
-                ],
-            )
-            .await?;
-            stdio = Some([Socket(input), Socket(output), Socket(error)]);
-            // Drop our copies of the sent endpoints before reading stdin.
+            stdio = Some(
+                handoff_stdio(&mut stream)
+                    .await
+                    .map_err(|e| super::io_stage("stdio handoff", e))?,
+            );
         } else {
             fds::send(&stream.0, &[]).await?;
         }
@@ -111,7 +102,33 @@ async fn handle(
     timeout(Duration::from_secs(2), write_frame(&mut writer, &response))
         .await
         .map_err(io::Error::other)??;
-    writer.shutdown().await
+    writer
+        .shutdown()
+        .await
+        .map_err(|e| super::io_stage("response shutdown", e))
+}
+
+/// SCM_RIGHTS keeps descriptors in flight, but Darwin can disconnect a Unix
+/// endpoint if its last installed descriptor closes before recvmsg installs
+/// the receiver's copy. Retain the sent endpoints until an explicit receipt.
+/// No I/O is performed on these shared open file descriptions.
+pub(super) async fn handoff_stdio(stream: &mut Socket) -> io::Result<[Socket; 3]> {
+    let (input, input_peer) = UnixStream::pair()?;
+    let (output, output_peer) = UnixStream::pair()?;
+    let (error, error_peer) = UnixStream::pair()?;
+    fds::send(
+        &stream.0,
+        &[
+            input_peer.as_raw_fd(),
+            output_peer.as_raw_fd(),
+            error_peer.as_raw_fd(),
+        ],
+    )
+    .await?;
+    if stream.read_u8().await? != STDIO_RECEIVED {
+        return Err(io::Error::other("missing stdio receipt"));
+    }
+    Ok([Socket(input), Socket(output), Socket(error)])
 }
 
 async fn dispatch(
@@ -215,10 +232,33 @@ async fn dispatch(
             };
             timeout(Duration::from_secs(2), async {
                 tokio::try_join!(
-                    stdout.write_all(&outcome.stdout.data),
-                    stderr.write_all(&outcome.stderr.data)
+                    async {
+                        stdout
+                            .write_all(&outcome.stdout.data)
+                            .await
+                            .map_err(|e| super::io_stage("stdout write", e))
+                    },
+                    async {
+                        stderr
+                            .write_all(&outcome.stderr.data)
+                            .await
+                            .map_err(|e| super::io_stage("stderr write", e))
+                    }
                 )?;
-                tokio::try_join!(stdout.shutdown(), stderr.shutdown())?;
+                tokio::try_join!(
+                    async {
+                        stdout
+                            .shutdown()
+                            .await
+                            .map_err(|e| super::io_stage("stdout shutdown", e))
+                    },
+                    async {
+                        stderr
+                            .shutdown()
+                            .await
+                            .map_err(|e| super::io_stage("stderr shutdown", e))
+                    }
+                )?;
                 Ok::<_, io::Error>(())
             })
             .await
