@@ -174,10 +174,12 @@ installing an older daemon is not a database downgrade path.
   cgroups). kilnd marks them `lost` at startup; delete them to clear the
   records.
 - **Node budget cleanup:** `LOST` and a `FAILED` create with no backend ID keep
-  their durable reservation. If deleting an ambiguous `FAILED` row reports
-  unexplained backend IDs, inspect `sudo kiln ls`, remove a live unexplained
-  sandbox with `sudo kiln rm ID` or a stale one with `sudo kiln gc ID`, then
-  retry `sudo kilndctl rm ID`. Do not release capacity by editing SQLite.
+  their durable reservation. Known-ID deletion requires a negative exact-ID
+  probe, a complete list omitting the ID and absent cgroup. Delete refuses a
+  no-ID ambiguous `FAILED` row even after stray resources have been removed:
+  ordinary listings cannot account for hidden resources, and authoritative
+  no-ID reconciliation is not yet supported. Do not release capacity by editing
+  SQLite.
   Lowering configured budgets below surviving reservations degrades Health and
   rejects new creates, but Get/List/Delete and reconciliation remain available
   so the node can be brought back within budget.

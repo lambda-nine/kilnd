@@ -63,8 +63,10 @@ sandboxes on this host. See [docs/threat-model.md](docs/threat-model.md).
   promises cannot be overcommitted by concurrent creates. Defaults reserve at
   most 3 GiB memory, 2,048 PIDs and 16 GiB disk for sandboxes. `LOST` remains
   reserved because it can recover; ambiguous `FAILED` creates remain reserved
-  until deletion proves no unexplained backend exists. `DELETING` releases
-  only after backend absence is durably recorded. Health exposes limits,
+  because no current operation can account for hidden resources without an ID.
+  Delete refuses to release those ambiguous rows, even with an empty listing.
+  `DELETING` releases only after an exact-ID negative probe, complete list
+  absence and cgroup absence are durably recorded. Health exposes limits,
   reservations and rejection totals since daemon startup. Lowering limits
   below existing ownership degrades Health and rejects creates while
   Get/List/Delete stay available.

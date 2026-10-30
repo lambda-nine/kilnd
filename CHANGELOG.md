@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Require exact-backend absence evidence after both successful and failed
+  removal, including failed-publication compensation. A live direct probe or
+  surviving cgroup keeps the row and its reservation retryable. Ambiguous
+  no-ID creates remain charged even with an empty listing; clearing them needs
+  authoritative resource reconciliation, which is not currently supported.
+
 - Add atomic, durable node-wide sandbox budgets for retained count, requested
   memory, PIDs and disk. Create now checks all four sums and inserts
   `CREATING` in one SQLite transaction; reservations survive cancellation,

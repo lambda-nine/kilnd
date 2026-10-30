@@ -351,17 +351,45 @@ async fn create_failure_is_recorded_and_returned() {
         1,
         "an ambiguous backend create error released its reservation"
     );
-    // A failed sandbox can be cleared.
-    let gone = m.delete(&all[0].id).await.unwrap();
-    assert_eq!(gone.state, SandboxState::Deleted);
+    // Even an empty listing cannot prove that an ambiguous allocation is gone.
+    assert!(matches!(
+        m.delete(&all[0].id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
     assert_eq!(
         m.health().await.unwrap().node_resources.reserved.sandboxes,
-        0
+        1
     );
 }
 
 #[tokio::test]
-async fn ambiguous_failed_reservation_needs_a_clean_backend_listing_to_release() {
+async fn ambiguous_create_with_unlisted_live_backend_keeps_reservation() {
+    let (m, fake) = manager();
+    fake.state().fail_create = Some("ambiguous backend failure".into());
+    m.create(CreateRequest::default()).await.unwrap_err();
+    let row = m.list(true).unwrap().remove(0);
+    let unreported = fake.insert(BackendStatus::Running);
+    fake.state().hidden_from_list.push(unreported.clone());
+    assert!(fake.list().await.unwrap().is_empty());
+    assert!(matches!(
+        m.delete(&row.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
+    assert!(fake.state().sandboxes.contains_key(&unreported));
+    assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Failed);
+    // Also recover an interrupted Delete written by the old list-only path.
+    m.store.set_sandbox_state(&row.id, SandboxState::Deleting, None, None).unwrap();
+    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+    assert!(m.reconcile().await.unwrap().still_deleting.contains(&row.id));
+    assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Deleting);
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        1
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_failed_reservation_survives_even_a_clean_backend_listing() {
     let (m, fake) = manager();
     fake.state().fail_create = Some("ambiguous create error".into());
     m.create(CreateRequest::default()).await.unwrap_err();
@@ -376,7 +404,7 @@ async fn ambiguous_failed_reservation_needs_a_clean_backend_listing_to_release()
 
     let error = m.delete(&row.id).await.unwrap_err();
     assert!(
-        matches!(error, Error::FailedPrecondition(ref message) if message.contains(&unexplained) && message.contains("fake backend") && message.contains("configured backend")),
+        matches!(error, Error::FailedPrecondition(ref message) if message.contains("fake backend") && message.contains("authoritative resource reconciliation")),
         "{error}"
     );
     assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Failed);
@@ -386,14 +414,17 @@ async fn ambiguous_failed_reservation_needs_a_clean_backend_listing_to_release()
     );
 
     fake.state().sandboxes.remove(&unexplained);
-    assert_eq!(m.delete(&row.id).await.unwrap().state, SandboxState::Deleted);
+    assert!(matches!(
+        m.delete(&row.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
     assert_eq!(
         m.delete(&compensated.id).await.unwrap().state,
         SandboxState::Deleted
     );
     assert_eq!(
-        m.health().await.unwrap().node_resources.reserved,
-        SandboxResources::default()
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        1
     );
 }
 
@@ -439,14 +470,14 @@ async fn reappeared_compensated_id_is_unmanaged_not_gc_owned_or_release_proof() 
 
     let error = m.delete(&ambiguous.id).await.unwrap_err();
     assert!(
-        matches!(error, Error::FailedPrecondition(ref message) if message.contains(&reappeared)),
+        matches!(error, Error::FailedPrecondition(ref message) if message.contains("authoritative resource reconciliation")),
         "{error}"
     );
     fake.state().sandboxes.remove(&reappeared);
-    assert_eq!(
-        m.delete(&ambiguous.id).await.unwrap().state,
-        SandboxState::Deleted
-    );
+    assert!(matches!(
+        m.delete(&ambiguous.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
 }
 
 #[tokio::test]
@@ -1813,11 +1844,7 @@ async fn lowered_node_budgets_degrade_but_keep_cleanup_available() {
 #[tokio::test]
 async fn restart_turns_creating_without_an_id_into_reserved_ambiguous_failed() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(
-        tmp.path(),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_dir = tmp.path().join("state");
     let fake = FakeRuntime::default();
     let now = now_ms();
@@ -1859,19 +1886,19 @@ async fn restart_turns_creating_without_an_id_into_reserved_ambiguous_failed() {
     assert_eq!(failed.state, SandboxState::Failed);
     assert!(failed.backend_id.is_none());
     assert_eq!(
-        manager.health().await.unwrap().node_resources.reserved.sandboxes,
+        manager
+            .health()
+            .await
+            .unwrap()
+            .node_resources
+            .reserved
+            .sandboxes,
         1,
         "restart reconciliation released an ambiguous create"
     );
 
-    assert_eq!(
-        manager.delete(&crashed_create.id).await.unwrap().state,
-        SandboxState::Deleted
-    );
-    assert_eq!(
-        manager.health().await.unwrap().node_resources.reserved,
-        SandboxResources::default()
-    );
+    assert!(matches!(manager.delete(&crashed_create.id).await, Err(Error::FailedPrecondition(_))));
+    assert_eq!(manager.health().await.unwrap().node_resources.reserved.sandboxes, 1);
 }
 
 #[tokio::test]
@@ -1927,11 +1954,7 @@ async fn reconcile_rejects_a_listing_that_hides_a_reachable_managed_sandbox() {
 #[tokio::test]
 async fn a_provably_reappeared_backend_recovers_after_restart_once() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(
-        tmp.path(),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_dir = tmp.path().join("state");
     let fake = FakeRuntime::default();
     let sandbox = {
@@ -1969,7 +1992,13 @@ async fn a_provably_reappeared_backend_recovers_after_restart_once() {
     assert_eq!(recovered.state, SandboxState::Ready);
     assert_eq!(recovered.failure_reason, None);
     assert_eq!(
-        manager.health().await.unwrap().node_resources.reserved.sandboxes,
+        manager
+            .health()
+            .await
+            .unwrap()
+            .node_resources
+            .reserved
+            .sandboxes,
         1
     );
 

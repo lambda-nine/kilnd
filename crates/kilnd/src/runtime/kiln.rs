@@ -499,17 +499,29 @@ impl Runtime for KilnRuntime {
 
     async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
         check_id(id)?;
-        match self
+        let removal = self
             .call("rm", &["rm".into(), id.into()], REMOVE_TIMEOUT)
+            .await;
+        // A successful rm or a list omission alone does not prove that the
+        // exact sandbox released its resources. Reuse startup's direct probe,
+        // complete listing and absent-cgroup standard on every release path.
+        match self
+            .validate_sandbox(
+                id,
+                Instant::now() + QUERY_TIMEOUT,
+                &CancellationToken::new(),
+            )
             .await
         {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if !self.list().await?.iter().any(|s| s.id == id) {
-                    return Err(RuntimeError::NotFound(id.to_string()));
-                }
-                Err(e)
-            }
+            Err(RuntimeError::NotFound(_)) => removal
+                .map(|_| ())
+                .map_err(|_| RuntimeError::NotFound(id.to_string())),
+            Ok(()) => Err(RuntimeError::Backend(format!(
+                "kiln rm {id} did not prove absence: exact backend is still reachable"
+            ))),
+            Err(e) => Err(RuntimeError::Backend(format!(
+                "kiln rm {id} did not prove absence: {e}"
+            ))),
         }
     }
 
@@ -763,6 +775,123 @@ mod tests {
         let source=fs::read_to_string(&runtime.bin).unwrap().replace("if sys.argv[1]=='capabilities':",&format!("open({trace:?},'a').write(' '.join(sys.argv[1:])+'\\n')\nif sys.argv[1]=='create':\n    print('abcd')\n    sys.exit(0)\nif sys.argv[1]=='ls':\n    {ls_body}\nif sys.argv[1]=='capabilities' and len(sys.argv)>3:\n    os.write(2,b'ID capability unavailable: legacy PID1 or removed sandbox')\n    sys.exit(2)\nif sys.argv[1]=='capabilities':"));
         fs::write(&runtime.bin, source).unwrap();
         runtime
+    }
+
+    // A valid listing may omit a live registry record. Exercise removal
+    // through the manager so a false NotFound would release durable capacity.
+    async fn assert_hidden_backend_retains_reservation(
+        reachable: bool,
+        rm_succeeds: bool,
+        publication_fails: bool,
+    ) {
+        use crate::manager::{CreateRequest, Limits, Manager};
+        use crate::model::SandboxState;
+        use crate::store::Store;
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = failed_id_probe_runtime(
+            tmp.path(),
+            true,
+            Some("os.write(1,b'ID\\tSTATUS\\tSHIM\\n'); sys.exit(0)"),
+        );
+        let mut source = fs::read_to_string(&runtime.bin).unwrap().replace(
+            "if sys.argv[1]=='create':",
+            &format!(
+                "if sys.argv[1]=='rm':\n    sys.exit({})\nif sys.argv[1]=='create':",
+                if rm_succeeds { 0 } else { 1 }
+            ),
+        );
+        if reachable {
+            // Remove the cgroup fixture: the positive exact-ID probe alone
+            // must prevent release even if the filesystem evidence is absent.
+            fs::remove_dir_all(runtime.cgroup_root.join("abcd")).unwrap();
+            source = source.replace("and len(sys.argv)>3:", "and False:");
+        }
+        fs::write(&runtime.bin, source).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        if publication_fails {
+            store.reject_ready_updates().unwrap();
+        }
+        let manager = Arc::new(Manager::new(runtime, store, Limits::default()));
+        let created = manager.create(CreateRequest::default()).await;
+        let row = manager.list(true).unwrap().remove(0);
+        if publication_fails {
+            assert!(created.is_err());
+        } else {
+            created.unwrap();
+            assert!(
+                manager.delete(&row.id).await.is_err(),
+                "hidden backend was deleted from accounting"
+            );
+        }
+        assert_eq!(
+            manager.get(&row.id, 0).unwrap().0.state,
+            SandboxState::Deleting
+        );
+        assert_eq!(
+            manager
+                .health()
+                .await
+                .unwrap()
+                .node_resources
+                .reserved
+                .sandboxes,
+            1
+        );
+        if reachable {
+            manager
+                .runtime()
+                .validate_sandbox(
+                    "abcd",
+                    Instant::now() + QUERY_TIMEOUT,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        } else {
+            assert!(manager.runtime().cgroup_root.join("abcd").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn hidden_registry_entry_keeps_delete_reservation() {
+        assert_hidden_backend_retains_reservation(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_rm_with_surviving_cgroup_keeps_delete_reservation() {
+        assert_hidden_backend_retains_reservation(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn successful_rm_without_absence_evidence_keeps_delete_reservation() {
+        assert_hidden_backend_retains_reservation(false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn hidden_backend_keeps_failed_publication_compensation_reserved() {
+        for reachable in [true, false] {
+            assert_hidden_backend_retains_reservation(reachable, false, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_accepts_only_confirmed_absence() {
+        for rm_succeeds in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime = failed_id_probe_runtime(tmp.path(), false, None);
+            let source = fs::read_to_string(&runtime.bin).unwrap().replace(
+                "if sys.argv[1]=='create':",
+                &format!(
+                    "if sys.argv[1]=='rm':\n    sys.exit({})\nif sys.argv[1]=='create':",
+                    if rm_succeeds { 0 } else { 1 }
+                ),
+            );
+            fs::write(&runtime.bin, source).unwrap();
+            assert!(matches!(
+                runtime.remove("abcd").await,
+                Ok(()) | Err(RuntimeError::NotFound(_))
+            ));
+        }
     }
 
     #[tokio::test]

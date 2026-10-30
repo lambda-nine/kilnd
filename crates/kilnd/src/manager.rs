@@ -19,9 +19,7 @@ use crate::model::{
     RuntimeErrorKind, RuntimeStage, Sandbox, SandboxSpec, SandboxState, new_id, now_ms, valid_id,
 };
 use crate::runtime::{BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
-use crate::store::{
-    ExecutionResult, ReserveSandbox, SandboxBudgets, SandboxResources, Store,
-};
+use crate::store::{ExecutionResult, ReserveSandbox, SandboxBudgets, SandboxResources, Store};
 use crate::validation::{
     MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, validate_allowlist_entry, validate_argv,
     validate_image_name, validate_writable_path,
@@ -472,7 +470,10 @@ impl<R: Runtime> Manager<R> {
                         out.still_deleting.push(s.id);
                     }
                 },
-                (SandboxState::Deleting, _) => {
+                // An older interrupted Delete may have published intent for
+                // an ambiguous no-ID create. Listing absence cannot clear it.
+                (SandboxState::Deleting, None) => out.still_deleting.push(s.id),
+                (SandboxState::Deleting, Some(_)) => {
                     self.store
                         .set_sandbox_state(&s.id, SandboxState::Deleted, None, None)?;
                     out.deleted.push(s.id);
@@ -654,11 +655,7 @@ impl<R: Runtime> Manager<R> {
         let limits = self.sandbox_budgets();
         let over_budget = [
             ("sandboxes", reserved.sandboxes, limits.sandboxes),
-            (
-                "memory bytes",
-                reserved.memory_bytes,
-                limits.memory_bytes,
-            ),
+            ("memory bytes", reserved.memory_bytes, limits.memory_bytes),
             ("PIDs", reserved.pids, limits.pids),
             ("disk bytes", reserved.disk_bytes, limits.disk_bytes),
         ]
@@ -747,10 +744,7 @@ impl<R: Runtime> Manager<R> {
                     .fetch_add(1, Ordering::Relaxed);
                 return Err(Error::ResourceExhausted(format!(
                     "node {} budget exhausted: {} reserved + {} requested exceeds limit {}",
-                    exhausted.resource,
-                    exhausted.reserved,
-                    exhausted.requested,
-                    exhausted.limit
+                    exhausted.resource, exhausted.reserved, exhausted.requested, exhausted.limit
                 )));
             }
         }
@@ -924,6 +918,11 @@ impl<R: Runtime> Manager<R> {
     /// comparison between our read and update.
     fn prepare_delete(&self, id: &str, mut sandbox: Sandbox) -> Result<Sandbox> {
         loop {
+            if sandbox.backend_id.is_none()
+                && !matches!(sandbox.state, SandboxState::Deleted | SandboxState::Creating)
+            {
+                return Err(self.ambiguous_reservation_error(&sandbox));
+            }
             match sandbox.state {
                 SandboxState::Deleted | SandboxState::Deleting => return Ok(sandbox),
                 // Its backend ID isn't known yet. If kilnd crashed mid-create,
@@ -956,7 +955,7 @@ impl<R: Runtime> Manager<R> {
         }
         if sandbox.state == SandboxState::Failed {
             if sandbox.backend_id.is_none() {
-                self.prove_ambiguous_failed_backend_absent(&sandbox).await?;
+                return Err(self.ambiguous_reservation_error(&sandbox));
             } else {
                 // FAILED with an ID is compensated history: removal or
                 // NotFound was already proven before that state was written.
@@ -1059,35 +1058,15 @@ impl<R: Runtime> Manager<R> {
         }
     }
 
-    /// A create error without a reported backend ID is explicitly ambiguous
-    /// in the Runtime contract. Do not let an ordinary API caller turn that
-    /// FAILED row into DELETED (and release its reservation) while any
-    /// unexplained backend could be the resource that create allocated.
-    async fn prove_ambiguous_failed_backend_absent(&self, sandbox: &Sandbox) -> Result<()> {
-        let known: HashSet<String> = self
-            .store
-            .owned_backend_ids(self.runtime.name())?
-            .into_iter()
-            .collect();
-        let mut unexplained: Vec<String> = self
-            .runtime
-            .list()
-            .await
-            .map_err(backend)?
-            .into_iter()
-            .filter(|candidate| !known.contains(&candidate.id))
-            .map(|candidate| candidate.id)
-            .collect();
-        unexplained.sort();
-        if unexplained.is_empty() {
-            return Ok(());
-        }
-        let candidates = unexplained.into_iter().take(4).collect::<Vec<_>>().join(", ");
-        Err(Error::FailedPrecondition(format!(
-            "cannot release the ambiguous reservation for failed sandbox {} while the {} backend has unexplained sandbox(es): {candidates}; resolve or remove those IDs with the configured backend, then retry DeleteSandbox",
+    /// The ordinary listing is not an inventory of hidden/unpublished
+    /// resources. No current Runtime operation can prove absence without an
+    /// ID, so an ambiguous reservation must stay charged, even on an empty list.
+    fn ambiguous_reservation_error(&self, sandbox: &Sandbox) -> Error {
+        Error::FailedPrecondition(format!(
+            "cannot release the ambiguous reservation for failed sandbox {}: no backend ID was reported; the {} backend listing cannot account for hidden or unpublished resources; authoritative resource reconciliation is required and is not currently supported",
             sandbox.id,
             self.runtime.name()
-        )))
+        ))
     }
 
     /// Starts a daemon-owned execution and waits for its result. Once the
@@ -1444,8 +1423,7 @@ impl<R: Runtime> Manager<R> {
     }
 
     fn check_exec(&self, req: &ExecRequest) -> Result<Duration> {
-        validate_argv(&req.argv, self.limits.max_argv_bytes)
-            .map_err(Error::InvalidArgument)?;
+        validate_argv(&req.argv, self.limits.max_argv_bytes).map_err(Error::InvalidArgument)?;
         if req.stdin.len() > self.limits.max_stdin_bytes {
             return Err(Error::InvalidArgument(format!(
                 "stdin is {} bytes; the limit is {}",

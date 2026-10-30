@@ -169,11 +169,15 @@ Reservations follow ownership evidence:
   `LOST` is retained because later reconciliation may restore the same backend
   to `READY`.
 - `FAILED` without a backend ID remains reserved because `Runtime::create`
-  explicitly permits an ambiguous error after allocation. Delete takes a
-  complete backend listing and refuses release while any ID is unexplained.
+  explicitly permits an ambiguous error after allocation. Delete refuses to
+  release it even with an empty listing: no current Runtime operation can
+  account for hidden or unpublished resources without the ID. Authoritative
+  resource reconciliation would be needed to release this reservation.
 - Successful failed-publication compensation records `FAILED` with the exact
   removed backend ID. That one `FAILED` shape releases immediately because
-  removal or `NotFound` was proven before the durable transition. Deleting
+  removal or `NotFound` was proven before the durable transition. The kiln
+  adapter requires a negative exact-ID probe, a complete list omitting that
+  ID and an absent cgroup after both successful and failed `rm`. Deleting
   that historical row moves it directly to `DELETED` without touching a
   backend that may since have reused the ID.
 - `DELETED` releases. A failed or interrupted delete remains `DELETING` and

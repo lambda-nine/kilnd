@@ -36,7 +36,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   inserts `CREATING`; cancellation, panic and restart cannot lose that promise.
   `CREATING`, `READY`, `DELETING` and `LOST` reserve their full effective spec.
   A create error without a backend ID is ambiguous and remains reserved until
-  a complete backend listing proves there are no unexplained IDs. Successful
+  authoritative reconciliation can account for hidden resources. Ordinary
+  listing absence never releases it; that reconciliation is not yet supported.
+  Successful
   compensation releases only after the exact backend is absent and the
   terminal transition is durable. Lowered budgets reject Create but retain the
   cleanup control plane. Per-sandbox limits, queue-inclusive exec timeout,
@@ -151,9 +153,9 @@ sandbox compromises the host.
   as an observed lower bound instead of claiming an exact total. Truncation is
   separately true only when observed bytes exceeded the retained prefix.
   Backend listings require clean EOF on both streams, no 64 KiB capture loss,
-  strict newline-terminated records, unique IDs and valid shim PIDs. Startup
-  directly probes omitted managed backends and checks their cgroup before
-  trusting absence, so a hidden registry record cannot turn a live sandbox
+  strict newline-terminated records, unique IDs and valid shim PIDs. Startup,
+  removal and failed-publication compensation directly probe omitted managed
+  backends and check their cgroup before trusting absence, so a hidden registry record cannot turn a live sandbox
   into `LOST`. A validated exact backend may recover `LOST` to `READY`.
   CLI and every managed live sandbox must advertise required capabilities;
   incompatible replacements and old PID 1 instances fail closed.
@@ -164,11 +166,11 @@ sandbox compromises the host.
   backend ID was never returned to kilnd. Reconciliation records the row as an
   ambiguous `FAILED` reservation and logs the backend as unmanaged; it cannot
   safely pair the two or remove an operator-created sandbox. Delete refuses to
-  release that reservation while a complete backend listing contains any
-  unexplained ID. A trusted operator must inspect the listing, remove or
-  resolve those IDs with the configured backend, and retry deletion. With the
-  kiln backend, use `kiln rm ID` for a live sandbox or scoped `kiln gc ID` for
-  a stale one. Ordinary RPC cancellation is not this case: accepted creates
+  release that reservation even when the ordinary listing is empty, because
+  hidden or unpublished resources may survive. There is currently no supported
+  authoritative reconciliation to clear a no-ID reservation. A trusted operator
+  can investigate and remove stray resources, but an empty listing and a retry
+  alone cannot return this capacity. Ordinary RPC cancellation is not this case: accepted creates
   are daemon-owned and finish or compensate after the caller disconnects.
 - **Group members are not isolated from each other.** Any member can exec in
   or delete any sandbox. Per-caller ownership belongs to the harness layer or

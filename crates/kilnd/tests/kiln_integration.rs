@@ -424,6 +424,10 @@ async fn hidden_registry_mount_does_not_mark_a_live_sandbox_lost() {
             manager.get(&sandbox_id, 0).unwrap().0.state,
             SandboxState::Ready
         );
+        let error = manager.delete(&sandbox_id).await.unwrap_err();
+        assert!(error.to_string().contains("cgroup"), "{error}");
+        assert_eq!(manager.get(&sandbox_id, 0).unwrap().0.state, SandboxState::Deleting);
+        assert_eq!(manager.health().await.unwrap().node_resources.reserved.sandboxes, 1);
         return;
     }
     if !enabled() {
