@@ -109,6 +109,10 @@ try:
     assert id in ctl('ls','--all',uid=USERS[0]).stdout and id in ctl('ls','--all').stdout
     assert ctl('execution',ex,uid=USERS[0]).stdout=='owner-output'
     ctl('rm',id,uid=USERS[0]); IDS.remove(id)
+    # The helper's inherited family filter must permit both network setup and
+    # libc DNS resolution. AF_UNIX/AF_NETLINK alone breaks hostname allowlists.
+    for network in (['--net','full'], ['--allow','example.com:443']):
+        assert ctl('run','--memory','64M','--disk','16M',*network,'--','printf','network-ok').stdout=='network-ok'
     print('3. Helper rejects group members, root and malformed service-UID requests', flush=True)
     helper_pid=run(['systemctl','show','-p','MainPID','--value','kilnd-helper']).stdout.strip()
     helper_status=dict(line.split(':',1) for line in open(f'/proc/{helper_pid}/status') if ':' in line)

@@ -11,6 +11,8 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   descriptors. Per-syscall nonblocking socket I/O protects deadlines and the
   listener against mutable flags and backpressure; Linux regressions exercise
   flag mutation, stalled stdin and cancellation. Upgrade daemon/helper together.
+- Preserve IPv4/IPv6 host DNS resolution for hostname allowlists under the
+  restored address-family filter; exercise full-network and hostname Create/Exec.
 - Restore PH0-2 helper systemd address-family, personality, realtime and
   kernel-log filters with ambient CAP_SETUID for UID-map setup. Installed
   regressions require Seccomp 2 and exact effective/bounding capability masks.
