@@ -33,6 +33,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   surviving cgroup keeps the row and its reservation retryable. Ambiguous
   no-ID creates remain charged even with an empty listing; clearing them needs
   authoritative resource reconciliation, which is not currently supported.
+  Store comments and operator guidance describe that retained-capacity limit.
 
 - Add atomic, durable node-wide sandbox budgets for retained count, requested
   memory, PIDs and disk. Create now checks all four sums and inserts

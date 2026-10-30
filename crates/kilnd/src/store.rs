@@ -441,7 +441,8 @@ impl Store {
     /// errors may be ambiguous after allocating an unreported backend.
     /// FAILED with a backend ID is written only after compensation proved
     /// that exact backend gone, so it releases capacity while retaining the
-    /// historical row. Explicit deletion resolves an ambiguous FAILED row.
+    /// historical row. Ambiguous no-ID failures require authoritative resource
+    /// reconciliation, which is not currently supported; Delete retains them.
     pub fn sandbox_resources(&self) -> Result<SandboxResources> {
         sandbox_resources(&self.conn())
     }

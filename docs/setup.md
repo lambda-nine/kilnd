@@ -39,8 +39,8 @@ kiln revision providing both is `40d9aa5003205d4c171e1b3eca61e9868064e98b`.
 Install a compatible artifact, then check `kiln capabilities --protocol=1`
 (binary output) and `kiln gc --help` (usage must advertise `[ID]...`). kilnd
 checks both interfaces before reconciliation and workload launch rather than
-trusting `--version`; it never falls back to global garbage collection. Existing sandboxes need compatible PID 1
-instances too; an old instance requires explicit recreation. An incompatible
+trusting `--version`; it never falls back to global garbage collection.
+Existing sandboxes need compatible PID 1 instances too; an old instance requires explicit recreation. An incompatible
 replacement CLI degrades Health and is rejected before workload launch.
 
 ## 3. kilnd in the VM

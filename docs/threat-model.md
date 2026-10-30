@@ -103,8 +103,9 @@ sandbox compromises the host.
   not measured allocator/RSS ceilings.
 - **Node budgets cover kilnd-managed promises, not all root activity.** A
   trusted root user or direct `kiln` invocation can create unmanaged backends
-  outside these reservations. Such unexplained backends conservatively block
-  release of an ambiguous failed create but are not charged a fabricated spec.
+  outside these reservations. Ambiguous no-ID creates remain charged even
+  after all listed backends are removed; unexplained backends are not charged
+  a fabricated spec.
   Memory, PIDs and disk are reserved from requested effective sandbox limits;
   they are not measurements of current RSS, task count or disk usage. CPU is
   intentionally schedulable and may be overcommitted rather than reserved.
