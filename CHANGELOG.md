@@ -6,6 +6,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Collapse nested runtime conditionals using let chains supported by Rust 1.88,
+  keeping strict Clippy clean on both MSRV 1.88 and Rust 1.99.
+
 - Preserve containment regression coverage from `review/exec-tree-containment`:
   timeout readiness, normal leader exit with nohup/setsid descendants, raw CLI
   stdout/stderr EOF, private output EOF, graceful shutdown and abrupt daemon

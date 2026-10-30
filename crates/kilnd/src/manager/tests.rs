@@ -672,7 +672,7 @@ async fn delete_queued_behind_compensation_preserves_reused_historical_id() {
     assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Failed);
     assert_eq!(m.health().await.unwrap().node_resources.reserved.sandboxes, 0);
     assert_eq!(deletion.await.unwrap().state, SandboxState::Deleted);
-    assert_eq!(fake.state().remove_attempts, [backend_id.clone()]);
+    assert_eq!(fake.state().remove_attempts.as_slice(), std::slice::from_ref(&backend_id));
     assert!(fake.state().sandboxes.contains_key(&backend_id));
     assert_eq!(m.health().await.unwrap().node_resources.reserved.sandboxes, 0);
     assert_eq!(m.delete(&row.id).await.unwrap().state, SandboxState::Deleted);

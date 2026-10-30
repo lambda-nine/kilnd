@@ -158,8 +158,15 @@ impl KilnRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
-        let out = self.call_until("gc --help", &["gc".into(), "--help".into()], deadline, cancel)
-            .await.map_err(|e| format!("scoped gc capability check failed: {e}"))?;
+        let out = self
+            .call_until(
+                "gc --help",
+                &["gc".into(), "--help".into()],
+                deadline,
+                cancel,
+            )
+            .await
+            .map_err(|e| format!("scoped gc capability check failed: {e}"))?;
         if out.stdout_completion != process::CaptureCompletion::Eof
             || out.stderr_completion != process::CaptureCompletion::Eof
             || out.stdout.truncated()
@@ -169,7 +176,10 @@ impl KilnRuntime {
         }
         let text = std::str::from_utf8(&out.stdout.data)
             .map_err(|e| format!("scoped gc help is not UTF-8: {e}"))?;
-        if !text.lines().any(|line| line.starts_with("Usage: ") && line.ends_with(" gc [ID]...")) {
+        if !text
+            .lines()
+            .any(|line| line.starts_with("Usage: ") && line.ends_with(" gc [ID]..."))
+        {
             return Err("scoped gc ID... is required; install kiln 40d9aa500320 or later with scoped GC support (global GC is never used)".into());
         }
         Ok(())
@@ -464,57 +474,54 @@ impl Runtime for KilnRuntime {
         if let Some(e) = reap_error {
             finish = Err(RuntimeDiagnostic::new(Kind::Io, Stage::Wait, e.to_string()));
         }
-        if !trusted_cleanup {
-            if let Err(e) = self.wait_exec_cleanup(id).await {
-                finish = Err(RuntimeDiagnostic::new(
-                    Kind::CleanupFailed,
-                    Stage::Cleanup,
-                    e.to_string(),
-                ));
-            }
+        if !trusted_cleanup && let Err(e) = self.wait_exec_cleanup(id).await {
+            finish = Err(RuntimeDiagnostic::new(
+                Kind::CleanupFailed,
+                Stage::Cleanup,
+                e.to_string(),
+            ));
         }
         // Readers remain alive during the entire cleanup barrier, then reach EOF.
         let raw = owner.settle().await;
         if matches!(stop, Stop::Exited)
             && !matches!(&finish, Err(d) if d.kind == Kind::CleanupFailed)
+            && let Ok(out) = &decoded
+            && raw.child_status.and_then(|s| s.code()) != Some(out.projection())
         {
-            if let Ok(out) = &decoded {
-                if raw.child_status.and_then(|s| s.code()) != Some(out.projection()) {
-                    host_protocol_failure = true;
-                    finish = Err(RuntimeDiagnostic::new(
-                        Kind::Protocol,
-                        Stage::Report,
-                        "CLI exit status disagrees with typed outcome",
-                    ));
-                }
-            }
+            host_protocol_failure = true;
+            finish = Err(RuntimeDiagnostic::new(
+                Kind::Protocol,
+                Stage::Report,
+                "CLI exit status disagrees with typed outcome",
+            ));
         }
-        if finish.is_ok() {
-            if let Some(error) = raw.stdout.error.as_ref().or(raw.stderr.error.as_ref()) {
-                finish = Err(RuntimeDiagnostic::new(Kind::Io, Stage::Capture, error));
-            }
+        if finish.is_ok()
+            && let Some(error) = raw.stdout.error.as_ref().or(raw.stderr.error.as_ref())
+        {
+            finish = Err(RuntimeDiagnostic::new(Kind::Io, Stage::Capture, error));
         }
-        if let Err(d) = &mut finish {
-            if host_protocol_failure && d.kind == Kind::Protocol {
-                let mut augmented = RuntimeDiagnostic::new(
-                    d.kind,
-                    d.stage,
-                    format!(
-                        "{}; CLI stdout: {}; CLI stderr: {}; status: {} bytes{}",
-                        d.message,
-                        summarize(&raw.cli_stdout.captured.data),
-                        summarize(&raw.cli_stderr.captured.data),
-                        raw.status.bytes.len(),
-                        raw.status
-                            .error
-                            .as_ref()
-                            .map(|e| format!(" ({e})"))
-                            .unwrap_or_default()
-                    ),
-                );
-                augmented.message_truncated |= d.message_truncated;
-                *d = augmented;
-            }
+        if let Err(d) = &mut finish
+            && host_protocol_failure
+            && d.kind == Kind::Protocol
+        {
+            let mut augmented = RuntimeDiagnostic::new(
+                d.kind,
+                d.stage,
+                format!(
+                    "{}; CLI stdout: {}; CLI stderr: {}; status: {} bytes{}",
+                    d.message,
+                    summarize(&raw.cli_stdout.captured.data),
+                    summarize(&raw.cli_stderr.captured.data),
+                    raw.status.bytes.len(),
+                    raw.status
+                        .error
+                        .as_ref()
+                        .map(|e| format!(" ({e})"))
+                        .unwrap_or_default()
+                ),
+            );
+            augmented.message_truncated |= d.message_truncated;
+            *d = augmented;
         }
         ExecOutcome {
             finish,
@@ -955,9 +962,9 @@ mod tests {
             );
             assert!(!tmp.path().join("workload").exists());
             let calls = fs::read_to_string(tmp.path().join("calls")).unwrap();
-            assert!(
-                calls.contains("capabilities --protocol=1\ngc --help\ncapabilities --protocol=1 abcd\nls\n")
-            );
+            assert!(calls.contains(
+                "capabilities --protocol=1\ngc --help\ncapabilities --protocol=1 abcd\nls\n"
+            ));
         }
     }
 
@@ -1679,20 +1686,27 @@ mod tests {
                 &format!("open({trace:?},'a').write(' '.join(sys.argv[1:])+'\\n')\nif sys.argv[1]=='gc' and sys.argv[2:]==['--help']:\n    print({help:?},end='')\n    sys.exit(0)\nif sys.argv[1]=='capabilities':"),
             );
             fs::write(&runtime.bin, source).unwrap();
-            let result = runtime.version(Instant::now() + QUERY_TIMEOUT, &CancellationToken::new()).await;
+            let result = runtime
+                .version(Instant::now() + QUERY_TIMEOUT, &CancellationToken::new())
+                .await;
             if help.contains("[ID]...") {
                 assert!(result.is_ok(), "{result:?}");
             } else {
                 let error = result.unwrap_err();
                 assert!(matches!(error, RuntimeError::Incompatible(_)));
                 assert!(error.to_string().contains("scoped gc"), "{error}");
-                let manager = Manager::new(runtime, Store::open_in_memory().unwrap(), Limits::default());
+                let manager =
+                    Manager::new(runtime, Store::open_in_memory().unwrap(), Limits::default());
                 assert!(manager.reconcile().await.is_err());
                 assert!(manager.list(true).unwrap().is_empty());
             }
             let calls = fs::read_to_string(trace).unwrap();
             assert!(calls.contains("gc --help\n"));
-            assert!(calls.lines().all(|call| call == "capabilities --protocol=1" || call == "gc --help"));
+            assert!(
+                calls
+                    .lines()
+                    .all(|call| call == "capabilities --protocol=1" || call == "gc --help")
+            );
         }
     }
 
