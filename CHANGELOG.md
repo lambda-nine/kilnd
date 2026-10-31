@@ -8,6 +8,8 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 - Specify the Phase 1b Firecracker runtime and guest broker design, including
   approved launch contracts, durable recovery, resource reservations and build gates.
+- Address the Phase 1b design review with mandatory absence fences, node-global
+  admission, live supervisor monitoring, bounded jail/I/O/workers and stronger gates.
 
 - Isolate the lock CLOEXEC regression in a dedicated child so unrelated parallel
   forks cannot transiently retain its lock and cause a false inheritance failure.
