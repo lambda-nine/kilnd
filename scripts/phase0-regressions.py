@@ -167,7 +167,17 @@ try:
     print('5. Startup prune retains charged rows and deletes eligible history', flush=True)
     seed=r'''
 import sqlite3,sys
-c=sqlite3.connect(sys.argv[1]); c.execute("INSERT INTO sandboxes (id,backend,state,spec,created_at_ms,updated_at_ms,list_seq,owner_uid) SELECT 'sb-1111111111111111',backend,'failed',spec,0,0,(SELECT MAX(list_seq)+1 FROM sandboxes),0 FROM sandboxes WHERE id=?",(sys.argv[2],)); c.execute('UPDATE history_sequence SET value=(SELECT MAX(list_seq) FROM sandboxes)'); c.commit()
+c=sqlite3.connect(sys.argv[1])
+c.execute("PRAGMA foreign_keys=ON")
+c.execute("""INSERT INTO sandboxes (id,backend,state,spec,created_at_ms,updated_at_ms,list_seq,owner_uid,
+    accounting_kind,reserved_memory_bytes,reserved_disk_bytes,reserved_pids,reserved_host_cpu_millis,
+    reserved_virtual_cpu_slots,reserved_host_pids,host_spec_sha256,guest_exec_spec_sha256)
+    SELECT 'sb-1111111111111111',backend,'failed',spec,0,0,(SELECT MAX(list_seq)+1 FROM sandboxes),0,
+    'legacy',reserved_memory_bytes,reserved_disk_bytes,reserved_pids,reserved_host_cpu_millis,
+    reserved_virtual_cpu_slots,reserved_host_pids,host_spec_sha256,guest_exec_spec_sha256
+    FROM sandboxes WHERE id=?""", (sys.argv[2],))
+c.execute('UPDATE history_sequence SET value=(SELECT MAX(list_seq) FROM sandboxes)')
+c.commit()
 '''
     run(['python3','-I','-c',seed,f'/var/lib/{STATE}/kilnd.db',live],uid='kilnd')
     start_aux('startup',zero=True)

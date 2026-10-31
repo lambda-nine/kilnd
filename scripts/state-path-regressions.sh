@@ -111,12 +111,12 @@ run_rejected sidecar "$fixture/sidecar-state" 'kilnd.db-wal.*without following s
 
 echo "5. Foreign, broad-mode, non-regular, and hard-linked databases are rejected"
 owned_mkdir 700 "$fixture/foreign-state"
-# Copy the main database bytes without opening the live source through the
-# distro sqlite3. The daemon links bundled SQLite, and mixing SQLite builds on
-# one live WAL can disturb its sidecar names even for a read-only backup.
-sudo cp --reflink=never /var/lib/kilnd/kilnd.db "$fixture/foreign-state/kilnd.db"
+# This deliberately untrusted database must be refused before opening or
+# migrating its rows. Use an independent synthetic schema, so the fixture never
+# copies a live WAL database or depends on the installed schema revision.
 sudo sqlite3 "$fixture/foreign-state/kilnd.db" \
-    "INSERT INTO sandboxes (id,backend,backend_id,state,spec,created_at_ms,updated_at_ms,list_seq) VALUES ('sb-0000000000000000','kiln','forged-backend','deleting','{}',1,1,9223372036854775807);"
+    "CREATE TABLE sandboxes (id TEXT PRIMARY KEY,backend TEXT,backend_id TEXT,state TEXT,spec TEXT,created_at_ms INTEGER,updated_at_ms INTEGER,list_seq INTEGER);
+     INSERT INTO sandboxes VALUES ('sb-0000000000000000','kiln','forged-backend','deleting','{}',1,1,9223372036854775807);"
 sudo chown "$(id -u):$(id -g)" "$fixture/foreign-state/kilnd.db"
 sudo chmod 600 "$fixture/foreign-state/kilnd.db"
 run_rejected foreign "$fixture/foreign-state" "kilnd.db must be owned by uid $(id -u kilnd)\|Permission denied"
