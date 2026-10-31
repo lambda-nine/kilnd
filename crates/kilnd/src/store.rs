@@ -2389,6 +2389,7 @@ mod tests {
     #[test]
     fn retention_age_count_and_watermark_survive_restart() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let dir = tmp.path().join("state");
         let store = Store::open(&dir).unwrap();
         let sb = sandbox();
@@ -3375,6 +3376,7 @@ mod tests {
         }
         assert_enforced(&Store::open_in_memory().unwrap(), "in memory");
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let dir = tmp.path().join("state");
         let created = Store::open(&dir).unwrap();
         assert_enforced(&created, "created on disk");
@@ -3790,6 +3792,7 @@ mod tests {
     #[test]
     fn triggers_defend_evidence_even_on_a_foreign_key_disabled_connection() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let dir = tmp.path().join("state");
         let store = Store::open(&dir).unwrap();
         let row = fenced_sandbox();
@@ -4185,6 +4188,7 @@ mod tests {
     #[test]
     fn direct_sql_cannot_use_stale_generation_evidence_or_roll_back_a_generation() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let dir = tmp.path().join("state");
         let store = Store::open(&dir).unwrap();
         let stale_attacks = |conn: &Connection, id: &str, evidence: &str| {
