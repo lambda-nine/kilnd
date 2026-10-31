@@ -167,11 +167,23 @@ sandbox compromises the host.
   they are not measurements of current RSS, task count or disk usage. CPU is
   intentionally schedulable and may be overcommitted rather than reserved. A
   legacy row's zero CPU, vCPU and host-PID values mean not reserved, not free.
-- **The Firecracker backend does not exist yet.** Schema 8, absence evidence and
-  dispositions are exercised only by `FakeRuntime`. No helper operation, node ledger,
-  guest or VM exists; kilnd still runs kiln only, and that remains experimental
+- **The Firecracker backend cannot launch anything yet.** B3 adds the typed helper
+  group, the root node ledger, approved plan verification and the fixed worker
+  processes, all disabled by default and with fake resources only under test. The
+  production manifest gate refuses every profile, no READY reply exists, and `main.rs`
+  selects kiln only. No VM, jailer, guest, jail, cgroup or disk exists: B4, B5 and B7
+  own them and their proofs. kilnd still runs kiln only, and that remains experimental
   shared-kernel isolation, not a boundary for hostile multi-tenant workloads.
   Daemon-local sums are never node totals for a backend with a node authority.
+- **The node ledger is part of the root trusted base,** with SQLite and its schema.
+  Its triggers stop mistakes through SQL. They cannot stop root or anything with file
+  authority: `SQLITE_DBCONFIG_ENABLE_TRIGGER`, a schema rewrite, or a rollback of the
+  files to an older consistent state. Startup audits refuse a changed schema, mismatched
+  receipts, a rolled-back generation counter and lost claims, but a coordinated rollback
+  of database and WAL is undetected, and a removed WAL can lose its last commits.
+- **A dynamically linked executable is unsupported, not bound.** Only static images
+  can be approved. Until a release ships a static helper and pins it, a node cannot
+  satisfy the helper-image self-check whatever the gate says.
 - **Deadlines are not hard real time.** SQLite and filesystem work is
   synchronous. Deadline delivery can be delayed by that work, and an expired
   recorded execution retains admission until backend cleanup and terminal

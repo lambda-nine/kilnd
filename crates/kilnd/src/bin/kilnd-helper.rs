@@ -13,6 +13,15 @@ use tokio_util::sync::CancellationToken;
 struct Args {
     #[arg(long, default_value = "/usr/local/bin/kiln")]
     kiln: PathBuf,
+    /// Root-owned Firecracker node policy. Absent, the group stays disabled. It serves
+    /// B3 infrastructure only: no VM launches, and every profile stays refused until
+    /// the production gate is lifted by a reviewed release.
+    #[arg(long)]
+    firecracker_policy: Option<PathBuf>,
+    /// One-time creation of the node ledger named by the policy, then exit. An existing
+    /// or partial ledger is refused; nothing else ever creates one.
+    #[arg(long, requires = "firecracker_policy")]
+    firecracker_init_ledger: bool,
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -38,6 +47,15 @@ async fn main() -> Result<()> {
     if !bin.is_file() {
         bail!("kiln executable is not a file");
     }
+    if args.firecracker_init_ledger {
+        let path = args.firecracker_policy.as_deref().context("policy path")?;
+        let policy = kilnd::helper::firecracker::read_policy(path, service_uid()?)
+            .map_err(anyhow::Error::msg)
+            .context("Firecracker node policy")?;
+        return kilnd::helper::firecracker::provision_ledger(&policy)
+            .map_err(anyhow::Error::msg)
+            .context("provision node ledger");
+    }
     if std::env::var("LISTEN_PID")?.parse::<u32>()? != std::process::id()
         || std::env::var("LISTEN_FDS")? != "1"
     {
@@ -53,6 +71,53 @@ async fn main() -> Result<()> {
     if unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    let service_uid = service_uid()?;
+    // Firecracker's startup failure never takes legacy kiln down with it: the group
+    // answers Disabled, and a configured node with a bad ledger answers Unavailable.
+    let firecracker = match &args.firecracker_policy {
+        None => None,
+        Some(path) => match kilnd::helper::firecracker::read_policy(path, service_uid) {
+            Err(error) => {
+                eprintln!("kilnd-helper: Firecracker group disabled: {error}");
+                None
+            }
+            Ok(policy) => {
+                let config = kilnd::helper::firecracker::production_config(policy);
+                match kilnd::helper::firecracker::Node::start(config).await {
+                    Ok(node) => Some(node),
+                    Err(error) => {
+                        eprintln!("kilnd-helper: Firecracker group disabled: {error}");
+                        None
+                    }
+                }
+            }
+        },
+    };
+    let stop = CancellationToken::new();
+    let stopped = stop.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM");
+        let mut int = signal(SignalKind::interrupt()).expect("SIGINT");
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+        stopped.cancel();
+    });
+    let served = kilnd::helper::serve_with_firecracker(
+        tokio::net::UnixListener::from_std(listener)?,
+        service_uid,
+        bin,
+        firecracker.clone(),
+        stop,
+    )
+    .await;
+    if let Some(node) = firecracker {
+        node.shutdown();
+    }
+    served.context("root helper")
+}
+
+/// The numeric service UID comes only from the root-controlled account database.
+fn service_uid() -> Result<u32> {
     let name = CString::new("kilnd").unwrap();
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut data = vec![0; 16384];
@@ -69,21 +134,5 @@ async fn main() -> Result<()> {
     if rc != 0 || found.is_null() || pwd.pw_uid == 0 {
         bail!("missing non-root kilnd system account");
     }
-    let stop = CancellationToken::new();
-    let stopped = stop.clone();
-    tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).expect("SIGTERM");
-        let mut int = signal(SignalKind::interrupt()).expect("SIGINT");
-        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
-        stopped.cancel();
-    });
-    kilnd::helper::serve(
-        tokio::net::UnixListener::from_std(listener)?,
-        pwd.pw_uid,
-        bin,
-        stop,
-    )
-    .await
-    .context("root helper")
+    Ok(pwd.pw_uid)
 }

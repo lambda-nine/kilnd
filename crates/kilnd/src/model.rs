@@ -174,6 +174,18 @@ impl fmt::Debug for Id128 {
     }
 }
 
+impl Serialize for Id128 {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Id128 {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::parse(&String::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A typed SHA-256 digest. The only text form is 64 lowercase hexadecimal digits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest([u8; 32]);
@@ -198,6 +210,18 @@ impl fmt::Display for Digest {
 impl fmt::Debug for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
+    }
+}
+
+impl Serialize for Digest {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::parse(&String::deserialize(d)?).map_err(serde::de::Error::custom)
     }
 }
 

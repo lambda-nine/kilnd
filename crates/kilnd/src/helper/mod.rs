@@ -1,22 +1,27 @@
 //! Minimal private root-helper transport; it never decodes gRPC or opens SQLite.
 mod client;
 mod fds;
+pub mod firecracker;
 pub(crate) mod protocol;
 mod server;
 mod socket;
-pub(crate) use client::Client;
+pub(crate) use client::{AttachedConnection, Client};
 use serde::{Serialize, de::DeserializeOwned};
-pub use server::serve;
+pub use server::{serve, serve_with_firecracker};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-async fn read_frame<T: DeserializeOwned>(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<T> {
+async fn read_frame_bytes(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
     let size = stream.read_u32().await? as usize;
     if size == 0 || size > protocol::MAX_FRAME {
         return Err(io::Error::other("helper frame size exceeded"));
     }
     let mut bytes = vec![0; size];
     stream.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+async fn read_frame<T: DeserializeOwned>(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<T> {
+    let bytes = read_frame_bytes(stream).await?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 async fn write_frame(

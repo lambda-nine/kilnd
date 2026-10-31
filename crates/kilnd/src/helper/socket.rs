@@ -6,7 +6,7 @@ use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 use tokio::net::UnixStream;
 
-pub(super) struct Socket(pub UnixStream);
+pub(in crate::helper) struct Socket(pub UnixStream);
 
 impl AsyncRead for Socket {
     fn poll_read(

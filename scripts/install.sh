@@ -65,6 +65,8 @@ for name in os.listdir(root):
 os.chown(root, uid, gid, follow_symlinks=False)
 PYTHON
 fi
+# Also creates the Firecracker ledger's private parents. No node policy or ledger is
+# installed, so that group stays disabled; see docs/setup.md before configuring one.
 sudo install -m 644 deploy/kilnd-helper.conf /etc/tmpfiles.d/kilnd-helper.conf
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/kilnd-helper.conf
 sudo install -m 644 deploy/kilnd-helper.socket /etc/systemd/system/kilnd-helper.socket

@@ -17,6 +17,7 @@ use crate::model::{
 pub use crate::model::CreateCertainty;
 
 pub mod fake;
+pub mod firecracker;
 pub mod kiln;
 #[doc(hidden)]
 pub mod kiln_direct;

@@ -96,7 +96,7 @@ sudo kilndctl ls --all
 ```sh
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-scripts/integration-test.sh          # dedicated admission stress, then root + real kiln
+scripts/integration-test.sh          # dedicated admission stress, root + real kiln, FD-exec properties
 scripts/daemon-singleton-regressions.sh # duplicate starts preserve active work
 scripts/state-path-regressions.sh    # ownership, mode, type, link and symlink defenses
 sudo python3 -I scripts/phase0-regressions.py # real peer UIDs, helper, privilege, retention
@@ -105,6 +105,37 @@ scripts/smoke.sh                     # through the installed service
 
 The smoke test restarts and kills kilnd, so don't run it on a node with
 sandboxes you care about.
+
+## Firecracker group (disabled by default)
+
+`scripts/install.sh` leaves this off: no policy, no ledger, unchanged capabilities and
+no VM launch. It only creates `/var/lib/kilnd-helper/firecracker` as root 0700.
+
+B3 infrastructure can be exercised with a root-owned policy file, mode 0644 or
+tighter, whose whole path is root-owned and not writable by anyone else:
+
+```json
+{"schema":"kilnd-firecracker-node-policy-v1",
+ "node_id":"<32 lowercase hex digits>",
+ "ledger_dir":"/var/lib/kilnd-helper/firecracker",
+ "ceilings":{"slots":3,"memory_bytes":3221225472,"disk_bytes":17179869184,
+             "host_cpu_millis":3500,"virtual_cpu_slots":3,"pids":2048,"host_pids":128},
+ "uid_range":{"first":300000,"last":365535},
+ "gid_range":{"first":300000,"last":365535},
+ "cid_range":{"first":3,"last":65535},
+ "profiles":[]}
+```
+
+```sh
+sudo kilnd-helper --firecracker-policy /etc/kilnd/firecracker-node.json --firecracker-init-ledger
+# Then add the same --firecracker-policy to ExecStart in a drop-in and restart.
+```
+
+The first command creates the ledger, once, and refuses if any ledger file exists; do
+not delete a ledger to recover from an error, because that discards every claim.
+Startup problems leave kiln running and the group disabled or Unavailable. Every
+profile is refused by the disabled gate until a reviewed release (B7). Do not expect a
+sandbox from this: Capabilities reports `launch_enabled: false`.
 
 ## Operating notes
 

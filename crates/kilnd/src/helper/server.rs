@@ -1,5 +1,6 @@
+use super::firecracker::{Node, WireDeadline};
 use super::protocol::*;
-use super::{fds, read_frame, socket::Socket, write_frame};
+use super::{fds, socket::Socket, write_frame};
 use crate::model::CreateCertainty;
 use crate::runtime::{ExecFinish, ExecSpec, Runtime, kiln_direct::DirectKilnRuntime};
 use std::io;
@@ -9,9 +10,53 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+/// Connections being framed and classified, each for at most two seconds. A peer that
+/// keeps more than this many silent connections open can still delay framing itself;
+/// nothing can make every raw connection fair. The guarantee is below: once framed, a
+/// recovery request has dispatch capacity that normal operations can never occupy.
+const FRAMING_SLOTS: usize = 128;
+/// Section 6.1's 64 operations: 60 for anything, 4 reserved for inspection and recovery.
+const NORMAL_OPERATION_SLOTS: usize = 60;
+const RESERVED_RECOVERY_SLOTS: usize = 4;
+/// Live attachments have their own bound and never hold an operation slot.
+const ATTACHMENT_SLOTS: usize = 16;
+
+/// The separate capacities of one listener.
+struct Budgets {
+    framing: Arc<Semaphore>,
+    normal: Arc<Semaphore>,
+    recovery: Arc<Semaphore>,
+    attachments: Arc<Semaphore>,
+}
+
+impl Budgets {
+    fn new() -> Self {
+        Self {
+            framing: Arc::new(Semaphore::new(FRAMING_SLOTS)),
+            normal: Arc::new(Semaphore::new(NORMAL_OPERATION_SLOTS)),
+            recovery: Arc::new(Semaphore::new(RESERVED_RECOVERY_SLOTS)),
+            attachments: Arc::new(Semaphore::new(ATTACHMENT_SLOTS)),
+        }
+    }
+
+    /// A slot for a classified request. Recovery prefers its reserve and may use a free
+    /// normal slot; a normal operation can never take a reserved one.
+    fn admit(&self, recovery: bool) -> Option<OwnedSemaphorePermit> {
+        if recovery {
+            self.recovery
+                .clone()
+                .try_acquire_owned()
+                .or_else(|_| self.normal.clone().try_acquire_owned())
+                .ok()
+        } else {
+            self.normal.clone().try_acquire_owned().ok()
+        }
+    }
+}
 
 /// Listener ownership is supplied by systemd's root-owned socket unit. The
 /// numeric service UID comes only from the root-controlled account database.
@@ -21,8 +66,20 @@ pub async fn serve(
     bin: PathBuf,
     shutdown: CancellationToken,
 ) -> io::Result<()> {
+    serve_with_firecracker(listener, uid, bin, None, shutdown).await
+}
+
+/// `firecracker` is present only under an explicit root policy. Its absence leaves
+/// the group answering Disabled and every kiln behavior byte-identical.
+pub async fn serve_with_firecracker(
+    listener: UnixListener,
+    uid: u32,
+    bin: PathBuf,
+    firecracker: Option<Arc<Node>>,
+    shutdown: CancellationToken,
+) -> io::Result<()> {
     let runtime = Arc::new(DirectKilnRuntime::new(bin));
-    let slots = Arc::new(Semaphore::new(64));
+    let budgets = Arc::new(Budgets::new());
     let tasks = TaskTracker::new();
     loop {
         let accepted = tokio::select! {
@@ -30,18 +87,20 @@ pub async fn serve(
             result = listener.accept() => result?,
         };
         let stream = accepted.0;
-        // Reject before reading any attacker-controlled frame (including root).
-        if stream.peer_cred()?.uid() != uid {
+        // Reject before reading any attacker-controlled frame (including root). Darwin
+        // refuses this query once a peer has gone, which must not end the listener.
+        if !stream.peer_cred().is_ok_and(|peer| peer.uid() == uid) {
             continue;
         }
-        let Ok(permit) = slots.clone().try_acquire_owned() else {
+        let Ok(framing) = budgets.framing.clone().try_acquire_owned() else {
             continue;
         };
         let runtime = runtime.clone();
         let stop = shutdown.child_token();
+        let firecracker = firecracker.clone();
+        let budgets = budgets.clone();
         tasks.spawn(async move {
-            let _permit = permit;
-            if let Err(error) = handle(stream, runtime, stop).await {
+            if let Err(error) = handle(stream, runtime, firecracker, framing, budgets, stop).await {
                 tracing::warn!(%error, "helper request failed");
                 #[cfg(test)]
                 eprintln!("helper request error: {error}");
@@ -56,12 +115,15 @@ pub async fn serve(
 async fn handle(
     stream: UnixStream,
     runtime: Arc<DirectKilnRuntime>,
+    firecracker: Option<Arc<Node>>,
+    framing: OwnedSemaphorePermit,
+    budgets: Arc<Budgets>,
     cancel: CancellationToken,
 ) -> io::Result<()> {
     let mut stream = Socket(stream);
     let request = timeout(Duration::from_secs(2), async {
         let descriptors = fds::receive(&stream.0).await?;
-        let request: Request = read_frame(&mut stream).await?;
+        let request: Request = read_request(&mut stream).await?;
         request
             .validate(descriptors.len())
             .map_err(io::Error::other)?;
@@ -69,16 +131,40 @@ async fn handle(
     })
     .await
     .map_err(io::Error::other)??;
+    // Framed and classified: this connection now competes for dispatch, not framing.
+    drop(framing);
     let remaining = request.deadline_ns.saturating_sub(super::monotonic_ns()?);
     if remaining > (u64::from(request.timeout_ms) + 1) * 1_000_000 {
         return Err(io::Error::other("invalid monotonic deadline"));
     }
     let deadline = Instant::now() + Duration::from_nanos(remaining);
+    let wire_deadline_ns = request.deadline_ns;
+    let request = match request.operation {
+        Operation::Firecracker(group) => {
+            return firecracker_request(
+                stream,
+                group,
+                firecracker,
+                budgets,
+                WireDeadline {
+                    instant: deadline,
+                    ns: wire_deadline_ns,
+                },
+                cancel,
+            )
+            .await;
+        }
+        Operation::Kiln(op) => op,
+    };
+    // As before, an operation with no slot closes without a reply.
+    let Some(_permit) = budgets.admit(request.is_recovery()) else {
+        return Ok(());
+    };
     // Only the opposite endpoints cross SCM_RIGHTS. Never share an open file
     // description for any endpoint on which the helper performs I/O.
     let mut stdio = None;
     timeout(Duration::from_secs(2), async {
-        if matches!(request.operation, Operation::Kiln(KilnRequest::Exec { .. })) {
+        if matches!(request, KilnRequest::Exec { .. }) {
             stdio = Some(
                 handoff_stdio(&mut stream)
                     .await
@@ -92,7 +178,7 @@ async fn handle(
     .await
     .map_err(io::Error::other)??;
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let operation = dispatch(request.operation, stdio, &runtime, deadline, &cancel);
+    let operation = dispatch(request, stdio, &runtime, deadline, &cancel);
     tokio::pin!(operation);
     let response = tokio::select! {
         result = &mut operation => result?,
@@ -131,14 +217,112 @@ pub(super) async fn handoff_stdio(stream: &mut Socket) -> io::Result<[Socket; 3]
     Ok([Socket(input), Socket(output), Socket(error)])
 }
 
+/// Parses a frame. A Firecracker frame must also be strict JSON as a whole, so a
+/// duplicate key inside labels cannot pass; a kiln frame parses exactly as before.
+async fn read_request(stream: &mut Socket) -> io::Result<Request> {
+    let bytes = super::read_frame_bytes(stream).await?;
+    let request: Request = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if matches!(request.operation, Operation::Firecracker(_)) {
+        crate::firecracker::strict_json(&bytes).map_err(io::Error::other)?;
+    }
+    Ok(request)
+}
+
+/// One Firecracker request: no descriptors cross, in either direction, and the reply
+/// is the separate `Response::Firecracker` branch. AttachInstance alone keeps its
+/// connection: that connection's EOF is the detach.
+async fn firecracker_request(
+    stream: Socket,
+    request: FirecrackerRequest,
+    firecracker: Option<Arc<Node>>,
+    budgets: Arc<Budgets>,
+    deadline: WireDeadline,
+    cancel: CancellationToken,
+) -> io::Result<()> {
+    timeout(Duration::from_secs(2), fds::send(&stream.0, &[]))
+        .await
+        .map_err(io::Error::other)??;
+    let peer_pid = stream.0.peer_cred()?.pid();
+    let instance = request.instance_id;
+    let attach = matches!(
+        request.operation,
+        FirecrackerOperation::AttachInstance { .. }
+    );
+    let recovery = request.operation.is_recovery();
+    // Attachments have their own bound and stay out of the operation budgets. A full
+    // budget answers at once: the last four operation slots serve only recovery.
+    let attachment = attach.then(|| budgets.attachments.clone().try_acquire_owned().ok());
+    let operation_slot = (!attach).then(|| budgets.admit(recovery));
+    let refused = match (&attachment, &operation_slot) {
+        (Some(None), _) => Some("too many attachments"),
+        (_, Some(None)) => Some("only reserved recovery slots remain"),
+        _ => None,
+    };
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let waiter = cancel.child_token();
+    let response = match &firecracker {
+        None => FirecrackerResponse::disabled(&request.operation),
+        Some(_) if refused.is_some() => FirecrackerResponse::Error(GroupError::new(
+            GroupErrorKind::ResourceExhausted,
+            refused.unwrap_or_default(),
+        )),
+        Some(node) => {
+            let operation = node.handle(request, peer_pid, deadline, &waiter);
+            tokio::pin!(operation);
+            tokio::select! {
+                response = &mut operation => response,
+                // One cancellation byte, extra data or EOF ends this waiter only.
+                // Accepted work remains owned by the helper.
+                _ = reader.read_u8() => { waiter.cancel(); operation.await }
+            }
+        }
+    };
+    let epoch = match &response {
+        FirecrackerResponse::Attached {
+            connection_epoch, ..
+        } if attach => Some(*connection_epoch),
+        _ => None,
+    };
+    let written = timeout(
+        Duration::from_secs(2),
+        write_frame(&mut writer, &Response::Firecracker(response)),
+    )
+    .await
+    .map_err(io::Error::other)
+    .and_then(|result| result);
+    let (Some(epoch), Some(node)) = (epoch, firecracker) else {
+        written?;
+        return writer
+            .shutdown()
+            .await
+            .map_err(|e| super::io_stage("response shutdown", e));
+    };
+    // The long-lived control connection holds only its attachment slot.
+    let _attachment = attachment;
+    drop(operation_slot);
+    if written.is_ok() {
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = hold_until_eof(&mut reader) => {}
+        }
+    }
+    node.detach(instance, epoch);
+    written
+}
+
+/// Discards bytes until EOF or an error; nothing on this connection is a request.
+async fn hold_until_eof(reader: &mut (impl AsyncReadExt + Unpin)) {
+    let mut bytes = [0u8; 64];
+    while matches!(reader.read(&mut bytes).await, Ok(n) if n > 0) {}
+}
+
 async fn dispatch(
-    operation: Operation,
+    op: KilnRequest,
     stdio: Option<[Socket; 3]>,
     runtime: &DirectKilnRuntime,
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> io::Result<Response> {
-    let Operation::Kiln(op) = operation;
     let error = |e| Response::Error {
         error: e,
         definitely_not_created: false,
@@ -266,4 +450,40 @@ async fn dispatch(
             response
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit1_normal_operations_cannot_take_reserved_recovery_slots() {
+        let budgets = Budgets::new();
+        let mut held: Vec<_> = (0..NORMAL_OPERATION_SLOTS)
+            .map(|_| budgets.admit(false).expect("a normal slot"))
+            .collect();
+        // Sixty normal operations, including legacy ones: the sixty-first has no slot,
+        // and all four reserved ones remain for recovery alone.
+        assert!(budgets.admit(false).is_none());
+        let recovery: Vec<_> = (0..RESERVED_RECOVERY_SLOTS)
+            .map(|_| budgets.admit(true).expect("a reserved slot"))
+            .collect();
+        assert!(budgets.admit(true).is_none(), "the total is sixty-four");
+        assert!(budgets.admit(false).is_none());
+        // Recovery can also use a free normal slot, so it never starves when idle.
+        held.pop();
+        assert!(budgets.admit(true).is_some());
+        drop(recovery);
+        assert_eq!(budgets.framing.available_permits(), FRAMING_SLOTS);
+        assert_eq!(budgets.attachments.available_permits(), ATTACHMENT_SLOTS);
+        // Health and cleanup are the legacy requests that keep the reserve.
+        for (request, reserved) in [
+            (KilnRequest::Capabilities { id: None }, true),
+            (KilnRequest::Rm { id: "ab".into() }, true),
+            (KilnRequest::Gc { ids: vec![] }, true),
+            (KilnRequest::Ls, false),
+        ] {
+            assert_eq!(request.is_recovery(), reserved, "{request:?}");
+        }
+    }
 }

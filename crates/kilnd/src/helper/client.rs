@@ -19,6 +19,41 @@ pub(crate) struct Client {
     pub path: PathBuf,
     pub expected_uid: u32,
 }
+
+/// A live AttachInstance connection. Dropping it is the detach.
+pub(crate) struct AttachedConnection {
+    _stream: UnixStream,
+}
+
+fn request_for(operation: Operation, deadline: Instant) -> io::Result<Request> {
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .max(1);
+    let deadline_ns = super::monotonic_ns()?
+        .checked_add(
+            u64::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_nanos(),
+            )
+            .map_err(io::Error::other)?,
+        )
+        .ok_or_else(|| io::Error::other("helper deadline overflow"))?;
+    let request = Request {
+        version: VERSION,
+        deadline_ns,
+        timeout_ms: u32::try_from(remaining).map_err(io::Error::other)?,
+        operation,
+    };
+    request.validate(0).map_err(io::Error::other)?;
+    Ok(request)
+}
+
+fn group_deadline(operation: &FirecrackerOperation) -> Instant {
+    Instant::now() + Duration::from_millis(u64::from(operation.timeout_ms()))
+}
+
 impl Client {
     pub async fn call(
         &self,
@@ -26,11 +61,66 @@ impl Client {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> io::Result<Response> {
-        self.exchange(operation, deadline, cancel, None).await
+        self.exchange(Operation::Kiln(operation), deadline, cancel, None)
+            .await
     }
+
+    /// One typed Firecracker exchange. Budgets are the wire's, with the same transport
+    /// allowances as kiln's controls. No descriptor travels either way.
+    pub async fn firecracker(
+        &self,
+        request: FirecrackerRequest,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> io::Result<FirecrackerResponse> {
+        // A longer caller budget narrows to this operation's own; it never fails.
+        let deadline = deadline.min(group_deadline(&request.operation));
+        match self
+            .exchange(Operation::Firecracker(request), deadline, cancel, None)
+            .await?
+        {
+            Response::Firecracker(response) => Ok(response),
+            _ => Err(io::Error::other("unexpected helper reply")),
+        }
+    }
+
+    /// AttachInstance keeps its connection open: one reply, then no EOF until a side
+    /// detaches. It fails only by not attaching, so there is nothing to clean up.
+    pub async fn attach(
+        &self,
+        request: FirecrackerRequest,
+        deadline: Instant,
+    ) -> io::Result<(FirecrackerResponse, AttachedConnection)> {
+        let deadline = deadline.min(group_deadline(&request.operation));
+        let request = request_for(Operation::Firecracker(request), deadline)?;
+        let mut stream = timeout_at(deadline, UnixStream::connect(&self.path))
+            .await
+            .map_err(io::Error::other)??;
+        if stream.peer_cred()?.uid() != self.expected_uid {
+            return Err(io::Error::other("helper is not root"));
+        }
+        let response_deadline = deadline + Duration::from_secs(2);
+        let response = timeout_at(response_deadline, async {
+            fds::send(&stream, &[]).await?;
+            write_frame(&mut stream, &request).await?;
+            if !fds::receive(&stream).await?.is_empty() {
+                return Err(io::Error::other("wrong helper descriptor count"));
+            }
+            read_frame::<Response>(&mut stream).await
+        })
+        .await
+        .map_err(io::Error::other)??;
+        match response {
+            Response::Firecracker(response) => {
+                Ok((response, AttachedConnection { _stream: stream }))
+            }
+            _ => Err(io::Error::other("unexpected helper reply")),
+        }
+    }
+
     async fn exchange(
         &self,
-        operation: KilnRequest,
+        operation: Operation,
         deadline: Instant,
         cancel: &CancellationToken,
         stdio: Option<tokio::sync::oneshot::Sender<Vec<OwnedFd>>>,
@@ -41,34 +131,22 @@ impl Client {
                 "helper deadline/cancellation before request",
             ));
         }
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .max(1);
-        let deadline_ns = super::monotonic_ns()?
-            .checked_add(
-                u64::try_from(
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_nanos(),
-                )
-                .map_err(io::Error::other)?,
-            )
-            .ok_or_else(|| io::Error::other("helper deadline overflow"))?;
         let allowance = match &operation {
-            KilnRequest::Exec { .. } => Duration::from_secs(70),
-            KilnRequest::Create { .. } => Duration::from_secs(5),
-            KilnRequest::Capabilities { .. } => Duration::from_secs(1),
+            Operation::Kiln(KilnRequest::Exec { .. }) => Duration::from_secs(70),
+            Operation::Kiln(KilnRequest::Create { .. }) => Duration::from_secs(5),
+            Operation::Kiln(KilnRequest::Capabilities { .. }) => Duration::from_secs(1),
+            Operation::Firecracker(request) => match request.operation {
+                FirecrackerOperation::Create { .. } => Duration::from_secs(5),
+                FirecrackerOperation::Capabilities => Duration::from_secs(1),
+                _ => Duration::from_secs(2),
+            },
             _ => Duration::from_secs(2),
         };
         let response_deadline = deadline + allowance;
-        let request = Request {
-            version: VERSION,
-            deadline_ns,
-            timeout_ms: u32::try_from(remaining).map_err(io::Error::other)?,
-            operation: Operation::Kiln(operation),
-        };
-        request.validate(0).map_err(io::Error::other)?;
+        // The group answers at its deadline and closes, so a cancel byte can race that
+        // close. Its reply decides the result, not a failed courtesy write.
+        let group = matches!(operation, Operation::Firecracker(_));
+        let request = request_for(operation, deadline)?;
         let mut stream = timeout_at(
             deadline.min(Instant::now() + Duration::from_secs(2)),
             UnixStream::connect(&self.path),
@@ -121,8 +199,16 @@ impl Client {
             tokio::pin!(response);
             tokio::select! {
                 result = &mut response => result,
-                _ = cancel.cancelled() => { writer.write_u8(1).await?; response.await },
-                _ = tokio::time::sleep_until(deadline) => { writer.write_u8(1).await?; response.await },
+                _ = cancel.cancelled() => {
+                    let written = writer.write_u8(1).await;
+                    if !group { written?; }
+                    response.await
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    let written = writer.write_u8(1).await;
+                    if !group { written?; }
+                    response.await
+                },
             }?
         };
         // Exactly one response and EOF, so a prefix cannot be accepted as proof.
@@ -177,7 +263,7 @@ impl Client {
                 stdin_bytes: spec.stdin.len(),
                 max_output: spec.max_output,
             };
-            let exchange = self.exchange(request, spec.deadline, cancel, Some(tx));
+            let exchange = self.exchange(Operation::Kiln(request), spec.deadline, cancel, Some(tx));
             let io_work = async {
                 let descriptors = rx.await.map_err(io::Error::other)?;
                 let mut streams = descriptors.into_iter();

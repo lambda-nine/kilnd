@@ -20,7 +20,9 @@ ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/proc/sys /sys /dev
 InaccessiblePaths=-/dev/kmsg -/proc/kmsg
-ReadWritePaths=/var/lib/kiln /run/kiln /sys/fs/cgroup /proc/sys/net/ipv4/ip_forward
+# Firecracker's root node ledger. No policy is configured by default, so nothing opens
+# it, and nothing here launches a VM: its capabilities arrive in B4 after review.
+ReadWritePaths=/var/lib/kiln /run/kiln /sys/fs/cgroup /proc/sys/net/ipv4/ip_forward -/var/lib/kilnd-helper
 # Namespace/mount setup, network policy, UID maps, quota setup and cleanup.
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
 # With explicit User=root, systemd's seccomp credential transition otherwise

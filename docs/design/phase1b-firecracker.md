@@ -987,3 +987,101 @@ and B4 still own the helper, node ledger and backend. Conservative readings take
 - Restored the original main `734e275` binaries and schema-7 dev database afterwards;
   original binary checksum, 119 rows, ambiguous reservation, Health and quick_check
   were verified. The design PDF was rendered again from this source.
+
+## B3 implementation notes (October 31, 2026)
+
+B3 implements section 11's B3 scope against fake resources. No semantic constraint
+changed. Conservative readings taken where this document left room:
+
+- **Inspect and List in B3.** There is no READY, so `PresentReady` is absent from the
+  wire. An accepted allocation inspects as `PresentBusy`, which the runtime maps to
+  Unknown: `AllocationObservation::Present` needs a boot receipt that cannot exist yet.
+- **A fence over an accepted token.** Section 4.1 describes a token rejected before
+  INTENT; section 4.5's lost-reply row and the required races also need one for a token
+  whose INTENT committed. FenceAbsent releases that claim in the same transaction only
+  if S has really exited and every worker row is settled. It removes nothing: a resource
+  S made stays a refusal (`ResourcesPresent`), since cleanup is B4's Remove. A worker row
+  with no recorded identity never had an open gate, so it settles as never started.
+- **Lookup past an expired deadline.** "Fence lookup first" and "no fresh budgets" meet at
+  an expired request. Only the read-only lookup may answer, within 250 ms of the deadline.
+  It returns an existing fence or refuses, and no later step runs. A fence attempt that
+  reaches the token lock after its own deadline refuses and leaves the gate as it was.
+- **Stale namespace ownership.** A different database UUID attaches with admission closed
+  and cannot rebind. It can read, and it cannot fence or claim until an operator resolves
+  it; the design's repair flow is B6.
+- **Peer start time.** H cannot read `/proc`, so L reads it at attach. It is recorded with
+  the attachment; the binding H checks on each call is the 128-bit epoch, the peer PID and
+  the live connection, whose EOF retires the epoch before that PID could be reused.
+- **Infrastructure identity.** The contract has no separate worker image, so L/P/S/M/K
+  journal the inherited `kilnd-helper` tuple. With no approved profile no image is pinned,
+  and those rows and admission are absent. S models dispatch by comparing each role's
+  retained descriptor with the plan and journals that actual tuple. R and D don't exist yet.
+- **Slot waits.** Preflight refuses when both P slots are busy. Create revalidation may
+  wait among at most 16 waiters up to its wire deadline, or concurrent admission would
+  fail on a transient; it never adds a process or borrows K.
+- **Fence headroom.** Each token is bounded at 4096 bytes, and 1024 tokens' worth of the
+  64 MiB allowance stays reserved for C1 rows the helper has not seen. Preflight and C2
+  refuse a new token past that; a fence for an existing token is always allowed.
+- **POSIX record locks.** Closing any descriptor for a file drops all of a process's locks
+  on it, including SQLite's. The ledger therefore inspects its files with `fstatat` once
+  a connection can exist. Opening `-shm` after SQLite would release its DMS lock.
+- **Startup work.** Policy, manifest and executable verification run in H before its
+  listener serves, as section 3.4 requires of the self-check. A stuck store can therefore
+  delay a configured helper's start, but only when a policy opts in. A lock still held
+  after five seconds leaves the group disabled for that run, with kiln unaffected.
+- **Test seams.** Fake catalog approval, fake resources and fault points are `cfg(test)`
+  only: production has no such variant, flag or environment hook. Fixture schemas are
+  refused under the test gate as well. A test manifest is production-shaped and made at
+  test time, and test walks skip ACL checks because a scratch filesystem may lack the
+  xattrs; the root Linux tests enforce them from `/`.
+
+**Review corrections (October 31, 2026).** An engineering review reproduced six control
+failures; these fixes change no semantic constraint:
+
+- **Monitor exit** fences and contains every existing boot through K before its slot can
+  be reassigned, and those boots never regain forward effects. Every replacement worker
+  settles its predecessor's permit after the reap and journals its expected image and
+  identity before receiving work; if L can't answer, no replacement happens. L must exist
+  to write, so it alone forks first and journals as its first act.
+- **Stale S heartbeats** now stop: H and M each request containment independently, with S's
+  slot, permit and charge kept. Any fence also revokes S, and S reads every queued command
+  before each effect.
+- **Emergency fan-out** is a bounded pending set in M that only an original K slot's reply
+  drains, owned through H's EOF until every target settles, without an ownership timeout.
+  M keeps idle K slots alive with private heartbeats while another K is stuck; K leaves
+  only after M stops sending for three seconds. Ledger replay remains a fallback.
+  `exit4_helper_loss_retains_pending_stops_without_an_ownership_timeout` stalls both K
+  processes past 30 seconds, then proves the original slots finish every pending stop. H also retries its own
+  dispatch each tick, one per subtree.
+- **Detach revokes pending admissions.** Generations live in a shared page mapped before any
+  fork. The commit-point read sits after every test stall, immediately before COMMIT. H
+  rechecks after P, after L's reply and before S's gate. A closed-admission attachment never
+  publishes a generation. A commit that wins the race keeps its claim, and gets no effects.
+- **The deadline carries through C3.** Everything forward uses the original wire deadline,
+  including `OpenGate`, which S checks before each effect. Detached work keeps its claim and
+  its cleanup, not unlimited start authority. An expired read-only lookup may return a fence
+  and nothing else: an accepted token answers `Expired`, not `Accepted`.
+- **Framing and dispatch are separate budgets:** 128 framing slots, then 60 normal plus 4
+  reserved operation slots after classification, including legacy operations (kiln
+  capabilities, `rm` and `gc` are reserved), and 16 attachment slots. This protects
+  dispatch, not raw connection fairness: 128 silent connections can still delay framing.
+
+**Exit tests** (`crates/kilnd/src/helper/firecracker/`): exit 1 `tests.rs::exit1_*`
+(including `exit1_absolute_wire_deadlines_*` and `exit1_a_full_operation_budget_*`), `server.rs`,
+`config.rs` and `manifest.rs` mutation tests; exit 2 `tests.rs::exit2_*`, including all
+eight forced races, the real Manager path, and `exit2_old_epoch_revoked_*` during P, queued
+in L and racing C2; exit 3 `tests.rs::exit3_*` and
+`journal/tests.rs::exit3_*`; exit 4 `tests.rs::exit4_*`, with stopped and stalled real
+processes behind the real listener, including `exit4_monitor_exit_fences_before_replacement`,
+`exit4_monitor_requests_a_stale_supervisors_stop_without_help_from_h` and
+`exit4_helper_loss_contains_all_three_allocations_with_two_recovery_slots`; exit 5 `executable/tests.rs::exit5_*`,
+`tests.rs::exit5_*` and journal lease tests, plus the root Linux
+`exit5_linux_root_*` tests in `scripts/integration-test.sh`; exit 6
+`journal/tests.rs::exit6_*` and `tests.rs::exit6_*`.
+
+**Remaining, by design:** B4 owns real storage, cgroups, jail, loop device, the patched
+jailer and the actual J/V chain with `/proc` evidence, real namespace observation and
+Remove/Stop, S/M pidfds and parent-death signals, host capability and free-space checks
+at preflight, capability grants, and a static helper image. B5 owns the broker, R, D and
+READY. B6 owns manager recovery, reconciliation and DB-repair flows. B7 alone may lift the
+production gate and let `main.rs` select this backend.

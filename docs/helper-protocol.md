@@ -10,8 +10,9 @@ including rejecting root connections. API group membership alone grants no
 helper access. The daemon verifies that its helper peer is root.
 
 The helper accepts a private v3 typed request enum. Its outer `operation` enum
-has one `kiln` variant; a future backend needs a separately validated variant.
-There are no Firecracker requests today. No request chooses an executable,
+has `kiln` and `firecracker` variants, each separately validated. The Firecracker
+group is described [below](#firecracker-group-schema-1); it is disabled by default
+and cannot launch anything in this build. No request chooses an executable,
 host path, environment, arbitrary kiln flags, or shell text. The root-owned
 helper command line fixes the kiln executable. Its canonical file and every
 ancestor must be root-owned and not group/other writable.
@@ -79,10 +80,19 @@ counts and sizes before any backend invocation. Hard ceilings are 8 GiB memory,
 32 labels, 4096 argv entries / 256 KiB argv, 1 MiB stdin and 1 MiB retained
 output per stream. GC has at most 1024 unique IDs per call; the daemon chunks
 larger scopes. Exec deadlines are at most one hour; control requests at most
-120 seconds. Header/body and output transfer have two second bounds, and there
-are at most 64 active connections/operations. Excess connections close. Slow
-clients consume bounded slots. Stdio readers continue counting after the
-retained prefix reaches its limit.
+120 seconds. Header/body and output transfer have two second bounds.
+
+Connections and operations have separate bounds. At most 128 connections can be
+reading their frame, each for at most two seconds, and only a framed, classified
+request takes an operation slot. There are 64 operation slots: 60 for anything and
+4 reserved for recovery, which are kiln capabilities, `rm` and `gc` and Firecracker
+`capabilities`, `inspect` and `fence_absent`. A normal operation, legacy or not, can
+never take a reserved slot; a kiln request with no slot closes without a reply, as
+before, and a group request answers `resource_exhausted`. Slow clients consume only
+framing slots, for a bounded time. This is not fairness against every raw connection:
+a peer holding 128 silent connections open can still delay framing. Only the service
+UID can connect at all, and the reserve protects dispatch of whatever gets framed.
+Stdio readers continue counting after the retained prefix reaches its limit.
 
 The root runtime retains ownership through child termination, reaping and
 capture settlement after deadline or cancellation. Create, remove, list and GC
@@ -99,6 +109,90 @@ Health publishes its deadline failure while owned probe cleanup keeps draining,
 without admitting a replacement probe. A failed helper exchange is an
 ambiguous create failure, or an Exec CleanupFailed result retaining already observed output prefixes; it cannot claim
 allocation absence, exact output totals, or successful execution.
+
+## Firecracker group schema 1
+
+`operation: {"firecracker": {group_version, instance_id, connection_epoch, operation}}`
+travels inside the same v3 envelope, deadline, frame bound and peer checks. Kiln
+frames and every kiln reply are byte-identical to before; regression goldens pin
+them. Replies use the separate `Response::Firecracker` branch. An old v3 helper
+closes the connection on the unknown variant, which is how a client detects it.
+
+The whole group frame must also be strict JSON: duplicate keys anywhere, including
+inside labels, close the connection without a reply, as do floats, depth above 32,
+unknown fields, a wrong group version and a misplaced epoch. No descriptor crosses
+in either direction. Nothing in the group can carry a path, UID, CID, PID, flag,
+command or environment. Identities are typed 128-bit IDs and digests, profiles are
+`[a-z0-9-]{1,64}`, and plan and receipt bytes are bounded lowercase hex.
+
+| Operation | Budget | Result |
+| --- | --- | --- |
+| `attach_instance {database_uuid}` | 5 s | `attached {node_id, connection_epoch, admission_open}`, and the connection stays open: its EOF is the detach |
+| `capabilities` | 2 s | Cached group and worker health. Without a policy: `enabled: false` |
+| `accounting` | 5 s | Node totals with generation and once-only shared reserve, or `unknown`. No other namespace's identity |
+| `preflight {allocation_id, sandbox_id, profile, spec}` | 30 s | `prepared` plan bytes, digests and reservation, or a refusal with no session effects |
+| `create {allocation_id, sandbox_id, plan, plan_digest}` | 120 s | `accepted`, the token's `absent` fence, or `ambiguous {class}`. There is no READY variant |
+| `inspect {allocation_id}` | 5 s | `present_busy`, `stopped_with_resources`, `absent_fenced`, `incompatible` or `unknown`. A missing record is `unknown` |
+| `list` | 30 s | This namespace's records with `complete`; anything stale or unexplained makes it incomplete |
+| `fence_absent {allocation_id, sandbox_id, plan_digest}` | 30 s | The permanent receipt, byte for byte, or `ambiguous {class}` |
+
+Only one live attachment may hold an instance ID. Every other operation needs the
+helper-issued epoch from that connection, and the same peer PID. An epoch dies with
+its connection or the helper; accepted work and its claims do not. A namespace whose
+stored database UUID differs gets `admission_open: false`, and can only read.
+
+Detach also revokes what is already in flight. Each attachment has a generation in a
+shared page mapped before any fork; H clears it with one atomic store, without waiting
+on L. Create rechecks it after P answers, L reads it at its commit point, and H rechecks
+it after L's reply and again before S's gate. A commit that just beat the revocation
+keeps its claim for an exact fence, and no effect starts.
+
+Create and FenceAbsent look the token up in the ledger before checking the epoch,
+the deadline or the catalog: an existing fence answers unchanged, even to a stale
+caller, and a conflicting record is never reported as absent. A read-only lookup may
+answer up to 250 ms after an expired wire deadline, and that authorizes nothing.
+The first rejection closes the token's in-memory gate, and only its durable fence
+ever answers for it again. A later cause clearing does not reopen it. Those two
+operations run detached from their waiter, whose disconnect or timeout gets
+`ambiguous {pending}` while permits and ownership stay put. The last four of the 64
+operation slots serve only recovery, and a live attachment occupies none: attachments
+have their own bound of 16.
+
+A wire deadline bounds all of Create's forward setup, not just its first reply. C2's
+reply, M's watch acknowledgement, S's identity and PREPARING records, the gate, and each
+later effect inside S all check the same original deadline. Once it passes no new S
+starts, a stop is recorded, and a permit with no process settles as never started. The
+claim stays, and cleanup keeps its own separate bounds.
+
+H, the listener, stays current-thread and does framing, peer checks, in-memory
+state and dispatch. Its fixed fork-only workers hold everything else:
+
+| Worker | Count | Does |
+| --- | --- | --- |
+| L | 1 | The sole SQLite connection to the root node ledger, serially |
+| P | 2 slots | Hashing, catalog and plan verification, namespace reads. Read-only |
+| S | 1 per accepted allocation | Gated until M acknowledges its watch and L records its identity and permit |
+| M | 1 | Heartbeat and EOF watches, stop dispatch; fails closed when H goes silent |
+| K | 2 slots | Stops an already-authorized subtree by verified identity, independent of L and S |
+
+Worker sockets carry bounded framed typed messages, with absolute deadlines and
+reader and writer tasks independent of any waiter. L's queue has four reserved
+slots. Preflight refuses at once when both P slots are busy; Create may wait for one
+among at most 16 waiters and never past its deadline. A worker stuck in a syscall
+keeps its slot: a slot is reassigned only after that process has exited and been
+reaped and its permit has settled in the ledger. A replacement's expected image and
+identity are journaled before it is given any work (L, which must exist to write, does
+this first thing). When M exits, every existing boot is fenced and contained through K
+before a new M can exist, and those boots get no forward effects again.
+
+A stale S heartbeat is an irrevocable stop, requested by both M and H, while the same S
+keeps its slot and its charge. M's stop work over the two K slots is a bounded pending
+set: a target waits for a slot's own reply instead of being dropped when both are
+busy. M owns that set through H's death until every target settles, with no ownership
+timeout. Private heartbeats keep idle K slots available while another K is stuck;
+ledger replay remains a fallback. A K that can't finish leaves the stop unknown and charged. In this build S's side
+effects are test-injected fake files and a fake child process. Production S performs
+none, and reports the retained-descriptor identity it would dispatch.
 
 ## Trust and failure analysis
 
@@ -162,7 +256,8 @@ writes. The bounding/effective/permitted mask remains `0x2010eb`, ambient is
 and a real Create/Exec lifecycle under the filtered unit.
 
 The helper stays on a current-thread runtime: adding worker threads would only
-move the risk to worker-pool exhaustion. All helper socket reads/writes use
+move the risk to worker-pool exhaustion. Firecracker's blocking work runs in separate
+fixed processes for the same reason. All helper socket reads/writes use
 `recv`/`send` (including descriptor envelopes) with `MSG_DONTWAIT` and readiness
 retry, even on control sockets. AF_UNIX `shutdown(SHUT_WR)` signals EOF without
 waiting for queued output to drain or consulting `O_NONBLOCK`. Request parsing,

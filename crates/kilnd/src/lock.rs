@@ -175,6 +175,12 @@ impl ExclusiveFileLock {
         })
     }
 
+    /// For a forked worker's keep-list: flock belongs to the open file description,
+    /// so an inheriting process holds the lock until it too has closed this.
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        self._file.as_raw_fd()
+    }
+
     #[cfg(test)]
     pub(crate) fn with_drop_probe(mut self, probe: impl FnOnce() + Send + Sync + 'static) -> Self {
         self.drop_probe = Some(Box::new(probe));

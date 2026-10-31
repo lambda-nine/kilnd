@@ -147,9 +147,42 @@ CleanupFailed/Cleanup. Previously observed status and bytes survive failures.
 Runtime::exec returns this evidence directly; non-exec methods retain Results.
 
 An allocation-token backend also needs preflight, recovery by exact token and
-receipts bound to its identity. That contract exists in B2 only through
-`FakeRuntime`'s `Fenced` mode: no Firecracker backend, helper operation or node
-ledger exists yet, and `main.rs` still selects kiln only.
+receipts bound to its identity. `FakeRuntime`'s `Fenced` mode exercises that contract
+for the manager. `FirecrackerRuntime` is the unprivileged typed client for the helper's
+Firecracker group: it reconstructs and verifies each prepared plan, and its create can
+end only in a matching fence or a charged ambiguous failure, because this build has no
+VM launch and no READY reply. `main.rs` still selects kiln only, and B7 alone may change
+that. The helper's side is the [root node ledger](#firecracker-node-authority).
+
+### Firecracker node authority
+
+`helper/firecracker` holds approved plans, the root ledger and the fixed worker
+processes ([protocol](helper-protocol.md#firecracker-group-schema-1),
+[design](design/phase1b-firecracker.md#b3-implementation-notes-october-31-2026)). With
+no `--firecracker-policy` the group answers Disabled. With one, a node ledger and
+fixed workers run, and the production manifest gate still refuses every profile, so
+every Preflight is a C0 refusal.
+
+`node.db` is SQLite in WAL/FULL with foreign keys on and `trusted_schema` off, in a
+pinned root 0700 directory, with one single-link 0600 database and sidecars; only the
+L process opens it. An explicit `--firecracker-init-ledger` creates it, and opening a
+missing, partial, corrupt or foreign one fails closed. Startup rejects a changed schema
+or row-level mismatch. One persistent lock excludes a second helper.
+
+C2 is one transaction that claims the full reservation vector, the VMM and relay
+UID/GID leases and the CID, and records INTENT, the plan, the executable leases, the
+conditional stop authority and the supervisor's intent. BEFORE triggers guard every
+unique key against each conflict algorithm. Each release goes through one
+FULL-sync transaction: permanent retired token, matching receipt, then claim and lease
+release, all or nothing. A fence needs every worker settled and the namespace
+positively absent. Shared infrastructure counts once. A lowered ceiling denies new
+admission and discounts nothing.
+
+An installed executable is retained by descriptor after a no-symlink walk from `/`
+with owner, mode, ACL and link checks, and every later check uses that descriptor.
+A restart reopens only the exact journaled tuple, so a replacement inode with
+identical bytes is refused. These are unprivileged property tests and root Linux
+tests in B3; only B4 launches anything.
 
 ## State machine
 

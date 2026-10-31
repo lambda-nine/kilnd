@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B3: add the typed Firecracker helper group (disabled by default), approved
+  plan verification, the root node ledger with durable claims and permanent absence
+  fences, protected retained-descriptor executable handling, and fixed L/P/S/M/K worker
+  processes. Fake resources only, under test; no VM launch, no READY reply, and every
+  profile refused by the production gate. Kiln wire bytes are unchanged, except that a
+  peer vanishing before its credentials can be read no longer ends the helper's listener.
+  The helper's connection budget splits: 128 framing slots, then 60 normal and 4 reserved
+  recovery operation slots after classification, so silent clients cannot occupy dispatch.
+
 - Close B2 recheck findings in schema 10: audit release receipts in trusted Rust
   reads, retain invalid releases as charged/quarantined, degrade Health and refuse
   admission. Detect missing reservation membership with an atomic SHA-256 marker.
