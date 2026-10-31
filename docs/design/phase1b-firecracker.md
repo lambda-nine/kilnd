@@ -34,7 +34,7 @@ e855fbee1914cc6ea5e57a1250610e128412c85a905c94a48fb54afdaa47f3d3
 
 That is **reference evidence, not approval to run this backend**. Its production contract fixes 768 MiB, one vCPU, THP, two drives, UID/GID 10000, no vsock, no outer cgroup limits and no new PID namespace. It has no broker. Silently adding vsock or changing jailer flags would violate that contract, even if the change appears safer.
 
-Phase 1b therefore needs a new bundle/contract revision and a newly approved manifest digest. Section 3 defines the required semantics; final serialized field names and schema numbers must be agreed with kiln-guest and frozen as shared golden fixtures in build step B1. Until then the backend refuses the current production profile. There is no permissive “legacy contract” mode.
+Phase 1b therefore needs a new bundle/contract revision and a newly approved manifest digest. Section 3 defines the required semantics; final serialized field names and schema numbers must be agreed with kiln-guest and frozen as shared golden fixtures in build step B1 (now manifest and contract schema 2, in `crates/kilnd/tests/fixtures/firecracker/`). Until then the backend refuses the current production profile. There is no permissive “legacy contract” mode.
 
 # 2. Architecture and trust
 
@@ -130,7 +130,7 @@ rootfstype=squashfs ro init=/init loglevel=3
 randomize_kstack_offset=on
 ```
 
-Those three display lines serialize as one space-separated line. The current appended suffix is ` pci=off root=/dev/vda ro earlycon=uart,mmio,0x40002000`; freeze and test its actual value for the new three-drive/vsock topology. Never hard-code acceptance of an unverified changed suffix. These are build B1 exit criteria, not permission to weaken init's exact comparison.
+Those three display lines serialize as one space-separated line. The current appended suffix is ` pci=off root=/dev/vda ro earlycon=uart,mmio,0x40002000`; freeze and test its actual value for the new three-drive/vsock topology. Never hard-code acceptance of an unverified changed suffix. These are build B1 exit criteria, not permission to weaken init's exact comparison. **B1 measured this:** real Firecracker 1.17.0 boots with three drives and vsock append the same suffix, and the contract freezes it (kiln-guest `results/phase1b-b1/suffix-probe.json`).
 
 ## 3.4 Executable identity from verification through exec
 

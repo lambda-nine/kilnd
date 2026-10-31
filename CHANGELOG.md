@@ -6,6 +6,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Freeze the Phase 1b `offline-768-v1` guest and launch contract (schema 2) as golden
+  fixtures shared with kiln-guest, with an independent Rust check of its plan, digests
+  and identity block. Fixtures only: production stays disabled without the broker.
+
 - Bind the Phase 1b design's complete helper executable chain to verified inodes,
   add replacement-race gates, and record Stephen's October 31 design decisions.
 

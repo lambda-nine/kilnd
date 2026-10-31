@@ -1,0 +1,413 @@
+{
+  "C0": "zero-session-side-effects",
+  "argv_and_prior_digest": "insufficient",
+  "boundaries": [
+    "before-S-exec-J",
+    "before-J-exec-V",
+    "before-formatter-exec",
+    "before-worker-exec"
+  ],
+  "cases": [
+    {
+      "accept": true,
+      "expected": {
+        "bytes": 131,
+        "installation_generation": 1,
+        "role": "jailer",
+        "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+        "st_dev": 2049,
+        "st_ino": 8000
+      },
+      "observed": {
+        "bytes": 131,
+        "role": "jailer",
+        "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+        "st_dev": 2049,
+        "st_ino": 8000
+      },
+      "race": "retained-fd-after-source-and-name-replacement",
+      "role": "jailer"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 131,
+        "installation_generation": 1,
+        "role": "jailer",
+        "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+        "st_dev": 2049,
+        "st_ino": 8000
+      },
+      "observed": {
+        "bytes": 131,
+        "role": "jailer",
+        "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+        "st_dev": 2049,
+        "st_ino": 9000
+      },
+      "race": "installed-identical-bytes-new-inode",
+      "role": "jailer"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 131,
+        "installation_generation": 1,
+        "role": "jailer",
+        "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+        "st_dev": 2049,
+        "st_ino": 8000
+      },
+      "observed": {
+        "bytes": 131,
+        "role": "jailer",
+        "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+        "st_dev": 2050,
+        "st_ino": 8000
+      },
+      "race": "other-device-same-inode",
+      "role": "jailer"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 131,
+        "installation_generation": 1,
+        "role": "jailer",
+        "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+        "st_dev": 2049,
+        "st_ino": 8000
+      },
+      "observed": {
+        "bytes": 131,
+        "role": "jailer",
+        "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+        "st_dev": 2049,
+        "st_ino": 10000
+      },
+      "race": "installed-name-different-bytes",
+      "role": "jailer"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 131,
+        "installation_generation": 1,
+        "role": "jailer",
+        "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+        "st_dev": 2049,
+        "st_ino": 8000
+      },
+      "observed": {
+        "bytes": 132,
+        "role": "jailer",
+        "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+        "st_dev": 2049,
+        "st_ino": 8000
+      },
+      "race": "size-only-disagreement",
+      "role": "jailer"
+    },
+    {
+      "accept": true,
+      "expected": {
+        "bytes": 136,
+        "installation_generation": 1,
+        "role": "firecracker",
+        "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+        "st_dev": 2049,
+        "st_ino": 8001
+      },
+      "observed": {
+        "bytes": 136,
+        "role": "firecracker",
+        "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+        "st_dev": 2049,
+        "st_ino": 8001
+      },
+      "race": "retained-fd-after-source-and-name-replacement",
+      "role": "firecracker"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 136,
+        "installation_generation": 1,
+        "role": "firecracker",
+        "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+        "st_dev": 2049,
+        "st_ino": 8001
+      },
+      "observed": {
+        "bytes": 136,
+        "role": "firecracker",
+        "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+        "st_dev": 2049,
+        "st_ino": 9001
+      },
+      "race": "installed-identical-bytes-new-inode",
+      "role": "firecracker"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 136,
+        "installation_generation": 1,
+        "role": "firecracker",
+        "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+        "st_dev": 2049,
+        "st_ino": 8001
+      },
+      "observed": {
+        "bytes": 136,
+        "role": "firecracker",
+        "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+        "st_dev": 2050,
+        "st_ino": 8001
+      },
+      "race": "other-device-same-inode",
+      "role": "firecracker"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 136,
+        "installation_generation": 1,
+        "role": "firecracker",
+        "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+        "st_dev": 2049,
+        "st_ino": 8001
+      },
+      "observed": {
+        "bytes": 136,
+        "role": "firecracker",
+        "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+        "st_dev": 2049,
+        "st_ino": 10001
+      },
+      "race": "installed-name-different-bytes",
+      "role": "firecracker"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 136,
+        "installation_generation": 1,
+        "role": "firecracker",
+        "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+        "st_dev": 2049,
+        "st_ino": 8001
+      },
+      "observed": {
+        "bytes": 137,
+        "role": "firecracker",
+        "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+        "st_dev": 2049,
+        "st_ino": 8001
+      },
+      "race": "size-only-disagreement",
+      "role": "firecracker"
+    },
+    {
+      "accept": true,
+      "expected": {
+        "bytes": 133,
+        "installation_generation": 1,
+        "role": "mkfs.xfs",
+        "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+        "st_dev": 2049,
+        "st_ino": 8002
+      },
+      "observed": {
+        "bytes": 133,
+        "role": "mkfs.xfs",
+        "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+        "st_dev": 2049,
+        "st_ino": 8002
+      },
+      "race": "retained-fd-after-source-and-name-replacement",
+      "role": "mkfs.xfs"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 133,
+        "installation_generation": 1,
+        "role": "mkfs.xfs",
+        "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+        "st_dev": 2049,
+        "st_ino": 8002
+      },
+      "observed": {
+        "bytes": 133,
+        "role": "mkfs.xfs",
+        "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+        "st_dev": 2049,
+        "st_ino": 9002
+      },
+      "race": "installed-identical-bytes-new-inode",
+      "role": "mkfs.xfs"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 133,
+        "installation_generation": 1,
+        "role": "mkfs.xfs",
+        "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+        "st_dev": 2049,
+        "st_ino": 8002
+      },
+      "observed": {
+        "bytes": 133,
+        "role": "mkfs.xfs",
+        "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+        "st_dev": 2050,
+        "st_ino": 8002
+      },
+      "race": "other-device-same-inode",
+      "role": "mkfs.xfs"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 133,
+        "installation_generation": 1,
+        "role": "mkfs.xfs",
+        "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+        "st_dev": 2049,
+        "st_ino": 8002
+      },
+      "observed": {
+        "bytes": 133,
+        "role": "mkfs.xfs",
+        "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+        "st_dev": 2049,
+        "st_ino": 10002
+      },
+      "race": "installed-name-different-bytes",
+      "role": "mkfs.xfs"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 133,
+        "installation_generation": 1,
+        "role": "mkfs.xfs",
+        "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+        "st_dev": 2049,
+        "st_ino": 8002
+      },
+      "observed": {
+        "bytes": 134,
+        "role": "mkfs.xfs",
+        "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+        "st_dev": 2049,
+        "st_ino": 8002
+      },
+      "race": "size-only-disagreement",
+      "role": "mkfs.xfs"
+    },
+    {
+      "accept": true,
+      "expected": {
+        "bytes": 137,
+        "installation_generation": 1,
+        "role": "kilnd-helper",
+        "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+        "st_dev": 2049,
+        "st_ino": 8003
+      },
+      "observed": {
+        "bytes": 137,
+        "role": "kilnd-helper",
+        "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+        "st_dev": 2049,
+        "st_ino": 8003
+      },
+      "race": "retained-fd-after-source-and-name-replacement",
+      "role": "kilnd-helper"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 137,
+        "installation_generation": 1,
+        "role": "kilnd-helper",
+        "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+        "st_dev": 2049,
+        "st_ino": 8003
+      },
+      "observed": {
+        "bytes": 137,
+        "role": "kilnd-helper",
+        "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+        "st_dev": 2049,
+        "st_ino": 9003
+      },
+      "race": "installed-identical-bytes-new-inode",
+      "role": "kilnd-helper"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 137,
+        "installation_generation": 1,
+        "role": "kilnd-helper",
+        "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+        "st_dev": 2049,
+        "st_ino": 8003
+      },
+      "observed": {
+        "bytes": 137,
+        "role": "kilnd-helper",
+        "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+        "st_dev": 2050,
+        "st_ino": 8003
+      },
+      "race": "other-device-same-inode",
+      "role": "kilnd-helper"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 137,
+        "installation_generation": 1,
+        "role": "kilnd-helper",
+        "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+        "st_dev": 2049,
+        "st_ino": 8003
+      },
+      "observed": {
+        "bytes": 137,
+        "role": "kilnd-helper",
+        "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+        "st_dev": 2049,
+        "st_ino": 10003
+      },
+      "race": "installed-name-different-bytes",
+      "role": "kilnd-helper"
+    },
+    {
+      "accept": false,
+      "expected": {
+        "bytes": 137,
+        "installation_generation": 1,
+        "role": "kilnd-helper",
+        "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+        "st_dev": 2049,
+        "st_ino": 8003
+      },
+      "observed": {
+        "bytes": 138,
+        "role": "kilnd-helper",
+        "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+        "st_dev": 2049,
+        "st_ino": 8003
+      },
+      "race": "size-only-disagreement",
+      "role": "kilnd-helper"
+    }
+  ],
+  "post_C1": "charged-until-AbsentFenced"
+}

@@ -1,0 +1,190 @@
+{
+  "architecture": "aarch64",
+  "artifacts": {
+    "Image": {
+      "bytes": 17807872,
+      "sha256": "0015f87e136b314a164b30f5255a1589144a3937db0dce00d5eef6c0fdbf2e6a"
+    },
+    "kernel.config": {
+      "bytes": 95549,
+      "sha256": "f07a7ffd291f4ad821e3f4f0f2e0ab1928d3024103f3c74d71e541765cc2d4e9"
+    },
+    "kiln": {
+      "bytes": 2376016,
+      "sha256": "54442ccc0ce12b9a9236c927b9073019d7d4774c2e2d82f4d55d0db491925c64"
+    },
+    "rootfs.squashfs": {
+      "bytes": 7380992,
+      "sha256": "d73081a2029b502d21627a63762c407791eae18a6646aa955b133a15984e39a0"
+    }
+  },
+  "broker": {
+    "enabled": false,
+    "protocol": null
+  },
+  "bundle_version": "0.1.0",
+  "firecracker_version": "1.17.0",
+  "inputs": {
+    "omitted_inventory_sha256": "20c3f231dc7c71d8a36c5fe48f95fb27b2006e8aaafbb28f8b54c82c7069c2b7",
+    "projected_from_manifest_sha256": "e855fbee1914cc6ea5e57a1250610e128412c85a905c94a48fb54afdaa47f3d3"
+  },
+  "kernel_version": "6.18.56-kiln-guest1",
+  "kiln_commit": "00d61c546db7aa67ad283d10c2ca6165ca5f8166",
+  "launch_contract": {
+    "boot": "cold-only",
+    "cpu_template": null,
+    "firecracker_cmdline_suffix": " pci=off root=/dev/vda ro earlycon=uart,mmio,0x40002000",
+    "profiles": {
+      "production": {
+        "firecracker": {
+          "boot-source": {
+            "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/init loglevel=3 randomize_kstack_offset=on",
+            "kernel_image_path": "/kernel"
+          },
+          "drives": [
+            {
+              "drive_id": "rootfs",
+              "is_read_only": true,
+              "is_root_device": true,
+              "path_on_host": "/rootfs"
+            },
+            {
+              "drive_id": "work",
+              "is_read_only": false,
+              "is_root_device": false,
+              "path_on_host": "/work"
+            }
+          ],
+          "machine-config": {
+            "huge_pages": "Transparent",
+            "mem_size_mib": 768,
+            "smt": false,
+            "track_dirty_pages": false,
+            "vcpu_count": 1
+          }
+        },
+        "jailer": {
+          "api_socket": "/api.sock",
+          "cgroup_version": 2,
+          "cgroups": [],
+          "config_file": "/config.json",
+          "daemonize": false,
+          "gid": 10000,
+          "new_pid_namespace": false,
+          "parent_cgroup": null,
+          "resource_limits": [],
+          "seccomp": "default",
+          "uid": 10000
+        }
+      },
+      "test-network": {
+        "firecracker": {
+          "boot-source": {
+            "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/init loglevel=3 randomize_kstack_offset=on kiln.test=1 kiln.net=1",
+            "kernel_image_path": "/kernel"
+          },
+          "drives": [
+            {
+              "drive_id": "rootfs",
+              "is_read_only": true,
+              "is_root_device": true,
+              "path_on_host": "/rootfs"
+            },
+            {
+              "drive_id": "work",
+              "is_read_only": false,
+              "is_root_device": false,
+              "path_on_host": "/work"
+            }
+          ],
+          "machine-config": {
+            "huge_pages": "Transparent",
+            "mem_size_mib": 768,
+            "smt": false,
+            "track_dirty_pages": false,
+            "vcpu_count": 1
+          },
+          "network-interfaces": [
+            {
+              "guest_mac": "06:00:ac:1e:63:02",
+              "host_dev_name": "kgtest0",
+              "iface_id": "eth0"
+            }
+          ]
+        },
+        "jailer": {
+          "api_socket": "/api.sock",
+          "cgroup_version": 2,
+          "cgroups": [],
+          "config_file": "/config.json",
+          "daemonize": false,
+          "gid": 10000,
+          "new_pid_namespace": false,
+          "parent_cgroup": null,
+          "resource_limits": [],
+          "seccomp": "default",
+          "uid": 10000
+        }
+      },
+      "test-offline": {
+        "firecracker": {
+          "boot-source": {
+            "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/init loglevel=3 randomize_kstack_offset=on kiln.test=1",
+            "kernel_image_path": "/kernel"
+          },
+          "drives": [
+            {
+              "drive_id": "rootfs",
+              "is_read_only": true,
+              "is_root_device": true,
+              "path_on_host": "/rootfs"
+            },
+            {
+              "drive_id": "work",
+              "is_read_only": false,
+              "is_root_device": false,
+              "path_on_host": "/work"
+            }
+          ],
+          "machine-config": {
+            "huge_pages": "Transparent",
+            "mem_size_mib": 768,
+            "smt": false,
+            "track_dirty_pages": false,
+            "vcpu_count": 1
+          }
+        },
+        "jailer": {
+          "api_socket": "/api.sock",
+          "cgroup_version": 2,
+          "cgroups": [],
+          "config_file": "/config.json",
+          "daemonize": false,
+          "gid": 10000,
+          "new_pid_namespace": false,
+          "parent_cgroup": null,
+          "resource_limits": [],
+          "seccomp": "default",
+          "uid": 10000
+        }
+      }
+    },
+    "schema": 1,
+    "snapshot_restore": false
+  },
+  "launch_profile": {
+    "huge_pages": "Transparent"
+  },
+  "schema": 1,
+  "source_date_epoch": 1793318400,
+  "work_disk": {
+    "filesystem": "xfs",
+    "minimum_mib": 512,
+    "mount_options": [
+      "nosuid",
+      "nodev",
+      "noexec",
+      "prjquota"
+    ]
+  }
+}

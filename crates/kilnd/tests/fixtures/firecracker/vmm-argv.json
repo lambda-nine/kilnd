@@ -1,0 +1,14 @@
+[
+  "/firecracker",
+  "--id",
+  "fc-2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+  "--start-time-us",
+  "1793318400000000",
+  "--start-time-cpu-us",
+  "0",
+  "--parent-cpu-time-us",
+  "1250",
+  "--no-api",
+  "--config-file",
+  "/config.json"
+]

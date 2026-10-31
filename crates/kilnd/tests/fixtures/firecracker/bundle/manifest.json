@@ -1,0 +1,651 @@
+{
+  "architecture": "aarch64",
+  "artifacts": {
+    "Image": {
+      "bytes": 24,
+      "sha256": "60a3c69c8cb23874b06caf7fe0fd0a5245cc44899b359b4c518b5c6390fbf18f"
+    },
+    "kernel.config": {
+      "bytes": 32,
+      "sha256": "f4c45a08aaa43fe5f6c939c31e746dd9db697487f946e9803d6503c28b1c0665"
+    },
+    "kiln": {
+      "bytes": 129,
+      "sha256": "ed521b90649fd763d504c85c0b93e8f96a224e3f6817b170771a8e672eb121dc"
+    },
+    "kilnd-guest-broker": {
+      "bytes": 143,
+      "sha256": "c4c151348c6b4202058d421d06071480cde69a687d4f445c1a9608b4d2bb3409"
+    },
+    "rootfs.squashfs": {
+      "bytes": 34,
+      "sha256": "88e009fa8880530c0ffc9ea497589d932a95079d328e5b37a3a8ecd6ea1a29b8"
+    }
+  },
+  "broker": {
+    "artifact": "kilnd-guest-broker",
+    "capabilities": [
+      "hello",
+      "initialize",
+      "probe",
+      "exec",
+      "cancel"
+    ],
+    "enabled": true,
+    "lifecycle": "init-supervised-no-restart",
+    "protocol": 1
+  },
+  "bundle_version": "0.2.0",
+  "executables": {
+    "firecracker": {
+      "bytes": 136,
+      "dependencies": [],
+      "format": "static-elf",
+      "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4"
+    },
+    "jailer": {
+      "bytes": 131,
+      "dependencies": [],
+      "format": "static-elf",
+      "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157"
+    },
+    "kilnd-helper": {
+      "bytes": 137,
+      "dependencies": [],
+      "format": "static-elf",
+      "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94"
+    },
+    "mkfs.xfs": {
+      "bytes": 133,
+      "dependencies": [],
+      "format": "static-elf",
+      "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e"
+    }
+  },
+  "firecracker_version": "1.17.0",
+  "fixture_only": true,
+  "inner_images": {
+    "alpine": {
+      "archive_sha256": "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773",
+      "shift_base": 2000000000,
+      "version": "3.24.2"
+    }
+  },
+  "inputs": {
+    "broker_source_commit": "d94996c9f1d9795b3a47d9ffc71d40c452a2e6ee",
+    "build_lock_sha256": "d4160d12ab9d76f9a80132fa46a216a0c4efc8814e772529e4c743f595a8fa50",
+    "contract_sha256": "035f4328aa03054bd454434f177275f43538e9d875bf220a701c1c79e658c105",
+    "handoff_recipe_sha256": "4e92a1a623f42765dd25833d91ef8f112e675720042500328f22b29d6bc630b0",
+    "init_source_sha256": "92889180b8e30317b9b1664f248537401425cc43dcbb1f52571b29f448740088",
+    "jailer_patch_sha256": "db58cb814db9da2af0ff7fa93520f8ce6e26d425e407c44df308ca01094644b6",
+    "phase1b_inputs_sha256": "074613b484280dd64d136a2adffd2fae89d089e9e02a89c86e9e173a3622c36f",
+    "pins_sha256": "faa4139efd63ec635d2254e88eb32e8b3b3f3681a28d19257a83199122c1b72a",
+    "provenance": "b1-fixture-static-aarch64-elf-v1",
+    "security_policy_sha256": "b58fae1b9bc0c4982efa6d02483be87659a9a8c819c3582bc630ed2b3a05de15",
+    "source_inventory_sha256": "333cbf5cbd44e666487bd551e9496bd5cac96d7f6ae04f0b8948cacfee9ca3bd",
+    "toolchain_files_sha256": "9e2282600cc0959d25247c3b90a04cd566a295f940965dc5b4224e38637682a9"
+  },
+  "kernel_policy": {
+    "config_artifact": "kernel.config",
+    "security_policy_sha256": "b58fae1b9bc0c4982efa6d02483be87659a9a8c819c3582bc630ed2b3a05de15"
+  },
+  "kernel_version": "6.18.56-kiln-guest1",
+  "kiln_commit": "00d61c546db7aa67ad283d10c2ca6165ca5f8166",
+  "launch_contract": {
+    "admission": {
+      "cpu_millis": 1000,
+      "guest_memory_bytes": 805306368,
+      "guest_service_pids": 32,
+      "host_overhead_bytes": 134217728,
+      "host_pids": 32,
+      "inner_cpu_millis_max": 1000,
+      "inner_images": [
+        "alpine"
+      ],
+      "inner_memory_max": 536870912,
+      "inner_network": "none",
+      "max_writable_path_bytes": 1024,
+      "max_writable_paths": 16,
+      "vcpu_slots": 1
+    },
+    "architecture": "aarch64",
+    "boot": "cold-only",
+    "broker": {
+      "crate": "kilnd-guest-broker",
+      "peer_cid": 2,
+      "port": 5252,
+      "protocol": 1,
+      "ready_authority": "validated-hello-initialize-smoke-drained",
+      "repository": "kilnd",
+      "restart": false
+    },
+    "cgroups": {
+      "allocation": {
+        "cpu.max": "100000 100000",
+        "direct_tasks": false,
+        "memory.max": 939524096,
+        "memory.oom.group": 1,
+        "memory.swap.max": 0,
+        "pids.max": 32
+      },
+      "control": {
+        "inherit": true
+      },
+      "controllers": [
+        "memory",
+        "pids",
+        "cpu"
+      ],
+      "placement_before_allocation": true,
+      "relay": {
+        "cpu.max": "5000 100000",
+        "memory.max": 16777216,
+        "pids.max": 4
+      },
+      "vm": {
+        "direct_tasks": false
+      },
+      "vm/console": {
+        "cpu.max": "5000 100000",
+        "memory.max": 4194304,
+        "pids.max": 2
+      },
+      "vm/vmm": {
+        "inherit": true
+      }
+    },
+    "executable": {
+      "ancestry": {
+        "default_acl_write": false,
+        "from": "opened-root",
+        "group_world_write": false,
+        "magic_links": false,
+        "nonroot_acl_write": false,
+        "owner_uid": 0,
+        "parent_rename_authority": "root-only",
+        "symlinks": false,
+        "traversal": "descriptor-relative-openat-or-openat2",
+        "unsupported_permission_check": "reject"
+      },
+      "argv0": "display-label-only",
+      "dependency_closure": {
+        "dynamic": "refused-by-this-revision-requires-approved-loader-libraries-config-search-paths-and-leases",
+        "loader_environment": "cleared",
+        "static": "no-PT_INTERP-or-DT_NEEDED"
+      },
+      "environment": {},
+      "exec": "execveat-AT_EMPTY_PATH",
+      "format": "static-elf",
+      "generation_lease": "allocation-and-worker-through-final-cleanup",
+      "identity_fields": [
+        "role",
+        "st_dev",
+        "st_ino",
+        "bytes",
+        "sha256",
+        "installation_generation"
+      ],
+      "inode_source": "verified-installed-fd-only-not-public-client",
+      "installation": {
+        "create_may_install": false,
+        "directories": "root:root-0700-no-extended-or-default-acl",
+        "file_capabilities": false,
+        "files": "root:root-0555-regular-single-link",
+        "from": "authenticated-source-fd",
+        "hardlinks": false,
+        "publish": "fsync-file-atomic-no-replace-fsync-parent",
+        "repair_in_place": false,
+        "setid": false
+      },
+      "observation": "pidfd-validated-proc-exe-device-inode-fd-hash-must-equal-journal-before-publication",
+      "observed_fields": [
+        "role",
+        "st_dev",
+        "st_ino",
+        "bytes",
+        "sha256"
+      ],
+      "open_flags": [
+        "O_RDONLY",
+        "O_NOFOLLOW",
+        "O_CLOEXEC",
+        "O_NONBLOCK"
+      ],
+      "path_fallback": false,
+      "restart": "protected-reopen-exact-device-inode-size-digest-generation-or-refuse",
+      "retain": [
+        "executable-fds",
+        "directory-fds"
+      ],
+      "roles": [
+        "jailer",
+        "firecracker",
+        "mkfs.xfs",
+        "kilnd-helper"
+      ],
+      "self_check": "helper-proc-self-exe-before-workers-and-traffic",
+      "shell_or_shebang": false,
+      "source_paths": "installation-input-never-execution-authority",
+      "store": "/opt/kilnd/exec/sha256/{sha256}/{role}",
+      "upgrade": "publish-new-generation-never-replace-or-delete-leased-object",
+      "worker_modes": "fork-only-inherit-verified-kilnd-helper"
+    },
+    "firecracker": {
+      "boot-source": {
+        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/init loglevel=3 randomize_kstack_offset=on",
+        "kernel_image_path": "/kernel"
+      },
+      "drives": [
+        {
+          "drive_id": "rootfs",
+          "is_read_only": true,
+          "is_root_device": true,
+          "path_on_host": "/rootfs"
+        },
+        {
+          "drive_id": "work",
+          "is_read_only": false,
+          "is_root_device": false,
+          "path_on_host": "/work"
+        },
+        {
+          "drive_id": "identity",
+          "is_read_only": true,
+          "is_root_device": false,
+          "path_on_host": "/identity"
+        }
+      ],
+      "machine-config": {
+        "huge_pages": "Transparent",
+        "mem_size_mib": 768,
+        "smt": false,
+        "track_dirty_pages": false,
+        "vcpu_count": 1
+      },
+      "vsock": {
+        "guest_cid": "$cid",
+        "uds_path": "/run/vsock.sock"
+      }
+    },
+    "firecracker_cmdline_suffix": " pci=off root=/dev/vda ro earlycon=uart,mmio,0x40002000",
+    "firecracker_lineage": "1.17.0",
+    "forbidden": [
+      "network-interfaces",
+      "metadata",
+      "tap",
+      "routes",
+      "nat",
+      "snapshot",
+      "restore",
+      "fork",
+      "pause",
+      "custom-init",
+      "extra-kernel-args",
+      "test-profiles",
+      "writable-root",
+      "custom-seccomp",
+      "cpu-template",
+      "extra-devices",
+      "host-mounts",
+      "daemonize",
+      "api-socket",
+      "provider-credentials"
+    ],
+    "handoff": {
+      "bootstrap_fields": [
+        "version",
+        "plan_generation",
+        "vmm_identity",
+        "exec_file_label",
+        "jail_root_identity"
+      ],
+      "bootstrap_max_bytes": 4096,
+      "capability_drop_order": [
+        "clear-supplementary-groups",
+        "clear-ambient-and-inheritable",
+        "drop-every-bounding-bit-while-privileged",
+        "set-real-effective-saved-gid",
+        "set-real-effective-saved-uid",
+        "clear-all-capability-sets",
+        "set-no-new-privs",
+        "exec-verified-vmm-fd"
+      ],
+      "close_on_vmm_exec": [
+        3,
+        4
+      ],
+      "control_fd": 4,
+      "deadline": "original-create",
+      "eof_timeout_malformed_publication_failure": "stop-no-fallback",
+      "fd_source": "helper-created-never-from-public-or-v3-request",
+      "gate": "post-exec-before-privileged-setup-observe-jailer-persist-then-Continue",
+      "jailer_entry": "validate-3-4-mark-cloexec-close-all-unexpected",
+      "jailer_exec_fd_cloexec": true,
+      "jailer_exec_fd_min": 5,
+      "only_inherited_extra_fds": [
+        3,
+        4
+      ],
+      "stock_jailer_compatible": false,
+      "version": 1,
+      "vmm_bind": "read-only-retained-inode-at-/firecracker-no-copy-no-chown",
+      "vmm_exec": "execveat-fd-3-AT_EMPTY_PATH-empty-env",
+      "vmm_fd": 3,
+      "vmm_observed_before": "BOOTING-and-READY-publication"
+    },
+    "identity": {
+      "block_hash": "separately-journaled-sha256",
+      "bytes": 4096,
+      "device": "vdc",
+      "fields": [
+        "instance_id",
+        "allocation_id",
+        "sandbox_id",
+        "boot_nonce",
+        "manifest_sha256",
+        "launch_sha256",
+        "work_uuid",
+        "inner_spec_sha256"
+      ],
+      "json": "utf8-sorted-keys-compact-no-floats-duplicates-or-unknown-fields",
+      "launch_hash_excludes": "identity-block-content",
+      "length": "u32-big-endian-1..4088",
+      "magic": "KID1",
+      "padding": "zero",
+      "path": "/identity",
+      "read_only": true
+    },
+    "interruption": "terminate-vm-after-dispatch",
+    "jail": {
+      "artifact_binds": [
+        "kernel",
+        "rootfs",
+        "config.json",
+        "identity",
+        "firecracker"
+      ],
+      "binds_read_only": true,
+      "charged_to": "allocation",
+      "mode": "0700",
+      "mount_data": "size=16M,nr_inodes=1024,mode=0700",
+      "mount_flags": [
+        "MS_NOSUID"
+      ],
+      "mounted_before": "first-jailer-write",
+      "not_applied": [
+        "noexec",
+        "nodev"
+      ],
+      "nr_inodes": 1024,
+      "options": [
+        "nosuid"
+      ],
+      "post_jailer": {
+        "before_ready": true,
+        "cache": "root:root-0444",
+        "firecracker": "root:root-0555-read-only-same-inode",
+        "only_writable_directory": "/run",
+        "root_dev_devnet": "root:root-0755",
+        "vmm_stopped_during_hardening": true
+      },
+      "root": "tmpfs",
+      "size_bytes": 16777216
+    },
+    "jailer_argv": [
+      "$jailer",
+      "--id",
+      "$backend_id",
+      "--exec-file",
+      "$firecracker",
+      "--uid",
+      "$uid",
+      "--gid",
+      "$gid",
+      "--chroot-base-dir",
+      "/var/lib/kilnd-helper/jails",
+      "--cgroup-version",
+      "2",
+      "--parent-cgroup",
+      "$vmm_cgroup",
+      "--new-pid-ns",
+      "--resource-limit",
+      "no-file=256",
+      "--",
+      "--no-api",
+      "--config-file",
+      "/config.json"
+    ],
+    "leases": {
+      "cid": [
+        3,
+        65535
+      ],
+      "gid": [
+        300000,
+        365535
+      ],
+      "uid": [
+        300000,
+        365535
+      ]
+    },
+    "limits": {
+      "artifact_max_bytes": 1073741824,
+      "manifest_max_bytes": 4194304
+    },
+    "manifest_schema": 2,
+    "markers": {
+      "KG_FIRST_COMMAND": "legacy-schema-1-diagnostic-only",
+      "KG_READY": "legacy-schema-1-diagnostic-only",
+      "create_ready": "host-validated-broker-ready",
+      "first_tool_result": "host-validated-terminal-result"
+    },
+    "persistent_inner_sandboxes": 1,
+    "process": {
+      "core_limit": 0,
+      "env": {},
+      "network_namespace": "unshared-no-links-or-routes",
+      "serial_input": false,
+      "stdin": "/dev/null",
+      "umask": "0077"
+    },
+    "profile": "offline-768-v1",
+    "relay_credentials": {
+      "CapAmb": 0,
+      "CapBnd": 0,
+      "CapEff": 0,
+      "CapInh": 0,
+      "CapPrm": 0,
+      "NoNewPrivs": 1,
+      "gid": "$relay_gid",
+      "groups": [],
+      "uid": "$relay_uid"
+    },
+    "schema": 2,
+    "sessions_per_vm": 1,
+    "shared": {
+      "cpu_millis": 500,
+      "disk_bytes": 536870912,
+      "fence_allowance_bytes": 67108864,
+      "memory_bytes": 134217728,
+      "once_per_node": true,
+      "pids": 32,
+      "store_bytes": 1073741824
+    },
+    "substitutions": {
+      "allocation_id": "Id128",
+      "boot_nonce": "Nonce256",
+      "cid": "GuestCid",
+      "executables": "VerifiedInstalledIdentityVector",
+      "gid": "VmmGid",
+      "inner_spec": "ValidatedOfflineSpec",
+      "instance_id": "Id128",
+      "relay_gid": "RelayGid",
+      "relay_uid": "RelayUid",
+      "sandbox_id": "SandboxId64",
+      "uid": "VmmUid",
+      "work_uuid": "Uuid"
+    },
+    "timing_exception": {
+      "excluded_from_semantic_digest": [
+        "start_time_us",
+        "start_time_cpu_us",
+        "parent_cpu_time_us"
+      ],
+      "order_fixed": true,
+      "source": "jailer-only",
+      "type": "u64-decimal-microseconds"
+    },
+    "vmm_argv": [
+      "/firecracker",
+      "--id",
+      "$backend_id",
+      "--start-time-us",
+      "$start_time_us",
+      "--start-time-cpu-us",
+      "$start_time_cpu_us",
+      "--parent-cpu-time-us",
+      "$parent_cpu_time_us",
+      "--no-api",
+      "--config-file",
+      "/config.json"
+    ],
+    "vmm_credentials": {
+      "CapAmb": 0,
+      "CapBnd": 0,
+      "CapEff": 0,
+      "CapInh": 0,
+      "CapPrm": 0,
+      "NoNewPrivs": 1,
+      "gid": "$gid",
+      "groups": [],
+      "seccomp": "default",
+      "status_seccomp": 2,
+      "uid": "$uid"
+    },
+    "warm_pool": 0,
+    "work": {
+      "backing": "root:root-0600-exclusive-regular-single-link",
+      "format": {
+        "execution": "retained-verified-fd",
+        "identity_checked": "before-and-after",
+        "sync": "file-and-parent",
+        "target": "new-inode-before-exposure-never-after-guest-write"
+      },
+      "formatter_argv": [
+        "$mkfs.xfs",
+        "-q",
+        "-f",
+        "-K",
+        "-m",
+        "uuid=$work_uuid",
+        "$work_backing_path"
+      ],
+      "formula": "max(minimum,round_up(inner_disk+guest_headroom,round))",
+      "guest_headroom_bytes": 268435456,
+      "guest_mount": "/var/lib/kiln/runs",
+      "host_allowance_bytes": 134217728,
+      "loop": {
+        "busy_slot": "refuse",
+        "detach_requires": "verified-identity-no-holders-no-pending-attachment",
+        "discard": false,
+        "intent_before_configure": true,
+        "jail_path": "/work",
+        "loop_control_exposed": false,
+        "node_mode": "0600",
+        "offset": 0,
+        "owner": [
+          "$uid",
+          "$gid"
+        ],
+        "record": [
+          "major",
+          "minor",
+          "backing_dev",
+          "backing_ino",
+          "offset",
+          "size_limit"
+        ],
+        "regular_file_fallback": false,
+        "size_limit": "$work_bytes",
+        "unmap": false,
+        "verify_before_exposure": true
+      },
+      "minimum_bytes": 536870912,
+      "mount_options": [
+        "nosuid",
+        "nodev",
+        "noexec",
+        "prjquota"
+      ],
+      "preallocation": "full-posix_fallocate-no-sparse-fallback",
+      "round_bytes": 67108864
+    },
+    "workers": {
+      "D": {
+        "credentials": "vmm-uid-gid-console-pipe-and-control-fds-only",
+        "per_allocation": 1,
+        "placement": "vm/console"
+      },
+      "K": {
+        "node_limit": 2,
+        "placement": "shared",
+        "reserved": true
+      },
+      "L": {
+        "node_limit": 1,
+        "placement": "shared"
+      },
+      "M": {
+        "node_limit": 1,
+        "placement": "shared"
+      },
+      "P": {
+        "node_limit": 2,
+        "per_allocation": 1,
+        "placement": "shared-before-C2-control-after-C2"
+      },
+      "R": {
+        "credentials": "separate-relay-uid-gid-no-groups-no-caps-nnp",
+        "per_allocation": 1,
+        "placement": "relay"
+      },
+      "S": {
+        "per_allocation": 1,
+        "placement": "control"
+      },
+      "disconnect": "detach-waiter-retain-ownership",
+      "dispatch": {
+        "exec_per_allocation": 1,
+        "operations": 64,
+        "reserved_recovery": 4
+      },
+      "fork_only": [
+        "L",
+        "P",
+        "S",
+        "R",
+        "D",
+        "M",
+        "K"
+      ],
+      "heartbeat_ms": 1000,
+      "intent_before_gate": true,
+      "replacement": "only-after-exit-reap-and-permits-settle",
+      "separate_executables": [],
+      "stop_dispatch_target_ms": 250
+    }
+  },
+  "schema": 2,
+  "source_date_epoch": 1793318400,
+  "work_disk": {
+    "filesystem": "xfs",
+    "minimum_mib": 512,
+    "mount_options": [
+      "nosuid",
+      "nodev",
+      "noexec",
+      "prjquota"
+    ]
+  }
+}

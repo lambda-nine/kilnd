@@ -1,0 +1,24 @@
+{
+  "jail_root_identity": {
+    "mount_id": 512,
+    "st_dev": 41,
+    "st_ino": 7
+  },
+  "plan_generation": 1,
+  "record": {
+    "exec_file_label": "/opt/kilnd/exec/sha256/80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4/firecracker",
+    "jail_root_identity": {
+      "mount_id": 512,
+      "st_dev": 41,
+      "st_ino": 7
+    },
+    "plan_generation": 1,
+    "version": 1,
+    "vmm_identity": {
+      "bytes": 136,
+      "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+      "st_dev": 2049,
+      "st_ino": 8001
+    }
+  }
+}

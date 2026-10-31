@@ -1,0 +1,68 @@
+{
+  "allocation_id": "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+  "boot_nonce": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+  "cid": 5253,
+  "executables": {
+    "firecracker": {
+      "bytes": 136,
+      "installation_generation": 1,
+      "role": "firecracker",
+      "sha256": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+      "st_dev": 2049,
+      "st_ino": 8001
+    },
+    "jailer": {
+      "bytes": 131,
+      "installation_generation": 1,
+      "role": "jailer",
+      "sha256": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+      "st_dev": 2049,
+      "st_ino": 8000
+    },
+    "kilnd-helper": {
+      "bytes": 137,
+      "installation_generation": 1,
+      "role": "kilnd-helper",
+      "sha256": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+      "st_dev": 2049,
+      "st_ino": 8003
+    },
+    "mkfs.xfs": {
+      "bytes": 133,
+      "installation_generation": 1,
+      "role": "mkfs.xfs",
+      "sha256": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+      "st_dev": 2049,
+      "st_ino": 8002
+    }
+  },
+  "gid": {
+    "kind": "VmmGid",
+    "value": 300005
+  },
+  "inner_spec": {
+    "cpu_millis": 1000,
+    "disk_bytes": 1073741824,
+    "image": "alpine",
+    "memory_bytes": 536870912,
+    "network": "none",
+    "pids": 128,
+    "read_only_root": false,
+    "writable_paths": []
+  },
+  "instance_id": "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+  "relay_gid": {
+    "kind": "RelayGid",
+    "value": 300006
+  },
+  "relay_uid": {
+    "kind": "RelayUid",
+    "value": 300006
+  },
+  "sandbox_id": "sb-3c3c3c3c3c3c3c3c",
+  "uid": {
+    "kind": "VmmUid",
+    "value": 300005
+  },
+  "work_uuid": "51b8e65e-23b9-4eba-a21c-7c1cce2c5f94"
+}

@@ -1,0 +1,507 @@
+[
+  {
+    "name": "nokaslr",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "boot-source",
+      "boot_args"
+    ],
+    "value": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/init loglevel=3 randomize_kstack_offset=on nokaslr",
+    "why": "boot argument addition"
+  },
+  {
+    "name": "init-zeroing-off",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "boot-source",
+      "boot_args"
+    ],
+    "value": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/init loglevel=3 randomize_kstack_offset=on init_on_alloc=0 init_on_free=0",
+    "why": "memory initialization"
+  },
+  {
+    "name": "custom-init",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "boot-source",
+      "boot_args"
+    ],
+    "value": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/bin/sh loglevel=3 randomize_kstack_offset=on",
+    "why": "custom init"
+  },
+  {
+    "name": "writable-root",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "drives",
+      0,
+      "is_read_only"
+    ],
+    "value": false,
+    "why": "writable root"
+  },
+  {
+    "name": "vcpu",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "machine-config",
+      "vcpu_count"
+    ],
+    "value": 2,
+    "why": "machine size"
+  },
+  {
+    "name": "ram",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "machine-config",
+      "mem_size_mib"
+    ],
+    "value": 512,
+    "why": "machine size"
+  },
+  {
+    "name": "thp",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "machine-config",
+      "huge_pages"
+    ],
+    "value": "None",
+    "why": "memory backing"
+  },
+  {
+    "name": "smt",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "machine-config",
+      "smt"
+    ],
+    "value": true,
+    "why": "machine shape"
+  },
+  {
+    "name": "dirty-tracking",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "machine-config",
+      "track_dirty_pages"
+    ],
+    "value": true,
+    "why": "snapshot surface"
+  },
+  {
+    "name": "cpu-template",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "cpu-config"
+    ],
+    "value": "/cpu.json",
+    "why": "custom CPU template"
+  },
+  {
+    "name": "nic",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "network-interfaces"
+    ],
+    "value": [
+      {
+        "host_dev_name": "tap0",
+        "iface_id": "eth0"
+      }
+    ],
+    "why": "extra NIC"
+  },
+  {
+    "name": "metadata",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "mmds-config"
+    ],
+    "value": {
+      "network_interfaces": [
+        "eth0"
+      ]
+    },
+    "why": "metadata service"
+  },
+  {
+    "name": "no-vsock",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "vsock"
+    ],
+    "remove": true,
+    "why": "legacy no-vsock profile"
+  },
+  {
+    "name": "no-identity-drive",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "drives",
+      2
+    ],
+    "remove": true,
+    "why": "identity drive absent"
+  },
+  {
+    "name": "vsock-path",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "vsock",
+      "uds_path"
+    ],
+    "value": "/vsock.sock",
+    "why": "vsock path"
+  },
+  {
+    "name": "extra-drive",
+    "path": [
+      "launch_contract",
+      "firecracker",
+      "drives",
+      3
+    ],
+    "value": {
+      "drive_id": "x",
+      "is_read_only": false,
+      "is_root_device": false,
+      "path_on_host": "/x"
+    },
+    "why": "extra drive"
+  },
+  {
+    "name": "daemonize",
+    "path": [
+      "launch_contract",
+      "jailer_argv",
+      15
+    ],
+    "value": "--daemonize",
+    "why": "no new PID namespace, daemonized jailer"
+  },
+  {
+    "name": "custom-seccomp",
+    "path": [
+      "launch_contract",
+      "jailer_argv",
+      20
+    ],
+    "value": "--seccomp-filter",
+    "why": "custom seccomp"
+  },
+  {
+    "name": "api-socket",
+    "path": [
+      "launch_contract",
+      "jailer_argv",
+      19
+    ],
+    "value": "--api-sock",
+    "why": "API socket"
+  },
+  {
+    "name": "uid-gid-collapse",
+    "path": [
+      "launch_contract",
+      "jailer_argv",
+      8
+    ],
+    "value": "$uid",
+    "why": "UID used as GID"
+  },
+  {
+    "name": "host-cgroup",
+    "path": [
+      "launch_contract",
+      "jailer_argv",
+      14
+    ],
+    "value": "/",
+    "why": "outer cgroup escape"
+  },
+  {
+    "name": "cap-bounding",
+    "path": [
+      "launch_contract",
+      "vmm_credentials",
+      "CapBnd"
+    ],
+    "value": 1,
+    "why": "nonzero bounding set"
+  },
+  {
+    "name": "cap-ambient",
+    "path": [
+      "launch_contract",
+      "vmm_credentials",
+      "CapAmb"
+    ],
+    "value": 1,
+    "why": "nonzero ambient set"
+  },
+  {
+    "name": "groups",
+    "path": [
+      "launch_contract",
+      "vmm_credentials",
+      "groups"
+    ],
+    "value": [
+      0
+    ],
+    "why": "supplementary group"
+  },
+  {
+    "name": "no-new-privs",
+    "path": [
+      "launch_contract",
+      "vmm_credentials",
+      "NoNewPrivs"
+    ],
+    "value": 0,
+    "why": "NoNewPrivs"
+  },
+  {
+    "name": "tmpfs-bytes",
+    "path": [
+      "launch_contract",
+      "jail",
+      "size_bytes"
+    ],
+    "value": 16777217,
+    "why": "jail tmpfs bound"
+  },
+  {
+    "name": "tmpfs-inodes",
+    "path": [
+      "launch_contract",
+      "jail",
+      "nr_inodes"
+    ],
+    "value": 1025,
+    "why": "jail tmpfs bound"
+  },
+  {
+    "name": "loop-fallback",
+    "path": [
+      "launch_contract",
+      "work",
+      "loop",
+      "regular_file_fallback"
+    ],
+    "value": true,
+    "why": "writable backing file in jail"
+  },
+  {
+    "name": "cgroup-memory",
+    "path": [
+      "launch_contract",
+      "cgroups",
+      "allocation",
+      "memory.max"
+    ],
+    "value": 939524097,
+    "why": "outer memory bound"
+  },
+  {
+    "name": "cgroup-pids",
+    "path": [
+      "launch_contract",
+      "cgroups",
+      "allocation",
+      "pids.max"
+    ],
+    "value": 33,
+    "why": "outer PID bound"
+  },
+  {
+    "name": "worker-slots",
+    "path": [
+      "launch_contract",
+      "workers",
+      "P",
+      "node_limit"
+    ],
+    "value": 3,
+    "why": "fixed worker limit"
+  },
+  {
+    "name": "path-fallback",
+    "path": [
+      "launch_contract",
+      "executable",
+      "path_fallback"
+    ],
+    "value": true,
+    "why": "pathname exec fallback"
+  },
+  {
+    "name": "fd-three",
+    "path": [
+      "launch_contract",
+      "handoff",
+      "vmm_fd"
+    ],
+    "value": 5,
+    "why": "FD handoff"
+  },
+  {
+    "name": "stock-jailer",
+    "path": [
+      "launch_contract",
+      "handoff",
+      "stock_jailer_compatible"
+    ],
+    "value": true,
+    "why": "unpatched jailer"
+  },
+  {
+    "name": "cold-only",
+    "path": [
+      "launch_contract",
+      "boot"
+    ],
+    "value": "snapshot-restore",
+    "why": "snapshot/restore"
+  },
+  {
+    "name": "warm-pool",
+    "path": [
+      "launch_contract",
+      "warm_pool"
+    ],
+    "value": 1,
+    "why": "warm pool"
+  },
+  {
+    "name": "legacy-schema",
+    "path": [
+      "schema"
+    ],
+    "value": 1,
+    "why": "schema 1 manifest"
+  },
+  {
+    "name": "unsupported-schema",
+    "path": [
+      "schema"
+    ],
+    "value": 3,
+    "why": "unknown schema"
+  },
+  {
+    "name": "broker-disabled",
+    "path": [
+      "broker",
+      "enabled"
+    ],
+    "value": false,
+    "why": "missing broker"
+  },
+  {
+    "name": "broker-restart",
+    "path": [
+      "broker",
+      "lifecycle"
+    ],
+    "value": "restart-on-failure",
+    "why": "broker auto-restart"
+  },
+  {
+    "name": "artifact-digest",
+    "path": [
+      "artifacts",
+      "Image",
+      "sha256"
+    ],
+    "value": "0000000000000000000000000000000000000000000000000000000000000000",
+    "why": "wrong kernel digest"
+  },
+  {
+    "name": "artifact-size",
+    "path": [
+      "artifacts",
+      "kiln",
+      "bytes"
+    ],
+    "value": 1,
+    "why": "wrong artifact size"
+  },
+  {
+    "name": "extra-artifact",
+    "path": [
+      "artifacts",
+      "debug"
+    ],
+    "value": {
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "why": "extra artifact"
+  },
+  {
+    "name": "dynamic-formatter",
+    "path": [
+      "executables",
+      "mkfs.xfs",
+      "format"
+    ],
+    "value": "dynamic-elf",
+    "why": "unbound loader closure"
+  },
+  {
+    "name": "library-dependency",
+    "path": [
+      "executables",
+      "mkfs.xfs",
+      "dependencies"
+    ],
+    "value": [
+      "/lib/libc.so.6"
+    ],
+    "why": "unbound library"
+  },
+  {
+    "name": "role-alias",
+    "path": [
+      "executables",
+      "firecracker",
+      "sha256"
+    ],
+    "value": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+    "why": "jailer image in the VMM role"
+  },
+  {
+    "name": "production-claim",
+    "path": [
+      "fixture_only"
+    ],
+    "value": false,
+    "why": "fixture manifest cannot claim production"
+  },
+  {
+    "name": "unknown-field",
+    "path": [
+      "debug"
+    ],
+    "value": true,
+    "why": "unknown field"
+  }
+]

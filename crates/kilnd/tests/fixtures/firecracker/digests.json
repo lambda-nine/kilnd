@@ -1,0 +1,31 @@
+{
+  "approved_manifest_sha256": "8b6873939ee80a32a37fc4eb8e07dfe82a65d86ae41fe1601f095cf0b2aff74e",
+  "files": {
+    "README.md": "f4fc860f40304433cbeef9cd1d99aa58a95a2e74a29e175dcde0809538db1b17",
+    "bootstrap.json": "410286f286e7e7b20da78528807b6581662e17e3cd9eed32a2d38cb3cc194a59",
+    "bundle/Image": "60a3c69c8cb23874b06caf7fe0fd0a5245cc44899b359b4c518b5c6390fbf18f",
+    "bundle/kernel.config": "f4c45a08aaa43fe5f6c939c31e746dd9db697487f946e9803d6503c28b1c0665",
+    "bundle/kiln": "ed521b90649fd763d504c85c0b93e8f96a224e3f6817b170771a8e672eb121dc",
+    "bundle/kilnd-guest-broker": "c4c151348c6b4202058d421d06071480cde69a687d4f445c1a9608b4d2bb3409",
+    "bundle/manifest.json": "8b6873939ee80a32a37fc4eb8e07dfe82a65d86ae41fe1601f095cf0b2aff74e",
+    "bundle/rootfs.squashfs": "88e009fa8880530c0ffc9ea497589d932a95079d328e5b37a3a8ecd6ea1a29b8",
+    "contract.json": "035f4328aa03054bd454434f177275f43538e9d875bf220a701c1c79e658c105",
+    "executables/firecracker": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
+    "executables/jailer": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
+    "executables/kilnd-helper": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
+    "executables/mkfs.xfs": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
+    "identity.bin": "f3d4bfe4be36ace3d5e2ceda147c8294adff0779b2b71ae5c047ae0fa53b59e6",
+    "jailer-patch.fixture": "db58cb814db9da2af0ff7fa93520f8ce6e26d425e407c44df308ca01094644b6",
+    "legacy-no-vsock-manifest.json": "d498adc916bdd67622121351eb6296b7dd6c1d6bee654ea5fccee6cf3552fd64",
+    "negative-cases.json": "9d3d0d5b1084e2d49ad311fe04c2c3e8d690705d29ac90bd73964eea99af3dc4",
+    "plan-equal-ids.json": "8c3c271e58186618219c39c84c9a21543800c62939ce92e728cdb75bd819b1e0",
+    "plan.json": "edfc9d52d8f433bcf9f740a1630594a58e7b54c2f90d298da23d17aa554a44c5",
+    "replacement-cases.json": "a3935cf5cc2d8bc5968f1f0ee90b25b58fa15f9f37bdcdac9d68f842ea3492c0",
+    "substitutions-equal-ids.json": "f157003cfd904431231316615edef8f19a55a64164872c7002f5afd5cddae968",
+    "substitutions.json": "4674100ce51f1e867a2e28493393c2b2f30139bf84baf9d975377874ba4c31cc",
+    "vmm-argv.json": "77720f0ab496f6b05bc8fde4532f2ee0621b32ee35e519d0c9e3e6fa6c35dd1d",
+    "vmm-status.txt": "1d07737b200f4087c2af50a04443803e03db37834f2a45e19cb5d368c665cbdb"
+  },
+  "launch_sha256": "2435a826715c33a2be0b71304c3013925c947b34054d774f8d331f32669f0c3a",
+  "plan_sha256": "6eb997d198a84c45ac178001478ba392c7e164e6e27418ca4bf29386e69c34c8"
+}
