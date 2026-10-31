@@ -9,7 +9,7 @@
     "bundle/kilnd-guest-broker": "c4c151348c6b4202058d421d06071480cde69a687d4f445c1a9608b4d2bb3409",
     "bundle/manifest.json": "67f3760e2aa2941b2d9cfb0034c05b0110f106deba9eb412e69b8daa2608e463",
     "bundle/rootfs.squashfs": "88e009fa8880530c0ffc9ea497589d932a95079d328e5b37a3a8ecd6ea1a29b8",
-    "conformance.json": "6400e37d39e0691fb32d279c2ffce54098d401e689ae78cbb522f14061717369",
+    "conformance.json": "400551e41b759c7af718df6f7fee26b440700d7207e7870e3d03a8d8e1e9581f",
     "contract.json": "ae4b5c5eda30dc2798ca5c2e8958aa1023429023a2bc8d41f5530b68ae5f45ed",
     "executables/firecracker": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
     "executables/jailer": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped deliberately whenever kiln-guest's fixtures are copied here.
 const DIGESTS_JSON_SHA256: &str =
-    "0bdb67a671089fe13322491f471e4ce3c1c7a48cd22458f4c0ec52aafb0f9b8b";
+    "a06c1d2ef9ef65eaa7fb4e5ae8757c9aea44b2d2d45874ed2f928df63f6651f8";
 const MIB: u64 = 1024 * 1024;
 
 fn fixtures() -> PathBuf {

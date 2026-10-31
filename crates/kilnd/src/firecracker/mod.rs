@@ -260,9 +260,17 @@ impl SpecBinding {
     }
 }
 pub fn bind_host_spec(value: &Value) -> Result<SpecBinding> {
-    let spec = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let spec: crate::model::SandboxSpec =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    // Serde enums also accept {"none":null} for a unit variant. The wire contract
+    // permits only "none"; never silently normalize an alternate input shape.
+    let typed = serde_json::to_value(&spec).map_err(|e| e.to_string())?;
+    if canonical(value)? != canonical(&typed)? {
+        return Err("host spec is not the exact effective model shape".into());
+    }
     SpecBinding::new(&spec)
 }
+
 pub fn verify_spec_binding(raw: &[u8]) -> Result<SpecBinding> {
     let value = strict_json(raw)?;
     let binding = bind_host_spec(&value["host_spec"])?;
