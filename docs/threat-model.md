@@ -88,6 +88,15 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   kilnd's own rows; unmanaged live and stale sandboxes are retained. Restart
   execution interruption is likewise joined through each sandbox and limited
   to the active backend.
+- **Typed reservation release.** Schema 8 records release explicitly. Legacy rows
+  carry a tag computed from schema 7's exact predicate; absence-fenced rows need a
+  foreign-key and trigger-checked reference to immutable evidence matching their own
+  node, instance, allocation and plan. Reconciliation validates a complete inventory
+  and all token evidence before any mutation or collection. These checks are defense
+  in depth against kilnd bugs and malformed SQL, not a boundary against the `kilnd`
+  account, which owns the database and could drop a trigger. Receipts are private,
+  trusted backend evidence bounded to 16 KiB, never caller strings or guest assertions,
+  and the API exposes none of them.
 - **No request-owned exec work.** After an execution row is recorded, a
   daemon supervisor owns backend cleanup, pipe capture and finalization even
   if the RPC disappears. kiln places each command in an execution cgroup;
@@ -136,7 +145,13 @@ sandbox compromises the host.
   history is now bounded by configurable retention; charged rows stay.
   Memory, PIDs and disk are reserved from requested effective sandbox limits;
   they are not measurements of current RSS, task count or disk usage. CPU is
-  intentionally schedulable and may be overcommitted rather than reserved.
+  intentionally schedulable and may be overcommitted rather than reserved. A
+  legacy row's zero CPU, vCPU and host-PID values mean not reserved, not free.
+- **The Firecracker backend does not exist yet.** Schema 8, absence evidence and
+  dispositions are exercised only by `FakeRuntime`. No helper operation, node ledger,
+  guest or VM exists; kilnd still runs kiln only, and that remains experimental
+  shared-kernel isolation, not a boundary for hostile multi-tenant workloads.
+  Daemon-local sums are never node totals for a backend with a node authority.
 - **Deadlines are not hard real time.** SQLite and filesystem work is
   synchronous. Deadline delivery can be delayed by that work, and an expired
   recorded execution retains admission until backend cleanup and terminal

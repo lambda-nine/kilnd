@@ -48,6 +48,8 @@ fn signal_number_is_uint32_in_generated_types_schema_and_wire() {
         stdin_bytes: 0,
         stdout: Default::default(),
         stderr: Default::default(),
+        sandbox_reusable: None,
+        cleanup_evidence: Default::default(),
     };
     let converted = kilnd::service::execution_pb(execution);
     let decoded = pb::Execution::decode(converted.encode_to_vec().as_slice()).unwrap();

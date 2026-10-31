@@ -202,15 +202,19 @@ mod tests {
         // test can fork after acquiring the ownership lock.
         const CHILD: &str = "KILND_LOCK_CLOEXEC_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "lock::tests::lock_descriptor_is_closed_across_exec",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .status()
-                .unwrap();
+            let mut child = {
+                let _guard = crate::process::spawn_guard();
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "lock::tests::lock_descriptor_is_closed_across_exec",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap()
+            };
+            let status = child.wait().unwrap();
             assert!(status.success());
             return;
         }

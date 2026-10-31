@@ -357,6 +357,14 @@ async fn pre_canceled_or_expired_exec_never_connects_to_helper() {
     let result = client.exec("abcd", &spec, &cancel).await;
     assert_eq!(result.finish, Ok(ExecFinish::Canceled));
     assert!(result.stdout.total_bytes_known);
+    assert_eq!(
+        result.disposition,
+        crate::model::SandboxDisposition::Reusable
+    );
+    assert_eq!(
+        result.cleanup,
+        crate::model::CleanupEvidence::NoChildStarted
+    );
     let spec = ExecSpec {
         deadline: tokio::time::Instant::now() - Duration::from_secs(1),
         ..spec
@@ -365,6 +373,32 @@ async fn pre_canceled_or_expired_exec_never_connects_to_helper() {
         .exec("abcd", &spec, &tokio_util::sync::CancellationToken::new())
         .await;
     assert_eq!(result.finish, Ok(ExecFinish::TimedOut));
+}
+
+#[tokio::test]
+async fn an_unconfirmed_helper_exec_quarantines_the_sandbox() {
+    use crate::model::{CleanupEvidence, RuntimeErrorKind, SandboxDisposition};
+    use crate::runtime::ExecSpec;
+    let client = Client {
+        path: "/nonexistent/kilnd-helper.sock".into(),
+        expected_uid: 0,
+    };
+    let argv = vec!["true".to_owned()];
+    let spec = ExecSpec {
+        argv: &argv,
+        stdin: b"",
+        deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+        max_output: 1024,
+    };
+    let result = client
+        .exec("abcd", &spec, &tokio_util::sync::CancellationToken::new())
+        .await;
+    assert_eq!(
+        result.finish.unwrap_err().kind,
+        RuntimeErrorKind::CleanupFailed
+    );
+    assert_eq!(result.disposition, SandboxDisposition::Quarantined);
+    assert_eq!(result.cleanup, CleanupEvidence::Unknown);
 }
 
 #[tokio::test]

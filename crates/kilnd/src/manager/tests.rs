@@ -6,6 +6,11 @@ use std::time::Duration;
 use super::*;
 use crate::runtime::fake::{FakeGate, FakeRuntime};
 
+/// A deadline for fake calls that never wait on it.
+fn now_plus() -> Instant {
+    Instant::now() + Duration::from_secs(60)
+}
+
 fn manager() -> (Arc<Manager<FakeRuntime>>, FakeRuntime) {
     manager_with(Limits::default())
 }
@@ -370,7 +375,13 @@ async fn ambiguous_create_with_unlisted_live_backend_keeps_reservation() {
     let row = m.list(true).unwrap().remove(0);
     let unreported = fake.insert(BackendStatus::Running);
     fake.state().hidden_from_list.push(unreported.clone());
-    assert!(fake.list().await.unwrap().is_empty());
+    assert!(
+        fake.list(now_plus(), &CancellationToken::new())
+            .await
+            .unwrap()
+            .records
+            .is_empty()
+    );
     assert!(matches!(
         m.delete(&row.id).await,
         Err(Error::FailedPrecondition(_))
@@ -1936,6 +1947,7 @@ async fn reconcile_repairs_state_and_is_repeatable() {
         failure_reason: None,
         create_certainty: CreateCertainty::AllocationAmbiguous,
         owner_uid: 0,
+        accounting: SandboxAccounting::legacy(&alive.spec, ""),
     };
     m.store.insert_sandbox(&crashed_create).unwrap();
     let other_backend = Sandbox {
@@ -2069,20 +2081,21 @@ async fn lowered_node_budgets_degrade_but_keep_cleanup_available() {
     let backend_id = fake.insert(BackendStatus::Running);
     let store = Store::open_in_memory().unwrap();
     let now = now_ms();
+    let spec = SandboxSpec {
+        image: "alpine".into(),
+        memory_bytes: 1 << 30,
+        cpu_millis: 1000,
+        pids: 256,
+        disk_bytes: 2 << 30,
+        network: Network::None,
+        read_only_root: false,
+        writable_paths: Vec::new(),
+        labels: BTreeMap::new(),
+    };
     let sandbox = Sandbox {
         id: new_id("sb"),
         state: SandboxState::Ready,
-        spec: SandboxSpec {
-            image: "alpine".into(),
-            memory_bytes: 1 << 30,
-            cpu_millis: 1000,
-            pids: 256,
-            disk_bytes: 2 << 30,
-            network: Network::None,
-            read_only_root: false,
-            writable_paths: Vec::new(),
-            labels: BTreeMap::new(),
-        },
+        spec: spec.clone(),
         backend: "fake".into(),
         backend_id: Some(backend_id),
         created_at_ms: now,
@@ -2091,6 +2104,7 @@ async fn lowered_node_budgets_degrade_but_keep_cleanup_available() {
         failure_reason: None,
         create_certainty: CreateCertainty::AllocationAmbiguous,
         owner_uid: 0,
+        accounting: SandboxAccounting::legacy(&spec, ""),
     };
     store.insert_sandbox(&sandbox).unwrap();
     let manager = Arc::new(Manager::new(
@@ -2131,20 +2145,21 @@ async fn restart_turns_creating_without_an_id_into_reserved_ambiguous_failed() {
     let state_dir = tmp.path().join("state");
     let fake = FakeRuntime::default();
     let now = now_ms();
+    let spec = SandboxSpec {
+        image: "alpine".into(),
+        memory_bytes: 512 << 20,
+        cpu_millis: 1000,
+        pids: 128,
+        disk_bytes: 1 << 30,
+        network: Network::None,
+        read_only_root: false,
+        writable_paths: Vec::new(),
+        labels: BTreeMap::new(),
+    };
     let crashed_create = Sandbox {
         id: new_id("sb"),
         state: SandboxState::Creating,
-        spec: SandboxSpec {
-            image: "alpine".into(),
-            memory_bytes: 512 << 20,
-            cpu_millis: 1000,
-            pids: 128,
-            disk_bytes: 1 << 30,
-            network: Network::None,
-            read_only_root: false,
-            writable_paths: Vec::new(),
-            labels: BTreeMap::new(),
-        },
+        spec: spec.clone(),
         backend: "fake".into(),
         backend_id: None,
         created_at_ms: now,
@@ -2153,6 +2168,7 @@ async fn restart_turns_creating_without_an_id_into_reserved_ambiguous_failed() {
         failure_reason: None,
         create_certainty: CreateCertainty::AllocationAmbiguous,
         owner_uid: 0,
+        accounting: SandboxAccounting::legacy(&spec, ""),
     };
     {
         let store = Store::open(&state_dir).unwrap();

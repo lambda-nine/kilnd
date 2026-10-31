@@ -180,7 +180,30 @@ async fn run(cli: Cli) -> Result<u8> {
                     resources.reserved_disk_bytes,
                     resources.max_disk_bytes
                 );
+                println!(
+                    "host reservations:   cpu {}/{} millis, vcpus {}/{}, host pids {}/{}",
+                    resources.reserved_host_cpu_millis,
+                    resources.max_host_cpu_millis,
+                    resources.reserved_virtual_cpu_slots,
+                    resources.max_virtual_cpu_slots,
+                    resources.reserved_host_pids,
+                    resources.max_host_pids
+                );
+                println!(
+                    "accounting:          {}",
+                    accounting_status(resources.accounting_status)
+                );
                 println!("rejected creates:   {}", resources.rejected_creates);
+            }
+            if let Some(capabilities) = h.runtime_capabilities {
+                println!(
+                    "interruption:        {}",
+                    if capabilities.interruption_preserves_session {
+                        "preserves the sandbox"
+                    } else {
+                        "retires the sandbox"
+                    }
+                );
             }
             if !h.detail.is_empty() {
                 println!("detail:             {}", h.detail);
@@ -286,6 +309,8 @@ async fn run(cli: Cli) -> Result<u8> {
             if !e.failure_reason.is_empty() {
                 eprintln!("reason:   {}", e.failure_reason);
             }
+            eprintln!("reusable: {}", sandbox_reusable(e.sandbox_reusable));
+            eprintln!("cleanup:  {}", cleanup_evidence(e.cleanup_evidence));
             eprintln!("started:  {}", time(e.started_at_unix_ms));
             eprintln!("finished: {}", time(e.finished_at_unix_ms));
             eprintln!("timeout:  {} ms", e.timeout_ms);
@@ -569,6 +594,23 @@ fn print_sandbox(s: &pb::Sandbox) {
     if !s.failure_reason.is_empty() {
         println!("reason:     {}", s.failure_reason);
     }
+    if let Some(r) = &s.reservation {
+        println!(
+            "reserved:   memory {} MiB, disk {} MiB, pids {}, host cpu {} millis, vcpus {}, host pids {}",
+            r.memory_bytes >> 20,
+            r.disk_bytes >> 20,
+            r.pids,
+            r.host_cpu_millis,
+            r.virtual_cpu_slots,
+            r.host_pids
+        );
+    }
+    if !s.runtime_profile.is_empty() {
+        println!("profile:    {}", s.runtime_profile);
+    }
+    if !s.runtime_artifact_digest.is_empty() {
+        println!("artifact:   {}", s.runtime_artifact_digest);
+    }
     if let Some(spec) = &s.spec {
         let l = spec.limits.unwrap_or_default();
         println!("image:      {}", spec.image);
@@ -625,6 +667,34 @@ fn execution_state(v: i32) -> String {
                 .to_lowercase()
         })
         .unwrap_or_else(|_| format!("unknown({v})"))
+}
+
+fn accounting_status(v: i32) -> String {
+    pb::NodeAccountingStatus::try_from(v)
+        .map(|s| {
+            s.as_str_name()
+                .trim_start_matches("NODE_ACCOUNTING_STATUS_")
+                .to_lowercase()
+        })
+        .unwrap_or_else(|_| format!("unknown({v})"))
+}
+
+fn cleanup_evidence(v: i32) -> String {
+    pb::CleanupEvidence::try_from(v)
+        .map(|s| {
+            s.as_str_name()
+                .trim_start_matches("CLEANUP_EVIDENCE_")
+                .to_lowercase()
+        })
+        .unwrap_or_else(|_| format!("unknown({v})"))
+}
+
+fn sandbox_reusable(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
 }
 
 fn rpc(s: tonic::Status) -> anyhow::Error {
@@ -843,6 +913,28 @@ mod tests {
                 page_size: Some(0),
                 page_token: "next".into(),
             }
+        );
+    }
+
+    #[test]
+    fn additive_evidence_displays_every_value() {
+        assert_eq!(sandbox_reusable(None), "unknown");
+        assert_eq!(sandbox_reusable(Some(false)), "no");
+        assert_eq!(
+            cleanup_evidence(pb::CleanupEvidence::Unknown as i32),
+            "unknown"
+        );
+        assert_eq!(
+            cleanup_evidence(pb::CleanupEvidence::SandboxStopped as i32),
+            "sandbox_stopped"
+        );
+        assert_eq!(
+            accounting_status(pb::NodeAccountingStatus::Unavailable as i32),
+            "unavailable"
+        );
+        assert_eq!(
+            sandbox_state(pb::SandboxState::Quarantined as i32),
+            "quarantined"
         );
     }
 

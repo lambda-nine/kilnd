@@ -1,7 +1,10 @@
 use super::protocol::*;
 use super::{fds, read_frame, write_frame};
-use crate::model::{Captured, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage};
-use crate::runtime::{ExecFinish, ExecOutcome, ExecSpec};
+use crate::model::{
+    Captured, CleanupEvidence, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage,
+    SandboxDisposition,
+};
+use crate::runtime::{ExecFinish, ExecOutcome, ExecSpec, legacy_exec_evidence};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -148,6 +151,8 @@ impl Client {
                 command_status: None,
                 stdout: Captured::known_empty(),
                 stderr: Captured::known_empty(),
+                disposition: SandboxDisposition::Reusable,
+                cleanup: CleanupEvidence::NoChildStarted,
             };
         }
         let observed_out = Arc::new(Mutex::new(Captured::default()));
@@ -161,6 +166,8 @@ impl Client {
             command_status: None,
             stdout: observed_out.lock().unwrap().clone(),
             stderr: observed_err.lock().unwrap().clone(),
+            disposition: SandboxDisposition::Quarantined,
+            cleanup: CleanupEvidence::Unknown,
         };
         let operation = async {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -216,8 +223,8 @@ impl Client {
                     status,
                     stdout,
                     stderr,
-                } => Ok(ExecOutcome {
-                    finish: match finish {
+                } => {
+                    let finish = match finish {
                         WireFinish::Completed => Ok(ExecFinish::Completed),
                         WireFinish::TimedOut => Ok(ExecFinish::TimedOut),
                         WireFinish::Canceled
@@ -227,11 +234,17 @@ impl Client {
                         }
                         WireFinish::Canceled => Ok(ExecFinish::Canceled),
                         WireFinish::Failed(d) => Err(d),
-                    },
-                    command_status: status,
-                    stdout: stdout.capture(out, spec.max_output)?,
-                    stderr: stderr.capture(err, spec.max_output)?,
-                }),
+                    };
+                    let (disposition, cleanup) = legacy_exec_evidence(&finish);
+                    Ok(ExecOutcome {
+                        finish,
+                        command_status: status,
+                        stdout: stdout.capture(out, spec.max_output)?,
+                        stderr: stderr.capture(err, spec.max_output)?,
+                        disposition,
+                        cleanup,
+                    })
+                }
                 Response::Error { error, .. } => Err(io::Error::other(
                     crate::runtime::RuntimeError::from(error).to_string(),
                 )),

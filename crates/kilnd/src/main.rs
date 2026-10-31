@@ -64,6 +64,15 @@ struct Args {
     /// Aggregate disk quota promised to durably reserved sandboxes on this node.
     #[arg(long, default_value_t = 16_u64 << 30)]
     max_node_disk_bytes: u64,
+    /// Local policy for host CPU millis an allocation-token backend reserves. Kiln reserves none.
+    #[arg(long, default_value_t = 3000)]
+    max_node_host_cpu_millis: u64,
+    /// Local policy for vCPU slots an allocation-token backend reserves. Kiln reserves none.
+    #[arg(long, default_value_t = 3)]
+    max_node_virtual_cpu_slots: u64,
+    /// Local policy for host PIDs an allocation-token backend reserves. Kiln reserves none.
+    #[arg(long, default_value_t = 96)]
+    max_node_host_pids: u64,
     /// Simultaneous admitted Unix connections; excess sockets are closed.
     #[arg(long, default_value_t = 64)]
     max_connections: usize,
@@ -271,6 +280,9 @@ fn validated_limits(args: &Args) -> Result<Limits> {
         max_node_memory_bytes: args.max_node_memory_bytes,
         max_node_pids: args.max_node_pids,
         max_node_disk_bytes: args.max_node_disk_bytes,
+        max_node_host_cpu_millis: args.max_node_host_cpu_millis,
+        max_node_virtual_cpu_slots: args.max_node_virtual_cpu_slots,
+        max_node_host_pids: args.max_node_host_pids,
         max_connections: args.max_connections,
         max_concurrent_rpcs: args.max_concurrent_rpcs,
         max_concurrent_health: args.max_concurrent_health,
@@ -455,6 +467,9 @@ mod tests {
         assert_eq!(limits.max_node_memory_bytes, 3 << 30);
         assert_eq!(limits.max_node_pids, 2048);
         assert_eq!(limits.max_node_disk_bytes, 16 << 30);
+        assert_eq!(limits.max_node_host_cpu_millis, 3000);
+        assert_eq!(limits.max_node_virtual_cpu_slots, 3);
+        assert_eq!(limits.max_node_host_pids, 96);
         let args = Args::try_parse_from(["kilnd", "--max-queued-execs-per-sandbox", "0"]).unwrap();
         validated_limits(&args).unwrap();
 

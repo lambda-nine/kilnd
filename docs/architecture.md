@@ -26,17 +26,28 @@ testable without kiln, through the fake runtime.
 
 ## The runtime adapter
 
-`runtime::Runtime` is the only kiln-shaped seam: `create(spec) → backend id`,
-`exec(id, argv, stdin, deadline, max_output, cancel)`, `validate_sandbox`, `remove`, `list`, `gc(ids)`
-and `version`. The contract that matters most: when an exec times out or is
-canceled, the command must be stopped *inside* the sandbox and the sandbox
-left usable. A Firecracker backend would implement the same trait over its
-API socket and a guest agent.
+`runtime::Runtime` is the only backend-shaped seam: `prepare(context, spec) →
+PreparedCreate`, `create(context, prepared) → CreatedSandbox`,
+`inspect_allocation`, `fence_absent`, `exec(id, execution, spec, cancel)`,
+`validate_sandbox`, `remove`, `list`, `gc(ids)`, `version` and `capabilities`.
+The contract that matters most: when an exec times out or is canceled, the
+command must be stopped before `exec` returns, and its outcome must say what that
+means for the sandbox. `ExecOutcome` carries a disposition (`Reusable`, `Stopped`,
+`Quarantined`) and cleanup evidence (`Unknown`, `NoChildStarted`, `RuntimeDrained`,
+`SandboxStopped`). `remove` and `gc` return typed `AbsenceReceipt`s, not `()`.
 
 `KilnRuntime` talks only to the root helper. The helper revalidates typed
 requests and uses `DirectKilnRuntime` in `runtime/kiln_direct.rs` to drive the
 installed CLI. The direct adapter is also used by root-only integration tests.
-The Runtime trait is unchanged. See the [private protocol](helper-protocol.md).
+The helper wire keeps its v3 shape, adds no action and carries no disposition: the
+client derives it from the same finish result the direct adapter uses. See the
+[private protocol](helper-protocol.md).
+
+Kiln's `prepare` wraps the unchanged spec with an empty plan and allocates nothing.
+Its CPU, vCPU and host-PID amounts are zero, meaning explicitly not reserved. Token
+recovery is `Unsupported`, and its absence receipt only wraps the existing strict
+removal proof. Reusable requires the existing cleanup barrier; `CleanupFailed`,
+including an unconfirmed helper exchange, becomes `Quarantined`.
 
 The helper maps these operations to fixed argv:
 
@@ -135,6 +146,11 @@ failure without a prior failure is Io/Capture; cleanup failure overrides other o
 CleanupFailed/Cleanup. Previously observed status and bytes survive failures.
 Runtime::exec returns this evidence directly; non-exec methods retain Results.
 
+An allocation-token backend also needs preflight, recovery by exact token and
+receipts bound to its identity. That contract exists in B2 only through
+`FakeRuntime`'s `Fenced` mode: no Firecracker backend, helper operation or node
+ledger exists yet, and `main.rs` still selects kiln only.
+
 ## State machine
 
 ```
@@ -144,7 +160,13 @@ Runtime::exec returns this evidence directly; non-exec methods retain Results.
     ▼                    ▼ (exec or startup)       │ (retry delete, or startup retries)
   FAILED               LOST
     └──── delete ───▶ DELETED ◀──── delete ────┘
+
+ READY ── cleanup unknown ──▶ QUARANTINED ── delete ──▶ DELETING
 ```
+
+`QUARANTINED` means a backend may remain and cleanup or reuse cannot be established.
+It refuses Exec with `FAILED_PRECONDITION`, never returns to `READY` by any path, and
+stays charged until Delete proves it gone.
 
 Executions: `RUNNING` → `EXITED` (with exit code) | `TIMED_OUT` | `CANCELED`
 (caller disconnected, sandbox deleted, or daemon shutdown) | `FAILED` (backend error) |
@@ -165,6 +187,15 @@ terminal update. The RPC is only a waiter: dropping it records the first
 cancellation reason and requests cancellation, but cannot abandon cleanup. A
 caller that disconnects while still queued is discarded before a row or
 backend process is created.
+The terminal update also commits `sandbox_reusable`, the cleanup evidence and the
+sandbox's disposition in one transaction, before the slot is released: `Stopped`
+becomes `LOST` and `Quarantined` becomes `QUARANTINED`, both still charged, and a
+queued successor's reload refuses. `DELETING` keeps its intent. On an absence-fenced
+row a claim without its evidence quarantines, and an otherwise clean finish becomes
+`CleanupFailed`, keeping status and captures, so a timeout or exit never reads as clean
+without a stop barrier, a drained completion or proof that no child started. Historical
+rows report unknown evidence, as does an adapter panic on a legacy row, which otherwise
+keeps its existing behavior; on an absence-fenced row a panic quarantines.
 If the terminal SQLite update fails, the supervisor keeps the lock and outcome
 and retries with bounded exponential backoff. Health is degraded and shutdown
 cannot claim a completed drain until that publication succeeds.
@@ -172,17 +203,25 @@ cannot claim a completed drain until that publication succeeds.
 ### Node resource reservations
 
 Per-sandbox cgroups and quotas bound one workload but do not stop the control
-plane promising the same node capacity many times. Create therefore opens an
-SQLite `IMMEDIATE` transaction, parses every reserved row with checked
-arithmetic, checks sandbox count plus aggregate memory, PIDs and disk, and
-inserts the new `CREATING` row before committing. There is no in-memory permit
-to lose on cancellation, panic or restart.
+plane promising the same node capacity many times. Create therefore prepares
+first, rechecks serving, then opens an SQLite `IMMEDIATE` transaction, sums every
+charged row's stored vector with checked arithmetic, checks sandbox count plus every
+vector dimension, and inserts the new `CREATING` row before committing. There is no
+in-memory permit to lose on cancellation, panic or restart. A preflight rejection
+leaves no row.
 
-Reservations follow ownership evidence:
+Schema 8 stores the reservation vector, both spec digests, full spec, profile,
+artifact digest, disposition and boot identity on each row, and a release decision
+that is never inferred at read time. Every older schema migrates through 7 and then
+one atomic step, all in one transaction. Each legacy row's amounts come exactly from
+its stored spec, with zero CPU, vCPU and host PIDs, and its tag comes exactly from
+schema 7's predicate, so every old ambiguous failure stays charged.
 
-- `CREATING`, `READY`, `DELETING` and `LOST` reserve the full effective spec.
-  `LOST` is retained because later reconciliation may restore the same backend
-  to `READY`.
+Reservations on a legacy row follow ownership evidence:
+
+- `CREATING`, `READY`, `DELETING`, `LOST` and `QUARANTINED` reserve their stored
+  vector. `LOST` is retained because later reconciliation may restore the same
+  backend to `READY`.
 - `FAILED` without a backend ID remains reserved by default, because
   `Runtime::create` failures are `AllocationAmbiguous` unless proven otherwise.
   This covers every ordinary error, panics, task cancellation, a crash during
@@ -222,8 +261,32 @@ from diagnostics text:
 From the spawn attempt on, everything else stays ambiguous: any other status, a
 signal, a malformed success, deadline, cancellation, spawn or wait I/O failure.
 
+An absence-fenced row has one rule instead: it is charged until its nullable
+`release_evidence_id` references an immutable `release_evidence` row, whatever its
+state, backend ID or certainty says. A composite foreign key binds that reference to
+the row's own node, instance, allocation, plan digest and kind `absent_fenced`.
+CHECKs and triggers forbid release before `FAILED`/`DELETED`, a prefilled backend ID,
+changing any identity, plan, spec or reservation column, updating or deleting
+evidence, deleting a charged row, returning to `READY` from a retired state, and
+laundering a row between regimes or forging a legacy tag. These triggers also hold
+on a connection with foreign keys off; every `Store` connection sets and verifies
+foreign keys on before any schema work. `last_helper_generation` records the newest
+generation the row published and only moves forward, with its ready or absence receipt:
+a ready or absence receipt no newer than it fails closed, in `Store` and in SQL, and only
+the row's own recorded release can replay. Evidence insert and terminal reference commit
+in one transaction, and history pruning never removes evidence. `NotFound`, an empty
+listing, a legacy receipt or a definite claim without a receipt releases nothing.
+
+Delete on such a row publishes `DELETING` first, then proves absence by exact token:
+removal if a record exists, `fence_absent` if none does. A row without a backend ID
+can be fenced, unlike a legacy no-ID row. A failed READY publication compensates the
+same way and stays charged until the receipt commits.
+
 Budgets are configured promises, not live RSS or disk-use measurements.
-Health reports both limits and reservations. If an operator lowers a budget
+Health reports both limits and reservations. `accounting_status` says where the
+totals came from: `LOCAL_LEGACY` for kiln, whose CPU, vCPU and host-PID fields are
+zero, and `UNAVAILABLE` when a node authority cannot be read, where totals are zero
+rather than a local sum that looks authoritative. If an operator lowers a budget
 below surviving ownership, startup reconciliation still completes and the API
 remains available for Get/List/Delete. Health is `DEGRADED` and every new
 Create is rejected until cleanup returns all sums within their ceilings.
@@ -523,6 +586,7 @@ namespace, mount, quota, network, ownership and cleanup capabilities.
 | Reserved sandbox memory | 3 GiB | `--max-node-memory-bytes` |
 | Reserved sandbox PIDs | 2,048 | `--max-node-pids` |
 | Reserved sandbox disk | 16 GiB | `--max-node-disk-bytes` |
+| Reserved host CPU, vCPU slots, host PIDs (not reserved by kiln) | 3000 millis, 3, 96 | `--max-node-host-cpu-millis`, `--max-node-virtual-cpu-slots`, `--max-node-host-pids` |
 | stdin / argv per exec | 1 MiB / 256 KiB | (code) |
 | argc per exec | 4096 | (code) |
 | Admitted connections | 64 | `--max-connections` |

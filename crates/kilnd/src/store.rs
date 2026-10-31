@@ -19,26 +19,262 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavio
 
 use crate::lock::ExclusiveFileLock;
 use crate::model::{
-    Captured, CommandStatus, CreateCertainty, Execution, ExecutionState, RuntimeDiagnostic,
-    Sandbox, SandboxSpec, SandboxState, now_ms,
+    AccountingRegime, AllocationBinding, Captured, CleanupEvidence, CommandStatus, CreateCertainty,
+    Digest, Execution, ExecutionState, Id128, LegacyRelease, ReservationRelease,
+    ResourceReservation, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage, Sandbox,
+    SandboxAccounting, SandboxDisposition, SandboxSpec, SandboxState, now_ms,
 };
 use crate::retention::{OutputStorage, Pruned, Retention};
+use crate::runtime::{CreatedSandbox, FencedAbsence, RuntimeReceipt};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
 INSERT INTO history_sequence VALUES (1, (SELECT COALESCE(MAX(list_seq), 0) FROM sandboxes));
 PRAGMA user_version = 6;";
 
-// A non-deleted row reserves capacity unless FAILED proves no backend remains:
-// a successful compensation recorded the exact removed backend ID, or the
-// runtime's typed result durably recorded that nothing was ever allocated.
-// Every other FAILED without an ID stays reserved as ambiguous.
-const RESERVED_SANDBOX_WHERE: &str = "state != 'deleted' AND NOT (state = 'failed' AND (backend_id IS NOT NULL OR create_certainty = 'definitely_not_created'))";
+// A row stays charged until its release is explicit. A legacy row's tag was
+// computed from schema 7's predicate: `state != 'deleted' AND NOT (state = 'failed'
+// AND (backend_id IS NOT NULL OR create_certainty = 'definitely_not_created'))`.
+// Every other FAILED without an ID stays reserved as ambiguous. An absence-fenced
+// row needs its evidence reference, whatever its state, backend ID or certainty.
+const RESERVED_SANDBOX_WHERE: &str = "((accounting_kind = 'legacy' AND legacy_release IS NULL) OR (accounting_kind = 'fenced' AND release_evidence_id IS NULL))";
 // Only these lifecycle states can still explain a listed backend ID. In
 // particular, compensated FAILED must not hide a backend that reappeared.
-const OWNED_BACKEND_WHERE: &str = "state IN ('creating', 'ready', 'deleting', 'lost')";
+const OWNED_BACKEND_WHERE: &str =
+    "state IN ('creating', 'ready', 'deleting', 'lost', 'quarantined')";
+
+// Schema 8 rebuilds both tables because SQLite cannot add a composite foreign key.
+// `sandboxes_v8` is the parent while `executions_v8` is copied, so no violation
+// exists at any instant and foreign keys stay enforced throughout the transaction.
+const MIGRATE_V8_TABLES: &str = "
+CREATE TABLE daemon_identity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    database_uuid TEXT NOT NULL CHECK (length(database_uuid) = 32 AND database_uuid NOT GLOB '*[^0-9a-f]*'),
+    instance_id TEXT NOT NULL CHECK (length(instance_id) = 32 AND instance_id NOT GLOB '*[^0-9a-f]*')
+);
+CREATE TABLE release_evidence (
+    receipt_id TEXT PRIMARY KEY CHECK (length(receipt_id) = 32 AND receipt_id NOT GLOB '*[^0-9a-f]*'),
+    node_id TEXT NOT NULL CHECK (length(node_id) = 32 AND node_id NOT GLOB '*[^0-9a-f]*'),
+    instance_id TEXT NOT NULL CHECK (length(instance_id) = 32 AND instance_id NOT GLOB '*[^0-9a-f]*'),
+    allocation_id TEXT NOT NULL UNIQUE CHECK (length(allocation_id) = 32 AND allocation_id NOT GLOB '*[^0-9a-f]*'),
+    plan_digest TEXT NOT NULL CHECK (length(plan_digest) = 64 AND plan_digest NOT GLOB '*[^0-9a-f]*'),
+    helper_generation INTEGER NOT NULL CHECK (typeof(helper_generation) = 'integer' AND helper_generation >= 1),
+    kind TEXT NOT NULL CHECK (kind = 'absent_fenced'),
+    receipt BLOB NOT NULL CHECK (typeof(receipt) = 'blob' AND length(receipt) BETWEEN 1 AND 16384),
+    recorded_at_ms INTEGER NOT NULL,
+    UNIQUE (node_id, instance_id, allocation_id, plan_digest, helper_generation, kind),
+    UNIQUE (receipt_id, node_id, instance_id, allocation_id, plan_digest, kind)
+);
+CREATE TABLE sandboxes_v8 (
+    id             TEXT PRIMARY KEY,
+    backend        TEXT NOT NULL,
+    backend_id     TEXT,
+    state          TEXT NOT NULL,
+    spec           TEXT NOT NULL,
+    failure_reason TEXT,
+    created_at_ms  INTEGER NOT NULL,
+    updated_at_ms  INTEGER NOT NULL,
+    deleted_at_ms  INTEGER,
+    list_seq       INTEGER NOT NULL,
+    create_certainty TEXT NOT NULL DEFAULT 'allocation_ambiguous' CHECK (create_certainty = 'allocation_ambiguous' OR (create_certainty = 'definitely_not_created' AND backend_id IS NULL AND state IN ('failed', 'deleted'))),
+    owner_uid INTEGER NOT NULL DEFAULT 0 CHECK (owner_uid BETWEEN 0 AND 4294967295),
+    accounting_kind TEXT NOT NULL CHECK (accounting_kind IN ('legacy', 'fenced')),
+    reserved_memory_bytes INTEGER NOT NULL CHECK (typeof(reserved_memory_bytes) = 'integer' AND reserved_memory_bytes >= 0),
+    reserved_disk_bytes INTEGER NOT NULL CHECK (typeof(reserved_disk_bytes) = 'integer' AND reserved_disk_bytes >= 0),
+    reserved_pids INTEGER NOT NULL CHECK (typeof(reserved_pids) = 'integer' AND reserved_pids >= 0),
+    reserved_host_cpu_millis INTEGER NOT NULL CHECK (typeof(reserved_host_cpu_millis) = 'integer' AND reserved_host_cpu_millis >= 0),
+    reserved_virtual_cpu_slots INTEGER NOT NULL CHECK (typeof(reserved_virtual_cpu_slots) = 'integer' AND reserved_virtual_cpu_slots >= 0),
+    reserved_host_pids INTEGER NOT NULL CHECK (typeof(reserved_host_pids) = 'integer' AND reserved_host_pids >= 0),
+    host_spec_sha256 TEXT NOT NULL CHECK (length(host_spec_sha256) = 64 AND host_spec_sha256 NOT GLOB '*[^0-9a-f]*'),
+    guest_exec_spec_sha256 TEXT NOT NULL CHECK (length(guest_exec_spec_sha256) = 64 AND guest_exec_spec_sha256 NOT GLOB '*[^0-9a-f]*'),
+    runtime_profile TEXT NOT NULL DEFAULT '',
+    runtime_artifact_digest TEXT NOT NULL DEFAULT '',
+    disposition TEXT NOT NULL DEFAULT 'reusable' CHECK (disposition IN ('reusable', 'stopped', 'quarantined')),
+    boot_id TEXT,
+    runtime_receipt BLOB CHECK (runtime_receipt IS NULL OR length(runtime_receipt) <= 16384),
+    legacy_release TEXT,
+    node_id TEXT CHECK (node_id IS NULL OR (length(node_id) = 32 AND node_id NOT GLOB '*[^0-9a-f]*')),
+    instance_id TEXT CHECK (instance_id IS NULL OR (length(instance_id) = 32 AND instance_id NOT GLOB '*[^0-9a-f]*')),
+    allocation_id TEXT CHECK (allocation_id IS NULL OR (length(allocation_id) = 32 AND allocation_id NOT GLOB '*[^0-9a-f]*')),
+    plan_version INTEGER CHECK (plan_version IS NULL OR plan_version BETWEEN 0 AND 4294967295),
+    plan_digest TEXT CHECK (plan_digest IS NULL OR (length(plan_digest) = 64 AND plan_digest NOT GLOB '*[^0-9a-f]*')),
+    plan BLOB CHECK (plan IS NULL OR (typeof(plan) = 'blob' AND length(plan) BETWEEN 1 AND 131072)),
+    release_evidence_id TEXT,
+    release_evidence_kind TEXT NOT NULL DEFAULT 'absent_fenced' CHECK (release_evidence_kind = 'absent_fenced'),
+    last_helper_generation INTEGER CHECK (last_helper_generation IS NULL OR (typeof(last_helper_generation) = 'integer' AND last_helper_generation >= 0)),
+    CHECK (legacy_release IS NULL
+        OR (legacy_release = 'deleted' AND state = 'deleted')
+        OR (legacy_release = 'compensated' AND state = 'failed' AND backend_id IS NOT NULL)
+        OR (legacy_release = 'definitely_not_created' AND state = 'failed' AND backend_id IS NULL AND create_certainty = 'definitely_not_created')),
+    CHECK (accounting_kind = 'fenced' OR state != 'deleted' OR legacy_release IS 'deleted'),
+    CHECK (accounting_kind = 'fenced' OR (release_evidence_id IS NULL AND node_id IS NULL AND instance_id IS NULL AND allocation_id IS NULL AND plan_version IS NULL AND plan_digest IS NULL AND plan IS NULL AND last_helper_generation IS NULL)),
+    CHECK (accounting_kind = 'legacy' OR (legacy_release IS NULL AND create_certainty = 'allocation_ambiguous'
+        AND node_id IS NOT NULL AND instance_id IS NOT NULL AND allocation_id IS NOT NULL
+        AND plan_version IS NOT NULL AND plan_digest IS NOT NULL AND plan IS NOT NULL AND last_helper_generation IS NOT NULL)),
+    CHECK (release_evidence_id IS NULL OR state IN ('failed', 'deleted')),
+    CHECK (accounting_kind = 'legacy' OR state != 'deleted' OR release_evidence_id IS NOT NULL),
+    CHECK (accounting_kind = 'legacy' OR state != 'creating' OR backend_id IS NULL),
+    CHECK (accounting_kind = 'legacy' OR backend_id IS NULL OR backend_id = 'fc-' || allocation_id),
+    CHECK (accounting_kind = 'legacy' OR state != 'ready' OR (backend_id IS NOT NULL AND boot_id IS NOT NULL AND runtime_receipt IS NOT NULL AND last_helper_generation >= 1)),
+    FOREIGN KEY (release_evidence_id, node_id, instance_id, allocation_id, plan_digest, release_evidence_kind)
+        REFERENCES release_evidence (receipt_id, node_id, instance_id, allocation_id, plan_digest, kind)
+);
+CREATE TABLE executions_v8 (
+    id               TEXT PRIMARY KEY,
+    sandbox_id       TEXT NOT NULL REFERENCES sandboxes_v8 (id),
+    argv             TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    exit_code        INTEGER,
+    failure_reason   TEXT,
+    timeout_ms       INTEGER NOT NULL,
+    stdin_bytes      INTEGER NOT NULL,
+    started_at_ms    INTEGER NOT NULL,
+    finished_at_ms   INTEGER,
+    stdout           BLOB NOT NULL DEFAULT x'',
+    stdout_bytes     INTEGER NOT NULL DEFAULT 0,
+    stdout_truncated INTEGER NOT NULL DEFAULT 0,
+    stdout_total_bytes_known INTEGER NOT NULL DEFAULT 0,
+    stderr           BLOB NOT NULL DEFAULT x'',
+    stderr_bytes     INTEGER NOT NULL DEFAULT 0,
+    stderr_truncated INTEGER NOT NULL DEFAULT 0,
+    stderr_total_bytes_known INTEGER NOT NULL DEFAULT 0,
+    command_status_kind TEXT,
+    command_status_value INTEGER,
+    command_core_dumped INTEGER,
+    runtime_error TEXT,
+    sandbox_reusable INTEGER CHECK (sandbox_reusable IS NULL OR sandbox_reusable IN (0, 1)),
+    cleanup_evidence TEXT NOT NULL DEFAULT 'unknown' CHECK (cleanup_evidence IN ('unknown', 'no_child_started', 'runtime_drained', 'sandbox_stopped'))
+);
+";
+
+// Runs after every row is copied, so history never trips a constraint meant for
+// new writes. These are defense in depth against malformed direct SQL; the typed
+// API is still what produces valid evidence.
+const MIGRATE_V8_FINISH: &str = "
+INSERT INTO executions_v8 (id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
+    started_at_ms, finished_at_ms, stdout, stdout_bytes, stdout_truncated, stdout_total_bytes_known,
+    stderr, stderr_bytes, stderr_truncated, stderr_total_bytes_known,
+    command_status_kind, command_status_value, command_core_dumped, runtime_error)
+SELECT id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
+    started_at_ms, finished_at_ms, stdout, stdout_bytes, stdout_truncated, stdout_total_bytes_known,
+    stderr, stderr_bytes, stderr_truncated, stderr_total_bytes_known,
+    command_status_kind, command_status_value, command_core_dumped, runtime_error
+FROM executions;
+DROP TABLE executions;
+DROP TABLE sandboxes;
+ALTER TABLE sandboxes_v8 RENAME TO sandboxes;
+ALTER TABLE executions_v8 RENAME TO executions;
+CREATE UNIQUE INDEX sandboxes_backend_id ON sandboxes (backend, backend_id) WHERE backend_id IS NOT NULL;
+CREATE INDEX sandboxes_state ON sandboxes (state);
+CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);
+CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';
+CREATE INDEX sandboxes_owner_list_seq ON sandboxes (owner_uid, list_seq DESC);
+CREATE UNIQUE INDEX sandboxes_allocation ON sandboxes (allocation_id) WHERE allocation_id IS NOT NULL;
+CREATE INDEX executions_sandbox ON executions (sandbox_id, started_at_ms);
+CREATE INDEX executions_state ON executions (state);
+CREATE TRIGGER daemon_identity_no_update BEFORE UPDATE ON daemon_identity
+BEGIN SELECT RAISE(ABORT, 'daemon identity is immutable'); END;
+CREATE TRIGGER daemon_identity_no_delete BEFORE DELETE ON daemon_identity
+BEGIN SELECT RAISE(ABORT, 'daemon identity is immutable'); END;
+CREATE TRIGGER release_evidence_no_update BEFORE UPDATE ON release_evidence
+BEGIN SELECT RAISE(ABORT, 'release evidence is immutable'); END;
+CREATE TRIGGER release_evidence_no_delete BEFORE DELETE ON release_evidence
+BEGIN SELECT RAISE(ABORT, 'release evidence is immutable'); END;
+CREATE TRIGGER release_evidence_no_replace BEFORE INSERT ON release_evidence
+WHEN EXISTS (SELECT 1 FROM release_evidence WHERE receipt_id = NEW.receipt_id OR allocation_id = NEW.allocation_id)
+BEGIN SELECT RAISE(ABORT, 'release evidence is immutable'); END;
+CREATE TRIGGER release_evidence_not_stale BEFORE INSERT ON release_evidence
+WHEN EXISTS (SELECT 1 FROM sandboxes WHERE allocation_id = NEW.allocation_id AND last_helper_generation >= NEW.helper_generation)
+BEGIN SELECT RAISE(ABORT, 'absence evidence is older than this allocation''s published generation'); END;
+CREATE TRIGGER sandboxes_no_replace BEFORE INSERT ON sandboxes
+WHEN EXISTS (SELECT 1 FROM sandboxes WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a sandbox row cannot be replaced'); END;
+CREATE TRIGGER sandboxes_immutable BEFORE UPDATE ON sandboxes
+WHEN NEW.id IS NOT OLD.id OR NEW.backend IS NOT OLD.backend OR NEW.spec IS NOT OLD.spec
+    OR NEW.created_at_ms IS NOT OLD.created_at_ms OR NEW.list_seq IS NOT OLD.list_seq
+    OR NEW.owner_uid IS NOT OLD.owner_uid OR NEW.accounting_kind IS NOT OLD.accounting_kind
+    OR NEW.reserved_memory_bytes IS NOT OLD.reserved_memory_bytes
+    OR NEW.reserved_disk_bytes IS NOT OLD.reserved_disk_bytes
+    OR NEW.reserved_pids IS NOT OLD.reserved_pids
+    OR NEW.reserved_host_cpu_millis IS NOT OLD.reserved_host_cpu_millis
+    OR NEW.reserved_virtual_cpu_slots IS NOT OLD.reserved_virtual_cpu_slots
+    OR NEW.reserved_host_pids IS NOT OLD.reserved_host_pids
+    OR NEW.host_spec_sha256 IS NOT OLD.host_spec_sha256
+    OR NEW.guest_exec_spec_sha256 IS NOT OLD.guest_exec_spec_sha256
+    OR NEW.runtime_profile IS NOT OLD.runtime_profile
+    OR NEW.runtime_artifact_digest IS NOT OLD.runtime_artifact_digest
+    OR NEW.node_id IS NOT OLD.node_id OR NEW.instance_id IS NOT OLD.instance_id
+    OR NEW.allocation_id IS NOT OLD.allocation_id OR NEW.plan_version IS NOT OLD.plan_version
+    OR NEW.plan_digest IS NOT OLD.plan_digest OR NEW.plan IS NOT OLD.plan
+    OR NEW.release_evidence_kind IS NOT OLD.release_evidence_kind
+BEGIN SELECT RAISE(ABORT, 'sandbox identity, plan, spec and reservation are immutable'); END;
+CREATE TRIGGER sandboxes_evidence_matches_update BEFORE UPDATE ON sandboxes
+WHEN NEW.release_evidence_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM release_evidence
+    WHERE receipt_id = NEW.release_evidence_id AND node_id = NEW.node_id AND instance_id = NEW.instance_id
+      AND allocation_id = NEW.allocation_id AND plan_digest = NEW.plan_digest AND kind = 'absent_fenced')
+BEGIN SELECT RAISE(ABORT, 'release evidence does not match this allocation'); END;
+CREATE TRIGGER sandboxes_evidence_matches_insert BEFORE INSERT ON sandboxes
+WHEN NEW.release_evidence_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM release_evidence
+    WHERE receipt_id = NEW.release_evidence_id AND node_id = NEW.node_id AND instance_id = NEW.instance_id
+      AND allocation_id = NEW.allocation_id AND plan_digest = NEW.plan_digest AND kind = 'absent_fenced'
+      AND helper_generation IS NEW.last_helper_generation)
+BEGIN SELECT RAISE(ABORT, 'release evidence does not match this allocation'); END;
+CREATE TRIGGER sandboxes_generation_is_monotonic BEFORE UPDATE ON sandboxes
+WHEN NEW.last_helper_generation IS NOT OLD.last_helper_generation AND (
+        OLD.last_helper_generation IS NULL OR NEW.last_helper_generation IS NULL
+        OR NEW.last_helper_generation <= OLD.last_helper_generation
+        OR NOT ((OLD.runtime_receipt IS NULL AND NEW.runtime_receipt IS NOT NULL)
+            OR (OLD.release_evidence_id IS NULL AND NEW.release_evidence_id IS NOT NULL)))
+BEGIN SELECT RAISE(ABORT, 'a helper generation only advances with its ready or absence receipt'); END;
+CREATE TRIGGER sandboxes_release_is_fresh BEFORE UPDATE ON sandboxes
+WHEN OLD.release_evidence_id IS NULL AND NEW.release_evidence_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM release_evidence
+    WHERE receipt_id = NEW.release_evidence_id
+      AND (helper_generation <= OLD.last_helper_generation OR helper_generation IS NOT NEW.last_helper_generation))
+BEGIN SELECT RAISE(ABORT, 'absence evidence is not newer than this allocation''s published generation'); END;
+CREATE TRIGGER sandboxes_release_is_permanent BEFORE UPDATE ON sandboxes
+WHEN (OLD.release_evidence_id IS NOT NULL
+        AND (NEW.release_evidence_id IS NOT OLD.release_evidence_id OR NEW.state NOT IN ('failed', 'deleted')))
+    OR (OLD.legacy_release IS NOT NULL AND NEW.legacy_release IS NULL)
+    OR (OLD.state = 'deleted' AND NEW.state != 'deleted')
+BEGIN SELECT RAISE(ABORT, 'a released reservation cannot be charged or reused again'); END;
+CREATE TRIGGER sandboxes_no_legacy_laundering BEFORE UPDATE ON sandboxes
+WHEN OLD.accounting_kind = 'legacy' AND OLD.state != 'creating' AND (
+        (OLD.backend_id IS NULL AND NEW.backend_id IS NOT NULL)
+        OR NEW.create_certainty IS NOT OLD.create_certainty
+        OR (OLD.state = 'failed' AND OLD.legacy_release IS NULL AND NEW.state = 'deleted'))
+BEGIN SELECT RAISE(ABORT, 'an ambiguous legacy reservation cannot acquire release provenance'); END;
+CREATE TRIGGER sandboxes_fenced_publication BEFORE UPDATE ON sandboxes
+WHEN OLD.accounting_kind = 'fenced' AND (
+        (OLD.backend_id IS NOT NULL AND NEW.backend_id IS NOT OLD.backend_id)
+        OR (OLD.boot_id IS NOT NULL AND NEW.boot_id IS NOT OLD.boot_id)
+        OR (OLD.runtime_receipt IS NOT NULL AND NEW.runtime_receipt IS NOT OLD.runtime_receipt))
+BEGIN SELECT RAISE(ABORT, 'a published allocation identity is immutable'); END;
+CREATE TRIGGER sandboxes_no_resurrection BEFORE UPDATE ON sandboxes
+WHEN NEW.state = 'ready' AND OLD.state != 'ready' AND (OLD.state = 'quarantined'
+        OR (OLD.accounting_kind = 'fenced' AND OLD.state != 'creating'))
+BEGIN SELECT RAISE(ABORT, 'a stopped or quarantined session cannot become ready'); END;
+CREATE TRIGGER sandboxes_fenced_disposition BEFORE UPDATE ON sandboxes
+WHEN OLD.accounting_kind = 'fenced' AND OLD.disposition != 'reusable' AND NEW.disposition = 'reusable'
+BEGIN SELECT RAISE(ABORT, 'a retired allocation cannot become reusable'); END;
+CREATE TRIGGER sandboxes_no_charged_delete BEFORE DELETE ON sandboxes
+WHEN (OLD.accounting_kind = 'legacy' AND OLD.legacy_release IS NULL)
+    OR (OLD.accounting_kind = 'fenced' AND OLD.release_evidence_id IS NULL)
+BEGIN SELECT RAISE(ABORT, 'a charged sandbox row cannot be deleted'); END;
+PRAGMA user_version = 8;";
+
+// The explicit legacy tag and reuse state for an update binding ?2 = new state and
+// ?3 = optional backend ID. An absence-fenced row never takes this path's tag.
+const LEGACY_TRANSITION: &str = "legacy_release = CASE WHEN accounting_kind = 'legacy' THEN CASE
+        WHEN ?2 = 'deleted' THEN 'deleted'
+        WHEN ?2 = 'failed' AND COALESCE(?3, backend_id) IS NOT NULL THEN 'compensated'
+        WHEN ?2 = 'failed' AND create_certainty = 'definitely_not_created' THEN 'definitely_not_created'
+    END END,
+    disposition = CASE WHEN accounting_kind = 'legacy' AND ?2 = 'ready' THEN 'reusable' ELSE disposition END";
 
 const MIGRATE_V3: &str = "
 ALTER TABLE executions ADD COLUMN command_status_kind TEXT;
@@ -127,9 +363,12 @@ pub struct Store {
     _state_directory: Option<File>,
     #[cfg(test)]
     reject_execution_finishes: Arc<AtomicBool>,
+    #[cfg(test)]
+    reject_evidence_commits: Arc<AtomicBool>,
 }
 
-/// How an execution ended, written in one update.
+/// How an execution ended, written in one transaction with what it means for its
+/// sandbox, so a queued successor reloads the outcome before the slot is released.
 pub struct ExecutionResult<'a> {
     pub state: ExecutionState,
     pub exit_code: Option<i32>,
@@ -138,6 +377,12 @@ pub struct ExecutionResult<'a> {
     pub failure_reason: Option<&'a str>,
     pub stdout: &'a Captured,
     pub stderr: &'a Captured,
+    pub sandbox_reusable: Option<bool>,
+    pub cleanup_evidence: CleanupEvidence,
+    /// `None` leaves the sandbox unchanged. `Stopped` turns READY into LOST and
+    /// `Quarantined` into QUARANTINED; both stay charged, and DELETING stays DELETING.
+    pub disposition: Option<SandboxDisposition>,
+    pub disposition_reason: Option<&'a str>,
 }
 
 pub struct SandboxPageRow {
@@ -159,16 +404,27 @@ pub struct SandboxResources {
     pub memory_bytes: u64,
     pub pids: u64,
     pub disk_bytes: u64,
+    pub host_cpu_millis: u64,
+    pub virtual_cpu_slots: u64,
+    pub host_pids: u64,
 }
 
 impl SandboxResources {
-    fn for_spec(spec: &SandboxSpec) -> Self {
+    pub fn for_reservation(r: &ResourceReservation) -> Self {
         Self {
             sandboxes: 1,
-            memory_bytes: spec.memory_bytes,
-            pids: u64::from(spec.pids),
-            disk_bytes: spec.disk_bytes,
+            memory_bytes: r.memory_bytes,
+            pids: r.pids,
+            disk_bytes: r.disk_bytes,
+            host_cpu_millis: r.host_cpu_millis,
+            virtual_cpu_slots: r.virtual_cpu_slots,
+            host_pids: r.host_pids,
         }
+    }
+
+    #[cfg(test)]
+    fn for_spec(spec: &SandboxSpec) -> Self {
+        Self::for_reservation(&ResourceReservation::legacy_for_spec(spec))
     }
 
     fn checked_add(self, other: Self) -> Result<Self> {
@@ -189,6 +445,18 @@ impl SandboxResources {
                 .disk_bytes
                 .checked_add(other.disk_bytes)
                 .context("sandbox disk reservation overflow")?,
+            host_cpu_millis: self
+                .host_cpu_millis
+                .checked_add(other.host_cpu_millis)
+                .context("sandbox host CPU reservation overflow")?,
+            virtual_cpu_slots: self
+                .virtual_cpu_slots
+                .checked_add(other.virtual_cpu_slots)
+                .context("sandbox vCPU reservation overflow")?,
+            host_pids: self
+                .host_pids
+                .checked_add(other.host_pids)
+                .context("sandbox host PID reservation overflow")?,
         })
     }
 }
@@ -200,6 +468,16 @@ pub struct SandboxBudgets {
     pub memory_bytes: u64,
     pub pids: u64,
     pub disk_bytes: u64,
+    pub host_cpu_millis: u64,
+    pub virtual_cpu_slots: u64,
+    pub host_pids: u64,
+}
+
+/// This database's durable identity, generated once and never changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DaemonIdentity {
+    pub database_uuid: Id128,
+    pub instance_id: Id128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,15 +494,41 @@ pub enum ReserveSandbox {
     Exhausted(BudgetExhausted),
 }
 
+fn i64_amount(value: u64, what: &str) -> Result<i64> {
+    i64::try_from(value).with_context(|| format!("{what} {value} exceeds the stored range"))
+}
+
 fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
+    let accounting = &sandbox.accounting;
+    let reservation = accounting.reservation;
+    let allocation = accounting.allocation.as_ref();
+    let fenced = sandbox.is_fenced();
+    // The tag is schema 7's predicate over this row, never a caller's claim.
+    let legacy_release = (!fenced)
+        .then(|| {
+            LegacyRelease::for_row(
+                sandbox.state,
+                sandbox.backend_id.as_deref(),
+                sandbox.create_certainty,
+            )
+        })
+        .flatten();
+    let release_evidence_id = match accounting.release {
+        ReservationRelease::Fenced(receipt) => Some(receipt.to_string()),
+        _ => None,
+    };
     // The counter survives retention, so an old page watermark excludes new inserts.
     conn.execute(
         "UPDATE history_sequence SET value = value + 1 WHERE id = 1",
         [],
     )?;
     conn.execute(
-        "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, owner_uid, list_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, (SELECT value FROM history_sequence WHERE id = 1))",
+        "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, owner_uid,
+            accounting_kind, reserved_memory_bytes, reserved_disk_bytes, reserved_pids, reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids,
+            host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest, disposition, boot_id, legacy_release,
+            node_id, instance_id, allocation_id, plan_version, plan_digest, plan, release_evidence_id, last_helper_generation, list_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33,
+            (SELECT value FROM history_sequence WHERE id = 1))",
         params![
             sandbox.id,
             sandbox.backend,
@@ -236,25 +540,73 @@ fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
             sandbox.updated_at_ms,
             sandbox.deleted_at_ms,
             sandbox.create_certainty.as_str(),
-            sandbox.owner_uid
+            sandbox.owner_uid,
+            if fenced { "fenced" } else { "legacy" },
+            i64_amount(reservation.memory_bytes, "reserved memory")?,
+            i64_amount(reservation.disk_bytes, "reserved disk")?,
+            i64_amount(reservation.pids, "reserved PIDs")?,
+            i64_amount(reservation.host_cpu_millis, "reserved host CPU")?,
+            i64_amount(reservation.virtual_cpu_slots, "reserved vCPU slots")?,
+            i64_amount(reservation.host_pids, "reserved host PIDs")?,
+            accounting.host_spec_sha256.to_string(),
+            accounting.guest_exec_spec_sha256.to_string(),
+            accounting.runtime_profile,
+            accounting.runtime_artifact_digest,
+            accounting.disposition.as_str(),
+            accounting.boot_id,
+            legacy_release.map(LegacyRelease::as_str),
+            allocation.map(|a| a.node_id.to_string()),
+            allocation.map(|a| a.instance_id.to_string()),
+            allocation.map(|a| a.allocation_id.to_string()),
+            allocation.map(|a| a.plan_version),
+            allocation.map(|a| a.plan_digest.to_string()),
+            allocation.map(|a| a.plan.as_slice()),
+            release_evidence_id,
+            accounting
+                .last_helper_generation
+                .map(|generation| i64_amount(generation, "helper generation"))
+                .transpose()?,
         ],
     )?;
     Ok(())
 }
 
 fn sandbox_resources(conn: &Connection) -> Result<SandboxResources> {
+    // Amounts come only from the stored vector: a later change to defaults, a
+    // bundle or a formula cannot reprice an existing commitment.
     let mut statement = conn.prepare(&format!(
-        "SELECT id, spec FROM sandboxes WHERE {RESERVED_SANDBOX_WHERE}"
+        "SELECT id, reserved_memory_bytes, reserved_disk_bytes, reserved_pids, reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids
+         FROM sandboxes WHERE {RESERVED_SANDBOX_WHERE}"
     ))?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            [
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ],
+        ))
     })?;
     let mut resources = SandboxResources::default();
     for row in rows {
-        let (id, encoded) = row?;
-        let spec: SandboxSpec = serde_json::from_str(&encoded)
-            .with_context(|| format!("sandbox {id}: bad spec while accounting resources"))?;
-        resources = resources.checked_add(SandboxResources::for_spec(&spec))?;
+        let (id, amounts) = row?;
+        let amount = |index: usize| {
+            u64::try_from(amounts[index])
+                .with_context(|| format!("sandbox {id}: negative stored reservation"))
+        };
+        resources =
+            resources.checked_add(SandboxResources::for_reservation(&ResourceReservation {
+                memory_bytes: amount(0)?,
+                disk_bytes: amount(1)?,
+                pids: amount(2)?,
+                host_cpu_millis: amount(3)?,
+                virtual_cpu_slots: amount(4)?,
+                host_pids: amount(5)?,
+            }))?;
     }
     Ok(resources)
 }
@@ -283,6 +635,24 @@ fn exhausted_budget(
             reserved.disk_bytes,
             requested.disk_bytes,
             budgets.disk_bytes,
+        ),
+        (
+            "host CPU millis",
+            reserved.host_cpu_millis,
+            requested.host_cpu_millis,
+            budgets.host_cpu_millis,
+        ),
+        (
+            "vCPU slots",
+            reserved.virtual_cpu_slots,
+            requested.virtual_cpu_slots,
+            budgets.virtual_cpu_slots,
+        ),
+        (
+            "host PIDs",
+            reserved.host_pids,
+            requested.host_pids,
+            budgets.host_pids,
         ),
     ] {
         let total = reserved
@@ -382,6 +752,8 @@ impl Store {
             _state_directory: state_directory,
             #[cfg(test)]
             reject_execution_finishes: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            reject_evidence_commits: Arc::new(AtomicBool::new(false)),
         };
         store.initialize()?;
         Ok(store)
@@ -389,73 +761,59 @@ impl Store {
 
     fn initialize(&self) -> Result<()> {
         let mut conn = self.conn();
+        // Evidence references depend on this, and SQLite ignores it inside a
+        // transaction and defaults it off per connection. Set and verify it first.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let foreign_keys: i64 = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+        if foreign_keys != 1 {
+            bail!("SQLite refused to enforce foreign keys on this connection");
+        }
+        // A conflict clause's implicit delete must also meet the no-delete triggers.
+        conn.pragma_update(None, "recursive_triggers", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => {
-                conn.execute_batch(&format!(
-                    "BEGIN; {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
-                ))
-                .context("create schema")?;
-            }
-            1 => {
-                let tx = conn.transaction()?;
-                tx.execute_batch("ALTER TABLE sandboxes ADD COLUMN list_seq INTEGER;
-                    WITH ordered AS (
-                        SELECT id, ROW_NUMBER() OVER (ORDER BY created_at_ms ASC, id DESC) AS seq FROM sandboxes
-                    )
-                    UPDATE sandboxes SET list_seq = (SELECT seq FROM ordered WHERE ordered.id = sandboxes.id);
-                    CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);
-                    CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';
-                    PRAGMA user_version = 2;")?;
-                tx.execute_batch(MIGRATE_V3)?;
-                tx.execute_batch(MIGRATE_V4)?;
-                tx.execute_batch(MIGRATE_V5)?;
-                tx.execute_batch(MIGRATE_V6)?;
-                tx.execute_batch(MIGRATE_V7)?;
-                tx.commit().context("migrate schema v1 to v7")?;
-            }
-            2 => {
-                let tx = conn.transaction()?;
-                tx.execute_batch(MIGRATE_V3)?;
-                tx.execute_batch(MIGRATE_V4)?;
-                tx.execute_batch(MIGRATE_V5)?;
-                tx.execute_batch(MIGRATE_V6)?;
-                tx.execute_batch(MIGRATE_V7)?;
-                tx.commit().context("migrate schema v2 to v7")?;
-            }
-            3 => {
-                let tx = conn.transaction()?;
-                tx.execute_batch(MIGRATE_V4)?;
-                tx.execute_batch(MIGRATE_V5)?;
-                tx.execute_batch(MIGRATE_V6)?;
-                tx.execute_batch(MIGRATE_V7)?;
-                tx.commit().context("migrate schema v3 to v7")?;
-            }
-            4 => {
-                let tx = conn.transaction()?;
-                tx.execute_batch(MIGRATE_V5)?;
-                tx.execute_batch(MIGRATE_V6)?;
-                tx.execute_batch(MIGRATE_V7)?;
-                tx.commit().context("migrate schema v4 to v7")?;
-            }
-            5 => {
-                let tx = conn.transaction()?;
-                tx.execute_batch(MIGRATE_V6)?;
-                tx.execute_batch(MIGRATE_V7)?;
-                tx.commit().context("migrate schema v5 to v7")?;
-            }
-            6 => {
-                let tx = conn.transaction()?;
-                tx.execute_batch(MIGRATE_V7)?;
-                tx.commit().context("migrate schema v6 to v7")?;
-            }
-            SCHEMA_VERSION => {}
-            v => bail!("database schema version {v} is newer than this kilnd ({SCHEMA_VERSION})"),
+        if version == SCHEMA_VERSION {
+            return Ok(());
         }
+        if !(0..SCHEMA_VERSION).contains(&version) {
+            bail!("database schema version {version} is newer than this kilnd ({SCHEMA_VERSION})");
+        }
+        // Every older schema reaches 7 through its existing steps, then the one v8
+        // step, all in one transaction: any failure leaves the old database intact.
+        let tx = conn.transaction()?;
+        if version == 0 {
+            tx.execute_batch(SCHEMA)?;
+        }
+        if version == 1 {
+            tx.execute_batch("ALTER TABLE sandboxes ADD COLUMN list_seq INTEGER;
+                WITH ordered AS (
+                    SELECT id, ROW_NUMBER() OVER (ORDER BY created_at_ms ASC, id DESC) AS seq FROM sandboxes
+                )
+                UPDATE sandboxes SET list_seq = (SELECT seq FROM ordered WHERE ordered.id = sandboxes.id);
+                CREATE UNIQUE INDEX sandboxes_list_seq ON sandboxes (list_seq DESC);
+                CREATE INDEX sandboxes_live_list_seq ON sandboxes (list_seq DESC) WHERE state != 'deleted';
+                PRAGMA user_version = 2;")?;
+        }
+        if (1..3).contains(&version) {
+            tx.execute_batch(MIGRATE_V3)?;
+        }
+        if (1..4).contains(&version) {
+            tx.execute_batch(MIGRATE_V4)?;
+        }
+        if (1..5).contains(&version) {
+            tx.execute_batch(MIGRATE_V5)?;
+        }
+        if (1..6).contains(&version) {
+            tx.execute_batch(MIGRATE_V6)?;
+        }
+        if (1..7).contains(&version) {
+            tx.execute_batch(MIGRATE_V7)?;
+        }
+        migrate_v8(&tx)?;
+        tx.commit()
+            .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
         Ok(())
     }
 
@@ -463,6 +821,18 @@ impl Store {
         // A panic while holding the lock can't leave SQLite inconsistent;
         // each statement is atomic.
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn identity(&self) -> Result<DaemonIdentity> {
+        let (database_uuid, instance_id): (String, String) = self.conn().query_row(
+            "SELECT database_uuid, instance_id FROM daemon_identity WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(DaemonIdentity {
+            database_uuid: Id128::parse(&database_uuid).map_err(anyhow::Error::msg)?,
+            instance_id: Id128::parse(&instance_id).map_err(anyhow::Error::msg)?,
+        })
     }
 
     pub fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
@@ -476,7 +846,7 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let reserved = sandbox_resources(&tx)?;
-        let requested = SandboxResources::for_spec(&s.spec);
+        let requested = SandboxResources::for_reservation(&s.accounting.reservation);
         if let Some(exhausted) = exhausted_budget(reserved, requested, budgets)? {
             return Ok(ReserveSandbox::Exhausted(exhausted));
         }
@@ -485,15 +855,16 @@ impl Store {
         Ok(ReserveSandbox::Inserted)
     }
 
-    /// Reservations survive daemon restart because they are derived from the
-    /// lifecycle rows. LOST stays reserved because it may recover to READY;
-    /// FAILED without a backend ID stays reserved because Runtime::create
+    /// Reservations survive daemon restart because they are stored with the
+    /// lifecycle rows. On a legacy row, LOST stays reserved because it may recover
+    /// to READY; FAILED without a backend ID stays reserved because Runtime::create
     /// errors may be ambiguous after allocating an unreported backend, unless
     /// `fail_create_definitely` recorded typed proof that nothing was allocated.
     /// FAILED with a backend ID is written only after compensation proved
     /// that exact backend gone, so it releases capacity while retaining the
     /// historical row. Ambiguous no-ID failures require authoritative resource
-    /// reconciliation, which is not currently supported; Delete retains them.
+    /// reconciliation, which legacy kiln does not support; Delete retains them.
+    /// An absence-fenced row is charged until it references a matching receipt.
     pub fn sandbox_resources(&self) -> Result<SandboxResources> {
         sandbox_resources(&self.conn())
     }
@@ -524,9 +895,11 @@ impl Store {
         let now = now_ms();
         let deleted_at = (state == SandboxState::Deleted).then_some(now);
         let n = self.conn().execute(
-            "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
-                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms)
-             WHERE id = ?1",
+            &format!(
+                "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
+                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION}
+             WHERE id = ?1"
+            ),
             params![id, state.as_str(), backend_id, failure_reason, now, deleted_at],
         )?;
         if n != 1 {
@@ -549,9 +922,11 @@ impl Store {
         let now = now_ms();
         let deleted_at = (state == SandboxState::Deleted).then_some(now);
         let n = self.conn().execute(
-            "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
-                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms)
-             WHERE id = ?1 AND state = ?7",
+            &format!(
+                "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
+                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION}
+             WHERE id = ?1 AND state = ?7"
+            ),
             params![
                 id,
                 state.as_str(),
@@ -570,8 +945,9 @@ impl Store {
     /// the row keeps its reservation, and restart treats it as ambiguous.
     pub fn fail_create_definitely(&self, id: &str, failure_reason: &str) -> Result<()> {
         let n = self.conn().execute(
-            "UPDATE sandboxes SET state = 'failed', create_certainty = ?2, failure_reason = ?3, updated_at_ms = ?4
-             WHERE id = ?1 AND state = 'creating' AND backend_id IS NULL",
+            "UPDATE sandboxes SET state = 'failed', create_certainty = ?2, failure_reason = ?3, updated_at_ms = ?4,
+                 legacy_release = 'definitely_not_created'
+             WHERE id = ?1 AND state = 'creating' AND backend_id IS NULL AND accounting_kind = 'legacy'",
             params![
                 id,
                 CreateCertainty::DefinitelyNotCreated.as_str(),
@@ -585,16 +961,240 @@ impl Store {
         Ok(())
     }
 
-    /// Marks a sandbox lost only if it is still READY. Delete publishes
-    /// DELETING before waiting for a running exec, so a late NotFound result
-    /// must not overwrite that cleanup intent.
-    pub fn mark_sandbox_lost_if_ready(&self, id: &str, failure_reason: &str) -> Result<bool> {
-        let n = self.conn().execute(
-            "UPDATE sandboxes SET state = 'lost', failure_reason = ?2, updated_at_ms = ?3
-             WHERE id = ?1 AND state = 'ready'",
-            params![id, failure_reason, now_ms()],
+    /// C7: publishes READY, the exact backend ID and the ready receipt in one
+    /// update. Only a CREATING row can take it, so a lost race never overwrites a
+    /// newer state. Returns whether this call published.
+    pub fn publish_fenced_ready(&self, id: &str, created: &CreatedSandbox) -> Result<bool> {
+        let RuntimeReceipt::Ready(receipt) = &created.receipt else {
+            bail!("sandbox {id}: a legacy create receipt cannot publish an allocation");
+        };
+        let encoded = receipt.encode()?;
+        let generation = i64_amount(receipt.helper_generation, "helper generation")?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = tx
+            .query_row(
+                &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
+                [id],
+                sandbox_row,
+            )
+            .optional()?
+            .transpose()?
+            .with_context(|| format!("sandbox {id} not found"))?;
+        let Some(binding) = row.accounting.allocation.as_ref() else {
+            bail!("sandbox {id}: a legacy row cannot publish an allocation");
+        };
+        if !receipt.matches(binding) {
+            bail!("sandbox {id}: ready receipt does not match its allocation identity and plan");
+        }
+        if created.backend_id != binding.backend_id() {
+            bail!(
+                "sandbox {id}: backend ID {} is not its allocation's",
+                created.backend_id
+            );
+        }
+        if row.state != SandboxState::Creating {
+            return Ok(false);
+        }
+        let last = row.accounting.last_helper_generation.unwrap_or(0);
+        if receipt.helper_generation <= last {
+            bail!(
+                "sandbox {id}: ready generation {} is not newer than recorded generation {last}",
+                receipt.helper_generation
+            );
+        }
+        tx.execute(
+            "UPDATE sandboxes SET state = 'ready', backend_id = ?2, boot_id = ?3, runtime_receipt = ?4,
+                 last_helper_generation = ?5, failure_reason = NULL, updated_at_ms = ?6
+             WHERE id = ?1",
+            params![id, created.backend_id, receipt.boot_id, encoded, generation, now_ms()],
         )?;
-        Ok(n == 1)
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The only way an absence-fenced row stops being charged: validated evidence
+    /// and the terminal reference commit in one transaction. A replay of the same
+    /// receipt is idempotent; any mismatch changes nothing and stays charged.
+    pub fn release_fenced(
+        &self,
+        id: &str,
+        terminal: SandboxState,
+        receipt: &FencedAbsence,
+        failure_reason: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(terminal, SandboxState::Failed | SandboxState::Deleted) {
+            bail!(
+                "sandbox {id}: release is terminal-only, not {}",
+                terminal.as_str()
+            );
+        }
+        #[cfg(test)]
+        if self.reject_evidence_commits.load(Ordering::SeqCst) {
+            bail!("injected evidence commit failure");
+        }
+        let encoded = receipt.encode()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = tx
+            .query_row(
+                &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
+                [id],
+                sandbox_row,
+            )
+            .optional()?
+            .transpose()?
+            .with_context(|| format!("sandbox {id} not found"))?;
+        let Some(binding) = row.accounting.allocation.as_ref() else {
+            bail!("sandbox {id}: legacy provenance cannot take an absence receipt");
+        };
+        if !receipt.matches(binding) {
+            bail!("sandbox {id}: absence receipt does not match its allocation identity and plan");
+        }
+        // Only the row's own recorded evidence replays. Any other receipt must be
+        // strictly newer than what this row last published: a helper generation that
+        // moves backward contradicts its own ledger, so it fails closed.
+        let generation = i64_amount(receipt.helper_generation(), "helper generation")?;
+        let last = row.accounting.last_helper_generation.unwrap_or(0);
+        match row.accounting.release {
+            ReservationRelease::Fenced(existing) if existing != receipt.receipt_id() => {
+                bail!("sandbox {id}: already released by receipt {existing}");
+            }
+            ReservationRelease::Fenced(_) => {}
+            _ if receipt.helper_generation() <= last => bail!(
+                "sandbox {id}: absence generation {} is not newer than recorded generation {last}",
+                receipt.helper_generation()
+            ),
+            _ => {}
+        }
+        let recorded: Option<(i64, Vec<u8>)> = tx
+            .query_row(
+                "SELECT helper_generation, receipt FROM release_evidence WHERE receipt_id = ?1",
+                [receipt.receipt_id().to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match recorded {
+            Some((stored, bytes)) if stored == generation && bytes == encoded => {}
+            Some(_) => bail!("sandbox {id}: conflicting release evidence for this receipt ID"),
+            None => {
+                tx.execute(
+                    "INSERT INTO release_evidence (receipt_id, node_id, instance_id, allocation_id, plan_digest, helper_generation, kind, receipt, recorded_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'absent_fenced', ?7, ?8)",
+                    params![
+                        receipt.receipt_id().to_string(),
+                        receipt.node_id().to_string(),
+                        receipt.instance_id().to_string(),
+                        receipt.allocation_id().to_string(),
+                        receipt.plan_digest().to_string(),
+                        generation,
+                        encoded,
+                        now_ms(),
+                    ],
+                )?;
+            }
+        }
+        // A terminal row keeps its first terminal evidence; only FAILED can still
+        // advance to DELETED, without rewriting that reference. An exact replay
+        // leaves every column, including timestamps, unchanged.
+        let state = if row.state == SandboxState::Deleted {
+            SandboxState::Deleted
+        } else {
+            terminal
+        };
+        if row.state == state
+            && row.accounting.release == ReservationRelease::Fenced(receipt.receipt_id())
+        {
+            tx.commit()?;
+            return Ok(());
+        }
+        let now = now_ms();
+        let deleted_at = (state == SandboxState::Deleted).then_some(now);
+        tx.execute(
+            "UPDATE sandboxes SET state = ?2, release_evidence_id = ?3, failure_reason = COALESCE(?4, failure_reason),
+                 updated_at_ms = ?5, deleted_at_ms = COALESCE(deleted_at_ms, ?6), last_helper_generation = ?7
+             WHERE id = ?1",
+            params![
+                id,
+                state.as_str(),
+                receipt.receipt_id().to_string(),
+                failure_reason,
+                now,
+                deleted_at,
+                generation,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Settles every RUNNING execution of one absence-fenced sandbox across a
+    /// crash, in one transaction with the sandbox's own disposition. `stopped`
+    /// is host proof that no command remains: INTERRUPTED and LOST. Without it the
+    /// execution is FAILED with CleanupFailed and the sandbox QUARANTINED.
+    pub fn conclude_running_executions(
+        &self,
+        sandbox_id: &str,
+        stopped: bool,
+        reason: &str,
+    ) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let concluded = if stopped {
+            tx.execute(
+                "UPDATE executions SET state = 'interrupted', failure_reason = ?2, finished_at_ms = ?3,
+                     sandbox_reusable = 0, cleanup_evidence = 'sandbox_stopped'
+                 WHERE sandbox_id = ?1 AND state = 'running'",
+                params![sandbox_id, reason, now],
+            )?
+        } else {
+            let diagnostic = serde_json::to_string(&RuntimeDiagnostic::new(
+                RuntimeErrorKind::CleanupFailed,
+                RuntimeStage::Cleanup,
+                reason,
+            ))?;
+            tx.execute(
+                "UPDATE executions SET state = 'failed', failure_reason = ?2, finished_at_ms = ?3,
+                     runtime_error = ?4, sandbox_reusable = 0, cleanup_evidence = 'unknown'
+                 WHERE sandbox_id = ?1 AND state = 'running'",
+                params![sandbox_id, reason, now, diagnostic],
+            )?
+        };
+        if concluded != 0 {
+            apply_disposition(
+                &tx,
+                sandbox_id,
+                if stopped {
+                    SandboxDisposition::Stopped
+                } else {
+                    SandboxDisposition::Quarantined
+                },
+                Some(reason),
+                now,
+            )?;
+        }
+        tx.commit()?;
+        Ok(concluded)
+    }
+
+    /// Retires a READY or LOST sandbox without touching any execution.
+    pub fn retire_sandbox(
+        &self,
+        id: &str,
+        disposition: SandboxDisposition,
+        reason: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        apply_disposition(&conn, id, disposition, Some(reason), now_ms())
+    }
+
+    pub fn has_running_execution(&self, sandbox_id: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM executions WHERE sandbox_id = ?1 AND state = 'running')",
+            [sandbox_id],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn sandbox(&self, id: &str) -> Result<Option<Sandbox>> {
@@ -676,7 +1276,7 @@ impl Store {
         let rows = stmt.query_map(
             params![owner, upper_seq, before_seq, i64::from(limit) + 1],
             |row| {
-                let list_seq = row.get(11)?;
+                let list_seq = row.get(SANDBOX_COLUMN_COUNT)?;
                 Ok(sandbox_row(row)?.map(|sandbox| SandboxPageRow { sandbox, list_seq }))
             },
         )?;
@@ -693,7 +1293,7 @@ impl Store {
 
     pub fn count_active_sandboxes(&self) -> Result<u32> {
         Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM sandboxes WHERE state IN ('creating', 'ready', 'deleting')",
+            "SELECT COUNT(*) FROM sandboxes WHERE state IN ('creating', 'ready', 'deleting', 'quarantined')",
             [],
             |r| r.get(0),
         )?)
@@ -778,11 +1378,14 @@ impl Store {
                 Vec::new()
             }
         };
-        let n = self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = tx.execute(
             "UPDATE executions SET state = ?2, exit_code = ?3, failure_reason = ?4, finished_at_ms = ?5,
                  stdout = ?6, stdout_bytes = ?7, stdout_truncated = ?8, stdout_total_bytes_known = ?9,
                  stderr = ?10, stderr_bytes = ?11, stderr_truncated = ?12, stderr_total_bytes_known = ?13,
-                 command_status_kind = ?14, command_status_value = ?15, command_core_dumped = ?16, runtime_error = ?17
+                 command_status_kind = ?14, command_status_value = ?15, command_core_dumped = ?16, runtime_error = ?17,
+                 sandbox_reusable = ?18, cleanup_evidence = ?19
              WHERE id = ?1 AND state = 'running'",
             params![
                 id,
@@ -801,12 +1404,29 @@ impl Store {
                 status_kind,
                 status_value,
                 core_dumped,
-                runtime_error
+                runtime_error,
+                r.sandbox_reusable,
+                r.cleanup_evidence.as_str()
             ],
         )?;
         if n != 1 {
             bail!("execution {id} is not running");
         }
+        if let Some(disposition) = r.disposition {
+            let sandbox_id: String = tx.query_row(
+                "SELECT sandbox_id FROM executions WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            apply_disposition(
+                &tx,
+                &sandbox_id,
+                disposition,
+                r.disposition_reason,
+                now_ms(),
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -945,12 +1565,24 @@ impl Store {
     }
 
     #[cfg(test)]
+    pub(crate) fn is_charged_for_test(&self, id: &str) -> bool {
+        self.sandbox(id).unwrap().unwrap().is_charged()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evidence_commit_rejection_flag(&self) -> Arc<AtomicBool> {
+        self.reject_evidence_commits.clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn execution_finish_rejection_flag(&self) -> Arc<AtomicBool> {
         self.reject_execution_finishes.clone()
     }
 
-    /// Marks this backend's executions still recorded as running as
-    /// interrupted. Only valid at startup, before any new execution begins.
+    /// Marks this backend's legacy executions still recorded as running as
+    /// interrupted. Only valid at startup, before any new execution begins. An
+    /// absence-fenced execution needs a stop barrier first; see
+    /// `conclude_running_executions`.
     pub fn interrupt_running_executions_for_backend(
         &self,
         backend: &str,
@@ -964,6 +1596,7 @@ impl Store {
                    SELECT 1 FROM sandboxes
                    WHERE sandboxes.id = executions.sandbox_id
                      AND sandboxes.backend = ?1
+                     AND sandboxes.accounting_kind = 'legacy'
                )",
             params![backend, reason, now_ms()],
         )?)
@@ -1378,7 +2011,15 @@ fn inspect_sqlite_sidecars(directory: &PreparedDirectory, expected_uid: u32) -> 
     Ok(())
 }
 
-const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, owner_uid";
+// A plan can be 128 KiB, and only recovery of a charged row reads one. A charged
+// row count is bounded by the sandbox budget; released history's is bounded only by
+// retention, so listings leave its stored plan out.
+const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, owner_uid,
+    accounting_kind, reserved_memory_bytes, reserved_disk_bytes, reserved_pids, reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids,
+    host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest, disposition, boot_id, legacy_release,
+    node_id, instance_id, allocation_id, plan_version, plan_digest,
+    CASE WHEN plan IS NULL OR release_evidence_id IS NULL THEN plan ELSE x'' END, release_evidence_id, last_helper_generation";
+const SANDBOX_COLUMN_COUNT: usize = 33;
 
 /// Row decoding errors are reported per row rather than as SQLite errors.
 fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
@@ -1386,7 +2027,66 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
     let spec: String = row.get(4)?;
     let id: String = row.get(0)?;
     let create_certainty: String = row.get(9)?;
+    let accounting_kind: String = row.get(11)?;
+    let amounts = [
+        row.get::<_, i64>(12)?,
+        row.get::<_, i64>(13)?,
+        row.get::<_, i64>(14)?,
+        row.get::<_, i64>(15)?,
+        row.get::<_, i64>(16)?,
+        row.get::<_, i64>(17)?,
+    ];
+    let host_digest: String = row.get(18)?;
+    let guest_digest: String = row.get(19)?;
+    let disposition: String = row.get(22)?;
+    let legacy_release: Option<String> = row.get(24)?;
+    let identity: [Option<String>; 3] = [row.get(25)?, row.get(26)?, row.get(27)?];
+    let plan_version: Option<u32> = row.get(28)?;
+    let plan_digest: Option<String> = row.get(29)?;
+    let plan: Option<Vec<u8>> = row.get(30)?;
+    let release_evidence_id: Option<String> = row.get(31)?;
+    let last_helper_generation: Option<i64> = row.get(32)?;
     Ok((|| {
+        let bad = |what: &str, why: String| anyhow::anyhow!("sandbox {id}: bad {what}: {why}");
+        let amount = |index: usize| {
+            u64::try_from(amounts[index]).map_err(|e| bad("reservation", e.to_string()))
+        };
+        let regime = match accounting_kind.as_str() {
+            "legacy" => AccountingRegime::Legacy,
+            "fenced" => AccountingRegime::AbsenceFenced,
+            other => bail!("sandbox {id}: unknown accounting kind {other:?}"),
+        };
+        let allocation = match (identity, plan_version, plan_digest, plan) {
+            (
+                [Some(node), Some(instance), Some(allocation)],
+                Some(version),
+                Some(digest),
+                Some(plan),
+            ) => {
+                let parse = |what: &str, value: &str| Id128::parse(value).map_err(|e| bad(what, e));
+                Some(AllocationBinding {
+                    node_id: parse("node ID", &node)?,
+                    instance_id: parse("instance ID", &instance)?,
+                    allocation_id: parse("allocation ID", &allocation)?,
+                    plan_version: version,
+                    plan_digest: Digest::parse(&digest).map_err(|e| bad("plan digest", e))?,
+                    plan,
+                })
+            }
+            ([None, None, None], None, None, None) => None,
+            _ => bail!("sandbox {id}: partial allocation identity"),
+        };
+        let release = match (legacy_release, release_evidence_id) {
+            (None, None) => ReservationRelease::Charged,
+            (Some(tag), None) => ReservationRelease::Legacy(
+                LegacyRelease::parse(&tag)
+                    .with_context(|| format!("sandbox {id}: unknown legacy release {tag:?}"))?,
+            ),
+            (None, Some(receipt)) => ReservationRelease::Fenced(
+                Id128::parse(&receipt).map_err(|e| bad("release evidence ID", e))?,
+            ),
+            (Some(_), Some(_)) => bail!("sandbox {id}: conflicting release provenance"),
+        };
         Ok(Sandbox {
             create_certainty: CreateCertainty::parse(&create_certainty).with_context(|| {
                 format!("sandbox {id}: unknown create certainty {create_certainty:?}")
@@ -1402,27 +2102,156 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
             updated_at_ms: row.get(7)?,
             deleted_at_ms: row.get(8)?,
             owner_uid: row.get(10)?,
+            accounting: SandboxAccounting {
+                regime,
+                reservation: ResourceReservation {
+                    memory_bytes: amount(0)?,
+                    disk_bytes: amount(1)?,
+                    pids: amount(2)?,
+                    host_cpu_millis: amount(3)?,
+                    virtual_cpu_slots: amount(4)?,
+                    host_pids: amount(5)?,
+                },
+                host_spec_sha256: Digest::parse(&host_digest)
+                    .map_err(|e| bad("host spec digest", e))?,
+                guest_exec_spec_sha256: Digest::parse(&guest_digest)
+                    .map_err(|e| bad("guest spec digest", e))?,
+                runtime_profile: row.get(20)?,
+                runtime_artifact_digest: row.get(21)?,
+                allocation,
+                boot_id: row.get(23)?,
+                disposition: SandboxDisposition::parse(&disposition).with_context(|| {
+                    format!("sandbox {id}: unknown disposition {disposition:?}")
+                })?,
+                release,
+                last_helper_generation: last_helper_generation
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|e| bad("helper generation", e.to_string()))?,
+            },
             id: id.clone(),
         })
     })())
+}
+
+/// One schema 7 row in its schema 8 form. Amounts are exactly the stored spec's;
+/// the release tag is exactly schema 7's predicate over the stored row. The spec
+/// text is copied verbatim, and a spec no reader could decode fails the migration.
+fn migrate_v8(tx: &Connection) -> Result<()> {
+    tx.execute_batch(MIGRATE_V8_TABLES)?;
+    tx.execute(
+        "INSERT INTO daemon_identity (id, database_uuid, instance_id) VALUES (1, ?1, ?2)",
+        params![Id128::random().to_string(), Id128::random().to_string()],
+    )?;
+    let mut rows = tx.prepare(
+        "SELECT id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, list_seq, create_certainty, owner_uid FROM sandboxes",
+    )?;
+    let mut insert = tx.prepare(
+        "INSERT INTO sandboxes_v8 (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, list_seq, create_certainty, owner_uid,
+            accounting_kind, reserved_memory_bytes, reserved_disk_bytes, reserved_pids, reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids,
+            host_spec_sha256, guest_exec_spec_sha256, legacy_release)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'legacy', ?13, ?14, ?15, 0, 0, 0, ?16, ?17, ?18)",
+    )?;
+    let mut cursor = rows.query([])?;
+    while let Some(row) = cursor.next()? {
+        let id: String = row.get(0)?;
+        let backend_id: Option<String> = row.get(2)?;
+        let state: String = row.get(3)?;
+        let encoded: String = row.get(4)?;
+        let certainty: String = row.get(10)?;
+        let spec: SandboxSpec = serde_json::from_str(&encoded)
+            .with_context(|| format!("migrate sandbox {id}: bad spec"))?;
+        let reservation = ResourceReservation::legacy_for_spec(&spec);
+        let (host, guest) = crate::model::spec_digests(&spec);
+        // An unrecognized historical state stays charged rather than guessed.
+        let tag = SandboxState::parse(&state).and_then(|state| {
+            LegacyRelease::for_row(
+                state,
+                backend_id.as_deref(),
+                CreateCertainty::parse(&certainty).unwrap_or_default(),
+            )
+        });
+        insert
+            .execute(params![
+                id,
+                row.get::<_, String>(1)?,
+                backend_id,
+                state,
+                encoded,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, i64>(9)?,
+                certainty,
+                row.get::<_, i64>(11)?,
+                i64_amount(reservation.memory_bytes, "reserved memory")?,
+                i64_amount(reservation.disk_bytes, "reserved disk")?,
+                i64_amount(reservation.pids, "reserved PIDs")?,
+                host.to_string(),
+                guest.to_string(),
+                tag.map(LegacyRelease::as_str),
+            ])
+            .with_context(|| format!("migrate sandbox {id}"))?;
+    }
+    drop(cursor);
+    drop(rows);
+    drop(insert);
+    tx.execute_batch(MIGRATE_V8_FINISH)?;
+    Ok(())
+}
+
+/// Maps a disposition onto the row in the caller's transaction. Only READY changes
+/// state: DELETING keeps its intent, and LOST or QUARANTINED already refuse Exec.
+fn apply_disposition(
+    conn: &Connection,
+    sandbox_id: &str,
+    disposition: SandboxDisposition,
+    reason: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    match disposition {
+        SandboxDisposition::Reusable => {}
+        SandboxDisposition::Stopped | SandboxDisposition::Quarantined => {
+            let state = if disposition == SandboxDisposition::Stopped {
+                SandboxState::Lost
+            } else {
+                SandboxState::Quarantined
+            };
+            conn.execute(
+                "UPDATE sandboxes SET disposition = ?2,
+                     state = CASE WHEN state = 'ready' THEN ?3
+                                  WHEN state = 'lost' AND ?3 = 'quarantined' THEN ?3
+                                  ELSE state END,
+                     failure_reason = CASE WHEN state IN ('ready', 'lost') THEN COALESCE(?4, failure_reason) ELSE failure_reason END,
+                     updated_at_ms = ?5
+                 WHERE id = ?1",
+                params![sandbox_id, disposition.as_str(), state.as_str(), reason, now],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 const EXECUTION_COLUMNS: &str =
     "id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
     started_at_ms, finished_at_ms, stdout, stdout_bytes, stdout_truncated, stdout_total_bytes_known,
     stderr, stderr_bytes, stderr_truncated, stderr_total_bytes_known,
-    command_status_kind, command_status_value, command_core_dumped, runtime_error";
+    command_status_kind, command_status_value, command_core_dumped, runtime_error,
+    sandbox_reusable, cleanup_evidence";
 
 const EXECUTION_METADATA_COLUMNS: &str =
     "id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
     started_at_ms, finished_at_ms, x'', stdout_bytes, stdout_truncated, stdout_total_bytes_known,
     x'', stderr_bytes, stderr_truncated, stderr_total_bytes_known,
-    command_status_kind, command_status_value, command_core_dumped, runtime_error";
+    command_status_kind, command_status_value, command_core_dumped, runtime_error,
+    sandbox_reusable, cleanup_evidence";
 
 fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
     let id: String = row.get(0)?;
     let argv: String = row.get(2)?;
     let state: String = row.get(3)?;
+    let cleanup_evidence: String = row.get(23)?;
     Ok((|| {
         Ok(Execution {
             sandbox_id: row.get(1)?,
@@ -1468,6 +2297,10 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
                 truncated: row.get(16)?,
                 total_bytes_known: row.get(17)?,
             },
+            sandbox_reusable: row.get(22)?,
+            cleanup_evidence: CleanupEvidence::parse(&cleanup_evidence).with_context(|| {
+                format!("execution {id}: unknown cleanup evidence {cleanup_evidence:?}")
+            })?,
             id: id.clone(),
         })
     })())
@@ -1477,6 +2310,7 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
 mod tests {
     use super::*;
     use crate::model::{Network, new_id};
+    use crate::runtime::CreatedSandbox;
     use std::collections::BTreeMap;
     use std::os::unix::fs::DirBuilderExt;
 
@@ -1635,6 +2469,10 @@ mod tests {
                         failure_reason: None,
                         stdout: &capture,
                         stderr: &capture,
+                        sandbox_reusable: None,
+                        cleanup_evidence: CleanupEvidence::Unknown,
+                        disposition: None,
+                        disposition_reason: None,
                     },
                     mode,
                 )
@@ -1812,6 +2650,10 @@ mod tests {
                     failure_reason: Some(&d.message),
                     stdout: &out,
                     stderr: &err,
+                    sandbox_reusable: None,
+                    cleanup_evidence: CleanupEvidence::Unknown,
+                    disposition: None,
+                    disposition_reason: None,
                 },
             )
             .unwrap();
@@ -1861,6 +2703,10 @@ mod tests {
                         failure_reason: None,
                         stdout: &Captured::default(),
                         stderr: &Captured::default(),
+                        sandbox_reusable: None,
+                        cleanup_evidence: CleanupEvidence::Unknown,
+                        disposition: None,
+                        disposition_reason: None,
                     },
                 )
                 .unwrap();
@@ -1918,6 +2764,20 @@ mod tests {
             failure_reason: None,
             create_certainty: CreateCertainty::AllocationAmbiguous,
             owner_uid: 0,
+            accounting: SandboxAccounting::legacy(
+                &SandboxSpec {
+                    image: "alpine".into(),
+                    memory_bytes: 1 << 29,
+                    cpu_millis: 1000,
+                    pids: 128,
+                    disk_bytes: 1 << 30,
+                    network: Network::Allow(vec!["example.com:443".into()]),
+                    read_only_root: true,
+                    writable_paths: vec!["/data".into()],
+                    labels: BTreeMap::from([("owner".into(), "tests".into())]),
+                },
+                "",
+            ),
         }
     }
 
@@ -1937,6 +2797,8 @@ mod tests {
             stdin_bytes: 3,
             stdout: Captured::default(),
             stderr: Captured::default(),
+            sandbox_reusable: None,
+            cleanup_evidence: CleanupEvidence::Unknown,
         }
     }
 
@@ -1989,6 +2851,7 @@ mod tests {
             4 => schema_v4(),
             5 => schema_v5(),
             6 => schema_v6(),
+            7 => SCHEMA.to_string(),
             _ => unreachable!(),
         }
     }
@@ -2158,6 +3021,1609 @@ mod tests {
                 assert_eq!(page.rows[0].list_seq, 41);
             }
         }
+    }
+
+    /// Every statement of one absence-fenced row and matching evidence.
+    fn fenced_sandbox() -> Sandbox {
+        let spec = SandboxSpec {
+            image: "alpine".into(),
+            memory_bytes: 512 << 20,
+            cpu_millis: 1000,
+            pids: 128,
+            disk_bytes: 1 << 30,
+            network: Network::None,
+            read_only_root: false,
+            writable_paths: vec![],
+            labels: BTreeMap::new(),
+        };
+        let plan = b"immutable plan".to_vec();
+        let mut row = Sandbox {
+            spec: spec.clone(),
+            accounting: SandboxAccounting::legacy(&spec, "offline-768-v1"),
+            ..sandbox()
+        };
+        row.accounting.regime = AccountingRegime::AbsenceFenced;
+        row.accounting.last_helper_generation = Some(0);
+        row.accounting.reservation = crate::firecracker::offline_768_v1_reservation(&spec).unwrap();
+        row.accounting.allocation = Some(AllocationBinding {
+            node_id: Id128::random(),
+            instance_id: Id128::random(),
+            allocation_id: Id128::random(),
+            plan_version: 1,
+            plan_digest: Digest::of(&plan),
+            plan,
+        });
+        row
+    }
+
+    fn receipt_for(row: &Sandbox) -> FencedAbsence {
+        let binding = row.accounting.allocation.as_ref().unwrap();
+        FencedAbsence::new(
+            Id128::random(),
+            binding.node_id,
+            binding.instance_id,
+            binding.allocation_id,
+            binding.plan_digest,
+            7,
+            String::new(),
+        )
+        .unwrap()
+    }
+
+    fn insert_evidence(
+        conn: &Connection,
+        (receipt, node, instance, allocation, plan): (&str, &str, &str, &str, &str),
+        generation: &str,
+        kind: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            &format!(
+                "INSERT INTO release_evidence (receipt_id, node_id, instance_id, allocation_id, plan_digest, helper_generation, kind, receipt, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, {generation}, {kind}, x'7b7d', 1)"
+            ),
+            params![receipt, node, instance, allocation, plan],
+        )
+    }
+
+    #[test]
+    fn schema8_migration_preserves_every_legacy_version_charge_and_root_owner() {
+        // The reported production row: a real ambiguous failure with no ID.
+        const KNOWN_REAL: &str = "sb-7d028a9321df8d7b";
+        let spec = sandbox().spec;
+        let encoded = serde_json::to_string(&spec).unwrap();
+        let expected = ResourceReservation::legacy_for_spec(&spec);
+        let (host, guest) = crate::model::spec_digests(&spec);
+        for version in 1..=7 {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = disk_database_at(tmp.path(), version);
+            let list_column = if version >= 2 { ", list_seq" } else { "" };
+            let certainty_column = if version >= 5 {
+                ", create_certainty"
+            } else {
+                ""
+            };
+            let owner_column = if version >= 7 { ", owner_uid" } else { "" };
+            // (id, state, backend, certainty, charged, tag)
+            let rows = [
+                (
+                    "sb-creating",
+                    "creating",
+                    None,
+                    "allocation_ambiguous",
+                    true,
+                    None,
+                ),
+                (
+                    "sb-ready",
+                    "ready",
+                    Some("ab-1"),
+                    "allocation_ambiguous",
+                    true,
+                    None,
+                ),
+                (
+                    "sb-lost",
+                    "lost",
+                    Some("ab-2"),
+                    "allocation_ambiguous",
+                    true,
+                    None,
+                ),
+                (
+                    "sb-deleting",
+                    "deleting",
+                    Some("ab-3"),
+                    "allocation_ambiguous",
+                    true,
+                    None,
+                ),
+                (
+                    KNOWN_REAL,
+                    "failed",
+                    None,
+                    "allocation_ambiguous",
+                    true,
+                    None,
+                ),
+                (
+                    "sb-comp",
+                    "failed",
+                    Some("ab-4"),
+                    "allocation_ambiguous",
+                    false,
+                    Some(LegacyRelease::Compensated),
+                ),
+                (
+                    "sb-definite",
+                    "failed",
+                    None,
+                    "definitely_not_created",
+                    false,
+                    Some(LegacyRelease::DefinitelyNotCreated),
+                ),
+                (
+                    "sb-deleted",
+                    "deleted",
+                    Some("ab-5"),
+                    "allocation_ambiguous",
+                    false,
+                    Some(LegacyRelease::Deleted),
+                ),
+            ];
+            let mut kept = Vec::new();
+            for (seq, row) in rows.iter().enumerate() {
+                // A definite row cannot predate the marker's schema.
+                if version < 5 && row.3 == "definitely_not_created" {
+                    continue;
+                }
+                let list_value = if version >= 2 {
+                    format!(", {}", seq + 1)
+                } else {
+                    String::new()
+                };
+                let certainty_value = if version >= 5 {
+                    format!(", '{}'", row.3)
+                } else {
+                    String::new()
+                };
+                let owner_value = if version >= 7 {
+                    ", 0".to_string()
+                } else {
+                    String::new()
+                };
+                conn.execute(
+                    &format!("INSERT INTO sandboxes (id,backend,backend_id,state,spec,created_at_ms,updated_at_ms{list_column}{certainty_column}{owner_column}) VALUES (?1,'kiln',?2,?3,?4,?5,?5{list_value}{certainty_value}{owner_value})"),
+                    params![row.0, row.2, row.1, encoded, seq as i64 + 1],
+                )
+                .unwrap();
+                kept.push(row);
+            }
+            conn.execute(
+                "INSERT INTO executions (id,sandbox_id,argv,state,exit_code,timeout_ms,stdin_bytes,started_at_ms,stdout,stdout_bytes) VALUES ('ex-old','sb-ready','[\"echo\"]','exited',0,1,0,1,x'6b657074',4)",
+                [],
+            )
+            .unwrap();
+            let charged = kept.iter().filter(|row| row.4).count() as u64;
+            release_database(conn, tmp.path());
+            let store = Store::reopen_after_restart(tmp.path());
+            let identity = store.identity().unwrap();
+            assert_eq!(
+                store.sandbox_resources().unwrap(),
+                SandboxResources {
+                    sandboxes: charged,
+                    memory_bytes: expected.memory_bytes * charged,
+                    pids: expected.pids * charged,
+                    disk_bytes: expected.disk_bytes * charged,
+                    host_cpu_millis: 0,
+                    virtual_cpu_slots: 0,
+                    host_pids: 0,
+                },
+                "v{version}"
+            );
+            for row in &kept {
+                let got = store.sandbox(row.0).unwrap().unwrap();
+                assert_eq!(got.owner_uid, 0, "v{version} {}", row.0);
+                assert_eq!(got.state.as_str(), row.1, "v{version} {}", row.0);
+                assert_eq!(got.backend_id.as_deref(), row.2, "v{version} {}", row.0);
+                assert_eq!(got.spec, spec, "v{version} {}", row.0);
+                assert_eq!(got.accounting.regime, AccountingRegime::Legacy);
+                assert_eq!(got.accounting.reservation, expected);
+                assert_eq!(got.accounting.host_spec_sha256, host);
+                assert_eq!(got.accounting.guest_exec_spec_sha256, guest);
+                assert_eq!(got.accounting.allocation, None);
+                assert_eq!(got.accounting.runtime_profile, "");
+                assert_eq!(got.accounting.runtime_artifact_digest, "");
+                assert_eq!(
+                    got.accounting.release,
+                    row.5
+                        .map_or(ReservationRelease::Charged, ReservationRelease::Legacy),
+                    "v{version} {}",
+                    row.0
+                );
+                assert_eq!(got.is_charged(), row.4, "v{version} {}", row.0);
+            }
+            assert!(store.sandbox(KNOWN_REAL).unwrap().unwrap().is_charged());
+            {
+                let conn = store.conn();
+                let stored: String = conn
+                    .query_row(
+                        "SELECT spec FROM sandboxes WHERE id = 'sb-ready'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(stored, encoded, "spec text is copied verbatim");
+                assert!(
+                    conn.execute("INSERT INTO executions (id,sandbox_id,argv,state,timeout_ms,stdin_bytes,started_at_ms) VALUES ('ex-orphan','sb-missing','[]','running',1,0,1)", [])
+                        .is_err(),
+                    "v{version} kept the executions foreign key"
+                );
+            }
+            let history = store.execution("ex-old").unwrap().unwrap();
+            assert_eq!(history.stdout.data, b"kept");
+            assert_eq!(history.sandbox_reusable, None, "v{version}");
+            assert_eq!(
+                history.cleanup_evidence,
+                CleanupEvidence::Unknown,
+                "v{version}"
+            );
+            // Foreign callers inherit nothing.
+            assert!(
+                store
+                    .sandbox_page_owned(true, None, None, 10, Some(1001))
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+            drop(store);
+            let store = Store::reopen_after_restart(tmp.path());
+            assert_eq!(
+                store.identity().unwrap(),
+                identity,
+                "v{version}: identity is durable"
+            );
+            assert_eq!(store.sandbox_resources().unwrap().sandboxes, charged);
+            // Delete of the real ambiguous row is still not something Store infers.
+            store
+                .set_sandbox_state(
+                    KNOWN_REAL,
+                    SandboxState::Failed,
+                    None,
+                    Some("still ambiguous"),
+                )
+                .unwrap();
+            assert!(store.sandbox(KNOWN_REAL).unwrap().unwrap().is_charged());
+        }
+    }
+
+    #[test]
+    fn schema8_fresh_and_migrated_schemas_are_identical() {
+        let schema_sql = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        let fresh = Store::open_in_memory().unwrap();
+        let expected = schema_sql(&fresh.conn());
+        for version in 1..=7 {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = disk_database_at(tmp.path(), version);
+            release_database(conn, tmp.path());
+            let store = Store::reopen_after_restart(tmp.path());
+            // Compare after a v1 database's ALTER-built history reached schema 8.
+            assert_eq!(schema_sql(&store.conn()), expected, "v{version}");
+        }
+    }
+
+    #[test]
+    fn schema8_migration_failure_rolls_back_the_whole_upgrade() {
+        for version in 1..=7 {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = disk_database_at(tmp.path(), version);
+            let list = if version >= 2 { ",list_seq" } else { "" };
+            let value = if version >= 2 { ",1" } else { "" };
+            conn.execute(
+                &format!("INSERT INTO sandboxes (id,backend,state,spec,created_at_ms,updated_at_ms{list}) VALUES ('sb-corrupt','kiln','failed','not json',1,1{value})"),
+                [],
+            )
+            .unwrap();
+            release_database(conn, tmp.path());
+            let error = Store::open(tmp.path())
+                .err()
+                .expect("a corrupt spec cannot migrate");
+            assert!(format!("{error:#}").contains("sb-corrupt"), "{error:#}");
+            let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
+            assert_eq!(
+                conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                    .unwrap(),
+                version
+            );
+            let leftovers: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('release_evidence','daemon_identity','sandboxes_v8','executions_v8')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(leftovers, 0, "v{version}");
+        }
+    }
+
+    #[test]
+    fn every_store_connection_enforces_foreign_keys() {
+        fn assert_enforced(store: &Store, label: &str) {
+            let conn = store.conn();
+            assert_eq!(
+                conn.pragma_query_value::<i64, _>(None, "foreign_keys", |r| r.get(0))
+                    .unwrap(),
+                1,
+                "{label}"
+            );
+            assert!(
+                conn.execute(
+                    "INSERT INTO executions (id,sandbox_id,argv,state,timeout_ms,stdin_bytes,started_at_ms) VALUES ('ex-orphan','sb-missing','[]','running',1,0,1)",
+                    [],
+                )
+                .is_err(),
+                "{label}"
+            );
+        }
+        assert_enforced(&Store::open_in_memory().unwrap(), "in memory");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let created = Store::open(&dir).unwrap();
+        assert_enforced(&created, "created on disk");
+        drop(created);
+        assert_enforced(
+            &Store::reopen_after_restart(&dir),
+            "reopened at the current schema",
+        );
+        for version in 1..=7 {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = disk_database_at(tmp.path(), version);
+            release_database(conn, tmp.path());
+            assert_enforced(
+                &Store::reopen_after_restart(tmp.path()),
+                &format!("migrated v{version}"),
+            );
+        }
+    }
+
+    #[test]
+    fn direct_sql_cannot_release_without_matching_evidence() {
+        let store = Store::open_in_memory().unwrap();
+        let row = fenced_sandbox();
+        let binding = row.accounting.allocation.clone().unwrap();
+        store.insert_sandbox(&row).unwrap();
+        let charged = SandboxResources::for_reservation(&row.accounting.reservation);
+        assert_eq!(store.sandbox_resources().unwrap(), charged);
+        let id = row.id.clone();
+        let (node, instance, allocation, plan) = (
+            binding.node_id.to_string(),
+            binding.instance_id.to_string(),
+            binding.allocation_id.to_string(),
+            binding.plan_digest.to_string(),
+        );
+        let other = Id128::random().to_string();
+        let other_digest = Digest::of(b"other").to_string();
+
+        {
+            let conn = store.conn();
+            // FAILED, a backend ID and a definite claim all leave it charged or refused.
+            conn.execute("UPDATE sandboxes SET state = 'failed' WHERE id = ?1", [&id])
+                .unwrap();
+            conn.execute(
+                "UPDATE sandboxes SET backend_id = 'fc-' || allocation_id WHERE id = ?1",
+                [&id],
+            )
+            .unwrap();
+            drop(conn);
+            assert_eq!(
+                store.sandbox_resources().unwrap(),
+                charged,
+                "FAILED with a backend ID"
+            );
+            let conn = store.conn();
+            for attack in [
+                // The certainty marker and every legacy tag.
+                "UPDATE sandboxes SET create_certainty = 'definitely_not_created' WHERE id = ?1",
+                "UPDATE sandboxes SET backend_id = NULL, create_certainty = 'definitely_not_created' WHERE id = ?1",
+                "UPDATE sandboxes SET legacy_release = 'compensated' WHERE id = ?1",
+                "UPDATE sandboxes SET legacy_release = 'definitely_not_created' WHERE id = ?1",
+                "UPDATE sandboxes SET state = 'deleted', legacy_release = 'deleted' WHERE id = ?1",
+                // Laundering the row into another regime.
+                "UPDATE sandboxes SET accounting_kind = 'legacy' WHERE id = ?1",
+                "UPDATE sandboxes SET accounting_kind = 'legacy', legacy_release = 'compensated', node_id = NULL, instance_id = NULL, allocation_id = NULL, plan_version = NULL, plan_digest = NULL, plan = NULL WHERE id = ?1",
+                // A boolean does not exist to set.
+                "UPDATE sandboxes SET reservation_released = 1 WHERE id = ?1",
+                // DELETED always needs evidence.
+                "UPDATE sandboxes SET state = 'deleted' WHERE id = ?1",
+                // A missing receipt.
+                "UPDATE sandboxes SET release_evidence_id = '00000000000000000000000000000000' WHERE id = ?1",
+                // Direct deletion of a charged row.
+                "DELETE FROM sandboxes WHERE id = ?1",
+                // Every immutable identity, plan, spec and reservation field.
+                "UPDATE sandboxes SET allocation_id = '00000000000000000000000000000000' WHERE id = ?1",
+                "UPDATE sandboxes SET node_id = '00000000000000000000000000000000' WHERE id = ?1",
+                "UPDATE sandboxes SET instance_id = '00000000000000000000000000000000' WHERE id = ?1",
+                "UPDATE sandboxes SET plan_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE id = ?1",
+                "UPDATE sandboxes SET plan = x'00' WHERE id = ?1",
+                "UPDATE sandboxes SET plan_version = 2 WHERE id = ?1",
+                "UPDATE sandboxes SET spec = '{}' WHERE id = ?1",
+                "UPDATE sandboxes SET host_spec_sha256 = '0000000000000000000000000000000000000000000000000000000000000000' WHERE id = ?1",
+                "UPDATE sandboxes SET guest_exec_spec_sha256 = '0000000000000000000000000000000000000000000000000000000000000000' WHERE id = ?1",
+                "UPDATE sandboxes SET reserved_memory_bytes = 0 WHERE id = ?1",
+                "UPDATE sandboxes SET reserved_disk_bytes = 0 WHERE id = ?1",
+                "UPDATE sandboxes SET reserved_pids = 0 WHERE id = ?1",
+                "UPDATE sandboxes SET reserved_host_cpu_millis = 0 WHERE id = ?1",
+                "UPDATE sandboxes SET reserved_virtual_cpu_slots = 0 WHERE id = ?1",
+                "UPDATE sandboxes SET reserved_host_pids = 0 WHERE id = ?1",
+                "UPDATE sandboxes SET owner_uid = 1 WHERE id = ?1",
+                "UPDATE sandboxes SET backend = 'other' WHERE id = ?1",
+                "UPDATE sandboxes SET runtime_profile = 'other' WHERE id = ?1",
+                // Another allocation's backend ID.
+                "UPDATE sandboxes SET backend_id = 'fc-00000000000000000000000000000000' WHERE id = ?1",
+            ] {
+                assert!(conn.execute(attack, [&id]).is_err(), "{attack}");
+            }
+            // Malformed evidence cannot even enter the table.
+            let good = (
+                other.as_str(),
+                node.as_str(),
+                instance.as_str(),
+                allocation.as_str(),
+                plan.as_str(),
+            );
+            assert!(
+                insert_evidence(&conn, good, "1", "'stopped'").is_err(),
+                "wrong kind"
+            );
+            assert!(
+                insert_evidence(&conn, good, "1", "NULL").is_err(),
+                "missing kind"
+            );
+            assert!(
+                insert_evidence(&conn, good, "0", "'absent_fenced'").is_err(),
+                "generation 0"
+            );
+            assert!(
+                insert_evidence(&conn, good, "-1", "'absent_fenced'").is_err(),
+                "negative generation"
+            );
+            assert!(
+                insert_evidence(&conn, good, "NULL", "'absent_fenced'").is_err(),
+                "missing generation"
+            );
+            assert!(
+                insert_evidence(&conn, good, "1.5", "'absent_fenced'").is_err(),
+                "fractional generation"
+            );
+            for (column, position) in [
+                ("receipt_id", 0),
+                ("node_id", 1),
+                ("instance_id", 2),
+                ("allocation_id", 3),
+                ("plan_digest", 4),
+            ] {
+                let mut fields = [good.0, good.1, good.2, good.3, good.4];
+                fields[position] = "not hex";
+                assert!(
+                    insert_evidence(
+                        &conn,
+                        (fields[0], fields[1], fields[2], fields[3], fields[4]),
+                        "1",
+                        "'absent_fenced'"
+                    )
+                    .is_err(),
+                    "malformed {column}"
+                );
+            }
+
+            // Well-formed evidence for another identity cannot satisfy this row.
+            for (i, (node, instance, allocation, plan)) in [
+                (
+                    other.as_str(),
+                    instance.as_str(),
+                    allocation.as_str(),
+                    plan.as_str(),
+                ),
+                (
+                    node.as_str(),
+                    other.as_str(),
+                    allocation.as_str(),
+                    plan.as_str(),
+                ),
+                (
+                    node.as_str(),
+                    instance.as_str(),
+                    other.as_str(),
+                    plan.as_str(),
+                ),
+                (
+                    node.as_str(),
+                    instance.as_str(),
+                    allocation.as_str(),
+                    other_digest.as_str(),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let receipt = Id128::random().to_string();
+                // Evidence for this exact allocation may exist only once, so give
+                // each mismatched case a distinct allocation when it is not the field.
+                let alloc = if i == 2 {
+                    allocation.to_string()
+                } else {
+                    Id128::random().to_string()
+                };
+                insert_evidence(
+                    &conn,
+                    (&receipt, node, instance, &alloc, plan),
+                    "1",
+                    "'absent_fenced'",
+                )
+                .unwrap();
+                assert!(
+                    conn.execute(
+                        "UPDATE sandboxes SET release_evidence_id = ?2 WHERE id = ?1",
+                        params![id, receipt],
+                    )
+                    .is_err(),
+                    "mismatched identity {i}"
+                );
+            }
+        }
+        assert_eq!(store.sandbox_resources().unwrap(), charged);
+
+        // A legacy row can never reference evidence, and its tag must fit its state.
+        let legacy = sandbox();
+        store.insert_sandbox(&legacy).unwrap();
+        store
+            .set_sandbox_state(&legacy.id, SandboxState::Failed, None, Some("ambiguous"))
+            .unwrap();
+        {
+            let conn = store.conn();
+            let evidence = Id128::random().to_string();
+            insert_evidence(
+                &conn,
+                (
+                    &evidence,
+                    &node,
+                    &instance,
+                    &Id128::random().to_string(),
+                    &plan,
+                ),
+                "1",
+                "'absent_fenced'",
+            )
+            .unwrap();
+            assert!(
+                conn.execute(
+                    "UPDATE sandboxes SET release_evidence_id = ?2 WHERE id = ?1",
+                    params![legacy.id, evidence]
+                )
+                .is_err()
+            );
+            for laundering in [
+                "UPDATE sandboxes SET legacy_release = 'compensated' WHERE id = ?1",
+                "UPDATE sandboxes SET legacy_release = 'definitely_not_created' WHERE id = ?1",
+                "UPDATE sandboxes SET legacy_release = 'deleted' WHERE id = ?1",
+                "UPDATE sandboxes SET legacy_release = 'freed' WHERE id = ?1",
+                "UPDATE sandboxes SET state = 'deleted' WHERE id = ?1",
+                "DELETE FROM sandboxes WHERE id = ?1",
+                "UPDATE sandboxes SET accounting_kind = 'fenced' WHERE id = ?1",
+                // Forging the facts a tag would need does not work either.
+                "UPDATE sandboxes SET backend_id = 'f00d', legacy_release = 'compensated' WHERE id = ?1",
+                "UPDATE sandboxes SET create_certainty = 'definitely_not_created', legacy_release = 'definitely_not_created' WHERE id = ?1",
+                "UPDATE sandboxes SET state = 'deleted', legacy_release = 'deleted' WHERE id = ?1",
+            ] {
+                assert!(
+                    conn.execute(laundering, [&legacy.id]).is_err(),
+                    "{laundering}"
+                );
+            }
+        }
+        // A conflict clause cannot delete another charged row by its unique index.
+        let (victim, attacker) = (sandbox(), sandbox());
+        store.insert_sandbox(&victim).unwrap();
+        store.insert_sandbox(&attacker).unwrap();
+        store
+            .set_sandbox_state(&victim.id, SandboxState::Ready, Some("taken"), None)
+            .unwrap();
+        store
+            .set_sandbox_state(&attacker.id, SandboxState::Ready, Some("mine"), None)
+            .unwrap();
+        assert!(
+            store
+                .conn()
+                .execute(
+                    "UPDATE OR REPLACE sandboxes SET backend_id = 'taken' WHERE id = ?1",
+                    [&attacker.id],
+                )
+                .is_err()
+        );
+        assert!(store.sandbox(&victim.id).unwrap().is_some());
+        store
+            .set_sandbox_state(&victim.id, SandboxState::Deleted, None, None)
+            .unwrap();
+        store
+            .set_sandbox_state(&attacker.id, SandboxState::Deleted, None, None)
+            .unwrap();
+
+        // The typed path, then everything that would undo it.
+        let receipt = receipt_for(&row);
+        store
+            .release_fenced(&id, SandboxState::Failed, &receipt, None)
+            .unwrap();
+        let released = store.sandbox(&id).unwrap().unwrap();
+        assert_eq!(
+            released.accounting.release,
+            ReservationRelease::Fenced(receipt.receipt_id())
+        );
+        assert_eq!(
+            store.sandbox_resources().unwrap().sandboxes,
+            1,
+            "only the legacy row is left"
+        );
+        let receipt_id = receipt.receipt_id().to_string();
+        {
+            let conn = store.conn();
+            for attack in [
+                "UPDATE sandboxes SET release_evidence_id = NULL WHERE id = ?1",
+                "UPDATE sandboxes SET state = 'ready' WHERE id = ?1",
+                "UPDATE sandboxes SET state = 'deleting' WHERE id = ?1",
+                "UPDATE sandboxes SET state = 'creating' WHERE id = ?1",
+                "UPDATE sandboxes SET state = 'quarantined' WHERE id = ?1",
+                "UPDATE sandboxes SET release_evidence_kind = 'other' WHERE id = ?1",
+            ] {
+                assert!(conn.execute(attack, [&id]).is_err(), "{attack}");
+            }
+            // Evidence itself is permanent, including through a conflict clause.
+            for attack in [
+                "UPDATE release_evidence SET helper_generation = 8 WHERE receipt_id = ?1",
+                "UPDATE release_evidence SET plan_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE receipt_id = ?1",
+                "UPDATE release_evidence SET kind = 'stopped' WHERE receipt_id = ?1",
+                "DELETE FROM release_evidence WHERE receipt_id = ?1",
+                "INSERT OR REPLACE INTO release_evidence SELECT receipt_id, node_id, instance_id, allocation_id, plan_digest, 9, kind, receipt, recorded_at_ms FROM release_evidence WHERE receipt_id = ?1",
+            ] {
+                assert!(conn.execute(attack, [&receipt_id]).is_err(), "{attack}");
+            }
+        }
+
+        // A receipt for another identity or a second receipt changes nothing.
+        let unreleased = fenced_sandbox();
+        store.insert_sandbox(&unreleased).unwrap();
+        let before = store.sandbox_resources().unwrap();
+        let b = unreleased.accounting.allocation.clone().unwrap();
+        let forged = |node, instance, allocation, plan| {
+            FencedAbsence::new(
+                Id128::random(),
+                node,
+                instance,
+                allocation,
+                plan,
+                1,
+                String::new(),
+            )
+            .unwrap()
+        };
+        let (other_id, other_plan) = (Id128::random(), Digest::of(b"x"));
+        for wrong in [
+            forged(other_id, b.instance_id, b.allocation_id, b.plan_digest),
+            forged(b.node_id, other_id, b.allocation_id, b.plan_digest),
+            forged(b.node_id, b.instance_id, other_id, b.plan_digest),
+            forged(b.node_id, b.instance_id, b.allocation_id, other_plan),
+            receipt.clone(),
+        ] {
+            assert!(
+                store
+                    .release_fenced(&unreleased.id, SandboxState::Failed, &wrong, None)
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .release_fenced(
+                    &legacy.id,
+                    SandboxState::Failed,
+                    &receipt_for(&unreleased),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .release_fenced(
+                    &unreleased.id,
+                    SandboxState::Ready,
+                    &receipt_for(&unreleased),
+                    None
+                )
+                .is_err()
+        );
+        assert_eq!(store.sandbox_resources().unwrap(), before);
+        let second = receipt_for(&row);
+        assert!(
+            store
+                .release_fenced(&id, SandboxState::Deleted, &second, None)
+                .is_err()
+        );
+
+        // An exact replay is a true no-op, and FAILED can advance keeping evidence.
+        let row_before = store.sandbox(&id).unwrap().unwrap();
+        store
+            .release_fenced(&id, SandboxState::Failed, &receipt, None)
+            .unwrap();
+        assert_eq!(store.sandbox(&id).unwrap().unwrap(), row_before);
+        store
+            .release_fenced(&id, SandboxState::Deleted, &receipt, None)
+            .unwrap();
+        let deleted = store.sandbox(&id).unwrap().unwrap();
+        assert_eq!(deleted.state, SandboxState::Deleted);
+        assert_eq!(
+            deleted.accounting.release,
+            ReservationRelease::Fenced(receipt.receipt_id())
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .release_fenced(&id, SandboxState::Deleted, &receipt, None)
+            .unwrap();
+        assert_eq!(
+            store.sandbox(&id).unwrap().unwrap(),
+            deleted,
+            "replay keeps timestamps"
+        );
+        assert!(
+            store
+                .conn()
+                .execute("UPDATE sandboxes SET state = 'failed' WHERE id = ?1", [&id])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn triggers_defend_evidence_even_on_a_foreign_key_disabled_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        let row = fenced_sandbox();
+        store.insert_sandbox(&row).unwrap();
+        let charged = store.sandbox_resources().unwrap();
+        drop(store);
+        // Bypasses Store deliberately, as a stray writer with foreign keys off would.
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "foreign_keys", |r| r.get(0))
+                .unwrap(),
+            0
+        );
+        for attack in [
+            "UPDATE sandboxes SET state = 'failed', release_evidence_id = '00000000000000000000000000000000' WHERE id = ?1",
+            "DELETE FROM sandboxes WHERE id = ?1",
+        ] {
+            assert!(conn.execute(attack, [&row.id]).is_err(), "{attack}");
+        }
+        drop(conn);
+        let store = Store::reopen_after_restart(&dir);
+        assert_eq!(store.sandbox_resources().unwrap(), charged);
+    }
+
+    #[test]
+    fn fenced_lifecycle_forbids_prefill_resurrection_and_blind_publication() {
+        let store = Store::open_in_memory().unwrap();
+        let row = fenced_sandbox();
+        let binding = row.accounting.allocation.clone().unwrap();
+        // C1 can never prefill a backend ID, nor can a fenced row be legacy-tagged at insert.
+        let mut prefilled = row.clone();
+        prefilled.backend_id = Some(binding.backend_id());
+        assert!(store.insert_sandbox(&prefilled).is_err());
+        store.insert_sandbox(&row).unwrap();
+        // Allocation IDs are never reused by another row.
+        let mut duplicate = fenced_sandbox();
+        duplicate
+            .accounting
+            .allocation
+            .as_mut()
+            .unwrap()
+            .allocation_id = binding.allocation_id;
+        assert!(store.insert_sandbox(&duplicate).is_err());
+        // The legacy fast paths cannot release or publish it.
+        assert!(store.fail_create_definitely(&row.id, "claimed").is_err());
+        assert!(
+            store
+                .set_sandbox_state(&row.id, SandboxState::Deleted, None, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .set_sandbox_state(
+                    &row.id,
+                    SandboxState::Ready,
+                    Some(&binding.backend_id()),
+                    None
+                )
+                .is_err()
+        );
+        assert!(store.is_charged_for_test(&row.id));
+        assert!(
+            store
+                .compare_and_set_sandbox_state(
+                    &row.id,
+                    SandboxState::Creating,
+                    SandboxState::Deleted,
+                    None,
+                    None
+                )
+                .is_err()
+        );
+        // A legacy create receipt cannot publish it.
+        let legacy_created = CreatedSandbox {
+            backend_id: binding.backend_id(),
+            receipt: RuntimeReceipt::Legacy,
+        };
+        assert!(
+            store
+                .publish_fenced_ready(&row.id, &legacy_created)
+                .is_err()
+        );
+        // Typed publication writes the exact identity once.
+        let created = CreatedSandbox {
+            backend_id: binding.backend_id(),
+            receipt: RuntimeReceipt::Ready(crate::runtime::ReadyReceipt {
+                node_id: binding.node_id,
+                instance_id: binding.instance_id,
+                allocation_id: binding.allocation_id,
+                plan_digest: binding.plan_digest,
+                helper_generation: 3,
+                boot_id: "boot-1".into(),
+            }),
+        };
+        assert!(store.publish_fenced_ready(&row.id, &created).unwrap());
+        assert!(
+            !store.publish_fenced_ready(&row.id, &created).unwrap(),
+            "CAS"
+        );
+        let ready = store.sandbox(&row.id).unwrap().unwrap();
+        assert_eq!(ready.state, SandboxState::Ready);
+        assert_eq!(
+            ready.backend_id.as_deref(),
+            Some(binding.backend_id().as_str())
+        );
+        assert_eq!(ready.accounting.boot_id.as_deref(), Some("boot-1"));
+        // A retired allocation never returns to READY or to reusable.
+        store
+            .retire_sandbox(&row.id, SandboxDisposition::Stopped, "stopped")
+            .unwrap();
+        let lost = store.sandbox(&row.id).unwrap().unwrap();
+        assert_eq!(
+            (lost.state, lost.accounting.disposition),
+            (SandboxState::Lost, SandboxDisposition::Stopped)
+        );
+        assert!(
+            store
+                .set_sandbox_state(&row.id, SandboxState::Ready, None, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .conn()
+                .execute(
+                    "UPDATE sandboxes SET disposition = 'reusable' WHERE id = ?1",
+                    [&row.id]
+                )
+                .is_err()
+        );
+        // Quarantine cannot return to READY on any regime.
+        let legacy = sandbox();
+        store.insert_sandbox(&legacy).unwrap();
+        store
+            .set_sandbox_state(&legacy.id, SandboxState::Ready, Some("kiln-1"), None)
+            .unwrap();
+        store
+            .retire_sandbox(
+                &legacy.id,
+                SandboxDisposition::Quarantined,
+                "unknown cleanup",
+            )
+            .unwrap();
+        assert_eq!(
+            store.sandbox(&legacy.id).unwrap().unwrap().state,
+            SandboxState::Quarantined
+        );
+        assert!(
+            store
+                .set_sandbox_state(&legacy.id, SandboxState::Ready, None, None)
+                .is_err()
+        );
+    }
+
+    fn ready_for(row: &Sandbox, generation: u64) -> crate::runtime::ReadyReceipt {
+        let binding = row.accounting.allocation.as_ref().unwrap();
+        crate::runtime::ReadyReceipt {
+            node_id: binding.node_id,
+            instance_id: binding.instance_id,
+            allocation_id: binding.allocation_id,
+            plan_digest: binding.plan_digest,
+            helper_generation: generation,
+            boot_id: "boot-1".into(),
+        }
+    }
+
+    fn created_for(row: &Sandbox, generation: u64) -> CreatedSandbox {
+        CreatedSandbox {
+            backend_id: row.accounting.allocation.as_ref().unwrap().backend_id(),
+            receipt: RuntimeReceipt::Ready(ready_for(row, generation)),
+        }
+    }
+
+    fn absence_for(row: &Sandbox, generation: u64) -> FencedAbsence {
+        let binding = row.accounting.allocation.as_ref().unwrap();
+        FencedAbsence::new(
+            Id128::random(),
+            binding.node_id,
+            binding.instance_id,
+            binding.allocation_id,
+            binding.plan_digest,
+            generation,
+            String::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn publish_fenced_ready_checks_its_own_identity_plan_backend_and_generation() {
+        let store = Store::open_in_memory().unwrap();
+        let row = fenced_sandbox();
+        store.insert_sandbox(&row).unwrap();
+        let good = ready_for(&row, 3);
+        let backend_id = row.accounting.allocation.as_ref().unwrap().backend_id();
+        let wrong = |receipt: crate::runtime::ReadyReceipt| CreatedSandbox {
+            backend_id: backend_id.clone(),
+            receipt: RuntimeReceipt::Ready(receipt),
+        };
+        // None of these goes through the manager's own check.
+        for (case, created) in [
+            (
+                "node",
+                wrong(crate::runtime::ReadyReceipt {
+                    node_id: Id128::random(),
+                    ..good.clone()
+                }),
+            ),
+            (
+                "instance",
+                wrong(crate::runtime::ReadyReceipt {
+                    instance_id: Id128::random(),
+                    ..good.clone()
+                }),
+            ),
+            (
+                "allocation",
+                wrong(crate::runtime::ReadyReceipt {
+                    allocation_id: Id128::random(),
+                    ..good.clone()
+                }),
+            ),
+            (
+                "plan",
+                wrong(crate::runtime::ReadyReceipt {
+                    plan_digest: Digest::of(b"other"),
+                    ..good.clone()
+                }),
+            ),
+            (
+                "generation zero",
+                wrong(crate::runtime::ReadyReceipt {
+                    helper_generation: 0,
+                    ..good.clone()
+                }),
+            ),
+            (
+                "generation range",
+                wrong(crate::runtime::ReadyReceipt {
+                    helper_generation: i64::MAX as u64 + 1,
+                    ..good.clone()
+                }),
+            ),
+            (
+                "empty boot",
+                wrong(crate::runtime::ReadyReceipt {
+                    boot_id: String::new(),
+                    ..good.clone()
+                }),
+            ),
+            (
+                "long boot",
+                wrong(crate::runtime::ReadyReceipt {
+                    boot_id: "b".repeat(129),
+                    ..good.clone()
+                }),
+            ),
+            (
+                "backend",
+                CreatedSandbox {
+                    backend_id: format!("fc-{}", Id128::random()),
+                    receipt: RuntimeReceipt::Ready(good.clone()),
+                },
+            ),
+            (
+                "legacy",
+                CreatedSandbox {
+                    backend_id: backend_id.clone(),
+                    receipt: RuntimeReceipt::Legacy,
+                },
+            ),
+        ] {
+            assert!(
+                store.publish_fenced_ready(&row.id, &created).is_err(),
+                "{case}"
+            );
+            let after = store.sandbox(&row.id).unwrap().unwrap();
+            assert_eq!(after, row, "{case} changed the row");
+        }
+        // A legacy row can't publish an allocation, even with a coherent receipt.
+        let legacy = sandbox();
+        store.insert_sandbox(&legacy).unwrap();
+        assert!(
+            store
+                .publish_fenced_ready(&legacy.id, &created_for(&row, 3))
+                .is_err()
+        );
+
+        // An older generation than the row recorded is stale, never just ignored.
+        let mut advanced = fenced_sandbox();
+        advanced.accounting.last_helper_generation = Some(5);
+        store.insert_sandbox(&advanced).unwrap();
+        for stale in [1, 4, 5] {
+            assert!(
+                store
+                    .publish_fenced_ready(&advanced.id, &created_for(&advanced, stale))
+                    .is_err(),
+                "{stale}"
+            );
+            assert_eq!(
+                store.sandbox(&advanced.id).unwrap().unwrap().state,
+                SandboxState::Creating
+            );
+        }
+        assert!(
+            store
+                .publish_fenced_ready(&advanced.id, &created_for(&advanced, 6))
+                .unwrap()
+        );
+        let ready = store.sandbox(&advanced.id).unwrap().unwrap();
+        assert_eq!(ready.accounting.last_helper_generation, Some(6));
+        // Identity is checked before the state comparison, and repeats change nothing.
+        assert!(
+            store
+                .publish_fenced_ready(&advanced.id, &created_for(&row, 7))
+                .is_err()
+        );
+        assert!(
+            !store
+                .publish_fenced_ready(&advanced.id, &created_for(&advanced, 7))
+                .unwrap()
+        );
+        assert_eq!(store.sandbox(&advanced.id).unwrap().unwrap(), ready);
+    }
+
+    #[test]
+    fn release_requires_a_generation_newer_than_any_published() {
+        let store = Store::open_in_memory().unwrap();
+        let row = fenced_sandbox();
+        store.insert_sandbox(&row).unwrap();
+        assert!(
+            store
+                .publish_fenced_ready(&row.id, &created_for(&row, 7))
+                .unwrap()
+        );
+        for stale in [1, 6, 7] {
+            let receipt = absence_for(&row, stale);
+            let error = store
+                .release_fenced(&row.id, SandboxState::Failed, &receipt, None)
+                .unwrap_err();
+            assert!(error.to_string().contains("not newer"), "{error:#}");
+            assert!(
+                store.sandbox(&row.id).unwrap().unwrap().is_charged(),
+                "{stale}"
+            );
+            // The rejected receipt left no evidence that could block the real one.
+            let evidence: i64 = store
+                .conn()
+                .query_row("SELECT COUNT(*) FROM release_evidence", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(evidence, 0, "{stale}");
+        }
+        let receipt = absence_for(&row, 8);
+        store
+            .release_fenced(&row.id, SandboxState::Failed, &receipt, None)
+            .unwrap();
+        let released = store.sandbox(&row.id).unwrap().unwrap();
+        assert_eq!(released.accounting.last_helper_generation, Some(8));
+        assert_eq!(
+            released.accounting.release,
+            ReservationRelease::Fenced(receipt.receipt_id())
+        );
+        assert_eq!(
+            store.sandbox_resources().unwrap(),
+            SandboxResources::default()
+        );
+
+        // The exact release replays idempotently even though 8 is no longer newer.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .release_fenced(&row.id, SandboxState::Failed, &receipt, None)
+            .unwrap();
+        assert_eq!(store.sandbox(&row.id).unwrap().unwrap(), released);
+        store
+            .release_fenced(&row.id, SandboxState::Deleted, &receipt, None)
+            .unwrap();
+        let deleted = store.sandbox(&row.id).unwrap().unwrap();
+        assert_eq!(deleted.state, SandboxState::Deleted);
+        assert_eq!(deleted.accounting.last_helper_generation, Some(8));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .release_fenced(&row.id, SandboxState::Deleted, &receipt, None)
+            .unwrap();
+        assert_eq!(store.sandbox(&row.id).unwrap().unwrap(), deleted);
+        // A different receipt, newer or not, can't replace it.
+        assert!(
+            store
+                .release_fenced(&row.id, SandboxState::Deleted, &absence_for(&row, 9), None)
+                .is_err()
+        );
+        assert_eq!(store.sandbox(&row.id).unwrap().unwrap(), deleted);
+    }
+
+    #[test]
+    fn direct_sql_cannot_use_stale_generation_evidence_or_roll_back_a_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        let stale_attacks = |conn: &Connection, id: &str, evidence: &str| {
+            for attack in [
+                // Referencing it alone, and carrying its stale generation with it.
+                "UPDATE sandboxes SET state = 'failed', release_evidence_id = ?2 WHERE id = ?1",
+                "UPDATE sandboxes SET state = 'failed', release_evidence_id = ?2, last_helper_generation = 5 WHERE id = ?1",
+                // Claiming a newer generation than the referenced evidence has.
+                "UPDATE sandboxes SET state = 'failed', release_evidence_id = ?2, last_helper_generation = 8 WHERE id = ?1",
+            ] {
+                assert!(
+                    conn.execute(attack, params![id, evidence]).is_err(),
+                    "{attack}"
+                );
+            }
+        };
+        // Evidence that entered while the row recorded nothing is positive, and stale
+        // once READY publishes a newer generation.
+        let row = fenced_sandbox();
+        let binding = row.accounting.allocation.clone().unwrap();
+        store.insert_sandbox(&row).unwrap();
+        let evidence = Id128::random().to_string();
+        let (node, instance, allocation, plan) = (
+            binding.node_id.to_string(),
+            binding.instance_id.to_string(),
+            binding.allocation_id.to_string(),
+            binding.plan_digest.to_string(),
+        );
+        insert_evidence(
+            &store.conn(),
+            (&evidence, &node, &instance, &allocation, &plan),
+            "5",
+            "'absent_fenced'",
+        )
+        .unwrap();
+        assert!(
+            store
+                .publish_fenced_ready(&row.id, &created_for(&row, 7))
+                .unwrap()
+        );
+        stale_attacks(&store.conn(), &row.id, &evidence);
+        assert!(store.sandbox(&row.id).unwrap().unwrap().is_charged());
+
+        // Evidence no newer than the published generation can't enter at all.
+        let other = fenced_sandbox();
+        let other_binding = other.accounting.allocation.clone().unwrap();
+        store.insert_sandbox(&other).unwrap();
+        assert!(
+            store
+                .publish_fenced_ready(&other.id, &created_for(&other, 7))
+                .unwrap()
+        );
+        for stale in ["1", "7"] {
+            assert!(
+                insert_evidence(
+                    &store.conn(),
+                    (
+                        &Id128::random().to_string(),
+                        &other_binding.node_id.to_string(),
+                        &other_binding.instance_id.to_string(),
+                        &other_binding.allocation_id.to_string(),
+                        &other_binding.plan_digest.to_string(),
+                    ),
+                    stale,
+                    "'absent_fenced'",
+                )
+                .is_err(),
+                "{stale}"
+            );
+        }
+
+        // A generation moves only forward, and only with its receipt.
+        {
+            let conn = store.conn();
+            for attack in [
+                "UPDATE sandboxes SET last_helper_generation = 6 WHERE id = ?1",
+                "UPDATE sandboxes SET last_helper_generation = 0 WHERE id = ?1",
+                "UPDATE sandboxes SET last_helper_generation = NULL WHERE id = ?1",
+                "UPDATE sandboxes SET last_helper_generation = 8 WHERE id = ?1",
+                "UPDATE sandboxes SET last_helper_generation = -1 WHERE id = ?1",
+                "UPDATE sandboxes SET last_helper_generation = 'x' WHERE id = ?1",
+            ] {
+                assert!(conn.execute(attack, [&other.id]).is_err(), "{attack}");
+            }
+            let creating = fenced_sandbox();
+            insert_sandbox(&conn, &creating).unwrap();
+            assert!(
+                conn.execute(
+                    "UPDATE sandboxes SET last_helper_generation = 3 WHERE id = ?1",
+                    [&creating.id]
+                )
+                .is_err()
+            );
+            // READY always carries a real generation.
+            assert!(
+                conn.execute(
+                    "UPDATE sandboxes SET state = 'ready', backend_id = 'fc-' || allocation_id, boot_id = 'b', runtime_receipt = x'7b7d' WHERE id = ?1",
+                    [&creating.id]
+                )
+                .is_err()
+            );
+            // A legacy row has none, and a fenced row must have one.
+            let legacy = sandbox();
+            insert_sandbox(&conn, &legacy).unwrap();
+            assert!(
+                conn.execute(
+                    "UPDATE sandboxes SET last_helper_generation = 1 WHERE id = ?1",
+                    [&legacy.id]
+                )
+                .is_err()
+            );
+        }
+        let mut no_generation = fenced_sandbox();
+        no_generation.accounting.last_helper_generation = None;
+        assert!(store.insert_sandbox(&no_generation).is_err());
+        let mut legacy_generation = sandbox();
+        legacy_generation.accounting.last_helper_generation = Some(1);
+        assert!(store.insert_sandbox(&legacy_generation).is_err());
+        // The trigger isn't overbroad: strictly newer evidence commits by direct SQL.
+        {
+            let conn = store.conn();
+            let fresh = Id128::random().to_string();
+            insert_evidence(
+                &conn,
+                (
+                    &fresh,
+                    &other_binding.node_id.to_string(),
+                    &other_binding.instance_id.to_string(),
+                    &other_binding.allocation_id.to_string(),
+                    &other_binding.plan_digest.to_string(),
+                ),
+                "8",
+                "'absent_fenced'",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sandboxes SET state = 'failed', release_evidence_id = ?2, last_helper_generation = 8 WHERE id = ?1",
+                params![other.id, fresh],
+            )
+            .unwrap();
+            assert!(
+                conn.execute(
+                    "UPDATE sandboxes SET last_helper_generation = 9 WHERE id = ?1",
+                    [&other.id]
+                )
+                .is_err()
+            );
+        }
+        // The freshness triggers hold with foreign keys off too.
+        drop(store);
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        stale_attacks(&conn, &row.id, &evidence);
+        drop(conn);
+        let store = Store::reopen_after_restart(&dir);
+        assert!(store.sandbox(&row.id).unwrap().unwrap().is_charged());
+    }
+
+    #[test]
+    fn terminal_execution_and_its_sandbox_disposition_commit_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        let row = sandbox();
+        store.insert_sandbox(&row).unwrap();
+        store
+            .set_sandbox_state(&row.id, SandboxState::Ready, Some("kiln-1"), None)
+            .unwrap();
+        let e = execution(&row.id);
+        store.insert_execution(&e).unwrap();
+        let capture = Captured::known_empty();
+        let result = ExecutionResult {
+            state: ExecutionState::TimedOut,
+            exit_code: None,
+            command_status: None,
+            runtime_error: None,
+            failure_reason: Some("timed out"),
+            stdout: &capture,
+            stderr: &capture,
+            sandbox_reusable: Some(false),
+            cleanup_evidence: CleanupEvidence::SandboxStopped,
+            disposition: Some(SandboxDisposition::Stopped),
+            disposition_reason: Some("retired"),
+        };
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_lost BEFORE UPDATE OF state ON sandboxes WHEN NEW.state = 'lost'
+                 BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+            )
+            .unwrap();
+        assert!(store.finish_execution(&e.id, &result).is_err());
+        assert_eq!(
+            store.execution(&e.id).unwrap().unwrap().state,
+            ExecutionState::Running
+        );
+        assert_eq!(
+            store.sandbox(&row.id).unwrap().unwrap().state,
+            SandboxState::Ready
+        );
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER reject_lost;")
+            .unwrap();
+        store.finish_execution(&e.id, &result).unwrap();
+        let finished = store.execution(&e.id).unwrap().unwrap();
+        assert_eq!(finished.state, ExecutionState::TimedOut);
+        assert_eq!(finished.sandbox_reusable, Some(false));
+        assert_eq!(finished.cleanup_evidence, CleanupEvidence::SandboxStopped);
+        let lost = store.sandbox(&row.id).unwrap().unwrap();
+        assert_eq!(lost.state, SandboxState::Lost);
+        assert_eq!(lost.failure_reason.as_deref(), Some("retired"));
+        assert!(lost.is_charged());
+
+        // DELETING keeps its intent; the disposition is still recorded.
+        let row = sandbox();
+        store.insert_sandbox(&row).unwrap();
+        store
+            .set_sandbox_state(&row.id, SandboxState::Deleting, Some("kiln-2"), None)
+            .unwrap();
+        let e = execution(&row.id);
+        store.insert_execution(&e).unwrap();
+        store
+            .finish_execution(
+                &e.id,
+                &ExecutionResult {
+                    disposition: Some(SandboxDisposition::Quarantined),
+                    ..result
+                },
+            )
+            .unwrap();
+        let deleting = store.sandbox(&row.id).unwrap().unwrap();
+        assert_eq!(deleting.state, SandboxState::Deleting);
+        assert_eq!(
+            deleting.accounting.disposition,
+            SandboxDisposition::Quarantined
+        );
+    }
+
+    #[test]
+    fn zero_age_and_count_prune_retains_charged_rows_and_permanent_evidence() {
+        let store = Store::open_in_memory().unwrap();
+        let mut kept = Vec::new();
+        // Charged absence-fenced rows, FAILED or deleting, whatever they say.
+        for state in [
+            SandboxState::Creating,
+            SandboxState::Failed,
+            SandboxState::Deleting,
+            SandboxState::Lost,
+            SandboxState::Quarantined,
+        ] {
+            let row = fenced_sandbox();
+            store.insert_sandbox(&row).unwrap();
+            store
+                .set_sandbox_state(&row.id, state, None, Some("x"))
+                .unwrap();
+            kept.push(row.id);
+        }
+        // A FAILED fenced row that knows its backend ID is still charged.
+        let cleanup_failed = fenced_sandbox();
+        let binding = cleanup_failed.accounting.allocation.clone().unwrap();
+        store.insert_sandbox(&cleanup_failed).unwrap();
+        store
+            .set_sandbox_state(
+                &cleanup_failed.id,
+                SandboxState::Failed,
+                Some(&binding.backend_id()),
+                Some("cleanup failed"),
+            )
+            .unwrap();
+        kept.push(cleanup_failed.id.clone());
+        // Charged legacy rows, including the ambiguous failure and quarantine.
+        let ambiguous = sandbox();
+        store.insert_sandbox(&ambiguous).unwrap();
+        store
+            .set_sandbox_state(&ambiguous.id, SandboxState::Failed, None, Some("x"))
+            .unwrap();
+        kept.push(ambiguous.id);
+        let quarantined = sandbox();
+        store.insert_sandbox(&quarantined).unwrap();
+        store
+            .set_sandbox_state(
+                &quarantined.id,
+                SandboxState::Quarantined,
+                Some("q-1"),
+                Some("x"),
+            )
+            .unwrap();
+        kept.push(quarantined.id);
+        // A released row with a publication-pending execution stays too.
+        let pending_parent = fenced_sandbox();
+        store.insert_sandbox(&pending_parent).unwrap();
+        let pending_receipt = receipt_for(&pending_parent);
+        store
+            .release_fenced(
+                &pending_parent.id,
+                SandboxState::Failed,
+                &pending_receipt,
+                None,
+            )
+            .unwrap();
+        let pending = execution(&pending_parent.id);
+        store.insert_execution(&pending).unwrap();
+        // Released history is removable, but its evidence is permanent.
+        let released = fenced_sandbox();
+        store.insert_sandbox(&released).unwrap();
+        let receipt = receipt_for(&released);
+        store
+            .release_fenced(&released.id, SandboxState::Deleted, &receipt, None)
+            .unwrap();
+        let legacy_released = sandbox();
+        store.insert_sandbox(&legacy_released).unwrap();
+        store
+            .set_sandbox_state(&legacy_released.id, SandboxState::Deleted, None, None)
+            .unwrap();
+
+        let before = store.sandbox_resources().unwrap();
+        let policy = Retention {
+            execution_max_age_secs: 0,
+            execution_max_count: 0,
+            sandbox_max_age_secs: 0,
+            sandbox_max_count: 0,
+            ..Retention::default()
+        };
+        let pruned = store.prune(&policy, now_ms() + 1_000_000).unwrap();
+        assert_eq!(
+            pruned.sandboxes, 2,
+            "only uncharged history without unfinished children"
+        );
+        assert_eq!(store.sandbox_resources().unwrap(), before);
+        for id in &kept {
+            assert!(store.sandbox(id).unwrap().is_some(), "{id}");
+        }
+        assert!(store.sandbox(&pending_parent.id).unwrap().is_some());
+        assert!(store.execution(&pending.id).unwrap().is_some());
+        assert!(store.sandbox(&released.id).unwrap().is_none());
+        assert!(store.sandbox(&legacy_released.id).unwrap().is_none());
+        let conn = store.conn();
+        let evidence: i64 = conn
+            .query_row("SELECT COUNT(*) FROM release_evidence", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(evidence, 2, "pruning history erases no replay evidence");
+        assert!(conn.execute("DELETE FROM release_evidence", []).is_err());
+    }
+
+    #[test]
+    fn budget_arithmetic_uses_stored_vectors_and_checks_overflow() {
+        let store = Store::open_in_memory().unwrap();
+        let shared_memory = 128u64 << 20;
+        let budgets = SandboxBudgets {
+            sandboxes: 16,
+            // 3072 MiB less the once-per-node shared reserve.
+            memory_bytes: (3072u64 << 20) - shared_memory,
+            pids: 2048,
+            disk_bytes: 16 << 30,
+            host_cpu_millis: 3000,
+            virtual_cpu_slots: 3,
+            host_pids: 96,
+        };
+        for _ in 0..3 {
+            let row = fenced_sandbox();
+            assert_eq!(
+                store.reserve_sandbox(&row, budgets).unwrap(),
+                ReserveSandbox::Inserted
+            );
+        }
+        let reserved = store.sandbox_resources().unwrap();
+        assert_eq!(reserved.memory_bytes, 3 * (896 << 20));
+        assert_eq!(reserved.memory_bytes + shared_memory, 2816 << 20);
+        assert_eq!(reserved.host_cpu_millis, 3000);
+        assert_eq!(reserved.virtual_cpu_slots, 3);
+        assert_eq!(reserved.host_pids, 96);
+        assert_eq!(reserved.pids, 3 * 192);
+        assert_eq!(reserved.disk_bytes, 3 * (1408u64 << 20));
+        let fourth = fenced_sandbox();
+        assert!(matches!(
+            store.reserve_sandbox(&fourth, budgets).unwrap(),
+            ReserveSandbox::Exhausted(BudgetExhausted { resource: "memory bytes", reserved, requested, limit })
+                if reserved == 3 * (896 << 20) && requested == 896 << 20 && limit == 2944 << 20
+        ));
+        assert!(store.sandbox(&fourth.id).unwrap().is_none());
+        // Each other dimension is independently enforced on a fresh sum.
+        for (resource, budgets) in [
+            (
+                "host CPU millis",
+                SandboxBudgets {
+                    host_cpu_millis: 3000 - 1,
+                    ..budgets
+                },
+            ),
+            (
+                "vCPU slots",
+                SandboxBudgets {
+                    virtual_cpu_slots: 2,
+                    ..budgets
+                },
+            ),
+            (
+                "host PIDs",
+                SandboxBudgets {
+                    host_pids: 95,
+                    ..budgets
+                },
+            ),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let roomy = SandboxBudgets {
+                memory_bytes: 1 << 40,
+                ..budgets
+            };
+            let mut outcome = ReserveSandbox::Inserted;
+            for _ in 0..3 {
+                outcome = store.reserve_sandbox(&fenced_sandbox(), roomy).unwrap();
+            }
+            assert!(
+                matches!(outcome, ReserveSandbox::Exhausted(e) if e.resource == resource),
+                "{resource}: {outcome:?}"
+            );
+        }
+        // Summation overflow is an error, not a wrap that frees capacity.
+        let store = Store::open_in_memory().unwrap();
+        let huge = |row: &mut Sandbox| row.accounting.reservation.memory_bytes = i64::MAX as u64;
+        let mut first = fenced_sandbox();
+        huge(&mut first);
+        let mut second = fenced_sandbox();
+        huge(&mut second);
+        let mut third = fenced_sandbox();
+        huge(&mut third);
+        store.insert_sandbox(&first).unwrap();
+        store.insert_sandbox(&second).unwrap();
+        store.insert_sandbox(&third).unwrap();
+        assert!(store.sandbox_resources().is_err());
+        // An amount outside the stored range fails rather than truncating.
+        let mut too_big = fenced_sandbox();
+        too_big.accounting.reservation.disk_bytes = u64::MAX;
+        assert!(
+            Store::open_in_memory()
+                .unwrap()
+                .insert_sandbox(&too_big)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2660,6 +5126,9 @@ mod tests {
             memory_bytes: first.spec.memory_bytes,
             pids: u64::from(first.spec.pids) * 4,
             disk_bytes: first.spec.disk_bytes * 4,
+            host_cpu_millis: 0,
+            virtual_cpu_slots: 0,
+            host_pids: 0,
         };
         assert_eq!(
             store.reserve_sandbox(&first, budgets).unwrap(),
@@ -2718,6 +5187,9 @@ mod tests {
                     memory_bytes: requested.memory_bytes * 2,
                     pids: requested.pids * 2,
                     disk_bytes: requested.disk_bytes * 2,
+                    host_cpu_millis: 0,
+                    virtual_cpu_slots: 0,
+                    host_pids: 0,
                 },
             ),
             (
@@ -2727,6 +5199,9 @@ mod tests {
                     memory_bytes: requested.memory_bytes,
                     pids: requested.pids * 2,
                     disk_bytes: requested.disk_bytes * 2,
+                    host_cpu_millis: 0,
+                    virtual_cpu_slots: 0,
+                    host_pids: 0,
                 },
             ),
             (
@@ -2736,6 +5211,9 @@ mod tests {
                     memory_bytes: requested.memory_bytes * 2,
                     pids: requested.pids,
                     disk_bytes: requested.disk_bytes * 2,
+                    host_cpu_millis: 0,
+                    virtual_cpu_slots: 0,
+                    host_pids: 0,
                 },
             ),
             (
@@ -2745,6 +5223,9 @@ mod tests {
                     memory_bytes: requested.memory_bytes * 2,
                     pids: requested.pids * 2,
                     disk_bytes: requested.disk_bytes,
+                    host_cpu_millis: 0,
+                    virtual_cpu_slots: 0,
+                    host_pids: 0,
                 },
             ),
         ] {
@@ -2909,6 +5390,10 @@ mod tests {
             failure_reason: None,
             stdout: &out,
             stderr: &err,
+            sandbox_reusable: None,
+            cleanup_evidence: CleanupEvidence::Unknown,
+            disposition: None,
+            disposition_reason: None,
         };
         store.finish_execution(&e.id, &result).unwrap();
         assert!(

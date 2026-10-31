@@ -13,11 +13,14 @@ use std::time::Duration;
 use hyper_util::rt::TokioIo;
 use kilnd::manager::{Limits, Manager};
 use kilnd::model::{
-    Captured, CommandStatus, Execution, ExecutionState, Network, Sandbox, SandboxSpec, SandboxState,
+    Captured, CleanupEvidence, CommandStatus, Digest, Execution, ExecutionState, Network, Sandbox,
+    SandboxAccounting, SandboxSpec, SandboxState,
 };
 use kilnd::runtime::fake::FakeRuntime;
 use kilnd::runtime::{
-    BackendSandbox, CreateFailure, ExecOutcome, ExecSpec, Runtime, RuntimeError,
+    AbsenceReceipt, AllocationObservation, BackendInventory, CreateContext, CreateFailure,
+    CreatedSandbox, ExecOutcome, ExecSpec, ExecutionContext, PreparedCreate, Runtime,
+    RuntimeCapabilities, RuntimeError,
 };
 use kilnd::store::{ExecutionResult, Store};
 use kilnd_api::v1 as pb;
@@ -61,8 +64,52 @@ impl Runtime for StressRuntime {
         }
     }
 
-    async fn create(&self, spec: &SandboxSpec) -> Result<String, CreateFailure> {
-        self.inner.create(spec).await
+    fn capabilities(&self) -> RuntimeCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn prepare(
+        &self,
+        context: &CreateContext,
+        spec: &SandboxSpec,
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedCreate, RuntimeError> {
+        self.inner.prepare(context, spec, deadline, cancel).await
+    }
+
+    async fn create(
+        &self,
+        context: &CreateContext,
+        prepared: &PreparedCreate,
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<CreatedSandbox, CreateFailure> {
+        self.inner.create(context, prepared, deadline, cancel).await
+    }
+
+    async fn inspect_allocation(
+        &self,
+        context: &CreateContext,
+        prepared_digest: &Digest,
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<AllocationObservation, RuntimeError> {
+        self.inner
+            .inspect_allocation(context, prepared_digest, deadline, cancel)
+            .await
+    }
+
+    async fn fence_absent(
+        &self,
+        context: &CreateContext,
+        prepared_digest: &Digest,
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<AbsenceReceipt, RuntimeError> {
+        self.inner
+            .fence_absent(context, prepared_digest, deadline, cancel)
+            .await
     }
 
     async fn validate_sandbox(
@@ -74,20 +121,40 @@ impl Runtime for StressRuntime {
         self.inner.validate_sandbox(id, deadline, cancel).await
     }
 
-    async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> ExecOutcome {
-        self.inner.exec(id, spec, cancel).await
+    async fn exec(
+        &self,
+        id: &str,
+        execution: &ExecutionContext,
+        spec: &ExecSpec<'_>,
+        cancel: &CancellationToken,
+    ) -> ExecOutcome {
+        self.inner.exec(id, execution, spec, cancel).await
     }
 
-    async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
-        self.inner.remove(id).await
+    async fn remove(
+        &self,
+        id: &str,
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<AbsenceReceipt, RuntimeError> {
+        self.inner.remove(id, deadline, cancel).await
     }
 
-    async fn list(&self) -> Result<Vec<BackendSandbox>, RuntimeError> {
-        self.inner.list().await
+    async fn list(
+        &self,
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<BackendInventory, RuntimeError> {
+        self.inner.list(deadline, cancel).await
     }
 
-    async fn gc(&self, ids: &[String]) -> Result<Vec<String>, RuntimeError> {
-        self.inner.gc(ids).await
+    async fn gc(
+        &self,
+        ids: &[String],
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
+        self.inner.gc(ids, deadline, cancel).await
     }
 }
 
@@ -207,20 +274,21 @@ fn metadata_history_rss_child() {
     }
     let root = PathBuf::from(std::env::var_os(HISTORY_ROOT_ENV).unwrap());
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let spec = SandboxSpec {
+        image: "alpine:latest".into(),
+        memory_bytes: 512 << 20,
+        cpu_millis: 1_000,
+        pids: 256,
+        disk_bytes: 2 << 30,
+        network: Network::None,
+        read_only_root: true,
+        writable_paths: Vec::new(),
+        labels: Default::default(),
+    };
     let sandbox = Sandbox {
         id: "sb-0000000000000001".into(),
         state: SandboxState::Ready,
-        spec: SandboxSpec {
-            image: "alpine:latest".into(),
-            memory_bytes: 512 << 20,
-            cpu_millis: 1_000,
-            pids: 256,
-            disk_bytes: 2 << 30,
-            network: Network::None,
-            read_only_root: true,
-            writable_paths: Vec::new(),
-            labels: Default::default(),
-        },
+        spec: spec.clone(),
         backend: "fake".into(),
         backend_id: Some("kiln-history".into()),
         created_at_ms: 1,
@@ -229,6 +297,7 @@ fn metadata_history_rss_child() {
         failure_reason: None,
         create_certainty: Default::default(),
         owner_uid: 0,
+        accounting: SandboxAccounting::legacy(&spec, ""),
     };
     let capture = Captured {
         data: vec![b'x'; HISTORY_STREAM_BYTES],
@@ -255,6 +324,8 @@ fn metadata_history_rss_child() {
             stdin_bytes: 0,
             stdout: Captured::default(),
             stderr: Captured::default(),
+            sandbox_reusable: None,
+            cleanup_evidence: CleanupEvidence::Unknown,
         };
         store.insert_execution(&execution).unwrap();
         store
@@ -268,6 +339,10 @@ fn metadata_history_rss_child() {
                     failure_reason: None,
                     stdout: &capture,
                     stderr: &capture,
+                    sandbox_reusable: None,
+                    cleanup_evidence: CleanupEvidence::Unknown,
+                    disposition: None,
+                    disposition_reason: None,
                 },
             )
             .unwrap();

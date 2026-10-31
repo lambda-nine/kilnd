@@ -75,7 +75,10 @@ API callers can control only their own sandboxes; root can control all of them. 
   missing image, releases as it durably becomes `FAILED`, and Delete retires
   that row without touching the backend.
   `DELETING` releases only after an exact-ID negative probe, complete list
-  absence and cgroup absence are durably recorded. Health exposes limits,
+  absence and cgroup absence are durably recorded. Unconfirmed execution cleanup
+  turns a sandbox `QUARANTINED`: it refuses Exec and stays reserved until Delete.
+  Schema 8 stores each reservation with its release provenance, and an execution
+  reports whether its sandbox can take another call. Health exposes limits,
   reservations and rejection totals since daemon startup. Lowering limits
   below existing ownership degrades Health and rejects creates while
   Get/List/Delete stay available.

@@ -3,7 +3,7 @@
 //! translation on top of this.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -15,11 +15,17 @@ use tracing::{info, warn};
 
 use crate::admission::{Admission, AdmissionSnapshot};
 use crate::model::{
-    Captured, CommandStatus, CreateCertainty, Execution, ExecutionState, Network,
-    RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage, Sandbox, SandboxSpec, SandboxState, new_id,
-    now_ms, valid_id,
+    AccountingRegime, AllocationBinding, Captured, CleanupEvidence, CommandStatus, CreateCertainty,
+    Digest, Execution, ExecutionState, Id128, Network, ReservationRelease, RuntimeDiagnostic,
+    RuntimeErrorKind, RuntimeStage, Sandbox, SandboxAccounting, SandboxDisposition, SandboxSpec,
+    SandboxState, new_id, now_ms, spec_digests, valid_id,
 };
-use crate::runtime::{BackendStatus, ExecFinish, ExecOutcome, ExecSpec, Runtime, RuntimeError};
+use crate::runtime::{
+    AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendRecord, BackendStatus,
+    CreateContext, CreateFailure, CreatedSandbox, EvidenceRegime, ExecFinish, ExecOutcome,
+    ExecSpec, ExecutionContext, FencedAbsence, MAX_BACKEND_PLAN_BYTES, PreparedCreate, Runtime,
+    RuntimeCapabilities, RuntimeError, RuntimeReceipt,
+};
 use crate::store::{ExecutionResult, ReserveSandbox, SandboxBudgets, SandboxResources, Store};
 use crate::validation::{
     MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, validate_allowlist_entry, validate_argv,
@@ -43,6 +49,11 @@ pub struct Limits {
     pub max_node_memory_bytes: u64,
     pub max_node_pids: u64,
     pub max_node_disk_bytes: u64,
+    /// Local policy for the host commitments only an allocation-token backend
+    /// reserves. Legacy kiln rows reserve zero, so these never limit them.
+    pub max_node_host_cpu_millis: u64,
+    pub max_node_virtual_cpu_slots: u64,
+    pub max_node_host_pids: u64,
     pub default_timeout: Duration,
     pub max_timeout: Duration,
     pub max_output_bytes: usize,
@@ -81,6 +92,9 @@ impl Default for Limits {
             max_node_memory_bytes: 3 << 30,
             max_node_pids: 2048,
             max_node_disk_bytes: 16 << 30,
+            max_node_host_cpu_millis: 3000,
+            max_node_virtual_cpu_slots: 3,
+            max_node_host_pids: 96,
             default_timeout: Duration::from_secs(60),
             max_timeout: Duration::from_secs(3600),
             max_output_bytes: 1 << 20,
@@ -239,6 +253,9 @@ pub struct Manager<R> {
     finalization_failures: AtomicU32,
     /// Create requests rejected by the durable sandbox reservation budgets.
     node_resource_rejections: AtomicU64,
+    /// Reconciliation found backend resources it cannot attribute, so no new
+    /// allocation may join them until a clean reconciliation.
+    admission_blocked: AtomicBool,
     started_at_ms: i64,
 }
 
@@ -254,6 +271,18 @@ pub struct Health {
     pub running_executions: u32,
     pub admission: AdmissionSnapshot,
     pub node_resources: NodeResourceSnapshot,
+    pub capabilities: RuntimeCapabilities,
+}
+
+/// Where a Health report's node totals came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeAccountingStatus {
+    /// This daemon's durable sum is the promise; CPU, vCPU and host PIDs are
+    /// not reserved.
+    LocalLegacy,
+    /// A node authority owns totals and it cannot be read. `reserved` is then
+    /// this daemon's local sum only and must not be presented as node totals.
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,6 +290,7 @@ pub struct NodeResourceSnapshot {
     pub limits: SandboxBudgets,
     pub reserved: SandboxResources,
     pub rejected_creates: u64,
+    pub accounting: NodeAccountingStatus,
 }
 
 /// What startup reconciliation changed, for logs and tests.
@@ -274,9 +304,27 @@ pub struct Reconciled {
     pub still_deleting: Vec<String>,
     pub interrupted_executions: usize,
     pub unmanaged: Vec<String>,
+    /// Rows whose release this pass committed with matching absence evidence.
+    pub released: Vec<String>,
+    pub quarantined: Vec<String>,
+    pub admission_blocked: bool,
+}
+
+/// What reconciliation learned about one charged absence-fenced row, gathered
+/// before any row or backend changes.
+struct FencedEvidence {
+    observation: AllocationObservation,
+    healthy: bool,
+    binding_error: Option<String>,
 }
 
 const MAX_LABELS: usize = 32;
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
+const CREATE_TIMEOUT: Duration = Duration::from_secs(120);
+const REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
+const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+const INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
+const FENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl<R: Runtime> Manager<R> {
     pub fn new(runtime: R, store: Store, limits: Limits) -> Self {
@@ -292,6 +340,7 @@ impl<R: Runtime> Manager<R> {
             operations: TaskTracker::new(),
             finalization_failures: AtomicU32::new(0),
             node_resource_rejections: AtomicU64::new(0),
+            admission_blocked: AtomicBool::new(false),
             started_at_ms: now_ms(),
         }
     }
@@ -302,6 +351,11 @@ impl<R: Runtime> Manager<R> {
 
     pub fn runtime(&self) -> &R {
         &self.runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_resources_for_test(&self) -> SandboxResources {
+        self.store.sandbox_resources().unwrap()
     }
 
     pub fn limits(&self) -> &Limits {
@@ -318,6 +372,9 @@ impl<R: Runtime> Manager<R> {
             memory_bytes: self.limits.max_node_memory_bytes,
             pids: self.limits.max_node_pids,
             disk_bytes: self.limits.max_node_disk_bytes,
+            host_cpu_millis: self.limits.max_node_host_cpu_millis,
+            virtual_cpu_slots: self.limits.max_node_virtual_cpu_slots,
+            host_pids: self.limits.max_node_host_pids,
         }
     }
 
@@ -360,58 +417,72 @@ impl<R: Runtime> Manager<R> {
         // still own a backend. A compensated FAILED row retained for history
         // proved its former backend absent; if that ID reappears, it is
         // unmanaged rather than permission to hide or garbage-collect it.
-        let known: HashSet<String> = self
+        let mut known: HashSet<String> = self
             .store
             .owned_backend_ids(self.runtime.name())?
             .into_iter()
             .collect();
-        let before_gc: HashMap<String, BackendStatus> = self
-            .runtime
-            .list()
-            .await
-            .map_err(backend)?
-            .into_iter()
-            .map(|s| (s.id, s.status))
+        // A charged allocation owns its token's backend ID before any publication.
+        let fenced_ids: HashSet<String> = sandboxes
+            .iter()
+            .filter(|s| s.backend == self.runtime.name() && s.is_fenced() && s.is_charged())
+            .filter_map(|s| {
+                s.accounting
+                    .allocation
+                    .as_ref()
+                    .map(AllocationBinding::backend_id)
+            })
             .collect();
+        let before_gc = self.validated_inventory(&sandboxes, &cancel).await?;
         // Prove the initial listing complete before even scoped backend
         // cleanup. A hidden reachable managed sandbox makes all evidence
         // suspect, while an explicit stale record is itself cleanup evidence.
         self.validate_reconciliation_evidence(&sandboxes, &before_gc, &cancel)
             .await?;
+        let mut fenced_evidence = self.observe_fenced(&sandboxes, &before_gc, &cancel).await?;
         let mut stale_owned: Vec<String> = before_gc
             .iter()
-            .filter(|(id, status)| **status == BackendStatus::Stale && known.contains(*id))
+            .filter(|(id, record)| {
+                record.status == BackendStatus::Stale
+                    && known.contains(*id)
+                    && !fenced_ids.contains(*id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         stale_owned.sort();
         let gc_removed = if stale_owned.is_empty() {
             Vec::new()
         } else {
-            let removed = self.runtime.gc(&stale_owned).await.map_err(backend)?;
+            let receipts = self
+                .runtime
+                .gc(&stale_owned, Instant::now() + LIST_TIMEOUT, &cancel)
+                .await
+                .map_err(backend)?;
             let requested: HashSet<_> = stale_owned.iter().cloned().collect();
             let mut reported = HashSet::new();
-            for id in &removed {
-                if !requested.contains(id) || !reported.insert(id.clone()) {
+            let mut removed = Vec::new();
+            for receipt in receipts {
+                let AbsenceReceipt::Legacy(absence) = receipt else {
+                    return Err(Error::Backend(
+                        "backend garbage collection returned an allocation receipt for a legacy scope".into(),
+                    ));
+                };
+                let id = absence.backend_id;
+                if !requested.contains(&id) || !reported.insert(id.clone()) {
                     return Err(Error::Backend(format!(
                         "backend garbage collection reported sandbox {id} outside its unique requested scope"
                     )));
                 }
+                removed.push(id);
             }
             removed
         };
-        let live: HashMap<String, BackendStatus> = self
-            .runtime
-            .list()
-            .await
-            .map_err(backend)?
-            .into_iter()
-            .map(|s| (s.id, s.status))
-            .collect();
+        let live = self.validated_inventory(&sandboxes, &cancel).await?;
         self.validate_reconciliation_evidence(&sandboxes, &live, &cancel)
             .await?;
         if let Some(id) = stale_owned
             .iter()
-            .find(|id| live.get(*id) == Some(&BackendStatus::Stale))
+            .find(|id| live.get(*id).map(|r| r.status) == Some(BackendStatus::Stale))
         {
             return Err(Error::Backend(format!(
                 "backend garbage collection left managed sandbox {id} stale"
@@ -425,8 +496,18 @@ impl<R: Runtime> Manager<R> {
             if s.backend != self.runtime.name() {
                 continue;
             }
-            let alive =
-                s.backend_id.as_ref().and_then(|b| live.get(b)) == Some(&BackendStatus::Running);
+            if s.is_fenced() {
+                if let Some(evidence) = fenced_evidence.remove(&s.id) {
+                    self.reconcile_fenced(s, evidence, &mut out).await?;
+                }
+                continue;
+            }
+            let alive = s
+                .backend_id
+                .as_ref()
+                .and_then(|b| live.get(b))
+                .map(|r| r.status)
+                == Some(BackendStatus::Running);
             match (s.state, &s.backend_id) {
                 (SandboxState::Creating, None) => {
                     self.store.set_sandbox_state(
@@ -457,11 +538,10 @@ impl<R: Runtime> Manager<R> {
                     }
                 }
                 (SandboxState::Deleting, Some(b)) if live.contains_key(b) => match self
-                    .runtime
-                    .remove(b)
+                    .remove_legacy(b)
                     .await
                 {
-                    Ok(()) | Err(RuntimeError::NotFound(_)) => {
+                    Ok(()) => {
                         self.store
                             .set_sandbox_state(&s.id, SandboxState::Deleted, None, None)?;
                         out.deleted.push(s.id);
@@ -499,13 +579,28 @@ impl<R: Runtime> Manager<R> {
                         .set_sandbox_state(&s.id, SandboxState::Ready, None, None)?;
                     out.recovered.push(s.id);
                 }
-                (SandboxState::Deleted | SandboxState::Failed | SandboxState::Lost, _) => {}
+                (
+                    SandboxState::Deleted
+                    | SandboxState::Failed
+                    | SandboxState::Lost
+                    | SandboxState::Quarantined,
+                    _,
+                ) => {}
             }
         }
-        out.interrupted_executions = self.store.interrupt_running_executions_for_backend(
+        out.interrupted_executions += self.store.interrupt_running_executions_for_backend(
             self.runtime.name(),
             "kilnd stopped while the execution was running",
         )?;
+        known.extend(fenced_ids);
+        // An allocation record or Unknown entry no row explains may be live work
+        // this daemon lost track of. Keep it, and stop admitting beside it.
+        out.admission_blocked = live.iter().any(|(id, record)| {
+            !known.contains(id)
+                && (record.allocation_id.is_some() || record.status == BackendStatus::Unknown)
+        });
+        self.admission_blocked
+            .store(out.admission_blocked, Ordering::Relaxed);
         out.unmanaged = live.into_keys().filter(|b| !known.contains(b)).collect();
         out.unmanaged.sort();
         for b in &out.unmanaged {
@@ -514,10 +609,460 @@ impl<R: Runtime> Manager<R> {
         Ok(out)
     }
 
+    /// A partial, duplicated or corrupt inventory proves nothing, so this fails
+    /// before reconciliation can read any omission as absence or act on a record.
+    async fn validated_inventory(
+        &self,
+        sandboxes: &[Sandbox],
+        cancel: &CancellationToken,
+    ) -> Result<HashMap<String, BackendRecord>> {
+        let inventory = self
+            .runtime
+            .list(Instant::now() + LIST_TIMEOUT, cancel)
+            .await
+            .map_err(backend)?;
+        if !inventory.complete {
+            return Err(Error::Backend(format!(
+                "backend inventory generation {} is incomplete",
+                inventory.generation
+            )));
+        }
+        let legacy_ids: HashSet<&str> = sandboxes
+            .iter()
+            .filter(|s| s.backend == self.runtime.name() && !s.is_fenced())
+            .filter_map(|s| s.backend_id.as_deref())
+            .collect();
+        let mut records = HashMap::with_capacity(inventory.records.len());
+        let mut allocations = HashSet::new();
+        for record in inventory.records {
+            let duplicate_allocation = record
+                .allocation_id
+                .is_some_and(|allocation| !allocations.insert(allocation));
+            let mislabeled = record
+                .allocation_id
+                .is_some_and(|allocation| record.id != format!("fc-{allocation}"));
+            if duplicate_allocation || mislabeled {
+                return Err(Error::Backend(format!(
+                    "backend inventory has a corrupt allocation record {}",
+                    record.id
+                )));
+            }
+            if legacy_ids.contains(record.id.as_str())
+                && !matches!(record.status, BackendStatus::Running | BackendStatus::Stale)
+            {
+                return Err(Error::Backend(format!(
+                    "backend inventory reports managed legacy sandbox {} as {:?}",
+                    record.id, record.status
+                )));
+            }
+            let id = record.id.clone();
+            if records.insert(id.clone(), record).is_some() {
+                return Err(Error::Backend(format!(
+                    "backend inventory lists {id} more than once"
+                )));
+            }
+        }
+        Ok(records)
+    }
+
+    /// Gathers allocation-token evidence for every charged absence-fenced row, and
+    /// fails with no mutation if any of it contradicts the inventory or the row.
+    async fn observe_fenced(
+        &self,
+        sandboxes: &[Sandbox],
+        inventory: &HashMap<String, BackendRecord>,
+        cancel: &CancellationToken,
+    ) -> Result<HashMap<String, FencedEvidence>> {
+        let mut gathered = HashMap::new();
+        for sandbox in sandboxes {
+            if sandbox.backend != self.runtime.name()
+                || !sandbox.is_fenced()
+                || !sandbox.is_charged()
+            {
+                continue;
+            }
+            let binding = fenced_binding(sandbox)?;
+            let binding_error = self.verify_fenced_binding(sandbox, binding).err();
+            let observation = self
+                .runtime
+                .inspect_allocation(
+                    &fenced_context(sandbox, binding),
+                    &binding.plan_digest,
+                    Instant::now() + INSPECT_TIMEOUT,
+                    cancel,
+                )
+                .await
+                .map_err(backend)?;
+            let backend_id = binding.backend_id();
+            let record = inventory.get(&backend_id);
+            // Helper generations only move forward: an older answer than this row
+            // already published contradicts the helper's own ledger.
+            let recorded = sandbox.accounting.last_helper_generation.unwrap_or(0);
+            let contradiction = match (&observation, record) {
+                (AllocationObservation::Present { receipt, .. }, _)
+                    if !receipt.matches(binding) =>
+                {
+                    Some("a ready receipt for another identity or plan")
+                }
+                (AllocationObservation::Present { receipt, .. }, _)
+                    if receipt.validate().is_err() || receipt.helper_generation < recorded =>
+                {
+                    Some("a ready receipt with an invalid or older generation")
+                }
+                (AllocationObservation::StoppedWithResources { helper_generation }, _)
+                    if *helper_generation < recorded =>
+                {
+                    Some("a stop observation older than this row's generation")
+                }
+                (AllocationObservation::AbsentFenced(receipt), _) if !receipt.matches(binding) => {
+                    Some("an absence receipt for another identity or plan")
+                }
+                (AllocationObservation::AbsentFenced(receipt), _)
+                    if receipt.helper_generation() <= recorded =>
+                {
+                    Some("an absence receipt not newer than this row's generation")
+                }
+                (
+                    AllocationObservation::Present { .. }
+                    | AllocationObservation::StoppedWithResources { .. },
+                    None,
+                ) => Some("a present allocation the inventory omitted"),
+                (AllocationObservation::AbsentFenced(_), Some(_)) => {
+                    Some("an absence receipt for an allocation the inventory lists")
+                }
+                (_, Some(r))
+                    if r.allocation_id != Some(binding.allocation_id)
+                        || r.plan_digest != Some(binding.plan_digest) =>
+                {
+                    Some("an inventory record for another identity or plan")
+                }
+                _ => None,
+            };
+            if let Some(contradiction) = contradiction {
+                return Err(Error::Backend(format!(
+                    "reconciliation evidence for {} shows {contradiction}",
+                    sandbox.id
+                )));
+            }
+            // A record that is not plainly ready, like Unknown, never reads as healthy.
+            let healthy = match &observation {
+                AllocationObservation::Present {
+                    healthy_idle: true,
+                    uncertain_execution: false,
+                    ..
+                } if record.is_some_and(|r| r.status == BackendStatus::Ready) => self
+                    .runtime
+                    .validate_sandbox(&backend_id, Instant::now() + INSPECT_TIMEOUT, cancel)
+                    .await
+                    .is_ok(),
+                _ => false,
+            };
+            gathered.insert(
+                sandbox.id.clone(),
+                FencedEvidence {
+                    observation,
+                    healthy,
+                    binding_error,
+                },
+            );
+        }
+        Ok(gathered)
+    }
+
+    /// Recomputes every stored commitment before trusting a row's plan: both spec
+    /// digests, the plan digest and its bound, and this database's instance.
+    fn verify_fenced_binding(
+        &self,
+        sandbox: &Sandbox,
+        binding: &AllocationBinding,
+    ) -> std::result::Result<(), String> {
+        let accounting = &sandbox.accounting;
+        if spec_digests(&sandbox.spec)
+            != (
+                accounting.host_spec_sha256,
+                accounting.guest_exec_spec_sha256,
+            )
+        {
+            return Err("stored spec does not match its digests".into());
+        }
+        if binding.plan.is_empty()
+            || binding.plan.len() > MAX_BACKEND_PLAN_BYTES
+            || Digest::of(&binding.plan) != binding.plan_digest
+        {
+            return Err("stored plan does not match its digest".into());
+        }
+        let identity = self.store.identity().map_err(|e| format!("{e:#}"))?;
+        if binding.instance_id != identity.instance_id {
+            return Err(format!(
+                "row belongs to instance {}, not {}",
+                binding.instance_id, identity.instance_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// One absence-fenced row's recovery, from evidence already validated. A RUNNING
+    /// execution settles first and never reruns; nothing here resurrects a stopped
+    /// boot, and the only release path is a matching receipt.
+    async fn reconcile_fenced(
+        &self,
+        sandbox: Sandbox,
+        evidence: FencedEvidence,
+        out: &mut Reconciled,
+    ) -> Result<()> {
+        let id = sandbox.id.clone();
+        let FencedEvidence {
+            observation,
+            healthy,
+            binding_error,
+        } = evidence;
+        if self.store.has_running_execution(&id)? {
+            let stopped = matches!(
+                observation,
+                AllocationObservation::StoppedWithResources { .. }
+                    | AllocationObservation::AbsentFenced(_)
+            );
+            let reason = if stopped {
+                "kilnd stopped while the execution was running; the host stopped this session"
+            } else {
+                "kilnd stopped while the execution was running; no stop barrier could be established"
+            };
+            out.interrupted_executions += self
+                .store
+                .conclude_running_executions(&id, stopped, reason)?;
+        }
+        let sandbox = self.load(&id).unwrap_or(sandbox);
+        if let Some(why) = &binding_error {
+            warn!(sandbox = %id, error = %why, "allocation binding failed verification");
+            if !matches!(sandbox.state, SandboxState::Deleting | SandboxState::Failed) {
+                self.store.set_sandbox_state(
+                    &id,
+                    SandboxState::Quarantined,
+                    None,
+                    Some(&format!("allocation binding failed verification: {why}")),
+                )?;
+                out.quarantined.push(id);
+            }
+            return Ok(());
+        }
+        if let AllocationObservation::AbsentFenced(receipt) = &observation {
+            let terminal = if sandbox.state == SandboxState::Deleting {
+                SandboxState::Deleted
+            } else {
+                SandboxState::Failed
+            };
+            self.store.release_fenced(
+                &id,
+                terminal,
+                receipt,
+                Some("the backend proved this allocation absent"),
+            )?;
+            if terminal == SandboxState::Deleted {
+                out.deleted.push(id.clone());
+            }
+            out.released.push(id);
+            return Ok(());
+        }
+        match sandbox.state {
+            SandboxState::Creating => {
+                // Adopt only the identical healthy boot. Anything partial or unknown
+                // is compensated or fenced by exact token, never booted again.
+                if let (true, AllocationObservation::Present { receipt, .. }) =
+                    (healthy, &observation)
+                {
+                    let created = CreatedSandbox {
+                        backend_id: fenced_binding(&sandbox)?.backend_id(),
+                        receipt: RuntimeReceipt::Ready(receipt.clone()),
+                    };
+                    self.store.publish_fenced_ready(&id, &created)?;
+                    out.recovered.push(id);
+                    return Ok(());
+                }
+                self.store.compare_and_set_sandbox_state(
+                    &id,
+                    SandboxState::Creating,
+                    SandboxState::Failed,
+                    None,
+                    Some("kilnd stopped while the sandbox was being created"),
+                )?;
+                out.failed.push(id.clone());
+                let row = self.load(&id)?;
+                self.settle_or_report(&row, SandboxState::Failed, out).await;
+            }
+            SandboxState::Ready => match &observation {
+                AllocationObservation::Present { receipt, .. }
+                    if healthy && sandbox.accounting.boot_id.as_ref() == Some(&receipt.boot_id) => {
+                }
+                AllocationObservation::StoppedWithResources { .. } => {
+                    self.store.retire_sandbox(
+                        &id,
+                        SandboxDisposition::Stopped,
+                        "no process remains for this session; its resources await Delete",
+                    )?;
+                    out.lost.push(id);
+                }
+                _ => {
+                    self.store.retire_sandbox(
+                        &id,
+                        SandboxDisposition::Quarantined,
+                        "this session's boot could not be established after restart",
+                    )?;
+                    out.quarantined.push(id);
+                }
+            },
+            SandboxState::Deleting => {
+                match self
+                    .settle_fenced(&sandbox, SandboxState::Deleted, None)
+                    .await
+                {
+                    Ok(()) => {
+                        out.deleted.push(id.clone());
+                        out.released.push(id);
+                    }
+                    Err(error) => {
+                        self.store.compare_and_set_sandbox_state(
+                            &id,
+                            SandboxState::Deleting,
+                            SandboxState::Deleting,
+                            None,
+                            Some(&format!("delete retry at startup failed: {error}")),
+                        )?;
+                        out.still_deleting.push(id);
+                    }
+                }
+            }
+            SandboxState::Failed => {
+                self.settle_or_report(&sandbox, SandboxState::Failed, out)
+                    .await;
+            }
+            // LOST and QUARANTINED wait for Delete; a charged row never self-heals.
+            SandboxState::Lost | SandboxState::Quarantined | SandboxState::Deleted => {}
+        }
+        Ok(())
+    }
+
+    async fn settle_or_report(
+        &self,
+        sandbox: &Sandbox,
+        terminal: SandboxState,
+        out: &mut Reconciled,
+    ) {
+        match self.settle_fenced(sandbox, terminal, None).await {
+            Ok(()) => out.released.push(sandbox.id.clone()),
+            Err(error) => {
+                warn!(sandbox = %sandbox.id, error = %error, "allocation stays charged; no matching absence proof");
+            }
+        }
+    }
+
+    /// Establishes absence for one exact token and commits it with the terminal
+    /// row in one transaction. A present or stopped allocation goes through
+    /// removal; one with no record through the fence. NotFound, an empty listing or
+    /// a legacy proof can never produce the receipt this requires.
+    async fn settle_fenced(
+        &self,
+        sandbox: &Sandbox,
+        terminal: SandboxState,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let binding = fenced_binding(sandbox)?;
+        let context = fenced_context(sandbox, binding);
+        let cancel = CancellationToken::new();
+        let observation = self
+            .runtime
+            .inspect_allocation(
+                &context,
+                &binding.plan_digest,
+                Instant::now() + INSPECT_TIMEOUT,
+                &cancel,
+            )
+            .await
+            .map_err(backend)?;
+        let receipt = match observation {
+            AllocationObservation::AbsentFenced(receipt) => AbsenceReceipt::Fenced(receipt),
+            AllocationObservation::Present { .. }
+            | AllocationObservation::StoppedWithResources { .. } => self
+                .runtime
+                .remove(
+                    &binding.backend_id(),
+                    Instant::now() + REMOVE_TIMEOUT,
+                    &cancel,
+                )
+                .await
+                .map_err(backend)?,
+            AllocationObservation::Unknown { .. } => self
+                .runtime
+                .fence_absent(
+                    &context,
+                    &binding.plan_digest,
+                    Instant::now() + FENCE_TIMEOUT,
+                    &cancel,
+                )
+                .await
+                .map_err(backend)?,
+            AllocationObservation::Unsupported => {
+                return Err(Error::Backend(format!(
+                    "the {} backend cannot prove allocation {} absent",
+                    self.runtime.name(),
+                    binding.allocation_id
+                )));
+            }
+        };
+        let AbsenceReceipt::Fenced(receipt) = receipt else {
+            return Err(Error::Backend(format!(
+                "legacy removal proof cannot release allocation {}",
+                binding.allocation_id
+            )));
+        };
+        self.commit_absence(sandbox, binding, terminal, &receipt, reason)
+    }
+
+    fn commit_absence(
+        &self,
+        sandbox: &Sandbox,
+        binding: &AllocationBinding,
+        terminal: SandboxState,
+        receipt: &FencedAbsence,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        if !receipt.matches(binding) {
+            return Err(Error::Backend(format!(
+                "absence receipt {} does not match allocation {}",
+                receipt.receipt_id(),
+                binding.allocation_id
+            )));
+        }
+        self.store
+            .release_fenced(&sandbox.id, terminal, receipt, reason)?;
+        info!(sandbox = %sandbox.id, receipt = %receipt.receipt_id(), generation = receipt.helper_generation(), "allocation absence recorded");
+        Ok(())
+    }
+
+    /// Legacy kiln's existing release standard: its strict removal, or its NotFound
+    /// from the same probe. It releases only through the row's explicit legacy tag.
+    async fn remove_legacy(&self, backend_id: &str) -> std::result::Result<(), RuntimeError> {
+        match self
+            .runtime
+            .remove(
+                backend_id,
+                Instant::now() + REMOVE_TIMEOUT,
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(AbsenceReceipt::Legacy(absence)) if absence.backend_id == backend_id => Ok(()),
+            Ok(_) => Err(RuntimeError::Backend(format!(
+                "backend removal of {backend_id} returned a receipt for another identity"
+            ))),
+            Err(RuntimeError::NotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn validate_reconciliation_evidence(
         &self,
         sandboxes: &[Sandbox],
-        live: &HashMap<String, BackendStatus>,
+        live: &HashMap<String, BackendRecord>,
         cancel: &CancellationToken,
     ) -> Result<()> {
         // Check all candidates before any durable reconciliation mutation.
@@ -526,13 +1071,13 @@ impl<R: Runtime> Manager<R> {
         // missing. A reachable backend proves the list was incomplete, so
         // startup must fail without changing the store or cleaning anything.
         for sandbox in sandboxes {
-            if sandbox.backend != self.runtime.name() {
+            if sandbox.backend != self.runtime.name() || sandbox.is_fenced() {
                 continue;
             }
             let Some(id) = &sandbox.backend_id else {
                 continue;
             };
-            match (sandbox.state, live.get(id)) {
+            match (sandbox.state, live.get(id).map(|r| r.status)) {
                 (
                     SandboxState::Creating | SandboxState::Ready | SandboxState::Lost,
                     Some(BackendStatus::Running),
@@ -674,6 +1219,17 @@ impl<R: Runtime> Manager<R> {
             ("memory bytes", reserved.memory_bytes, limits.memory_bytes),
             ("PIDs", reserved.pids, limits.pids),
             ("disk bytes", reserved.disk_bytes, limits.disk_bytes),
+            (
+                "host CPU millis",
+                reserved.host_cpu_millis,
+                limits.host_cpu_millis,
+            ),
+            (
+                "vCPU slots",
+                reserved.virtual_cpu_slots,
+                limits.virtual_cpu_slots,
+            ),
+            ("host PIDs", reserved.host_pids, limits.host_pids),
         ]
         .into_iter()
         .filter(|(_, current, limit)| current > limit)
@@ -689,6 +1245,26 @@ impl<R: Runtime> Manager<R> {
                 over_budget.join(", ")
             ));
         }
+        let capabilities = self.runtime.capabilities();
+        let accounting = match capabilities.accounting {
+            AccountingAuthority::LocalLegacy => NodeAccountingStatus::LocalLegacy,
+            AccountingAuthority::Node => {
+                serving = false;
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str("node accounting authority is unavailable");
+                NodeAccountingStatus::Unavailable
+            }
+        };
+        if self.admission_blocked.load(Ordering::Relaxed) {
+            serving = false;
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail
+                .push_str("backend resources no row explains block CreateSandbox until reconciled");
+        }
         Ok(Health {
             serving: serving && !self.shutting_down.is_cancelled(),
             shutting_down: self.shutting_down.is_cancelled(),
@@ -703,7 +1279,9 @@ impl<R: Runtime> Manager<R> {
                 limits,
                 reserved,
                 rejected_creates: self.node_resource_rejections.load(Ordering::Relaxed),
+                accounting,
             },
+            capabilities,
         })
     }
 
@@ -748,12 +1326,29 @@ impl<R: Runtime> Manager<R> {
         owner_uid: u32,
     ) -> Result<Sandbox> {
         self.check_serving()?;
+        if self.admission_blocked.load(Ordering::Relaxed) {
+            return Err(Error::FailedPrecondition(
+                "backend resources no row explains block new sandboxes until reconciled".into(),
+            ));
+        }
         let spec = self.resolve_spec(req)?;
+        let context = CreateContext {
+            instance_id: self.store.identity()?.instance_id,
+            allocation_id: Id128::random(),
+            sandbox_id: new_id("sb"),
+        };
+        // C0: read-only preflight. A rejection here leaves no row and no charge.
+        let prepared = self.prepare_create(&context, &spec).await;
+        // Serving may have ended during that await. An operation tracked since
+        // create_owned still refuses here, before any reservation or allocation.
+        self.check_serving()?;
+        let prepared = prepared?;
+        let binding = prepared.binding(&context);
         let now = now_ms();
-        let mut sandbox = Sandbox {
-            id: new_id("sb"),
+        let sandbox = Sandbox {
+            id: context.sandbox_id.clone(),
             state: SandboxState::Creating,
-            spec,
+            spec: prepared.spec().clone(),
             backend: self.runtime.name().to_string(),
             backend_id: None,
             created_at_ms: now,
@@ -762,10 +1357,29 @@ impl<R: Runtime> Manager<R> {
             failure_reason: None,
             create_certainty: CreateCertainty::AllocationAmbiguous,
             owner_uid,
+            accounting: SandboxAccounting {
+                regime: match prepared.regime() {
+                    EvidenceRegime::LegacyLocal => AccountingRegime::Legacy,
+                    EvidenceRegime::AbsenceFenced { .. } => AccountingRegime::AbsenceFenced,
+                },
+                reservation: prepared.reservation(),
+                host_spec_sha256: prepared.host_spec_sha256(),
+                guest_exec_spec_sha256: prepared.guest_exec_spec_sha256(),
+                runtime_profile: prepared.runtime_profile().into(),
+                runtime_artifact_digest: prepared.runtime_artifact_digest().into(),
+                allocation: binding,
+                boot_id: None,
+                disposition: SandboxDisposition::Reusable,
+                release: ReservationRelease::Charged,
+                last_helper_generation: match prepared.regime() {
+                    EvidenceRegime::LegacyLocal => None,
+                    EvidenceRegime::AbsenceFenced { .. } => Some(0),
+                },
+            },
         };
-        // Recorded before the backend runs, so a crash mid-create leaves a
-        // trace for reconciliation. Count and all three resource sums are
-        // checked with this insert in one SQLite transaction.
+        // C1: recorded before the backend runs, so a crash mid-create leaves a
+        // trace for reconciliation. Count and every resource sum are checked with
+        // this insert in one SQLite transaction.
         match self
             .store
             .reserve_sandbox(&sandbox, self.sandbox_budgets())?
@@ -788,17 +1402,23 @@ impl<R: Runtime> Manager<R> {
         // report as unmanaged if it can still observe it.
         let backend_create = {
             let manager = Arc::clone(&self);
-            let spec = sandbox.spec.clone();
-            tokio::spawn(async move { manager.runtime.create(&spec).await })
+            let context = context.clone();
+            let deadline = Instant::now() + CREATE_TIMEOUT;
+            tokio::spawn(async move {
+                manager
+                    .runtime
+                    .create(&context, &prepared, deadline, &CancellationToken::new())
+                    .await
+            })
         };
-        let created = match backend_create.await {
+        let joined = backend_create.await;
+        if sandbox.is_fenced() {
+            return self.finish_fenced_create(sandbox, joined).await;
+        }
+        let created = match joined {
             Ok(result) => result,
             Err(join) => {
-                let reason = if join.is_panic() {
-                    "backend create task panicked"
-                } else {
-                    "backend create task was canceled"
-                };
+                let reason = join_reason(&join);
                 warn!(sandbox = %sandbox.id, error = reason, "sandbox creation failed");
                 self.store.set_sandbox_state(
                     &sandbox.id,
@@ -813,7 +1433,8 @@ impl<R: Runtime> Manager<R> {
             }
         };
         match created {
-            Ok(backend_id) => {
+            Ok(created) => {
+                let backend_id = created.backend_id;
                 if let Err(e) = self.store.set_sandbox_state(
                     &sandbox.id,
                     SandboxState::Ready,
@@ -825,9 +1446,13 @@ impl<R: Runtime> Manager<R> {
                         .await);
                 }
                 info!(sandbox = %sandbox.id, backend_id = %backend_id, "sandbox ready");
-                sandbox.backend_id = Some(backend_id);
-                sandbox.state = SandboxState::Ready;
-                Ok(self.store.sandbox(&sandbox.id)?.unwrap_or(sandbox))
+                let id = sandbox.id.clone();
+                let fallback = Sandbox {
+                    backend_id: Some(backend_id),
+                    state: SandboxState::Ready,
+                    ..sandbox
+                };
+                Ok(self.store.sandbox(&id)?.unwrap_or(fallback))
             }
             Err(failure) => {
                 let reason = failure.error().to_string();
@@ -854,6 +1479,172 @@ impl<R: Runtime> Manager<R> {
         }
     }
 
+    /// C0. Runs in its own task so a panic stays a create error with no row, and
+    /// the result must commit to the exact spec this daemon resolved.
+    async fn prepare_create(
+        self: &Arc<Self>,
+        context: &CreateContext,
+        spec: &SandboxSpec,
+    ) -> Result<PreparedCreate> {
+        let task = {
+            let manager = Arc::clone(self);
+            let (context, spec) = (context.clone(), spec.clone());
+            let cancel = self.shutting_down.child_token();
+            let deadline = Instant::now() + PREPARE_TIMEOUT;
+            tokio::spawn(async move {
+                manager
+                    .runtime
+                    .prepare(&context, &spec, deadline, &cancel)
+                    .await
+            })
+        };
+        let prepared = match task.await {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error @ (RuntimeError::Incompatible(_) | RuntimeError::Unsupported(_)))) => {
+                return Err(Error::FailedPrecondition(error.to_string()));
+            }
+            Ok(Err(error)) => return Err(backend(error)),
+            Err(join) => {
+                let reason = if join.is_panic() {
+                    "backend prepare task panicked"
+                } else {
+                    "backend prepare task was canceled"
+                };
+                return Err(Error::Backend(format!("prepare sandbox: {reason}")));
+            }
+        };
+        if prepared.spec() != spec {
+            return Err(Error::Backend(
+                "backend prepared a plan for a different spec".into(),
+            ));
+        }
+        Ok(prepared)
+    }
+
+    /// C6 through C8 for an allocation token. Only a matching ready receipt may
+    /// publish READY, and only a matching absence receipt may release. A backend
+    /// panic or error, or a definite claim without that receipt, stays charged.
+    async fn finish_fenced_create(
+        &self,
+        sandbox: Sandbox,
+        joined: std::result::Result<
+            std::result::Result<CreatedSandbox, CreateFailure>,
+            tokio::task::JoinError,
+        >,
+    ) -> Result<Sandbox> {
+        let id = sandbox.id.clone();
+        let binding = fenced_binding(&sandbox)?.clone();
+        let reason = match joined {
+            Ok(Ok(created)) => match ready_receipt_mismatch(&binding, &created) {
+                None => {
+                    if let Err(e) =
+                        self.store
+                            .publish_fenced_ready(&id, &created)
+                            .and_then(|published| {
+                                if published {
+                                    Ok(())
+                                } else {
+                                    Err(anyhow::anyhow!("sandbox {id} left CREATING before READY"))
+                                }
+                            })
+                    {
+                        return Err(self.compensate_fenced_publication(&id, e).await);
+                    }
+                    info!(sandbox = %id, backend_id = %created.backend_id, "sandbox ready");
+                    return self.load(&id);
+                }
+                Some(why) => format!("backend create returned {why}"),
+            },
+            Ok(Err(failure)) => {
+                let reason = failure.error().to_string();
+                if let Some(receipt) = failure.absence() {
+                    match self.commit_absence(
+                        &sandbox,
+                        &binding,
+                        SandboxState::Failed,
+                        receipt,
+                        Some(&reason),
+                    ) {
+                        Ok(()) => {
+                            warn!(sandbox = %id, error = %reason, "create rejected with durable absence proof");
+                            return Err(Error::Backend(format!("create sandbox {id}: {reason}")));
+                        }
+                        // An unusable receipt is no proof: charged like any failure.
+                        Err(error) => {
+                            warn!(sandbox = %id, error = %error, "create rejection carried unusable absence evidence");
+                        }
+                    }
+                }
+                reason
+            }
+            Err(join) => join_reason(&join).to_string(),
+        };
+        warn!(sandbox = %id, error = %reason, "sandbox creation failed; allocation stays charged");
+        // Published first: the row is visibly FAILED and charged however long the
+        // fence below takes, and if this write fails it stays CREATING and charged.
+        self.store.compare_and_set_sandbox_state(
+            &id,
+            SandboxState::Creating,
+            SandboxState::Failed,
+            None,
+            Some(&reason),
+        )?;
+        let row = self.load(&id)?;
+        if let Err(error) = self.settle_fenced(&row, SandboxState::Failed, None).await {
+            warn!(sandbox = %id, error = %error, "allocation stays charged; retry through Delete or reconciliation");
+        }
+        Err(Error::Backend(format!("create sandbox {id}: {reason}")))
+    }
+
+    /// C8: READY could not be persisted. Publish cleanup intent if possible, then
+    /// remove by exact token; the row stays charged until the receipt commits.
+    async fn compensate_fenced_publication(
+        &self,
+        sandbox_id: &str,
+        publication: anyhow::Error,
+    ) -> Error {
+        let slot = self.slot(sandbox_id);
+        let _guard = slot.exec_lock.lock().await;
+        let reason = format!("record ready state failed: {publication:#}");
+        if let Err(e) = self.store.compare_and_set_sandbox_state(
+            sandbox_id,
+            SandboxState::Creating,
+            SandboxState::Deleting,
+            None,
+            Some(&reason),
+        ) {
+            warn!(sandbox = %sandbox_id, error = %format!("{e:#}"), "could not record create compensation intent");
+        }
+        let row = match self.load(sandbox_id) {
+            Ok(row) => row,
+            Err(error) => return error,
+        };
+        let finished = format!("{reason}; backend removed");
+        match self
+            .settle_fenced(&row, SandboxState::Failed, Some(&finished))
+            .await
+        {
+            Ok(()) => {
+                warn!(sandbox = %sandbox_id, "ready publication failed; allocation proved absent");
+                Error::Internal(publication)
+            }
+            Err(cleanup) => {
+                let reason = format!("{reason}; cleanup failed: {cleanup}");
+                if let Err(e) = self.store.compare_and_set_sandbox_state(
+                    sandbox_id,
+                    SandboxState::Deleting,
+                    SandboxState::Deleting,
+                    None,
+                    Some(&reason),
+                ) {
+                    warn!(sandbox = %sandbox_id, error = %format!("{e:#}"), "create compensation failure could not be recorded");
+                }
+                warn!(sandbox = %sandbox_id, error = %cleanup, "ready publication and compensation failed");
+                Error::Internal(anyhow::anyhow!("{reason}"))
+            }
+        }
+    }
+
     /// A backend exists but READY could not be persisted. Publish cleanup
     /// intent before awaiting removal, then preserve any failed compensation
     /// as DELETING so it remains counted and retryable.
@@ -875,8 +1666,8 @@ impl<R: Runtime> Manager<R> {
             warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %format!("{e:#}"), "could not record create compensation intent");
         }
 
-        match self.runtime.remove(backend_id).await {
-            Ok(()) | Err(RuntimeError::NotFound(_)) => {
+        match self.remove_legacy(backend_id).await {
+            Ok(()) => {
                 let reason = format!("{publication_reason}; backend removed");
                 if let Err(e) = self.store.set_sandbox_state(
                     sandbox_id,
@@ -989,9 +1780,42 @@ impl<R: Runtime> Manager<R> {
     /// comparison between our read and update.
     fn prepare_delete(&self, id: &str, mut sandbox: Sandbox) -> Result<Sandbox> {
         loop {
+            if sandbox.is_fenced() {
+                // Every charged allocation can move to DELETING: without an ID it
+                // can still be fenced by exact token. A released FAILED row needs
+                // no backend work and keeps its evidence.
+                let expected = match sandbox.state {
+                    SandboxState::Deleted | SandboxState::Deleting => return Ok(sandbox),
+                    SandboxState::Creating => {
+                        return Err(Error::FailedPrecondition(format!(
+                            "sandbox {id} is still being created; retry"
+                        )));
+                    }
+                    expected => expected,
+                };
+                let next = if sandbox.is_charged() {
+                    SandboxState::Deleting
+                } else {
+                    SandboxState::Deleted
+                };
+                if self.store.compare_and_set_sandbox_state(
+                    id,
+                    expected,
+                    next,
+                    None,
+                    sandbox.failure_reason.as_deref(),
+                )? {
+                    return self.load(id);
+                }
+                sandbox = self.load(id)?;
+                continue;
+            }
             if sandbox.backend_id.is_none()
                 && sandbox.create_certainty == CreateCertainty::AllocationAmbiguous
-                && !matches!(sandbox.state, SandboxState::Deleted | SandboxState::Creating)
+                && !matches!(
+                    sandbox.state,
+                    SandboxState::Deleted | SandboxState::Creating
+                )
             {
                 return Err(self.ambiguous_reservation_error(&sandbox));
             }
@@ -1022,7 +1846,9 @@ impl<R: Runtime> Manager<R> {
                     }
                     sandbox = self.load(id)?;
                 }
-                expected @ (SandboxState::Ready | SandboxState::Lost) => {
+                expected @ (SandboxState::Ready
+                | SandboxState::Lost
+                | SandboxState::Quarantined) => {
                     if self.store.compare_and_set_sandbox_state(
                         id,
                         expected,
@@ -1066,11 +1892,32 @@ impl<R: Runtime> Manager<R> {
             return Ok(sandbox);
         }
 
+        if sandbox.is_fenced() {
+            return match self
+                .settle_fenced(&sandbox, SandboxState::Deleted, None)
+                .await
+            {
+                Ok(()) => {
+                    info!(sandbox = %id, "sandbox deleted");
+                    self.load(id)
+                }
+                Err(e) => {
+                    let reason = format!("delete failed: {e}");
+                    warn!(sandbox = %id, error = %reason, "sandbox delete failed; allocation stays charged");
+                    self.store.compare_and_set_sandbox_state(
+                        id,
+                        SandboxState::Deleting,
+                        SandboxState::Deleting,
+                        None,
+                        Some(&reason),
+                    )?;
+                    Err(Error::Backend(format!("delete sandbox {id}: {e}")))
+                }
+            };
+        }
+
         let result = match &sandbox.backend_id {
-            Some(b) => match self.runtime.remove(b).await {
-                Ok(()) | Err(RuntimeError::NotFound(_)) => Ok(()),
-                Err(e) => Err(e),
-            },
+            Some(b) => self.remove_legacy(b).await,
             None => Ok(()),
         };
         match result {
@@ -1294,6 +2141,8 @@ impl<R: Runtime> Manager<R> {
             stdin_bytes: req.stdin.len() as u64,
             stdout: Captured::default(),
             stderr: Captured::default(),
+            sandbox_reusable: None,
+            cleanup_evidence: CleanupEvidence::Unknown,
         };
         if Instant::now() >= deadline {
             return Some(Err(Error::DeadlineExceeded(
@@ -1316,6 +2165,10 @@ impl<R: Runtime> Manager<R> {
         let stdin = req.stdin;
         let max_output = self.limits.max_output_bytes;
         let backend_cancel = cancel.clone();
+        let execution_context = ExecutionContext {
+            execution_id: execution.id.clone(),
+            execution_token: Id128::random(),
+        };
         let mut backend = tokio::spawn(async move {
             if backend_cancel.token.is_cancelled() {
                 return ExecOutcome {
@@ -1323,6 +2176,8 @@ impl<R: Runtime> Manager<R> {
                     command_status: None,
                     stdout: Captured::known_empty(),
                     stderr: Captured::known_empty(),
+                    disposition: SandboxDisposition::Reusable,
+                    cleanup: CleanupEvidence::NoChildStarted,
                 };
             }
             let spec = ExecSpec {
@@ -1333,7 +2188,12 @@ impl<R: Runtime> Manager<R> {
             };
             backend_manager
                 .runtime
-                .exec(&backend_id_for_task, &spec, &backend_cancel.token)
+                .exec(
+                    &backend_id_for_task,
+                    &execution_context,
+                    &spec,
+                    &backend_cancel.token,
+                )
                 .await
         });
         // Poll backend completion first so a late receiver drop cannot turn
@@ -1368,6 +2228,11 @@ impl<R: Runtime> Manager<R> {
                     command_status: None,
                     stdout: Captured::default(),
                     stderr: Captured::default(),
+                    // Legacy kiln keeps its existing behavior after an adapter
+                    // panic, but records that nothing established cleanup. Any
+                    // other regime retires the session below.
+                    disposition: SandboxDisposition::Reusable,
+                    cleanup: CleanupEvidence::Unknown,
                 }
             }
         };
@@ -1378,6 +2243,10 @@ impl<R: Runtime> Manager<R> {
                 "backend reported completion without command status",
             ));
         }
+        // Normalized first, so the terminal state can never read as a clean timeout,
+        // cancellation or exit when the evidence for it did not hold.
+        let (disposition, cleanup_evidence, sandbox_reusable) =
+            normalize_exec_outcome(&sandbox, &mut outcome);
         let (state, exit_code, reason) = match &outcome.finish {
             Ok(ExecFinish::Completed) => (
                 ExecutionState::Exited,
@@ -1401,6 +2270,25 @@ impl<R: Runtime> Manager<R> {
             Err(e) => (ExecutionState::Failed, None, Some(e.message.clone())),
         };
         let (stdout, stderr) = (&outcome.stdout, &outcome.stderr);
+        let disposition_reason = match disposition {
+            SandboxDisposition::Reusable => None,
+            SandboxDisposition::Stopped if matches!(&outcome.finish, Err(d) if d.kind == RuntimeErrorKind::NotFound) => {
+                Some(format!(
+                    "backend sandbox {backend_id} disappeared during an execution"
+                ))
+            }
+            SandboxDisposition::Stopped => Some(format!(
+                "execution {} retired this session: its host stop barrier passed",
+                execution.id
+            )),
+            SandboxDisposition::Quarantined => Some(format!(
+                "execution {} could not establish cleanup; delete this sandbox",
+                execution.id
+            )),
+        };
+        if let Some(why) = &disposition_reason {
+            warn!(sandbox = %sandbox.id, disposition = disposition.as_str(), "{why}");
+        }
         let mut retry_delay = Duration::from_millis(10);
         let mut finalization_degraded = false;
         loop {
@@ -1414,6 +2302,10 @@ impl<R: Runtime> Manager<R> {
                     failure_reason: reason.as_deref(),
                     stdout,
                     stderr,
+                    sandbox_reusable,
+                    cleanup_evidence,
+                    disposition: Some(disposition),
+                    disposition_reason: disposition_reason.as_deref(),
                 },
                 self.limits.retention.output_storage,
             ) {
@@ -1431,13 +2323,6 @@ impl<R: Runtime> Manager<R> {
         }
         if finalization_degraded {
             self.finalization_failures.fetch_sub(1, Ordering::Relaxed);
-        }
-        if matches!(&outcome.finish, Err(d) if d.kind == RuntimeErrorKind::NotFound) {
-            let why = format!("backend sandbox {backend_id} disappeared during an execution");
-            warn!(sandbox = %sandbox.id, "{why}");
-            if let Err(error) = self.store.mark_sandbox_lost_if_ready(&sandbox.id, &why) {
-                return Some(Err(error.into()));
-            }
         }
         info!(
             sandbox = %sandbox.id,
@@ -1611,6 +2496,103 @@ fn backend(e: RuntimeError) -> Error {
     Error::Backend(e.to_string())
 }
 
+fn join_reason(join: &tokio::task::JoinError) -> &'static str {
+    if join.is_panic() {
+        "backend create task panicked"
+    } else {
+        "backend create task was canceled"
+    }
+}
+
+fn fenced_binding(sandbox: &Sandbox) -> Result<&AllocationBinding> {
+    sandbox.accounting.allocation.as_ref().ok_or_else(|| {
+        Error::Internal(anyhow::anyhow!(
+            "absence-fenced sandbox {} has no allocation identity",
+            sandbox.id
+        ))
+    })
+}
+
+fn fenced_context(sandbox: &Sandbox, binding: &AllocationBinding) -> CreateContext {
+    CreateContext {
+        instance_id: binding.instance_id,
+        allocation_id: binding.allocation_id,
+        sandbox_id: sandbox.id.clone(),
+    }
+}
+
+/// Why a create result cannot publish this allocation, if any.
+fn ready_receipt_mismatch(
+    binding: &AllocationBinding,
+    created: &CreatedSandbox,
+) -> Option<&'static str> {
+    let RuntimeReceipt::Ready(receipt) = &created.receipt else {
+        return Some("legacy evidence for an allocation token");
+    };
+    if !receipt.matches(binding) {
+        return Some("a ready receipt for another identity or plan");
+    }
+    if created.backend_id != binding.backend_id() {
+        return Some("a backend ID other than its allocation's");
+    }
+    if receipt.validate().is_err() {
+        return Some("an invalid generation or boot identity");
+    }
+    None
+}
+
+/// Holds a runtime's claim to its evidence before it reaches the row. A legacy
+/// claim passes through; its existing contract is what the disposition names, and
+/// only `Unknown` cleanup, like an adapter panic, leaves reusability unknown. An
+/// absence-fenced session is reusable only after a completed result, or with proof
+/// that no child started. Anything weaker is quarantined.
+fn settled_exec_evidence(
+    sandbox: &Sandbox,
+    outcome: &ExecOutcome,
+) -> (SandboxDisposition, CleanupEvidence, Option<bool>) {
+    use CleanupEvidence as Cleanup;
+    use SandboxDisposition as Disposition;
+    let (disposition, cleanup) = (outcome.disposition, outcome.cleanup);
+    if !sandbox.is_fenced() {
+        let reusable = match (disposition, cleanup) {
+            (Disposition::Reusable, Cleanup::Unknown) => None,
+            (Disposition::Reusable, _) => Some(true),
+            _ => Some(false),
+        };
+        return (disposition, cleanup, reusable);
+    }
+    let completed = outcome.finish == Ok(ExecFinish::Completed);
+    match (disposition, cleanup) {
+        (Disposition::Reusable, Cleanup::RuntimeDrained) if completed => {
+            (disposition, cleanup, Some(true))
+        }
+        (Disposition::Reusable, Cleanup::NoChildStarted) if !completed => {
+            (disposition, cleanup, Some(true))
+        }
+        (Disposition::Stopped, Cleanup::SandboxStopped) => (disposition, cleanup, Some(false)),
+        _ => (Disposition::Quarantined, Cleanup::Unknown, Some(false)),
+    }
+}
+
+/// Settles an outcome's evidence and makes its result agree. A session quarantined
+/// because its claim did not hold has no host stop barrier, so an otherwise clean
+/// finish becomes CleanupFailed; status, captures and any existing failure stay.
+fn normalize_exec_outcome(
+    sandbox: &Sandbox,
+    outcome: &mut ExecOutcome,
+) -> (SandboxDisposition, CleanupEvidence, Option<bool>) {
+    let settled = settled_exec_evidence(sandbox, outcome);
+    if sandbox.is_fenced() && settled.0 == SandboxDisposition::Quarantined && outcome.finish.is_ok()
+    {
+        outcome.finish = Err(RuntimeDiagnostic::new(
+            RuntimeErrorKind::CleanupFailed,
+            RuntimeStage::Cleanup,
+            "the backend reported this result without evidence that its cleanup held",
+        ));
+    }
+    settled
+}
+
 /// The owner and root may use a sandbox; nobody else may.
 fn may_use(sandbox: &Sandbox, uid: u32) -> bool {
     uid == 0 || sandbox.owner_uid == uid
@@ -1618,3 +2600,6 @@ fn may_use(sandbox: &Sandbox, uid: u32) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod fenced_tests;

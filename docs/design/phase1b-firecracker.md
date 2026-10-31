@@ -912,3 +912,25 @@ digests and isolate fixtures from production schemas. The shared corpus replaces
 Rust's hash-change-only negative evidence with validation of all mutations.
 Actual jailer/VMM capability masks, retained-FD handoff and broker readiness
 remain B4/B5 gates; synthetic B1 evidence does not claim those gates passed.
+
+## B2 implementation notes (October 31, 2026)
+
+B2 implements sections 8.4, 9 and 7.2's accounting against `FakeRuntime` only; B3
+and B4 still own the helper, node ledger and backend. Conservative readings taken:
+
+- `SpecBinding` applies the offline profile, so legacy kiln rows use the same canonical
+  digest helper without it. Only absence-fenced plans go through `SpecBinding`.
+- Kiln rows store no allocation identity or plan: both are absent from migrated rows,
+  and kiln has no token recovery to use them. Only absence-fenced rows bind them.
+- Section 9.1 has no Runtime stop operation. Recovery of a RUNNING execution therefore
+  publishes INTERRUPTED and LOST only when inspection already reports host stop evidence,
+  and otherwise FAILED/CleanupFailed and QUARANTINED. A live VM is not stopped by B2.
+- A legacy adapter panic keeps its existing READY behavior, reporting unknown reuse;
+  on an absence-fenced row it quarantines. Legacy CleanupFailed quarantines as specified.
+- A live supervisor whose READY reply was lost compensates rather than adopts; only
+  restart recovery adopts. Periodic retry belongs to B6: until then Delete and startup
+  reconciliation retry release.
+- `NodeResourceStats` accounting fields took the next free numbers, 16 through 18.
+- `last_helper_generation` carries only the ready and absence generations. A row that
+  never published READY records zero, so any positive absence generation passes until
+  B3's ledger supplies more; Inspect/Stop observations are compared but not persisted.

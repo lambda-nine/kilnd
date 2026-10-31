@@ -6,6 +6,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B2: add runtime preflight, typed receipts, execution dispositions and
+  schema 8's stored reservation vectors and immutable release evidence, enforced in
+  SQL; quarantine a kiln sandbox whose cleanup cannot be confirmed. Additive
+  `kilnd.v1` fields. The fake models the absence-fenced backend; none is selectable.
+- Serialize descriptor creation with fork on non-Linux hosts, where close-on-exec
+  isn't atomic and a sibling child could hold a capture pipe past the drain grace.
+
 - Fix B1's Python/Rust JSON mismatch with a production strict parser, ASCII
   canonicalizer and shared mutation/Unicode corpus; bind complete host specs
   including labels separately from guest execution specs, and isolate fixtures

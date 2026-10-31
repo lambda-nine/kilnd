@@ -108,7 +108,15 @@ async fn lifecycle_against_real_kiln() {
     let s = m.create(req).await.unwrap();
     assert_eq!(s.state, SandboxState::Ready);
     let backend_id = s.backend_id.clone().unwrap();
-    let listed = m.runtime().list().await.unwrap();
+    let listed = m
+        .runtime()
+        .list(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .records;
     assert!(
         listed.iter().any(|b| b.id == backend_id),
         "kiln ls shows {backend_id}"
@@ -324,7 +332,15 @@ async fn lifecycle_against_real_kiln() {
 
     let d = m.delete(&s.id).await.unwrap();
     assert_eq!(d.state, SandboxState::Deleted);
-    let listed = m.runtime().list().await.unwrap();
+    let listed = m
+        .runtime()
+        .list(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .records;
     assert!(
         !listed.iter().any(|b| b.id == backend_id),
         "kiln rm removed {backend_id}"
@@ -416,7 +432,11 @@ async fn a_sandbox_killed_behind_kilnds_back_is_lost_after_reconcile() {
         .unwrap();
     // Remove it with kiln directly, as an operator or a reboot would.
     m.runtime()
-        .remove(s.backend_id.as_ref().unwrap())
+        .remove(
+            s.backend_id.as_ref().unwrap(),
+            tokio::time::Instant::now() + Duration::from_secs(120),
+            &tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -811,9 +831,13 @@ fn one_small_sandbox() -> (Limits, CreateRequest) {
 async fn listed_ids(manager: &Manager<KilnRuntime>) -> Vec<String> {
     let mut ids: Vec<String> = manager
         .runtime()
-        .list()
+        .list(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            &tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap()
+        .records
         .into_iter()
         .map(|sandbox| sandbox.id)
         .collect();
@@ -1023,7 +1047,14 @@ async fn real_kiln_post_allocation_failure_stays_charged_across_restart() {
     assert!(listed_ids(&manager).await.contains(&backend_id));
 
     // An operator's own cleanup is no evidence kilnd can use either.
-    kiln().remove(&backend_id).await.unwrap();
+    kiln()
+        .remove(
+            &backend_id,
+            tokio::time::Instant::now() + Duration::from_secs(120),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
     manager.reconcile().await.unwrap();
     assert_eq!(
         manager

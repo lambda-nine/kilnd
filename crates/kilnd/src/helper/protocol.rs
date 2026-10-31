@@ -169,7 +169,9 @@ impl From<RuntimeError> for WireError {
         let text: String = e.to_string().chars().take(2048).collect();
         match e {
             RuntimeError::NotFound(_) => Self::NotFound(text),
-            RuntimeError::Incompatible(_) => Self::Incompatible(text),
+            RuntimeError::Incompatible(_) | RuntimeError::Unsupported(_) => {
+                Self::Incompatible(text)
+            }
             RuntimeError::Io(_) => Self::Io(text),
             RuntimeError::Backend(_) => Self::Backend(text),
         }

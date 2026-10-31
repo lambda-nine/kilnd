@@ -122,6 +122,7 @@ The daemon's admission flags and defaults are:
 | `--max-node-memory-bytes` | 3221225472 (3 GiB) |
 | `--max-node-pids` | 2048 |
 | `--max-node-disk-bytes` | 17179869184 (16 GiB) |
+| `--max-node-host-cpu-millis`, `--max-node-virtual-cpu-slots`, `--max-node-host-pids` | 3000, 3, 96 (kiln reserves none) |
 | `--health-probe-timeout-secs` | 2 |
 | `--health-success-cache-secs`, `--health-failure-cache-secs` | 5, 1 |
 
@@ -172,7 +173,7 @@ bounded `next_page_token` until empty, keeping `include_deleted` and the calling
 uid unchanged. Tokens do not survive the schema 7 upgrade: restart the listing.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
-bounds. Every older schema upgrades in order through v7. Schema 5 introduced
+bounds. Every older schema upgrades in order through v8. Schema 5 introduced
 typed termination and runtime diagnostics together with output, terminal state,
 truncation facts and whether each byte total is exact, plus each sandbox's
 create certainty. Historical records retain unknown typed values and unknown
@@ -185,6 +186,13 @@ installing an older daemon is not a database downgrade path.
 Schema 7 records each sandbox's owner and assigns every existing row to root.
 After upgrading, non-root callers no longer see sandboxes they created earlier;
 use root to inspect or delete them. Older binaries refuse schema 7.
+
+Schema 8 rebuilds the sandbox and execution tables in one transaction, so the first
+start needs free disk for a second copy of retained output. It preserves every charge
+exactly, gives this database a durable UUID and instance ID, and refuses to migrate a
+row whose stored spec cannot be decoded, leaving the old schema intact. A kiln sandbox
+whose execution cleanup cannot be confirmed now becomes `quarantined` rather than
+staying `ready`; delete it. Older binaries refuse schema 8.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart.

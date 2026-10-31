@@ -213,6 +213,43 @@ pub fn validate_guest_exec_spec(value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Both spec digests under the canonical byte contract, without the offline profile
+/// checks `SpecBinding` adds. Legacy kiln rows use this; a Firecracker plan never does.
+pub fn spec_digests(spec: &crate::model::SandboxSpec) -> Result<(String, String)> {
+    let host = serde_json::to_value(spec).map_err(|e| e.to_string())?;
+    let mut guest = host.clone();
+    guest.as_object_mut().unwrap().remove("labels");
+    Ok((json_digest(&host)?, json_digest(&guest)?))
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Section 7.2's versioned `offline-768-v1` reservation, in checked arithmetic. The
+/// outer charge is configured RAM plus overhead, never RSS/PSS.
+pub fn offline_768_v1_reservation(
+    spec: &crate::model::SandboxSpec,
+) -> Result<crate::model::ResourceReservation> {
+    let overflow = || "reservation arithmetic overflow".to_string();
+    let rounded = spec
+        .disk_bytes
+        .checked_add(256 * MIB)
+        .and_then(|bytes| bytes.checked_next_multiple_of(64 * MIB))
+        .ok_or_else(overflow)?;
+    Ok(crate::model::ResourceReservation {
+        memory_bytes: (768 + 128) * MIB,
+        disk_bytes: rounded
+            .max(512 * MIB)
+            .checked_add(128 * MIB)
+            .ok_or_else(overflow)?,
+        pids: u64::from(spec.pids)
+            .checked_add(32 + 32)
+            .ok_or_else(overflow)?,
+        host_cpu_millis: 1000,
+        virtual_cpu_slots: 1,
+        host_pids: 32,
+    })
+}
+
 /// Immutable daemon plan/journal payload. The guest receives only the projection
 /// and guest_exec_spec_sha256. Deserialize is intentionally unavailable: recovery
 /// must recompute and compare via verify_spec_binding before accepting a journal.
@@ -224,8 +261,7 @@ pub struct SpecBinding {
 }
 impl SpecBinding {
     pub fn new(spec: &crate::model::SandboxSpec) -> Result<Self> {
-        let host = serde_json::to_value(spec).map_err(|e| e.to_string())?;
-        let mut guest = host.clone();
+        let mut guest = serde_json::to_value(spec).map_err(|e| e.to_string())?;
         guest.as_object_mut().unwrap().remove("labels");
         validate_guest_exec_spec(&guest)?;
         if spec.labels.len() > 32 {
@@ -243,10 +279,11 @@ impl SpecBinding {
                 return Err("invalid label".into());
             }
         }
+        let (host_spec_sha256, guest_exec_spec_sha256) = spec_digests(spec)?;
         Ok(Self {
             host_spec: spec.clone(),
-            host_spec_sha256: json_digest(&host)?,
-            guest_exec_spec_sha256: json_digest(&guest)?,
+            host_spec_sha256,
+            guest_exec_spec_sha256,
         })
     }
     pub fn host_spec_sha256(&self) -> &str {
@@ -523,5 +560,112 @@ fn expand(value: &Value, values: &Value) -> Result<Value> {
             Ok(json!(out))
         }
         _ => Ok(value.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Network, SandboxSpec};
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn spec(disk_bytes: u64, pids: u32) -> SandboxSpec {
+        SandboxSpec {
+            image: "alpine".into(),
+            memory_bytes: 512 * MIB,
+            cpu_millis: 1000,
+            pids,
+            disk_bytes,
+            network: Network::None,
+            read_only_root: false,
+            writable_paths: vec![],
+            labels: Default::default(),
+        }
+    }
+
+    #[test]
+    fn offline_768_reservation_arithmetic_is_checked() {
+        let r = offline_768_v1_reservation(&spec(1 << 30, 128)).unwrap();
+        // Section 7.1's worked example: W = 1280 MiB, host disk = 1408 MiB.
+        assert_eq!(r.disk_bytes, 1408 * MIB);
+        assert_eq!(r.memory_bytes, 896 * MIB);
+        assert_eq!(r.pids, 192);
+        assert_eq!(r.host_pids, 32);
+        assert_eq!(r.host_cpu_millis, 1000);
+        assert_eq!(r.virtual_cpu_slots, 1);
+
+        // W = max(512 MiB, round_up(D + 256 MiB, 64 MiB)), reserved = W + 128 MiB.
+        for (disk, expected_w) in [
+            (1, 512),             // floor
+            (256 * MIB, 512),     // exactly the floor
+            (256 * MIB + 1, 576), // one byte rounds a whole quantum
+            (320 * MIB, 576),     // exact multiple does not round further
+            (320 * MIB + 1, 640),
+            (1024 * MIB, 1280),
+            (1024 * MIB + 1, 1344),
+        ] {
+            let reserved = offline_768_v1_reservation(&spec(disk, 1))
+                .unwrap()
+                .disk_bytes;
+            assert_eq!(reserved, (expected_w + 128) * MIB, "disk {disk}");
+            assert_eq!(reserved % (64 * MIB), 0, "disk {disk}");
+        }
+
+        // Overflow fails at every addition rather than wrapping to a small charge.
+        for disk in [
+            u64::MAX,
+            u64::MAX - 256 * MIB + 1,
+            // D + 256 MiB fits, its round-up does not.
+            u64::MAX - 256 * MIB,
+            // W fits, W + 128 MiB does not.
+            (u64::MAX / (64 * MIB)) * (64 * MIB) - 256 * MIB,
+        ] {
+            assert!(
+                offline_768_v1_reservation(&spec(disk, 1)).is_err(),
+                "disk {disk}"
+            );
+        }
+        // The largest PID count cannot overflow the aggregate.
+        assert_eq!(
+            offline_768_v1_reservation(&spec(1, u32::MAX)).unwrap().pids,
+            u64::from(u32::MAX) + 64
+        );
+    }
+
+    #[test]
+    fn three_sessions_fit_and_a_fourth_does_not_in_the_3_gib_budget() {
+        let session = offline_768_v1_reservation(&spec(1 << 30, 128))
+            .unwrap()
+            .memory_bytes;
+        let (shared, budget) = (128 * MIB, 3072 * MIB);
+        let total = |sessions: u64| {
+            session
+                .checked_mul(sessions)
+                .and_then(|memory| memory.checked_add(shared))
+                .unwrap()
+        };
+        assert_eq!(total(3), 2816 * MIB);
+        assert!(total(3) <= budget, "3*896+128 fits");
+        assert_eq!(total(4), 3712 * MIB);
+        assert!(total(4) > budget, "4*896+128 does not");
+    }
+
+    #[test]
+    fn spec_digests_match_spec_binding_without_its_offline_profile() {
+        let offline = spec(1 << 30, 128);
+        let binding = SpecBinding::new(&offline).unwrap();
+        assert_eq!(
+            spec_digests(&offline).unwrap(),
+            (
+                binding.host_spec_sha256().to_string(),
+                binding.guest_exec_spec_sha256().to_string()
+            )
+        );
+        let mut full = offline.clone();
+        full.network = Network::Full;
+        full.image = "ubuntu".into();
+        assert!(SpecBinding::new(&full).is_err());
+        assert!(spec_digests(&full).is_ok());
     }
 }

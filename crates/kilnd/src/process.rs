@@ -62,6 +62,32 @@ pub(crate) unsafe fn prepare_child(expected_parent: libc::pid_t) -> io::Result<(
 /// left running in the background may hold the pipes open indefinitely.
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
+/// Serializes descriptor creation with fork where the OS cannot do both atomically.
+/// Darwin has no `pipe2` or `SOCK_CLOEXEC`, so std and these adapters create a
+/// descriptor and then set close-on-exec. A fork on another thread in between leaks
+/// it into that child, which can then hold a capture pipe open past the drain grace,
+/// so a backend's real EOF is never observed. Linux, the only production target,
+/// creates them atomically and takes no lock. Hold this from creating a child's
+/// descriptors through its spawn, and never across an await.
+#[doc(hidden)]
+pub struct SpawnGuard {
+    #[cfg(not(target_os = "linux"))]
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+#[doc(hidden)]
+pub fn spawn_guard() -> SpawnGuard {
+    #[cfg(not(target_os = "linux"))]
+    {
+        static SPAWN: Mutex<()> = Mutex::new(());
+        SpawnGuard {
+            _held: SPAWN.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    SpawnGuard {}
+}
+
 #[derive(Debug)]
 pub enum Finish {
     Exited(ExitStatus),
@@ -199,7 +225,10 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
     unsafe {
         cmd.pre_exec(move || prepare_child(expected_parent));
     }
-    let mut child = cmd.spawn()?;
+    let mut child = {
+        let _guard = spawn_guard();
+        cmd.spawn()?
+    };
 
     // Capture and stdin tasks must never detach from this operation. If the
     // run future is unexpectedly dropped (for example by a backend panic),

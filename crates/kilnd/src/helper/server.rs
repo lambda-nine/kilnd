@@ -217,7 +217,7 @@ async fn dispatch(
                 deadline,
                 max_output,
             };
-            let outcome = runtime.exec(&id, &spec, cancel).await;
+            let outcome = runtime.exec_direct(&id, &spec, cancel).await;
             // No stdio bytes appear in the control protocol, only evidence.
             let response = Response::Executed {
                 finish: match outcome.finish {

@@ -1,12 +1,16 @@
 //! Unprivileged kiln runtime adapter: only the private root helper runs kiln.
-use super::{BackendSandbox, CreateFailure, ExecOutcome, ExecSpec, Runtime, RuntimeError};
+use super::{
+    AbsenceReceipt, AllocationObservation, BackendInventory, BackendSandbox, CreateContext,
+    CreateFailure, CreatedSandbox, ExecOutcome, ExecSpec, ExecutionContext, LegacyAbsence,
+    LegacyProof, PreparedCreate, Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt,
+    kiln_direct::{KILN_PROFILE, legacy_capabilities, legacy_inventory, unsupported_token},
+};
 use crate::helper::{
     Client,
     protocol::{KilnRequest, Response},
 };
-use crate::model::SandboxSpec;
+use crate::model::{Digest, SandboxSpec};
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +45,9 @@ impl Runtime for KilnRuntime {
     fn name(&self) -> &'static str {
         "kiln"
     }
+    fn capabilities(&self) -> RuntimeCapabilities {
+        legacy_capabilities()
+    }
     async fn version(
         &self,
         deadline: Instant,
@@ -74,17 +81,37 @@ impl Runtime for KilnRuntime {
             _ => Err(unexpected()),
         }
     }
-    async fn create(&self, spec: &SandboxSpec) -> Result<String, CreateFailure> {
+    async fn prepare(
+        &self,
+        _context: &CreateContext,
+        spec: &SandboxSpec,
+        _deadline: Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<PreparedCreate, RuntimeError> {
+        Ok(PreparedCreate::legacy(spec.clone(), KILN_PROFILE))
+    }
+    async fn create(
+        &self,
+        _context: &CreateContext,
+        prepared: &PreparedCreate,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<CreatedSandbox, CreateFailure> {
         match self
             .client
             .call(
-                KilnRequest::Create { spec: spec.clone() },
-                Instant::now() + Duration::from_secs(120),
-                &CancellationToken::new(),
+                KilnRequest::Create {
+                    spec: prepared.spec().clone(),
+                },
+                deadline,
+                cancel,
             )
             .await?
         {
-            Response::Created(id) => Ok(id),
+            Response::Created(backend_id) => Ok(CreatedSandbox {
+                backend_id,
+                receipt: RuntimeReceipt::Legacy,
+            }),
             Response::Error {
                 error,
                 definitely_not_created: true,
@@ -93,36 +120,69 @@ impl Runtime for KilnRuntime {
             _ => Err(unexpected().into()),
         }
     }
-    async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> ExecOutcome {
+    async fn inspect_allocation(
+        &self,
+        _context: &CreateContext,
+        _prepared_digest: &Digest,
+        _deadline: Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<AllocationObservation, RuntimeError> {
+        Ok(AllocationObservation::Unsupported)
+    }
+    async fn fence_absent(
+        &self,
+        _context: &CreateContext,
+        _prepared_digest: &Digest,
+        _deadline: Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<AbsenceReceipt, RuntimeError> {
+        Err(unsupported_token())
+    }
+    async fn exec(
+        &self,
+        id: &str,
+        _execution: &ExecutionContext,
+        spec: &ExecSpec<'_>,
+        cancel: &CancellationToken,
+    ) -> ExecOutcome {
         self.client.exec(id, spec, cancel).await
     }
-    async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
+    async fn remove(
+        &self,
+        id: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<AbsenceReceipt, RuntimeError> {
         match self
-            .call(
-                KilnRequest::Rm { id: id.into() },
-                Instant::now() + Duration::from_secs(120),
-                &CancellationToken::new(),
-            )
+            .call(KilnRequest::Rm { id: id.into() }, deadline, cancel)
             .await?
         {
-            Response::Removed => Ok(()),
+            Response::Removed => Ok(AbsenceReceipt::Legacy(LegacyAbsence {
+                backend_id: id.into(),
+                proof: LegacyProof::StrictRemoval,
+            })),
             _ => Err(unexpected()),
         }
     }
-    async fn list(&self) -> Result<Vec<BackendSandbox>, RuntimeError> {
-        match self
-            .call(
-                KilnRequest::Ls,
-                Instant::now() + Duration::from_secs(30),
-                &CancellationToken::new(),
-            )
-            .await?
-        {
-            Response::Listed(rows) => Ok(rows.into_iter().map(Into::into).collect()),
+    async fn list(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<BackendInventory, RuntimeError> {
+        match self.call(KilnRequest::Ls, deadline, cancel).await? {
+            Response::Listed(rows) => {
+                let rows: Vec<BackendSandbox> = rows.into_iter().map(Into::into).collect();
+                Ok(legacy_inventory(rows))
+            }
             _ => Err(unexpected()),
         }
     }
-    async fn gc(&self, ids: &[String]) -> Result<Vec<String>, RuntimeError> {
+    async fn gc(
+        &self,
+        ids: &[String],
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
         let mut removed = Vec::new();
         for chunk in ids.chunks(crate::helper::protocol::MAX_GC_IDS) {
             match self
@@ -130,12 +190,17 @@ impl Runtime for KilnRuntime {
                     KilnRequest::Gc {
                         ids: chunk.to_vec(),
                     },
-                    Instant::now() + Duration::from_secs(30),
-                    &CancellationToken::new(),
+                    deadline,
+                    cancel,
                 )
                 .await?
             {
-                Response::Collected(ids) => removed.extend(ids),
+                Response::Collected(ids) => removed.extend(ids.into_iter().map(|backend_id| {
+                    AbsenceReceipt::Legacy(LegacyAbsence {
+                        backend_id,
+                        proof: LegacyProof::ScopedGc,
+                    })
+                })),
                 _ => return Err(unexpected()),
             }
         }

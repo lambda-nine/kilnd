@@ -100,7 +100,10 @@ pub async fn probe(
             },
         });
     }
-    let mut child = cmd.spawn()?;
+    let mut child = {
+        let _guard = crate::process::spawn_guard();
+        cmd.spawn()?
+    };
     let status = Arc::new(Mutex::new(StatusState::default()));
     let stderr = Arc::new(Mutex::new(StreamState::default()));
     let mut error_reader = spawn_capture(
@@ -246,6 +249,7 @@ fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
 
 impl OwnedExec {
     pub fn spawn(bin: &Path, id: &str, spec: &ExecSpec<'_>) -> io::Result<Self> {
+        let spawning = crate::process::spawn_guard();
         let (status, status_child) = pair(Shutdown::Write, Shutdown::Read)?;
         let (mut stdin, stdin_child) = pair(Shutdown::Read, Shutdown::Write)?;
         let (stdout, stdout_child) = pair(Shutdown::Write, Shutdown::Read)?;
@@ -285,6 +289,9 @@ impl OwnedExec {
             });
         }
         let mut child = cmd.spawn()?;
+        // The guard holds nothing on Linux, where this drop is only a no-op.
+        #[allow(clippy::drop_non_drop)]
+        drop(spawning);
         drop((status_child, stdin_child, stdout_child, stderr_child));
         let stdout_state = Arc::new(Mutex::new(StreamState::default()));
         let stderr_state = Arc::new(Mutex::new(StreamState::default()));
@@ -844,11 +851,85 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
         tokio::time::sleep(Duration::from_millis(1100)).await;
     }
 
+    /// Without atomic close-on-exec, a descriptor created beside another thread's fork
+    /// can leak into that child and delay a real EOF past the drain grace, so every
+    /// path that creates a child's descriptors must serialize with every fork.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn every_spawn_path_serializes_descriptors_with_fork() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("kiln");
+        fixture(&bin, "sys.exit(0)");
+        for path in ["run", "probe", "owned"] {
+            let held = crate::process::spawn_guard();
+            let (finished, done) = std::sync::mpsc::channel();
+            let bin = bin.clone();
+            let worker = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    let cancel = CancellationToken::new();
+                    match path {
+                        "run" => {
+                            let args = [std::ffi::OsStr::new("capabilities")];
+                            let request = crate::process::Request {
+                                program: &bin,
+                                args: &args,
+                                stdin: b"",
+                                deadline,
+                                max_output: 1024,
+                            };
+                            crate::process::run(&request, &cancel).await.unwrap();
+                        }
+                        "probe" => {
+                            probe(&bin, &["capabilities".to_string()], deadline, &cancel)
+                                .await
+                                .unwrap();
+                        }
+                        _ => {
+                            let argv = vec!["ignored".to_string()];
+                            let spec = ExecSpec {
+                                argv: &argv,
+                                stdin: b"",
+                                deadline,
+                                max_output: 16,
+                            };
+                            let mut owner = OwnedExec::spawn(&bin, "abcd", &spec).unwrap();
+                            owner.kill_reap().await.unwrap();
+                            owner.settle().await;
+                        }
+                    }
+                });
+                finished.send(()).unwrap();
+            });
+            assert!(
+                done.recv_timeout(Duration::from_millis(50)).is_err(),
+                "{path} spawned outside the guard"
+            );
+            drop(held);
+            done.recv_timeout(Duration::from_secs(30)).unwrap();
+            worker.join().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn owned_exec_recovers_descriptors_in_a_dedicated_child() {
         const CHILD: &str = "KILND_EXEC_FD_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","runtime::kiln_process::tests::owned_exec_recovers_descriptors_in_a_dedicated_child","--nocapture"]).env(CHILD,"1").output().unwrap();
+            let child = {
+                let _guard = crate::process::spawn_guard();
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","runtime::kiln_process::tests::owned_exec_recovers_descriptors_in_a_dedicated_child","--nocapture"])
+                    .env(CHILD,"1")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+            let output = child.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",

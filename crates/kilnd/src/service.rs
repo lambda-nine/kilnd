@@ -54,6 +54,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             running_executions: h.running_executions,
             admission: Some(admission_pb(h.admission)),
             node_resources: Some(node_resources_pb(h.node_resources)),
+            runtime_capabilities: Some(runtime_capabilities_pb(h.capabilities)),
         }))
     }
 
@@ -261,17 +262,55 @@ fn admission_pb(s: crate::admission::AdmissionSnapshot) -> pb::AdmissionStats {
     }
 }
 
+fn runtime_capabilities_pb(c: crate::runtime::RuntimeCapabilities) -> pb::RuntimeCapabilities {
+    pb::RuntimeCapabilities {
+        network_modes: c
+            .network_modes
+            .iter()
+            .map(|mode| {
+                match mode {
+                    crate::model::Network::None => pb::NetworkMode::None,
+                    crate::model::Network::Full => pb::NetworkMode::Full,
+                    crate::model::Network::Allow(_) => pb::NetworkMode::Allowlist,
+                }
+                .into()
+            })
+            .collect(),
+        interruption_preserves_session: c.interruption_preserves_session,
+        checkpoint: c.checkpoint,
+    }
+}
+
 fn node_resources_pb(s: crate::manager::NodeResourceSnapshot) -> pb::NodeResourceStats {
+    use crate::manager::NodeAccountingStatus as Accounting;
+    // A daemon's local sum is the node total only for a backend with no node
+    // authority, which reserves no CPU, vCPU or host PIDs. Otherwise an unreadable
+    // authority reports nothing rather than a number that looks authoritative.
+    let local = s.accounting == Accounting::LocalLegacy;
+    let total = |value: u64| if local { value } else { 0 };
     pb::NodeResourceStats {
-        max_sandboxes: s.limits.sandboxes,
-        reserved_sandboxes: s.reserved.sandboxes,
-        max_memory_bytes: s.limits.memory_bytes,
-        reserved_memory_bytes: s.reserved.memory_bytes,
-        max_pids: s.limits.pids,
-        reserved_pids: s.reserved.pids,
-        max_disk_bytes: s.limits.disk_bytes,
-        reserved_disk_bytes: s.reserved.disk_bytes,
+        max_sandboxes: total(s.limits.sandboxes),
+        reserved_sandboxes: total(s.reserved.sandboxes),
+        max_memory_bytes: total(s.limits.memory_bytes),
+        reserved_memory_bytes: total(s.reserved.memory_bytes),
+        max_pids: total(s.limits.pids),
+        reserved_pids: total(s.reserved.pids),
+        max_disk_bytes: total(s.limits.disk_bytes),
+        reserved_disk_bytes: total(s.reserved.disk_bytes),
         rejected_creates: s.rejected_creates,
+        max_host_cpu_millis: 0,
+        reserved_host_cpu_millis: 0,
+        max_virtual_cpu_slots: 0,
+        reserved_virtual_cpu_slots: 0,
+        max_host_pids: 0,
+        reserved_host_pids: 0,
+        accounting_status: match s.accounting {
+            Accounting::LocalLegacy => pb::NodeAccountingStatus::LocalLegacy,
+            Accounting::Unavailable => pb::NodeAccountingStatus::Unavailable,
+        }
+        .into(),
+        accounting_generation: 0,
+        accounting_observed_at_unix_ms: 0,
     }
 }
 
@@ -401,7 +440,9 @@ pub fn sandbox_pb(s: Sandbox) -> pb::Sandbox {
         SandboxState::Deleted => pb::SandboxState::Deleted,
         SandboxState::Failed => pb::SandboxState::Failed,
         SandboxState::Lost => pb::SandboxState::Lost,
+        SandboxState::Quarantined => pb::SandboxState::Quarantined,
     };
+    let reservation = s.accounting.reservation;
     pb::Sandbox {
         id: s.id,
         state: state.into(),
@@ -413,6 +454,16 @@ pub fn sandbox_pb(s: Sandbox) -> pb::Sandbox {
         deleted_at_unix_ms: s.deleted_at_ms.unwrap_or(0),
         failure_reason: s.failure_reason.unwrap_or_default(),
         owner_uid: s.owner_uid,
+        reservation: Some(pb::ResourceReservation {
+            memory_bytes: reservation.memory_bytes,
+            disk_bytes: reservation.disk_bytes,
+            pids: reservation.pids,
+            host_cpu_millis: reservation.host_cpu_millis,
+            virtual_cpu_slots: reservation.virtual_cpu_slots,
+            host_pids: reservation.host_pids,
+        }),
+        runtime_profile: s.accounting.runtime_profile,
+        runtime_artifact_digest: s.accounting.runtime_artifact_digest,
     }
 }
 
@@ -465,6 +516,14 @@ pub fn execution_pb(e: Execution) -> pb::Execution {
         stdin_bytes: e.stdin_bytes,
         stdout: Some(output_pb(e.stdout)),
         stderr: Some(output_pb(e.stderr)),
+        sandbox_reusable: e.sandbox_reusable,
+        cleanup_evidence: match e.cleanup_evidence {
+            crate::model::CleanupEvidence::Unknown => pb::CleanupEvidence::Unknown,
+            crate::model::CleanupEvidence::NoChildStarted => pb::CleanupEvidence::NoChildStarted,
+            crate::model::CleanupEvidence::RuntimeDrained => pb::CleanupEvidence::RuntimeDrained,
+            crate::model::CleanupEvidence::SandboxStopped => pb::CleanupEvidence::SandboxStopped,
+        }
+        .into(),
     }
 }
 
@@ -574,7 +633,11 @@ mod tests {
         ));
         let sandbox = manager.create(CreateRequest::default()).await.unwrap();
         let service = Service::new(manager.clone());
-        for argv in [vec![], vec![String::new()], vec!["echo".into(), "a\0b".into()]] {
+        for argv in [
+            vec![],
+            vec![String::new()],
+            vec!["echo".into(), "a\0b".into()],
+        ] {
             let error = service
                 .exec(as_root(pb::ExecRequest {
                     sandbox_id: sandbox.id.clone(),
@@ -1025,6 +1088,142 @@ mod tests {
             .unwrap();
         assert_eq!(next.state, ExecutionState::Exited);
         assert_eq!(next.stdout.data, b"usable\n");
+    }
+
+    #[tokio::test]
+    async fn health_and_rows_expose_additive_evidence_fields_for_kiln_semantics() {
+        let (fake, _manager, service) = owned_service(Limits::default());
+        let sandbox = create_as(&service, 0).await;
+        let reservation = sandbox.reservation.unwrap();
+        let limits = sandbox.spec.unwrap().limits.unwrap();
+        assert_eq!(reservation.memory_bytes, limits.memory_bytes);
+        assert_eq!(reservation.disk_bytes, limits.disk_bytes);
+        assert_eq!(reservation.pids, u64::from(limits.pids));
+        assert_eq!(reservation.host_cpu_millis, 0);
+        assert_eq!(reservation.virtual_cpu_slots, 0);
+        assert_eq!(reservation.host_pids, 0);
+        assert_eq!(sandbox.runtime_profile, "fake");
+        assert_eq!(sandbox.runtime_artifact_digest, "");
+
+        let health = service
+            .health(as_root(pb::HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let stats = health.node_resources.unwrap();
+        assert_eq!(
+            stats.accounting_status,
+            pb::NodeAccountingStatus::LocalLegacy as i32
+        );
+        assert_eq!(stats.reserved_sandboxes, 1);
+        assert_eq!(stats.reserved_memory_bytes, reservation.memory_bytes);
+        assert_eq!(
+            (
+                stats.max_host_cpu_millis,
+                stats.reserved_host_cpu_millis,
+                stats.max_virtual_cpu_slots,
+                stats.reserved_virtual_cpu_slots,
+                stats.max_host_pids,
+                stats.reserved_host_pids,
+            ),
+            (0, 0, 0, 0, 0, 0),
+            "kiln reserves no CPU, vCPU or host PIDs"
+        );
+        let capabilities = health.runtime_capabilities.unwrap();
+        assert!(capabilities.interruption_preserves_session);
+        assert!(!capabilities.checkpoint);
+        assert_eq!(capabilities.network_modes.len(), 3);
+
+        let exec = |argv: &[&str], id: &str| {
+            as_root(pb::ExecRequest {
+                sandbox_id: id.to_string(),
+                argv: argv.iter().map(|a| a.to_string()).collect(),
+                ..Default::default()
+            })
+        };
+        let done = KilndService::exec(&service, exec(&["exit", "127"], &sandbox.id))
+            .await
+            .unwrap()
+            .into_inner()
+            .execution
+            .unwrap();
+        assert_eq!(done.exit_code, Some(127), "exit projection is unchanged");
+        assert_eq!(done.sandbox_reusable, Some(true));
+        assert_eq!(
+            done.cleanup_evidence,
+            pb::CleanupEvidence::RuntimeDrained as i32
+        );
+
+        let failed = KilndService::exec(&service, exec(&["cleanup-fail"], &sandbox.id))
+            .await
+            .unwrap()
+            .into_inner()
+            .execution
+            .unwrap();
+        assert_eq!(failed.sandbox_reusable, Some(false));
+        assert_eq!(failed.cleanup_evidence, pb::CleanupEvidence::Unknown as i32);
+        let refused = KilndService::exec(&service, exec(&["echo"], &sandbox.id))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(fake.state().exec_calls.len(), 2);
+        let got = service
+            .get_sandbox(as_root(pb::GetSandboxRequest {
+                id: sandbox.id,
+                execution_limit: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .sandbox
+            .unwrap();
+        assert_eq!(got.state, pb::SandboxState::Quarantined as i32);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_node_authority_is_never_replaced_by_a_local_sum() {
+        let fake = FakeRuntime::fenced();
+        let manager = Arc::new(Manager::new(
+            fake,
+            Store::open_in_memory().unwrap(),
+            Limits::default(),
+        ));
+        let service = Service::new(manager.clone());
+        let sandbox = create_as(&service, 0).await;
+        assert_eq!(sandbox.reservation.unwrap().memory_bytes, 896 << 20);
+        assert_eq!(sandbox.runtime_profile, "offline-768-v1");
+        assert_eq!(sandbox.runtime_artifact_digest.len(), 64);
+        assert_eq!(manager.store_resources_for_test().sandboxes, 1);
+        let health = service
+            .health(as_root(pb::HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(health.status, pb::health_response::Status::Degraded as i32);
+        let stats = health.node_resources.unwrap();
+        assert_eq!(
+            stats.accounting_status,
+            pb::NodeAccountingStatus::Unavailable as i32
+        );
+        assert_eq!(
+            (
+                stats.reserved_sandboxes,
+                stats.reserved_memory_bytes,
+                stats.reserved_pids,
+                stats.reserved_disk_bytes,
+                stats.reserved_host_cpu_millis,
+                stats.reserved_virtual_cpu_slots,
+                stats.reserved_host_pids,
+            ),
+            (0, 0, 0, 0, 0, 0, 0),
+            "local charges must not look like node totals"
+        );
+        let capabilities = health.runtime_capabilities.unwrap();
+        assert!(!capabilities.interruption_preserves_session);
+        assert_eq!(
+            capabilities.network_modes,
+            vec![pb::NetworkMode::None as i32]
+        );
     }
 
     fn owned_service(

@@ -13,14 +13,16 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BackendSandbox, BackendStatus, CreateFailure, ExecFinish, ExecOutcome, ExecSpec, Runtime,
-    RuntimeError,
+    AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendInventory, BackendSandbox,
+    BackendStatus, CreateContext, CreateFailure, CreatedSandbox, ExecFinish, ExecOutcome, ExecSpec,
+    ExecutionContext, LegacyAbsence, LegacyProof, PreparedCreate, Runtime, RuntimeCapabilities,
+    RuntimeError, RuntimeReceipt, legacy_exec_evidence,
 };
 use super::{
     kiln_process::{self, OwnedExec, Stop},
     kiln_protocol as protocol,
 };
-use crate::model::{Captured, Network, SandboxSpec};
+use crate::model::{Captured, CleanupEvidence, Digest, Network, SandboxDisposition, SandboxSpec};
 use crate::model::{RuntimeDiagnostic, RuntimeErrorKind as Kind, RuntimeStage as Stage};
 use crate::process::{self, Finish};
 
@@ -37,6 +39,33 @@ const REMOVE_TIMEOUT: Duration = Duration::from_secs(60);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 const CLEANUP_POLL: Duration = Duration::from_millis(10);
+
+/// The profile recorded for new kiln rows. Descriptive only; historical rows
+/// keep an empty profile.
+pub(crate) const KILN_PROFILE: &str = "kiln";
+
+pub(crate) fn legacy_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        network_modes: vec![Network::None, Network::Full, Network::Allow(Vec::new())],
+        interruption_preserves_session: true,
+        checkpoint: false,
+        accounting: AccountingAuthority::LocalLegacy,
+    }
+}
+
+/// `kiln ls` was parsed strictly and completely, so it is a complete inventory by
+/// the same standard reconciliation already required of it.
+pub(crate) fn legacy_inventory(rows: Vec<BackendSandbox>) -> BackendInventory {
+    BackendInventory {
+        records: rows.into_iter().map(Into::into).collect(),
+        generation: 0,
+        complete: true,
+    }
+}
+
+pub(crate) fn unsupported_token() -> RuntimeError {
+    RuntimeError::Unsupported("the kiln backend has no allocation-token recovery".into())
+}
 
 pub struct DirectKilnRuntime {
     bin: PathBuf,
@@ -180,7 +209,10 @@ impl DirectKilnRuntime {
             || out.stdout.truncated()
             || out.stderr.truncated()
         {
-            return Err("scoped gc capability check received incomplete help output".into());
+            return Err(format!(
+                "scoped gc capability check received incomplete help output: stdout {:?}; stderr {:?}",
+                out.stdout_completion, out.stderr_completion
+            ));
         }
         let text = std::str::from_utf8(&out.stdout.data)
             .map_err(|e| format!("scoped gc help is not UTF-8: {e}"))?;
@@ -351,95 +383,30 @@ impl DirectKilnRuntime {
         Ok(removed)
     }
 
-    #[cfg(test)]
-    fn with_cgroup_root(bin: PathBuf, cgroup_root: &Path) -> Self {
-        Self {
-            bin,
-            cgroup_root: cgroup_root.to_path_buf(),
-        }
-    }
-}
-
-impl Runtime for DirectKilnRuntime {
-    fn name(&self) -> &'static str {
-        "kiln"
-    }
-
-    async fn version(
-        &self,
-        deadline: Instant,
-        cancel: &CancellationToken,
-    ) -> Result<String, RuntimeError> {
-        let caps = self.capabilities(None, deadline, cancel).await?;
-        Ok(format!(
-            "{}: {} {} (persistent-exec v1)",
-            self.bin.display(),
-            caps.package,
-            caps.provenance
-        ))
-    }
-
-    async fn validate_sandbox(
+    /// The helper's wire exec has no execution context, so its dispatch uses this
+    /// directly. The cleanup contract is unchanged; disposition only names it.
+    pub(crate) async fn exec_direct(
         &self,
         id: &str,
-        deadline: Instant,
+        spec: &ExecSpec<'_>,
         cancel: &CancellationToken,
-    ) -> Result<(), RuntimeError> {
-        check_id(id)?;
-        match self.capabilities(Some(id), deadline, cancel).await {
-            Ok(_) => Ok(()),
-            Err(probe_error) => {
-                if cancel.is_cancelled() || Instant::now() >= deadline {
-                    return Err(RuntimeError::Incompatible(format!(
-                        "{probe_error}; sandbox presence was not observed: no remaining deadline/cancellation budget"
-                    )));
-                }
-                match self.list_until(deadline, cancel).await {
-                    Ok(sandboxes) if !sandboxes.iter().any(|sandbox| sandbox.id == id) => {
-                        if cancel.is_cancelled() || Instant::now() >= deadline {
-                            return Err(RuntimeError::Incompatible(format!(
-                                "{probe_error}; sandbox absence was not confirmed within the original deadline/cancellation budget"
-                            )));
-                        }
-                        let cgroup = self.cgroup_root.join(id);
-                        match tokio::fs::metadata(&cgroup).await {
-                            Ok(_) => Err(RuntimeError::Incompatible(format!(
-                                "{probe_error}; kiln ls omitted sandbox {id}, but its cgroup {} still exists",
-                                cgroup.display()
-                            ))),
-                            Err(error) if error.kind() == ErrorKind::NotFound => {
-                                Err(RuntimeError::NotFound(id.into()))
-                            }
-                            Err(error) => Err(RuntimeError::Incompatible(format!(
-                                "{probe_error}; sandbox presence could not be confirmed: inspect cgroup {}: {error}",
-                                cgroup.display()
-                            ))),
-                        }
-                    }
-                    Ok(_) => Err(probe_error),
-                    Err(observation_error) => Err(RuntimeError::Incompatible(format!(
-                        "{probe_error}; sandbox presence could not be confirmed: {observation_error}"
-                    ))),
-                }
+    ) -> ExecOutcome {
+        // Every early return precedes the spawn, so no child can need cleanup
+        // unless the probe proved this sandbox gone.
+        let empty = |finish: Result<ExecFinish, RuntimeDiagnostic>| {
+            let (disposition, _) = legacy_exec_evidence(&finish);
+            ExecOutcome {
+                finish,
+                command_status: None,
+                stdout: Captured::known_empty(),
+                stderr: Captured::known_empty(),
+                disposition,
+                cleanup: if disposition == SandboxDisposition::Reusable {
+                    CleanupEvidence::NoChildStarted
+                } else {
+                    CleanupEvidence::Unknown
+                },
             }
-        }
-    }
-
-    async fn create(&self, spec: &SandboxSpec) -> Result<String, CreateFailure> {
-        self.create_until(
-            spec,
-            Instant::now() + CREATE_TIMEOUT,
-            &CancellationToken::new(),
-        )
-        .await
-    }
-
-    async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> ExecOutcome {
-        let empty = |finish| ExecOutcome {
-            finish,
-            command_status: None,
-            stdout: Captured::known_empty(),
-            stderr: Captured::known_empty(),
         };
         if let Err(e) = check_id(id) {
             return empty(Err(RuntimeDiagnostic::new(
@@ -619,35 +586,188 @@ impl Runtime for DirectKilnRuntime {
             augmented.message_truncated |= d.message_truncated;
             *d = augmented;
         }
+        let (disposition, cleanup) = legacy_exec_evidence(&finish);
         ExecOutcome {
             finish,
             command_status,
             stdout: raw.stdout.captured,
             stderr: raw.stderr.captured,
+            disposition,
+            cleanup,
         }
     }
 
-    async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
-        self.remove_until(
-            id,
-            Instant::now() + REMOVE_TIMEOUT,
-            &CancellationToken::new(),
-        )
-        .await
+    #[cfg(test)]
+    fn with_cgroup_root(bin: PathBuf, cgroup_root: &Path) -> Self {
+        Self {
+            bin,
+            cgroup_root: cgroup_root.to_path_buf(),
+        }
+    }
+}
+
+impl Runtime for DirectKilnRuntime {
+    fn name(&self) -> &'static str {
+        "kiln"
     }
 
-    async fn list(&self) -> Result<Vec<BackendSandbox>, RuntimeError> {
-        self.list_until(Instant::now() + QUERY_TIMEOUT, &CancellationToken::new())
+    fn capabilities(&self) -> RuntimeCapabilities {
+        legacy_capabilities()
+    }
+
+    async fn version(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<String, RuntimeError> {
+        let caps = self.capabilities(None, deadline, cancel).await?;
+        Ok(format!(
+            "{}: {} {} (persistent-exec v1)",
+            self.bin.display(),
+            caps.package,
+            caps.provenance
+        ))
+    }
+
+    async fn validate_sandbox(
+        &self,
+        id: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(), RuntimeError> {
+        check_id(id)?;
+        match self.capabilities(Some(id), deadline, cancel).await {
+            Ok(_) => Ok(()),
+            Err(probe_error) => {
+                if cancel.is_cancelled() || Instant::now() >= deadline {
+                    return Err(RuntimeError::Incompatible(format!(
+                        "{probe_error}; sandbox presence was not observed: no remaining deadline/cancellation budget"
+                    )));
+                }
+                match self.list_until(deadline, cancel).await {
+                    Ok(sandboxes) if !sandboxes.iter().any(|sandbox| sandbox.id == id) => {
+                        if cancel.is_cancelled() || Instant::now() >= deadline {
+                            return Err(RuntimeError::Incompatible(format!(
+                                "{probe_error}; sandbox absence was not confirmed within the original deadline/cancellation budget"
+                            )));
+                        }
+                        let cgroup = self.cgroup_root.join(id);
+                        match tokio::fs::metadata(&cgroup).await {
+                            Ok(_) => Err(RuntimeError::Incompatible(format!(
+                                "{probe_error}; kiln ls omitted sandbox {id}, but its cgroup {} still exists",
+                                cgroup.display()
+                            ))),
+                            Err(error) if error.kind() == ErrorKind::NotFound => {
+                                Err(RuntimeError::NotFound(id.into()))
+                            }
+                            Err(error) => Err(RuntimeError::Incompatible(format!(
+                                "{probe_error}; sandbox presence could not be confirmed: inspect cgroup {}: {error}",
+                                cgroup.display()
+                            ))),
+                        }
+                    }
+                    Ok(_) => Err(probe_error),
+                    Err(observation_error) => Err(RuntimeError::Incompatible(format!(
+                        "{probe_error}; sandbox presence could not be confirmed: {observation_error}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    async fn prepare(
+        &self,
+        _context: &CreateContext,
+        spec: &SandboxSpec,
+        _deadline: Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<PreparedCreate, RuntimeError> {
+        Ok(PreparedCreate::legacy(spec.clone(), KILN_PROFILE))
+    }
+
+    async fn create(
+        &self,
+        _context: &CreateContext,
+        prepared: &PreparedCreate,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<CreatedSandbox, CreateFailure> {
+        self.create_until(prepared.spec(), deadline, cancel)
             .await
+            .map(|backend_id| CreatedSandbox {
+                backend_id,
+                receipt: RuntimeReceipt::Legacy,
+            })
     }
 
-    async fn gc(&self, ids: &[String]) -> Result<Vec<String>, RuntimeError> {
-        self.gc_until(
-            ids,
-            Instant::now() + QUERY_TIMEOUT,
-            &CancellationToken::new(),
-        )
-        .await
+    async fn inspect_allocation(
+        &self,
+        _context: &CreateContext,
+        _prepared_digest: &Digest,
+        _deadline: Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<AllocationObservation, RuntimeError> {
+        Ok(AllocationObservation::Unsupported)
+    }
+
+    async fn fence_absent(
+        &self,
+        _context: &CreateContext,
+        _prepared_digest: &Digest,
+        _deadline: Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<AbsenceReceipt, RuntimeError> {
+        Err(unsupported_token())
+    }
+
+    async fn exec(
+        &self,
+        id: &str,
+        _execution: &ExecutionContext,
+        spec: &ExecSpec<'_>,
+        cancel: &CancellationToken,
+    ) -> ExecOutcome {
+        self.exec_direct(id, spec, cancel).await
+    }
+
+    async fn remove(
+        &self,
+        id: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<AbsenceReceipt, RuntimeError> {
+        self.remove_until(id, deadline, cancel).await?;
+        Ok(AbsenceReceipt::Legacy(LegacyAbsence {
+            backend_id: id.into(),
+            proof: LegacyProof::StrictRemoval,
+        }))
+    }
+
+    async fn list(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<BackendInventory, RuntimeError> {
+        Ok(legacy_inventory(self.list_until(deadline, cancel).await?))
+    }
+
+    async fn gc(
+        &self,
+        ids: &[String],
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
+        Ok(self
+            .gc_until(ids, deadline, cancel)
+            .await?
+            .into_iter()
+            .map(|backend_id| {
+                AbsenceReceipt::Legacy(LegacyAbsence {
+                    backend_id,
+                    proof: LegacyProof::ScopedGc,
+                })
+            })
+            .collect())
     }
 }
 
@@ -858,6 +978,40 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
+    impl DirectKilnRuntime {
+        async fn create_now(&self, spec: &SandboxSpec) -> Result<String, CreateFailure> {
+            self.create_until(
+                spec,
+                Instant::now() + CREATE_TIMEOUT,
+                &CancellationToken::new(),
+            )
+            .await
+        }
+
+        async fn remove_now(&self, id: &str) -> Result<(), RuntimeError> {
+            self.remove_until(
+                id,
+                Instant::now() + REMOVE_TIMEOUT,
+                &CancellationToken::new(),
+            )
+            .await
+        }
+
+        async fn list_now(&self) -> Result<Vec<BackendSandbox>, RuntimeError> {
+            self.list_until(Instant::now() + QUERY_TIMEOUT, &CancellationToken::new())
+                .await
+        }
+
+        async fn gc_now(&self, ids: &[String]) -> Result<Vec<String>, RuntimeError> {
+            self.gc_until(
+                ids,
+                Instant::now() + QUERY_TIMEOUT,
+                &CancellationToken::new(),
+            )
+            .await
+        }
+    }
+
     fn fixture_runtime(tmp: &Path, body: &str) -> DirectKilnRuntime {
         let bin = tmp.join("kiln");
         fixture(&bin, body);
@@ -998,6 +1152,90 @@ mod tests {
         }
     }
 
+    /// The adapter wraps existing behavior in typed results and adds no new action.
+    #[tokio::test]
+    async fn kiln_prepare_wraps_the_spec_and_has_no_allocation_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = failed_id_probe_runtime(tmp.path(), false, None);
+        let trace = tmp.path().join("calls");
+        let cancel = CancellationToken::new();
+        let soon = Instant::now() + QUERY_TIMEOUT;
+        let context = CreateContext {
+            instance_id: crate::model::Id128::random(),
+            allocation_id: crate::model::Id128::random(),
+            sandbox_id: crate::model::new_id("sb"),
+        };
+        let mut requested = spec(Network::Full);
+        requested.labels.insert("k".into(), "v".into());
+        let prepared = runtime
+            .prepare(&context, &requested, soon, &cancel)
+            .await
+            .unwrap();
+        assert!(!trace.exists(), "prepare must not reach the backend");
+        assert_eq!(prepared.spec(), &requested);
+        assert_eq!(
+            prepared.regime(),
+            crate::runtime::EvidenceRegime::LegacyLocal
+        );
+        assert_eq!(prepared.backend_plan(), b"");
+        assert_eq!(prepared.plan_version(), 0);
+        assert_eq!(prepared.runtime_profile(), KILN_PROFILE);
+        let reservation = prepared.reservation();
+        assert_eq!(reservation.memory_bytes, requested.memory_bytes);
+        assert_eq!(reservation.disk_bytes, requested.disk_bytes);
+        assert_eq!(reservation.pids, u64::from(requested.pids));
+        assert_eq!(
+            (
+                reservation.host_cpu_millis,
+                reservation.virtual_cpu_slots,
+                reservation.host_pids
+            ),
+            (0, 0, 0),
+            "legacy CPU, vCPU and host PIDs are explicitly not reserved"
+        );
+        assert_eq!(
+            (
+                prepared.host_spec_sha256(),
+                prepared.guest_exec_spec_sha256()
+            ),
+            crate::model::spec_digests(&requested)
+        );
+        let digest = prepared.plan_digest();
+        assert_eq!(
+            runtime
+                .inspect_allocation(&context, &digest, soon, &cancel)
+                .await
+                .unwrap(),
+            AllocationObservation::Unsupported
+        );
+        assert!(matches!(
+            runtime.fence_absent(&context, &digest, soon, &cancel).await,
+            Err(RuntimeError::Unsupported(_))
+        ));
+        assert!(!trace.exists(), "token recovery must not reach the backend");
+
+        // A strict removal is a legacy receipt; its bare NotFound stays NotFound,
+        // so nothing downstream can mistake it for allocation-level proof.
+        let removed = runtime.remove("abcd", soon, &cancel).await;
+        let expected = AbsenceReceipt::Legacy(LegacyAbsence {
+            backend_id: "abcd".into(),
+            proof: LegacyProof::StrictRemoval,
+        });
+        assert!(
+            matches!(&removed, Ok(receipt) if *receipt == expected)
+                || matches!(removed, Err(RuntimeError::NotFound(_))),
+            "{removed:?}"
+        );
+        let inventory = runtime.list(soon, &cancel).await.unwrap();
+        assert!(inventory.complete);
+        assert_eq!(inventory.generation, 0);
+        assert!(runtime.gc(&[], soon, &cancel).await.unwrap().is_empty());
+        let caps = Runtime::capabilities(&runtime);
+        assert_eq!(caps.accounting, AccountingAuthority::LocalLegacy);
+        assert!(caps.interruption_preserves_session);
+        assert!(!caps.checkpoint);
+    }
+
     #[tokio::test]
     async fn remove_accepts_only_confirmed_absence() {
         for rm_succeeds in [true, false] {
@@ -1012,7 +1250,7 @@ mod tests {
             );
             fs::write(&runtime.bin, source).unwrap();
             assert!(matches!(
-                runtime.remove("abcd").await,
+                runtime.remove_now("abcd").await,
                 Ok(()) | Err(RuntimeError::NotFound(_))
             ));
         }
@@ -1186,7 +1424,7 @@ mod tests {
         let body =
             format!("os.write(1,b'ID\\tSTATUS\\tSHIM\\n'+b'a'*{CONTROL_OUTPUT}); sys.exit(0)");
         let runtime = failed_id_probe_runtime(tmp.path(), false, Some(&body));
-        let error = runtime.list().await.unwrap_err();
+        let error = runtime.list_now().await.unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1208,14 +1446,17 @@ mod tests {
         );
         fs::write(&runtime.bin, source).unwrap();
 
-        assert!(runtime.gc(&[]).await.unwrap().is_empty());
+        assert!(runtime.gc_now(&[]).await.unwrap().is_empty());
         assert_eq!(
-            runtime.gc(&["abcd".into(), "beef".into()]).await.unwrap(),
+            runtime
+                .gc_now(&["abcd".into(), "beef".into()])
+                .await
+                .unwrap(),
             ["abcd"]
         );
         assert_eq!(fs::read_to_string(trace).unwrap(), "gc abcd beef\n");
 
-        let error = runtime.gc(&["beef".into()]).await.unwrap_err();
+        let error = runtime.gc_now(&["beef".into()]).await.unwrap_err();
         assert!(error.to_string().contains("outside its requested scope"));
     }
 
@@ -1367,7 +1608,7 @@ mod tests {
     async fn execute(runtime: &DirectKilnRuntime) -> ExecOutcome {
         let argv = vec!["--status-fd=999".into(), "ignored".into()];
         runtime
-            .exec(
+            .exec_direct(
                 "abcd",
                 &ExecSpec {
                     argv: &argv,
@@ -1430,7 +1671,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(if timeout { 1 } else { 5 }),
                 max_output: 1024,
             };
-            let (out, ()) = tokio::join!(runtime.exec("abcd", &spec, &cancel), async {
+            let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
                 wait_marker(&marker).await;
                 if !timeout {
                     cancel.cancel();
@@ -1478,7 +1719,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(if timeout { 1 } else { 5 }),
                 max_output: 1024,
             };
-            let (out, ()) = tokio::join!(runtime.exec("abcd", &spec, &cancel), async {
+            let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
                 wait_marker(&marker).await;
                 if !timeout {
                     cancel.cancel();
@@ -1522,7 +1763,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(5),
                 max_output: 1024,
             };
-            let (out, ()) = tokio::join!(runtime.exec("abcd", &spec, &cancel), async {
+            let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
                 wait_marker(&marker).await;
                 cancel.cancel();
             });
@@ -1550,7 +1791,7 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 1024,
         };
-        let (out, ()) = tokio::join!(runtime.exec("abcd", &spec, &cancel), async {
+        let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
             wait_marker(&marker).await;
             cancel.cancel();
         });
@@ -1737,13 +1978,13 @@ mod tests {
             max_output: 1,
         };
         assert_eq!(
-            runtime.exec("abcd", &spec, &cancel).await.finish,
+            runtime.exec_direct("abcd", &spec, &cancel).await.finish,
             Ok(ExecFinish::Canceled)
         );
         spec.deadline = Instant::now() - Duration::from_secs(1);
         assert_eq!(
             runtime
-                .exec("abcd", &spec, &CancellationToken::new())
+                .exec_direct("abcd", &spec, &CancellationToken::new())
                 .await
                 .finish,
             Ok(ExecFinish::TimedOut)
@@ -1763,7 +2004,10 @@ mod tests {
             ),
         );
         if capabilities_v1 {
-            source = source.replace("os.write(1,CAPS)", "os.write(1,CAPS[:16]+b'\\x0f'+CAPS[17:])");
+            source = source.replace(
+                "os.write(1,CAPS)",
+                "os.write(1,CAPS[:16]+b'\\x0f'+CAPS[17:])",
+            );
         }
         fs::write(&runtime.bin, source).unwrap();
         runtime
@@ -1785,7 +2029,7 @@ mod tests {
             false,
             "os.write(2,b'image missing'); sys.exit(124)",
         );
-        let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+        let failure = runtime.create_now(&spec(Network::None)).await.unwrap_err();
         assert_eq!(failure.certainty(), CreateCertainty::DefinitelyNotCreated);
         assert!(failure.to_string().contains("image missing"), "{failure}");
         // The gate runs for this exact create, then the flagged create follows.
@@ -1822,7 +2066,7 @@ mod tests {
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let runtime = create_fixture(tmp.path(), false, body);
-            let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+            let failure = runtime.create_now(&spec(Network::None)).await.unwrap_err();
             assert_eq!(
                 failure.certainty(),
                 CreateCertainty::AllocationAmbiguous,
@@ -1835,9 +2079,13 @@ mod tests {
     #[tokio::test]
     async fn create_succeeds_with_the_unchanged_id_format() {
         let tmp = tempfile::tempdir().unwrap();
-        let runtime = create_fixture(tmp.path(), false, "print('18de453339a8cc89-3762'); sys.exit(0)");
+        let runtime = create_fixture(
+            tmp.path(),
+            false,
+            "print('18de453339a8cc89-3762'); sys.exit(0)",
+        );
         assert_eq!(
-            runtime.create(&spec(Network::None)).await.unwrap(),
+            runtime.create_now(&spec(Network::None)).await.unwrap(),
             "18de453339a8cc89-3762"
         );
     }
@@ -1853,7 +2101,7 @@ mod tests {
             &format!("if sys.argv[1:]==['gc','--help']:\n    os.remove({bin:?})"),
         );
         fs::write(&bin, source).unwrap();
-        let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+        let failure = runtime.create_now(&spec(Network::None)).await.unwrap_err();
         assert!(matches!(failure.error(), RuntimeError::Io(_)), "{failure}");
         assert_eq!(failure.certainty(), CreateCertainty::AllocationAmbiguous);
     }
@@ -1897,7 +2145,7 @@ mod tests {
         // A legacy CLI cannot have exit 124 trusted, or even be asked to create.
         let tmp = tempfile::tempdir().unwrap();
         let runtime = create_fixture(tmp.path(), true, "print('abcd'); sys.exit(124)");
-        let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+        let failure = runtime.create_now(&spec(Network::None)).await.unwrap_err();
         assert_eq!(failure.certainty(), CreateCertainty::DefinitelyNotCreated);
         assert!(matches!(failure.error(), RuntimeError::Incompatible(_)));
         assert!(failure.to_string().contains("0x10"), "{failure}");
@@ -1909,7 +2157,11 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let failure = runtime
-            .create_until(&spec(Network::None), Instant::now() + QUERY_TIMEOUT, &cancel)
+            .create_until(
+                &spec(Network::None),
+                Instant::now() + QUERY_TIMEOUT,
+                &cancel,
+            )
             .await
             .unwrap_err();
         assert_eq!(failure.certainty(), CreateCertainty::DefinitelyNotCreated);
@@ -1928,7 +2180,7 @@ mod tests {
                 "\n    if '--require-exec-protocol=1' in sys.argv:\n        os.write(2,b'unexpected argument'); sys.exit(2)\n    open({marker:?},'w').close(); print('abcd'); sys.exit(0)"
             ),
         );
-        let failure = runtime.create(&spec(Network::None)).await.unwrap_err();
+        let failure = runtime.create_now(&spec(Network::None)).await.unwrap_err();
         assert_eq!(failure.certainty(), CreateCertainty::AllocationAmbiguous);
         assert!(!marker.exists());
     }
@@ -1948,7 +2200,10 @@ mod tests {
         let cancel = CancellationToken::new();
         let deadline = Instant::now() + QUERY_TIMEOUT;
         runtime.version(deadline, &cancel).await.unwrap();
-        runtime.validate_sandbox("abcd", deadline, &cancel).await.unwrap();
+        runtime
+            .validate_sandbox("abcd", deadline, &cancel)
+            .await
+            .unwrap();
 
         // A CLI without the bit is refused before reconciliation looks at
         // anything, and a usable-looking per-ID frame cannot substitute for it.
@@ -2089,6 +2344,8 @@ mod tests {
             set_events(&events, "populated 0\n");
         });
         assert!(start.elapsed() >= Duration::from_millis(600));
+        assert_eq!(out.disposition, SandboxDisposition::Reusable);
+        assert_eq!(out.cleanup, CleanupEvidence::RuntimeDrained);
         assert_eq!(out.finish.unwrap_err().kind, Kind::Protocol);
         assert_eq!(out.stdout.data, b"beforeafter");
         assert_eq!(out.stdout.total_bytes, 11);
@@ -2104,6 +2361,8 @@ mod tests {
         );
         fs::remove_file(runtime.cgroup_root.join("abcd/exec/cgroup.events")).unwrap();
         let out = execute(&runtime).await;
+        assert_eq!(out.disposition, SandboxDisposition::Quarantined);
+        assert_eq!(out.cleanup, CleanupEvidence::Unknown);
         assert_eq!(
             (
                 out.finish.as_ref().unwrap_err().kind,
@@ -2279,7 +2538,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(30),
                 max_output: 1024,
             };
-            runtime.exec("abcd", &spec, &task_cancel).await
+            runtime.exec_direct("abcd", &spec, &task_cancel).await
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             while !started.exists() {

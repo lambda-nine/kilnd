@@ -46,6 +46,9 @@ service KilndService {
   // cancellation but the daemon retains cleanup and finalization ownership.
   // Cancellation does not undo command side effects. A disconnected caller
   // can find recent execution IDs with GetSandbox, then use GetExecution.
+  // A successful RPC does not mean the sandbox survived: check the execution's
+  // sandbox_reusable before assuming it can take another call. LOST and QUARANTINED
+  // sandboxes fail FAILED_PRECONDITION.
   rpc Exec(ExecRequest) returns (ExecResponse);
 
   // Returns one execution, including its captured output.
@@ -75,14 +78,41 @@ message HealthResponse {
   uint32 running_executions = 8;
   AdmissionStats admission = 9;
   NodeResourceStats node_resources = 10;
+  RuntimeCapabilities runtime_capabilities = 11;
+}
+
+// Generic facts about this daemon's execution backend. Clients check these
+// rather than assuming a backend's behavior.
+message RuntimeCapabilities {
+  // Network modes the backend can enforce. Other modes fail before allocation.
+  repeated NetworkMode network_modes = 1;
+  // False when any interruption after dispatch retires the sandbox.
+  bool interruption_preserves_session = 2;
+  bool checkpoint = 3;
+}
+
+// Where NodeResourceStats' totals came from.
+enum NodeAccountingStatus {
+  NODE_ACCOUNTING_STATUS_UNSPECIFIED = 0;
+  // This daemon's own durable reservation sums. The backend reserves no host CPU,
+  // virtual CPU slots or host PIDs, so those fields are zero.
+  NODE_ACCOUNTING_STATUS_LOCAL_LEGACY = 1;
+  // Totals from the node's accounting authority, as of the stated generation.
+  NODE_ACCOUNTING_STATUS_AUTHORITATIVE = 2;
+  // The last authoritative totals, older than the authority's freshness bound.
+  NODE_ACCOUNTING_STATUS_STALE = 3;
+  // The authority cannot be read. All totals are zero and mean nothing: a daemon
+  // never substitutes its own sums for node totals.
+  NODE_ACCOUNTING_STATUS_UNAVAILABLE = 4;
 }
 
 // Durable capacity promised to owned or ambiguous sandbox rows. These are hard
 // reservation sums, not measured live consumption. FAILED without a backend ID
 // remains reserved because a create error may be ambiguous, unless the backend
 // proved the failure preceded any allocation; that FAILED and compensated FAILED
-// with the exact removed backend ID release. LOST remains reserved because
-// reconciliation may restore it to READY.
+// with the exact removed backend ID release. LOST and QUARANTINED remain reserved.
+// A backend with allocation-level recovery releases only with durable proof that
+// the allocation is absent. Check accounting_status before reading any total.
 message NodeResourceStats {
   uint64 max_sandboxes = 1;
   uint64 reserved_sandboxes = 2;
@@ -94,6 +124,17 @@ message NodeResourceStats {
   uint64 reserved_disk_bytes = 8;
   // Create requests rejected by these budgets since daemon startup.
   uint64 rejected_creates = 9;
+  uint64 max_host_cpu_millis = 10;
+  uint64 reserved_host_cpu_millis = 11;
+  uint64 max_virtual_cpu_slots = 12;
+  uint64 reserved_virtual_cpu_slots = 13;
+  uint64 max_host_pids = 14;
+  uint64 reserved_host_pids = 15;
+  NodeAccountingStatus accounting_status = 16;
+  // The authority's snapshot generation; zero when it has none.
+  uint64 accounting_generation = 17;
+  // When the authority's snapshot was observed; zero when it has none.
+  int64 accounting_observed_at_unix_ms = 18;
 }
 
 // Current use and cumulative admission rejections since daemon startup.
@@ -129,9 +170,25 @@ enum SandboxState {
   SANDBOX_STATE_DELETED = 4;
   // Creation failed; see failure_reason. Delete it to clear the record.
   SANDBOX_STATE_FAILED = 5;
-  // The backend no longer has it (host reboot, crashed shim). Delete it to
-  // clear the record.
+  // The backend no longer has it (host reboot, crashed shim) or an interruption
+  // retired it. Delete it to clear the record.
   SANDBOX_STATE_LOST = 6;
+  // A potentially owned backend cannot safely run commands because cleanup or
+  // reuse could not be established. Exec fails FAILED_PRECONDITION; it stays
+  // charged until DeleteSandbox proves it gone.
+  SANDBOX_STATE_QUARANTINED = 7;
+}
+
+// Host commitments, stored independently of the spec's tool limits.
+message ResourceReservation {
+  uint64 memory_bytes = 1;
+  uint64 disk_bytes = 2;
+  // The conservative aggregate; host_pids is a component, not another amount.
+  uint64 pids = 3;
+  // Zero on a backend that does not reserve it.
+  uint64 host_cpu_millis = 4;
+  uint64 virtual_cpu_slots = 5;
+  uint64 host_pids = 6;
 }
 
 enum NetworkMode {
@@ -201,6 +258,13 @@ message Sandbox {
   // The uid of the local caller that created it. Fixed at creation. Only this
   // uid and root (0) can see or use the sandbox; older sandboxes belong to root.
   uint32 owner_uid = 10;
+  // Effective host commitments, distinct from the spec's tool limits.
+  ResourceReservation reservation = 11;
+  // Operator-selected execution profile. Descriptive, never caller-selectable;
+  // empty for historical rows.
+  string runtime_profile = 12;
+  // Backend-neutral provenance digest; empty when the backend has none.
+  string runtime_artifact_digest = 13;
 }
 
 message CreateSandboxRequest {
@@ -292,6 +356,17 @@ enum ExecutionState {
   EXECUTION_STATE_INTERRUPTED = 6;
 }
 
+// How execution cleanup was established. No stronger attestation is claimed.
+enum CleanupEvidence {
+  // Historical rows and executions whose cleanup could not be established.
+  CLEANUP_EVIDENCE_UNKNOWN = 0;
+  CLEANUP_EVIDENCE_NO_CHILD_STARTED = 1;
+  // The trusted runtime inside the sandbox drained the command's processes.
+  CLEANUP_EVIDENCE_RUNTIME_DRAINED = 2;
+  // The whole sandbox stopped, so no process of this command can remain.
+  CLEANUP_EVIDENCE_SANDBOX_STOPPED = 3;
+}
+
 // Captured output, cut at the daemon's per-stream limit.
 message Output {
   // The first bytes of the stream, up to the limit.
@@ -327,6 +402,10 @@ message Execution {
   Output stderr = 12;
   CommandStatus command_status = 13;
   RuntimeDiagnostic runtime_error = 14;
+  // Absent when unknown, including every historical row. False means this sandbox
+  // cannot take another call, even when this RPC succeeded.
+  optional bool sandbox_reusable = 15;
+  CleanupEvidence cleanup_evidence = 16;
 }
 
 message CommandStatus {

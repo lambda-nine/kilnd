@@ -6,20 +6,29 @@
 //! - `sleep`: waits until the timeout or cancellation
 //! - `spew N`: writes N bytes to stdout
 //! - `vanish`: the sandbox disappears mid-command, like a crashed shim
+//! - `cleanup-fail`: the command ends but its cleanup cannot be confirmed
 //! - anything else: exits 127
+//!
+//! Evidence comes in two modes. The default [`FakeEvidenceMode::Legacy`] behaves
+//! like kiln: a backend ID and legacy proof. [`FakeEvidenceMode::Fenced`] models the
+//! allocation-token contract: an immutable plan per token, a monotonic node
+//! generation and permanent absence fences, with no real workers or helper ledger.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BackendSandbox, BackendStatus, CreateFailure, ExecFinish, ExecOutcome, ExecSpec, Runtime,
-    RuntimeError,
+    AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendInventory, BackendRecord,
+    BackendStatus, CreateContext, CreateFailure, CreatedSandbox, ExecFinish, ExecOutcome, ExecSpec,
+    ExecutionContext, FencedAbsence, LegacyAbsence, LegacyProof, PreparedCreate, ReadyReceipt,
+    Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt, legacy_exec_evidence,
 };
 use crate::model::{
-    Captured, CommandStatus, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage, SandboxSpec,
+    Captured, CleanupEvidence, CommandStatus, Digest, Id128, Network, RuntimeDiagnostic,
+    RuntimeErrorKind, RuntimeStage, SandboxDisposition, SandboxSpec,
 };
 
 /// A deterministic one-shot pause for lifecycle tests. Tests wait for
@@ -62,8 +71,127 @@ impl FakeGate {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FakeEvidenceMode {
+    #[default]
+    Legacy,
+    Fenced,
+}
+
+/// A durable helper phase, in order. Reaching one means its journal write landed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FakePhase {
+    /// C2: the node claim and INTENT committed in one transaction.
+    Intent,
+    /// C3: PREPARING; partial files, mounts or cgroups may exist.
+    Preparing,
+    /// C4: SPAWN_INTENT.
+    SpawnIntent,
+    /// C5: BOOTING.
+    Booting,
+    /// C6: READY.
+    Ready,
+    /// No process remains, but resources do.
+    Stopped,
+}
+
+impl FakePhase {
+    const CREATE_PATH: [Self; 5] = [
+        Self::Intent,
+        Self::Preparing,
+        Self::SpawnIntent,
+        Self::Booting,
+        Self::Ready,
+    ];
+}
+
+/// A post-C1 rejection before INTENT. Each stays ambiguous until fenced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeRejection {
+    Collision,
+    CatalogMismatch,
+    DeadlineExpired,
+    CapacityExhausted,
+    Panic,
+}
+
+/// One allocation in the modeled helper ledger. Its plan never changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeAllocation {
+    pub instance_id: Id128,
+    pub plan_digest: Digest,
+    pub phase: FakePhase,
+    pub generation: u64,
+    pub boot_id: String,
+    pub uncertain_execution: bool,
+}
+
+/// How a test corrupts an otherwise valid receipt identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeForgery {
+    Node,
+    Instance,
+    Allocation,
+    Plan,
+    /// A positive absence generation older than anything the helper has since
+    /// published. On a ready reply this is generation zero, which no ledger issues.
+    StaleGeneration,
+    /// A ready reply with no boot identity.
+    EmptyBoot,
+}
+
+/// Fault switches for the fenced mode. Everything is explicit and deterministic;
+/// the defaults model a healthy helper.
+#[derive(Default)]
+pub struct FakeFenced {
+    pub node_id: Option<Id128>,
+    pub node_generation: u64,
+    pub allocations: BTreeMap<Id128, FakeAllocation>,
+    /// Permanent retired-token fences; nothing removes an entry.
+    pub fences: BTreeMap<Id128, FencedAbsence>,
+    /// Allocations ever claimed. A retried token never increases this.
+    pub claims_made: u64,
+    pub fail_prepare: Option<String>,
+    pub prepare_gate: Option<FakeGate>,
+    pub prepare_panics: bool,
+    /// Preflight finishes even after cancellation, so only the manager's own
+    /// recheck stands between it and an allocation.
+    pub prepare_ignores_cancel: bool,
+    pub prepare_calls: u32,
+    /// Holds the next create calls, in order, before their fence lookup.
+    pub queued_create_gates: VecDeque<FakeGate>,
+    pub rejection: Option<FakeRejection>,
+    /// One-shot pause just after a phase's journal write lands.
+    pub phase_gates: BTreeMap<FakePhase, FakeGate>,
+    /// Returns an ambiguous error just after reaching this phase.
+    pub stop_at: Option<FakePhase>,
+    /// READY commits but the reply is lost, once.
+    pub lose_ready_reply: bool,
+    /// The fence transaction cannot commit.
+    pub fence_unavailable: Option<String>,
+    /// One-shot pause after quiescence, before the fence's durable commit.
+    pub fence_gate: Option<FakeGate>,
+    /// The fence commits but its reply is lost, once.
+    pub lose_fence_reply: bool,
+    /// Removal finished and ABSENT committed, but the reply is lost, once.
+    pub lose_remove_reply: bool,
+    pub fence_calls: u32,
+    pub forge: Option<FakeForgery>,
+    /// One-shot: the next exec reports this disposition and evidence, whatever
+    /// actually happened, as a broken or compromised backend could.
+    pub forge_exec_claim: Option<(SandboxDisposition, CleanupEvidence)>,
+    pub inspect_unavailable: bool,
+    /// Replaces every observation, for evidence a real helper could report.
+    pub observation_override: Option<AllocationObservation>,
+    pub inventory_incomplete: bool,
+    pub inventory_duplicates: bool,
+    pub inventory_extra: Vec<BackendRecord>,
+}
+
 #[derive(Default)]
 pub struct FakeState {
+    pub mode: FakeEvidenceMode,
+    pub fenced: FakeFenced,
     pub sandboxes: BTreeMap<String, BackendStatus>,
     /// Specs passed to `create`, in order.
     pub created: Vec<SandboxSpec>,
@@ -150,6 +278,362 @@ impl FakeRuntime {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A healthy allocation-token backend for one fixed node.
+    pub fn fenced() -> Self {
+        let fake = Self::default();
+        {
+            let mut state = fake.state();
+            state.mode = FakeEvidenceMode::Fenced;
+            state.fenced.node_id = Some(Id128::random());
+        }
+        fake
+    }
+
+    fn fenced_node(state: &FakeState) -> Id128 {
+        state.fenced.node_id.expect("fenced mode has a node ID")
+    }
+
+    fn next_generation(fenced: &mut FakeFenced) -> u64 {
+        fenced.node_generation += 1;
+        fenced.node_generation
+    }
+
+    /// The commit of one fence: a permanent ledger entry and its receipt. Fences
+    /// are never rewritten, so a replay can only observe this exact value.
+    fn commit_fence(
+        fenced: &mut FakeFenced,
+        node_id: Id128,
+        instance_id: Id128,
+        allocation_id: Id128,
+        plan_digest: Digest,
+    ) -> Result<FencedAbsence, RuntimeError> {
+        let generation = Self::next_generation(fenced);
+        let receipt = FencedAbsence::new(
+            Id128::random(),
+            node_id,
+            instance_id,
+            allocation_id,
+            plan_digest,
+            generation,
+            "fake: no owned process, file, mount or cgroup remains".into(),
+        )?;
+        fenced.fences.insert(allocation_id, receipt.clone());
+        fenced.allocations.remove(&allocation_id);
+        Ok(receipt)
+    }
+
+    /// A forged result leaves the ledger untouched: it models a wrong answer.
+    fn delivered(
+        fenced: &FakeFenced,
+        receipt: FencedAbsence,
+    ) -> Result<FencedAbsence, RuntimeError> {
+        let Some(forgery) = fenced.forge else {
+            return Ok(receipt);
+        };
+        let other = Id128::random();
+        FencedAbsence::new(
+            receipt.receipt_id(),
+            if forgery == FakeForgery::Node {
+                other
+            } else {
+                receipt.node_id()
+            },
+            if forgery == FakeForgery::Instance {
+                other
+            } else {
+                receipt.instance_id()
+            },
+            if forgery == FakeForgery::Allocation {
+                other
+            } else {
+                receipt.allocation_id()
+            },
+            if forgery == FakeForgery::Plan {
+                Digest::of(b"forged")
+            } else {
+                receipt.plan_digest()
+            },
+            if forgery == FakeForgery::StaleGeneration {
+                1
+            } else {
+                receipt.helper_generation()
+            },
+            String::new(),
+        )
+    }
+
+    fn ready_receipt(
+        state: &FakeState,
+        allocation_id: Id128,
+        allocation: &FakeAllocation,
+    ) -> ReadyReceipt {
+        ReadyReceipt {
+            node_id: Self::fenced_node(state),
+            instance_id: allocation.instance_id,
+            allocation_id,
+            plan_digest: allocation.plan_digest,
+            helper_generation: allocation.generation,
+            boot_id: allocation.boot_id.clone(),
+        }
+    }
+
+    async fn create_fenced(
+        &self,
+        context: &CreateContext,
+        prepared: &PreparedCreate,
+        deadline: tokio::time::Instant,
+    ) -> Result<CreatedSandbox, CreateFailure> {
+        let allocation_id = context.allocation_id;
+        let queued = self.state().fenced.queued_create_gates.pop_front();
+        if let Some(gate) = queued {
+            gate.hold().await;
+        }
+        {
+            let mut guard = self.state();
+            let state = &mut *guard;
+            // Every lookup precedes revalidation, so a fence wins over any cause
+            // and an existing token never selects a new claim.
+            if let Some(fence) = state.fenced.fences.get(&allocation_id) {
+                let error = RuntimeError::Backend(format!("allocation {allocation_id} is fenced"));
+                return Err(CreateFailure::absent_fenced(fence.clone(), error));
+            }
+            if let Some(existing) = state.fenced.allocations.get(&allocation_id) {
+                if existing.plan_digest != prepared.plan_digest() {
+                    return Err(RuntimeError::Backend(format!(
+                        "allocation {allocation_id} has a conflicting plan"
+                    ))
+                    .into());
+                }
+                if existing.phase == FakePhase::Ready {
+                    let backend_id = format!("fc-{allocation_id}");
+                    let receipt = Self::ready_receipt(state, allocation_id, existing);
+                    return Ok(CreatedSandbox {
+                        backend_id,
+                        receipt: RuntimeReceipt::Ready(receipt),
+                    });
+                }
+                return Err(RuntimeError::Backend(format!(
+                    "allocation {allocation_id} is still in {:?}",
+                    existing.phase
+                ))
+                .into());
+            }
+            let rejected = match state.fenced.rejection {
+                Some(FakeRejection::Panic) => panic!("injected fake create panic"),
+                Some(FakeRejection::Collision) => Some("identity candidate was claimed first"),
+                Some(FakeRejection::CatalogMismatch) => Some("deployment catalog changed"),
+                Some(FakeRejection::DeadlineExpired) => Some("create deadline expired"),
+                Some(FakeRejection::CapacityExhausted) => Some("node capacity exhausted"),
+                None if tokio::time::Instant::now() >= deadline => Some("create deadline expired"),
+                None => None,
+            };
+            if let Some(reason) = rejected {
+                return Err(RuntimeError::Backend(reason.into()).into());
+            }
+            state.fenced.claims_made += 1;
+            let generation = Self::next_generation(&mut state.fenced);
+            state.fenced.allocations.insert(
+                allocation_id,
+                FakeAllocation {
+                    instance_id: context.instance_id,
+                    plan_digest: prepared.plan_digest(),
+                    phase: FakePhase::Intent,
+                    generation,
+                    boot_id: format!("boot-{}", Id128::random()),
+                    uncertain_execution: false,
+                },
+            );
+            state.created.push(prepared.spec().clone());
+        }
+        for phase in FakePhase::CREATE_PATH {
+            let (gate, stop) = {
+                let mut guard = self.state();
+                let state = &mut *guard;
+                let generation = Self::next_generation(&mut state.fenced);
+                let Some(allocation) = state.fenced.allocations.get_mut(&allocation_id) else {
+                    return Err(RuntimeError::Backend(format!(
+                        "allocation {allocation_id} was fenced during create"
+                    ))
+                    .into());
+                };
+                allocation.phase = phase;
+                allocation.generation = generation;
+                if phase == FakePhase::Ready {
+                    state
+                        .sandboxes
+                        .insert(format!("fc-{allocation_id}"), BackendStatus::Ready);
+                }
+                (
+                    state.fenced.phase_gates.remove(&phase),
+                    state.fenced.stop_at == Some(phase),
+                )
+            };
+            if let Some(gate) = gate {
+                gate.hold().await;
+            }
+            if stop {
+                return Err(RuntimeError::Backend(format!(
+                    "injected create failure after {phase:?}"
+                ))
+                .into());
+            }
+        }
+        let mut guard = self.state();
+        let state = &mut *guard;
+        if std::mem::take(&mut state.fenced.lose_ready_reply) {
+            return Err(RuntimeError::Backend("helper reply lost after READY".into()).into());
+        }
+        let allocation = state
+            .fenced
+            .allocations
+            .get(&allocation_id)
+            .expect("just reached READY");
+        let mut receipt = Self::ready_receipt(state, allocation_id, allocation);
+        match state.fenced.forge {
+            Some(FakeForgery::Node) => receipt.node_id = Id128::random(),
+            Some(FakeForgery::Instance) => receipt.instance_id = Id128::random(),
+            Some(FakeForgery::Allocation) => receipt.allocation_id = Id128::random(),
+            Some(FakeForgery::Plan) => receipt.plan_digest = Digest::of(b"forged"),
+            Some(FakeForgery::StaleGeneration) => receipt.helper_generation = 0,
+            Some(FakeForgery::EmptyBoot) => receipt.boot_id = String::new(),
+            None => {}
+        }
+        Ok(CreatedSandbox {
+            backend_id: format!("fc-{allocation_id}"),
+            receipt: RuntimeReceipt::Ready(receipt),
+        })
+    }
+
+    async fn remove_fenced(&self, id: &str) -> Result<AbsenceReceipt, RuntimeError> {
+        let parsed = id
+            .strip_prefix("fc-")
+            .and_then(|hex| Id128::parse(hex).ok());
+        let Some(allocation_id) = parsed else {
+            return Err(RuntimeError::NotFound(id.to_string()));
+        };
+        let gate = {
+            let mut guard = self.state();
+            let state = &mut *guard;
+            state.remove_attempts.push(id.to_string());
+            if let Some(fence) = state.fenced.fences.get(&allocation_id).cloned() {
+                return Ok(AbsenceReceipt::Fenced(Self::delivered(
+                    &state.fenced,
+                    fence,
+                )?));
+            }
+            if !state.fenced.allocations.contains_key(&allocation_id) {
+                return Err(RuntimeError::NotFound(id.to_string()));
+            }
+            state.remove_before_delete.take()
+        };
+        if let Some(gate) = gate {
+            gate.hold().await;
+        }
+        let (receipt, after) = {
+            let mut guard = self.state();
+            let state = &mut *guard;
+            let node_id = Self::fenced_node(state);
+            let Some(allocation) = state.fenced.allocations.get_mut(&allocation_id) else {
+                return Err(RuntimeError::NotFound(id.to_string()));
+            };
+            if state.fail_remove {
+                // The VMM stopped; its disk and jail did not go away.
+                allocation.phase = FakePhase::Stopped;
+                state
+                    .sandboxes
+                    .insert(id.to_string(), BackendStatus::StoppedWithResources);
+                return Err(RuntimeError::Backend("fake remove failed".into()));
+            }
+            let (instance_id, plan_digest) = (allocation.instance_id, allocation.plan_digest);
+            let receipt = Self::commit_fence(
+                &mut state.fenced,
+                node_id,
+                instance_id,
+                allocation_id,
+                plan_digest,
+            )?;
+            state.sandboxes.remove(id);
+            state.removed.push(id.to_string());
+            (receipt, state.remove_after_delete.take())
+        };
+        if let Some(gate) = after {
+            gate.hold().await;
+        }
+        let mut state = self.state();
+        if std::mem::take(&mut state.fenced.lose_remove_reply) {
+            return Err(RuntimeError::Backend(
+                "helper reply lost after ABSENT".into(),
+            ));
+        }
+        Ok(AbsenceReceipt::Fenced(Self::delivered(
+            &state.fenced,
+            receipt,
+        )?))
+    }
+
+    fn fenced_inventory(&self) -> Result<BackendInventory, RuntimeError> {
+        let state = self.state();
+        if state.unavailable {
+            return Err(RuntimeError::Backend("fake backend unavailable".into()));
+        }
+        let mut records: Vec<BackendRecord> = state
+            .fenced
+            .allocations
+            .iter()
+            .map(|(allocation_id, allocation)| BackendRecord {
+                id: format!("fc-{allocation_id}"),
+                status: match allocation.phase {
+                    FakePhase::Ready if allocation.uncertain_execution => BackendStatus::Busy,
+                    FakePhase::Ready => BackendStatus::Ready,
+                    FakePhase::Stopped => BackendStatus::StoppedWithResources,
+                    _ => BackendStatus::Busy,
+                },
+                allocation_id: Some(*allocation_id),
+                plan_digest: Some(allocation.plan_digest),
+                generation: allocation.generation,
+            })
+            .collect();
+        records.extend(state.fenced.inventory_extra.iter().cloned());
+        if state.fenced.inventory_duplicates
+            && let Some(first) = records.first().cloned()
+        {
+            records.push(first);
+        }
+        Ok(BackendInventory {
+            records,
+            generation: state.fenced.node_generation,
+            complete: !state.fenced.inventory_incomplete,
+        })
+    }
+
+    /// Applies the fenced mode's reuse rules to a finished simulation.
+    fn fenced_evidence(&self, id: &str, outcome: &mut ExecOutcome) {
+        use SandboxDisposition::{Quarantined, Reusable, Stopped};
+        (outcome.disposition, outcome.cleanup) = match &outcome.finish {
+            Ok(ExecFinish::Completed) => (Reusable, CleanupEvidence::RuntimeDrained),
+            Ok(ExecFinish::TimedOut | ExecFinish::Canceled) => {
+                (Stopped, CleanupEvidence::SandboxStopped)
+            }
+            Err(d) if d.kind == RuntimeErrorKind::NotFound => {
+                (Stopped, CleanupEvidence::SandboxStopped)
+            }
+            Err(_) => (Quarantined, CleanupEvidence::Unknown),
+        };
+        if outcome.disposition == Stopped {
+            let mut guard = self.state();
+            let state = &mut *guard;
+            let token = id
+                .strip_prefix("fc-")
+                .and_then(|hex| Id128::parse(hex).ok());
+            if let Some(allocation) = token.and_then(|t| state.fenced.allocations.get_mut(&t)) {
+                allocation.phase = FakePhase::Stopped;
+                state
+                    .sandboxes
+                    .insert(id.to_string(), BackendStatus::StoppedWithResources);
+            }
+        }
+    }
+
     /// Adds a sandbox the way something other than kilnd would.
     pub fn insert(&self, status: BackendStatus) -> String {
         let mut s = self.state();
@@ -161,9 +645,23 @@ impl FakeRuntime {
 
     fn running(&self, id: &str) -> Result<(), RuntimeError> {
         match self.state().sandboxes.get(id) {
-            Some(BackendStatus::Running) => Ok(()),
+            Some(BackendStatus::Running | BackendStatus::Ready) => Ok(()),
             _ => Err(RuntimeError::NotFound(id.to_string())),
         }
+    }
+
+    /// Runs one simulated command. A fresh legacy execution keeps kiln's mapping;
+    /// the fenced mode applies its own reuse rules afterward.
+    fn with_evidence(&self, id: &str, mut outcome: ExecOutcome) -> ExecOutcome {
+        if self.state().mode == FakeEvidenceMode::Fenced {
+            self.fenced_evidence(id, &mut outcome);
+            if let Some(claim) = self.state().fenced.forge_exec_claim.take() {
+                (outcome.disposition, outcome.cleanup) = claim;
+            }
+        } else {
+            (outcome.disposition, outcome.cleanup) = legacy_exec_evidence(&outcome.finish);
+        }
+        outcome
     }
 }
 
@@ -181,12 +679,43 @@ fn exited(code: i32, stdout: Vec<u8>, max: usize) -> ExecOutcome {
             total_bytes_known: true,
         },
         stderr: Captured::known_empty(),
+        disposition: SandboxDisposition::Reusable,
+        cleanup: CleanupEvidence::RuntimeDrained,
+    }
+}
+
+fn no_output(finish: Result<ExecFinish, RuntimeDiagnostic>) -> ExecOutcome {
+    ExecOutcome {
+        finish,
+        command_status: None,
+        stdout: Captured::known_empty(),
+        stderr: Captured::known_empty(),
+        disposition: SandboxDisposition::Reusable,
+        cleanup: CleanupEvidence::RuntimeDrained,
     }
 }
 
 impl Runtime for FakeRuntime {
     fn name(&self) -> &'static str {
         "fake"
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        let fenced = self.state().mode == FakeEvidenceMode::Fenced;
+        RuntimeCapabilities {
+            network_modes: if fenced {
+                vec![Network::None]
+            } else {
+                vec![Network::None, Network::Full, Network::Allow(Vec::new())]
+            },
+            interruption_preserves_session: !fenced,
+            checkpoint: false,
+            accounting: if fenced {
+                AccountingAuthority::Node
+            } else {
+                AccountingAuthority::LocalLegacy
+            },
+        }
     }
 
     async fn version(
@@ -210,7 +739,9 @@ impl Runtime for FakeRuntime {
             };
             if let Some(error) = error {
                 let cleanup = self.state().version_cleanup_gate.take();
-                if let Some(cleanup) = cleanup { cleanup.hold().await; }
+                if let Some(cleanup) = cleanup {
+                    cleanup.hold().await;
+                }
                 return Err(RuntimeError::Backend(error.into()));
             }
         }
@@ -221,7 +752,73 @@ impl Runtime for FakeRuntime {
         Ok("fake 1.0".into())
     }
 
-    async fn create(&self, spec: &SandboxSpec) -> Result<String, CreateFailure> {
+    async fn prepare(
+        &self,
+        _context: &CreateContext,
+        spec: &SandboxSpec,
+        deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedCreate, RuntimeError> {
+        let (node_id, gate, fail, panics, ignores_cancel) = {
+            let mut state = self.state();
+            if state.mode == FakeEvidenceMode::Legacy {
+                return Ok(PreparedCreate::legacy(spec.clone(), "fake"));
+            }
+            state.fenced.prepare_calls += 1;
+            (
+                Self::fenced_node(&state),
+                state.fenced.prepare_gate.take(),
+                state.fenced.fail_prepare.clone(),
+                state.fenced.prepare_panics,
+                state.fenced.prepare_ignores_cancel,
+            )
+        };
+        if let Some(gate) = gate {
+            if ignores_cancel {
+                gate.hold().await;
+            } else {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return Err(RuntimeError::Backend("preflight canceled".into()));
+                    }
+                    () = tokio::time::sleep_until(deadline) => {
+                        return Err(RuntimeError::Backend("preflight timed out".into()));
+                    }
+                    () = gate.hold() => {}
+                }
+            }
+        }
+        assert!(!panics, "injected fake prepare panic");
+        if let Some(message) = fail {
+            return Err(RuntimeError::Incompatible(message));
+        }
+        let reservation =
+            crate::firecracker::offline_768_v1_reservation(spec).map_err(RuntimeError::Backend)?;
+        // Bound to the spec so a changed spec can never share a plan digest.
+        let plan = serde_json::to_vec(&(spec, reservation)).map_err(std::io::Error::other)?;
+        PreparedCreate::fenced(
+            spec.clone(),
+            reservation,
+            1,
+            plan,
+            "offline-768-v1",
+            Digest::of(b"fake approved bundle"),
+            node_id,
+        )
+    }
+
+    async fn create(
+        &self,
+        context: &CreateContext,
+        prepared: &PreparedCreate,
+        deadline: tokio::time::Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<CreatedSandbox, CreateFailure> {
+        if self.state().mode == FakeEvidenceMode::Fenced {
+            return self.create_fenced(context, prepared, deadline).await;
+        }
+        let spec = prepared.spec();
         let before = self.state().create_before_allocation.take();
         if let Some(gate) = before {
             gate.hold().await;
@@ -230,9 +827,9 @@ impl Runtime for FakeRuntime {
             let mut s = self.state();
             assert!(!s.panic_create, "injected fake create panic");
             if let Some(msg) = &s.fail_create_definitely {
-                return Err(CreateFailure::definitely_not_created(RuntimeError::Backend(
-                    msg.clone(),
-                )));
+                return Err(CreateFailure::definitely_not_created(
+                    RuntimeError::Backend(msg.clone()),
+                ));
             }
             if let Some(msg) = &s.fail_create {
                 return Err(RuntimeError::Backend(msg.clone()).into());
@@ -249,7 +846,123 @@ impl Runtime for FakeRuntime {
         if let Some(gate) = after {
             gate.hold().await;
         }
-        Ok(id)
+        Ok(CreatedSandbox {
+            backend_id: id,
+            receipt: RuntimeReceipt::Legacy,
+        })
+    }
+
+    async fn inspect_allocation(
+        &self,
+        context: &CreateContext,
+        prepared_digest: &Digest,
+        _deadline: tokio::time::Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<AllocationObservation, RuntimeError> {
+        let mut guard = self.state();
+        let state = &mut *guard;
+        if state.mode == FakeEvidenceMode::Legacy {
+            return Ok(AllocationObservation::Unsupported);
+        }
+        if state.fenced.inspect_unavailable {
+            return Err(RuntimeError::Backend("fake helper unavailable".into()));
+        }
+        if let Some(observation) = state.fenced.observation_override.clone() {
+            return Ok(observation);
+        }
+        let allocation_id = context.allocation_id;
+        if let Some(fence) = state.fenced.fences.get(&allocation_id).cloned() {
+            return Ok(AllocationObservation::AbsentFenced(Self::delivered(
+                &state.fenced,
+                fence,
+            )?));
+        }
+        let Some(allocation) = state.fenced.allocations.get(&allocation_id) else {
+            return Ok(AllocationObservation::Unknown {
+                reason: format!("no record for allocation {allocation_id}"),
+            });
+        };
+        if allocation.plan_digest != *prepared_digest {
+            return Ok(AllocationObservation::Unknown {
+                reason: format!("allocation {allocation_id} has a different plan"),
+            });
+        }
+        Ok(if allocation.phase == FakePhase::Stopped {
+            AllocationObservation::StoppedWithResources {
+                helper_generation: allocation.generation,
+            }
+        } else {
+            AllocationObservation::Present {
+                receipt: Self::ready_receipt(state, allocation_id, allocation),
+                healthy_idle: allocation.phase == FakePhase::Ready
+                    && !allocation.uncertain_execution,
+                uncertain_execution: allocation.uncertain_execution,
+            }
+        })
+    }
+
+    async fn fence_absent(
+        &self,
+        context: &CreateContext,
+        prepared_digest: &Digest,
+        _deadline: tokio::time::Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<AbsenceReceipt, RuntimeError> {
+        let allocation_id = context.allocation_id;
+        let gate = {
+            let mut guard = self.state();
+            let state = &mut *guard;
+            if state.mode == FakeEvidenceMode::Legacy {
+                return Err(RuntimeError::Unsupported(
+                    "the legacy fake has no allocation-token recovery".into(),
+                ));
+            }
+            state.fenced.fence_calls += 1;
+            if let Some(fence) = state.fenced.fences.get(&allocation_id).cloned() {
+                return Ok(AbsenceReceipt::Fenced(Self::delivered(
+                    &state.fenced,
+                    fence,
+                )?));
+            }
+            if state.fenced.allocations.contains_key(&allocation_id) {
+                return Err(RuntimeError::Backend(format!(
+                    "allocation {allocation_id} still owns resources"
+                )));
+            }
+            if let Some(message) = &state.fenced.fence_unavailable {
+                return Err(RuntimeError::Backend(message.clone()));
+            }
+            state.fenced.fence_gate.take()
+        };
+        if let Some(gate) = gate {
+            gate.hold().await;
+        }
+        let mut guard = self.state();
+        let state = &mut *guard;
+        // Another caller may have committed while this one waited at the gate.
+        if let Some(fence) = state.fenced.fences.get(&allocation_id).cloned() {
+            return Ok(AbsenceReceipt::Fenced(Self::delivered(
+                &state.fenced,
+                fence,
+            )?));
+        }
+        let node_id = Self::fenced_node(state);
+        let receipt = Self::commit_fence(
+            &mut state.fenced,
+            node_id,
+            context.instance_id,
+            allocation_id,
+            *prepared_digest,
+        )?;
+        if std::mem::take(&mut state.fenced.lose_fence_reply) {
+            return Err(RuntimeError::Backend(
+                "helper reply lost after fence".into(),
+            ));
+        }
+        Ok(AbsenceReceipt::Fenced(Self::delivered(
+            &state.fenced,
+            receipt,
+        )?))
     }
 
     async fn validate_sandbox(
@@ -266,26 +979,30 @@ impl Runtime for FakeRuntime {
         self.running(id)
     }
 
-    async fn exec(&self, id: &str, spec: &ExecSpec<'_>, cancel: &CancellationToken) -> ExecOutcome {
+    async fn exec(
+        &self,
+        id: &str,
+        _execution: &ExecutionContext,
+        spec: &ExecSpec<'_>,
+        cancel: &CancellationToken,
+    ) -> ExecOutcome {
         if let Err(e) = self.running(id) {
-            return ExecOutcome {
-                finish: Err(RuntimeDiagnostic::new(
+            return self.with_evidence(
+                id,
+                no_output(Err(RuntimeDiagnostic::new(
                     RuntimeErrorKind::NotFound,
                     RuntimeStage::Connect,
                     e.to_string(),
-                )),
-                command_status: None,
-                stdout: Captured::known_empty(),
-                stderr: Captured::known_empty(),
-            };
+                ))),
+            );
         }
         if cancel.is_cancelled() {
             self.state().canceled_execs += 1;
+            // Proof no bytes were dispatched, so even a fenced session survives.
             return ExecOutcome {
-                finish: Ok(ExecFinish::Canceled),
-                command_status: None,
-                stdout: Captured::known_empty(),
-                stderr: Captured::known_empty(),
+                disposition: SandboxDisposition::Reusable,
+                cleanup: CleanupEvidence::NoChildStarted,
+                ..no_output(Ok(ExecFinish::Canceled))
             };
         }
         let (gate, panic_exec) = {
@@ -303,7 +1020,7 @@ impl Runtime for FakeRuntime {
         }
         assert!(!panic_exec, "injected fake exec panic");
         let args = &spec.argv[1..];
-        match spec.argv[0].as_str() {
+        let outcome = match spec.argv[0].as_str() {
             "echo" => exited(
                 0,
                 format!("{}\n", args.join(" ")).into_bytes(),
@@ -338,6 +1055,8 @@ impl Runtime for FakeRuntime {
                         truncated: kept < total,
                         total_bytes_known: true,
                     },
+                    disposition: SandboxDisposition::Reusable,
+                    cleanup: CleanupEvidence::RuntimeDrained,
                 }
             }
             "sleep" => {
@@ -348,26 +1067,21 @@ impl Runtime for FakeRuntime {
                         ExecFinish::Canceled
                     },
                 };
-                ExecOutcome {
-                    finish: Ok(finish),
-                    command_status: None,
-                    stdout: Captured::known_empty(),
-                    stderr: Captured::known_empty(),
-                }
+                no_output(Ok(finish))
             }
             "vanish" => {
                 self.state().sandboxes.remove(id);
-                ExecOutcome {
-                    finish: Err(RuntimeDiagnostic::new(
-                        RuntimeErrorKind::NotFound,
-                        RuntimeStage::Connect,
-                        format!("sandbox {id} not found in backend"),
-                    )),
-                    command_status: None,
-                    stdout: Captured::known_empty(),
-                    stderr: Captured::known_empty(),
-                }
+                no_output(Err(RuntimeDiagnostic::new(
+                    RuntimeErrorKind::NotFound,
+                    RuntimeStage::Connect,
+                    format!("sandbox {id} not found in backend"),
+                )))
             }
+            "cleanup-fail" => no_output(Err(RuntimeDiagnostic::new(
+                RuntimeErrorKind::CleanupFailed,
+                RuntimeStage::Cleanup,
+                "injected cleanup failure",
+            ))),
             "signal" => ExecOutcome {
                 command_status: Some(CommandStatus::Signaled {
                     signal: args.first().and_then(|s| s.parse().ok()).unwrap_or(15),
@@ -398,6 +1112,8 @@ impl Runtime for FakeRuntime {
                     truncated: 5.min(spec.max_output) < 101,
                     total_bytes_known: false,
                 },
+                disposition: SandboxDisposition::Reusable,
+                cleanup: CleanupEvidence::RuntimeDrained,
             },
             _ => ExecOutcome {
                 finish: Ok(ExecFinish::Completed),
@@ -409,11 +1125,22 @@ impl Runtime for FakeRuntime {
                     truncated: false,
                     total_bytes_known: true,
                 },
+                disposition: SandboxDisposition::Reusable,
+                cleanup: CleanupEvidence::RuntimeDrained,
             },
-        }
+        };
+        self.with_evidence(id, outcome)
     }
 
-    async fn remove(&self, id: &str) -> Result<(), RuntimeError> {
+    async fn remove(
+        &self,
+        id: &str,
+        _deadline: tokio::time::Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<AbsenceReceipt, RuntimeError> {
+        if self.state().mode == FakeEvidenceMode::Fenced {
+            return self.remove_fenced(id).await;
+        }
         let gate = {
             let mut s = self.state();
             s.remove_attempts.push(id.to_string());
@@ -440,31 +1167,83 @@ impl Runtime for FakeRuntime {
         if let Some(gate) = after {
             gate.hold().await;
         }
-        Ok(())
+        Ok(AbsenceReceipt::Legacy(LegacyAbsence {
+            backend_id: id.to_string(),
+            proof: LegacyProof::StrictRemoval,
+        }))
     }
 
-    async fn list(&self) -> Result<Vec<BackendSandbox>, RuntimeError> {
+    async fn list(
+        &self,
+        _deadline: tokio::time::Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<BackendInventory, RuntimeError> {
+        if self.state().mode == FakeEvidenceMode::Fenced {
+            return self.fenced_inventory();
+        }
         let s = self.state();
         if s.unavailable {
             return Err(RuntimeError::Backend("fake backend unavailable".into()));
         }
-        Ok(s.sandboxes
-            .iter()
-            .filter(|(id, _)| !s.hidden_from_list.iter().any(|hidden| hidden == *id))
-            .map(|(id, status)| BackendSandbox {
-                id: id.clone(),
-                status: *status,
-            })
-            .collect())
+        Ok(BackendInventory {
+            records: s
+                .sandboxes
+                .iter()
+                .filter(|(id, _)| !s.hidden_from_list.iter().any(|hidden| hidden == *id))
+                .map(|(id, status)| BackendRecord {
+                    id: id.clone(),
+                    status: *status,
+                    allocation_id: None,
+                    plan_digest: None,
+                    generation: 0,
+                })
+                .collect(),
+            generation: 0,
+            complete: true,
+        })
     }
 
-    async fn gc(&self, ids: &[String]) -> Result<Vec<String>, RuntimeError> {
-        let mut s = self.state();
+    async fn gc(
+        &self,
+        ids: &[String],
+        _deadline: tokio::time::Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
+        let mut guard = self.state();
+        let s = &mut *guard;
         if s.unavailable {
             return Err(RuntimeError::Backend("fake backend unavailable".into()));
         }
         s.gc_runs += 1;
         s.gc_requests.push(ids.to_vec());
+        if s.mode == FakeEvidenceMode::Fenced {
+            // Only named allocations individually proven stopped; never a live one.
+            let node_id = Self::fenced_node(s);
+            let mut receipts = Vec::new();
+            for id in ids {
+                let token = id
+                    .strip_prefix("fc-")
+                    .and_then(|hex| Id128::parse(hex).ok());
+                let Some(allocation_id) = token else { continue };
+                let Some(allocation) = s.fenced.allocations.get(&allocation_id) else {
+                    continue;
+                };
+                if allocation.phase != FakePhase::Stopped {
+                    continue;
+                }
+                let (instance_id, plan_digest) = (allocation.instance_id, allocation.plan_digest);
+                let receipt = Self::commit_fence(
+                    &mut s.fenced,
+                    node_id,
+                    instance_id,
+                    allocation_id,
+                    plan_digest,
+                )?;
+                s.sandboxes.remove(id);
+                receipts.push(AbsenceReceipt::Fenced(receipt));
+            }
+            return Ok(receipts);
+        }
         let stale: Vec<String> = s
             .sandboxes
             .iter()
@@ -476,6 +1255,14 @@ impl Runtime for FakeRuntime {
         for id in &stale {
             s.sandboxes.remove(id);
         }
-        Ok(stale)
+        Ok(stale
+            .into_iter()
+            .map(|backend_id| {
+                AbsenceReceipt::Legacy(LegacyAbsence {
+                    backend_id,
+                    proof: LegacyProof::ScopedGc,
+                })
+            })
+            .collect())
     }
 }
