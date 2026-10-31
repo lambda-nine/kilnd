@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix B1's Python/Rust JSON mismatch with a production strict parser, ASCII
+  canonicalizer and shared mutation/Unicode corpus; bind complete host specs
+  including labels separately from guest execution specs, and isolate fixtures
+  in test-only schemas/types with no production override.
+
 - Freeze the Phase 1b `offline-768-v1` guest and launch contract (schema 2) as golden
   fixtures shared with kiln-guest, with an independent Rust check of its plan, digests
   and identity block. Fixtures only: production stays disabled without the broker.

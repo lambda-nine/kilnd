@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped deliberately whenever kiln-guest's fixtures are copied here.
 const DIGESTS_JSON_SHA256: &str =
-    "7b888cf260f67816634e51766573d7750a5c05c7d819a1f8e8c737ea82ba874f";
+    "0bdb67a671089fe13322491f471e4ce3c1c7a48cd22458f4c0ec52aafb0f9b8b";
 const MIB: u64 = 1024 * 1024;
 
 fn fixtures() -> PathBuf {
@@ -21,11 +21,11 @@ fn bytes(name: &str) -> Vec<u8> {
 }
 
 fn load(name: &str) -> Value {
-    serde_json::from_slice(&bytes(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
+    kilnd::firecracker::strict_json(&bytes(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
 }
 
 fn canonical(value: &Value) -> Vec<u8> {
-    serde_json::to_vec(value).unwrap()
+    kilnd::firecracker::canonical(value).unwrap()
 }
 
 fn text<'a>(value: &'a Value, pointer: &str) -> &'a str {
@@ -167,7 +167,7 @@ fn json_fixtures_are_strict_sorted_documents() {
 }
 
 #[test]
-fn manifest_is_schema_2_fixture_bound_to_its_approval() {
+fn manifest_is_test_schema_bound_to_its_approval() {
     let raw = bytes("bundle/manifest.json");
     let manifest = load("bundle/manifest.json");
     assert_eq!(
@@ -198,13 +198,16 @@ fn manifest_is_schema_2_fixture_bound_to_its_approval() {
     .map(String::from)
     .collect();
     assert_eq!(fields, expected);
-    assert_eq!(manifest["schema"], json!(2));
+    assert_eq!(manifest["schema"], json!("kiln-test-manifest-v1"));
     assert_eq!(manifest["fixture_only"], json!(true));
     assert_eq!(manifest["architecture"], json!("aarch64"));
     assert_eq!(manifest["firecracker_version"], json!("1.17.0"));
     assert_eq!(manifest["launch_contract"], load("contract.json"));
     assert_eq!(manifest["broker"]["protocol"], json!(1));
-    assert_eq!(manifest["broker"]["lifecycle"], json!("init-supervised-no-restart"));
+    assert_eq!(
+        manifest["broker"]["lifecycle"],
+        json!("init-supervised-no-restart")
+    );
     let artifacts = manifest["artifacts"].as_object().unwrap();
     assert_eq!(artifacts.len(), 5);
     for (name, record) in artifacts {
@@ -238,7 +241,10 @@ fn assert_static_aarch64_elf(data: &[u8]) {
     for index in 0..count {
         let start = offset + index * 56;
         let kind = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
-        assert!(kind != 3 && kind != 2, "PT_INTERP/PT_DYNAMIC in a static image");
+        assert!(
+            kind != 3 && kind != 2,
+            "PT_INTERP/PT_DYNAMIC in a static image"
+        );
     }
 }
 
@@ -290,7 +296,10 @@ fn contract_freezes_the_designed_values() {
         ("/vmm_credentials/seccomp", json!("default")),
         ("/jail/size_bytes", json!(16 * MIB)),
         ("/jail/nr_inodes", json!(1024)),
-        ("/jail/mount_data", json!("size=16M,nr_inodes=1024,mode=0700")),
+        (
+            "/jail/mount_data",
+            json!("size=16M,nr_inodes=1024,mode=0700"),
+        ),
         ("/jail/mount_flags", json!(["MS_NOSUID"])),
         ("/jail/binds_read_only", json!(true)),
         ("/work/loop/offset", json!(0)),
@@ -335,7 +344,10 @@ fn contract_freezes_the_designed_values() {
         ("/executable/ancestry/group_world_write", json!(false)),
         ("/executable/ancestry/nonroot_acl_write", json!(false)),
         ("/executable/ancestry/default_acl_write", json!(false)),
-        ("/executable/ancestry/parent_rename_authority", json!("root-only")),
+        (
+            "/executable/ancestry/parent_rename_authority",
+            json!("root-only"),
+        ),
         ("/executable/ancestry/symlinks", json!(false)),
         ("/executable/installation/hardlinks", json!(false)),
         ("/executable/installation/file_capabilities", json!(false)),
@@ -343,7 +355,14 @@ fn contract_freezes_the_designed_values() {
         ("/executable/installation/create_may_install", json!(false)),
         (
             "/executable/identity_fields",
-            json!(["role", "st_dev", "st_ino", "bytes", "sha256", "installation_generation"]),
+            json!([
+                "role",
+                "st_dev",
+                "st_ino",
+                "bytes",
+                "sha256",
+                "installation_generation"
+            ]),
         ),
         ("/handoff/version", json!(1)),
         ("/handoff/vmm_fd", json!(3)),
@@ -385,7 +404,12 @@ fn contract_freezes_the_designed_values() {
             ("identity", "/identity", false, true),
         ]
     );
-    let top: BTreeSet<_> = contract["firecracker"].as_object().unwrap().keys().cloned().collect();
+    let top: BTreeSet<_> = contract["firecracker"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
     assert_eq!(
         top,
         ["boot-source", "drives", "machine-config", "vsock"]
@@ -416,27 +440,61 @@ fn check_derived_plan(plan: &Value, subs: &Value, uid: u64, gid: u64) {
     };
     let cgroup = format!("kilnd-firecracker/{instance}/{backend}");
     let launch = &plan["launch"];
-    assert_eq!(plan["manifest_sha256"], load("digests.json")["approved_manifest_sha256"]);
+    assert_eq!(
+        plan["manifest_sha256"],
+        load("digests.json")["approved_manifest_sha256"]
+    );
     assert_eq!(&plan["substitutions"], subs);
     assert_eq!(
         launch["jailer_argv"],
         json!([
-            store("jailer"), "--id", backend, "--exec-file", store("firecracker"),
-            "--uid", uid.to_string(), "--gid", gid.to_string(),
-            "--chroot-base-dir", "/var/lib/kilnd-helper/jails", "--cgroup-version", "2",
-            "--parent-cgroup", format!("{cgroup}/vm/vmm"), "--new-pid-ns",
-            "--resource-limit", "no-file=256", "--", "--no-api", "--config-file", "/config.json"
+            store("jailer"),
+            "--id",
+            backend,
+            "--exec-file",
+            store("firecracker"),
+            "--uid",
+            uid.to_string(),
+            "--gid",
+            gid.to_string(),
+            "--chroot-base-dir",
+            "/var/lib/kilnd-helper/jails",
+            "--cgroup-version",
+            "2",
+            "--parent-cgroup",
+            format!("{cgroup}/vm/vmm"),
+            "--new-pid-ns",
+            "--resource-limit",
+            "no-file=256",
+            "--",
+            "--no-api",
+            "--config-file",
+            "/config.json"
         ])
     );
     assert_eq!(
         launch["vmm_argv_semantic"],
-        json!(["/firecracker", "--id", backend, "--no-api", "--config-file", "/config.json"])
+        json!([
+            "/firecracker",
+            "--id",
+            backend,
+            "--no-api",
+            "--config-file",
+            "/config.json"
+        ])
     );
     let backing = format!("/var/lib/kilnd-helper/work/{instance}/{backend}/work.xfs");
     assert_eq!(
         launch["formatter_argv"],
-        json!([store("mkfs.xfs"), "-q", "-f", "-K", "-m",
-               format!("uuid={}", text(subs, "/work_uuid")), backing])
+        json!([
+            store("mkfs.xfs"),
+            "-q",
+            "-f",
+            "-K",
+            "-m",
+            format!("uuid={}", text(subs, "/work_uuid")),
+            backing
+        ])
     );
     assert_eq!(launch["work_backing_path"], json!(backing));
     assert_eq!(launch["cgroup"], json!(cgroup));
@@ -464,8 +522,14 @@ fn check_derived_plan(plan: &Value, subs: &Value, uid: u64, gid: u64) {
     let recipe = &launch["resource_recipe"];
     assert_eq!(recipe["vmm_credentials"]["uid"], json!(uid));
     assert_eq!(recipe["vmm_credentials"]["gid"], json!(gid));
-    assert_eq!(recipe["relay_credentials"]["uid"], subs["relay_uid"]["value"]);
-    assert_eq!(recipe["relay_credentials"]["gid"], subs["relay_gid"]["value"]);
+    assert_eq!(
+        recipe["relay_credentials"]["uid"],
+        subs["relay_uid"]["value"]
+    );
+    assert_eq!(
+        recipe["relay_credentials"]["gid"],
+        subs["relay_gid"]["value"]
+    );
     assert_eq!(recipe["work"]["loop"]["size_limit"], json!(work));
     assert_eq!(recipe["work"]["loop"]["owner"], json!([uid, gid]));
     assert_eq!(recipe["work"]["formatter_argv"], launch["formatter_argv"]);
@@ -481,7 +545,10 @@ fn plans_rederive_with_typed_unequal_and_equal_ids() {
     assert_eq!(subs["relay_uid"]["kind"], json!("RelayUid"));
     assert_eq!(subs["relay_gid"]["kind"], json!("RelayGid"));
     check_derived_plan(&plan, &subs, 300001, 300002);
-    let (plan, subs) = (load("plan-equal-ids.json"), load("substitutions-equal-ids.json"));
+    let (plan, subs) = (
+        load("plan-equal-ids.json"),
+        load("substitutions-equal-ids.json"),
+    );
     assert_eq!(subs["uid"], json!({"kind": "VmmUid", "value": 300005}));
     assert_eq!(subs["gid"], json!({"kind": "VmmGid", "value": 300005}));
     check_derived_plan(&plan, &subs, 300005, 300005);
@@ -512,7 +579,10 @@ fn canonical_digests_agree_across_implementations() {
     let digests = load("digests.json");
     let plan = load("plan.json");
     assert_eq!(sha256(&canonical(&plan)), text(&digests, "/plan_sha256"));
-    assert_eq!(sha256(&canonical(&plan["launch"])), text(&digests, "/launch_sha256"));
+    assert_eq!(
+        sha256(&canonical(&plan["launch"])),
+        text(&digests, "/launch_sha256")
+    );
 }
 
 #[test]
@@ -524,7 +594,11 @@ fn identity_block_is_framed_canonical_and_bound() {
     assert!((1..=4088).contains(&length));
     assert!(block[8 + length..].iter().all(|byte| *byte == 0));
     let record: Value = serde_json::from_slice(&block[8..8 + length]).unwrap();
-    assert_eq!(canonical(&record), &block[8..8 + length], "canonical record");
+    assert_eq!(
+        canonical(&record),
+        &block[8..8 + length],
+        "canonical record"
+    );
     let subs = load("substitutions.json");
     let digests = load("digests.json");
     assert_eq!(
@@ -535,7 +609,7 @@ fn identity_block_is_framed_canonical_and_bound() {
             "work_uuid": subs["work_uuid"],
             "manifest_sha256": digests["approved_manifest_sha256"],
             "launch_sha256": digests["launch_sha256"],
-            "inner_spec_sha256": sha256(&canonical(&subs["inner_spec"])),
+            "guest_exec_spec_sha256": sha256(&canonical(&subs["inner_spec"])),
         })
     );
     assert_eq!(text(&subs, "/boot_nonce").len(), 64);
@@ -581,12 +655,13 @@ fn apply_mutation(document: &mut Value, case: &Value) {
 }
 
 #[test]
-fn every_named_attack_leaves_the_approval() {
+fn every_named_attack_is_refused_even_when_reapproved() {
     let manifest = load("bundle/manifest.json");
     let approved = load("digests.json")["approved_manifest_sha256"].clone();
     let cases = load("negative-cases.json");
     let cases = cases.as_array().unwrap();
     assert!(cases.len() >= 40);
+    let bases = load("conformance.json")["bases"].clone();
     let mut names = BTreeSet::new();
     for case in cases {
         let name = text(case, "/name");
@@ -597,6 +672,14 @@ fn every_named_attack_leaves_the_approval() {
         assert_ne!(mutated, manifest, "{name} changed nothing");
         let raw = serde_json::to_string_pretty(&mutated).unwrap() + "\n";
         assert_ne!(json!(sha256(raw.as_bytes())), approved, "{name}");
+        assert!(
+            corpus_validate("fixture_manifest", raw.as_bytes(), &bases).is_err(),
+            "{name}"
+        );
+        assert!(
+            kilnd::firecracker::validate_manifest(raw.as_bytes(), &sha256(raw.as_bytes())).is_err(),
+            "{name}"
+        );
     }
     for name in [
         "nokaslr",
@@ -625,12 +708,21 @@ fn every_named_attack_leaves_the_approval() {
 fn legacy_no_vsock_manifest_cannot_satisfy_the_contract() {
     let legacy = load("legacy-no-vsock-manifest.json");
     assert_eq!(legacy["schema"], json!(1));
-    assert_eq!(legacy["broker"], json!({"enabled": false, "protocol": null}));
+    assert_eq!(
+        legacy["broker"],
+        json!({"enabled": false, "protocol": null})
+    );
     let production = &legacy["launch_contract"]["profiles"]["production"];
     assert!(production["firecracker"].get("vsock").is_none());
     assert_eq!(production["jailer"]["uid"], json!(10000));
     assert_eq!(production["jailer"]["new_pid_namespace"], json!(false));
-    assert_eq!(production["firecracker"]["drives"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        production["firecracker"]["drives"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         text(&legacy, "/inputs/projected_from_manifest_sha256"),
         "e855fbee1914cc6ea5e57a1250610e128412c85a905c94a48fb54afdaa47f3d3"
@@ -674,7 +766,12 @@ fn replacement_verdicts_use_the_actual_executed_tuple() {
 #[test]
 fn vmm_argv_varies_only_in_jailer_timing() {
     let argv = load("vmm-argv.json");
-    let argv: Vec<_> = argv.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    let argv: Vec<_> = argv
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
     let backend = format!("fc-{}", text(&load("substitutions.json"), "/allocation_id"));
     let template = load("contract.json")["vmm_argv"].clone();
     assert_eq!(template.as_array().unwrap().len(), argv.len());
@@ -682,7 +779,14 @@ fn vmm_argv_varies_only_in_jailer_timing() {
         match slot.as_str().unwrap() {
             "$backend_id" => assert_eq!(argv[index], backend),
             name if name.starts_with('$') => {
-                assert!(["$start_time_us", "$start_time_cpu_us", "$parent_cpu_time_us"].contains(&name));
+                assert!(
+                    [
+                        "$start_time_us",
+                        "$start_time_cpu_us",
+                        "$parent_cpu_time_us"
+                    ]
+                    .contains(&name)
+                );
                 argv[index].parse::<u64>().unwrap();
                 assert!(argv[index] == "0" || !argv[index].starts_with('0'));
             }
@@ -695,7 +799,10 @@ fn vmm_argv_varies_only_in_jailer_timing() {
         .filter(|(index, _)| ![3, 4, 5, 6, 7, 8].contains(index))
         .map(|(_, item)| *item)
         .collect();
-    assert_eq!(json!(semantic), load("plan.json")["launch"]["vmm_argv_semantic"]);
+    assert_eq!(
+        json!(semantic),
+        load("plan.json")["launch"]["vmm_argv_semantic"]
+    );
 }
 
 #[test]
@@ -703,8 +810,14 @@ fn status_fixture_has_separate_ids_empty_groups_and_zero_masks() {
     let status = String::from_utf8(bytes("vmm-status.txt")).unwrap();
     let field = |name: &str| -> Vec<String> {
         let prefix = format!("{name}:");
-        let line = status.lines().find(|line| line.starts_with(&prefix)).unwrap();
-        line[prefix.len()..].split_whitespace().map(String::from).collect()
+        let line = status
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap();
+        line[prefix.len()..]
+            .split_whitespace()
+            .map(String::from)
+            .collect()
     };
     assert_eq!(field("Uid"), ["300001"; 4]);
     assert_eq!(field("Gid"), ["300002"; 4]);
@@ -747,18 +860,29 @@ fn bootstrap_record_binds_the_retained_vmm_and_jail() {
 fn assert_no_placeholder(name: &str, value: &Value) {
     match value {
         Value::String(item) => assert!(
-            !item.contains('$') && !item.contains('{') && !item.to_lowercase().contains("placeholder"),
+            !item.contains('$')
+                && !item.contains('{')
+                && !item.to_lowercase().contains("placeholder"),
             "{name}: {item}"
         ),
-        Value::Array(items) => items.iter().for_each(|item| assert_no_placeholder(name, item)),
-        Value::Object(map) => map.values().for_each(|item| assert_no_placeholder(name, item)),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|item| assert_no_placeholder(name, item)),
+        Value::Object(map) => map
+            .values()
+            .for_each(|item| assert_no_placeholder(name, item)),
         _ => {}
     }
 }
 
 #[test]
 fn resolved_fixtures_have_no_placeholder_security_fields() {
-    for name in ["plan.json", "plan-equal-ids.json", "substitutions.json", "bootstrap.json"] {
+    for name in [
+        "plan.json",
+        "plan-equal-ids.json",
+        "substitutions.json",
+        "bootstrap.json",
+    ] {
         assert_no_placeholder(name, &load(name));
     }
 }
@@ -767,7 +891,168 @@ fn resolved_fixtures_have_no_placeholder_security_fields() {
 fn production_stays_disabled_without_the_broker() {
     // Fixtures only: B7 alone may let the daemon select this backend.
     assert_eq!(load("bundle/manifest.json")["fixture_only"], json!(true));
-    assert!(String::from_utf8(bytes("README.md")).unwrap().contains("they grant no deployment"));
+    assert!(
+        String::from_utf8(bytes("README.md"))
+            .unwrap()
+            .contains("they grant no deployment")
+    );
     let main = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    assert!(!fs::read_to_string(main).unwrap().to_lowercase().contains("firecracker"));
+    assert!(
+        !fs::read_to_string(main)
+            .unwrap()
+            .to_lowercase()
+            .contains("firecracker")
+    );
+}
+
+// This type exists only in this integration-test binary. It cannot construct a
+// PreparedCreate; its JSON schema/profile are outside the production namespace.
+struct FixturePlan(Value);
+fn fixture_plan(bases: &Value) -> Result<FixturePlan, String> {
+    use kilnd::firecracker as fc;
+    let baseline = &bases["fixture_plan"];
+    let subs = &baseline["substitutions"];
+    let binding = fc::bind_host_spec(&baseline["host_spec"])?;
+    let mut doc = binding.journal_value();
+    doc["schema"] = json!("kiln-test-plan-v1");
+    doc["profile"] = json!("test-only-b1");
+    doc["substitutions"] = subs.clone();
+    doc["manifest_sha256"] = baseline["manifest_sha256"].clone();
+    doc["launch"] = fc::derive_launch(subs, &bases["fixture_manifest"]["executables"])?;
+    Ok(FixturePlan(doc))
+}
+fn corpus_validate(kind: &str, raw: &[u8], bases: &Value) -> Result<Vec<u8>, String> {
+    use kilnd::firecracker as fc;
+    let v = fc::strict_json(raw)?;
+    match kind {
+        "json" => {}
+        "contract" => {
+            fc::validate_contract(raw)?;
+        }
+        "guest_exec_spec" => fc::validate_guest_exec_spec(&v)?,
+        "substitutions" => {
+            fc::derive_launch(&v, &bases["fixture_manifest"]["executables"])?;
+        }
+        "host_spec" => {
+            fc::bind_host_spec(&v)?;
+        }
+        "binding" => {
+            fc::verify_spec_binding(raw)?;
+        }
+        "fixture_manifest" => {
+            // Fixed schema and provenance, independently checked recipe, and
+            // actual artifact bytes. No approval-hash-only mutation test.
+            fc::verify_exact(raw, &bases["fixture_manifest"])?;
+            fc::validate_contract(&fc::canonical(&v["launch_contract"])?)?;
+            for (group, prefix) in [("artifacts", "bundle"), ("executables", "executables")] {
+                for (name, pin) in v[group].as_object().ok_or("fixture records")? {
+                    let data = bytes(&format!("{prefix}/{name}"));
+                    if pin["bytes"] != json!(data.len()) || pin["sha256"] != fc::sha256(&data) {
+                        return Err("fixture byte mismatch".into());
+                    }
+                }
+            }
+        }
+        "fixture_plan" => {
+            fc::verify_exact(raw, &fixture_plan(bases)?.0)?;
+        }
+        "production_manifest" => {
+            fc::validate_manifest(raw, &fc::sha256(raw))?;
+        }
+        _ => return Err(format!("unknown kind {kind}")),
+    }
+    fc::canonical(&v)
+}
+fn unhex(s: &str) -> Vec<u8> {
+    s.as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
+        .collect()
+}
+#[test]
+fn shared_conformance_corpus() {
+    use kilnd::firecracker as fc;
+    let corpus = load("conformance.json");
+    let bases = &corpus["bases"];
+    let cases = corpus["cases"].as_array().unwrap();
+    assert!(cases.len() > 2000);
+    for case in cases {
+        let raw = if let Some(repeat) = case["repeat_hex"].as_str() {
+            let mut raw = unhex(repeat).repeat(case["repeat"].as_u64().unwrap() as usize);
+            raw.extend(unhex(text(case, "/suffix_hex")));
+            raw
+        } else if let Some(raw) = case["raw_hex"].as_str() {
+            unhex(raw)
+        } else {
+            let mut v = bases[case["base"].as_str().unwrap()].clone();
+            apply_mutation(&mut v, case);
+            fc::canonical(&v).unwrap()
+        };
+        let result = corpus_validate(text(case, "/kind"), &raw, bases);
+        assert_eq!(
+            result.is_ok(),
+            case["accept"].as_bool().unwrap(),
+            "{}: {result:?}",
+            text(case, "/name")
+        );
+        if let Ok(actual) = result {
+            assert_eq!(
+                actual,
+                text(case, "/canonical_ascii").as_bytes(),
+                "{}",
+                text(case, "/name")
+            );
+            assert_eq!(
+                fc::sha256(&actual),
+                text(case, "/sha256"),
+                "{}",
+                text(case, "/name")
+            );
+        }
+    }
+}
+#[test]
+fn unicode_and_duplicate_poc() {
+    use kilnd::firecracker as fc;
+    let value = fc::strict_json("{\"writable_paths\":[\"/雪\"]}".as_bytes()).unwrap();
+    assert_eq!(
+        fc::canonical(&value).unwrap(),
+        br#"{"writable_paths":["/\u96ea"]}"#
+    );
+    assert!(fc::strict_json(br#"{"schema":1,"schema":2}"#).is_err());
+    assert!(fc::canonical(&json!(1.0)).is_err());
+}
+#[test]
+fn label_collision_and_journal_replay() {
+    use kilnd::firecracker as fc;
+    let mut host = load("plan.json")["host_spec"].clone();
+    host["labels"] = json!({"tenant":"alpha"});
+    let a = fc::bind_host_spec(&host).unwrap();
+    host["labels"] = json!({"tenant":"beta"});
+    let b = fc::bind_host_spec(&host).unwrap();
+    assert_ne!(a.host_spec_sha256(), b.host_spec_sha256());
+    assert_eq!(a.guest_exec_spec_sha256(), b.guest_exec_spec_sha256());
+    fc::verify_spec_binding(&fc::canonical(&a.journal_value()).unwrap()).unwrap();
+    let mut stale = a.journal_value();
+    stale["host_spec"] = host;
+    assert!(fc::verify_spec_binding(&fc::canonical(&stale).unwrap()).is_err());
+}
+#[test]
+fn fixture_mode_poc_cannot_make_production_plan() {
+    use kilnd::firecracker as fc;
+    let fixture = load("bundle/manifest.json");
+    assert_eq!(fixture["schema"], json!("kiln-test-manifest-v1"));
+    assert_eq!(load("plan.json")["schema"], json!("kiln-test-plan-v1"));
+    assert_eq!(load("plan.json")["profile"], json!("test-only-b1"));
+    for schema in [json!("kiln-test-manifest-v1"), json!(2)] {
+        for flag in [true, false] {
+            let mut m = fixture.clone();
+            m["schema"] = schema.clone();
+            m["fixture_only"] = json!(flag);
+            let raw = fc::canonical(&m).unwrap();
+            assert!(fc::validate_manifest(&raw, &fc::sha256(&raw)).is_err());
+        }
+    }
 }

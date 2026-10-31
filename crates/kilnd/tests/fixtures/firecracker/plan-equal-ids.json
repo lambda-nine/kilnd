@@ -1,4 +1,17 @@
 {
+  "guest_exec_spec_sha256": "24efdf3fc3f1f3a34a8100f6c894d0d117239ccc51ffa1ef7866f3775d71c0a2",
+  "host_spec": {
+    "cpu_millis": 1000,
+    "disk_bytes": 1073741824,
+    "image": "alpine",
+    "labels": {},
+    "memory_bytes": 536870912,
+    "network": "none",
+    "pids": 128,
+    "read_only_root": false,
+    "writable_paths": []
+  },
+  "host_spec_sha256": "cb049152516f3b1411f542e225b64f97dd3cfdc6d75ef3799a19af998b75e08b",
   "launch": {
     "cgroup": "kilnd-firecracker/1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a/fc-2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
     "executable_paths": {
@@ -176,9 +189,9 @@
           "manifest_sha256",
           "launch_sha256",
           "work_uuid",
-          "inner_spec_sha256"
+          "guest_exec_spec_sha256"
         ],
-        "json": "utf8-sorted-keys-compact-no-floats-duplicates-or-unknown-fields",
+        "json": "ascii-sorted-unicode-scalar-keys-compact-escaped-nonascii-integers-i64min-u64max-depth32",
         "launch_hash_excludes": "identity-block-content",
         "length": "u32-big-endian-1..4088",
         "magic": "KID1",
@@ -396,9 +409,9 @@
     "work_backing_path": "/var/lib/kilnd-helper/work/1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a/fc-2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b/work.xfs",
     "work_bytes": 1342177280
   },
-  "manifest_sha256": "8b6873939ee80a32a37fc4eb8e07dfe82a65d86ae41fe1601f095cf0b2aff74e",
-  "profile": "offline-768-v1",
-  "schema": 2,
+  "manifest_sha256": "67f3760e2aa2941b2d9cfb0034c05b0110f106deba9eb412e69b8daa2608e463",
+  "profile": "test-only-b1",
+  "schema": "kiln-test-plan-v1",
   "substitutions": {
     "allocation_id": "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
     "boot_nonce": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",

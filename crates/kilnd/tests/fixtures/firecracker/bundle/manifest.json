@@ -74,11 +74,11 @@
   "inputs": {
     "broker_source_commit": "d94996c9f1d9795b3a47d9ffc71d40c452a2e6ee",
     "build_lock_sha256": "d4160d12ab9d76f9a80132fa46a216a0c4efc8814e772529e4c743f595a8fa50",
-    "contract_sha256": "035f4328aa03054bd454434f177275f43538e9d875bf220a701c1c79e658c105",
+    "contract_sha256": "ae4b5c5eda30dc2798ca5c2e8958aa1023429023a2bc8d41f5530b68ae5f45ed",
     "handoff_recipe_sha256": "4e92a1a623f42765dd25833d91ef8f112e675720042500328f22b29d6bc630b0",
     "init_source_sha256": "92889180b8e30317b9b1664f248537401425cc43dcbb1f52571b29f448740088",
     "jailer_patch_sha256": "db58cb814db9da2af0ff7fa93520f8ce6e26d425e407c44df308ca01094644b6",
-    "phase1b_inputs_sha256": "074613b484280dd64d136a2adffd2fae89d089e9e02a89c86e9e173a3622c36f",
+    "phase1b_inputs_sha256": "3a2ee78bf09db3f053fb1db1c8fc2400c0973efc5e7933332f79fec97495af52",
     "pins_sha256": "faa4139efd63ec635d2254e88eb32e8b3b3f3681a28d19257a83199122c1b72a",
     "provenance": "b1-fixture-static-aarch64-elf-v1",
     "security_policy_sha256": "b58fae1b9bc0c4982efa6d02483be87659a9a8c819c3582bc630ed2b3a05de15",
@@ -291,6 +291,16 @@
       "api-socket",
       "provider-credentials"
     ],
+    "guest_exec_spec_fields": [
+      "image",
+      "memory_bytes",
+      "cpu_millis",
+      "pids",
+      "disk_bytes",
+      "network",
+      "read_only_root",
+      "writable_paths"
+    ],
     "handoff": {
       "bootstrap_fields": [
         "version",
@@ -345,9 +355,9 @@
         "manifest_sha256",
         "launch_sha256",
         "work_uuid",
-        "inner_spec_sha256"
+        "guest_exec_spec_sha256"
       ],
-      "json": "utf8-sorted-keys-compact-no-floats-duplicates-or-unknown-fields",
+      "json": "ascii-sorted-unicode-scalar-keys-compact-escaped-nonascii-integers-i64min-u64max-depth32",
       "launch_hash_excludes": "identity-block-content",
       "length": "u32-big-endian-1..4088",
       "magic": "KID1",
@@ -471,6 +481,10 @@
       "once_per_node": true,
       "pids": 32,
       "store_bytes": 1073741824
+    },
+    "spec_digests": {
+      "guest_exec_spec_sha256": "label-free-execution-spec-identity-Hello-Initialize",
+      "host_spec_sha256": "complete-effective-SandboxSpec-including-labels-daemon-plan-and-journal"
     },
     "substitutions": {
       "allocation_id": "Id128",
@@ -636,7 +650,7 @@
       "stop_dispatch_target_ms": 250
     }
   },
-  "schema": 2,
+  "schema": "kiln-test-manifest-v1",
   "source_date_epoch": 1793318400,
   "work_disk": {
     "filesystem": "xfs",

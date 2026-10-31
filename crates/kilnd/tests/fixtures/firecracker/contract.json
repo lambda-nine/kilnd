@@ -198,6 +198,16 @@
     "api-socket",
     "provider-credentials"
   ],
+  "guest_exec_spec_fields": [
+    "image",
+    "memory_bytes",
+    "cpu_millis",
+    "pids",
+    "disk_bytes",
+    "network",
+    "read_only_root",
+    "writable_paths"
+  ],
   "handoff": {
     "bootstrap_fields": [
       "version",
@@ -252,9 +262,9 @@
       "manifest_sha256",
       "launch_sha256",
       "work_uuid",
-      "inner_spec_sha256"
+      "guest_exec_spec_sha256"
     ],
-    "json": "utf8-sorted-keys-compact-no-floats-duplicates-or-unknown-fields",
+    "json": "ascii-sorted-unicode-scalar-keys-compact-escaped-nonascii-integers-i64min-u64max-depth32",
     "launch_hash_excludes": "identity-block-content",
     "length": "u32-big-endian-1..4088",
     "magic": "KID1",
@@ -378,6 +388,10 @@
     "once_per_node": true,
     "pids": 32,
     "store_bytes": 1073741824
+  },
+  "spec_digests": {
+    "guest_exec_spec_sha256": "label-free-execution-spec-identity-Hello-Initialize",
+    "host_spec_sha256": "complete-effective-SandboxSpec-including-labels-daemon-plan-and-journal"
   },
   "substitutions": {
     "allocation_id": "Id128",

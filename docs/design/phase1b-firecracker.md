@@ -97,7 +97,7 @@ The manager generates instance/allocation/sandbox identity in memory before pref
 3. Validate architecture, every host executable identity/dependency closure under section 3.4, VMM/jailer exact version and digests, kernel policy/config digest, inner image catalog and shifted ownership provenance, broker digest/protocol/capabilities, root digest, source/build provenance fields, work-disk policy and the full launch contract. All declared artifacts, including the separately retained kiln, broker and kernel config, must match size and digest. Authenticating only the artifacts actually attached to the VM is insufficient.
 4. Expand the contract into a **complete** planned configuration and argv. Compare the actual objects to be serialized/launched, not a parallel description. Allowed dynamic fields are explicitly typed below. Reject extra devices, flags, duplicate flags, JSON keys, CPU templates, test parameters, debug endpoints, snapshot settings and boot-argument additions. Require guest init's production hardening checks before broker startup.
 5. Validate the effective sandbox spec independently, then calculate the reservation using checked arithmetic. Reject network Full/Allow rather than silently running offline. Verify cgroup v2/controllers/`cgroup.kill`, KVM availability, mount/storage features, identity-range configuration, and binary ancestry. A read-only capability check may open `/dev/kvm` and query its API; it must not create a VM.
-6. Select currently free UID/GID/CID candidates without reserving them, and generate nonce/work UUID in memory. Include these and every derived name in the exact plan. Return `PreparedCreate` including profile/manifest digest, exact effective spec digest, reservation, a versioned private plan and its digest. The manager atomically records it with the reservation. `Create` revalidates the bytes and plan under the registry/allocation locks, then atomically claims those candidates in INTENT. If another create claimed one first, do not substitute another UID/GID/CID or mutate a stored plan. A C0 rejection has no daemon row. After C1, a collision, catalog mismatch, expired request or any other rejection remains charged until the exact token has a durable ABSENT receipt under section 4.1. The helper may return an immediate retryable error with AllocationAmbiguous, but never uncharged evidence from an unfenced rejection. A changed catalog never silently selects a different plan.
+6. Select currently free UID/GID/CID candidates without reserving them, and generate nonce/work UUID in memory. Include these and every derived name in the exact plan. Return `PreparedCreate` including profile/manifest digest, `host_spec_sha256` over the complete effective `SandboxSpec` including labels, plus `guest_exec_spec_sha256` over the label-free guest execution projection, reservation, a versioned private plan and its digest. The manager atomically records it with the reservation. `Create` revalidates the bytes and plan under the registry/allocation locks, then atomically claims those candidates in INTENT. If another create claimed one first, do not substitute another UID/GID/CID or mutate a stored plan. A C0 rejection has no daemon row. After C1, a collision, catalog mismatch, expired request or any other rejection remains charged until the exact token has a durable ABSENT receipt under section 4.1. The helper may return an immediate retryable error with AllocationAmbiguous, but never uncharged evidence from an unfenced rejection. A changed catalog never silently selects a different plan.
 
 Artifacts live in a root-owned immutable/content-addressed store. Keep verified descriptors pinned through staging **and actual execution**; never authorize a fresh pathname lookup from an earlier hash. No non-root principal may write an immutable artifact or rename any of its ancestors. The protected executable store and generation leases in section 3.4 cover the entire privileged child chain. Read-only bind mounts of staged kernel/root and a helper-owned config prevent a jailed process from changing those bytes. Trusted root is outside the attacker model. Revocation denies new creates/execs but **never** denies inspection or cleanup of already owned resources.
 
@@ -120,7 +120,7 @@ Freeze a new production-only `offline-768-v1` profile. The signed/approved manif
 | Dynamic resources | Work disk size/UUID and validated inner spec; exact-size loop block binding; jail tmpfs 16 MiB / 1024 inodes; outer and worker CPU/memory/PID values from sections 6.4/7, never arbitrary keys |
 | Forbidden | Snapshot/restore, custom init/kernel args, test profiles, serial input, writable root, custom seccomp/CPU templates, extra devices or host mounts |
 
-The identity block is a 4096-byte zero-padded raw record, no filesystem: magic `KID1`, big-endian u32 JSON length (1–4088), then canonical strict JSON. It binds instance ID, allocation ID, sandbox ID, 256-bit boot nonce, manifest digest, effective-launch digest, work UUID and inner-spec digest. It contains no reusable credential and is not proof against guest root. The launch digest covers canonical configuration/argv and the resolved resource recipe, including identity-drive presence/path; it excludes identity-block content to avoid a self-referential hash. The block's own SHA-256 is separately journaled. Init/broker must require exactly one valid record, zero padding and read-only vdc.
+The identity block is a 4096-byte zero-padded raw record, no filesystem: magic `KID1`, big-endian u32 JSON length (1–4088), then canonical strict JSON. It binds instance ID, allocation ID, sandbox ID, 256-bit boot nonce, manifest digest, effective-launch digest, work UUID and `guest_exec_spec_sha256`. It contains no reusable credential and is not proof against guest root. The launch digest covers canonical configuration/argv and the resolved resource recipe, including identity-drive presence/path; it excludes identity-block content to avoid a self-referential hash. The block's own SHA-256 is separately journaled. Init/broker must require exactly one valid record, zero padding and read-only vdc.
 
 The exact guest command line is inherited from the newly approved bundle; initially retain the current reviewed line:
 
@@ -131,6 +131,54 @@ randomize_kstack_offset=on
 ```
 
 Those three display lines serialize as one space-separated line. The current appended suffix is ` pci=off root=/dev/vda ro earlycon=uart,mmio,0x40002000`; freeze and test its actual value for the new three-drive/vsock topology. Never hard-code acceptance of an unverified changed suffix. These are build B1 exit criteria, not permission to weaken init's exact comparison. **B1 measured this:** real Firecracker 1.17.0 boots with three drives and vsock append the same suffix, and the contract freezes it (kiln-guest `results/phase1b-b1/suffix-probe.json`).
+
+### Canonical JSON and the two spec digests (B1 correction)
+
+All manifest, recipe, plan, spec and identity JSON uses one byte contract. Input
+is strict UTF-8, at most 4 MiB, without a BOM, trailing data, unpaired surrogate
+escapes or duplicate **decoded** object keys (including escaped aliases). Root
+depth is zero; each object key/value and array element adds one; reject any node
+past depth 32, including keys. A guest control frame additionally obeys section
+5.2's smaller depth and encoded-size bounds.
+
+Canonical bytes are ASCII, no whitespace or final newline, comma/colon separators,
+object keys sorted lexicographically by Unicode scalar value, and array order
+preserved. Strings have no Unicode normalization. Escape quote and backslash;
+use `\b`, `\f`, `\n`, `\r`, `\t` for those five controls; encode all other
+U+0000–001F and every scalar above U+007E with lowercase four-digit `\u` escapes.
+Astral scalars use UTF-16 surrogate-pair escapes. Do not escape slash. Booleans
+and null spell `true`, `false`, `null`. Integers range from -9223372036854775808
+through 18446744073709551615, with ordinary decimal spelling: no plus sign,
+leading zero, negative zero, fraction, exponent, float or non-finite constant.
+Raw manifest approval still hashes the **original bytes**, not canonical bytes.
+
+`host_spec_sha256` hashes the canonical complete effective `SandboxSpec`, including
+labels and every filled default. `guest_exec_spec_sha256` hashes exactly its
+label-free execution projection. The daemon's immutable prepared plan and future
+B2 durable journal carry the full spec and both digests; Create replay and recovery
+recompute and compare both before accepting a plan. A label-only mutation changes
+the host digest and plan digest, while the guest digest and identity block remain
+unchanged. Only `guest_exec_spec_sha256` goes into vdc, Hello and Initialize.
+Neither digest may be called an ambiguous “exact spec digest”. B1 provides the
+production `SpecBinding` codec/verification; B2 still owns the journal migration
+and lifecycle integration described in section 9.
+
+Fixtures are outside the production schema namespace: `kiln-test-manifest-v1`,
+`kiln-test-plan-v1`, profile `test-only-b1`. Constructors live only in test code,
+with a `FixturePlan` type and no conversion to `PreparedCreate`. Production manifest
+validation rejects them unconditionally, regardless of independent approval;
+there is no fixture boolean or CLI switch. Relabeling their schema or clearing
+their fixture flag cannot make them deployable. Schema 2 remains disabled until
+the reviewed B4/B5/B7 artifacts and approval gates are implemented.
+
+Both repositories check in the identical `conformance.json` corpus. Both suites
+assert accept/reject verdicts and exact canonical bytes/SHA-256, including valid
+non-ASCII writable paths, Unicode scalar ordering and surrogate edges, number
+spellings/bounds, duplicates, schema confusion, every contract/manifest/plan/
+substitution/spec/binding leaf mutation, and all named attacks. Rust uses the
+production strict parser, canonicalizer, frozen recipe validator and launch
+rederivation; fixture envelopes remain test-only. Recomputed approvals do not
+turn a mutated recipe into an accepted launch.
 
 ## 3.4 Executable identity from verification through exec
 
@@ -314,9 +362,9 @@ Frame assembly/transfer and expected request/response stages are bounded to two 
 
 | Kind | Fields / behavior |
 |---|---|
-| `Hello` (1) | Host challenge[32], expected instance/allocation/sandbox IDs, boot nonce, manifest/launch/spec digests, supported protocol=1; one per connection before any other verb |
+| `Hello` (1) | Host challenge[32], expected instance/allocation/sandbox IDs, boot nonce, manifest/launch digests and `guest_exec_spec_sha256`, supported protocol=1; one per connection before any other verb |
 | `HelloReply` (2) | Echo challenge, identity from vdc, guest kernel boot ID, broker build digest, kiln CLI protocol/features, runtime-hardening booleans, work UUID/mount flags, persistent inner ID if already initialized |
-| `Initialize` (3) | Exact inner spec, spec digest; allowed once per cold boot after Hello; a duplicate identical request returns the same result, a conflicting one closes/quarantines |
+| `Initialize` (3) | Exact label-free execution spec, `guest_exec_spec_sha256`; allowed once per cold boot after Hello; a duplicate identical request returns the same result, a conflicting one closes/quarantines |
 | `Ready` (4) | Bound identity/digests, inner ID, execution capability bits, idle=true, work quota verified, boot ID; emitted after persistent create and a supervised `true` smoke exec have drained |
 | `Probe` (5), `ProbeReply` (6) | Expected boot/inner IDs; idle/busy and active execution token; no create/restart/mutation |
 | `Exec` (7) | Execution token, public execution ID, argv, stdin_bytes, max_output, remaining_ms; only in initialized idle state |
@@ -603,7 +651,7 @@ Periodic reconciliation runs at 30-second intervals with jitter and singleflight
 
 Replace schema 7's `backend_id IS NOT NULL` inference with typed release evidence. For Firecracker, `reservation_released` is derived from a validated evidence reference, never an independently writable boolean. Migrate every legacy row using **exactly** schema 7's existing reserved predicate and spec-derived amounts; never reinterpret old ambiguous failures. For new Firecracker rows, **every release after C1 requires a matching durable ABSENT receipt**, including rejection before INTENT. C0 rejection has no row. A cleanup-failed FAILED row may have an allocation/backend identity and still be charged.
 
-Add an immutable `release_evidence` table keyed by receipt ID, with NOT NULL node/instance/allocation/plan digest/helper generation/kind fields and a unique identity tuple. A Firecracker row's nullable `release_evidence_id` has a composite foreign key matching its own immutable identity/plan and `AbsentFenced` kind; SQL CHECKs/triggers reject mismatches, active-state releases and evidence mutation. Foreign keys are mandatory on every connection. Legacy release provenance has a separate tagged representation and cannot satisfy a Firecracker reference. In the same transaction insert validated evidence, set the terminal row and evidence reference; absence of the reference means charged regardless of state/backend ID. Store reservation components, prepared plan/version, boot identity and cleanup disposition alongside it. Persist the API state/execution outcome/reservation-release decision atomically. Constraints forbid a released nonterminal Firecracker allocation and conflicting plan/identity updates. Older binaries must refuse the upgraded schema. Migration, prune SQL, reservation summation, manager compensation and delete fast paths must change in the same mergeable step; modifying only the Runtime adapter is unsafe.
+Add an immutable `release_evidence` table keyed by receipt ID, with NOT NULL node/instance/allocation/plan digest/helper generation/kind fields and a unique identity tuple. A Firecracker row's nullable `release_evidence_id` has a composite foreign key matching its own immutable identity/plan and `AbsentFenced` kind; SQL CHECKs/triggers reject mismatches, active-state releases and evidence mutation. Foreign keys are mandatory on every connection. Legacy release provenance has a separate tagged representation and cannot satisfy a Firecracker reference. In the same transaction insert validated evidence, set the terminal row and evidence reference; absence of the reference means charged regardless of state/backend ID. Store the complete effective host spec and both explicitly named digests (`host_spec_sha256`, `guest_exec_spec_sha256`), reservation components, prepared plan/version, boot identity and cleanup disposition alongside it. Persist the API state/execution outcome/reservation-release decision atomically. Constraints forbid a released nonterminal Firecracker allocation and conflicting plan/identity updates. Older binaries must refuse the upgraded schema. Migration, prune SQL, reservation summation, manager compensation and delete fast paths must change in the same mergeable step; modifying only the Runtime adapter is unsafe.
 
 Keep immutable caller UID, root override, foreign-as-NOT_FOUND behavior and SQL owner filtering before pagination. Helper metadata does not replace those checks. Keep `full|metadata|none` output semantics and existing age/count policies; retain charged, quarantined, unfinished and publication-pending rows. Pruning must consult explicit release evidence and cannot erase replay fences. Diagnostics/argv/specs may still contain private information; no new “secure erase” claim.
 
@@ -615,7 +663,9 @@ Retain Runtime's create/exec/remove/list/gc/version/validation roles. Add prepar
 
 ```rust
 struct PreparedCreate {
-    spec: SandboxSpec,
+    spec: SandboxSpec, // complete effective host spec, including labels
+    host_spec_sha256: Digest,
+    guest_exec_spec_sha256: Digest,
     reservation: ResourceReservation,
     plan_version: u32,
     plan_digest: Digest,
@@ -742,7 +792,7 @@ Use separately mergeable changes against main, with no production backend enable
 
 **Files:** kiln-guest `scripts/launch_contract.py`, manifest builder/validator, `src/init.c`, bundle input pins and `tests/test_launch_contract.py`; new shared golden fixtures under kilnd `crates/kilnd/tests/fixtures/firecracker/`. Agree the schema revision and exact permitted substitutions from section 3, including identity vdc, broker lifecycle and the executable identity/FD-handoff recipe for jailer, Firecracker, formatter and all separate helper images. Keep production deployment disabled while the broker artifact is absent.
 
-**Exit:** negative mutation tests pass; the current no-vsock manifest is refused; fixtures have no placeholder security fields. UID and GID are separate typed substitutions (include an unequal pair); the contract freezes empty Groups and zero effective/permitted/inheritable/bounding/ambient capability masks, exact jail tmpfs byte/inode limits, loop device recipe, worker/cgroup limits and timing-argv exception. Pin and review the complete descriptor/capability-drop handoff; B4 must prove actual VMM masks and executable identity before approval. The executable contract freezes protected ancestry (ownership, modes, ACLs and parent rename authority), size/digest per role, allowed node-local inode identity, dependency closure, generation leases and FD 3/4 handoff. Add explicit source-parent/installed-name replacement fixtures after verification and before exec; the Linux retained-FD fixture records the actual executable device/inode/digest and must match its expected tuple. Contract tests reject an observed replacement even if argv or the earlier digest matches. These fixtures need no guest boot; B4 tests the actual J/V chain. Changing semantic constraints requires design review.
+**Exit:** Python/Rust shared conformance and negative mutation tests pass with identical verdicts/canonical bytes/digests; the two spec digests bind host labels and guest execution separately; fixture schemas/types cannot enter production validation or PreparedCreate; the current no-vsock manifest is refused; fixtures have no placeholder security fields. UID and GID are separate typed substitutions (include an unequal pair); the contract freezes empty Groups and zero effective/permitted/inheritable/bounding/ambient capability masks, exact jail tmpfs byte/inode limits, loop device recipe, worker/cgroup limits and timing-argv exception. Pin and review the complete descriptor/capability-drop handoff; B4 must prove actual VMM masks and executable identity before approval. The executable contract freezes protected ancestry (ownership, modes, ACLs and parent rename authority), size/digest per role, allowed node-local inode identity, dependency closure, generation leases and FD 3/4 handoff. Add explicit source-parent/installed-name replacement fixtures after verification and before exec; the Linux retained-FD fixture records the actual executable device/inode/digest and must match its expected tuple. Contract tests reject an observed replacement even if argv or the earlier digest matches. These fixtures need no guest boot; B4 tests the actual J/V chain. Changing semantic constraints requires design review.
 
 ## B2 — Runtime evidence and durable accounting
 
@@ -835,7 +885,7 @@ pandoc docs/design/phase1b-firecracker.md \
   -o ../research/phase1b-firecracker-design.pdf
 ```
 
-The PDF is a local review artifact; the source and style are on `design/phase1b`. No PR, merge, production installation or VM run is part of this task.
+The PDF is a local review artifact; the source and style are versioned with this design. Rendering grants no production approval. B1 contract tests run on macOS and Linux/root; B4/B5 still owe the live production-chain evidence.
 
 # 15. Review response
 
@@ -853,3 +903,12 @@ Daybreak Blue's October 31 recheck at `1e448d2` **closed all seven original find
 | Recheck 1. Executable identity lost at launch (KR-05) | Sections 3.1–3.4, 4.1/4.3–4.4, 6.2/6.4 and 7.1 require protected ancestry, retained-FD execution and expected/observed identity for J/V/formatter/all helper images. The explicit J-to-V handoff has no pathname-copy/exec fallback. Sections 10.1/10.2 and B1/B3/B4 race source/installed-name replacement and assert the actual executable device/inode/digest |
 
 The retained-descriptor handoff and zero-bounding-set requirement require the narrow jailer patch in sections 3.4/6.2, pinned and reviewed before B4. New loop-device and worker mechanisms also require their stated compatibility/fault tests. They are build prerequisites, not silent exceptions to the approved launch contract.
+
+## B1 implementation review corrections (October 31, 2026)
+
+The B1 break-it report's three findings are accepted: sections 3.2/3.3 now
+freeze strict cross-language canonical bytes, distinguish the host/guest spec
+digests and isolate fixtures from production schemas. The shared corpus replaces
+Rust's hash-change-only negative evidence with validation of all mutations.
+Actual jailer/VMM capability masks, retained-FD handoff and broker readiness
+remain B4/B5 gates; synthetic B1 evidence does not claim those gates passed.
