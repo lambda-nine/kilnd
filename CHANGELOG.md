@@ -6,6 +6,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Bind the Phase 1b design's complete helper executable chain to verified inodes,
+  add replacement-race gates, and record Stephen's October 31 design decisions.
+
 - Specify the Phase 1b Firecracker runtime and guest broker design, including
   approved launch contracts, durable recovery, resource reservations and build gates.
 - Address the Phase 1b design review with mandatory absence fences, node-global
