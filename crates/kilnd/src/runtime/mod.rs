@@ -321,6 +321,41 @@ impl FencedAbsence {
         bounded_receipt(serde_json::to_vec(self).map_err(std::io::Error::other)?)
     }
 
+    /// Decode the sole durable AbsentFenced encoding. Its kind is implicit in
+    /// this type; unknown/duplicate fields and alternate encodings are refused.
+    pub fn decode(encoded: &[u8]) -> Result<Self, RuntimeError> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            receipt_id: String,
+            node_id: String,
+            instance_id: String,
+            allocation_id: String,
+            plan_digest: String,
+            helper_generation: u64,
+            observations: String,
+        }
+        let invalid =
+            |message: String| RuntimeError::Backend(format!("invalid FencedAbsence: {message}"));
+        if encoded.len() > MAX_RECEIPT_BYTES {
+            return Err(invalid("receipt exceeds size bound".into()));
+        }
+        let wire: Wire = serde_json::from_slice(encoded).map_err(|e| invalid(e.to_string()))?;
+        let receipt = Self::new(
+            Id128::parse(&wire.receipt_id).map_err(invalid)?,
+            Id128::parse(&wire.node_id).map_err(invalid)?,
+            Id128::parse(&wire.instance_id).map_err(invalid)?,
+            Id128::parse(&wire.allocation_id).map_err(invalid)?,
+            Digest::parse(&wire.plan_digest).map_err(invalid)?,
+            wire.helper_generation,
+            wire.observations,
+        )?;
+        if receipt.encode()? != encoded {
+            return Err(invalid("noncanonical encoding".into()));
+        }
+        Ok(receipt)
+    }
+
     pub fn receipt_id(&self) -> Id128 {
         self.receipt_id
     }

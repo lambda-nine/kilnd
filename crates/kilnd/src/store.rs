@@ -27,7 +27,7 @@ use crate::model::{
 use crate::retention::{OutputStorage, Pruned, Retention};
 use crate::runtime::{CreatedSandbox, FencedAbsence, RuntimeReceipt};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -266,6 +266,72 @@ WHEN (OLD.accounting_kind = 'legacy' AND OLD.legacy_release IS NULL)
     OR (OLD.accounting_kind = 'fenced' AND OLD.release_evidence_id IS NULL)
 BEGIN SELECT RAISE(ABORT, 'a charged sandbox row cannot be deleted'); END;
 PRAGMA user_version = 8;";
+
+// Every UNIQUE key must be guarded before SQLite resolves conflicts: implicit
+// REPLACE deletes skip DELETE triggers when recursive_triggers is off. ABORT
+// in a BEFORE trigger also cannot be weakened by OR IGNORE/FAIL/ROLLBACK.
+const MIGRATE_V9: &str = "
+DROP TRIGGER sandboxes_no_replace;
+CREATE TRIGGER sandboxes_no_replace BEFORE INSERT ON sandboxes
+WHEN EXISTS (SELECT 1 FROM sandboxes WHERE rowid = NEW.rowid OR id = NEW.id OR list_seq = NEW.list_seq
+    OR (NEW.backend_id IS NOT NULL AND backend = NEW.backend AND backend_id = NEW.backend_id)
+    OR (NEW.allocation_id IS NOT NULL AND allocation_id = NEW.allocation_id))
+BEGIN SELECT RAISE(ABORT, 'a sandbox row cannot be replaced'); END;
+CREATE TRIGGER sandboxes_no_replace_update BEFORE UPDATE ON sandboxes
+WHEN EXISTS (SELECT 1 FROM sandboxes WHERE rowid != OLD.rowid AND (
+    rowid = NEW.rowid OR id = NEW.id OR list_seq = NEW.list_seq
+    OR (NEW.backend_id IS NOT NULL AND backend = NEW.backend AND backend_id = NEW.backend_id)
+    OR (NEW.allocation_id IS NOT NULL AND allocation_id = NEW.allocation_id)))
+BEGIN SELECT RAISE(ABORT, 'a sandbox row cannot be replaced'); END;
+CREATE TRIGGER daemon_identity_no_replace BEFORE INSERT ON daemon_identity
+WHEN EXISTS (SELECT 1 FROM daemon_identity WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'daemon identity is immutable'); END;
+CREATE TRIGGER executions_no_replace BEFORE INSERT ON executions
+WHEN EXISTS (SELECT 1 FROM executions WHERE rowid = NEW.rowid OR id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'an execution row cannot be replaced'); END;
+CREATE TRIGGER executions_no_replace_update BEFORE UPDATE ON executions
+WHEN EXISTS (SELECT 1 FROM executions WHERE rowid != OLD.rowid AND (rowid = NEW.rowid OR id = NEW.id))
+BEGIN SELECT RAISE(ABORT, 'an execution row cannot be replaced'); END;
+CREATE TRIGGER history_sequence_no_replace BEFORE INSERT ON history_sequence
+WHEN EXISTS (SELECT 1 FROM history_sequence WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'history sequence cannot be replaced'); END;
+CREATE TRIGGER history_sequence_identity BEFORE UPDATE OF id ON history_sequence
+WHEN NEW.id IS NOT OLD.id
+BEGIN SELECT RAISE(ABORT, 'history sequence identity is immutable'); END;
+DROP TRIGGER release_evidence_no_replace;
+CREATE TRIGGER release_evidence_no_replace BEFORE INSERT ON release_evidence
+WHEN EXISTS (SELECT 1 FROM release_evidence WHERE rowid = NEW.rowid
+    OR receipt_id = NEW.receipt_id OR allocation_id = NEW.allocation_id)
+BEGIN SELECT RAISE(ABORT, 'release evidence is immutable'); END;
+CREATE TRIGGER release_evidence_validate BEFORE INSERT ON release_evidence
+WHEN kilnd_fenced_absence_valid(NEW.receipt, NEW.receipt_id, NEW.node_id,
+    NEW.instance_id, NEW.allocation_id, NEW.plan_digest, NEW.helper_generation, NEW.kind) IS NOT 1
+BEGIN SELECT RAISE(ABORT, 'invalid encoded AbsentFenced evidence'); END;
+PRAGMA user_version = 9;";
+
+/// Register before preparing any schema statement. An independent connection
+/// without this function cannot insert evidence, even with defensive pragmas off.
+fn register_receipt_validator(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "kilnd_fenced_absence_valid",
+        8,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let bytes = ctx.get::<Vec<u8>>(0)?;
+            let Ok(receipt) = FencedAbsence::decode(&bytes) else {
+                return Ok(false);
+            };
+            Ok(receipt.receipt_id().to_string() == ctx.get::<String>(1)?
+                && receipt.node_id().to_string() == ctx.get::<String>(2)?
+                && receipt.instance_id().to_string() == ctx.get::<String>(3)?
+                && receipt.allocation_id().to_string() == ctx.get::<String>(4)?
+                && receipt.plan_digest().to_string() == ctx.get::<String>(5)?
+                && receipt.helper_generation() as i64 == ctx.get::<i64>(6)?
+                && ctx.get::<String>(7)? == "absent_fenced")
+        },
+    )
+}
 
 // The explicit legacy tag and reuse state for an update binding ?2 = new state and
 // ?3 = optional backend ID. An absence-fenced row never takes this path's tag.
@@ -761,6 +827,7 @@ impl Store {
 
     fn initialize(&self) -> Result<()> {
         let mut conn = self.conn();
+        register_receipt_validator(&conn)?;
         // Evidence references depend on this, and SQLite ignores it inside a
         // transaction and defaults it off per connection. Set and verify it first.
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -768,7 +835,7 @@ impl Store {
         if foreign_keys != 1 {
             bail!("SQLite refused to enforce foreign keys on this connection");
         }
-        // A conflict clause's implicit delete must also meet the no-delete triggers.
+        // Defense in depth; BEFORE collision guards protect other connections too.
         conn.pragma_update(None, "recursive_triggers", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -811,7 +878,22 @@ impl Store {
         if (1..7).contains(&version) {
             tx.execute_batch(MIGRATE_V7)?;
         }
-        migrate_v8(&tx)?;
+        if version < 8 {
+            migrate_v8(&tx)?;
+        }
+        // A schema-8 database may already contain malformed evidence. Refuse the
+        // upgrade atomically rather than blessing it or erasing its replay fence.
+        let invalid: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM release_evidence WHERE kilnd_fenced_absence_valid(
+                receipt, receipt_id, node_id, instance_id, allocation_id, plan_digest,
+                helper_generation, kind) IS NOT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        if invalid != 0 {
+            bail!("schema 8 contains {invalid} invalid AbsentFenced receipts");
+        }
+        tx.execute_batch(MIGRATE_V9)?;
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
         Ok(())
@@ -3077,12 +3159,28 @@ mod tests {
         generation: &str,
         kind: &str,
     ) -> rusqlite::Result<usize> {
+        let encoded = FencedAbsence::new(
+            Id128::parse(receipt).unwrap_or_else(|_| Id128::random()),
+            Id128::parse(node).unwrap_or_else(|_| Id128::random()),
+            Id128::parse(instance).unwrap_or_else(|_| Id128::random()),
+            Id128::parse(allocation).unwrap_or_else(|_| Id128::random()),
+            Digest::parse(plan).unwrap_or_else(|_| Digest::of(b"invalid")),
+            generation
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n >= 1)
+                .unwrap_or(1),
+            String::new(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
         conn.execute(
             &format!(
                 "INSERT INTO release_evidence (receipt_id, node_id, instance_id, allocation_id, plan_digest, helper_generation, kind, receipt, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, {generation}, {kind}, x'7b7d', 1)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, {generation}, {kind}, ?6, 1)"
             ),
-            params![receipt, node, instance, allocation, plan],
+            params![receipt, node, instance, allocation, plan, encoded],
         )
     }
 
@@ -3298,7 +3396,7 @@ mod tests {
     }
 
     #[test]
-    fn schema8_fresh_and_migrated_schemas_are_identical() {
+    fn schema9_fresh_and_migrated_schemas_are_identical() {
         let schema_sql = |conn: &Connection| -> Vec<(String, String)> {
             conn.prepare(
                 "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name",
@@ -3311,12 +3409,17 @@ mod tests {
         };
         let fresh = Store::open_in_memory().unwrap();
         let expected = schema_sql(&fresh.conn());
-        for version in 1..=7 {
+        for version in 1..=8 {
             let tmp = tempfile::tempdir().unwrap();
-            let conn = disk_database_at(tmp.path(), version);
+            let mut conn = disk_database_at(tmp.path(), version.min(7));
+            if version == 8 {
+                let tx = conn.transaction().unwrap();
+                migrate_v8(&tx).unwrap();
+                tx.commit().unwrap();
+            }
             release_database(conn, tmp.path());
             let store = Store::reopen_after_restart(tmp.path());
-            // Compare after a v1 database's ALTER-built history reached schema 8.
+            // Compare after every supported historical schema reaches schema 9.
             assert_eq!(schema_sql(&store.conn()), expected, "v{version}");
         }
     }
@@ -3823,6 +3926,611 @@ mod tests {
         drop(conn);
         let store = Store::reopen_after_restart(&dir);
         assert_eq!(store.sandbox_resources().unwrap(), charged);
+    }
+
+    #[test]
+    fn external_replace_cannot_release_charged_row_without_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        let row = fenced_sandbox();
+        store.insert_sandbox(&row).unwrap();
+        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+
+        // A concurrent non-Store SQLite connection can choose both protections off.
+        // Reusing list_seq selects the charged row as OR REPLACE's conflict
+        // victim. Neither per-connection pragma may weaken the BEFORE guard.
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.pragma_update(None, "recursive_triggers", "OFF")
+            .unwrap();
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "foreign_keys", |r| r.get(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "recursive_triggers", |r| r.get(0))
+                .unwrap(),
+            0
+        );
+        conn.execute(
+            "INSERT OR REPLACE INTO sandboxes (
+                id, backend, backend_id, state, spec, failure_reason,
+                created_at_ms, updated_at_ms, deleted_at_ms, list_seq,
+                create_certainty, owner_uid, accounting_kind,
+                reserved_memory_bytes, reserved_disk_bytes, reserved_pids,
+                reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids,
+                host_spec_sha256, guest_exec_spec_sha256,
+                runtime_profile, runtime_artifact_digest, disposition,
+                boot_id, runtime_receipt, legacy_release,
+                node_id, instance_id, allocation_id, plan_version, plan_digest, plan,
+                release_evidence_id, release_evidence_kind, last_helper_generation
+             )
+             SELECT
+                'sb-0000000000000000', backend, NULL, 'failed', spec, 'forged release',
+                created_at_ms, updated_at_ms, NULL, list_seq,
+                'definitely_not_created', owner_uid, 'legacy',
+                reserved_memory_bytes, reserved_disk_bytes, reserved_pids,
+                0, 0, 0,
+                host_spec_sha256, guest_exec_spec_sha256,
+                '', '', 'reusable',
+                NULL, NULL, 'definitely_not_created',
+                NULL, NULL, NULL, NULL, NULL, NULL,
+                NULL, 'absent_fenced', NULL
+             FROM sandboxes WHERE id = ?1",
+            [&row.id],
+        )
+        .unwrap_err();
+        drop(conn);
+
+        assert!(store.sandbox(&row.id).unwrap().unwrap().is_charged());
+        assert_eq!(
+            store.sandbox_resources().unwrap().sandboxes,
+            1,
+            "charged capacity was released without any release_evidence row"
+        );
+        assert_eq!(
+            store
+                .conn()
+                .query_row("SELECT COUNT(*) FROM release_evidence", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    fn defenseless_connection(dir: &Path) -> Connection {
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        for pragma in ["foreign_keys", "recursive_triggers"] {
+            conn.pragma_update(None, pragma, "OFF").unwrap();
+            assert_eq!(
+                conn.pragma_query_value::<i64, _>(None, pragma, |r| r.get(0))
+                    .unwrap(),
+                0
+            );
+        }
+        conn
+    }
+
+    fn table_snapshot(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = conn
+            .prepare(&format!("SELECT rowid, * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |r| (0..columns).map(|i| r.get(i)).collect())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Clone a valid row with selected SQL expressions substituted. All other
+    /// columns remain valid, so a refusal proves conflict handling, not a missing
+    /// NOT NULL fixture field. `source` and substitutions are test-owned literals.
+    fn clone_row_sql(
+        conn: &Connection,
+        table: &str,
+        algorithm: &str,
+        source: &str,
+        changes: &[(&str, &str)],
+    ) -> String {
+        let columns: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut names = vec!["rowid".to_string()];
+        names.extend(columns);
+        let select: Vec<&str> = names
+            .iter()
+            .map(|name| {
+                changes
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map_or(name.as_str(), |(_, expr)| *expr)
+            })
+            .collect();
+        format!(
+            "INSERT OR {algorithm} INTO {table} ({}) SELECT {} FROM {table} WHERE {source}",
+            names.join(","),
+            select.join(",")
+        )
+    }
+
+    #[test]
+    fn external_conflict_algorithms_preserve_every_unique_key_and_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        let victim = fenced_sandbox();
+        store.insert_sandbox(&victim).unwrap();
+        // Publish a backend key without releasing capacity.
+        store
+            .conn()
+            .execute(
+                "UPDATE sandboxes SET state='failed', backend_id='fc-' || allocation_id WHERE id=?1",
+                [&victim.id],
+            )
+            .unwrap();
+        let attacker = sandbox();
+        store.insert_sandbox(&attacker).unwrap();
+        let e1 = execution(&victim.id);
+        let e2 = execution(&victim.id);
+        store.insert_execution(&e1).unwrap();
+        store.insert_execution(&e2).unwrap();
+        let retired = fenced_sandbox();
+        store.insert_sandbox(&retired).unwrap();
+        let fence = receipt_for(&retired);
+        store
+            .release_fenced(&retired.id, SandboxState::Deleted, &fence, None)
+            .unwrap();
+        // History can expire while the fence remains permanent. With the API row
+        // gone, no freshness trigger can mask a missing collision guard.
+        store
+            .conn()
+            .execute("DELETE FROM sandboxes WHERE id=?1", [&retired.id])
+            .unwrap();
+        let other_fence = receipt_for(&fenced_sandbox());
+        insert_evidence(
+            &store.conn(),
+            (
+                &other_fence.receipt_id().to_string(),
+                &other_fence.node_id().to_string(),
+                &other_fence.instance_id().to_string(),
+                &other_fence.allocation_id().to_string(),
+                &other_fence.plan_digest().to_string(),
+            ),
+            "7",
+            "'absent_fenced'",
+        )
+        .unwrap();
+        let charged = store.sandbox_resources().unwrap();
+        let conn = defenseless_connection(&dir);
+        // Register the real decoder here so evidence conflict tests cannot pass
+        // merely because an independent connection lacks the function.
+        register_receipt_validator(&conn).unwrap();
+        let tables = [
+            "sandboxes",
+            "daemon_identity",
+            "release_evidence",
+            "history_sequence",
+            "executions",
+        ];
+        // Freeze the audited UNIQUE inventory so an added index demands review.
+        for (table, expected) in [
+            (
+                "sandboxes",
+                vec!["id", "backend,backend_id", "list_seq", "allocation_id"],
+            ),
+            (
+                "release_evidence",
+                vec![
+                    "receipt_id",
+                    "allocation_id",
+                    "node_id,instance_id,allocation_id,plan_digest,helper_generation,kind",
+                    "receipt_id,node_id,instance_id,allocation_id,plan_digest,kind",
+                ],
+            ),
+            ("executions", vec!["id"]),
+            ("daemon_identity", vec![]), // INTEGER PRIMARY KEY aliases rowid.
+            ("history_sequence", vec![]),
+        ] {
+            let indexes: Vec<String> = conn
+                .prepare(&format!(
+                    "SELECT name FROM pragma_index_list('{table}') WHERE \"unique\"=1"
+                ))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let mut actual: Vec<String> = indexes
+                .iter()
+                .map(|name| {
+                    conn.query_row(
+                        "SELECT group_concat(name, ',') FROM pragma_index_info(?1)",
+                        [name],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            actual.sort();
+            let mut expected: Vec<String> = expected.into_iter().map(String::from).collect();
+            expected.sort();
+            assert_eq!(actual, expected, "unaudited unique key on {table}");
+        }
+        let snapshots: Vec<_> = tables.iter().map(|t| table_snapshot(&conn, t)).collect();
+        let source = format!("id='{}'", victim.id);
+        let victim_rowid: i64 = conn
+            .query_row(
+                "SELECT rowid FROM sandboxes WHERE id=?1",
+                [&victim.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for algorithm in ["REPLACE", "IGNORE", "ABORT", "FAIL", "ROLLBACK"] {
+            // Isolate each declared unique key; also cover SQLite's implicit rowid.
+            for key in ["id", "list_seq", "backend_id", "allocation_id", "rowid"] {
+                let id = if key == "id" { "id" } else { "'sb-candidate'" };
+                let seq = if key == "list_seq" {
+                    "list_seq"
+                } else {
+                    "1000000"
+                };
+                let backend = if key == "backend_id" {
+                    "(SELECT backend_id FROM sandboxes WHERE accounting_kind='fenced')"
+                } else {
+                    "NULL"
+                };
+                let alloc = if key == "backend_id" {
+                    "NULL"
+                } else if key == "allocation_id" {
+                    "allocation_id"
+                } else {
+                    "'ffffffffffffffffffffffffffffffff'"
+                };
+                let rowid = if key == "rowid" { "rowid" } else { "1000000" };
+                let sql = clone_row_sql(
+                    &conn,
+                    "sandboxes",
+                    algorithm,
+                    &if key == "backend_id" {
+                        format!("id='{}'", attacker.id)
+                    } else {
+                        source.clone()
+                    },
+                    &[
+                        ("id", id),
+                        ("list_seq", seq),
+                        ("backend_id", backend),
+                        ("allocation_id", alloc),
+                        ("rowid", rowid),
+                    ],
+                );
+                assert!(conn.execute(&sql, []).is_err(), "{algorithm} insert {key}");
+                let value = match key {
+                    "id" => format!("'{}'", victim.id),
+                    "list_seq" => format!("(SELECT list_seq FROM sandboxes WHERE {source})"),
+                    "backend_id" => format!("(SELECT backend_id FROM sandboxes WHERE {source})"),
+                    "allocation_id" => {
+                        format!("(SELECT allocation_id FROM sandboxes WHERE {source})")
+                    }
+                    "rowid" => victim_rowid.to_string(),
+                    _ => unreachable!(),
+                };
+                let sql = format!("UPDATE OR {algorithm} sandboxes SET {key}={value} WHERE id=?1");
+                assert!(
+                    conn.execute(&sql, [&attacker.id]).is_err(),
+                    "{algorithm} update {key}"
+                );
+            }
+            for table in ["daemon_identity", "history_sequence"] {
+                let source = format!("rowid=(SELECT MIN(rowid) FROM {table})");
+                let sql = clone_row_sql(&conn, table, algorithm, &source, &[]);
+                assert!(
+                    conn.execute(&sql, []).is_err(),
+                    "{algorithm} insert {table}"
+                );
+            }
+            for key in ["id", "rowid"] {
+                let source = format!("id='{}'", e1.id);
+                let changes = if key == "id" {
+                    vec![("rowid", "1000000")]
+                } else {
+                    vec![("id", "'exec-candidate'")]
+                };
+                let sql = clone_row_sql(&conn, "executions", algorithm, &source, &changes);
+                assert!(
+                    conn.execute(&sql, []).is_err(),
+                    "{algorithm} insert executions {key}"
+                );
+                let sql = format!(
+                    "UPDATE OR {algorithm} executions SET {key}=(SELECT {key} FROM executions WHERE id=?1) WHERE id=?2"
+                );
+                assert!(
+                    conn.execute(&sql, params![e1.id, e2.id]).is_err(),
+                    "{algorithm} update executions {key}"
+                );
+            }
+            // release_evidence's two composite unique indexes both contain the
+            // globally unique allocation_id, so its guard covers those too.
+            for key in [
+                "receipt_id",
+                "allocation_id",
+                "identity_tuple",
+                "reference_tuple",
+                "rowid",
+            ] {
+                let receipt = FencedAbsence::new(
+                    if matches!(key, "receipt_id" | "reference_tuple") {
+                        fence.receipt_id()
+                    } else {
+                        Id128::random()
+                    },
+                    fence.node_id(),
+                    fence.instance_id(),
+                    if matches!(key, "receipt_id" | "rowid") {
+                        Id128::random()
+                    } else {
+                        fence.allocation_id()
+                    },
+                    fence.plan_digest(),
+                    7,
+                    String::new(),
+                )
+                .unwrap();
+                let blob = receipt.encode().unwrap();
+                let rowid = if key == "rowid" {
+                    format!(
+                        "(SELECT rowid FROM release_evidence WHERE receipt_id='{}')",
+                        fence.receipt_id()
+                    )
+                } else {
+                    "1000000".to_string()
+                };
+                let sql = format!(
+                    "INSERT OR {algorithm} INTO release_evidence (rowid,receipt_id,node_id,instance_id,allocation_id,plan_digest,helper_generation,kind,receipt,recorded_at_ms) VALUES ({rowid},?1,?2,?3,?4,?5,7,'absent_fenced',?6,1)"
+                );
+                assert!(
+                    conn.execute(
+                        &sql,
+                        params![
+                            receipt.receipt_id().to_string(),
+                            receipt.node_id().to_string(),
+                            receipt.instance_id().to_string(),
+                            receipt.allocation_id().to_string(),
+                            receipt.plan_digest().to_string(),
+                            blob
+                        ]
+                    )
+                    .is_err(),
+                    "{algorithm} insert evidence {key}"
+                );
+            }
+            for key in [
+                "receipt_id",
+                "allocation_id",
+                "node_id",
+                "instance_id",
+                "plan_digest",
+                "helper_generation",
+                "kind",
+                "rowid",
+            ] {
+                let sql = format!(
+                    "UPDATE OR {algorithm} release_evidence SET {key}=(SELECT {key} FROM release_evidence WHERE receipt_id=?1) WHERE receipt_id=?2"
+                );
+                assert!(
+                    conn.execute(
+                        &sql,
+                        params![
+                            fence.receipt_id().to_string(),
+                            other_fence.receipt_id().to_string()
+                        ]
+                    )
+                    .is_err(),
+                    "{algorithm} update evidence {key}"
+                );
+            }
+            assert!(
+                conn.execute(
+                    &format!("UPDATE OR {algorithm} daemon_identity SET id=1"),
+                    []
+                )
+                .is_err()
+            );
+            assert!(
+                conn.execute(
+                    &format!("UPDATE OR {algorithm} daemon_identity SET instance_id=?1"),
+                    [Id128::random().to_string()]
+                )
+                .is_err()
+            );
+            assert!(
+                conn.execute(
+                    &format!("UPDATE OR {algorithm} release_evidence SET recorded_at_ms=0"),
+                    []
+                )
+                .is_err()
+            );
+            for (table, before) in tables.iter().zip(&snapshots) {
+                assert_eq!(
+                    &table_snapshot(&conn, table),
+                    before,
+                    "{algorithm}: {table}"
+                );
+            }
+            assert_eq!(store.sandbox_resources().unwrap(), charged);
+        }
+    }
+
+    #[test]
+    fn encoded_absence_is_validated_on_store_and_independent_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        let row = fenced_sandbox();
+        store.insert_sandbox(&row).unwrap();
+        let receipt = receipt_for(&row);
+        let valid = receipt.encode().unwrap();
+        assert_eq!(FencedAbsence::decode(&valid).unwrap(), receipt);
+        let text = String::from_utf8(valid.clone()).unwrap();
+        let mut malformed = vec![
+            vec![0],
+            b"{}".to_vec(),
+            vec![],
+            vec![b'x'; 16385],
+            valid[..valid.len() - 1].to_vec(),
+            format!(" {text}").into_bytes(),
+        ];
+        let mut unknown = serde_json::from_slice::<serde_json::Value>(&valid).unwrap();
+        unknown["kind"] = "stopped".into();
+        malformed.push(serde_json::to_vec(&unknown).unwrap());
+        // Duplicate fields, alternate field order, escaped IDs and floating
+        // generation spellings cannot round-trip to the production encoding.
+        malformed.push(
+            text.replacen('{', "{\"observations\":\"\",", 1)
+                .into_bytes(),
+        );
+        malformed.push(
+            serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&valid).unwrap()).unwrap(),
+        );
+        malformed.push(
+            text.replace("\"helper_generation\":7", "\"helper_generation\":7.0")
+                .into_bytes(),
+        );
+        let receipt_id = receipt.receipt_id().to_string();
+        malformed.push(
+            text.replacen(
+                &format!("\"receipt_id\":\"{receipt_id}"),
+                &format!(
+                    "\"receipt_id\":\"\\u00{:02x}{}",
+                    receipt_id.as_bytes()[0],
+                    &receipt_id[1..]
+                ),
+                1,
+            )
+            .into_bytes(),
+        );
+        let external = defenseless_connection(&dir);
+        let insert = |conn: &Connection, blob: &[u8], fields: &[String]| {
+            conn.execute("INSERT INTO release_evidence (receipt_id,node_id,instance_id,allocation_id,plan_digest,helper_generation,kind,receipt,recorded_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1)",
+                params![fields[0],fields[1],fields[2],fields[3],fields[4],fields[5],fields[6],blob])
+        };
+        let fields = vec![
+            receipt.receipt_id().to_string(),
+            receipt.node_id().to_string(),
+            receipt.instance_id().to_string(),
+            receipt.allocation_id().to_string(),
+            receipt.plan_digest().to_string(),
+            "7".into(),
+            "absent_fenced".into(),
+        ];
+        // No function is a hard failure even for a valid receipt.
+        let err = insert(&external, &valid, &fields).unwrap_err();
+        assert!(err.to_string().contains("no such function"), "{err}");
+        for blob in &malformed {
+            assert!(insert(&external, blob, &fields).is_err());
+        }
+        register_receipt_validator(&external).unwrap();
+        for conn in [&*store.conn(), &external] {
+            let before = table_snapshot(conn, "sandboxes");
+            for blob in &malformed {
+                assert!(FencedAbsence::decode(blob).is_err(), "{blob:?}");
+                assert!(insert(conn, blob, &fields).is_err(), "{blob:?}");
+                // The original x'00' PoC's release UPDATE must fail too.
+                assert!(conn.execute("UPDATE sandboxes SET state='failed', release_evidence_id=?2, last_helper_generation=7 WHERE id=?1", params![row.id,fields[0]]).is_err());
+            }
+            for position in 0..fields.len() {
+                let mut mismatched = fields.clone();
+                mismatched[position] = match position {
+                    4 => Digest::of(b"other").to_string(),
+                    5 => "8".into(),
+                    6 => "stopped".into(),
+                    _ => Id128::random().to_string(),
+                };
+                assert!(
+                    insert(conn, &valid, &mismatched).is_err(),
+                    "column {position}"
+                );
+            }
+            assert_eq!(table_snapshot(conn, "sandboxes"), before);
+            assert!(table_snapshot(conn, "release_evidence").is_empty());
+        }
+        assert!(store.sandbox(&row.id).unwrap().unwrap().is_charged());
+        // Prove the gate accepts the canonical receipt and normal release path.
+        store
+            .release_fenced(&row.id, SandboxState::Failed, &receipt, None)
+            .unwrap();
+        assert!(!store.sandbox(&row.id).unwrap().unwrap().is_charged());
+    }
+
+    #[test]
+    fn schema9_upgrade_validates_existing_schema8_receipts_atomically() {
+        for valid in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut conn = disk_database_at(tmp.path(), 7);
+            let tx = conn.transaction().unwrap();
+            migrate_v8(&tx).unwrap();
+            tx.commit().unwrap();
+            let row = fenced_sandbox();
+            insert_sandbox(&conn, &row).unwrap();
+            let receipt = receipt_for(&row);
+            let encoded = if valid {
+                receipt.encode().unwrap()
+            } else {
+                vec![0]
+            };
+            conn.execute("INSERT INTO release_evidence (receipt_id,node_id,instance_id,allocation_id,plan_digest,helper_generation,kind,receipt,recorded_at_ms) VALUES (?1,?2,?3,?4,?5,7,'absent_fenced',?6,1)", params![receipt.receipt_id().to_string(),receipt.node_id().to_string(),receipt.instance_id().to_string(),receipt.allocation_id().to_string(),receipt.plan_digest().to_string(),encoded]).unwrap();
+            let before = table_snapshot(&conn, "sandboxes");
+            let evidence = table_snapshot(&conn, "release_evidence");
+            release_database(conn, tmp.path());
+            let upgraded = Store::open(tmp.path());
+            if valid {
+                let store = upgraded.unwrap();
+                assert_eq!(table_snapshot(&store.conn(), "sandboxes"), before);
+                assert_eq!(table_snapshot(&store.conn(), "release_evidence"), evidence);
+                assert_eq!(
+                    store
+                        .conn()
+                        .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                        .unwrap(),
+                    9
+                );
+                assert!(store.sandbox(&row.id).unwrap().unwrap().is_charged());
+            } else {
+                let error = upgraded
+                    .err()
+                    .expect("corrupt schema 8 must not be accepted");
+                assert!(
+                    error.to_string().contains("invalid AbsentFenced"),
+                    "{error:#}"
+                );
+                let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
+                assert_eq!(
+                    conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                        .unwrap(),
+                    8
+                );
+                assert_eq!(table_snapshot(&conn, "sandboxes"), before);
+                assert_eq!(table_snapshot(&conn, "release_evidence"), evidence);
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE name='release_evidence_validate'",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+        }
     }
 
     #[test]

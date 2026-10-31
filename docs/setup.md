@@ -173,7 +173,7 @@ bounded `next_page_token` until empty, keeping `include_deleted` and the calling
 uid unchanged. Tokens do not survive the schema 7 upgrade: restart the listing.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
-bounds. Every older schema upgrades in order through v8. Schema 5 introduced
+bounds. Every older schema upgrades in order through v9. Schema 5 introduced
 typed termination and runtime diagnostics together with output, terminal state,
 truncation facts and whether each byte total is exact, plus each sandbox's
 create certainty. Historical records retain unknown typed values and unknown
@@ -193,6 +193,13 @@ exactly, gives this database a durable UUID and instance ID, and refuses to migr
 row whose stored spec cannot be decoded, leaving the old schema intact. A kiln sandbox
 whose execution cleanup cannot be confirmed now becomes `quarantined` rather than
 staying `ready`; delete it. Older binaries refuse schema 8.
+
+Schema 9 hardens conflict handling independently of per-connection pragmas and
+requires canonical, identity-matching typed absence receipts at the SQL boundary.
+A schema-8 database containing invalid receipts is refused atomically; preserve it
+for investigation rather than deleting evidence. Independent SQLite connections
+without the registered receipt validator cannot insert release evidence. Older
+binaries refuse schema 9.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart.

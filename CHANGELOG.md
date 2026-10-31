@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Harden B2 accounting in schema 9: reject conflicts on every unique key before
+  SQLite can replace-delete charged rows or fences, even with defensive pragmas
+  off. Validate canonical typed AbsentFenced bytes and their column bindings in
+  an SQL trigger; refuse an upgrade containing malformed schema-8 evidence.
+
 - Phase 1b B2: add runtime preflight, typed receipts, execution dispositions and
   schema 8's stored reservation vectors and immutable release evidence, enforced in
   SQL; quarantine a kiln sandbox whose cleanup cannot be confirmed. Additive
