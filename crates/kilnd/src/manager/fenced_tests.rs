@@ -1962,3 +1962,36 @@ async fn reconcile_refuses_a_generation_that_moved_backward() {
     assert_eq!(m.list(true).unwrap(), before);
     assert_eq!(row(&m).state, sandbox.state);
 }
+
+#[tokio::test]
+async fn corrupt_release_degrades_health_and_blocks_admission_with_capacity_remaining() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::fenced();
+    let m = Arc::new(Manager::new(
+        fake,
+        Store::open(&dir).unwrap(),
+        Limits::default(),
+    ));
+    let sandbox = m.create(CreateRequest::default()).await.unwrap();
+    m.delete(&sandbox.id).await.unwrap();
+    let external = rusqlite::Connection::open(dir.join("kilnd.db")).unwrap();
+    external
+        .set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+            false,
+        )
+        .unwrap();
+    external
+        .execute("UPDATE release_evidence SET receipt=x'00'", [])
+        .unwrap();
+    let health = m.health().await.unwrap();
+    assert!(!health.serving);
+    assert!(
+        health.detail.contains("degraded accounting"),
+        "{}",
+        health.detail
+    );
+    assert_eq!(health.node_resources.reserved.sandboxes, 1);
+    assert!(m.create(CreateRequest::default()).await.is_err());
+    assert!(m.get(&sandbox.id, 0).unwrap().0.is_charged());
+}

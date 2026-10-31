@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Close B2 recheck findings in schema 10: audit release receipts in trusted Rust
+  reads, retain invalid releases as charged/quarantined, degrade Health and refuse
+  admission. Detect missing reservation membership with an atomic SHA-256 marker.
+  Verify private kilnd ownership/modes at install/startup; document that hostile
+  connections (including disabled triggers/spoofed validators) have file authority
+  and are outside SQL guards. The B3/B4 root node ledger is authoritative and never
+  frees node resources without its own ABSENT receipt. Mark the SQL validator
+  innocuous and set/verify trusted_schema=OFF on every Store connection.
+
 - Harden B2 accounting in schema 9: reject conflicts on every unique key before
   SQLite can replace-delete charged rows or fences, even with defensive pragmas
   off. Validate canonical typed AbsentFenced bytes and their column bindings in

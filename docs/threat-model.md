@@ -94,7 +94,27 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   node, instance, allocation and plan. Reconciliation validates a complete inventory
   and all token evidence before any mutation or collection. These checks are defense
   in depth against kilnd bugs and malformed SQL, not a boundary against the `kilnd`
-  account, which owns the database and could drop a trigger. Receipts are private,
+  account. Opening another SQLite connection already requires that account's
+  database-file authority: disabling triggers with SQLITE_DBCONFIG_ENABLE_TRIGGER,
+  spoofing a connection-local validator, dropping triggers and rewriting files are
+  all out of scope. Triggers protect kilnd bugs and honest SQL mistakes through
+  standard tools, not hostile connections. Permissions are the boundary: install
+  checks kilnd ownership and 0700/0600 modes after legacy ownership transfer;
+  startup checks before open and after SQLite setup. For Firecracker, the root-owned
+  kilnd-helper node ledger (B3/B4) is authoritative even against a compromised
+  kilnd user; it never frees capacity or host resources without its own ABSENT
+  receipt, whatever the daemon DB says. B2 has no implemented node ledger yet.
+  Every trusted accounting read independently decodes referenced FencedAbsence
+  receipts in Rust and matches their complete binding and generation. Invalid or
+  missing evidence remains charged and is projected QUARANTINED; Health is degraded,
+  admission refuses, and prune retains it. Store connections set and verify
+  trusted_schema=OFF, and the trigger validator is deterministic/innocuous.
+  Schema 10 also stores a SHA-256 marker of immutable reservation membership,
+  updated only by trusted insert/prune code in the same transaction. Startup and
+  accounting reads compare it; missing/changed membership refuses reads/admission/
+  prune as degraded with unknown totals, never free capacity. It cannot detect
+  pre-migration loss or coordinated rewriting of both data and marker. See the
+  [B2 storage design](design/phase1b-firecracker.md#84-schema-ownership-and-history-protection). Receipts are private,
   trusted backend evidence bounded to 16 KiB, never caller strings or guest assertions,
   and the API exposes none of them.
 - **No request-owned exec work.** After an execution row is recorded, a

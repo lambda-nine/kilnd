@@ -1212,7 +1212,14 @@ impl<R: Runtime> Manager<R> {
                 "{finalization_failures} execution finalization write(s) retrying"
             ));
         }
-        let reserved = self.store.sandbox_resources()?;
+        let (reserved, accounting_degraded) = self.store.accounting_snapshot()?;
+        if accounting_degraded {
+            serving = false;
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str("degraded accounting: invalid release evidence is quarantined and charged; admission disabled");
+        }
         let limits = self.sandbox_budgets();
         let over_budget = [
             ("sandboxes", reserved.sandboxes, limits.sandboxes),

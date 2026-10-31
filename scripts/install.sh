@@ -37,6 +37,13 @@ for name in os.listdir(root):
 for name in os.listdir(root):
     os.chown(os.path.join(root, name), uid, gid, follow_symlinks=False)
 os.chown(root, uid, gid, follow_symlinks=False)
+# The ownership transfer above supports the legacy root daemon. Installation
+# must finish with the same private boundary that Store::open requires.
+m = os.lstat(root)
+assert m.st_uid == uid and stat.S_IMODE(m.st_mode) == 0o700, 'state directory must be kilnd-owned 0700'
+for name in os.listdir(root):
+    m = os.lstat(os.path.join(root, name))
+    assert m.st_uid == uid and stat.S_ISREG(m.st_mode) and m.st_nlink == 1 and stat.S_IMODE(m.st_mode) == 0o600, 'state file must be kilnd-owned 0600: ' + name
 PYTHON
 fi
 # Old API runtime directory is root-owned. It contains only the endpoint and

@@ -73,7 +73,7 @@ finally:
 '''
     run(['python3', '-I', '-c', source, payload.hex(), marker.hex(), str(len(descriptors)), str(size if size is not None else len(payload))], uid=uid)
 
-def start_aux(suffix, zero=False):
+def start_aux(suffix, zero=False, expect_integrity_failure=False):
     unit=f'{STATE}-{suffix}'
     UNITS.append(unit)
     run(['systemd-run', '--quiet', '--unit', unit, '--property=User=kilnd', '--property=Group=kilnd',
@@ -83,7 +83,12 @@ def start_aux(suffix, zero=False):
          '/usr/local/bin/kilnd', '--socket', SOCKET, '--state-dir', f'/var/lib/{STATE}',
          '--execution-max-count', '0' if zero else '1', '--deleted-sandbox-max-count', '0' if zero else '1',
          '--prune-interval-secs', '1', '--output-storage', 'metadata'])
-    eventually(lambda: ctl('health', aux=True, ok=False).returncode == 0)
+    if expect_integrity_failure:
+        eventually(lambda: run(['systemctl', 'is-failed', unit], ok=False).stdout.strip() == 'failed')
+        diagnostic = run(['journalctl', '-u', unit, '--no-pager']).stdout
+        assert 'degraded accounting: reservation integrity mismatch' in diagnostic, diagnostic
+    else:
+        eventually(lambda: ctl('health', aux=True, ok=False).returncode == 0)
     return unit
 
 try:
@@ -168,6 +173,10 @@ try:
     seed=r'''
 import sqlite3,sys
 c=sqlite3.connect(sys.argv[1])
+# Preserve the genuine Store-produced marker and membership. A raw SQL insert
+# cannot update membership authority; startup must refuse this fixture.
+backup=sqlite3.connect(sys.argv[1]+'.fixture-backup')
+c.backup(backup); backup.close()
 c.execute("PRAGMA foreign_keys=ON")
 c.execute("""INSERT INTO sandboxes (id,backend,state,spec,created_at_ms,updated_at_ms,list_seq,owner_uid,
     accounting_kind,reserved_memory_bytes,reserved_disk_bytes,reserved_pids,reserved_host_cpu_millis,
@@ -180,10 +189,18 @@ c.execute('UPDATE history_sequence SET value=(SELECT MAX(list_seq) FROM sandboxe
 c.commit()
 '''
     run(['python3','-I','-c',seed,f'/var/lib/{STATE}/kilnd.db',live],uid='kilnd')
+    start_aux('startup-invalid', zero=True, expect_integrity_failure=True)
+    restore=r'''
+import os,sqlite3,sys
+backup=sqlite3.connect(sys.argv[1]+'.fixture-backup')
+dest=sqlite3.connect(sys.argv[1]); backup.backup(dest)
+dest.close(); backup.close(); os.unlink(sys.argv[1]+'.fixture-backup')
+'''
+    run(['python3','-I','-c',restore,f'/var/lib/{STATE}/kilnd.db'],uid='kilnd')
     start_aux('startup',zero=True)
     missing('get',sb2,aux=True); missing('execution',live_ex,aux=True)
-    ctl('get',live,aux=True); ctl('get','sb-1111111111111111',aux=True)
-    p=ctl('rm','sb-1111111111111111',aux=True,ok=False); assert p.returncode!=0
+    ctl('get',live,aux=True); missing('get','sb-1111111111111111',aux=True)
+    assert 'sandboxes 1/' in ctl('health',aux=True).stdout
     ctl('rm',live,aux=True); IDS.remove(live)
     print('PASS Phase 0',flush=True)
 finally:

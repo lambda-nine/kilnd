@@ -1,5 +1,5 @@
 //! SQLite state: one row per sandbox and per execution. kilnd is the only
-//! writer; the database lives in a root-only directory.
+//! writer; the database lives in a kilnd-owned private directory.
 
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
@@ -16,6 +16,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
+use sha2::{Digest as _, Sha256};
 
 use crate::lock::ExclusiveFileLock;
 use crate::model::{
@@ -27,7 +28,7 @@ use crate::model::{
 use crate::retention::{OutputStorage, Pruned, Retention};
 use crate::runtime::{CreatedSandbox, FencedAbsence, RuntimeReceipt};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -310,13 +311,16 @@ BEGIN SELECT RAISE(ABORT, 'invalid encoded AbsentFenced evidence'); END;
 PRAGMA user_version = 9;";
 
 /// Register before preparing any schema statement. An independent connection
-/// without this function cannot insert evidence, even with defensive pragmas off.
+/// without this function cannot insert evidence while triggers are enabled.
+/// This name is not an authenticity boundary: another connection can replace it.
 fn register_receipt_validator(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     conn.create_scalar_function(
         "kilnd_fenced_absence_valid",
         8,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
         |ctx| {
             let bytes = ctx.get::<Vec<u8>>(0)?;
             let Ok(receipt) = FencedAbsence::decode(&bytes) else {
@@ -331,6 +335,134 @@ fn register_receipt_validator(conn: &Connection) -> rusqlite::Result<()> {
                 && ctx.get::<String>(7)? == "absent_fenced")
         },
     )
+}
+
+// Only trusted Store insert/prune transactions refresh this marker, never a
+// trigger. It detects accidental/missing membership, not hostile file authority.
+const MIGRATE_V10: &str = "
+CREATE TABLE reservation_integrity (id INTEGER PRIMARY KEY CHECK (id = 1), digest BLOB NOT NULL CHECK (length(digest) = 32));
+PRAGMA user_version = 10;";
+
+fn reservation_digest(conn: &Connection) -> Result<Vec<u8>> {
+    // Include all immutable reservation/identity data; lifecycle transitions and
+    // release references intentionally do not change this membership fingerprint.
+    let mut stmt = conn.prepare(
+        "SELECT id, list_seq, backend, spec, created_at_ms, owner_uid,
+        accounting_kind, reserved_memory_bytes, reserved_disk_bytes, reserved_pids,
+        reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids,
+        host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest,
+        node_id, instance_id, allocation_id, plan_version, plan_digest, plan
+        FROM sandboxes ORDER BY id COLLATE BINARY",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut hash = Sha256::new();
+    hash.update(b"kilnd-reservation-membership-v1");
+    while let Some(row) = rows.next()? {
+        hash.update(b"row");
+        for i in 0..23 {
+            use rusqlite::types::ValueRef;
+            match row.get_ref(i)? {
+                ValueRef::Null => hash.update([0]),
+                ValueRef::Integer(n) => {
+                    hash.update([1]);
+                    hash.update(n.to_le_bytes());
+                }
+                ValueRef::Real(_) => bail!("degraded accounting: real in immutable reservation"),
+                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                    hash.update([if matches!(row.get_ref(i)?, ValueRef::Text(_)) {
+                        2
+                    } else {
+                        3
+                    }]);
+                    hash.update((bytes.len() as u64).to_le_bytes());
+                    hash.update(bytes);
+                }
+            }
+        }
+    }
+    Ok(hash.finalize().to_vec())
+}
+
+fn refresh_reservation_integrity(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO reservation_integrity (id, digest) VALUES (1, ?1)
+        ON CONFLICT(id) DO UPDATE SET digest = excluded.digest",
+        [reservation_digest(conn)?],
+    )?;
+    Ok(())
+}
+
+// Call inside the same transaction/snapshot as every accounting decision. Decode
+// in Rust, independently of whichever SQL function an external writer registered.
+// Quarantine is a read projection: retain the corrupt reference for investigation.
+fn audit_accounting(conn: &Connection) -> Result<bool> {
+    let expected: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT digest FROM reservation_integrity WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if expected.as_deref() != Some(reservation_digest(conn)?.as_slice()) {
+        bail!(
+            "degraded accounting: reservation integrity mismatch (missing or changed rows); admission and pruning disabled"
+        );
+    }
+    conn.execute_batch("DELETE FROM temp.accounting_quarantine;")?;
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.node_id, s.instance_id, s.allocation_id,
+        s.plan_digest, s.release_evidence_id, s.last_helper_generation,
+        e.receipt_id, e.node_id, e.instance_id, e.allocation_id, e.plan_digest,
+        e.helper_generation, e.kind, e.receipt, s.state
+        FROM sandboxes s LEFT JOIN release_evidence e ON e.receipt_id = s.release_evidence_id
+        WHERE s.accounting_kind = 'fenced' AND (s.release_evidence_id IS NOT NULL OR s.state = 'deleted')",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut degraded = false;
+    while let Some(row) = rows.next()? {
+        let valid = (|| -> Result<bool> {
+            let Some(bytes) = row.get::<_, Option<Vec<u8>>>(14)? else {
+                return Ok(false);
+            };
+            let Ok(receipt) = FencedAbsence::decode(&bytes) else {
+                return Ok(false);
+            };
+            let fields = [
+                receipt.node_id().to_string(),
+                receipt.instance_id().to_string(),
+                receipt.allocation_id().to_string(),
+                receipt.plan_digest().to_string(),
+                receipt.receipt_id().to_string(),
+            ];
+            for (column, field) in (1..=5).zip(&fields) {
+                if row.get::<_, Option<String>>(column)?.as_ref() != Some(field) {
+                    return Ok(false);
+                }
+            }
+            for (column, field) in
+                (7..=11).zip([&fields[4], &fields[0], &fields[1], &fields[2], &fields[3]])
+            {
+                if row.get::<_, Option<String>>(column)?.as_ref() != Some(field) {
+                    return Ok(false);
+                }
+            }
+            Ok(
+                row.get::<_, Option<i64>>(6)? == Some(receipt.helper_generation() as i64)
+                    && row.get::<_, Option<i64>>(12)? == Some(receipt.helper_generation() as i64)
+                    && row.get::<_, Option<String>>(13)?.as_deref() == Some("absent_fenced")
+                    && matches!(row.get::<_, String>(15)?.as_str(), "failed" | "deleted"),
+            )
+        })()
+        .unwrap_or(false);
+        if !valid {
+            degraded = true;
+            conn.execute(
+                "INSERT INTO temp.accounting_quarantine VALUES (?1)",
+                [row.get::<_, String>(0)?],
+            )?;
+        }
+    }
+    Ok(degraded)
 }
 
 // The explicit legacy tag and reuse state for an update binding ?2 = new state and
@@ -642,7 +774,7 @@ fn sandbox_resources(conn: &Connection) -> Result<SandboxResources> {
     // bundle or a formula cannot reprice an existing commitment.
     let mut statement = conn.prepare(&format!(
         "SELECT id, reserved_memory_bytes, reserved_disk_bytes, reserved_pids, reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids
-         FROM sandboxes WHERE {RESERVED_SANDBOX_WHERE}"
+         FROM sandboxes WHERE {RESERVED_SANDBOX_WHERE} OR id IN (SELECT id FROM temp.accounting_quarantine)"
     ))?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -779,7 +911,26 @@ impl Store {
         {
             bail!("{} changed while opening", database_path.display());
         }
-        Self::init_with_directory(conn, Some(instance_lock), Some(directory.file))
+        let store = Self::init_with_directory(
+            conn,
+            Some(instance_lock),
+            Some(directory.file.try_clone()?),
+        )?;
+        validate_directory(
+            &directory.file.metadata()?,
+            &directory.path,
+            expected_uid,
+            true,
+            "state",
+        )?;
+        inspect_database_entry(
+            &directory.file,
+            OsStr::new("kilnd.db"),
+            &database_path,
+            expected_uid,
+        )?;
+        inspect_sqlite_sidecars(&directory, expected_uid)?;
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -828,6 +979,12 @@ impl Store {
     fn initialize(&self) -> Result<()> {
         let mut conn = self.conn();
         register_receipt_validator(&conn)?;
+        conn.pragma_update(None, "trusted_schema", "OFF")?;
+        let trusted: i64 = conn.pragma_query_value(None, "trusted_schema", |r| r.get(0))?;
+        if trusted != 0 {
+            bail!("SQLite refused trusted_schema=OFF");
+        }
+        conn.execute_batch("CREATE TEMP TABLE accounting_quarantine (id TEXT PRIMARY KEY);")?;
         // Evidence references depend on this, and SQLite ignores it inside a
         // transaction and defaults it off per connection. Set and verify it first.
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -842,6 +999,9 @@ impl Store {
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == SCHEMA_VERSION {
+            let tx = conn.transaction()?;
+            audit_accounting(&tx)?;
+            tx.commit()?;
             return Ok(());
         }
         if !(0..SCHEMA_VERSION).contains(&version) {
@@ -881,19 +1041,41 @@ impl Store {
         if version < 8 {
             migrate_v8(&tx)?;
         }
-        // A schema-8 database may already contain malformed evidence. Refuse the
-        // upgrade atomically rather than blessing it or erasing its replay fence.
-        let invalid: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM release_evidence WHERE kilnd_fenced_absence_valid(
-                receipt, receipt_id, node_id, instance_id, allocation_id, plan_digest,
-                helper_generation, kind) IS NOT 1",
-            [],
-            |r| r.get(0),
-        )?;
-        if invalid != 0 {
-            bail!("schema 8 contains {invalid} invalid AbsentFenced receipts");
+        if version < 9 {
+            // Use the production decoder directly, including unreferenced evidence.
+            let mut stmt = tx.prepare("SELECT receipt, receipt_id, node_id, instance_id, allocation_id, plan_digest, helper_generation, kind FROM release_evidence")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let valid = (|| -> Result<bool> {
+                    let receipt = FencedAbsence::decode(&row.get::<_, Vec<u8>>(0)?)
+                        .map_err(anyhow::Error::msg)?;
+                    let fields = [
+                        receipt.receipt_id().to_string(),
+                        receipt.node_id().to_string(),
+                        receipt.instance_id().to_string(),
+                        receipt.allocation_id().to_string(),
+                        receipt.plan_digest().to_string(),
+                    ];
+                    for (i, field) in (1..=5).zip(fields) {
+                        if row.get::<_, String>(i)? != field {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(row.get::<_, i64>(6)? == receipt.helper_generation() as i64
+                        && row.get::<_, String>(7)? == "absent_fenced")
+                })()
+                .unwrap_or(false);
+                if !valid {
+                    bail!("schema 8 contains invalid AbsentFenced receipts");
+                }
+            }
+            drop(rows);
+            drop(stmt);
+            tx.execute_batch(MIGRATE_V9)?;
         }
-        tx.execute_batch(MIGRATE_V9)?;
+        tx.execute_batch(MIGRATE_V10)?;
+        refresh_reservation_integrity(&tx)?;
+        audit_accounting(&tx)?;
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
         Ok(())
@@ -918,7 +1100,15 @@ impl Store {
     }
 
     pub fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
-        insert_sandbox(&self.conn(), s)
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if audit_accounting(&tx)? {
+            bail!("degraded accounting: quarantined release evidence");
+        }
+        insert_sandbox(&tx, s)?;
+        refresh_reservation_integrity(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Atomically checks every durable node reservation and inserts the new
@@ -927,12 +1117,16 @@ impl Store {
     pub fn reserve_sandbox(&self, s: &Sandbox, budgets: SandboxBudgets) -> Result<ReserveSandbox> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if audit_accounting(&tx)? {
+            bail!("degraded accounting: quarantined release evidence; admission disabled");
+        }
         let reserved = sandbox_resources(&tx)?;
         let requested = SandboxResources::for_reservation(&s.accounting.reservation);
         if let Some(exhausted) = exhausted_budget(reserved, requested, budgets)? {
             return Ok(ReserveSandbox::Exhausted(exhausted));
         }
         insert_sandbox(&tx, s)?;
+        refresh_reservation_integrity(&tx)?;
         tx.commit()?;
         Ok(ReserveSandbox::Inserted)
     }
@@ -948,17 +1142,30 @@ impl Store {
     /// reconciliation, which legacy kiln does not support; Delete retains them.
     /// An absence-fenced row is charged until it references a matching receipt.
     pub fn sandbox_resources(&self) -> Result<SandboxResources> {
-        sandbox_resources(&self.conn())
+        self.accounting_snapshot().map(|(resources, _)| resources)
+    }
+
+    /// A single trusted snapshot for Health: invalid releases remain charged and
+    /// return degraded=true. Lost membership has unknown totals and is an error.
+    pub fn accounting_snapshot(&self) -> Result<(SandboxResources, bool)> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let degraded = audit_accounting(&tx)?;
+        let resources = sandbox_resources(&tx)?;
+        tx.commit()?;
+        Ok((resources, degraded))
     }
 
     /// Backend IDs that a nonterminal lifecycle row can still own. This is
     /// deliberately narrower than reservations: ambiguous FAILED has no ID,
     /// while compensated FAILED has an ID but proved it absent.
     pub fn owned_backend_ids(&self, backend: &str) -> Result<Vec<String>> {
-        let conn = self.conn();
+        let mut connection = self.conn();
+        let conn = connection.transaction()?;
+        audit_accounting(&conn)?;
         let mut statement = conn.prepare(&format!(
             "SELECT backend_id FROM sandboxes
-             WHERE backend = ?1 AND backend_id IS NOT NULL AND {OWNED_BACKEND_WHERE}"
+             WHERE backend = ?1 AND backend_id IS NOT NULL AND ({OWNED_BACKEND_WHERE} OR id IN (SELECT id FROM temp.accounting_quarantine))"
         ))?;
         let rows = statement.query_map([backend], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1118,6 +1325,9 @@ impl Store {
         let encoded = receipt.encode()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if audit_accounting(&tx)? {
+            bail!("degraded accounting: quarantined release evidence");
+        }
         let row = tx
             .query_row(
                 &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
@@ -1280,23 +1490,27 @@ impl Store {
     }
 
     pub fn sandbox(&self, id: &str) -> Result<Option<Sandbox>> {
-        self.conn()
-            .query_row(
-                &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
-                [id],
-                sandbox_row,
-            )
-            .optional()?
-            .transpose()
+        let mut connection = self.conn();
+        let conn = connection.transaction()?;
+        audit_accounting(&conn)?;
+        conn.query_row(
+            &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
+            [id],
+            sandbox_row,
+        )
+        .optional()?
+        .transpose()
     }
 
     /// Newest first.
     pub fn sandboxes(&self, include_deleted: bool) -> Result<Vec<Sandbox>> {
-        let conn = self.conn();
+        let mut connection = self.conn();
+        let conn = connection.transaction()?;
+        audit_accounting(&conn)?;
         let filter = if include_deleted {
             ""
         } else {
-            "WHERE state != 'deleted'"
+            "WHERE (state != 'deleted' OR id IN (SELECT id FROM temp.accounting_quarantine))"
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT {SANDBOX_COLUMNS} FROM sandboxes {filter} ORDER BY list_seq DESC"
@@ -1327,11 +1541,13 @@ impl Store {
         limit: u32,
         owner: Option<u32>,
     ) -> Result<SandboxPage> {
-        let conn = self.conn();
+        let mut connection = self.conn();
+        let conn = connection.transaction()?;
+        audit_accounting(&conn)?;
         let filter = if include_deleted {
             ""
         } else {
-            "state != 'deleted' AND "
+            "(state != 'deleted' OR id IN (SELECT id FROM temp.accounting_quarantine)) AND "
         };
         let owned = if owner.is_some() {
             "owner_uid = ?1 AND "
@@ -1374,8 +1590,11 @@ impl Store {
     }
 
     pub fn count_active_sandboxes(&self) -> Result<u32> {
-        Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM sandboxes WHERE state IN ('creating', 'ready', 'deleting', 'quarantined')",
+        let mut connection = self.conn();
+        let conn = connection.transaction()?;
+        audit_accounting(&conn)?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM sandboxes WHERE state IN ('creating', 'ready', 'deleting', 'quarantined') OR id IN (SELECT id FROM temp.accounting_quarantine)",
             [],
             |r| r.get(0),
         )?)
@@ -1526,6 +1745,7 @@ impl Store {
         let sandbox_cutoff = cutoff(policy.sandbox_max_age_secs)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        audit_accounting(&tx)?;
         let terminal = "state IN ('exited','timed_out','canceled','failed','interrupted') AND finished_at_ms IS NOT NULL";
         let mut result = Pruned {
             executions: tx.execute(&format!("DELETE FROM executions WHERE id IN (
@@ -1538,6 +1758,7 @@ impl Store {
         tx.execute(&format!("INSERT INTO retention_sandboxes
             SELECT id FROM (SELECT id, updated_at_ms, ROW_NUMBER() OVER (ORDER BY updated_at_ms DESC, list_seq DESC) AS n
             FROM sandboxes WHERE state IN ('deleted','failed') AND NOT ({RESERVED_SANDBOX_WHERE})
+            AND id NOT IN (SELECT id FROM temp.accounting_quarantine)
             AND NOT EXISTS (SELECT 1 FROM executions WHERE sandbox_id = sandboxes.id AND NOT ({terminal})))
             WHERE updated_at_ms <= ?1 OR n > ?2"), params![sandbox_cutoff, policy.sandbox_max_count])?;
         result.executions += tx.execute(
@@ -1549,6 +1770,7 @@ impl Store {
             [],
         )?;
         tx.execute_batch("DROP TABLE retention_sandboxes;")?;
+        refresh_reservation_integrity(&tx)?;
         tx.commit()?;
         Ok(result)
     }
@@ -2100,8 +2322,9 @@ const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_rea
     accounting_kind, reserved_memory_bytes, reserved_disk_bytes, reserved_pids, reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids,
     host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest, disposition, boot_id, legacy_release,
     node_id, instance_id, allocation_id, plan_version, plan_digest,
-    CASE WHEN plan IS NULL OR release_evidence_id IS NULL THEN plan ELSE x'' END, release_evidence_id, last_helper_generation";
-const SANDBOX_COLUMN_COUNT: usize = 33;
+    CASE WHEN plan IS NULL OR release_evidence_id IS NULL THEN plan ELSE x'' END, release_evidence_id, last_helper_generation,
+    id IN (SELECT id FROM temp.accounting_quarantine)";
+const SANDBOX_COLUMN_COUNT: usize = 34;
 
 /// Row decoding errors are reported per row rather than as SQLite errors.
 fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
@@ -2169,7 +2392,7 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
             ),
             (Some(_), Some(_)) => bail!("sandbox {id}: conflicting release provenance"),
         };
-        Ok(Sandbox {
+        let mut sandbox = Sandbox {
             create_certainty: CreateCertainty::parse(&create_certainty).with_context(|| {
                 format!("sandbox {id}: unknown create certainty {create_certainty:?}")
             })?,
@@ -2212,7 +2435,15 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
                     .map_err(|e| bad("helper generation", e.to_string()))?,
             },
             id: id.clone(),
-        })
+        };
+        if row.get::<_, bool>(33)? {
+            sandbox.state = SandboxState::Quarantined;
+            sandbox.accounting.disposition = SandboxDisposition::Quarantined;
+            sandbox.accounting.release = ReservationRelease::Charged;
+            sandbox.failure_reason =
+                Some("degraded accounting: invalid or missing AbsentFenced receipt".into());
+        }
+        Ok(sandbox)
     })())
 }
 
@@ -4001,6 +4232,355 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_trigger_disabled_delete_degrades_reads_and_restart() {
+        use rusqlite::config::DbConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        let row = fenced_sandbox();
+        store.insert_sandbox(&row).unwrap();
+        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.pragma_update(None, "recursive_triggers", "OFF")
+            .unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        assert!(
+            !conn
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
+                .unwrap()
+        );
+        assert!(
+            !conn
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
+                .unwrap()
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='sandboxes_no_charged_delete'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            1,
+            "the schema itself was not changed"
+        );
+
+        conn.execute("DELETE FROM sandboxes WHERE id=?1", [&row.id])
+            .unwrap();
+        assert!(
+            store
+                .sandbox(&row.id)
+                .unwrap_err()
+                .to_string()
+                .contains("degraded accounting")
+        );
+        assert!(store.sandbox_resources().is_err());
+        assert!(store.sandboxes(true).is_err());
+        assert!(store.sandbox_page(false, None, None, 1).is_err());
+        assert!(
+            store
+                .reserve_sandbox(&fenced_sandbox(), roomy_budgets())
+                .is_err()
+        );
+        assert!(
+            store
+                .prune(
+                    &Retention {
+                        sandbox_max_age_secs: 0,
+                        sandbox_max_count: 0,
+                        ..Retention::default()
+                    },
+                    now_ms()
+                )
+                .is_err()
+        );
+        // A trusted write must not silently rebaseline the missing commitment.
+        assert!(store.insert_sandbox(&fenced_sandbox()).is_err());
+        drop(conn);
+        drop(store);
+        let error = Store::open(&dir)
+            .err()
+            .expect("missing row survived restart");
+        assert!(format!("{error:#}").contains("degraded accounting"));
+    }
+
+    #[test]
+    fn spoofed_validator_remains_charged_quarantined_and_degraded() {
+        use rusqlite::functions::FunctionFlags;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        let row = fenced_sandbox();
+        let binding = row.accounting.allocation.clone().unwrap();
+        store.insert_sandbox(&row).unwrap();
+        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        conn.create_scalar_function(
+            "kilnd_fenced_absence_valid",
+            8,
+            FunctionFlags::SQLITE_UTF8
+                | FunctionFlags::SQLITE_DETERMINISTIC
+                | FunctionFlags::SQLITE_INNOCUOUS,
+            |_ctx| Ok(true),
+        )
+        .unwrap();
+        let receipt_id = Id128::random().to_string();
+        conn.execute(
+            "INSERT INTO release_evidence (
+                receipt_id, node_id, instance_id, allocation_id, plan_digest,
+                helper_generation, kind, receipt, recorded_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 1, 'absent_fenced', x'00', 1)",
+            params![
+                receipt_id,
+                binding.node_id.to_string(),
+                binding.instance_id.to_string(),
+                binding.allocation_id.to_string(),
+                binding.plan_digest.to_string(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sandboxes
+             SET state='failed', failure_reason='forged release',
+                 release_evidence_id=?2, last_helper_generation=1
+             WHERE id=?1",
+            params![row.id, receipt_id],
+        )
+        .unwrap();
+        assert_eq!(
+            store.sandbox_resources().unwrap().sandboxes,
+            1,
+            "Rust accounting refuses the spoofed connection-local validator"
+        );
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>(
+                "SELECT receipt FROM release_evidence WHERE receipt_id=?1",
+                [&receipt_id],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            vec![0]
+        );
+        assert_quarantined_reads(&store, &row);
+        assert!(store.accounting_snapshot().unwrap().1);
+        assert!(
+            store
+                .reserve_sandbox(&fenced_sandbox(), roomy_budgets())
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .prune(
+                    &Retention {
+                        sandbox_max_age_secs: 0,
+                        sandbox_max_count: 0,
+                        ..Retention::default()
+                    },
+                    now_ms()
+                )
+                .unwrap()
+                .sandboxes,
+            0
+        );
+        drop(conn);
+        drop(store);
+        let store = Store::open(&dir).unwrap();
+        assert_quarantined_reads(&store, &row);
+        assert!(store.accounting_snapshot().unwrap().1);
+    }
+
+    #[test]
+    fn legitimate_fenced_release_works_with_untrusted_schema_on_every_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        for memory in [false, true] {
+            let store = if memory {
+                Store::open_in_memory().unwrap()
+            } else {
+                Store::open(tmp.path()).unwrap()
+            };
+            assert_eq!(
+                store
+                    .conn()
+                    .pragma_query_value::<i64, _>(None, "trusted_schema", |r| r.get(0))
+                    .unwrap(),
+                0
+            );
+            let row = fenced_sandbox();
+            store.insert_sandbox(&row).unwrap();
+            store
+                .release_fenced(&row.id, SandboxState::Failed, &receipt_for(&row), None)
+                .unwrap();
+            assert_eq!(
+                store.accounting_snapshot().unwrap(),
+                (SandboxResources::default(), false)
+            );
+            assert!(!store.sandbox(&row.id).unwrap().unwrap().is_charged());
+            drop(store);
+            if !memory {
+                let reopened = Store::open(tmp.path()).unwrap();
+                assert_eq!(
+                    reopened
+                        .conn()
+                        .pragma_query_value::<i64, _>(None, "trusted_schema", |r| r.get(0))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    reopened.accounting_snapshot().unwrap(),
+                    (SandboxResources::default(), false)
+                );
+            }
+        }
+    }
+
+    fn roomy_budgets() -> SandboxBudgets {
+        SandboxBudgets {
+            sandboxes: 100,
+            memory_bytes: u64::MAX,
+            disk_bytes: u64::MAX,
+            pids: u64::MAX,
+            host_cpu_millis: u64::MAX,
+            virtual_cpu_slots: u64::MAX,
+            host_pids: u64::MAX,
+        }
+    }
+
+    fn assert_quarantined_reads(store: &Store, original: &Sandbox) {
+        let check = |row: &Sandbox| {
+            assert_eq!(row.id, original.id);
+            assert!(row.is_charged());
+            assert_eq!(row.state, SandboxState::Quarantined);
+            assert_eq!(row.accounting.disposition, SandboxDisposition::Quarantined);
+        };
+        check(&store.sandbox(&original.id).unwrap().unwrap());
+        for include_deleted in [false, true] {
+            let rows = store.sandboxes(include_deleted).unwrap();
+            assert_eq!(rows.len(), 1);
+            check(&rows[0]);
+            let page = store
+                .sandbox_page_owned(include_deleted, None, None, 1, Some(original.owner_uid))
+                .unwrap();
+            assert_eq!(page.rows.len(), 1);
+            check(&page.rows[0].sandbox);
+            assert!(!page.has_more);
+            assert!(
+                store
+                    .sandbox_page_owned(
+                        include_deleted,
+                        None,
+                        None,
+                        1,
+                        Some(original.owner_uid + 1)
+                    )
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            store.sandbox_resources().unwrap(),
+            SandboxResources::for_reservation(&original.accounting.reservation)
+        );
+    }
+
+    #[test]
+    fn trusted_reads_validate_all_receipt_fields_and_missing_evidence() {
+        // Start with a real release, then model out-of-scope file authority.
+        // Every side column, encoded field and the row's generation is checked.
+        for attack in [
+            "DELETE FROM release_evidence",
+            "UPDATE release_evidence SET receipt=x'00'",
+            "UPDATE release_evidence SET receipt=x''",
+            "UPDATE release_evidence SET receipt=CAST('{}' AS BLOB)",
+            "UPDATE release_evidence SET receipt_id='11111111111111111111111111111111'",
+            "UPDATE release_evidence SET node_id='11111111111111111111111111111111'",
+            "UPDATE release_evidence SET instance_id='11111111111111111111111111111111'",
+            "UPDATE release_evidence SET allocation_id='11111111111111111111111111111111'",
+            "UPDATE release_evidence SET plan_digest='1111111111111111111111111111111111111111111111111111111111111111'",
+            "UPDATE release_evidence SET helper_generation=8",
+            "UPDATE release_evidence SET kind='other'",
+            "UPDATE sandboxes SET last_helper_generation=8",
+            "UPDATE sandboxes SET release_evidence_id=NULL",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let store = Store::open(tmp.path()).unwrap();
+            let row = fenced_sandbox();
+            store.insert_sandbox(&row).unwrap();
+            store
+                .release_fenced(&row.id, SandboxState::Deleted, &receipt_for(&row), None)
+                .unwrap();
+            let external = Connection::open(tmp.path().join("kilnd.db")).unwrap();
+            external
+                .set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+                    false,
+                )
+                .unwrap();
+            external
+                .execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            external.execute(attack, []).unwrap();
+            assert_quarantined_reads(&store, &row);
+            assert!(store.accounting_snapshot().unwrap().1, "{attack}");
+            assert_eq!(
+                store
+                    .prune(
+                        &Retention {
+                            sandbox_max_age_secs: 0,
+                            sandbox_max_count: 0,
+                            ..Retention::default()
+                        },
+                        now_ms()
+                    )
+                    .unwrap()
+                    .sandboxes,
+                0,
+                "{attack}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_rewrite_control_is_out_of_scope_but_missing_row_is_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        let row = fenced_sandbox();
+        store.insert_sandbox(&row).unwrap();
+        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute_batch("DROP TRIGGER sandboxes_no_charged_delete;")
+            .unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='sandboxes_no_charged_delete'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            0,
+            "this control deliberately rewrote the schema"
+        );
+        conn.execute("DELETE FROM sandboxes WHERE id=?1", [&row.id])
+            .unwrap();
+        assert!(store.sandbox(&row.id).is_err());
+        assert!(store.sandbox_resources().is_err());
+    }
+
     fn defenseless_connection(dir: &Path) -> Connection {
         let conn = Connection::open(dir.join("kilnd.db")).unwrap();
         for pragma in ["foreign_keys", "recursive_triggers"] {
@@ -4011,6 +4591,29 @@ mod tests {
                 0
             );
         }
+        // Recheck PoC configuration: host-API-controlled connections remain
+        // outside the boundary, but these ordinary SQL conflicts still fail.
+        for pragma in [
+            "ignore_check_constraints",
+            "writable_schema",
+            "trusted_schema",
+            "legacy_alter_table",
+            "defer_foreign_keys",
+        ] {
+            conn.pragma_update(None, pragma, "ON").unwrap();
+        }
+        assert!(
+            !conn
+                .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
+                .unwrap()
+        );
+        assert!(
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+                true
+            )
+            .unwrap()
+        );
         conn
     }
 
@@ -4094,6 +4697,8 @@ mod tests {
             .conn()
             .execute("DELETE FROM sandboxes WHERE id=?1", [&retired.id])
             .unwrap();
+        // Fixture-only trusted deletion models Store::prune's atomic marker update.
+        refresh_reservation_integrity(&store.conn()).unwrap();
         let other_fence = receipt_for(&fenced_sandbox());
         insert_evidence(
             &store.conn(),
@@ -4501,7 +5106,7 @@ mod tests {
                         .conn()
                         .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                         .unwrap(),
-                    9
+                    SCHEMA_VERSION
                 );
                 assert!(store.sandbox(&row.id).unwrap().unwrap().is_charged());
             } else {
@@ -5008,6 +5613,7 @@ mod tests {
             // A legacy row has none, and a fenced row must have one.
             let legacy = sandbox();
             insert_sandbox(&conn, &legacy).unwrap();
+            refresh_reservation_integrity(&conn).unwrap();
             assert!(
                 conn.execute(
                     "UPDATE sandboxes SET last_helper_generation = 1 WHERE id = ?1",
