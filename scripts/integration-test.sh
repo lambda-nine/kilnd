@@ -28,3 +28,4 @@ for line in sys.stdin:
 ')
 [ -n "$lib" ] || { echo "library test binary not found" >&2; exit 1; }
 sudo "$lib" --ignored --test-threads=1 --nocapture exit5_linux_root
+sudo "$lib" --ignored --test-threads=1 --nocapture b3_linux_root

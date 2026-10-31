@@ -133,6 +133,21 @@ sudo kilnd-helper --firecracker-policy /etc/kilnd/firecracker-node.json --firecr
 
 The first command creates the ledger, once, and refuses if any ledger file exists; do
 not delete a ledger to recover from an error, because that discards every claim.
+
+Each kilnd instance is then enrolled by root, with the helper stopped, naming the unit
+that serves it and reading the installed image's identity:
+
+```sh
+sudo systemctl stop kilnd-helper.service
+sudo kilnd-helper enroll --instance <32 hex digits> --unit kilnd.service
+sudo systemctl start kilnd-helper.service
+```
+
+Enroll again whenever `/usr/local/bin/kilnd` is replaced: until then that instance can't
+attach. `--cgroup` names the unit's cgroup if it isn't `/system.slice/<unit>`, and the unit
+must not set `Delegate=`. A policy's `max_enrolled_instances` limits the total (default 8).
+This needs Linux 6.5 or later.
+
 Startup problems leave kiln running and the group disabled or Unavailable. Every
 profile is refused by the disabled gate until a reviewed release (B7). Do not expect a
 sandbox from this: Capabilities reports `launch_enabled: false`.

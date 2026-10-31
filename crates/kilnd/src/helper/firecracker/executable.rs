@@ -537,6 +537,47 @@ fn check_object_meta(
     Ok(meta)
 }
 
+/// A program outside the digest store, such as the installed kilnd, under the same
+/// protected traversal: root-owned, not writable by anyone else, single-link and regular,
+/// with no setuid, setgid, sticky bit, ACL or file capability. The mode may keep root's
+/// write bit, since installers use 0755 and root is the one writer it admits.
+pub fn open_protected_program(policy: &WalkPolicy, path: &Path) -> Result<File, ExecutableError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ExecutableError::Object("the program path has no parent".into()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| ExecutableError::Object("the program path has no file name".into()))?;
+    let directory = walk_directory(policy, parent)?;
+    let name = component_name(name)?;
+    let file = open_at(
+        directory.file().as_raw_fd(),
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )
+    .map_err(|e| ExecutableError::Object(format!("{}: {e}", path.display())))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| ExecutableError::Descriptor(format!("{}: {e}", path.display())))?;
+    let mode = meta.permissions().mode() & 0o7777;
+    if !meta.is_file()
+        || meta.uid() != policy.owner_uid
+        || mode & 0o7022 != 0
+        || mode & 0o111 == 0
+        || meta.nlink() != 1
+    {
+        return Err(ExecutableError::Object(format!(
+            "{} is not a protected program: uid {}, mode {mode:o}, {} links",
+            path.display(),
+            meta.uid(),
+            meta.nlink(),
+        )));
+    }
+    check_acls(&file, policy, false)?;
+    check_capabilities(&file, policy)?;
+    Ok(file)
+}
+
 fn verify_object(
     policy: &WalkPolicy,
     directory: &ProtectedDir,

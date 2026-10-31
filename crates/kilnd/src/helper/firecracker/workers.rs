@@ -17,6 +17,7 @@ use super::journal::{
     WorkerIntentSpec,
 };
 use super::manifest::{self, ManifestGate};
+use super::peer::PeerAttestor;
 use crate::helper::protocol::{AmbiguousClass, PreparedReply, WireBytes};
 use crate::model::{Digest, Id128, ResourceReservation, SandboxSpec};
 use serde::de::DeserializeOwned;
@@ -39,6 +40,9 @@ pub const MAX_IPC_FRAME: usize = 1 << 20;
 /// L's bounded queue. The reserved lane is never consumed by new admissions.
 pub const LEDGER_QUEUE_NORMAL: usize = 28;
 pub const LEDGER_QUEUE_RESERVED: usize = 4;
+/// One attachment proof per enrolled instance, separate from the lanes above: no volume
+/// of other traffic takes this lane, and attach traffic never takes theirs.
+pub const LEDGER_QUEUE_ATTACH: usize = super::config::MAX_ENROLLED_HARD as usize;
 pub const PREP_SLOTS: usize = 2;
 pub const RECOVERY_SLOTS: usize = 2;
 
@@ -427,6 +431,7 @@ pub enum CallError {
 pub enum Lane {
     Normal,
     Reserved,
+    Attach,
 }
 
 struct PendingCall {
@@ -443,6 +448,7 @@ pub struct Channel {
     next_id: AtomicU64,
     normal: Arc<Semaphore>,
     reserved: Arc<Semaphore>,
+    attach: Arc<Semaphore>,
     closed: CancellationToken,
 }
 
@@ -453,10 +459,21 @@ impl Channel {
         normal: usize,
         reserved: usize,
     ) -> io::Result<(Arc<Self>, mpsc::Receiver<Value>)> {
+        Self::spawn_with_attach(stream, normal, reserved, 0)
+    }
+
+    /// L's channel, which alone has an attachment lane.
+    pub fn spawn_with_attach(
+        stream: std::os::unix::net::UnixStream,
+        normal: usize,
+        reserved: usize,
+        attach: usize,
+    ) -> io::Result<(Arc<Self>, mpsc::Receiver<Value>)> {
         stream.set_nonblocking(true)?;
         let stream = crate::helper::socket::Socket(UnixStream::from_std(stream)?);
         let (mut read_half, mut write_half) = tokio::io::split(stream);
-        let (writer, mut outgoing) = mpsc::channel::<Vec<u8>>((normal + reserved).max(4) + 8);
+        let (writer, mut outgoing) =
+            mpsc::channel::<Vec<u8>>((normal + reserved + attach).max(4) + 8);
         let (event_tx, events) = mpsc::channel(64);
         let pending: Arc<Mutex<HashMap<u64, PendingCall>>> = Arc::default();
         let closed = CancellationToken::new();
@@ -466,6 +483,7 @@ impl Channel {
             next_id: AtomicU64::new(1),
             normal: Arc::new(Semaphore::new(normal)),
             reserved: Arc::new(Semaphore::new(reserved)),
+            attach: Arc::new(Semaphore::new(attach)),
             closed: closed.clone(),
         });
         {
@@ -540,6 +558,7 @@ impl Channel {
                 .clone()
                 .try_acquire_owned()
                 .or_else(|_| self.normal.clone().try_acquire_owned()),
+            Lane::Attach => self.attach.clone().try_acquire_owned(),
         }
         .map_err(|_| CallError::Full)?;
         if self.is_closed() {
@@ -660,6 +679,23 @@ pub fn process_state(pid: i32) -> ProcessState {
     }
 }
 
+/// The path a fixture peer runs from, for the test-only enrollment above.
+#[cfg(all(test, target_os = "linux"))]
+fn test_process_image(pid: i32) -> std::path::PathBuf {
+    std::fs::read_link(format!("/proc/{pid}/exe")).expect("the fixture peer's image")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn test_process_image(pid: i32) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: path is writable and exactly the size given.
+    let len = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+    assert!(len > 0, "the fixture peer's image");
+    path.truncate(len as usize);
+    std::ffi::OsStr::from_bytes(&path).into()
+}
+
 /// Host boot identity: a changed value invalidates every recorded PID.
 #[cfg(target_os = "linux")]
 pub fn host_boot_id() -> String {
@@ -776,6 +812,8 @@ pub struct Timings {
     pub tick: Duration,
     pub heartbeat: Duration,
     pub heartbeat_timeout: Duration,
+    /// How long startup retries its infrastructure rows before giving up on serving.
+    pub startup_journal: Duration,
 }
 
 impl Default for Timings {
@@ -784,6 +822,7 @@ impl Default for Timings {
             tick: Duration::from_millis(100),
             heartbeat: Duration::from_millis(250),
             heartbeat_timeout: Duration::from_secs(1),
+            startup_journal: Duration::from_secs(30),
         }
     }
 }
@@ -803,6 +842,9 @@ pub struct ProfileRuntime {
 pub struct TestInjection {
     pub effects: Vec<FakeEffect>,
     pub fake_root: Option<std::path::PathBuf>,
+    /// Root's enrollment, done on first attach, for tests about something else.
+    pub auto_enroll: bool,
+    pub peers: super::peer::TestPeers,
 }
 
 /// Fake side effects, performed for real by S under its permit: an owned file or a
@@ -828,6 +870,10 @@ pub struct NodeConfig {
     pub timings: Timings,
     /// The verified image every fork-only worker inherits, when a profile pins it.
     pub helper_image: Option<ExecutableIdentity>,
+    /// The kilnd account an attached peer must run as.
+    pub service_uid: u32,
+    /// Root policy's total of enrolled instances, which sizes each instance's share.
+    pub max_enrolled: u32,
     #[cfg(test)]
     pub test: TestInjection,
 }
@@ -854,6 +900,13 @@ pub enum LedgerRequest {
     Attach {
         instance: Id128,
         database_uuid: Id128,
+        peer_pid: i32,
+    },
+    /// Root's enrollment, for fixtures testing something other than enrollment. It
+    /// enrolls the peer's real image. Production enrolls only from the root command.
+    #[cfg(test)]
+    TestEnroll {
+        instance: Id128,
         peer_pid: i32,
     },
     Lookup {
@@ -929,7 +982,11 @@ pub enum LedgerReply {
     Expired,
     Attached {
         outcome: AttachOutcome,
-        peer_start: Option<u64>,
+        peer_start: u64,
+    },
+    /// The peer is not the enrolled service, or the instance isn't enrolled.
+    AttachRefused {
+        reason: String,
     },
     Lookup(TokenLookup),
     PreflightSnapshot {
@@ -958,6 +1015,7 @@ pub enum LedgerReply {
 
 fn handle_ledger(
     ledger: &mut Ledger,
+    attestor: &mut PeerAttestor,
     revocations: &RevocationTable,
     request: LedgerRequest,
 ) -> Result<LedgerReply, LedgerError> {
@@ -967,15 +1025,44 @@ fn handle_ledger(
             database_uuid,
             peer_pid,
         } => {
-            let outcome = ledger.attach_instance(instance, database_uuid)?;
-            let peer_start = match process_state(peer_pid) {
-                ProcessState::Running { start_time } => Some(start_time),
-                _ => None,
+            let Some(enrollment) = ledger.enrollment(instance)? else {
+                return Ok(LedgerReply::AttachRefused {
+                    reason: "this instance is not enrolled".into(),
+                });
+            };
+            // The proof comes first. A refused peer never reaches any write.
+            let peer_start = match attestor.attest(peer_pid, &enrollment) {
+                Ok(start) => start,
+                Err(refusal) => {
+                    return Ok(LedgerReply::AttachRefused {
+                        reason: refusal.to_string(),
+                    });
+                }
             };
             LedgerReply::Attached {
-                outcome,
+                outcome: ledger.attach_instance(instance, database_uuid)?,
                 peer_start,
             }
+        }
+        #[cfg(test)]
+        LedgerRequest::TestEnroll { instance, peer_pid } => {
+            let path = test_process_image(peer_pid);
+            let meta = std::fs::metadata(&path).expect("the fixture peer's image");
+            use std::os::unix::fs::MetadataExt;
+            let unit = format!("fixture-{instance}.service");
+            let enrollment = super::peer::Enrollment {
+                instance_id: instance,
+                cgroup: format!("/fixture.slice/{unit}"),
+                unit,
+                executable: super::peer::EnrolledExecutable {
+                    st_dev: meta.dev(),
+                    st_ino: meta.ino(),
+                    bytes: meta.len(),
+                    sha256: super::peer::fixture_digest(),
+                },
+            };
+            ledger.enroll_instance(&enrollment, super::config::MAX_ENROLLED_HARD)?;
+            LedgerReply::Done
         }
         LedgerRequest::Lookup {
             instance,
@@ -1016,6 +1103,11 @@ fn handle_ledger(
             }
         }
         LedgerRequest::RecordInfrastructure { spec, pid } => {
+            if fault_enabled("L.record_infrastructure.fail") {
+                return Ok(LedgerReply::Failed {
+                    reason: "injected infrastructure journal failure".into(),
+                });
+            }
             let ProcessState::Running { start_time } = process_state(pid) else {
                 return Ok(LedgerReply::Failed {
                     reason: "worker exited before its identity was recorded".into(),
@@ -1062,6 +1154,11 @@ fn handle_ledger(
             worker_id,
             settlement,
         } => {
+            if fault_enabled("L.settle.fail") {
+                return Ok(LedgerReply::Failed {
+                    reason: "injected settlement failure".into(),
+                });
+            }
             ledger.settle_worker(worker_id, &settlement)?;
             LedgerReply::Done
         }
@@ -1093,6 +1190,7 @@ fn ledger_failure(error: LedgerError) -> LedgerReply {
 pub fn ledger_main(
     mut endpoint: Endpoint,
     config: LedgerConfig,
+    mut attestor: PeerAttestor,
     mut heartbeat: Heartbeat,
     revocations: Arc<RevocationTable>,
     expiring: fn(&LedgerRequest) -> bool,
@@ -1116,9 +1214,8 @@ pub fn ledger_main(
                 reason: error.to_string(),
             },
             Ok(_) if expiring(&request) && monotonic_ns() >= deadline_ns => LedgerReply::Expired,
-            Ok(ledger) => {
-                handle_ledger(ledger, &revocations, request).unwrap_or_else(ledger_failure)
-            }
+            Ok(ledger) => handle_ledger(ledger, &mut attestor, &revocations, request)
+                .unwrap_or_else(ledger_failure),
         };
         fault_point("L.reply");
         if endpoint.send(id, &reply, Duration::from_secs(5)).is_err() {
@@ -1198,6 +1295,9 @@ pub enum PrepReply {
     Rejected {
         class: AmbiguousClass,
         reason: String,
+        /// The plan failed its own bytes or its binding to this token. A daemon verifies
+        /// both before C1, so this token cannot be one it holds a charge for.
+        malformed: bool,
     },
     Allocation(NamespaceObservation),
     Node(NodeObservation),
@@ -1298,6 +1398,11 @@ fn preflight_job(
     })
 }
 
+struct RevalidateRefusal {
+    reason: String,
+    malformed: bool,
+}
+
 fn revalidate_job(
     config: &NodeConfig,
     instance: Id128,
@@ -1305,7 +1410,7 @@ fn revalidate_job(
     sandbox_id: &str,
     plan: &[u8],
     plan_digest: &Digest,
-) -> Result<RevalidatedPlan, String> {
+) -> Result<RevalidatedPlan, RevalidateRefusal> {
     fault_point("P.revalidate");
     let plan = config::verify_plan_bytes(
         plan,
@@ -1314,14 +1419,22 @@ fn revalidate_job(
         instance,
         allocation,
         sandbox_id,
-    )?;
-    expected_plan_shape(config, &plan)?;
+    )
+    .map_err(|reason| RevalidateRefusal {
+        reason,
+        malformed: true,
+    })?;
+    let current = |reason| RevalidateRefusal {
+        reason,
+        malformed: false,
+    };
+    expected_plan_shape(config, &plan).map_err(current)?;
     let profile = config.profile(&plan.inputs.profile).expect("just checked");
-    verify_bundle(config, profile)?;
+    verify_bundle(config, profile).map_err(current)?;
     profile
         .table
         .revalidate(&plan.inputs.executables)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| current(e.to_string()))?;
     Ok(RevalidatedPlan {
         profile: plan.inputs.profile.clone(),
         manifest_sha256: plan.inputs.manifest_sha256,
@@ -1386,6 +1499,7 @@ pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat:
             PrepRequest::Revalidate { .. } if expired => PrepReply::Rejected {
                 class: AmbiguousClass::Expired,
                 reason: "create deadline expired before revalidation".into(),
+                malformed: false,
             },
             PrepRequest::Preflight {
                 instance,
@@ -1415,9 +1529,10 @@ pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat:
                 &plan_digest,
             ) {
                 Ok(plan) => PrepReply::Revalidated(Box::new(plan)),
-                Err(reason) => PrepReply::Rejected {
+                Err(refusal) => PrepReply::Rejected {
                     class: AmbiguousClass::CatalogMismatch,
-                    reason,
+                    reason: refusal.reason,
+                    malformed: refusal.malformed,
                 },
             },
             PrepRequest::ObserveAllocation {

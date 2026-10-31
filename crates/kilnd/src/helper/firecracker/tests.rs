@@ -3,13 +3,14 @@
 //! parts are only the resources S creates and the catalog this file injects; stalls
 //! are real blocked or stopped processes. Nothing here launches a VM.
 #![allow(clippy::type_complexity)]
-use super::config::{NodeCeilings, ProfileCatalog, SharedReserve};
+use super::config::{DEFAULT_MAX_ENROLLED, NodeCeilings, ProfileCatalog, SharedReserve};
 use super::executable::tests::{all_pins, fixture_bytes, pin_of};
 use super::executable::{self, Role, WalkPolicy};
 use super::identity::IdentityRanges;
 use super::inventory::{ObservationBackend, fake};
 use super::journal::{Ledger, LedgerConfig};
 use super::manifest::ManifestGate;
+use super::peer::{TestPeers, fixture_digest};
 use super::workers::{FakeEffect, NodeConfig, TestInjection, Timings, faults};
 use super::{Node, load_profile};
 use crate::helper::protocol::*;
@@ -53,6 +54,23 @@ struct NodeOptions {
     heartbeat_timeout_ms: u64,
     /// Restrict the fence allowance to exercise node headroom end to end.
     fence_allowance_bytes: Option<u64>,
+    startup_journal_ms: u64,
+    max_enrolled: u32,
+    /// Enroll on first attach, for tests that are about something else.
+    auto_enroll: bool,
+    peers: PeerEvidence,
+}
+
+/// Where a fixture helper reads an attaching peer's cgroup. The UID, start time, image
+/// and connection pin are real in all three.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum PeerEvidence {
+    /// Whatever the instance enrolled.
+    AnyCgroup,
+    /// `<root>/peers/<pid>`, for hosts where a test can't place a process in a cgroup.
+    Markers,
+    /// The kernel's `/proc/<pid>/cgroup`.
+    Real,
 }
 
 impl Default for NodeOptions {
@@ -63,6 +81,10 @@ impl Default for NodeOptions {
             effects: vec![],
             heartbeat_timeout_ms: 5_000,
             fence_allowance_bytes: None,
+            startup_journal_ms: 30_000,
+            max_enrolled: DEFAULT_MAX_ENROLLED,
+            auto_enroll: true,
+            peers: PeerEvidence::AnyCgroup,
         }
     }
 }
@@ -138,11 +160,33 @@ fn node_fixture_child() {
                 tick: Duration::from_millis(20),
                 heartbeat: Duration::from_millis(100),
                 heartbeat_timeout: Duration::from_millis(config.options.heartbeat_timeout_ms),
+                startup_journal: Duration::from_millis(config.options.startup_journal_ms),
             },
             helper_image,
+            // SAFETY: geteuid has no preconditions.
+            service_uid: unsafe { libc::geteuid() },
+            max_enrolled: config.options.max_enrolled,
             test: TestInjection {
                 effects,
                 fake_root: Some(config.root.join("fake")),
+                auto_enroll: config.options.auto_enroll,
+                peers: match config.options.peers {
+                    PeerEvidence::AnyCgroup => TestPeers {
+                        directory: None,
+                        any_cgroup: true,
+                        assumed_digest: Some(fixture_digest()),
+                    },
+                    PeerEvidence::Markers => TestPeers {
+                        directory: Some(config.root.join("peers")),
+                        any_cgroup: false,
+                        assumed_digest: Some(fixture_digest()),
+                    },
+                    PeerEvidence::Real => TestPeers {
+                        directory: None,
+                        any_cgroup: false,
+                        assumed_digest: Some(fixture_digest()),
+                    },
+                },
             },
         };
         let node = match Node::start(node_config).await {
@@ -235,6 +279,7 @@ fn prepare_tree(options: NodeOptions) -> (tempfile::TempDir, PathBuf, ChildConfi
         "ledger",
         "fake",
         "faults",
+        "peers",
         "source",
     ] {
         private_dir(&root.join(name));
@@ -306,6 +351,18 @@ impl Fixture {
         };
         fixture.start().await;
         fixture
+    }
+
+    /// Provisioned, with the helper not yet running: root's enrollment happens here.
+    fn unstarted(options: NodeOptions) -> Self {
+        let (temp, root, config) = prepare_tree(options);
+        Ledger::provision(&ledger_config(&config)).unwrap();
+        Self {
+            temp,
+            root,
+            child: Mutex::new(None),
+            seen: Mutex::default(),
+        }
     }
 
     fn spawn_helper(&self) {
@@ -483,6 +540,9 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         if std::thread::panicking() {
             eprintln!("--- helper fixture log ---\n{}", self.log());
+            if let Ok(peers) = std::fs::read_to_string(self.root.join("peer.log")) {
+                eprintln!("--- peer log ---\n{peers}");
+            }
         }
         // Clear every stall first, so nothing outlives this fixture.
         let _ = std::fs::remove_dir_all(self.root.join("faults"));
@@ -1478,9 +1538,13 @@ async fn exit3_one_live_holder_per_namespace_and_epochs_die_with_their_holder() 
     let database = Id128::random();
     let holder = fixture.runtime(instance, database);
     let epoch = epoch_of(&holder).await;
-    // A second live attachment cannot take this namespace, by copying its IDs.
-    let thief = fixture.runtime(instance, database);
-    let refused = thief.version(deadline(5), &no_cancel()).await.unwrap_err();
+    // A second live attachment can't take this namespace, even from the enrolled
+    // service. A process that isn't that service is refused outright: see control_plane.
+    let successor = fixture.runtime(instance, database);
+    let refused = successor
+        .version(deadline(5), &no_cancel())
+        .await
+        .unwrap_err();
     assert!(refused.to_string().contains("live holder"), "{refused}");
     // An epoch from a wrong or missing value never authorizes anything.
     let wrong = raw_call(
@@ -1523,12 +1587,12 @@ async fn exit3_one_live_holder_per_namespace_and_epochs_die_with_their_holder() 
     create_accepted(&fixture, &holder, &context, &plan).await;
     // Detach invalidates the epoch; ledger-owned work and its claim remain.
     holder.test_reattach().await;
-    let after = thief.test_epoch(deadline(5)).await;
+    let after = successor.test_epoch(deadline(5)).await;
     let replacement = match after {
         Ok(epoch) => epoch,
         Err(_) => {
-            wait_until_attached(&thief).await;
-            epoch_of(&thief).await
+            wait_until_attached(&successor).await;
+            epoch_of(&successor).await
         }
     };
     assert_ne!(replacement, epoch);
@@ -1549,7 +1613,7 @@ async fn exit3_one_live_holder_per_namespace_and_epochs_die_with_their_holder() 
             ..
         })
     ));
-    assert_eq!(node_totals(&thief).await.claimed.slots, 1);
+    assert_eq!(node_totals(&successor).await.claimed.slots, 1);
     assert_eq!(fixture.active_allocations(), 1);
     // Reattaching does not clear or adopt: the same token still answers identically.
     match raw_create(&fixture, &context, replacement, &plan).await {
@@ -2329,6 +2393,7 @@ async fn exit4_monitor_requests_a_stale_supervisors_stop_without_help_from_h() {
     let (heartbeat_worker, _heartbeat_monitor) = datagram_pair().unwrap();
     recovery_worker.set_nonblocking(true).unwrap();
     let timings = Timings {
+        startup_journal: Duration::from_secs(5),
         tick: Duration::from_millis(20),
         heartbeat: Duration::from_millis(50),
         heartbeat_timeout: Duration::from_millis(400),
@@ -2693,9 +2758,15 @@ async fn exit4_helper_loss_retains_pending_stops_without_an_ownership_timeout() 
     // The other K remains stuck. M must keep the available K's original slot alive.
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert!(alive(monitor));
-    assert!(alive(recovery[0]), "an available K left pending work unowned");
+    assert!(
+        alive(recovery[0]),
+        "an available K left pending work unowned"
+    );
     signal(recovery[1], libc::SIGCONT);
-    wait_until("every target to settle", || vms.iter().all(|vm| !alive(*vm))).await;
+    wait_until("every target to settle", || {
+        vms.iter().all(|vm| !alive(*vm))
+    })
+    .await;
     wait_until("M to leave only after settlement", || !alive(monitor)).await;
     for pid in &recovery {
         wait_until("K to leave after M", || !alive(*pid)).await;
@@ -4108,31 +4179,6 @@ async fn exit1_a_full_operation_budget_keeps_four_slots_for_recovery_only() {
 }
 
 #[tokio::test]
-async fn exit1_attachments_have_their_own_bound_and_never_hold_operation_slots() {
-    let fixture = Fixture::new(NodeOptions::default()).await;
-    let mut attached = Vec::new();
-    for _ in 0..16 {
-        let runtime = fixture.runtime(Id128::random(), Id128::random());
-        epoch_of(&runtime).await;
-        attached.push(runtime);
-    }
-    let refused = fixture.runtime(Id128::random(), Id128::random());
-    let error = refused
-        .version(deadline(5), &no_cancel())
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("too many attachments"),
-        "{error}"
-    );
-    // Sixteen live control connections leave every operation slot free.
-    assert!(attached[0].version(deadline(5), &no_cancel()).await.is_ok());
-    // One leaving frees its capacity, and also its generation slot.
-    attached[0].test_reattach().await;
-    wait_until_attached(&refused).await;
-}
-
-#[tokio::test]
 async fn exit1_prepared_wire_is_reconstructed_and_verified_field_by_field() {
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
@@ -4684,7 +4730,7 @@ fn exit5_linux_root_production_policy_provisions_once_and_serves_no_profile() {
         super::provision_ledger(&parsed).is_err(),
         "provisioning happens once"
     );
-    let config = super::production_config(parsed);
+    let config = super::production_config(parsed, 999);
     assert!(
         config.profiles.is_empty(),
         "the disabled gate leaves no profile"
@@ -4704,3 +4750,5 @@ fn fixture_child_does_nothing_without_its_environment() {
     assert!(std::env::var(FIXTURE_ENV).is_err());
     node_fixture_child();
 }
+
+mod control_plane;

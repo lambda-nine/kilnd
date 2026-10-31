@@ -325,6 +325,8 @@ pub enum GroupErrorKind {
     Unavailable,
     ResourceExhausted,
     Incompatible,
+    /// Not root-enrolled, or the connecting process is not the enrolled service.
+    Unauthorized,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

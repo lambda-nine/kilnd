@@ -5,6 +5,7 @@
 use super::config::{NodeCeilings, SharedReserve, validate_ceilings};
 use super::executable::{ExecutableIdentity, ProtectedDir, Role, WalkPolicy, walk_directory};
 use super::identity::{ClaimedIdentities, IdentityLeases, LeaseKind};
+use super::peer::{EnrolledExecutable, Enrollment};
 use crate::model::{Digest, Id128, ResourceReservation, now_ms};
 use crate::runtime::FencedAbsence;
 use rusqlite::{
@@ -41,7 +42,13 @@ CREATE TABLE generation_counter (
 ) STRICT;
 CREATE TABLE instances (
     instance_id TEXT PRIMARY KEY,
-    database_uuid TEXT NOT NULL,
+    unit TEXT NOT NULL UNIQUE,
+    cgroup TEXT NOT NULL UNIQUE,
+    exe_st_dev INTEGER NOT NULL,
+    exe_st_ino INTEGER NOT NULL,
+    exe_bytes INTEGER NOT NULL,
+    exe_sha256 TEXT NOT NULL,
+    database_uuid TEXT,
     first_generation INTEGER NOT NULL CHECK (first_generation >= 1)
 ) STRICT;
 CREATE TABLE allocations (
@@ -159,9 +166,19 @@ CREATE TRIGGER generation_no_delete BEFORE DELETE ON generation_counter
 BEGIN SELECT RAISE(ABORT, 'the generation counter is permanent'); END;
 
 CREATE TRIGGER instances_no_replace BEFORE INSERT ON instances
-WHEN EXISTS (SELECT 1 FROM instances WHERE rowid = NEW.rowid OR instance_id = NEW.instance_id)
+WHEN EXISTS (SELECT 1 FROM instances WHERE rowid = NEW.rowid OR instance_id = NEW.instance_id
+    OR unit = NEW.unit OR cgroup = NEW.cgroup)
 BEGIN SELECT RAISE(ABORT, 'an instance binding cannot be replaced'); END;
+CREATE TRIGGER instances_no_replace_update BEFORE UPDATE ON instances
+WHEN EXISTS (SELECT 1 FROM instances WHERE rowid != OLD.rowid AND (rowid = NEW.rowid
+    OR instance_id = NEW.instance_id OR unit = NEW.unit OR cgroup = NEW.cgroup))
+BEGIN SELECT RAISE(ABORT, 'an instance binding cannot be replaced'); END;
+-- Root may re-enroll a unit or image. Identity never changes, and a database binding
+-- is written once, by that instance's first attachment.
 CREATE TRIGGER instances_no_update BEFORE UPDATE ON instances
+WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
+    OR NEW.first_generation IS NOT OLD.first_generation
+    OR (OLD.database_uuid IS NOT NULL AND NEW.database_uuid IS NOT OLD.database_uuid)
 BEGIN SELECT RAISE(ABORT, 'an instance binding is immutable'); END;
 CREATE TRIGGER instances_no_delete BEFORE DELETE ON instances
 BEGIN SELECT RAISE(ABORT, 'an instance binding is permanent'); END;
@@ -551,6 +568,33 @@ pub enum AttachOutcome {
     /// Another database once owned this namespace: claims survive and admission is
     /// blocked until an operator resolves it. The binding itself never changes.
     DatabaseMismatch { node_id: Id128, generation: u64 },
+    /// Root never enrolled this instance. Nothing was written.
+    NotEnrolled,
+    /// A first binding would write past the fence floor. Nothing was written, and an
+    /// instance already bound attaches with no write at all, so it is unaffected.
+    NoSpace,
+}
+
+/// Root's enrollment command, in one transaction. Only root reaches this: the helper
+/// serves it over no socket, and it needs the node lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnrollOutcome {
+    Enrolled {
+        generation: u64,
+    },
+    /// The same instance again, with this unit and image now expected.
+    Updated {
+        generation: u64,
+    },
+    /// Root policy's total is reached. Enrolled instances stay as they are.
+    LimitReached {
+        limit: u32,
+    },
+    /// Another instance has this unit: one unit serves one instance, or compromising
+    /// it would give both.
+    UnitTaken,
+    /// Past the fence floor: the space already promised to fences stays promised.
+    NoSpace,
 }
 
 /// Node totals; no other instance's session identities appear here.
@@ -605,6 +649,7 @@ pub struct WorkerRecord {
 #[serde(deny_unknown_fields)]
 pub struct ReplaySnapshot {
     pub generation: u64,
+    pub enrolled: Vec<Id128>,
     pub active_allocations: Vec<InventoryRecord>,
     pub unsettled_workers: Vec<WorkerRecord>,
     pub executable_leases: Vec<ExecutableIdentity>,
@@ -991,63 +1036,180 @@ impl Ledger {
         self.fail_next_commit.set(true);
     }
 
-    /// Binds a namespace to its database once. A mismatched database is reported and
-    /// never overwrites the binding: its claims stay attributed to that namespace.
+    /// The root enrollment command. `limit` comes from the root policy; lowering it
+    /// later refuses new enrollments and removes nothing.
+    pub fn enroll_instance(
+        &mut self,
+        enrollment: &Enrollment,
+        limit: u32,
+    ) -> Result<EnrollOutcome, LedgerError> {
+        let has_headroom = self.fence_headroom()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let instance = enrollment.instance_id.to_string();
+        let exists: i64 = tx
+            .prepare_cached("SELECT COUNT(*) FROM instances WHERE instance_id = ?1")?
+            .query_row([&instance], |r| r.get(0))?;
+        let taken: i64 = tx
+            .prepare_cached(
+                "SELECT COUNT(*) FROM instances
+                 WHERE instance_id != ?1 AND (unit = ?2 OR cgroup = ?3)",
+            )?
+            .query_row(params![instance, enrollment.unit, enrollment.cgroup], |r| {
+                r.get(0)
+            })?;
+        if taken != 0 {
+            return Ok(EnrollOutcome::UnitTaken);
+        }
+        let image = &enrollment.executable;
+        let (dev, ino, bytes) = (
+            signed(image.st_dev, "st_dev")?,
+            signed(image.st_ino, "st_ino")?,
+            signed(image.bytes, "bytes")?,
+        );
+        let generation = if exists == 0 {
+            let total: i64 = tx
+                .prepare_cached("SELECT COUNT(*) FROM instances")?
+                .query_row([], |r| r.get(0))?;
+            if unsigned(total)? >= u64::from(limit) {
+                return Ok(EnrollOutcome::LimitReached { limit });
+            }
+            if !has_headroom {
+                return Ok(EnrollOutcome::NoSpace);
+            }
+            let generation = next_generation(&tx)?;
+            tx.prepare_cached(
+                "INSERT INTO instances (instance_id, unit, cgroup, exe_st_dev, exe_st_ino,
+                    exe_bytes, exe_sha256, first_generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?
+            .execute(params![
+                instance,
+                enrollment.unit,
+                enrollment.cgroup,
+                dev,
+                ino,
+                bytes,
+                image.sha256.to_string(),
+                signed(generation, "generation")?
+            ])?;
+            EnrollOutcome::Enrolled { generation }
+        } else {
+            let generation = next_generation(&tx)?;
+            tx.prepare_cached(
+                "UPDATE instances SET unit = ?2, cgroup = ?3, exe_st_dev = ?4, exe_st_ino = ?5,
+                    exe_bytes = ?6, exe_sha256 = ?7
+                 WHERE instance_id = ?1",
+            )?
+            .execute(params![
+                instance,
+                enrollment.unit,
+                enrollment.cgroup,
+                dev,
+                ino,
+                bytes,
+                image.sha256.to_string(),
+            ])?;
+            EnrollOutcome::Updated { generation }
+        };
+        commit_tx(tx, &self.fail_next_commit)?;
+        Ok(generation)
+    }
+
+    /// What root enrolled for one instance. L reads this fresh for every attachment.
+    pub fn enrollment(&self, instance: Id128) -> Result<Option<Enrollment>, LedgerError> {
+        let row = self
+            .conn
+            .prepare_cached(
+                "SELECT unit, cgroup, exe_st_dev, exe_st_ino, exe_bytes, exe_sha256
+                 FROM instances WHERE instance_id = ?1",
+            )?
+            .query_row([instance.to_string()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })
+            .optional()?;
+        let Some((unit, cgroup, dev, ino, bytes, sha)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(Enrollment {
+            instance_id: instance,
+            unit,
+            cgroup,
+            executable: EnrolledExecutable {
+                st_dev: unsigned(dev)?,
+                st_ino: unsigned(ino)?,
+                bytes: unsigned(bytes)?,
+                sha256: parse_sha(sha)?,
+            },
+        }))
+    }
+
+    fn enrolled_instances(&self) -> Result<Vec<Id128>, LedgerError> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT instance_id FROM instances ORDER BY instance_id")?;
+        let mut rows = statement.query([])?;
+        let mut enrolled = Vec::new();
+        while let Some(row) = rows.next()? {
+            enrolled.push(parse_id(row.get(0)?)?);
+        }
+        Ok(enrolled)
+    }
+
+    /// An attested peer's database claim. The UUID identifies reconciliation state and
+    /// authorizes nothing. The first attachment records it on the instance's own row,
+    /// which is the one write attach can make; every later one writes nothing. A
+    /// mismatch is reported and never overwrites: claims stay with that namespace.
     pub fn attach_instance(
         &mut self,
         instance: Id128,
         database_uuid: Id128,
     ) -> Result<AttachOutcome, LedgerError> {
         let node_id = self.config.node_id;
-        let tx = self
+        let bound: Option<Option<String>> = self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let bound: Option<String> = tx
             .prepare_cached("SELECT database_uuid FROM instances WHERE instance_id = ?1")?
             .query_row([instance.to_string()], |r| r.get(0))
             .optional()?;
-        let outcome = match bound {
-            Some(existing) if existing == database_uuid.to_string() => {
-                let generation: i64 = tx.query_row(
-                    "SELECT value FROM generation_counter WHERE id = 1",
-                    [],
-                    |r| r.get(0),
-                )?;
-                AttachOutcome::Bound {
-                    node_id,
-                    generation: unsigned(generation)?,
-                }
-            }
-            Some(_) => {
-                let generation: i64 = tx.query_row(
-                    "SELECT value FROM generation_counter WHERE id = 1",
-                    [],
-                    |r| r.get(0),
-                )?;
-                AttachOutcome::DatabaseMismatch {
-                    node_id,
-                    generation: unsigned(generation)?,
-                }
-            }
-            None => {
-                let generation = next_generation(&tx)?;
-                tx.prepare_cached(
-                    "INSERT INTO instances (instance_id, database_uuid, first_generation)
-                     VALUES (?1, ?2, ?3)",
-                )?
-                .execute(params![
-                    instance.to_string(),
-                    database_uuid.to_string(),
-                    signed(generation, "generation")?
-                ])?;
-                AttachOutcome::Bound {
-                    node_id,
-                    generation,
-                }
-            }
+        let Some(bound) = bound else {
+            return Ok(AttachOutcome::NotEnrolled);
         };
-        commit_tx(tx, &self.fail_next_commit)?;
-        Ok(outcome)
+        match bound {
+            Some(existing) if existing == database_uuid.to_string() => Ok(AttachOutcome::Bound {
+                node_id,
+                generation: self.generation()?,
+            }),
+            Some(_) => Ok(AttachOutcome::DatabaseMismatch {
+                node_id,
+                generation: self.generation()?,
+            }),
+            None => {
+                if !self.fence_headroom()? {
+                    return Ok(AttachOutcome::NoSpace);
+                }
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.prepare_cached(
+                    "UPDATE instances SET database_uuid = ?2
+                     WHERE instance_id = ?1 AND database_uuid IS NULL",
+                )?
+                .execute(params![instance.to_string(), database_uuid.to_string()])?;
+                commit_tx(tx, &self.fail_next_commit)?;
+                Ok(AttachOutcome::Bound {
+                    node_id,
+                    generation: self.generation()?,
+                })
+            }
+        }
     }
 
     fn lookup_on(
@@ -1259,11 +1421,12 @@ impl Ledger {
             }
             TokenLookup::Unknown => {}
         }
-        let bound: Option<String> = tx
+        // Admission follows an attachment, which recorded a database on this row.
+        let bound: Option<Option<String>> = tx
             .prepare_cached("SELECT database_uuid FROM instances WHERE instance_id = ?1")?
             .query_row([request.instance_id.to_string()], |r| r.get(0))
             .optional()?;
-        if bound.is_none() {
+        if bound.flatten().is_none() {
             return Ok(AdmitOutcome::InstanceMismatch);
         }
         let taken: i64 = tx
@@ -1897,6 +2060,7 @@ impl Ledger {
         }
         Ok(ReplaySnapshot {
             generation: self.generation()?,
+            enrolled: self.enrolled_instances()?,
             active_allocations,
             unsettled_workers,
             executable_leases,

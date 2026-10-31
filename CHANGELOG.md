@@ -14,6 +14,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   peer vanishing before its credentials can be read no longer ends the helper's listener.
   The helper's connection budget splits: 128 framing slots, then 60 normal and 4 reserved
   recovery operation slots after classification, so silent clients cannot occupy dispatch.
+- Close the B3 break-it findings. Root enrolls Firecracker instances with `kilnd-helper
+  enroll`, and attachment proves the peer's UID, unit cgroup and kilnd image; the database
+  UUID authenticates nothing. Enrollment is bounded by policy, with one attachment slot per
+  instance. Token gates follow the durable lookup and are partitioned by instance. Workers
+  are never published without their journal row. Attachment needs Linux 6.5 or later.
 
 - Close B2 recheck findings in schema 10: audit release receipts in trusted Rust
   reads, retain invalid releases as charged/quarantined, degrade Health and refuse

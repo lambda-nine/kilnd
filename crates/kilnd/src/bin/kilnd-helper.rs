@@ -1,6 +1,6 @@
 //! Socket-activated root privilege boundary. No gRPC, DB, shell, or arbitrary argv.
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::{
     ffi::CString,
     os::fd::{AsRawFd, FromRawFd},
@@ -22,6 +22,31 @@ struct Args {
     /// or partial ledger is refused; nothing else ever creates one.
     #[arg(long, requires = "firecracker_policy")]
     firecracker_init_ledger: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Root-only: names the systemd unit and installed kilnd image allowed to serve an
+    /// instance. Stop kilnd-helper first: this takes its node lock, and runs over no socket.
+    Enroll {
+        /// The instance's 32-digit hexadecimal ID.
+        #[arg(long)]
+        instance: String,
+        /// The kilnd service unit that serves it, such as kilnd.service.
+        #[arg(long)]
+        unit: String,
+        /// The unit's exact cgroup, when it isn't /system.slice/<unit>.
+        #[arg(long)]
+        cgroup: Option<String>,
+        /// The installed kilnd image that unit runs. Enroll again after replacing it.
+        #[arg(long, default_value = kilnd::helper::firecracker::peer::DEFAULT_KILND_PATH)]
+        kilnd: PathBuf,
+        /// The root-owned Firecracker node policy naming the ledger and the enrollment limit.
+        #[arg(long, default_value = "/etc/kilnd/firecracker-node.json")]
+        policy: PathBuf,
+    },
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -31,6 +56,34 @@ async fn main() -> Result<()> {
     }
     unsafe {
         libc::umask(0o077);
+    }
+    if let Some(Command::Enroll {
+        instance,
+        unit,
+        cgroup,
+        kilnd,
+        policy,
+    }) = &args.command
+    {
+        let instance = kilnd::model::Id128::parse(instance)
+            .map_err(|_| anyhow::anyhow!("--instance must be a 32-digit hexadecimal ID"))?;
+        if !kilnd.is_absolute() {
+            bail!("--kilnd must be absolute");
+        }
+        let policy = kilnd::helper::firecracker::read_policy(policy, service_uid()?)
+            .map_err(anyhow::Error::msg)
+            .context("Firecracker node policy")?;
+        let done = kilnd::helper::firecracker::enroll_instance(
+            &policy,
+            instance,
+            unit,
+            cgroup.as_deref(),
+            kilnd,
+        )
+        .map_err(anyhow::Error::msg)
+        .context("enroll instance")?;
+        println!("{done}");
+        return Ok(());
     }
     // No request can select an executable; the administrator's configured
     // executable and every ancestor must be root-owned and not writable.
@@ -82,7 +135,7 @@ async fn main() -> Result<()> {
                 None
             }
             Ok(policy) => {
-                let config = kilnd::helper::firecracker::production_config(policy);
+                let config = kilnd::helper::firecracker::production_config(policy, service_uid);
                 match kilnd::helper::firecracker::Node::start(config).await {
                     Ok(node) => Some(node),
                     Err(error) => {

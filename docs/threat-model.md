@@ -175,6 +175,11 @@ sandbox compromises the host.
   own them and their proofs. kilnd still runs kiln only, and that remains experimental
   shared-kernel isolation, not a boundary for hostile multi-tenant workloads.
   Daemon-local sums are never node totals for a backend with a node authority.
+- **A compromised service account cannot take over another instance.** Root enrolls each
+  instance with its unit and image, and attachment proves both, so copied daemon files
+  give nothing. Units sharing one service UID can still signal each other, and ptrace
+  each other unless Yama restricts it: a node with several instances needs per-instance
+  accounts or `kernel.yama.ptrace_scope` of at least 1.
 - **The node ledger is part of the root trusted base,** with SQLite and its schema.
   Its triggers stop mistakes through SQL. They cannot stop root or anything with file
   authority: `SQLITE_DBCONFIG_ENABLE_TRIGGER`, a schema rewrite, or a rollback of the

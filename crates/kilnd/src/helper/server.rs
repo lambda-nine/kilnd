@@ -1,3 +1,4 @@
+use super::firecracker::peer::PeerPin;
 use super::firecracker::{Node, WireDeadline};
 use super::protocol::*;
 use super::{fds, socket::Socket, write_frame};
@@ -22,15 +23,12 @@ const FRAMING_SLOTS: usize = 128;
 /// Section 6.1's 64 operations: 60 for anything, 4 reserved for inspection and recovery.
 const NORMAL_OPERATION_SLOTS: usize = 60;
 const RESERVED_RECOVERY_SLOTS: usize = 4;
-/// Live attachments have their own bound and never hold an operation slot.
-const ATTACHMENT_SLOTS: usize = 16;
 
 /// The separate capacities of one listener.
 struct Budgets {
     framing: Arc<Semaphore>,
     normal: Arc<Semaphore>,
     recovery: Arc<Semaphore>,
-    attachments: Arc<Semaphore>,
 }
 
 impl Budgets {
@@ -39,7 +37,6 @@ impl Budgets {
             framing: Arc::new(Semaphore::new(FRAMING_SLOTS)),
             normal: Arc::new(Semaphore::new(NORMAL_OPERATION_SLOTS)),
             recovery: Arc::new(Semaphore::new(RESERVED_RECOVERY_SLOTS)),
-            attachments: Arc::new(Semaphore::new(ATTACHMENT_SLOTS)),
         }
     }
 
@@ -242,32 +239,37 @@ async fn firecracker_request(
     timeout(Duration::from_secs(2), fds::send(&stream.0, &[]))
         .await
         .map_err(io::Error::other)??;
-    let peer_pid = stream.0.peer_cred()?.pid();
+    // The connector's own pidfd, taken before any reply. A kernel that can't supply one
+    // gets no authority at all. A live connector holds its number, so the PID below is
+    // really this connection's, and a socket left behind by a process whose PID was
+    // later reused speaks for no one.
+    let pin = PeerPin::of_connection(stream.0.as_raw_fd()).ok();
+    let peer_pid = stream
+        .0
+        .peer_cred()?
+        .pid()
+        .filter(|_| pin.as_ref().is_some_and(PeerPin::alive));
     let instance = request.instance_id;
     let attach = matches!(
         request.operation,
         FirecrackerOperation::AttachInstance { .. }
     );
     let recovery = request.operation.is_recovery();
-    // Attachments have their own bound and stay out of the operation budgets. A full
-    // budget answers at once: the last four operation slots serve only recovery.
-    let attachment = attach.then(|| budgets.attachments.clone().try_acquire_owned().ok());
+    // No common pool of attachments exists: each enrolled instance has its own one, and
+    // anything else is refused at once by the node. A full operation budget answers at
+    // once too: the last four operation slots serve only recovery.
     let operation_slot = (!attach).then(|| budgets.admit(recovery));
-    let refused = match (&attachment, &operation_slot) {
-        (Some(None), _) => Some("too many attachments"),
-        (_, Some(None)) => Some("only reserved recovery slots remain"),
-        _ => None,
-    };
+    let refused = matches!(operation_slot, Some(None));
     let (mut reader, mut writer) = tokio::io::split(stream);
     let waiter = cancel.child_token();
     let response = match &firecracker {
         None => FirecrackerResponse::disabled(&request.operation),
-        Some(_) if refused.is_some() => FirecrackerResponse::Error(GroupError::new(
+        Some(_) if refused => FirecrackerResponse::Error(GroupError::new(
             GroupErrorKind::ResourceExhausted,
-            refused.unwrap_or_default(),
+            "only reserved recovery slots remain",
         )),
         Some(node) => {
-            let operation = node.handle(request, peer_pid, deadline, &waiter);
+            let operation = node.handle(request, peer_pid, pin, deadline, &waiter);
             tokio::pin!(operation);
             tokio::select! {
                 response = &mut operation => response,
@@ -297,8 +299,6 @@ async fn firecracker_request(
             .await
             .map_err(|e| super::io_stage("response shutdown", e));
     };
-    // The long-lived control connection holds only its attachment slot.
-    let _attachment = attachment;
     drop(operation_slot);
     if written.is_ok() {
         tokio::select! {
@@ -475,7 +475,6 @@ mod tests {
         assert!(budgets.admit(true).is_some());
         drop(recovery);
         assert_eq!(budgets.framing.available_permits(), FRAMING_SLOTS);
-        assert_eq!(budgets.attachments.available_permits(), ATTACHMENT_SLOTS);
         // Health and cleanup are the legacy requests that keep the reserve.
         for (request, reserved) in [
             (KilnRequest::Capabilities { id: None }, true),

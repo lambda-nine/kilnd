@@ -136,10 +136,17 @@ command or environment. Identities are typed 128-bit IDs and digests, profiles a
 | `list` | 30 s | This namespace's records with `complete`; anything stale or unexplained makes it incomplete |
 | `fence_absent {allocation_id, sandbox_id, plan_digest}` | 30 s | The permanent receipt, byte for byte, or `ambiguous {class}` |
 
+An instance must be enrolled by root first (`kilnd-helper enroll`, which takes the node
+lock and uses no socket). Attachment succeeds only for a process running as the kilnd
+UID, in exactly the enrolled unit's cgroup, from the enrolled image by device, inode, size
+and digest, and anything else gets `unauthorized`. The connection's `SO_PEERPIDFD` pins
+that process, so Linux 6.5 or later is required. The database UUID authenticates nothing.
+
 Only one live attachment may hold an instance ID. Every other operation needs the
-helper-issued epoch from that connection, and the same peer PID. An epoch dies with
-its connection or the helper; accepted work and its claims do not. A namespace whose
-stored database UUID differs gets `admission_open: false`, and can only read.
+helper-issued epoch from that connection, and the same peer PID, whose process must still
+be alive. An epoch dies with its connection or the helper; accepted work and its claims
+do not. An attested service whose stored database UUID differs gets
+`admission_open: false`, and can only read.
 
 Detach also revokes what is already in flight. Each attachment has a generation in a
 shared page mapped before any fork; H clears it with one atomic store, without waiting
@@ -147,16 +154,20 @@ on L. Create rechecks it after P answers, L reads it at its commit point, and H 
 it after L's reply and again before S's gate. A commit that just beat the revocation
 keeps its claim for an exact fence, and no effect starts.
 
-Create and FenceAbsent look the token up in the ledger before checking the epoch,
-the deadline or the catalog: an existing fence answers unchanged, even to a stale
-caller, and a conflicting record is never reported as absent. A read-only lookup may
-answer up to 250 ms after an expired wire deadline, and that authorizes nothing.
-The first rejection closes the token's in-memory gate, and only its durable fence
-ever answers for it again. A later cause clearing does not reopen it. Those two
+Create and FenceAbsent from any process but the instance's live holder are refused as
+`old_epoch` with no lookup and no state. From the holder, they look the token up in the
+ledger before checking the epoch, the deadline or the catalog: an existing fence answers
+unchanged, even under a stale epoch, and a conflicting record is never reported as absent.
+A read-only lookup may answer up to 250 ms after an expired wire deadline, and that
+authorizes nothing. After that lookup finds nothing, the first rejection closes the
+token's in-memory gate, and only its durable fence ever answers for it again. A later
+cause clearing does not reopen it. Gates are per instance, with a quota: a token whose plan
+was malformed may be evicted, and a full table refuses that instance's new tokens with
+`worker_exhausted`, while tokens the ledger owns and fences are unaffected. Those two
 operations run detached from their waiter, whose disconnect or timeout gets
 `ambiguous {pending}` while permits and ownership stay put. The last four of the 64
-operation slots serve only recovery, and a live attachment occupies none: attachments
-have their own bound of 16.
+operation slots serve only recovery, and a live attachment occupies none: each enrolled
+instance has its own one.
 
 A wire deadline bounds all of Create's forward setup, not just its first reply. C2's
 reply, M's watch acknowledgement, S's identity and PREPARING records, the gate, and each

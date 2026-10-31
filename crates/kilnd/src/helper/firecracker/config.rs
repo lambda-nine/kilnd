@@ -19,6 +19,10 @@ pub const PLAN_VERSION: u32 = 1;
 pub const DEFAULT_LEDGER_DIR: &str = "/var/lib/kilnd-helper/firecracker";
 pub const DEFAULT_EXEC_STORE: &str = "/opt/kilnd/exec/sha256";
 pub const MAX_PROFILES: usize = 8;
+/// Enrolled instances when a policy doesn't say otherwise.
+pub const DEFAULT_MAX_ENROLLED: u32 = 8;
+/// No policy may exceed this. H maps one fixed revocation slot per possible instance.
+pub const MAX_ENROLLED_HARD: u32 = 64;
 
 /// The root catalog's node ceilings. A daemon can narrow these, never expand them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +105,9 @@ pub struct NodePolicy {
     pub node_id: Id128,
     pub ledger_dir: PathBuf,
     pub ceilings: NodeCeilings,
+    /// Most instances root may enroll on this node. Every enrolled instance keeps its
+    /// own attachment slot and token quota, so this bounds both.
+    pub max_enrolled_instances: u32,
     pub identity_ranges: IdentityRanges,
     pub profiles: Vec<ProfileCatalog>,
 }
@@ -119,6 +126,8 @@ struct WirePolicy {
     node_id: Id128,
     ledger_dir: PathBuf,
     ceilings: NodeCeilings,
+    #[serde(default = "default_max_enrolled")]
+    max_enrolled_instances: u32,
     uid_range: WireRange,
     gid_range: WireRange,
     cid_range: WireRange,
@@ -136,6 +145,10 @@ pub fn valid_profile(profile: &str) -> bool {
 
 /// Parses the root-owned policy with strict JSON and exact fields. It does not read
 /// the paths it names; those are verified by protected traversal in the workers.
+fn default_max_enrolled() -> u32 {
+    DEFAULT_MAX_ENROLLED
+}
+
 pub fn parse_policy(raw: &[u8], service_uid: u32) -> Result<NodePolicy, String> {
     let wire: WirePolicy =
         serde_json::from_value(strict_json(raw)?).map_err(|e| format!("node policy: {e}"))?;
@@ -164,10 +177,16 @@ pub fn parse_policy(raw: &[u8], service_uid: u32) -> Result<NodePolicy, String> 
         return Err("ledger directory must be absolute".into());
     }
     validate_ceilings(&wire.ceilings, &SharedReserve::default())?;
+    if wire.max_enrolled_instances == 0 || wire.max_enrolled_instances > MAX_ENROLLED_HARD {
+        return Err(format!(
+            "max_enrolled_instances must be between 1 and {MAX_ENROLLED_HARD}"
+        ));
+    }
     Ok(NodePolicy {
         node_id: wire.node_id,
         ledger_dir: wire.ledger_dir,
         ceilings: wire.ceilings,
+        max_enrolled_instances: wire.max_enrolled_instances,
         identity_ranges: ranges,
         profiles: wire.profiles,
     })

@@ -43,7 +43,8 @@ fn group_failure(error: GroupError) -> RuntimeError {
     match error.kind {
         GroupErrorKind::Incompatible
         | GroupErrorKind::Disabled
-        | GroupErrorKind::OwnershipConflict => RuntimeError::Incompatible(text),
+        | GroupErrorKind::OwnershipConflict
+        | GroupErrorKind::Unauthorized => RuntimeError::Incompatible(text),
         _ => RuntimeError::Backend(text),
     }
 }

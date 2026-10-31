@@ -9,16 +9,18 @@ pub mod identity;
 pub mod inventory;
 pub mod journal;
 pub mod manifest;
+pub mod peer;
 pub mod workers;
 
-use self::config::{NodePolicy, ProfileCatalog};
+use self::config::{MAX_ENROLLED_HARD, NodePolicy, ProfileCatalog};
 use self::executable::{ExecutableIdentity, ExecutableTable, Role, WalkPolicy};
 use self::inventory::{NamespaceObservation, NodeObservation, ObservationBackend, WorkerFreshness};
 use self::journal::{
-    AdmitOutcome, AdmitRequest, AttachOutcome, FenceOutcome, FenceRequest, LedgerConfig,
-    StopAuthority, TokenLookup, WorkerIntentSpec,
+    AdmitOutcome, AdmitRequest, AttachOutcome, EnrollOutcome, FenceOutcome, FenceRequest,
+    LedgerConfig, StopAuthority, TokenLookup, WorkerIntentSpec,
 };
 use self::manifest::ManifestGate;
+use self::peer::{Enrollment, PeerAttestor, PeerPin};
 use self::workers::{
     AdmissionAuthority, CallError, Channel, Endpoint, Heartbeat, Lane, LedgerReply, LedgerRequest,
     MonitorCommand, MonitorEvent, MonitorReply, MonitorSockets, NodeConfig, PrepReply, PrepRequest,
@@ -45,13 +47,15 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-/// The most live instance attachments on one node.
-const MAX_ATTACHMENTS: usize = 16;
-/// Bounded in-memory token state. Closed gates survive until their fence is durable.
+/// Attach attempts that may wait for one instance's turn with L. A hostile process
+/// cannot use these to hold anything: a refused proof gives the turn straight back.
+const MAX_ATTACH_WAITERS: usize = 8;
+/// Rejected-token memory for the node, divided equally among possible instances. The
+/// ledger stays authoritative for every token it owns, so this bounds memory, not answers.
 const MAX_TOKEN_GATES: usize = 4096;
 /// Queued requests for one token, beyond which a duplicate is refused immediately.
 const MAX_TOKEN_WAITERS: usize = 16;
-/// Accepted work that may outlive its waiter.
+/// Accepted work that may outlive its waiter, divided the same way.
 const MAX_DETACHED: usize = 128;
 /// Creates waiting for a preparation slot. Preflight never waits: it refuses at once.
 const MAX_PREP_WAITERS: usize = 16;
@@ -64,6 +68,10 @@ const CONTROL_QUEUE: usize = 8;
 /// How long startup waits for a previous helper's ledger process to leave.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 const SUPERVISOR_CGROUP_LEAF: &str = "control";
+/// A private replacement L gets this long for each exact reply before it is discarded.
+const REPLACEMENT_LEDGER_REPLY: Duration = Duration::from_secs(5);
+/// Failed replacements fork no faster than this.
+const REPLACEMENT_LEDGER_RETRY: Duration = Duration::from_millis(250);
 
 /// The resource names a supervisor may touch. Journaled before its gate opens.
 const ALLOWED_RESOURCES: [&str; 5] = ["work.xfs", "identity.bin", "jail-root", "cgroup", "vm"];
@@ -103,11 +111,16 @@ pub enum NodeError {
     Config(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct Attachment {
     epoch: Id128,
     peer_pid: i32,
-    peer_start: Option<u64>,
+    /// L's reading, kept for diagnosis. The pin below is what authorizes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    peer_start: u64,
+    /// The attested process itself. Once it is gone this attachment authorizes nothing,
+    /// whoever later gets its number or inherited its socket.
+    pin: PeerPin,
     /// False when another database already owns this namespace.
     admission_open: bool,
     /// Its slot and generation in the table L reads at C2. A namespace with closed
@@ -115,26 +128,199 @@ struct Attachment {
     authority: AdmissionAuthority,
 }
 
+/// Why a gate closed and how replaceable that memory is.
+#[derive(Clone, Copy)]
+struct ClosedGate {
+    class: AmbiguousClass,
+    /// Rejected on the plan's own bytes or token binding: a daemon verifies both before
+    /// C1, so no charge can depend on this. Any other rejection might be post-C1.
+    evictable: bool,
+    order: u64,
+}
+
+static GATE_ORDER: AtomicU64 = AtomicU64::new(0);
+
 /// Per-token serialization and the in-memory dispatch gate. The first rejection after
-/// C1 closes the gate at once; nothing reopens it, even when the cause later clears.
+/// the durable lookup closes the gate at once; nothing reopens it, even when the cause
+/// later clears. Requests in flight use an open gate; only a closed one is retained.
 #[derive(Default)]
 struct TokenGate {
     serial: Arc<tokio::sync::Mutex<()>>,
-    closed: Mutex<Option<AmbiguousClass>>,
+    closed: Mutex<Option<ClosedGate>>,
     waiters: AtomicUsize,
+    /// In-flight flows using this entry, counted under the table's lock.
+    users: AtomicUsize,
+    /// The ledger owns this token and answers for it from now on: no need to retain it.
+    durable: std::sync::atomic::AtomicBool,
 }
 
 impl TokenGate {
+    /// A possibly post-C1 rejection or a fence. Also protects an earlier evictable close.
     fn close(&self, class: AmbiguousClass) {
-        self.closed.lock().unwrap().get_or_insert(class);
+        let mut closed = self.closed.lock().unwrap();
+        match closed.as_mut() {
+            Some(existing) => existing.evictable = false,
+            None => {
+                *closed = Some(ClosedGate {
+                    class,
+                    evictable: false,
+                    order: GATE_ORDER.fetch_add(1, Ordering::Relaxed),
+                });
+            }
+        }
+    }
+
+    fn close_evictable(&self, class: AmbiguousClass) {
+        self.closed.lock().unwrap().get_or_insert(ClosedGate {
+            class,
+            evictable: true,
+            order: GATE_ORDER.fetch_add(1, Ordering::Relaxed),
+        });
     }
 
     fn closed(&self) -> Option<AmbiguousClass> {
-        *self.closed.lock().unwrap()
+        self.closed.lock().unwrap().map(|closed| closed.class)
+    }
+
+    fn mark_durable(&self) {
+        self.durable.store(true, Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> bool {
+        self.users.load(Ordering::Relaxed) == 0
+    }
+}
+
+/// One instance's non-durable token memory. Its size is `quota` retained gates plus
+/// that instance's in-flight flows, and no other instance can add to it or evict from it.
+struct GateTable {
+    quota: usize,
+    gates: HashMap<Id128, Arc<TokenGate>>,
+}
+
+impl GateTable {
+    fn new(quota: usize) -> Self {
+        Self {
+            quota,
+            gates: HashMap::new(),
+        }
+    }
+
+    fn enter(&mut self, allocation: Id128) -> Arc<TokenGate> {
+        let gate = self.gates.entry(allocation).or_default().clone();
+        gate.users.fetch_add(1, Ordering::Relaxed);
+        gate
+    }
+
+    fn leave(&mut self, allocation: Id128, gate: &TokenGate) {
+        gate.users.fetch_sub(1, Ordering::Relaxed);
+        if gate.idle() && (gate.closed().is_none() || gate.durable.load(Ordering::Relaxed)) {
+            self.gates.remove(&allocation);
+        }
+        self.enforce_quota();
+    }
+
+    fn retained(&self) -> usize {
+        self.gates
+            .values()
+            .filter(|gate| gate.idle() && gate.closed().is_some())
+            .count()
+    }
+
+    /// The oldest idle closed gate that matches `evictable_only`.
+    fn oldest(&self, evictable_only: bool) -> Option<Id128> {
+        self.gates
+            .iter()
+            .filter(|(_, gate)| gate.idle())
+            .filter_map(|(id, gate)| {
+                let closed = (*gate.closed.lock().unwrap())?;
+                (closed.evictable || !evictable_only).then_some((closed.order, *id))
+            })
+            .min()
+            .map(|(_, id)| id)
+    }
+
+    /// Room for one more rejection, making it from a malformed token if needed. No room
+    /// means every retained gate may guard a charged token, so a new one gets no work.
+    fn make_room(&mut self) -> bool {
+        if self.retained() < self.quota {
+            return true;
+        }
+        match self.oldest(true) {
+            Some(id) => {
+                self.gates.remove(&id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Fence attempts on unknown tokens can close gates past `make_room`, and memory
+    /// stays bounded regardless. The cost of dropping one lands on this instance alone,
+    /// and is safe: a later request still starts from the durable lookup, and only a
+    /// matching ABSENT ever releases anything.
+    fn enforce_quota(&mut self) {
+        while self.retained() > self.quota {
+            let Some(id) = self.oldest(true).or_else(|| self.oldest(false)) else {
+                return;
+            };
+            self.gates.remove(&id);
+        }
+    }
+}
+
+/// One enrolled instance's fixed share of the node. These exist only for instances root
+/// enrolled, so no request can create one, and none of them is drawn from a common pool.
+struct InstanceShare {
+    /// FIFO: one proof at a time for this instance, and its one attachment slot.
+    attach_turn: Arc<Semaphore>,
+    attach_waiters: AtomicUsize,
+    detached: Arc<Semaphore>,
+    gates: Mutex<GateTable>,
+}
+
+impl InstanceShare {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            attach_turn: Arc::new(Semaphore::new(1)),
+            attach_waiters: AtomicUsize::new(0),
+            detached: Arc::new(Semaphore::new((MAX_DETACHED / capacity).max(2))),
+            gates: Mutex::new(GateTable::new(MAX_TOKEN_GATES / capacity)),
+        }
+    }
+}
+
+/// A flow's use of its token's gate, released however the flow ends.
+struct GateUse {
+    share: Arc<InstanceShare>,
+    allocation: Id128,
+    gate: Arc<TokenGate>,
+}
+
+impl GateUse {
+    fn enter(share: Arc<InstanceShare>, allocation: Id128) -> Self {
+        let gate = share.gates.lock().unwrap().enter(allocation);
+        Self {
+            share,
+            allocation,
+            gate,
+        }
+    }
+}
+
+impl Drop for GateUse {
+    fn drop(&mut self) {
+        self.share
+            .gates
+            .lock()
+            .unwrap()
+            .leave(self.allocation, &self.gate);
     }
 }
 
 struct SupervisorEntry {
+    instance: Id128,
     pid: i32,
     channel: Arc<Channel>,
     worker_id: i64,
@@ -265,14 +451,17 @@ pub struct Node {
     monitor: Mutex<MonitorSlot>,
     recovery: [Mutex<WorkerSlot>; workers::RECOVERY_SLOTS],
     attachments: Mutex<HashMap<Id128, Attachment>>,
-    attaching: Mutex<std::collections::HashSet<Id128>>,
-    gates: Mutex<HashMap<Id128, Arc<TokenGate>>>,
+    /// Filled from the ledger before serving. Enrollment needs the node lock, which this
+    /// helper holds, so the set cannot change while it runs.
+    shares: Mutex<Option<HashMap<Id128, Arc<InstanceShare>>>>,
     supervisors: Mutex<HashMap<Id128, SupervisorEntry>>,
     pending: Mutex<VecDeque<LedgerRequest>>,
     flushing: tokio::sync::Mutex<()>,
-    detached: Arc<Semaphore>,
     prep_waiters: AtomicUsize,
     ledger_fault: Mutex<Option<String>>,
+    /// The last replacement L that had to be discarded, until one succeeds.
+    ledger_replacement_fault: Mutex<Option<String>>,
+    ledger_retry_at: Mutex<Option<std::time::Instant>>,
     lease_fault: Mutex<Option<String>>,
     stale_workers: Mutex<Vec<String>>,
     monitor_lost: Mutex<bool>,
@@ -323,19 +512,25 @@ fn spawn_ledger_slot(
     let mut keep = vec![child.as_raw_fd(), heartbeat.as_raw_fd()];
     keep.extend(lock_fd);
     let inherited = revocations.clone();
+    #[cfg(not(test))]
+    let attestor = PeerAttestor::new(config.service_uid);
+    #[cfg(test)]
+    let attestor = PeerAttestor::with_test_peers(config.service_uid, config.test.peers.clone());
     let pid = workers::spawn_process(&keep, move || {
         workers::ledger_main(
             Endpoint::new(child),
             ledger,
+            attestor,
             Heartbeat::new(heartbeat, every),
             inherited,
             workers::ledger_request_expires,
         );
     })?;
-    let (channel, _events) = Channel::spawn(
+    let (channel, _events) = Channel::spawn_with_attach(
         host,
         workers::LEDGER_QUEUE_NORMAL,
         workers::LEDGER_QUEUE_RESERVED,
+        workers::LEDGER_QUEUE_ATTACH,
     )?;
     Ok(WorkerSlot::new(pid, channel))
 }
@@ -482,7 +677,7 @@ impl Node {
             recovery,
         };
         // Mapped before any fork, so every L, including a replacement, shares it.
-        let revocations = Arc::new(RevocationTable::new(MAX_ATTACHMENTS)?);
+        let revocations = Arc::new(RevocationTable::new(MAX_ENROLLED_HARD as usize)?);
         let ledger = spawn_ledger_slot(&config, &sockets, &revocations, Some(lock_fd))?;
         let prep = [
             spawn_prep_slot(&config, &sockets, 0)?,
@@ -504,14 +699,14 @@ impl Node {
             monitor: Mutex::new(monitor),
             recovery: [Mutex::new(kill0), Mutex::new(kill1)],
             attachments: Mutex::default(),
-            attaching: Mutex::default(),
-            gates: Mutex::default(),
+            shares: Mutex::new(None),
             supervisors: Mutex::default(),
             pending: Mutex::default(),
             flushing: tokio::sync::Mutex::new(()),
-            detached: Arc::new(Semaphore::new(MAX_DETACHED)),
             prep_waiters: AtomicUsize::new(0),
             ledger_fault: Mutex::new(None),
+            ledger_replacement_fault: Mutex::new(None),
+            ledger_retry_at: Mutex::new(None),
             lease_fault: Mutex::new(None),
             stale_workers: Mutex::default(),
             monitor_lost: Mutex::new(false),
@@ -525,13 +720,46 @@ impl Node {
         tokio::spawn(Self::monitor_events(Arc::downgrade(&node), monitor_events));
         tokio::spawn(Self::supervise(Arc::downgrade(&node)));
         drop(directory);
-        node.replay_at_startup().await;
+        if let Err(reason) = node.replay_at_startup().await {
+            node.abandon_startup().await;
+            return Err(NodeError::Config(reason));
+        }
         Ok(node)
     }
 
+    /// A node that can't journal its own workers serves nothing. Its sockets close, its
+    /// workers leave on that EOF, and this helper reaps them and goes on serving kiln.
+    async fn abandon_startup(&self) {
+        self.stop.cancel();
+        for kind in SLOTS {
+            self.with_slot(kind, |slot| slot.channel.close());
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut waiting = 0;
+            for kind in SLOTS {
+                self.with_slot(kind, |slot| {
+                    if !slot.reaped {
+                        if let Some(evidence) = try_reap(slot.pid) {
+                            slot.reaped = true;
+                            slot.exit = Some(evidence);
+                        } else {
+                            waiting += 1;
+                        }
+                    }
+                });
+            }
+            if waiting == 0 || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Replays claims before serving. A ledger that cannot answer leaves the node
-    /// degraded: read paths say Unavailable, and capacity is never presumed free.
-    async fn replay_at_startup(self: &Arc<Self>) {
+    /// degraded: read paths say Unavailable, and capacity is never presumed free. A
+    /// ledger that answers but cannot journal the workers about to serve is an error.
+    async fn replay_at_startup(self: &Arc<Self>) -> Result<(), String> {
         let deadline = workers::monotonic_ns().saturating_add(30_000_000_000);
         let channel = self.ledger_channel();
         match channel
@@ -541,7 +769,8 @@ impl Node {
             Ok(LedgerReply::Replay(snapshot)) => {
                 self.generation_hint
                     .store(snapshot.generation, Ordering::Relaxed);
-                self.register_infrastructure().await;
+                self.load_shares(&snapshot.enrolled);
+                self.register_infrastructure().await?;
                 if !snapshot.executable_leases.is_empty()
                     && let Some(slot) = self.try_prep_slot()
                 {
@@ -576,31 +805,67 @@ impl Node {
                     Some("the ledger did not answer its replay".into());
             }
         }
+        Ok(())
+    }
+
+    /// One fixed share per enrolled instance, sized for the most this policy allows, so
+    /// an instance's share doesn't depend on how many others are enrolled today.
+    fn load_shares(&self, enrolled: &[Id128]) {
+        let capacity = (self.config.max_enrolled as usize).max(enrolled.len());
+        let shares = enrolled
+            .iter()
+            .map(|instance| (*instance, Arc::new(InstanceShare::new(capacity))))
+            .collect();
+        *self.shares.lock().unwrap() = Some(shares);
+    }
+
+    fn share(&self, instance: Id128) -> Option<Arc<InstanceShare>> {
+        let shares = self.shares.lock().unwrap();
+        shares.as_ref()?.get(&instance).cloned()
     }
 
     /// Journals each startup worker's inherited image identity, when a profile pins it.
-    async fn register_infrastructure(self: &Arc<Self>) {
+    /// Only an exact reply counts. A slot without its row keeps being retried within the
+    /// budget, and past that startup fails: the caller's listener never serves.
+    async fn register_infrastructure(self: &Arc<Self>) -> Result<(), String> {
         let Some(image) = self.config.helper_image else {
-            return;
+            return Ok(());
         };
-        let deadline = workers::monotonic_ns().saturating_add(5_000_000_000);
-        let channel = self.ledger_channel();
+        let give_up = Instant::now() + self.config.timings.startup_journal;
         for kind in SLOTS {
-            let pid = self.with_slot(kind, |slot| slot.pid);
-            let reply = channel
-                .call::<LedgerReply>(
-                    Lane::Reserved,
-                    &LedgerRequest::RecordInfrastructure {
-                        spec: Box::new(infrastructure_spec(kind, image)),
-                        pid,
-                    },
-                    deadline,
-                )
-                .await;
-            if let Ok(LedgerReply::Worker { worker_id }) = reply {
-                self.with_slot(kind, |slot| slot.worker_id = Some(worker_id));
+            loop {
+                // A replaced L records itself, so this also ends when that happened.
+                let (pid, recorded) = self.with_slot(kind, |slot| (slot.pid, slot.worker_id));
+                if recorded.is_some() {
+                    break;
+                }
+                let remaining = give_up.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!(
+                        "the {} worker has no journal row, so nothing can be served",
+                        kind.mode()
+                    ));
+                }
+                let channel = self.ledger_channel();
+                let request = LedgerRequest::RecordInfrastructure {
+                    spec: Box::new(infrastructure_spec(kind, image)),
+                    pid,
+                };
+                let call = channel.call::<LedgerReply>(Lane::Reserved, &request, u64::MAX);
+                if let Ok(Ok(LedgerReply::Worker { worker_id })) =
+                    tokio::time::timeout(remaining, call).await
+                {
+                    self.with_slot(kind, |slot| {
+                        if slot.pid == pid {
+                            slot.worker_id = Some(worker_id);
+                        }
+                    });
+                } else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
             }
         }
+        Ok(())
     }
 
     fn with_slot<T>(&self, kind: SlotKind, use_slot: impl FnOnce(&mut WorkerSlot) -> T) -> T {
@@ -857,8 +1122,9 @@ impl Node {
         entry.stop_fenced = true;
         entry.revoked = true;
         entry.revoke_sent = entry.channel.notify(&SupervisorCommand::Revoke);
+        let instance = entry.instance;
         drop(supervisors);
-        if let Some(gate) = self.gate(allocation) {
+        if let Some(gate) = self.gate(instance, allocation) {
             gate.close(AmbiguousClass::GateClosed);
         }
         self.queue_record(LedgerRequest::RecordStop {
@@ -1195,38 +1461,7 @@ impl Node {
         };
         let spec = Box::new(infrastructure_spec(kind, image));
         if kind == SlotKind::Ledger {
-            let mut spawned = self.spawn_slot(kind).map_err(|_| ())?;
-            let channel = spawned.worker().channel.clone();
-            let pid = spawned.worker().pid;
-            // A row still unsettled travels with the slot, for the next attempt.
-            spawned.worker_mut().worker_id = prior;
-            if let Some(worker_id) = prior {
-                let settled = channel
-                    .call::<LedgerReply>(
-                        Lane::Reserved,
-                        &LedgerRequest::Settle {
-                            worker_id,
-                            settlement: evidence,
-                        },
-                        u64::MAX,
-                    )
-                    .await;
-                if matches!(settled, Ok(LedgerReply::Done)) {
-                    spawned.worker_mut().worker_id = None;
-                }
-            }
-            let recorded = channel
-                .call::<LedgerReply>(
-                    Lane::Reserved,
-                    &LedgerRequest::RecordInfrastructure { spec, pid },
-                    u64::MAX,
-                )
-                .await;
-            if let Ok(LedgerReply::Worker { worker_id }) = recorded {
-                spawned.worker_mut().worker_id = Some(worker_id);
-            }
-            self.publish_slot(kind, spawned);
-            return Ok(());
+            return self.replace_ledger(prior, evidence, spec).await;
         }
         if let Some(worker_id) = prior {
             let settled = self
@@ -1278,33 +1513,114 @@ impl Node {
         Ok(())
     }
 
-    fn gate(&self, allocation: Id128) -> Option<Arc<TokenGate>> {
-        self.gates.lock().unwrap().get(&allocation).cloned()
+    /// L alone is forked before its own row can exist. It stays private until it has
+    /// settled its predecessor and journaled itself, each with the exact reply: anything
+    /// else closes its socket, so it exits having served nothing, and it gets reaped.
+    /// The dead slot keeps refusing ledger traffic and the fault is visible in Capabilities.
+    async fn replace_ledger(
+        self: &Arc<Self>,
+        prior: Option<i64>,
+        evidence: String,
+        spec: Box<WorkerIntentSpec>,
+    ) -> Result<(), ()> {
+        {
+            let mut retry_at = self.ledger_retry_at.lock().unwrap();
+            if retry_at.is_some_and(|at| std::time::Instant::now() < at) {
+                return Err(());
+            }
+            *retry_at = Some(std::time::Instant::now() + REPLACEMENT_LEDGER_RETRY);
+        }
+        let mut spawned = self.spawn_slot(SlotKind::Ledger).map_err(|error| {
+            *self.ledger_replacement_fault.lock().unwrap() =
+                Some(format!("no replacement ledger process: {error}"));
+        })?;
+        let channel = spawned.worker().channel.clone();
+        let pid = spawned.worker().pid;
+        match self
+            .journal_replacement_ledger(&channel, pid, prior, evidence, spec)
+            .await
+        {
+            Ok(worker_id) => {
+                spawned.worker_mut().worker_id = Some(worker_id);
+                self.publish_slot(SlotKind::Ledger, spawned);
+                *self.ledger_replacement_fault.lock().unwrap() = None;
+                *self.ledger_retry_at.lock().unwrap() = None;
+                Ok(())
+            }
+            Err(reason) => {
+                channel.close();
+                self.discarded.lock().unwrap().push(pid);
+                *self.ledger_replacement_fault.lock().unwrap() =
+                    Some(format!("the ledger was not replaced: {reason}"));
+                Err(())
+            }
+        }
     }
 
-    /// Finds or creates a token's gate. When the map is full, only idle open gates
-    /// are evicted: a closed gate stays until its durable fence replaces it.
-    fn gate_for(&self, allocation: Id128) -> Option<Arc<TokenGate>> {
-        let mut gates = self.gates.lock().unwrap();
-        if let Some(gate) = gates.get(&allocation) {
-            return Some(gate.clone());
+    async fn journal_replacement_ledger(
+        &self,
+        channel: &Channel,
+        pid: i32,
+        prior: Option<i64>,
+        evidence: String,
+        spec: Box<WorkerIntentSpec>,
+    ) -> Result<i64, String> {
+        if let Some(worker_id) = prior {
+            let settled = tokio::time::timeout(
+                REPLACEMENT_LEDGER_REPLY,
+                channel.call::<LedgerReply>(
+                    Lane::Reserved,
+                    &LedgerRequest::Settle {
+                        worker_id,
+                        settlement: evidence,
+                    },
+                    u64::MAX,
+                ),
+            )
+            .await;
+            if !matches!(settled, Ok(Ok(LedgerReply::Done))) {
+                return Err("its predecessor did not settle".into());
+            }
+            // Durable now, so a later attempt must not settle it again.
+            self.with_slot(SlotKind::Ledger, |slot| slot.worker_id = None);
         }
-        if gates.len() >= MAX_TOKEN_GATES {
-            let idle = gates
-                .iter()
-                .find(|(_, gate)| Arc::strong_count(gate) == 1 && gate.closed().is_none())
-                .map(|(id, _)| *id);
-            gates.remove(&idle?);
+        let recorded = tokio::time::timeout(
+            REPLACEMENT_LEDGER_REPLY,
+            channel.call::<LedgerReply>(
+                Lane::Reserved,
+                &LedgerRequest::RecordInfrastructure { spec, pid },
+                u64::MAX,
+            ),
+        )
+        .await;
+        match recorded {
+            Ok(Ok(LedgerReply::Worker { worker_id })) => Ok(worker_id),
+            _ => Err("it could not journal its own identity".into()),
         }
-        let gate = Arc::new(TokenGate::default());
-        gates.insert(allocation, gate.clone());
-        Some(gate)
+    }
+
+    fn gate(&self, instance: Id128, allocation: Id128) -> Option<Arc<TokenGate>> {
+        let share = self.share(instance)?;
+        let gates = share.gates.lock().unwrap();
+        gates.gates.get(&allocation).cloned()
+    }
+
+    /// The live holder of this instance is the process making this request. It is the
+    /// only one any instance-scoped request can speak for: a request from anyone else
+    /// gets no lookup, no answer about a token, and no in-memory state of any kind.
+    fn is_holder(&self, instance: Id128, peer_pid: Option<i32>) -> bool {
+        let attachments = self.attachments.lock().unwrap();
+        attachments.get(&instance).is_some_and(|attachment| {
+            peer_pid == Some(attachment.peer_pid) && attachment.pin.alive()
+        })
     }
 
     fn epoch_valid(&self, instance: Id128, epoch: Option<Id128>, peer_pid: Option<i32>) -> bool {
         let attachments = self.attachments.lock().unwrap();
         attachments.get(&instance).is_some_and(|attachment| {
-            Some(attachment.epoch) == epoch && peer_pid == Some(attachment.peer_pid)
+            Some(attachment.epoch) == epoch
+                && peer_pid == Some(attachment.peer_pid)
+                && attachment.pin.alive()
         })
     }
 
@@ -1343,6 +1659,7 @@ impl Node {
         self: &Arc<Self>,
         request: FirecrackerRequest,
         peer_pid: Option<i32>,
+        pin: Option<PeerPin>,
         deadline: WireDeadline,
         cancel: &CancellationToken,
     ) -> FirecrackerResponse {
@@ -1350,7 +1667,7 @@ impl Node {
         let epoch = request.connection_epoch;
         match request.operation {
             FirecrackerOperation::AttachInstance { database_uuid } => {
-                self.attach(instance, database_uuid, peer_pid, deadline)
+                self.attach(instance, database_uuid, peer_pid, pin, deadline)
                     .await
             }
             FirecrackerOperation::Create {
@@ -1359,6 +1676,14 @@ impl Node {
                 plan,
                 plan_digest,
             } => {
+                let (Some(share), true) =
+                    (self.share(instance), self.is_holder(instance, peer_pid))
+                else {
+                    return FirecrackerResponse::Create(ambiguous_create(
+                        AmbiguousClass::OldEpoch,
+                        "this process does not hold the instance",
+                    ));
+                };
                 let node = self.clone();
                 let token = CreateToken {
                     instance,
@@ -1372,6 +1697,7 @@ impl Node {
                 };
                 let reply = self
                     .run_detached(
+                        &share,
                         deadline,
                         cancel,
                         allocation_id,
@@ -1386,6 +1712,14 @@ impl Node {
                 sandbox_id,
                 plan_digest,
             } => {
+                let (Some(share), true) =
+                    (self.share(instance), self.is_holder(instance, peer_pid))
+                else {
+                    return FirecrackerResponse::Fence(ambiguous_fence(
+                        AmbiguousClass::OldEpoch,
+                        "this process does not hold the instance",
+                    ));
+                };
                 let node = self.clone();
                 let token = FenceToken {
                     instance,
@@ -1398,6 +1732,7 @@ impl Node {
                 };
                 let reply = self
                     .run_detached(
+                        &share,
                         deadline,
                         cancel,
                         allocation_id,
@@ -1460,8 +1795,11 @@ impl Node {
 
     /// Accepted work runs on its own task. A waiter that times out or disconnects gets
     /// an honest "not yet known", and permits and ownership stay exactly where they are.
+    /// No free slot in this instance's share leaves no new state either: the lookup has
+    /// not run yet, and only an existing gate can close on this.
     async fn run_detached<T, F, Fut>(
         self: &Arc<Self>,
+        share: &InstanceShare,
         deadline: WireDeadline,
         cancel: &CancellationToken,
         allocation: Id128,
@@ -1473,8 +1811,8 @@ impl Node {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T> + Send + 'static,
     {
-        let Ok(permit) = self.detached.clone().try_acquire_owned() else {
-            if let Some(gate) = self.gate_for(allocation) {
+        let Ok(permit) = share.detached.clone().try_acquire_owned() else {
+            if let Some(gate) = share.gates.lock().unwrap().gates.get(&allocation) {
                 gate.close(AmbiguousClass::WorkerExhausted);
             }
             return unknown;
@@ -1494,34 +1832,71 @@ impl Node {
         }
     }
 
+    /// Root's enrollment is the only authority here. An unenrolled instance is refused
+    /// with no L call and no state. For an enrolled one, L proves the connecting process
+    /// is the enrolled service, and the database UUID only names reconciliation state.
     async fn attach(
         self: &Arc<Self>,
         instance: Id128,
         database_uuid: Id128,
         peer_pid: Option<i32>,
+        pin: Option<PeerPin>,
         deadline: WireDeadline,
     ) -> FirecrackerResponse {
-        let Some(peer_pid) = peer_pid else {
-            return group_error(GroupErrorKind::Invalid, "peer PID is unavailable");
+        let (Some(peer_pid), Some(pin)) = (peer_pid, pin) else {
+            return group_error(
+                GroupErrorKind::Unauthorized,
+                "the connecting process cannot be identified",
+            );
         };
-        {
-            let attachments = self.attachments.lock().unwrap();
-            let mut attaching = self.attaching.lock().unwrap();
-            if attachments.contains_key(&instance) || attaching.contains(&instance) {
-                return group_error(
-                    GroupErrorKind::AlreadyAttached,
-                    "another live holder has this instance",
-                );
-            }
-            if attachments.len() + attaching.len() >= MAX_ATTACHMENTS {
-                return group_error(GroupErrorKind::ResourceExhausted, "too many attachments");
-            }
-            attaching.insert(instance);
+        if self.shares.lock().unwrap().is_none() {
+            let reason = self.ledger_fault.lock().unwrap().clone();
+            return group_error(
+                GroupErrorKind::Unavailable,
+                reason.unwrap_or_else(|| "the node ledger has not been read".into()),
+            );
+        }
+        #[cfg(test)]
+        if self.config.test.auto_enroll && self.share(instance).is_none() {
+            self.test_enroll(instance, peer_pid).await;
+        }
+        let Some(share) = self.share(instance) else {
+            return group_error(
+                GroupErrorKind::Unauthorized,
+                "this instance is not enrolled",
+            );
+        };
+        if self.holder_alive(instance) {
+            return group_error(
+                GroupErrorKind::AlreadyAttached,
+                "another live holder has this instance",
+            );
+        }
+        // This instance's own queue, so nothing another instance does can fill it.
+        if share.attach_waiters.fetch_add(1, Ordering::AcqRel) >= MAX_ATTACH_WAITERS {
+            share.attach_waiters.fetch_sub(1, Ordering::AcqRel);
+            return group_error(
+                GroupErrorKind::ResourceExhausted,
+                "too many attach attempts for this instance",
+            );
+        }
+        let turn =
+            tokio::time::timeout_at(deadline.instant, share.attach_turn.clone().acquire_owned())
+                .await;
+        share.attach_waiters.fetch_sub(1, Ordering::AcqRel);
+        let Ok(Ok(_turn)) = turn else {
+            return group_error(GroupErrorKind::Unavailable, "attach deadline expired");
+        };
+        if self.holder_alive(instance) {
+            return group_error(
+                GroupErrorKind::AlreadyAttached,
+                "another live holder has this instance",
+            );
         }
         let reply = tokio::time::timeout_at(
             deadline.instant,
             self.ledger_call(
-                Lane::Normal,
+                Lane::Attach,
                 &LedgerRequest::Attach {
                     instance,
                     database_uuid,
@@ -1531,27 +1906,58 @@ impl Node {
             ),
         )
         .await;
-        self.attaching.lock().unwrap().remove(&instance);
         let (outcome, peer_start) = match reply {
             Ok(Ok(LedgerReply::Attached {
                 outcome,
                 peer_start,
             })) => (outcome, peer_start),
+            Ok(Ok(LedgerReply::AttachRefused { reason })) => {
+                tracing::warn!(%instance, peer_pid, %reason, "attachment refused");
+                return group_error(
+                    GroupErrorKind::Unauthorized,
+                    "this process is not the enrolled service for that instance",
+                );
+            }
             Ok(Ok(LedgerReply::Unavailable { reason } | LedgerReply::Failed { reason })) => {
                 return group_error(GroupErrorKind::Unavailable, reason);
             }
             _ => return group_error(GroupErrorKind::Unavailable, "ledger did not answer attach"),
         };
+        // Still alive means the connector kept this number through L's reads, so the
+        // process L proved is the one on this connection, not a later user of its PID.
+        if !pin.alive() {
+            return group_error(
+                GroupErrorKind::Unauthorized,
+                "the connecting process is gone",
+            );
+        }
         let Ok(epoch) = fresh_id() else {
             return group_error(GroupErrorKind::Unavailable, "no entropy for an epoch");
         };
         let (node_id, admission_open) = match outcome {
             AttachOutcome::Bound { node_id, .. } => (node_id, true),
             AttachOutcome::DatabaseMismatch { node_id, .. } => (node_id, false),
+            AttachOutcome::NotEnrolled => {
+                return group_error(
+                    GroupErrorKind::Unauthorized,
+                    "this instance is not enrolled",
+                );
+            }
+            AttachOutcome::NoSpace => {
+                return group_error(
+                    GroupErrorKind::ResourceExhausted,
+                    "the ledger has no room for a first attachment",
+                );
+            }
         };
         {
             let mut attachments = self.attachments.lock().unwrap();
-            let Some(slot) = (0..MAX_ATTACHMENTS as u32)
+            // A holder whose process died but whose socket lingers in another process
+            // holds nothing. Its epoch ends here, and its own EOF later finds a new one.
+            if let Some(stale) = attachments.remove(&instance) {
+                self.revocations.revoke(stale.authority.slot);
+            }
+            let Some(slot) = (0..MAX_ENROLLED_HARD)
                 .find(|slot| !attachments.values().any(|a| a.authority.slot == *slot))
             else {
                 return group_error(GroupErrorKind::ResourceExhausted, "too many attachments");
@@ -1571,6 +1977,7 @@ impl Node {
                     epoch,
                     peer_pid,
                     peer_start,
+                    pin,
                     admission_open,
                     authority,
                 },
@@ -1580,6 +1987,34 @@ impl Node {
             node_id,
             connection_epoch: epoch,
             admission_open,
+        }
+    }
+
+    fn holder_alive(&self, instance: Id128) -> bool {
+        self.attachments
+            .lock()
+            .unwrap()
+            .get(&instance)
+            .is_some_and(|attachment| attachment.pin.alive())
+    }
+
+    /// The fixture's stand-in for root's enrollment command, for tests of other things.
+    #[cfg(test)]
+    async fn test_enroll(&self, instance: Id128, peer_pid: i32) {
+        let enrolled = self
+            .ledger_call(
+                Lane::Reserved,
+                &LedgerRequest::TestEnroll { instance, peer_pid },
+                u64::MAX,
+            )
+            .await;
+        if matches!(enrolled, Ok(LedgerReply::Done)) {
+            let capacity = self.config.max_enrolled as usize;
+            if let Some(shares) = self.shares.lock().unwrap().as_mut() {
+                shares
+                    .entry(instance)
+                    .or_insert_with(|| Arc::new(InstanceShare::new(capacity)));
+            }
         }
     }
 
@@ -1604,6 +2039,9 @@ impl Node {
             WorkerHealth::Stalled
         };
         let mut ledger_fault = self.ledger_fault.lock().unwrap().clone();
+        if ledger_fault.is_none() {
+            ledger_fault = self.ledger_replacement_fault.lock().unwrap().clone();
+        }
         if ledger_fault.is_none() {
             ledger_fault = self.lease_fault.lock().unwrap().clone();
         }
@@ -1746,9 +2184,13 @@ impl Node {
     /// The detached body of Create. The ordering is the design's: durable token lookup
     /// first, then gate, epoch, deadline and revalidation, then the one C2 transaction.
     async fn create_flow(self: Arc<Self>, token: CreateToken) -> CreateReply {
-        let Some(gate) = self.gate_for(token.allocation) else {
-            return ambiguous_create(AmbiguousClass::WorkerExhausted, "token table is full");
+        let Some(share) = self.share(token.instance) else {
+            return ambiguous_create(AmbiguousClass::OldEpoch, "this instance is not enrolled");
         };
+        // An open entry for serialization only: it leaves with this flow unless the
+        // durable lookup says Unknown and a later step rejects the token.
+        let entry = GateUse::enter(share.clone(), token.allocation);
+        let gate = entry.gate.clone();
         if gate.waiters.fetch_add(1, Ordering::AcqRel) >= MAX_TOKEN_WAITERS {
             gate.waiters.fetch_sub(1, Ordering::AcqRel);
             return ambiguous_create(AmbiguousClass::Pending, "too many queued duplicates");
@@ -1770,16 +2212,19 @@ impl Node {
             .await;
         match reply {
             Ok(LedgerReply::Lookup(TokenLookup::Fenced { receipt })) => {
+                gate.mark_durable();
                 return CreateReply::Absent {
                     receipt: WireBytes(receipt),
                 };
             }
             Ok(LedgerReply::Lookup(TokenLookup::Conflict { reason })) => {
+                gate.mark_durable();
                 return ambiguous_create(AmbiguousClass::Conflict, reason);
             }
             Ok(LedgerReply::Lookup(TokenLookup::Active {
                 generation, phase, ..
             })) => {
+                gate.mark_durable();
                 // The expired read-only grace can return a fence and nothing else.
                 if token.deadline.expired() {
                     return ambiguous_create(AmbiguousClass::Expired, "create deadline expired");
@@ -1805,6 +2250,14 @@ impl Node {
             return ambiguous_create(
                 AmbiguousClass::GateClosed,
                 format!("this token was rejected earlier ({class:?}); it needs its fence"),
+            );
+        }
+        // A rejection below must be able to close this gate, or it can't start at all. Only
+        // this instance's own rejected tokens can fill its table, and only for its new work.
+        if !share.gates.lock().unwrap().make_room() {
+            return ambiguous_create(
+                AmbiguousClass::WorkerExhausted,
+                "this instance has too many rejected tokens awaiting their fences",
             );
         }
         // Every rejection below closes the gate before answering.
@@ -1857,7 +2310,17 @@ impl Node {
             .await
         {
             Ok(PrepReply::Revalidated(plan)) => plan,
-            Ok(PrepReply::Rejected { class, reason }) => return reject(class, reason),
+            Ok(PrepReply::Rejected {
+                class,
+                reason,
+                malformed,
+            }) => {
+                if malformed {
+                    gate.close_evictable(class);
+                    return ambiguous_create(class, reason);
+                }
+                return reject(class, reason);
+            }
             Ok(_) => {
                 return reject(
                     AmbiguousClass::WorkerPanic,
@@ -1919,6 +2382,7 @@ impl Node {
                 phase,
                 replay,
             })) => {
+                gate.mark_durable();
                 if replay {
                     return CreateReply::Accepted {
                         generation,
@@ -1976,9 +2440,12 @@ impl Node {
                 AmbiguousClass::OldEpoch,
                 "the attachment was replaced before this could commit".into(),
             ),
-            Ok(LedgerReply::Admit(AdmitOutcome::Fenced { receipt })) => CreateReply::Absent {
-                receipt: WireBytes(receipt),
-            },
+            Ok(LedgerReply::Admit(AdmitOutcome::Fenced { receipt })) => {
+                gate.mark_durable();
+                CreateReply::Absent {
+                    receipt: WireBytes(receipt),
+                }
+            }
             Ok(LedgerReply::Admit(AdmitOutcome::Conflict { reason })) => {
                 reject(AmbiguousClass::Conflict, reason)
             }
@@ -2066,6 +2533,7 @@ impl Node {
         self.supervisors.lock().unwrap().insert(
             allocation,
             SupervisorEntry {
+                instance,
                 pid,
                 channel: channel.clone(),
                 worker_id,
@@ -2282,9 +2750,11 @@ impl Node {
     /// closes the gate, revokes and waits for every permit, requires positive absence
     /// and then commits once. A response of Absent always follows that durable commit.
     async fn fence_flow(self: Arc<Self>, token: FenceToken) -> FenceReply {
-        let Some(gate) = self.gate_for(token.allocation) else {
-            return ambiguous_fence(AmbiguousClass::WorkerExhausted, "token table is full");
+        let Some(share) = self.share(token.instance) else {
+            return ambiguous_fence(AmbiguousClass::OldEpoch, "this instance is not enrolled");
         };
+        let entry = GateUse::enter(share.clone(), token.allocation);
+        let gate = entry.gate.clone();
         if gate.waiters.fetch_add(1, Ordering::AcqRel) >= MAX_TOKEN_WAITERS {
             gate.waiters.fetch_sub(1, Ordering::AcqRel);
             return ambiguous_fence(AmbiguousClass::Pending, "too many queued duplicates");
@@ -2305,15 +2775,17 @@ impl Node {
             .await;
         match reply {
             Ok(LedgerReply::Lookup(TokenLookup::Fenced { receipt })) => {
-                self.forget_token(token.allocation);
+                self.forget_token(&gate, token.allocation);
                 return FenceReply::Absent {
                     receipt: WireBytes(receipt),
                 };
             }
             Ok(LedgerReply::Lookup(TokenLookup::Conflict { reason })) => {
+                gate.mark_durable();
                 return ambiguous_fence(AmbiguousClass::Conflict, reason);
             }
-            Ok(LedgerReply::Lookup(TokenLookup::Active { .. } | TokenLookup::Unknown)) => {}
+            Ok(LedgerReply::Lookup(TokenLookup::Active { .. })) => gate.mark_durable(),
+            Ok(LedgerReply::Lookup(TokenLookup::Unknown)) => {}
             Ok(LedgerReply::Unavailable { reason } | LedgerReply::Failed { reason }) => {
                 return ambiguous_fence(AmbiguousClass::LedgerUnavailable, reason);
             }
@@ -2388,7 +2860,7 @@ impl Node {
                 // Durable now, with this token's serialization still held.
                 #[cfg(test)]
                 workers::faults::hold(&format!("H.fence.after_commit.{}", token.allocation)).await;
-                self.forget_token(token.allocation);
+                self.forget_token(&gate, token.allocation);
                 FenceReply::Absent {
                     receipt: WireBytes(receipt),
                 }
@@ -2479,8 +2951,8 @@ impl Node {
     }
 
     /// The durable fence now answers for this token; its memory can go.
-    fn forget_token(&self, allocation: Id128) {
-        self.gates.lock().unwrap().remove(&allocation);
+    fn forget_token(&self, gate: &TokenGate, allocation: Id128) {
+        gate.mark_durable();
         let removed = self.supervisors.lock().unwrap().remove(&allocation);
         if removed.is_some() {
             self.monitor
@@ -2638,7 +3110,14 @@ impl Node {
                     "vm": entry.vm.map(|vm| vm.pid),
                 }))
             }).collect::<serde_json::Map<_, _>>(),
-            "closed_gates": self.gates.lock().unwrap().values().filter(|g| g.closed().is_some()).count(),
+            "closed_gates": self.shares.lock().unwrap().iter().flat_map(|shares| shares.values()).map(|share| {
+                share.gates.lock().unwrap().gates.values().filter(|g| g.closed().is_some()).count()
+            }).sum::<usize>(),
+            "open_gates": self.shares.lock().unwrap().iter().flat_map(|shares| shares.values()).map(|share| {
+                share.gates.lock().unwrap().gates.values().filter(|g| g.closed().is_none()).count()
+            }).sum::<usize>(),
+            "discarded": self.discarded.lock().unwrap().clone(),
+            "attached": self.attachments.lock().unwrap().len(),
             "peer_starts": self.attachments.lock().unwrap().values().map(|a| a.peer_start).collect::<Vec<_>>(),
         })
     }
@@ -2756,7 +3235,7 @@ pub fn load_profile(
 
 /// The production configuration from a verified root policy. Nothing here accepts a
 /// fixture, and until B7 the production gate leaves the served profile list empty.
-pub fn production_config(policy: NodePolicy) -> NodeConfig {
+pub fn production_config(policy: NodePolicy, service_uid: u32) -> NodeConfig {
     let walk = WalkPolicy::production();
     let mut profiles = Vec::new();
     for catalog in &policy.profiles {
@@ -2797,6 +3276,8 @@ pub fn production_config(policy: NodePolicy) -> NodeConfig {
         observation: ObservationBackend::Disabled,
         timings: Timings::default(),
         helper_image,
+        service_uid,
+        max_enrolled: policy.max_enrolled_instances,
         #[cfg(test)]
         test: workers::TestInjection::default(),
     }
@@ -2826,6 +3307,79 @@ pub fn provision_ledger(policy: &NodePolicy) -> Result<(), String> {
         shared: config::SharedReserve::default(),
     })
     .map_err(|e| e.to_string())
+}
+
+/// Root's `kilnd-helper enroll`. It takes the node lock, so it runs with the helper
+/// stopped and reaches the ledger by no socket, and the next helper loads the result.
+pub fn enroll_instance(
+    policy: &NodePolicy,
+    instance: Id128,
+    unit: &str,
+    cgroup: Option<&str>,
+    kilnd: &Path,
+) -> Result<String, String> {
+    let config = LedgerConfig {
+        directory: policy.ledger_dir.clone(),
+        policy: WalkPolicy::production(),
+        node_id: policy.node_id,
+        ceilings: policy.ceilings,
+        shared: config::SharedReserve::default(),
+    };
+    enroll_with(
+        &config,
+        policy.max_enrolled_instances,
+        instance,
+        unit,
+        cgroup,
+        kilnd,
+    )
+}
+
+fn enroll_with(
+    config: &LedgerConfig,
+    limit: u32,
+    instance: Id128,
+    unit: &str,
+    cgroup: Option<&str>,
+    kilnd: &Path,
+) -> Result<String, String> {
+    let cgroup = peer::unit_cgroup(unit, cgroup)?;
+    let directory =
+        executable::walk_directory(&config.policy, &config.directory).map_err(|e| e.to_string())?;
+    let _lock = ExclusiveFileLock::acquire_at(
+        directory.file(),
+        OsStr::new(journal::LEDGER_LOCK),
+        &journal::ledger_lock_path(&config.directory),
+        "Firecracker node ledger",
+    )
+    .map_err(|error| format!("stop kilnd-helper before enrolling: {error:#}"))?;
+    let executable =
+        peer::read_installed_kilnd(&config.policy, kilnd).map_err(|e| e.to_string())?;
+    let mut ledger = journal::Ledger::open(config.clone()).map_err(|e| e.to_string())?;
+    let enrollment = Enrollment {
+        instance_id: instance,
+        unit: unit.to_string(),
+        cgroup,
+        executable,
+    };
+    match ledger
+        .enroll_instance(&enrollment, limit)
+        .map_err(|e| e.to_string())?
+    {
+        EnrollOutcome::Enrolled { generation } => {
+            Ok(format!("enrolled {instance} at generation {generation}"))
+        }
+        EnrollOutcome::Updated { generation } => Ok(format!(
+            "updated {instance}'s enrollment at generation {generation}"
+        )),
+        EnrollOutcome::LimitReached { limit } => Err(format!(
+            "the node policy allows {limit} enrolled instances, and all are in use"
+        )),
+        EnrollOutcome::UnitTaken => Err("another instance is enrolled with this unit".into()),
+        EnrollOutcome::NoSpace => {
+            Err("the ledger has no room left beyond what its fences need".into())
+        }
+    }
 }
 
 /// The role J, V and the formatter would be dispatched from, in plan order.

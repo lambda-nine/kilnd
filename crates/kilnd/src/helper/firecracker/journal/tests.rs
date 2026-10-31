@@ -1,6 +1,7 @@
 //! Ledger authority tests, with real SQLite files and no fakes of its behavior.
 #![allow(clippy::type_complexity)]
 use super::*;
+use crate::helper::firecracker::config::MAX_ENROLLED_HARD;
 use crate::helper::firecracker::config::tests::{sample_leases, sample_vector};
 use crate::helper::firecracker::identity::{GuestCid, RelayGid, RelayUid, VmmGid, VmmUid};
 use crate::runtime::FencedAbsence;
@@ -45,8 +46,33 @@ fn database() -> Id128 {
     Id128::from_bytes([0x33; 16])
 }
 
+/// What root's enrollment command writes, with a unit derived from the instance.
+fn enrollment_of(instance: Id128) -> Enrollment {
+    Enrollment {
+        instance_id: instance,
+        unit: format!("kilnd-{instance}.service"),
+        cgroup: format!("/system.slice/kilnd-{instance}.service"),
+        executable: EnrolledExecutable {
+            st_dev: 1,
+            st_ino: 2,
+            bytes: 3,
+            sha256: Digest::of(b"kilnd"),
+        },
+    }
+}
+
+fn enroll(ledger: &mut Ledger, instance: Id128) {
+    assert!(matches!(
+        ledger
+            .enroll_instance(&enrollment_of(instance), MAX_ENROLLED_HARD)
+            .unwrap(),
+        EnrollOutcome::Enrolled { .. }
+    ));
+}
+
 fn attached(config: &LedgerConfig) -> Ledger {
     let mut ledger = Ledger::open(config.clone()).unwrap();
+    enroll(&mut ledger, instance());
     assert!(matches!(
         ledger.attach_instance(instance(), database()).unwrap(),
         AttachOutcome::Bound { .. }
@@ -549,6 +575,7 @@ fn exit6_fence_allowance_stops_new_tokens_before_accepted_ones_cannot_fence() {
     let mut tight = fixture.config.clone();
     tight.shared.fence_allowance_bytes = (PRE_INTENT_TOKEN_MARGIN + 2) * FENCE_ENTRY_BOUND;
     let mut ledger = Ledger::open(tight).unwrap();
+    enroll(&mut ledger, instance());
     assert!(matches!(
         ledger.attach_instance(instance(), database()).unwrap(),
         AttachOutcome::Bound { .. }
@@ -771,6 +798,7 @@ fn exit3_allocation_and_sandbox_are_unique_across_every_instance() {
     let fixture = temp_ledger(unrestricted());
     let mut ledger = attached(&fixture.config);
     let other = Id128::from_bytes([0x44; 16]);
+    enroll(&mut ledger, other);
     assert!(matches!(
         ledger
             .attach_instance(other, Id128::from_bytes([0x55; 16]))
@@ -997,12 +1025,14 @@ fn exit6_every_unique_key_and_conflict_algorithm_is_guarded() {
         ),
         (
             "instances",
-            "INSERT OR {c} INTO instances SELECT instance_id, 'other', first_generation FROM instances".into(),
+            "INSERT OR {c} INTO instances SELECT instance_id, unit, cgroup, exe_st_dev, exe_st_ino,
+                exe_bytes, exe_sha256, 'other', first_generation FROM instances".into(),
         ),
         (
             "instances",
-            "INSERT OR {c} INTO instances (rowid, instance_id, database_uuid, first_generation)
-             SELECT rowid, 'new', 'other', 1 FROM instances".into(),
+            "INSERT OR {c} INTO instances (rowid, instance_id, unit, cgroup, exe_st_dev, exe_st_ino,
+                exe_bytes, exe_sha256, database_uuid, first_generation)
+             SELECT rowid, 'new', 'new.service', '/new', 1, 1, 1, 'x', 'other', 1 FROM instances".into(),
         ),
         (
             "allocations",
@@ -1256,4 +1286,149 @@ fn exit6_a_held_claim_cannot_coexist_with_a_fence_or_absent_phase() {
             .is_err(),
         "a phase change without a newer generation"
     );
+}
+
+#[test]
+fn b3_01_attach_authenticates_nothing_and_refuses_an_unenrolled_instance() {
+    let fixture = temp_ledger(unrestricted());
+    let mut ledger = Ledger::open(fixture.config.clone()).unwrap();
+    assert_eq!(
+        ledger.attach_instance(instance(), database()).unwrap(),
+        AttachOutcome::NotEnrolled
+    );
+    assert_eq!(ledger.enrollment(instance()).unwrap(), None);
+    let rows = |ledger: &Ledger| -> i64 {
+        ledger
+            .connection()
+            .query_row("SELECT COUNT(*) FROM instances", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rows(&ledger), 0, "an attempt creates no row");
+    enroll(&mut ledger, instance());
+    assert_eq!(
+        ledger.enrollment(instance()).unwrap(),
+        Some(enrollment_of(instance()))
+    );
+    // Enrollment names no database: the first attested attachment records one.
+    assert!(matches!(
+        ledger.attach_instance(instance(), database()).unwrap(),
+        AttachOutcome::Bound { .. }
+    ));
+    let copied = Id128::from_bytes([0x99; 16]);
+    assert!(matches!(
+        ledger.attach_instance(instance(), copied).unwrap(),
+        AttachOutcome::DatabaseMismatch { .. }
+    ));
+}
+
+#[test]
+fn b3_02_enrollment_is_bounded_and_one_unit_serves_one_instance() {
+    let fixture = temp_ledger(unrestricted());
+    let mut ledger = Ledger::open(fixture.config.clone()).unwrap();
+    let id = |byte| Id128::from_bytes([byte; 16]);
+    for byte in 0..8 {
+        assert!(matches!(
+            ledger.enroll_instance(&enrollment_of(id(byte)), 8).unwrap(),
+            EnrollOutcome::Enrolled { .. }
+        ));
+    }
+    assert_eq!(
+        ledger.enroll_instance(&enrollment_of(id(8)), 8).unwrap(),
+        EnrollOutcome::LimitReached { limit: 8 }
+    );
+    // A unit, or its cgroup, can't serve a second instance.
+    let mut same_unit = enrollment_of(id(8));
+    same_unit.unit = enrollment_of(id(0)).unit;
+    assert_eq!(
+        ledger.enroll_instance(&same_unit, 16).unwrap(),
+        EnrollOutcome::UnitTaken
+    );
+    let mut same_cgroup = enrollment_of(id(8));
+    same_cgroup.cgroup = enrollment_of(id(0)).cgroup;
+    assert_eq!(
+        ledger.enroll_instance(&same_cgroup, 16).unwrap(),
+        EnrollOutcome::UnitTaken
+    );
+    // An upgrade re-enrolls the new image, at the limit, and the binding is unaffected.
+    ledger.attach_instance(id(0), database()).unwrap();
+    let mut upgraded = enrollment_of(id(0));
+    upgraded.executable.st_ino = 99;
+    assert!(matches!(
+        ledger.enroll_instance(&upgraded, 8).unwrap(),
+        EnrollOutcome::Updated { .. }
+    ));
+    assert_eq!(
+        ledger.enrollment(id(0)).unwrap().unwrap().executable.st_ino,
+        99
+    );
+    assert!(matches!(
+        ledger.attach_instance(id(0), database()).unwrap(),
+        AttachOutcome::Bound { .. }
+    ));
+    // A lowered limit removes nothing and still lets existing rows re-enroll.
+    assert!(matches!(
+        ledger.enroll_instance(&upgraded, 1).unwrap(),
+        EnrollOutcome::Updated { .. }
+    ));
+    assert_eq!(ledger.replay().unwrap().enrolled.len(), 8);
+}
+
+#[test]
+fn b3_02_attach_writes_only_its_own_row_once_and_respects_the_fence_floor() {
+    let fixture = temp_ledger(unrestricted());
+    let mut tight = fixture.config.clone();
+    tight.shared.fence_allowance_bytes = (PRE_INTENT_TOKEN_MARGIN + 2) * FENCE_ENTRY_BOUND;
+    let mut ledger = Ledger::open(tight).unwrap();
+    enroll(&mut ledger, instance());
+    let other = Id128::from_bytes([0x44; 16]);
+    enroll(&mut ledger, other);
+    assert!(matches!(
+        ledger.attach_instance(instance(), database()).unwrap(),
+        AttachOutcome::Bound { .. }
+    ));
+    let generation = ledger.generation().unwrap();
+    let changes = ledger.connection().total_changes();
+    for _ in 0..100 {
+        assert!(matches!(
+            ledger.attach_instance(instance(), database()).unwrap(),
+            AttachOutcome::Bound { .. }
+        ));
+        assert!(matches!(
+            ledger
+                .attach_instance(instance(), Id128::from_bytes([0x99; 16]))
+                .unwrap(),
+            AttachOutcome::DatabaseMismatch { .. }
+        ));
+        assert_eq!(
+            ledger.attach_instance(Id128::random(), database()).unwrap(),
+            AttachOutcome::NotEnrolled
+        );
+    }
+    assert_eq!(
+        ledger.connection().total_changes(),
+        changes,
+        "a reattachment and a refusal write nothing"
+    );
+    assert_eq!(ledger.generation().unwrap(), generation);
+    // Accepted tokens have used the headroom: a new binding must not take what's left.
+    accepted(ledger.admit_intent(&request(1)).unwrap());
+    accepted(ledger.admit_intent(&request(2)).unwrap());
+    assert!(!ledger.fence_headroom().unwrap());
+    assert_eq!(
+        ledger
+            .attach_instance(other, Id128::from_bytes([0x55; 16]))
+            .unwrap(),
+        AttachOutcome::NoSpace
+    );
+    assert_eq!(
+        ledger
+            .enroll_instance(&enrollment_of(Id128::random()), MAX_ENROLLED_HARD)
+            .unwrap(),
+        EnrollOutcome::NoSpace
+    );
+    // The instance already bound keeps working at the floor: it needs no write.
+    assert!(matches!(
+        ledger.attach_instance(instance(), database()).unwrap(),
+        AttachOutcome::Bound { .. }
+    ));
 }
