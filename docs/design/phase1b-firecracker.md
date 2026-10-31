@@ -1085,3 +1085,11 @@ Remove/Stop, S/M pidfds and parent-death signals, host capability and free-space
 at preflight, capability grants, and a static helper image. B5 owns the broker, R, D and
 READY. B6 owns manager recovery, reconciliation and DB-repair flows. B7 alone may lift the
 production gate and let `main.rs` select this backend.
+
+Linux validation corrections preserve the same contract: the Firecracker client relies
+on the original wire deadline instead of sending a redundant cancel byte when that
+deadline expires, avoiding a Linux response-close/EOF race. Explicit cancellation and
+strict EOF validation remain. `exit1_deadline_does_not_race_response_eof_with_a_redundant_cancel_byte`
+checks the absence of that write. The root traversal test requires successful ACL and
+capability injection, removes each fault, restores ACL-derived mode bits and verifies
+the positive control before the next independent attack.

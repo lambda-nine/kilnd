@@ -205,8 +205,10 @@ impl Client {
                     response.await
                 },
                 _ = tokio::time::sleep_until(deadline) => {
-                    let written = writer.write_u8(1).await;
-                    if !group { written?; }
+                    // Firecracker enforces the original wire deadline itself. A
+                    // redundant byte can race its response shutdown on Linux and
+                    // reset the stream before the required EOF is observed.
+                    if !group { writer.write_u8(1).await?; }
                     response.await
                 },
             }?

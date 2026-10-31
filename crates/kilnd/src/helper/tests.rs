@@ -5,6 +5,54 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
+#[tokio::test]
+async fn exit1_deadline_does_not_race_response_eof_with_a_redundant_cancel_byte() {
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{Instant, timeout};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("helper.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(fds::receive(&stream).await.unwrap().is_empty());
+        let request: Request = read_frame(&mut stream).await.unwrap();
+        request.validate(0).unwrap();
+        fds::send(&stream, &[]).await.unwrap();
+        // Withhold the reply beyond the wire deadline. The server owns that timer;
+        // a redundant client byte would race its response close on Linux.
+        assert!(timeout(Duration::from_millis(150), stream.read_u8()).await.is_err());
+        write_frame(
+            &mut stream,
+            &Response::Firecracker(FirecrackerResponse::Error(GroupError::new(
+                GroupErrorKind::Unavailable,
+                "original deadline expired",
+            ))),
+        )
+        .await
+        .unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let reply = Client {
+        path,
+        expected_uid: unsafe { libc::geteuid() },
+    }
+    .firecracker(
+        FirecrackerRequest {
+            group_version: FIRECRACKER_GROUP_VERSION,
+            instance_id: crate::model::Id128::random(),
+            connection_epoch: Some(crate::model::Id128::random()),
+            operation: FirecrackerOperation::Capabilities,
+        },
+        Instant::now() + Duration::from_millis(100),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(reply, FirecrackerResponse::Error(error)
+        if error.kind == GroupErrorKind::Unavailable));
+    server.await.unwrap();
+}
+
 #[test]
 fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
     let valid: serde_json::Value = serde_json::json!({"version":3,"timeout_ms":1000,"deadline_ns":1,"operation":{"kiln":{"rm":{"id":"ab"}}}});
