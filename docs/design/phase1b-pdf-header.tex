@@ -1,0 +1,26 @@
+% House style: kiln-learning/chapter-18-node-budgets.tex.
+\usepackage{fontspec}
+\setmainfont{XCharter}[Extension=.otf,UprightFont=*-Roman,
+  BoldFont=*-Bold,ItalicFont=*-Italic,BoldItalicFont=*-BoldItalic,
+  Numbers=Lining]
+\setmonofont{Inconsolatazi4}[Extension=.otf,UprightFont=*-Regular,
+  BoldFont=*-Bold,Scale=0.9]
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{fvextra}
+\usepackage{xurl}
+\definecolor{kilnblue}{HTML}{2457A6}
+\definecolor{codebg}{gray}{0.96}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt plus 1pt}
+\setlength{\emergencystretch}{3em}
+\raggedbottom
+\setlist{itemsep=2pt,topsep=3pt,parsep=0pt,leftmargin=1.35em}
+\RecustomVerbatimEnvironment{verbatim}{Verbatim}{
+  fontsize=\scriptsize,breaklines=true,breakanywhere=true,
+  frame=single,framesep=3pt,rulecolor=\color{gray!30}}
+\AtBeginDocument{\hypersetup{colorlinks=true,linkcolor=kilnblue,urlcolor=kilnblue}}
+% Allow long inline identifiers, digests and source paths to wrap in tables.
+\usepackage{seqsplit}
+\let\kilntexttt\texttt
+\renewcommand{\texttt}[1]{\kilntexttt{\seqsplit{#1}}}

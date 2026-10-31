@@ -6,6 +6,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Specify the Phase 1b Firecracker runtime and guest broker design, including
+  approved launch contracts, durable recovery, resource reservations and build gates.
+
 - Isolate the lock CLOEXEC regression in a dedicated child so unrelated parallel
   forks cannot transiently retain its lock and cause a false inheritance failure.
 
