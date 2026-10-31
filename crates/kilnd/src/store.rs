@@ -55,7 +55,7 @@ CREATE TABLE daemon_identity (
     instance_id TEXT NOT NULL CHECK (length(instance_id) = 32 AND instance_id NOT GLOB '*[^0-9a-f]*')
 );
 CREATE TABLE release_evidence (
-    receipt_id TEXT PRIMARY KEY CHECK (length(receipt_id) = 32 AND receipt_id NOT GLOB '*[^0-9a-f]*'),
+    receipt_id TEXT PRIMARY KEY NOT NULL CHECK (length(receipt_id) = 32 AND receipt_id NOT GLOB '*[^0-9a-f]*'),
     node_id TEXT NOT NULL CHECK (length(node_id) = 32 AND node_id NOT GLOB '*[^0-9a-f]*'),
     instance_id TEXT NOT NULL CHECK (length(instance_id) = 32 AND instance_id NOT GLOB '*[^0-9a-f]*'),
     allocation_id TEXT NOT NULL UNIQUE CHECK (length(allocation_id) = 32 AND allocation_id NOT GLOB '*[^0-9a-f]*'),
@@ -3480,6 +3480,13 @@ mod tests {
                 instance.as_str(),
                 allocation.as_str(),
                 plan.as_str(),
+            );
+            assert!(
+                conn.execute(
+                    "INSERT INTO release_evidence (node_id,instance_id,allocation_id,plan_digest,helper_generation,kind,receipt,recorded_at_ms) VALUES (?1,?2,?3,?4,1,'absent_fenced',x'00',0)",
+                    params![node, instance, allocation, plan],
+                ).is_err(),
+                "missing receipt ID"
             );
             assert!(
                 insert_evidence(&conn, good, "1", "'stopped'").is_err(),
