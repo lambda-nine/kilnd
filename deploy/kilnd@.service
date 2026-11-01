@@ -1,0 +1,48 @@
+# One further kilnd instance, under its own Unix account: scripts/add-instance.sh makes
+# the account kilnd-<name> and enrolls it. kilnd.service stays the single-instance default.
+# Must not set Delegate=: the unit's cgroup stays root-writable only, which attachment
+# relies on. The kiln backend is kilnd.service's alone: the helper refuses an enrolled
+# account's kiln requests, so until B7 selects Firecracker this serves no sandboxes.
+[Unit]
+Description=Unprivileged kilnd sandbox control daemon, instance %i
+Documentation=https://github.com/lambda-nine/kilnd
+Requires=kilnd-helper.socket
+After=kilnd-helper.socket kilnd-helper.service
+Wants=kilnd-helper.service
+
+[Service]
+User=kilnd-%i
+Group=kilnd-%i
+ExecStart=/usr/local/bin/kilnd --socket /run/kilnd-%i/kilnd.sock --socket-group kilnd-%i --state-dir /var/lib/kilnd-%i --helper-socket /run/kilnd-helper/helper.sock --log-format json
+TimeoutStopSec=300
+Restart=on-failure
+RestartSec=2
+# Owned by this account alone: no other instance can read its database or its WAL.
+StateDirectory=kilnd-%i
+StateDirectoryMode=0700
+RuntimeDirectory=kilnd-%i
+RuntimeDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+InaccessiblePaths=-/var/lib/kiln -/run/kiln
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,8 @@
 #!/bin/sh
 # Builds kilnd and kilndctl, installs them in /usr/local/bin, creates the
-# kilnd group (allowed to use the API socket) and starts the kilnd service.
+# kilnd group (allowed to use the API socket) and the kilnd-helper group (allowed to
+# reach the helper socket, whose own check is the peer's UID), and starts the kilnd
+# service. Further instances: scripts/add-instance.sh.
 # Needs kiln installed first (kiln's scripts/install.sh). Run inside the VM
 # as your user:
 #   scripts/install.sh
@@ -12,10 +14,14 @@ target=${CARGO_TARGET_DIR:-target}
 cargo build --release --locked
 getent group kilnd >/dev/null || sudo groupadd --system kilnd
 getent passwd kilnd >/dev/null || sudo useradd --system --gid kilnd --home-dir /nonexistent --shell /usr/sbin/nologin kilnd
+getent group kilnd-helper >/dev/null || sudo groupadd --system kilnd-helper
+sudo usermod -a -G kilnd-helper kilnd
 # Stop the old daemon before transferring its private state. No live SQLite
 # files or ownership locks are moved under a running process.
 sudo systemctl stop kilnd.service 2>/dev/null || true
 sudo systemctl stop kilnd-helper.service 2>/dev/null || true
+# Picks up the socket's group, for an install older than the kilnd-helper group.
+sudo systemctl stop kilnd-helper.socket 2>/dev/null || true
 sudo install -m 755 "$target/release/kilnd-helper" /usr/local/bin/kilnd-helper
 sudo install -m 755 "$target/release/kilnd" /usr/local/bin/kilnd
 sudo install -m 755 "$target/release/kilndctl" /usr/local/bin/kilndctl
@@ -72,6 +78,7 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/kilnd-helper.conf
 sudo install -m 644 deploy/kilnd-helper.socket /etc/systemd/system/kilnd-helper.socket
 sudo install -m 644 deploy/kilnd-helper.service /etc/systemd/system/kilnd-helper.service
 sudo install -m 644 deploy/kilnd.service /etc/systemd/system/kilnd.service
+sudo install -m 644 deploy/kilnd@.service /etc/systemd/system/kilnd@.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now kilnd-helper.socket
 sudo systemctl enable --now kilnd-helper.service

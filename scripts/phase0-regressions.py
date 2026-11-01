@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Privileged installed-service checks. Run as root in the shared kiln VM."""
 import array
+import grp
 import json
 import os
 import pwd
@@ -101,10 +102,10 @@ try:
     for path, mode in [('/var/lib/kilnd',0o700),('/var/lib/kilnd/kilnd.db',0o600),('/run/kilnd',0o750),('/run/kilnd/kilnd.sock',0o660)]:
         m=os.lstat(path); assert m.st_uid==KILND.pw_uid and stat.S_IMODE(m.st_mode)==mode, (path,m)
     for path, mode in [('/run/kilnd-helper',0o750),('/run/kilnd-helper/helper.sock',0o660)]:
-        m=os.lstat(path); assert m.st_uid==0 and m.st_gid==KILND.pw_gid and stat.S_IMODE(m.st_mode)==mode, (path,m)
+        m=os.lstat(path); assert m.st_uid==0 and m.st_gid==grp.getgrnam('kilnd-helper').gr_gid and stat.S_IMODE(m.st_mode)==mode, (path,m)
     print('2. Different real peer UIDs cannot see or mutate ownership', flush=True)
     for user in USERS:
-        run(['useradd','--system','--gid','kilnd','--home-dir','/nonexistent','--shell','/usr/sbin/nologin',user])
+        run(['useradd','--system','--gid','kilnd','--groups','kilnd-helper','--home-dir','/nonexistent','--shell','/usr/sbin/nologin',user])
     id=ctl('create','--memory','64M','--disk','16M',uid=USERS[0]).stdout.strip(); IDS.append(id)
     p=ctl('exec','--verbose',id,'--','printf','owner-output',uid=USERS[0]); assert p.stdout=='owner-output'
     ex=re.search(r'ex-[0-9a-f]{16}',p.stderr)[0]

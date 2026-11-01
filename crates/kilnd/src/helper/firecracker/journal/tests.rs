@@ -53,6 +53,8 @@ fn enrollment_of(instance: Id128) -> Enrollment {
         instance_id: instance,
         unit: format!("kilnd-{instance}.service"),
         cgroup: format!("/system.slice/kilnd-{instance}.service"),
+        uid: crate::helper::firecracker::peer::fixture_account(instance).0,
+        gid: crate::helper::firecracker::peer::fixture_account(instance).1,
         executable: EnrolledExecutable {
             st_dev: 1,
             st_ino: 2,
@@ -1022,6 +1024,100 @@ fn b3r_01_every_row_a_claim_or_fence_writes_names_its_instance() {
 }
 
 #[test]
+fn b3r_02_one_account_serves_one_instance() {
+    let fixture = temp_ledger(unrestricted());
+    let mut ledger = Ledger::open(fixture.config.clone()).unwrap();
+    let first = enrollment_of(instance());
+    assert!(matches!(
+        ledger.enroll_instance(&first, 8).unwrap(),
+        EnrollOutcome::Enrolled { .. }
+    ));
+    let other = Id128::from_bytes([0x44; 16]);
+    // The same UID, or the same GID, under another instance and another unit.
+    let mut same_uid = enrollment_of(other);
+    same_uid.uid = first.uid;
+    assert_eq!(
+        ledger.enroll_instance(&same_uid, 8).unwrap(),
+        EnrollOutcome::AccountTaken
+    );
+    let mut same_gid = enrollment_of(other);
+    same_gid.gid = first.gid;
+    assert_eq!(
+        ledger.enroll_instance(&same_gid, 8).unwrap(),
+        EnrollOutcome::AccountTaken
+    );
+    assert!(ledger.enrollment(other).unwrap().is_none());
+    // Nor can a later re-enrollment move onto an account someone else holds.
+    assert!(matches!(
+        ledger.enroll_instance(&enrollment_of(other), 8).unwrap(),
+        EnrollOutcome::Enrolled { .. }
+    ));
+    let mut moved = enrollment_of(other);
+    moved.uid = first.uid;
+    assert_eq!(
+        ledger.enroll_instance(&moved, 8).unwrap(),
+        EnrollOutcome::AccountTaken
+    );
+    // Its own account again is fine, and root can never be one.
+    assert!(matches!(
+        ledger.enroll_instance(&first, 8).unwrap(),
+        EnrollOutcome::Updated { .. }
+    ));
+    let mut root = enrollment_of(Id128::from_bytes([0x45; 16]));
+    root.uid = 0;
+    assert!(ledger.enroll_instance(&root, 8).is_err());
+    // What H partitions by comes back with every instance.
+    let enrolled = ledger.replay().unwrap().enrolled;
+    assert_eq!(enrolled.len(), 2);
+    assert!(enrolled.iter().any(|account| {
+        account.instance_id == instance() && account.uid == first.uid && account.gid == first.gid
+    }));
+}
+
+#[test]
+fn b3r_02_startup_refuses_a_ledger_whose_instances_share_an_account() {
+    let table = |rows: &str| {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE instances (instance_id TEXT, uid INTEGER, gid INTEGER);
+             INSERT INTO instances VALUES {rows};"
+        ))
+        .unwrap();
+        audit_accounts(&conn)
+    };
+    assert!(table("('a', 1000, 1000), ('b', 1001, 1001)").is_ok());
+    for (what, rows) in [
+        ("uid", "('a', 1000, 1000), ('b', 1000, 1001)"),
+        ("gid", "('a', 1000, 1000), ('b', 1001, 1000)"),
+        ("root", "('a', 0, 1000)"),
+    ] {
+        let refused = table(rows).unwrap_err().to_string();
+        assert!(
+            refused.contains("share a Unix account"),
+            "{what}: {refused}"
+        );
+    }
+    // In a real file the schema itself says so, and rewriting it fails the digest first.
+    let fixture = temp_ledger(unrestricted());
+    {
+        let mut ledger = Ledger::open(fixture.config.clone()).unwrap();
+        enroll(&mut ledger, instance());
+        let conn = ledger.connection();
+        conn.pragma_update(None, "writable_schema", "ON").unwrap();
+        conn.execute(
+            "UPDATE sqlite_schema SET sql = replace(sql, 'uid INTEGER NOT NULL UNIQUE', 'uid INTEGER NOT NULL')
+             WHERE name = 'instances'",
+            [],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        Ledger::open(fixture.config.clone()),
+        Err(LedgerError::Corrupt(_))
+    ));
+}
+
+#[test]
 fn exit3_a_different_database_cannot_rebind_a_namespace_or_clear_its_claims() {
     let fixture = temp_ledger(NodeCeilings::default());
     {
@@ -1199,14 +1295,14 @@ fn exit6_every_unique_key_and_conflict_algorithm_is_guarded() {
         ),
         (
             "instances",
-            "INSERT OR {c} INTO instances SELECT instance_id, unit, cgroup, exe_st_dev, exe_st_ino,
+            "INSERT OR {c} INTO instances SELECT instance_id, unit, cgroup, uid, gid, exe_st_dev, exe_st_ino,
                 exe_bytes, exe_sha256, 'other', first_generation FROM instances".into(),
         ),
         (
             "instances",
-            "INSERT OR {c} INTO instances (rowid, instance_id, unit, cgroup, exe_st_dev, exe_st_ino,
+            "INSERT OR {c} INTO instances (rowid, instance_id, unit, cgroup, uid, gid, exe_st_dev, exe_st_ino,
                 exe_bytes, exe_sha256, database_uuid, first_generation)
-             SELECT rowid, 'new', 'new.service', '/new', 1, 1, 1, 'x', 'other', 1 FROM instances".into(),
+             SELECT rowid, 'new', 'new.service', '/new', 77, 77, 1, 1, 1, 'x', 'other', 1 FROM instances".into(),
         ),
         (
             "allocations",

@@ -61,15 +61,16 @@ struct NodeOptions {
     peers: PeerEvidence,
 }
 
-/// Where a fixture helper reads an attaching peer's cgroup. The UID, start time, image
-/// and connection pin are real in all three.
+/// Where a fixture helper reads an attaching peer's cgroup and account. The start time,
+/// image and connection pin are real in all three.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 enum PeerEvidence {
     /// Whatever the instance enrolled.
     AnyCgroup,
-    /// `<root>/peers/<pid>`, for hosts where a test can't place a process in a cgroup.
+    /// `<root>/peers/<pid>` and `<pid>.account`, for a host where a test can't place a
+    /// process in a cgroup or run it under another account.
     Markers,
-    /// The kernel's `/proc/<pid>/cgroup`.
+    /// The kernel's `/proc/<pid>/cgroup` and SO_PEERCRED.
     Real,
 }
 
@@ -165,7 +166,7 @@ fn node_fixture_child() {
             },
             helper_image,
             // SAFETY: geteuid has no preconditions.
-            service_uid: unsafe { libc::geteuid() },
+            helper_uid: unsafe { libc::geteuid() },
             max_enrolled: config.options.max_enrolled,
             test: TestInjection {
                 effects,
@@ -175,16 +176,19 @@ fn node_fixture_child() {
                     PeerEvidence::AnyCgroup => TestPeers {
                         directory: None,
                         any_cgroup: true,
+                        any_account: true,
                         assumed_digest: Some(fixture_digest()),
                     },
                     PeerEvidence::Markers => TestPeers {
                         directory: Some(config.root.join("peers")),
                         any_cgroup: false,
+                        any_account: false,
                         assumed_digest: Some(fixture_digest()),
                     },
                     PeerEvidence::Real => TestPeers {
                         directory: None,
                         any_cgroup: false,
+                        any_account: false,
                         assumed_digest: Some(fixture_digest()),
                     },
                 },
@@ -398,6 +402,22 @@ impl Fixture {
             std::os::unix::net::UnixStream::connect(self.root.join("helper.sock")).is_ok()
         })
         .await;
+        // Peers under other real accounts reach the socket, as the installed group lets
+        // them; the helper's own check is what is being tested.
+        if self.root.join("other-accounts").exists() {
+            std::fs::set_permissions(
+                self.root.join("helper.sock"),
+                std::fs::Permissions::from_mode(0o666),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Lets processes under other real accounts reach this fixture's socket and image.
+    #[cfg(target_os = "linux")]
+    fn allow_other_accounts(&self) {
+        std::fs::write(self.root.join("other-accounts"), b"").unwrap();
+        std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o711)).unwrap();
     }
 
     fn helper_pid(&self) -> i32 {

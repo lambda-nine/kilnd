@@ -47,6 +47,8 @@ CREATE TABLE instances (
     instance_id TEXT PRIMARY KEY,
     unit TEXT NOT NULL UNIQUE,
     cgroup TEXT NOT NULL UNIQUE,
+    uid INTEGER NOT NULL UNIQUE CHECK (uid > 0),
+    gid INTEGER NOT NULL UNIQUE CHECK (gid > 0),
     exe_st_dev INTEGER NOT NULL,
     exe_st_ino INTEGER NOT NULL,
     exe_bytes INTEGER NOT NULL,
@@ -191,11 +193,12 @@ BEGIN SELECT RAISE(ABORT, 'the generation counter is permanent'); END;
 
 CREATE TRIGGER instances_no_replace BEFORE INSERT ON instances
 WHEN EXISTS (SELECT 1 FROM instances WHERE rowid = NEW.rowid OR instance_id = NEW.instance_id
-    OR unit = NEW.unit OR cgroup = NEW.cgroup)
+    OR unit = NEW.unit OR cgroup = NEW.cgroup OR uid = NEW.uid OR gid = NEW.gid)
 BEGIN SELECT RAISE(ABORT, 'an instance binding cannot be replaced'); END;
 CREATE TRIGGER instances_no_replace_update BEFORE UPDATE ON instances
 WHEN EXISTS (SELECT 1 FROM instances WHERE rowid != OLD.rowid AND (rowid = NEW.rowid
-    OR instance_id = NEW.instance_id OR unit = NEW.unit OR cgroup = NEW.cgroup))
+    OR instance_id = NEW.instance_id OR unit = NEW.unit OR cgroup = NEW.cgroup
+    OR uid = NEW.uid OR gid = NEW.gid))
 BEGIN SELECT RAISE(ABORT, 'an instance binding cannot be replaced'); END;
 -- Root may re-enroll a unit or image. Identity never changes, and a database binding
 -- is written once, by that instance's first attachment.
@@ -634,6 +637,9 @@ pub enum EnrollOutcome {
     /// Another instance has this unit: one unit serves one instance, or compromising
     /// it would give both.
     UnitTaken,
+    /// Another instance has this UID or GID. Two instances under one account could
+    /// reach each other's memory and files, whatever else separates them.
+    AccountTaken,
     /// Past the fence floor: the space already promised to fences stays promised.
     NoSpace,
 }
@@ -686,12 +692,21 @@ pub struct WorkerRecord {
     pub host_boot_id: Option<String>,
 }
 
+/// One enrolled instance and its account, which is what H partitions by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrolledAccount {
+    pub instance_id: Id128,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// Everything a helper restart replays before serving.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaySnapshot {
     pub generation: u64,
-    pub enrolled: Vec<Id128>,
+    pub enrolled: Vec<EnrolledAccount>,
     pub active_allocations: Vec<InventoryRecord>,
     pub unsettled_workers: Vec<WorkerRecord>,
     pub executable_leases: Vec<ExecutableIdentity>,
@@ -829,6 +844,24 @@ fn expected_schema_digest() -> Result<Digest, rusqlite::Error> {
     let scratch = Connection::open_in_memory()?;
     scratch.execute_batch(SCHEMA)?;
     schema_digest(&scratch)
+}
+
+/// One account serves one instance. The schema already says so; this is the startup
+/// refusal for a ledger that doesn't, however it came to be that way.
+fn audit_accounts(conn: &Connection) -> Result<(), LedgerError> {
+    let shared: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM (SELECT uid FROM instances GROUP BY uid HAVING COUNT(*) > 1))
+              + (SELECT COUNT(*) FROM (SELECT gid FROM instances GROUP BY gid HAVING COUNT(*) > 1))
+              + (SELECT COUNT(*) FROM instances WHERE uid <= 0 OR gid <= 0)",
+        [],
+        |r| r.get(0),
+    )?;
+    if shared != 0 {
+        return Err(LedgerError::Corrupt(
+            "enrolled instances share a Unix account".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_id(text: String) -> Result<Id128, LedgerError> {
@@ -1024,6 +1057,7 @@ impl Ledger {
                 "ledger belongs to node {node}"
             )));
         }
+        audit_accounts(conn)?;
         let generation = self.generation()?;
         // Every stored generation must be behind the counter: a rolled-back counter
         // could otherwise reissue a receipt generation.
@@ -1143,6 +1177,17 @@ impl Ledger {
         if taken != 0 {
             return Ok(EnrollOutcome::UnitTaken);
         }
+        let account_taken: i64 = tx
+            .prepare_cached(
+                "SELECT COUNT(*) FROM instances
+                 WHERE instance_id != ?1 AND (uid = ?2 OR gid = ?3)",
+            )?
+            .query_row(params![instance, enrollment.uid, enrollment.gid], |r| {
+                r.get(0)
+            })?;
+        if account_taken != 0 {
+            return Ok(EnrollOutcome::AccountTaken);
+        }
         let image = &enrollment.executable;
         let (dev, ino, bytes) = (
             signed(image.st_dev, "st_dev")?,
@@ -1161,14 +1206,16 @@ impl Ledger {
             }
             let generation = next_generation(&tx)?;
             tx.prepare_cached(
-                "INSERT INTO instances (instance_id, unit, cgroup, exe_st_dev, exe_st_ino,
+                "INSERT INTO instances (instance_id, unit, cgroup, uid, gid, exe_st_dev, exe_st_ino,
                     exe_bytes, exe_sha256, first_generation)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?
             .execute(params![
                 instance,
                 enrollment.unit,
                 enrollment.cgroup,
+                enrollment.uid,
+                enrollment.gid,
                 dev,
                 ino,
                 bytes,
@@ -1179,14 +1226,16 @@ impl Ledger {
         } else {
             let generation = next_generation(&tx)?;
             tx.prepare_cached(
-                "UPDATE instances SET unit = ?2, cgroup = ?3, exe_st_dev = ?4, exe_st_ino = ?5,
-                    exe_bytes = ?6, exe_sha256 = ?7
+                "UPDATE instances SET unit = ?2, cgroup = ?3, uid = ?4, gid = ?5, exe_st_dev = ?6,
+                    exe_st_ino = ?7, exe_bytes = ?8, exe_sha256 = ?9
                  WHERE instance_id = ?1",
             )?
             .execute(params![
                 instance,
                 enrollment.unit,
                 enrollment.cgroup,
+                enrollment.uid,
+                enrollment.gid,
                 dev,
                 ino,
                 bytes,
@@ -1203,27 +1252,31 @@ impl Ledger {
         let row = self
             .conn
             .prepare_cached(
-                "SELECT unit, cgroup, exe_st_dev, exe_st_ino, exe_bytes, exe_sha256
+                "SELECT unit, cgroup, uid, gid, exe_st_dev, exe_st_ino, exe_bytes, exe_sha256
                  FROM instances WHERE instance_id = ?1",
             )?
             .query_row([instance.to_string()], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, u32>(2)?,
+                    r.get::<_, u32>(3)?,
                     r.get::<_, i64>(4)?,
-                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
                 ))
             })
             .optional()?;
-        let Some((unit, cgroup, dev, ino, bytes, sha)) = row else {
+        let Some((unit, cgroup, uid, gid, dev, ino, bytes, sha)) = row else {
             return Ok(None);
         };
         Ok(Some(Enrollment {
             instance_id: instance,
             unit,
             cgroup,
+            uid,
+            gid,
             executable: EnrolledExecutable {
                 st_dev: unsigned(dev)?,
                 st_ino: unsigned(ino)?,
@@ -1233,14 +1286,18 @@ impl Ledger {
         }))
     }
 
-    fn enrolled_instances(&self) -> Result<Vec<Id128>, LedgerError> {
+    fn enrolled_instances(&self) -> Result<Vec<EnrolledAccount>, LedgerError> {
         let mut statement = self
             .conn
-            .prepare_cached("SELECT instance_id FROM instances ORDER BY instance_id")?;
+            .prepare_cached("SELECT instance_id, uid, gid FROM instances ORDER BY instance_id")?;
         let mut rows = statement.query([])?;
         let mut enrolled = Vec::new();
         while let Some(row) = rows.next()? {
-            enrolled.push(parse_id(row.get(0)?)?);
+            enrolled.push(EnrolledAccount {
+                instance_id: parse_id(row.get(0)?)?,
+                uid: row.get(1)?,
+                gid: row.get(2)?,
+            });
         }
         Ok(enrolled)
     }

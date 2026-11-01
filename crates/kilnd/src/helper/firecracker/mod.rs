@@ -21,7 +21,7 @@ use self::journal::{
     LedgerConfig, StopAuthority, TokenLookup, WorkerIntentSpec,
 };
 use self::manifest::ManifestGate;
-use self::peer::{Enrollment, PeerAttestor, PeerPin};
+use self::peer::{Enrollment, PeerAttestor, PeerCredentials, PeerPin};
 use self::workers::{
     AdmissionAuthority, CallError, Channel, Endpoint, Heartbeat, Lane, LedgerReply, LedgerRequest,
     MonitorCommand, MonitorEvent, MonitorReply, MonitorSockets, NodeConfig, PrepReply, PrepRequest,
@@ -116,6 +116,7 @@ pub enum NodeError {
 struct Attachment {
     epoch: Id128,
     peer_pid: i32,
+    peer_uid: u32,
     /// L's reading, kept for diagnosis. The pin below is what authorizes.
     #[cfg_attr(not(test), allow(dead_code))]
     peer_start: u64,
@@ -272,6 +273,14 @@ impl GateTable {
 
 /// One enrolled instance's fixed share of the node. These exist only for instances root
 /// enrolled, so no request can create one, and none of them is drawn from a common pool.
+/// Every enrolled instance's share, and which account each one belongs to. One account
+/// serves one instance, so a peer's kernel-reported UID names its instance by itself.
+#[derive(Default)]
+struct Shares {
+    by_instance: HashMap<Id128, Arc<InstanceShare>>,
+    by_uid: HashMap<u32, Id128>,
+}
+
 struct InstanceShare {
     /// FIFO: one proof at a time for this instance, and its one attachment slot.
     attach_turn: Arc<Semaphore>,
@@ -453,7 +462,7 @@ pub struct Node {
     attachments: Mutex<HashMap<Id128, Attachment>>,
     /// Filled from the ledger before serving. Enrollment needs the node lock, which this
     /// helper holds, so the set cannot change while it runs.
-    shares: Mutex<Option<HashMap<Id128, Arc<InstanceShare>>>>,
+    shares: Mutex<Option<Shares>>,
     supervisors: Mutex<HashMap<AllocationKey, SupervisorEntry>>,
     pending: Mutex<VecDeque<LedgerRequest>>,
     flushing: tokio::sync::Mutex<()>,
@@ -513,9 +522,9 @@ fn spawn_ledger_slot(
     keep.extend(lock_fd);
     let inherited = revocations.clone();
     #[cfg(not(test))]
-    let attestor = PeerAttestor::new(config.service_uid);
+    let attestor = PeerAttestor::new();
     #[cfg(test)]
-    let attestor = PeerAttestor::with_test_peers(config.service_uid, config.test.peers.clone());
+    let attestor = PeerAttestor::with_test_peers(config.test.peers.clone());
     let pid = workers::spawn_process(&keep, move || {
         workers::ledger_main(
             Endpoint::new(child),
@@ -769,7 +778,11 @@ impl Node {
             Ok(LedgerReply::Replay(snapshot)) => {
                 self.generation_hint
                     .store(snapshot.generation, Ordering::Relaxed);
-                self.load_shares(&snapshot.enrolled);
+                if let Err(reason) = self.load_shares(&snapshot.enrolled) {
+                    // Refused whole. Nothing can attach, and kiln goes on being served.
+                    *self.ledger_fault.lock().unwrap() = Some(reason);
+                    return Ok(());
+                }
                 self.register_infrastructure().await?;
                 if !snapshot.executable_leases.is_empty()
                     && let Some(slot) = self.try_prep_slot()
@@ -809,19 +822,73 @@ impl Node {
     }
 
     /// One fixed share per enrolled instance, sized for the most this policy allows, so
-    /// an instance's share doesn't depend on how many others are enrolled today.
-    fn load_shares(&self, enrolled: &[Id128]) {
+    /// an instance's share doesn't depend on how many others are enrolled today. Every
+    /// separation between instances rests on their accounts, so a ledger that binds one
+    /// to anything but its own serves no instance at all.
+    fn load_shares(&self, enrolled: &[journal::EnrolledAccount]) -> Result<(), String> {
         let capacity = (self.config.max_enrolled as usize).max(enrolled.len());
-        let shares = enrolled
-            .iter()
-            .map(|instance| (*instance, Arc::new(InstanceShare::new(capacity))))
-            .collect();
+        let mut shares = Shares::default();
+        for account in enrolled {
+            peer::validate_account(
+                account.uid,
+                account.gid,
+                self.config.helper_uid,
+                &self.config.ranges,
+            )
+            .map_err(|reason| format!("instance {}: {reason}", account.instance_id))?;
+            if shares
+                .by_uid
+                .insert(account.uid, account.instance_id)
+                .is_some()
+            {
+                return Err("two enrolled instances share a Unix account".into());
+            }
+            shares
+                .by_instance
+                .insert(account.instance_id, Arc::new(InstanceShare::new(capacity)));
+        }
         *self.shares.lock().unwrap() = Some(shares);
+        Ok(())
     }
 
     fn share(&self, instance: Id128) -> Option<Arc<InstanceShare>> {
         let shares = self.shares.lock().unwrap();
-        shares.as_ref()?.get(&instance).cloned()
+        shares.as_ref()?.by_instance.get(&instance).cloned()
+    }
+
+    /// Whether this account is enrolled. The listener asks this before reading anything
+    /// from a connection, so it takes one in-memory lock and nothing else.
+    pub fn admits_uid(&self, uid: u32) -> bool {
+        let shares = self.shares.lock().unwrap();
+        shares.as_ref().is_some_and(|s| s.by_uid.contains_key(&uid))
+    }
+
+    /// The kernel's UID for this peer. A test fixture has only one real account, so its
+    /// peers stand in for theirs the way they do for a cgroup. L reads the same evidence.
+    #[cfg(test)]
+    fn observed_uid(&self, peer: PeerCredentials, instance: Id128) -> u32 {
+        let test = &self.config.test.peers;
+        if test.any_account {
+            let shares = self.shares.lock().unwrap();
+            let mine = shares.as_ref().and_then(|shares| {
+                shares
+                    .by_uid
+                    .iter()
+                    .find(|(_, owner)| **owner == instance)
+                    .map(|(uid, _)| *uid)
+            });
+            return mine.unwrap_or(peer.uid);
+        }
+        test.directory
+            .as_deref()
+            .zip(peer.pid)
+            .and_then(|(directory, pid)| peer::marked_account(directory, pid))
+            .map_or(peer.uid, |(uid, _)| uid)
+    }
+
+    #[cfg(not(test))]
+    fn observed_uid(&self, peer: PeerCredentials, _instance: Id128) -> u32 {
+        peer.uid
     }
 
     /// Journals each startup worker's inherited image identity, when a profile pins it.
@@ -1617,18 +1684,21 @@ impl Node {
     /// The live holder of this instance is the process making this request. It is the
     /// only one any instance-scoped request can speak for: a request from anyone else
     /// gets no lookup, no answer about a token, and no in-memory state of any kind.
-    fn is_holder(&self, instance: Id128, peer_pid: Option<i32>) -> bool {
+    fn is_holder(&self, instance: Id128, peer: PeerCredentials) -> bool {
         let attachments = self.attachments.lock().unwrap();
         attachments.get(&instance).is_some_and(|attachment| {
-            peer_pid == Some(attachment.peer_pid) && attachment.pin.alive()
+            peer.pid == Some(attachment.peer_pid)
+                && peer.uid == attachment.peer_uid
+                && attachment.pin.alive()
         })
     }
 
-    fn epoch_valid(&self, instance: Id128, epoch: Option<Id128>, peer_pid: Option<i32>) -> bool {
+    fn epoch_valid(&self, instance: Id128, epoch: Option<Id128>, peer: PeerCredentials) -> bool {
         let attachments = self.attachments.lock().unwrap();
         attachments.get(&instance).is_some_and(|attachment| {
             Some(attachment.epoch) == epoch
-                && peer_pid == Some(attachment.peer_pid)
+                && peer.pid == Some(attachment.peer_pid)
+                && peer.uid == attachment.peer_uid
                 && attachment.pin.alive()
         })
     }
@@ -1667,26 +1737,31 @@ impl Node {
     pub async fn handle(
         self: &Arc<Self>,
         request: FirecrackerRequest,
-        peer_pid: Option<i32>,
+        peer: PeerCredentials,
         pin: Option<PeerPin>,
         deadline: WireDeadline,
         cancel: &CancellationToken,
     ) -> FirecrackerResponse {
         let instance = request.instance_id;
         let epoch = request.connection_epoch;
+        if let FirecrackerOperation::AttachInstance { database_uuid } = request.operation {
+            return self
+                .attach(instance, database_uuid, peer, pin, deadline)
+                .await;
+        }
+        let peer = PeerCredentials {
+            uid: self.observed_uid(peer, instance),
+            ..peer
+        };
         match request.operation {
-            FirecrackerOperation::AttachInstance { database_uuid } => {
-                self.attach(instance, database_uuid, peer_pid, pin, deadline)
-                    .await
-            }
+            FirecrackerOperation::AttachInstance { .. } => unreachable!("handled above"),
             FirecrackerOperation::Create {
                 allocation_id,
                 sandbox_id,
                 plan,
                 plan_digest,
             } => {
-                let (Some(share), true) =
-                    (self.share(instance), self.is_holder(instance, peer_pid))
+                let (Some(share), true) = (self.share(instance), self.is_holder(instance, peer))
                 else {
                     return FirecrackerResponse::Create(ambiguous_create(
                         AmbiguousClass::OldEpoch,
@@ -1697,7 +1772,7 @@ impl Node {
                 let token = CreateToken {
                     instance,
                     epoch,
-                    peer_pid,
+                    peer,
                     allocation: allocation_id,
                     sandbox_id,
                     plan: plan.0,
@@ -1721,8 +1796,7 @@ impl Node {
                 sandbox_id,
                 plan_digest,
             } => {
-                let (Some(share), true) =
-                    (self.share(instance), self.is_holder(instance, peer_pid))
+                let (Some(share), true) = (self.share(instance), self.is_holder(instance, peer))
                 else {
                     return FirecrackerResponse::Fence(ambiguous_fence(
                         AmbiguousClass::OldEpoch,
@@ -1733,7 +1807,7 @@ impl Node {
                 let token = FenceToken {
                     instance,
                     epoch,
-                    peer_pid,
+                    peer,
                     allocation: allocation_id,
                     sandbox_id,
                     plan_digest,
@@ -1752,7 +1826,7 @@ impl Node {
                 FirecrackerResponse::Fence(reply)
             }
             operation => {
-                if !self.epoch_valid(instance, epoch, peer_pid) {
+                if !self.epoch_valid(instance, epoch, peer) {
                     return group_error(
                         GroupErrorKind::StaleEpoch,
                         "connection epoch is not current for this instance",
@@ -1848,11 +1922,11 @@ impl Node {
         self: &Arc<Self>,
         instance: Id128,
         database_uuid: Id128,
-        peer_pid: Option<i32>,
+        peer: PeerCredentials,
         pin: Option<PeerPin>,
         deadline: WireDeadline,
     ) -> FirecrackerResponse {
-        let (Some(peer_pid), Some(pin)) = (peer_pid, pin) else {
+        let (Some(peer_pid), Some(pin)) = (peer.pid, pin) else {
             return group_error(
                 GroupErrorKind::Unauthorized,
                 "the connecting process cannot be identified",
@@ -1875,6 +1949,7 @@ impl Node {
                 "this instance is not enrolled",
             );
         };
+        let peer_uid = self.observed_uid(peer, instance);
         if self.holder_alive(instance) {
             return group_error(
                 GroupErrorKind::AlreadyAttached,
@@ -1985,6 +2060,7 @@ impl Node {
                 Attachment {
                     epoch,
                     peer_pid,
+                    peer_uid,
                     peer_start,
                     pin,
                     admission_open,
@@ -2020,7 +2096,10 @@ impl Node {
         if matches!(enrolled, Ok(LedgerReply::Done)) {
             let capacity = self.config.max_enrolled as usize;
             if let Some(shares) = self.shares.lock().unwrap().as_mut() {
+                let (uid, _) = peer::fixture_account(instance);
+                shares.by_uid.insert(uid, instance);
                 shares
+                    .by_instance
                     .entry(instance)
                     .or_insert_with(|| Arc::new(InstanceShare::new(capacity)));
             }
@@ -2277,7 +2356,7 @@ impl Node {
             gate.close(class);
             ambiguous_create(class, message)
         };
-        if !self.epoch_valid(token.instance, token.epoch, token.peer_pid) {
+        if !self.epoch_valid(token.instance, token.epoch, token.peer) {
             return reject(
                 AmbiguousClass::OldEpoch,
                 "connection epoch is not current".into(),
@@ -2823,7 +2902,7 @@ impl Node {
                 );
             }
         }
-        if !self.epoch_valid(token.instance, token.epoch, token.peer_pid) {
+        if !self.epoch_valid(token.instance, token.epoch, token.peer) {
             return ambiguous_fence(AmbiguousClass::OldEpoch, "connection epoch is not current");
         }
         if !self.admission_open(token.instance) {
@@ -3182,10 +3261,10 @@ impl Node {
                     "vm": entry.vm.map(|vm| vm.pid),
                 }))
             }).collect::<serde_json::Map<_, _>>(),
-            "closed_gates": self.shares.lock().unwrap().iter().flat_map(|shares| shares.values()).map(|share| {
+            "closed_gates": self.shares.lock().unwrap().iter().flat_map(|shares| shares.by_instance.values()).map(|share| {
                 share.gates.lock().unwrap().gates.values().filter(|g| g.closed().is_some()).count()
             }).sum::<usize>(),
-            "open_gates": self.shares.lock().unwrap().iter().flat_map(|shares| shares.values()).map(|share| {
+            "open_gates": self.shares.lock().unwrap().iter().flat_map(|shares| shares.by_instance.values()).map(|share| {
                 share.gates.lock().unwrap().gates.values().filter(|g| g.closed().is_none()).count()
             }).sum::<usize>(),
             "discarded": self.discarded.lock().unwrap().clone(),
@@ -3218,7 +3297,7 @@ impl Drop for PrepLease {
 struct CreateToken {
     instance: Id128,
     epoch: Option<Id128>,
-    peer_pid: Option<i32>,
+    peer: PeerCredentials,
     allocation: Id128,
     sandbox_id: String,
     plan: Vec<u8>,
@@ -3229,7 +3308,7 @@ struct CreateToken {
 struct FenceToken {
     instance: Id128,
     epoch: Option<Id128>,
-    peer_pid: Option<i32>,
+    peer: PeerCredentials,
     allocation: Id128,
     sandbox_id: String,
     plan_digest: Digest,
@@ -3325,7 +3404,7 @@ pub fn load_profile(
 
 /// The production configuration from a verified root policy. Nothing here accepts a
 /// fixture, and until B7 the production gate leaves the served profile list empty.
-pub fn production_config(policy: NodePolicy, service_uid: u32) -> NodeConfig {
+pub fn production_config(policy: NodePolicy, helper_uid: u32) -> NodeConfig {
     let walk = WalkPolicy::production();
     let mut profiles = Vec::new();
     for catalog in &policy.profiles {
@@ -3367,7 +3446,7 @@ pub fn production_config(policy: NodePolicy, service_uid: u32) -> NodeConfig {
         observation: ObservationBackend::Disabled,
         timings: Timings::default(),
         helper_image,
-        service_uid,
+        helper_uid,
         max_enrolled: policy.max_enrolled_instances,
         #[cfg(test)]
         test: workers::TestInjection::default(),
@@ -3403,13 +3482,17 @@ pub fn provision_ledger(policy: &NodePolicy) -> Result<(), String> {
 
 /// Root's `kilnd-helper enroll`. It takes the node lock, so it runs with the helper
 /// stopped and reaches the ledger by no socket, and the next helper loads the result.
+#[allow(clippy::too_many_arguments)]
 pub fn enroll_instance(
     policy: &NodePolicy,
     instance: Id128,
     unit: &str,
     cgroup: Option<&str>,
+    (uid, gid): (u32, u32),
+    helper_uid: u32,
     kilnd: &Path,
 ) -> Result<String, String> {
+    peer::validate_account(uid, gid, helper_uid, &policy.identity_ranges)?;
     let config = LedgerConfig {
         directory: policy.ledger_dir.clone(),
         policy: WalkPolicy::production(),
@@ -3424,6 +3507,7 @@ pub fn enroll_instance(
         instance,
         unit,
         cgroup,
+        (uid, gid),
         kilnd,
     )
 }
@@ -3434,6 +3518,7 @@ fn enroll_with(
     instance: Id128,
     unit: &str,
     cgroup: Option<&str>,
+    (uid, gid): (u32, u32),
     kilnd: &Path,
 ) -> Result<String, String> {
     let cgroup = peer::unit_cgroup(unit, cgroup)?;
@@ -3453,6 +3538,8 @@ fn enroll_with(
         instance_id: instance,
         unit: unit.to_string(),
         cgroup,
+        uid,
+        gid,
         executable,
     };
     match ledger
@@ -3469,6 +3556,9 @@ fn enroll_with(
             "the node policy allows {limit} enrolled instances, and all are in use"
         )),
         EnrollOutcome::UnitTaken => Err("another instance is enrolled with this unit".into()),
+        EnrollOutcome::AccountTaken => {
+            Err("another instance is enrolled under this UID or GID".into())
+        }
         EnrollOutcome::NoSpace => {
             Err("the ledger has no room left beyond what its fences need".into())
         }

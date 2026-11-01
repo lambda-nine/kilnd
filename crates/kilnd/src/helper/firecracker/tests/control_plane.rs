@@ -13,6 +13,12 @@ const PEER_ENV: &str = "KILND_B3_PEER";
 #[cfg(target_os = "linux")]
 const ROOT_PTRACE_ENV: &str = "KILND_B3_NO_PTRACE_TARGET";
 const VICTIM_UNIT: &str = "victim.service";
+/// Numeric accounts need no passwd entry to run a process, so nothing is left behind.
+const VICTIM_ACCOUNT: (u32, u32) = (64_100, 64_100);
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const ATTACKER_ACCOUNT: (u32, u32) = (64_101, 64_101);
+#[allow(dead_code)]
+const STRANGER_ACCOUNT: (u32, u32) = (64_102, 64_102);
 
 /// This test binary's real identity, which the image its peer processes run must match.
 /// Its digest is the fixture's: hashing it is slow, and peer.rs hashes real images.
@@ -97,10 +103,13 @@ fn peer_fixture_child() {
     runtime.block_on(async move {
         let go = out.with_extension("go");
         wait_until("the test placed this peer", || go.exists()).await;
+        // The socket belongs to the helper, whichever account this peer runs under.
+        let helper_uid = std::fs::metadata(plan.root.join("helper.sock"))
+            .unwrap()
+            .uid();
         let peer = Arc::new(FirecrackerRuntime::with_helper_uid(
             plan.root.join("helper.sock"),
-            // SAFETY: geteuid has no preconditions.
-            unsafe { libc::geteuid() },
+            helper_uid,
             plan.instance,
             plan.database,
         ));
@@ -213,6 +222,17 @@ impl Placement {
         }
     }
 
+    /// Only a marker needs writing: a real account is the one the process really runs as.
+    fn mark_account(&self, pid: i32, (uid, gid): (u32, u32)) {
+        if !matches!(self.evidence, PeerEvidence::Real) {
+            std::fs::write(
+                self.root.join("peers").join(format!("{pid}.account")),
+                format!("{uid}:{gid}"),
+            )
+            .unwrap();
+        }
+    }
+
     fn place(&self, pid: i32, cgroup: &str) {
         match self.evidence {
             PeerEvidence::Real => {
@@ -242,8 +262,21 @@ impl Drop for Placement {
 }
 
 impl Fixture {
-    /// Root's enrollment of this binary's image, with the helper stopped.
+    /// Root's enrollment of this binary's image, with the helper stopped, under an account
+    /// of the instance's own.
     fn enroll(&self, instance: Id128, unit: &str, cgroup: &str, limit: u32) -> EnrollOutcome {
+        let account = super::super::peer::fixture_account(instance);
+        self.enroll_as(instance, unit, cgroup, limit, account)
+    }
+
+    fn enroll_as(
+        &self,
+        instance: Id128,
+        unit: &str,
+        cgroup: &str,
+        limit: u32,
+        (uid, gid): (u32, u32),
+    ) -> EnrollOutcome {
         let config: ChildConfig =
             serde_json::from_slice(&std::fs::read(self.root.join("config.json")).unwrap()).unwrap();
         let mut ledger = Ledger::open(ledger_config(&config)).unwrap();
@@ -253,6 +286,8 @@ impl Fixture {
                     instance_id: instance,
                     unit: unit.into(),
                     cgroup: cgroup.into(),
+                    uid,
+                    gid,
                     executable: own_image(),
                 },
                 limit,
@@ -269,10 +304,28 @@ impl Fixture {
         image: &Path,
         name: &str,
     ) -> Peer {
-        let out = self.root.join(format!("peer-{name}.json"));
-        for extension in ["report", "go", "staged"] {
-            let _ = std::fs::remove_file(out.with_extension(extension));
+        self.spawn_peer_as(plan, placement, cgroup, image, name, VICTIM_ACCOUNT)
+    }
+
+    /// The same, under `account`: for real under real evidence, otherwise by its marker.
+    fn spawn_peer_as(
+        &self,
+        plan: &PeerPlan,
+        placement: &Placement,
+        cgroup: &str,
+        image: &Path,
+        name: &str,
+        account: (u32, u32),
+    ) -> Peer {
+        // Its own directory, since a peer under another account writes its report here.
+        let directory = self.root.join("peer-io").join(name);
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let real_account = matches!(placement.evidence, PeerEvidence::Real);
+        if real_account {
+            std::os::unix::fs::chown(&directory, Some(account.0), Some(account.1)).unwrap();
         }
+        let out = directory.join("plan.json");
         std::fs::write(&out, serde_json::to_vec(plan).unwrap()).unwrap();
         let log = std::fs::OpenOptions::new()
             .create(true)
@@ -281,7 +334,8 @@ impl Fixture {
             .unwrap();
         let child = {
             let _guard = crate::process::spawn_guard();
-            Command::new(image)
+            let mut command = Command::new(image);
+            command
                 .args([
                     "--ignored",
                     "--exact",
@@ -292,10 +346,14 @@ impl Fixture {
                 .env(PEER_ENV, &out)
                 .stdin(Stdio::null())
                 .stdout(log.try_clone().unwrap())
-                .stderr(log)
-                .spawn()
-                .unwrap()
+                .stderr(log);
+            if real_account {
+                use std::os::unix::process::CommandExt;
+                command.uid(account.0).gid(account.1);
+            }
+            command.spawn().unwrap()
         };
+        placement.mark_account(child.id() as i32, account);
         placement.place(child.id() as i32, cgroup);
         std::fs::write(out.with_extension("go"), b"").unwrap();
         Peer { child, out }
@@ -373,9 +431,13 @@ async fn takeover_scenario(evidence: PeerEvidence) {
     let unit_cgroup = placement.cgroup_of(VICTIM_UNIT);
     let elsewhere = placement.cgroup_of("thief.service");
     assert!(matches!(
-        fixture.enroll(instance, VICTIM_UNIT, &unit_cgroup, 8),
+        fixture.enroll_as(instance, VICTIM_UNIT, &unit_cgroup, 8, VICTIM_ACCOUNT),
         EnrollOutcome::Enrolled { .. }
     ));
+    #[cfg(target_os = "linux")]
+    if matches!(evidence, PeerEvidence::Real) {
+        fixture.allow_other_accounts();
+    }
     fixture.start().await;
     let own = std::env::current_exe().unwrap();
     let copied = fixture.root.join("copied-kilnd");
@@ -629,6 +691,8 @@ fn b3_linux_root_attestation_needs_no_cap_sys_ptrace() {
             instance_id: Id128::random(),
             unit: "nobody.service".into(),
             cgroup: "/any".into(),
+            uid: NOBODY,
+            gid: NOBODY,
             executable: EnrolledExecutable {
                 st_dev: meta.dev(),
                 st_ino: meta.ino(),
@@ -636,14 +700,12 @@ fn b3_linux_root_attestation_needs_no_cap_sys_ptrace() {
                 sha256: executable::hash_descriptor(&image, meta.len()).unwrap(),
             },
         };
-        let mut attestor = PeerAttestor::with_test_peers(
-            NOBODY,
-            TestPeers {
-                directory: None,
-                any_cgroup: true,
-                assumed_digest: None,
-            },
-        );
+        let mut attestor = PeerAttestor::with_test_peers(TestPeers {
+            directory: None,
+            any_cgroup: true,
+            any_account: false,
+            assumed_digest: None,
+        });
         attestor.attest(pid, &enrollment).unwrap();
         // Root's own filesystem IDs came back afterward.
         let own = std::fs::File::open(std::env::current_exe().unwrap());
@@ -682,6 +744,80 @@ fn b3_linux_root_attestation_needs_no_cap_sys_ptrace() {
     let _ = target.kill();
     let _ = target.wait();
     assert!(status.success());
+}
+
+/// PoC 01 in reverse. Two real accounts at the laxest Yama setting: the kernel's own
+/// ptrace, signal and file checks separate them, so nothing depends on that sysctl.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs root on Linux: run in the VM"]
+fn b3r_02_linux_root_another_account_cannot_reach_memory_signals_or_state_at_yama_zero() {
+    use std::os::unix::process::CommandExt;
+    assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(original) = self.0.take() {
+                let _ = std::fs::write("/proc/sys/kernel/yama/ptrace_scope", original);
+            }
+        }
+    }
+    let original = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").ok();
+    let _restore = Restore(original.clone());
+    if original.is_some() {
+        std::fs::write("/proc/sys/kernel/yama/ptrace_scope", "0").unwrap();
+    }
+    let mut daemon = Command::new("/bin/sleep")
+        .arg("60")
+        .uid(VICTIM_ACCOUNT.0)
+        .gid(VICTIM_ACCOUNT.1)
+        .spawn()
+        .unwrap();
+    let pid = daemon.id();
+    // A state directory and database as the unit and store leave them.
+    let state = tempfile::Builder::new()
+        .prefix("b3r02")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let database = state.path().join("kilnd.db");
+    std::fs::write(&database, b"token").unwrap();
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::chown(&database, Some(VICTIM_ACCOUNT.0), Some(VICTIM_ACCOUNT.1)).unwrap();
+    std::os::unix::fs::chown(state.path(), Some(VICTIM_ACCOUNT.0), Some(VICTIM_ACCOUNT.1)).unwrap();
+    let as_account = |(uid, gid): (u32, u32), script: &str| {
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .uid(uid)
+            .gid(gid)
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let probes = [
+        ("memory", format!("exec 3<>/proc/{pid}/mem")),
+        ("signal", format!("kill -0 {pid}")),
+        ("database", format!("cat {} >/dev/null", database.display())),
+    ];
+    for (what, script) in &probes {
+        // The control: these probes do work, for the instance's own account.
+        assert!(as_account(VICTIM_ACCOUNT, script), "own account: {what}");
+        assert!(
+            !as_account(ATTACKER_ACCOUNT, script),
+            "other account: {what}"
+        );
+    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Some(value) = &original {
+        drop(_restore);
+        assert_eq!(
+            &std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").unwrap(),
+            value,
+            "the original setting came back"
+        );
+    }
 }
 
 /// The connector's pidfd outlives its number's first owner and reports it gone.
@@ -726,7 +862,8 @@ async fn b3_01_enroll_checks_its_unit_image_limit_and_the_helper_lock() {
     std::fs::write(&kilnd, b"kilnd image").unwrap();
     std::fs::set_permissions(&kilnd, std::fs::Permissions::from_mode(0o755)).unwrap();
     let enroll = |instance: Id128, unit: &str, limit: u32, image: &Path| {
-        super::super::enroll_with(&ledger, limit, instance, unit, None, image)
+        let account = super::super::peer::fixture_account(instance);
+        super::super::enroll_with(&ledger, limit, instance, unit, None, account, image)
     };
     let first = Id128::random();
     let done = enroll(first, "kilnd.service", 2, &kilnd).unwrap();
@@ -775,6 +912,77 @@ async fn b3_01_enroll_checks_its_unit_image_limit_and_the_helper_lock() {
     fixture.start().await;
     let busy = enroll(first, "kilnd.service", 2, &kilnd).unwrap_err();
     assert!(busy.contains("stop kilnd-helper"), "{busy}");
+}
+
+#[tokio::test]
+async fn b3r_02_enroll_refuses_a_shared_or_privileged_account() {
+    let fixture = Fixture::unstarted(NodeOptions::default());
+    let config: ChildConfig =
+        serde_json::from_slice(&std::fs::read(fixture.root.join("config.json")).unwrap()).unwrap();
+    let ledger = ledger_config(&config);
+    private_dir(&fixture.root.join("bin"));
+    let kilnd = fixture.root.join("bin/kilnd");
+    std::fs::write(&kilnd, b"kilnd image").unwrap();
+    std::fs::set_permissions(&kilnd, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let enroll = |instance: Id128, unit: &str, account: (u32, u32)| {
+        super::super::enroll_with(&ledger, 8, instance, unit, None, account, &kilnd)
+    };
+    enroll(Id128::random(), "first.service", VICTIM_ACCOUNT).unwrap();
+    let shared = enroll(Id128::random(), "second.service", VICTIM_ACCOUNT).unwrap_err();
+    assert!(shared.contains("UID or GID"), "{shared}");
+    let row: (i64, i64) = fixture.read(|view| {
+        view.query_row("SELECT uid, gid FROM instances", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+    });
+    assert_eq!(row, (64_100, 64_100), "the row records the account");
+    // Root's command also rules out root, itself and the VM identity ranges.
+    let policy = |uid, gid, helper| {
+        super::super::peer::validate_account(uid, gid, helper, &IdentityRanges::default())
+    };
+    assert!(policy(0, 990, 0).is_err());
+    assert!(policy(990, 0, 0).is_err());
+    assert!(policy(990, 990, 990).is_err());
+    assert!(policy(300_001, 990, 0).is_err());
+    assert!(policy(990, 990, 0).is_ok());
+}
+
+/// A ledger that binds an instance to root or to the VM identity ranges would break
+/// every separation built on accounts, so that node serves no instance at all.
+#[tokio::test]
+async fn b3r_02_a_ledger_binding_a_forbidden_account_serves_no_instance() {
+    for account in [
+        (301_000, 990),
+        // SAFETY: geteuid has no preconditions. The fixture helper's own account.
+        (unsafe { libc::geteuid() }, 990),
+    ] {
+        let fixture = Fixture::unstarted(NodeOptions {
+            auto_enroll: false,
+            ..NodeOptions::default()
+        });
+        let instance = Id128::random();
+        assert!(matches!(
+            fixture.enroll_as(
+                instance,
+                VICTIM_UNIT,
+                "/test.slice/victim.service",
+                8,
+                account
+            ),
+            EnrollOutcome::Enrolled { .. }
+        ));
+        fixture.start().await;
+        let refused = fixture
+            .runtime(instance, Id128::random())
+            .test_epoch(deadline(5))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("account") || refused.contains("VM identity"),
+            "{refused}"
+        );
+    }
 }
 
 #[test]

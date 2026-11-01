@@ -1,12 +1,15 @@
-//! Who may hold an instance. Root enrolls an instance with the systemd unit and the
-//! installed kilnd image allowed to serve it, and AttachInstance proves the connecting
-//! process is that service: right UID, exactly that unit's cgroup, and that executable
-//! by device, inode and digest. Nothing a same-UID process can read or copy takes part.
-//! A database UUID is a reconciliation identifier here, never a credential.
+//! Who may hold an instance. Root enrolls an instance with its own Unix account, the
+//! systemd unit and the installed kilnd image allowed to serve it, and AttachInstance
+//! proves the connecting process is that service: that account, exactly that unit's
+//! cgroup, and that executable by device, inode and digest. One account serves one
+//! instance, so another instance's process is another UID to the kernel, for signals,
+//! ptrace and files alike. A database UUID is a reconciliation identifier, never a
+//! credential.
 //!
 //! L collects this evidence, because H performs no `/proc` or hashing work. The pin is
 //! H's half: the connector's own pidfd, which proves L looked at that exact process.
 use super::executable::{self, ExecutableError, WalkPolicy};
+use super::identity::IdentityRanges;
 use crate::model::{Digest, Id128};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -42,7 +45,37 @@ pub struct Enrollment {
     pub instance_id: Id128,
     pub unit: String,
     pub cgroup: String,
+    /// This instance's own account. No other instance may share either ID.
+    pub uid: u32,
+    pub gid: u32,
     pub executable: EnrolledExecutable,
+}
+
+/// The kernel's identity for the process on a connection, from SO_PEERCRED.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCredentials {
+    pub pid: Option<i32>,
+    pub uid: u32,
+}
+
+/// What root may bind an instance to. An instance's account must be nothing else on this
+/// node: not root, not the helper, and not an identity a VM's jail could later be given.
+pub fn validate_account(
+    uid: u32,
+    gid: u32,
+    helper_uid: u32,
+    ranges: &IdentityRanges,
+) -> Result<(), String> {
+    if uid == 0 || gid == 0 {
+        return Err("an instance cannot run as root".into());
+    }
+    if uid == helper_uid {
+        return Err("an instance cannot run as the helper's own account".into());
+    }
+    if ranges.uid.contains(&uid) || ranges.gid.contains(&gid) {
+        return Err("an instance's account is inside the VM identity ranges".into());
+    }
+    Ok(())
 }
 
 /// A systemd service unit's plain name: one path component, nothing to traverse.
@@ -112,8 +145,8 @@ pub fn read_installed_kilnd(
 pub enum PeerRefusal {
     #[error("the peer process is gone or could not be read: {0}")]
     Unreadable(String),
-    #[error("the peer does not run as the service account")]
-    Uid,
+    #[error("the peer does not run as the instance's account")]
+    Account,
     #[error("the peer is not in the enrolled unit's cgroup")]
     Cgroup,
     #[error("the peer is not running the enrolled kilnd image")]
@@ -127,18 +160,18 @@ pub enum PeerRefusal {
 pub struct PeerFacts {
     /// Real, effective, saved and filesystem UIDs.
     pub uids: [u32; 4],
+    /// The same four GIDs.
+    pub gids: [u32; 4],
     pub cgroup: String,
     pub start_time: u64,
 }
 
 /// The cheap half of the decision, in the order the checks run.
-pub fn check_facts(
-    facts: &PeerFacts,
-    service_uid: u32,
-    enrollment: &Enrollment,
-) -> Result<(), PeerRefusal> {
-    if facts.uids.iter().any(|uid| *uid != service_uid) {
-        return Err(PeerRefusal::Uid);
+pub fn check_facts(facts: &PeerFacts, enrollment: &Enrollment) -> Result<(), PeerRefusal> {
+    if facts.uids.iter().any(|uid| *uid != enrollment.uid)
+        || facts.gids.iter().any(|gid| *gid != enrollment.gid)
+    {
+        return Err(PeerRefusal::Account);
     }
     // Exact: a child cgroup of the unit is not the unit.
     if facts.cgroup != enrollment.cgroup {
@@ -312,6 +345,7 @@ mod platform {
             let stat = self.read_entry("stat")?;
             Ok(PeerFacts {
                 uids: parse_ids(&status, "Uid").ok_or_else(|| invalid("status"))?,
+                gids: parse_ids(&status, "Gid").ok_or_else(|| invalid("status"))?,
                 // No unified line is a hierarchy this contract does not recognize.
                 cgroup: parse_cgroup(&cgroup).unwrap_or_default().to_string(),
                 start_time: parse_start_time(&stat).ok_or_else(|| invalid("stat"))?,
@@ -376,6 +410,7 @@ mod platform {
             }
             Ok(PeerFacts {
                 uids: [info.pbi_ruid, info.pbi_uid, info.pbi_svuid, info.pbi_uid],
+                gids: [info.pbi_rgid, info.pbi_gid, info.pbi_svgid, info.pbi_gid],
                 cgroup: String::new(),
                 start_time: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
             })
@@ -406,6 +441,14 @@ pub fn fixture_digest() -> Digest {
     Digest::of(b"fixture test image")
 }
 
+/// An auto-enrolled instance's own account, outside the VM identity ranges.
+#[cfg(test)]
+pub fn fixture_account(instance: Id128) -> (u32, u32) {
+    let digest = Digest::of(instance.to_string().as_bytes()).to_string();
+    let id = 400_000 + u32::from_str_radix(&digest[..7], 16).unwrap();
+    (id, id)
+}
+
 /// How tests stand in for a cgroup on hosts where the test can't place a process in one.
 /// The rest of the evidence stays real. Compiled out of production.
 #[cfg(test)]
@@ -415,39 +458,65 @@ pub struct TestPeers {
     pub directory: Option<std::path::PathBuf>,
     /// Instances the fixture auto-enrolled accept this process in their own cgroup.
     pub any_cgroup: bool,
+    /// In-process fixtures have one real account, so each peer speaks as the account of
+    /// the instance it names. Tests of accounts themselves leave this off.
+    pub any_account: bool,
     /// A debug test binary takes seconds to hash under an unoptimized SHA-256, once per
     /// helper per attach path. Fixtures take this digest for it, and everything else
     /// about the image stays real. The tests below hash real small images.
     pub assumed_digest: Option<Digest>,
 }
 
+/// A test peer's stand-in account, `<uid>:<gid>`.
+#[cfg(test)]
+pub fn marked_account(directory: &Path, pid: i32) -> Option<(u32, u32)> {
+    let text = std::fs::read_to_string(directory.join(format!("{pid}.account"))).ok()?;
+    let (uid, gid) = text.split_once(':')?;
+    Some((uid.parse().ok()?, gid.parse().ok()?))
+}
+
 /// L's half of attachment. It remembers the digest of the enrolled inode by its stat
 /// identity, so a holder that keeps reattaching cannot make L hash its image each time.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PeerAttestor {
-    service_uid: u32,
     memo: HashMap<ImageStat, Digest>,
     #[cfg(test)]
     test: TestPeers,
 }
 
 impl PeerAttestor {
-    pub fn new(service_uid: u32) -> Self {
-        Self {
-            service_uid,
-            memo: HashMap::new(),
-            #[cfg(test)]
-            test: TestPeers::default(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     #[cfg(test)]
-    pub fn with_test_peers(service_uid: u32, test: TestPeers) -> Self {
+    pub fn with_test_peers(test: TestPeers) -> Self {
         Self {
             test,
-            ..Self::new(service_uid)
+            ..Self::new()
         }
     }
+
+    /// `<directory>/<pid>.account` stands in for the account a test can't actually run a
+    /// process under, as the cgroup marker does for a cgroup. The kernel's otherwise.
+    #[cfg(test)]
+    fn observed_account(&self, pid: i32, facts: &mut PeerFacts, enrollment: &Enrollment) {
+        if self.test.any_account {
+            facts.uids = [enrollment.uid; 4];
+            facts.gids = [enrollment.gid; 4];
+        } else if let Some((uid, gid)) = self
+            .test
+            .directory
+            .as_deref()
+            .and_then(|directory| marked_account(directory, pid))
+        {
+            facts.uids = [uid; 4];
+            facts.gids = [gid; 4];
+        }
+    }
+
+    #[cfg(not(test))]
+    fn observed_account(&self, _pid: i32, _facts: &mut PeerFacts, _enrollment: &Enrollment) {}
 
     #[cfg(test)]
     fn observed_cgroup(&self, pid: i32, real: String, enrollment: &Enrollment) -> String {
@@ -475,7 +544,9 @@ impl PeerAttestor {
         let view = ProcessView::open(pid).map_err(unreadable)?;
         let mut facts = view.facts().map_err(unreadable)?;
         facts.cgroup = self.observed_cgroup(pid, facts.cgroup, enrollment);
-        check_facts(&facts, self.service_uid, enrollment)?;
+        let real_ids = (facts.uids, facts.gids);
+        self.observed_account(pid, &mut facts, enrollment);
+        check_facts(&facts, enrollment)?;
         let image = view.open_image().map_err(unreadable)?;
         let stat = ImageStat::of(&image).map_err(unreadable)?;
         #[cfg(test)]
@@ -494,7 +565,10 @@ impl PeerAttestor {
             Ok(digest)
         })?;
         let after = view.facts().map_err(unreadable)?;
-        if after.start_time != facts.start_time || after.uids != facts.uids || !view.still_alive() {
+        if after.start_time != facts.start_time
+            || (after.uids, after.gids) != real_ids
+            || !view.still_alive()
+        {
             return Err(PeerRefusal::Changed);
         }
         Ok(facts.start_time)
@@ -577,6 +651,8 @@ mod tests {
             instance_id: Id128::from_bytes([7; 16]),
             unit: "kilnd.service".into(),
             cgroup: "/system.slice/kilnd.service".into(),
+            uid: 990,
+            gid: 990,
             executable: EnrolledExecutable {
                 st_dev: 1,
                 st_ino: 2,
@@ -589,6 +665,7 @@ mod tests {
     fn facts() -> PeerFacts {
         PeerFacts {
             uids: [990; 4],
+            gids: [990; 4],
             cgroup: "/system.slice/kilnd.service".into(),
             start_time: 100,
         }
@@ -605,15 +682,22 @@ mod tests {
     }
 
     #[test]
-    fn b3_01_every_uid_and_the_exact_cgroup_must_match() {
-        assert_eq!(check_facts(&facts(), 990, &enrollment()), Ok(()));
+    fn b3r_02_every_uid_every_gid_and_the_exact_cgroup_must_match() {
+        assert_eq!(check_facts(&facts(), &enrollment()), Ok(()));
         for slot in 0..4 {
             let mut other = facts();
             other.uids[slot] = 991;
             assert_eq!(
-                check_facts(&other, 990, &enrollment()),
-                Err(PeerRefusal::Uid),
-                "{slot}"
+                check_facts(&other, &enrollment()),
+                Err(PeerRefusal::Account),
+                "uid {slot}"
+            );
+            let mut other = facts();
+            other.gids[slot] = 991;
+            assert_eq!(
+                check_facts(&other, &enrollment()),
+                Err(PeerRefusal::Account),
+                "gid {slot}"
             );
         }
         for cgroup in [
@@ -626,9 +710,28 @@ mod tests {
             let mut other = facts();
             other.cgroup = cgroup.into();
             assert_eq!(
-                check_facts(&other, 990, &enrollment()),
+                check_facts(&other, &enrollment()),
                 Err(PeerRefusal::Cgroup),
                 "{cgroup}"
+            );
+        }
+    }
+
+    #[test]
+    fn b3r_02_an_account_is_nothing_else_on_the_node() {
+        let ranges = IdentityRanges::default();
+        assert!(validate_account(990, 990, 0, &ranges).is_ok());
+        for (uid, gid, helper) in [
+            (0, 990, 0),
+            (990, 0, 0),
+            (990, 990, 990),
+            (300_000, 990, 0),
+            (365_535, 990, 0),
+            (990, 300_000, 0),
+        ] {
+            assert!(
+                validate_account(uid, gid, helper, &ranges).is_err(),
+                "{uid}:{gid} under helper {helper}"
             );
         }
     }
@@ -717,8 +820,8 @@ mod tests {
 
     #[test]
     fn b3_01_attestor_hashes_a_real_process_image_and_refuses_what_differs() {
-        // SAFETY: geteuid has no preconditions.
-        let uid = unsafe { libc::geteuid() };
+        // SAFETY: getuid and getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
@@ -727,6 +830,8 @@ mod tests {
         let image = wait_for_image(pid);
         let meta = image.metadata().unwrap();
         let mut right = enrollment();
+        right.uid = uid;
+        right.gid = gid;
         right.executable = EnrolledExecutable {
             st_dev: meta.dev(),
             st_ino: meta.ino(),
@@ -736,9 +841,10 @@ mod tests {
         let test = TestPeers {
             directory: None,
             any_cgroup: true,
+            any_account: false,
             assumed_digest: None,
         };
-        let mut attestor = PeerAttestor::with_test_peers(uid, test.clone());
+        let mut attestor = PeerAttestor::with_test_peers(test);
         assert!(attestor.attest(pid, &right).is_ok());
         assert!(attestor.attest(pid, &right).is_ok(), "the memo answers");
         assert_eq!(attestor.memo.len(), 1);
@@ -756,8 +862,12 @@ mod tests {
             attestor.attest(pid, &other_inode),
             Err(PeerRefusal::Executable)
         );
-        let mut other_uid = PeerAttestor::with_test_peers(uid + 1, test);
-        assert_eq!(other_uid.attest(pid, &right), Err(PeerRefusal::Uid));
+        let mut other_uid = right.clone();
+        other_uid.uid = uid + 1;
+        assert_eq!(attestor.attest(pid, &other_uid), Err(PeerRefusal::Account));
+        let mut other_gid = right.clone();
+        other_gid.gid = gid + 1;
+        assert_eq!(attestor.attest(pid, &other_gid), Err(PeerRefusal::Account));
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(matches!(

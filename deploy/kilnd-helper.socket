@@ -5,7 +5,7 @@ After=systemd-tmpfiles-setup.service
 [Socket]
 ListenStream=/run/kilnd-helper/helper.sock
 SocketUser=root
-SocketGroup=kilnd
+SocketGroup=kilnd-helper
 SocketMode=0660
 DirectoryMode=0750
 RemoveOnStop=yes

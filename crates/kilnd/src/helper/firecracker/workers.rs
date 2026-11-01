@@ -870,8 +870,8 @@ pub struct NodeConfig {
     pub timings: Timings,
     /// The verified image every fork-only worker inherits, when a profile pins it.
     pub helper_image: Option<ExecutableIdentity>,
-    /// The kilnd account an attached peer must run as.
-    pub service_uid: u32,
+    /// The helper's own account, which no instance may be enrolled under.
+    pub helper_uid: u32,
     /// Root policy's total of enrolled instances, which sizes each instance's share.
     pub max_enrolled: u32,
     #[cfg(test)]
@@ -1059,10 +1059,13 @@ fn handle_ledger(
             let meta = std::fs::metadata(&path).expect("the fixture peer's image");
             use std::os::unix::fs::MetadataExt;
             let unit = format!("fixture-{instance}.service");
+            let (uid, gid) = super::peer::fixture_account(instance);
             let enrollment = super::peer::Enrollment {
                 instance_id: instance,
                 cgroup: format!("/fixture.slice/{unit}"),
                 unit,
+                uid,
+                gid,
                 executable: super::peer::EnrolledExecutable {
                     st_dev: meta.dev(),
                     st_ino: meta.ino(),

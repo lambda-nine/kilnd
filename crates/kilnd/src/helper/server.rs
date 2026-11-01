@@ -1,4 +1,4 @@
-use super::firecracker::peer::PeerPin;
+use super::firecracker::peer::{PeerCredentials, PeerPin};
 use super::firecracker::{Node, WireDeadline};
 use super::protocol::*;
 use super::{fds, socket::Socket, write_frame};
@@ -86,7 +86,11 @@ pub async fn serve_with_firecracker(
         let stream = accepted.0;
         // Reject before reading any attacker-controlled frame (including root). Darwin
         // refuses this query once a peer has gone, which must not end the listener.
-        if !stream.peer_cred().is_ok_and(|peer| peer.uid() == uid) {
+        let Ok(peer_uid) = stream.peer_cred().map(|peer| peer.uid()) else {
+            continue;
+        };
+        // The kiln account, or an account root enrolled for a Firecracker instance.
+        if peer_uid != uid && !firecracker.as_ref().is_some_and(|n| n.admits_uid(peer_uid)) {
             continue;
         }
         let Ok(framing) = budgets.framing.clone().try_acquire_owned() else {
@@ -97,7 +101,10 @@ pub async fn serve_with_firecracker(
         let firecracker = firecracker.clone();
         let budgets = budgets.clone();
         tasks.spawn(async move {
-            if let Err(error) = handle(stream, runtime, firecracker, framing, budgets, stop).await {
+            let legacy = peer_uid == uid;
+            if let Err(error) =
+                handle(stream, runtime, firecracker, legacy, framing, budgets, stop).await
+            {
                 tracing::warn!(%error, "helper request failed");
                 #[cfg(test)]
                 eprintln!("helper request error: {error}");
@@ -113,6 +120,7 @@ async fn handle(
     stream: UnixStream,
     runtime: Arc<DirectKilnRuntime>,
     firecracker: Option<Arc<Node>>,
+    legacy: bool,
     framing: OwnedSemaphorePermit,
     budgets: Arc<Budgets>,
     cancel: CancellationToken,
@@ -151,6 +159,9 @@ async fn handle(
             )
             .await;
         }
+        // kiln's registry has no instances: it is the service account's alone, and an
+        // enrolled account gets no answer about it at all.
+        Operation::Kiln(_) if !legacy => return Ok(()),
         Operation::Kiln(op) => op,
     };
     // As before, an operation with no slot closes without a reply.
@@ -244,11 +255,13 @@ async fn firecracker_request(
     // really this connection's, and a socket left behind by a process whose PID was
     // later reused speaks for no one.
     let pin = PeerPin::of_connection(stream.0.as_raw_fd()).ok();
-    let peer_pid = stream
-        .0
-        .peer_cred()?
-        .pid()
-        .filter(|_| pin.as_ref().is_some_and(PeerPin::alive));
+    let credentials = stream.0.peer_cred()?;
+    let peer = PeerCredentials {
+        pid: credentials
+            .pid()
+            .filter(|_| pin.as_ref().is_some_and(PeerPin::alive)),
+        uid: credentials.uid(),
+    };
     let instance = request.instance_id;
     let attach = matches!(
         request.operation,
@@ -269,7 +282,7 @@ async fn firecracker_request(
             "only reserved recovery slots remain",
         )),
         Some(node) => {
-            let operation = node.handle(request, peer_pid, pin, deadline, &waiter);
+            let operation = node.handle(request, peer, pin, deadline, &waiter);
             tokio::pin!(operation);
             tokio::select! {
                 response = &mut operation => response,

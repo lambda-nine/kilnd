@@ -28,8 +28,9 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Root-only: names the systemd unit and installed kilnd image allowed to serve an
-    /// instance. Stop kilnd-helper first: this takes its node lock, and runs over no socket.
+    /// Root-only: names the Unix account, systemd unit and installed kilnd image allowed to
+    /// serve an instance. Stop kilnd-helper first: this takes its node lock, and runs over
+    /// no socket.
     Enroll {
         /// The instance's 32-digit hexadecimal ID.
         #[arg(long)]
@@ -40,6 +41,10 @@ enum Command {
         /// The unit's exact cgroup, when it isn't /system.slice/<unit>.
         #[arg(long)]
         cgroup: Option<String>,
+        /// The instance's own Unix account, which no other instance may share. The default
+        /// suits one instance; each further one needs its own, such as kilnd-<name>.
+        #[arg(long, default_value = "kilnd")]
+        user: String,
         /// The installed kilnd image that unit runs. Enroll again after replacing it.
         #[arg(long, default_value = kilnd::helper::firecracker::peer::DEFAULT_KILND_PATH)]
         kilnd: PathBuf,
@@ -61,6 +66,7 @@ async fn main() -> Result<()> {
         instance,
         unit,
         cgroup,
+        user,
         kilnd,
         policy,
     }) = &args.command
@@ -78,6 +84,9 @@ async fn main() -> Result<()> {
             instance,
             unit,
             cgroup.as_deref(),
+            account(user).with_context(|| format!("--user {user}"))?,
+            // SAFETY: geteuid has no preconditions.
+            unsafe { libc::geteuid() },
             kilnd,
         )
         .map_err(anyhow::Error::msg)
@@ -135,7 +144,9 @@ async fn main() -> Result<()> {
                 None
             }
             Ok(policy) => {
-                let config = kilnd::helper::firecracker::production_config(policy, service_uid);
+                // SAFETY: geteuid has no preconditions.
+                let helper_uid = unsafe { libc::geteuid() };
+                let config = kilnd::helper::firecracker::production_config(policy, helper_uid);
                 match kilnd::helper::firecracker::Node::start(config).await {
                     Ok(node) => Some(node),
                     Err(error) => {
@@ -171,7 +182,16 @@ async fn main() -> Result<()> {
 
 /// The numeric service UID comes only from the root-controlled account database.
 fn service_uid() -> Result<u32> {
-    let name = CString::new("kilnd").unwrap();
+    let (uid, _) = account("kilnd").context("missing kilnd system account")?;
+    if uid == 0 {
+        bail!("missing non-root kilnd system account");
+    }
+    Ok(uid)
+}
+
+/// A named account's UID and primary GID, from that same database.
+fn account(name: &str) -> Result<(u32, u32)> {
+    let name = CString::new(name).context("account name")?;
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut data = vec![0; 16384];
     let mut found = std::ptr::null_mut();
@@ -184,8 +204,8 @@ fn service_uid() -> Result<u32> {
             &mut found,
         )
     };
-    if rc != 0 || found.is_null() || pwd.pw_uid == 0 {
-        bail!("missing non-root kilnd system account");
+    if rc != 0 || found.is_null() {
+        bail!("no such account");
     }
-    Ok(pwd.pw_uid)
+    Ok((pwd.pw_uid, pwd.pw_gid))
 }
