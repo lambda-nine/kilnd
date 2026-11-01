@@ -3477,15 +3477,109 @@ pub fn read_policy(path: &Path, service_uid: u32) -> Result<NodePolicy, String> 
 
 /// The explicit one-time ledger creation. Install scripts do not run this.
 pub fn provision_ledger(policy: &NodePolicy) -> Result<(), String> {
-    journal::Ledger::provision(&LedgerConfig {
+    journal::Ledger::provision(&root_ledger_config(policy)).map_err(|e| e.to_string())
+}
+
+/// The ledger as root's commands reach it, with no helper running.
+fn root_ledger_config(policy: &NodePolicy) -> LedgerConfig {
+    LedgerConfig {
         directory: policy.ledger_dir.clone(),
         policy: WalkPolicy::production(),
         node_id: policy.node_id,
         ceilings: policy.ceilings,
         shared: config::SharedReserve::default(),
         max_enrolled: policy.max_enrolled_instances,
+    }
+}
+
+/// Runs one root command on the ledger under the node lock, which only a stopped helper
+/// leaves free.
+fn with_node_lock<T>(
+    config: &LedgerConfig,
+    command: impl FnOnce(&mut journal::Ledger) -> Result<T, String>,
+) -> Result<T, String> {
+    let directory =
+        executable::walk_directory(&config.policy, &config.directory).map_err(|e| e.to_string())?;
+    let _lock = ExclusiveFileLock::acquire_at(
+        directory.file(),
+        OsStr::new(journal::LEDGER_LOCK),
+        &journal::ledger_lock_path(&config.directory),
+        "Firecracker node ledger",
+    )
+    .map_err(|error| format!("stop kilnd-helper first: {error:#}"))?;
+    let mut ledger = journal::Ledger::open(config.clone()).map_err(|e| e.to_string())?;
+    command(&mut ledger)
+}
+
+/// Root's `kilnd-helper enrollments`: every enrollment, as upgrades read them.
+pub fn list_enrollments(policy: &NodePolicy) -> Result<Vec<Enrollment>, String> {
+    list_enrollments_with(&root_ledger_config(policy))
+}
+
+fn list_enrollments_with(config: &LedgerConfig) -> Result<Vec<Enrollment>, String> {
+    with_node_lock(config, |ledger| {
+        ledger.enrollments().map_err(|e| e.to_string())
     })
-    .map_err(|e| e.to_string())
+}
+
+/// Root's `kilnd-helper refresh-enrollments`: binds every enrolled instance to the image
+/// at `kilnd`, in one transaction, leaving each instance's identity, account and unit
+/// alone. With `check` it proves the same command would work, and writes nothing.
+pub fn refresh_enrollments(
+    policy: &NodePolicy,
+    kilnd: &Path,
+    check: bool,
+) -> Result<String, String> {
+    refresh_enrollments_with(&root_ledger_config(policy), kilnd, check)
+}
+
+fn refresh_enrollments_with(
+    config: &LedgerConfig,
+    kilnd: &Path,
+    check: bool,
+) -> Result<String, String> {
+    with_node_lock(config, |ledger| {
+        let image = peer::read_installed_kilnd(&config.policy, kilnd).map_err(|e| e.to_string())?;
+        let mut rows = ledger.enrollments().map_err(|e| e.to_string())?;
+        if check {
+            return Ok(format!("can refresh {} enrollments", rows.len()));
+        }
+        for row in &mut rows {
+            row.executable = image;
+        }
+        written_images(ledger, &rows)
+    })
+}
+
+/// Root's `kilnd-helper restore-enrollments`: puts back the images `enrollments` printed
+/// earlier, for an upgrade that failed. It can change only images, and only if the
+/// snapshot names exactly the instances enrolled now, each with its stored binding.
+pub fn restore_enrollments(policy: &NodePolicy, snapshot: &[Enrollment]) -> Result<String, String> {
+    restore_enrollments_with(&root_ledger_config(policy), snapshot)
+}
+
+fn restore_enrollments_with(
+    config: &LedgerConfig,
+    snapshot: &[Enrollment],
+) -> Result<String, String> {
+    with_node_lock(config, |ledger| written_images(ledger, snapshot))
+}
+
+fn written_images(ledger: &mut journal::Ledger, rows: &[Enrollment]) -> Result<String, String> {
+    match ledger
+        .set_enrolled_images(rows)
+        .map_err(|e| e.to_string())?
+    {
+        journal::EnrolledImagesOutcome::Updated {
+            generation,
+            instances,
+        } => Ok(format!(
+            "set the image of {instances} enrollments at generation {generation}"
+        )),
+        journal::EnrolledImagesOutcome::IdentityChanged => {
+            Err("the enrolled instances are not the ones named; nothing was changed".into())
+        }
+    }
 }
 
 /// Root's `kilnd-helper enroll`. It takes the node lock, so it runs with the helper
@@ -3501,16 +3595,8 @@ pub fn enroll_instance(
     kilnd: &Path,
 ) -> Result<String, String> {
     peer::validate_account(uid, gid, helper_uid, &policy.identity_ranges)?;
-    let config = LedgerConfig {
-        directory: policy.ledger_dir.clone(),
-        policy: WalkPolicy::production(),
-        node_id: policy.node_id,
-        ceilings: policy.ceilings,
-        shared: config::SharedReserve::default(),
-        max_enrolled: policy.max_enrolled_instances,
-    };
     enroll_with(
-        &config,
+        &root_ledger_config(policy),
         policy.max_enrolled_instances,
         instance,
         unit,
@@ -3530,47 +3616,39 @@ fn enroll_with(
     kilnd: &Path,
 ) -> Result<String, String> {
     let cgroup = peer::unit_cgroup(unit, cgroup)?;
-    let directory =
-        executable::walk_directory(&config.policy, &config.directory).map_err(|e| e.to_string())?;
-    let _lock = ExclusiveFileLock::acquire_at(
-        directory.file(),
-        OsStr::new(journal::LEDGER_LOCK),
-        &journal::ledger_lock_path(&config.directory),
-        "Firecracker node ledger",
-    )
-    .map_err(|error| format!("stop kilnd-helper before enrolling: {error:#}"))?;
-    let executable =
-        peer::read_installed_kilnd(&config.policy, kilnd).map_err(|e| e.to_string())?;
-    let mut ledger = journal::Ledger::open(config.clone()).map_err(|e| e.to_string())?;
-    let enrollment = Enrollment {
-        instance_id: instance,
-        unit: unit.to_string(),
-        cgroup,
-        uid,
-        gid,
-        executable,
-    };
-    match ledger
-        .enroll_instance(&enrollment, limit)
-        .map_err(|e| e.to_string())?
-    {
-        EnrollOutcome::Enrolled { generation } => {
-            Ok(format!("enrolled {instance} at generation {generation}"))
+    with_node_lock(config, |ledger| {
+        let executable =
+            peer::read_installed_kilnd(&config.policy, kilnd).map_err(|e| e.to_string())?;
+        let enrollment = Enrollment {
+            instance_id: instance,
+            unit: unit.to_string(),
+            cgroup,
+            uid,
+            gid,
+            executable,
+        };
+        match ledger
+            .enroll_instance(&enrollment, limit)
+            .map_err(|e| e.to_string())?
+        {
+            EnrollOutcome::Enrolled { generation } => {
+                Ok(format!("enrolled {instance} at generation {generation}"))
+            }
+            EnrollOutcome::Updated { generation } => Ok(format!(
+                "updated {instance}'s enrollment at generation {generation}"
+            )),
+            EnrollOutcome::LimitReached { limit } => Err(format!(
+                "the node policy allows {limit} enrolled instances, and all are in use"
+            )),
+            EnrollOutcome::UnitTaken => Err("another instance is enrolled with this unit".into()),
+            EnrollOutcome::AccountTaken => {
+                Err("another instance is enrolled under this UID or GID".into())
+            }
+            EnrollOutcome::NoSpace => {
+                Err("the ledger has no room left beyond what its fences need".into())
+            }
         }
-        EnrollOutcome::Updated { generation } => Ok(format!(
-            "updated {instance}'s enrollment at generation {generation}"
-        )),
-        EnrollOutcome::LimitReached { limit } => Err(format!(
-            "the node policy allows {limit} enrolled instances, and all are in use"
-        )),
-        EnrollOutcome::UnitTaken => Err("another instance is enrolled with this unit".into()),
-        EnrollOutcome::AccountTaken => {
-            Err("another instance is enrolled under this UID or GID".into())
-        }
-        EnrollOutcome::NoSpace => {
-            Err("the ledger has no room left beyond what its fences need".into())
-        }
-    }
+    })
 }
 
 /// The role J, V and the formatter would be dispatched from, in plan order.

@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::{
     ffi::CString,
+    io::Read,
     os::fd::{AsRawFd, FromRawFd},
     os::unix::fs::MetadataExt,
     path::PathBuf,
@@ -10,6 +11,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
+#[command(version)]
 struct Args {
     #[arg(long, default_value = "/usr/local/bin/kiln")]
     kiln: PathBuf,
@@ -30,7 +32,7 @@ struct Args {
 enum Command {
     /// Root-only: names the Unix account, systemd unit and installed kilnd image allowed to
     /// serve an instance. Stop kilnd-helper first: this takes its node lock, and runs over
-    /// no socket.
+    /// no socket. scripts/add-instance.sh does that, with the ID `kilnd init-state` printed.
     Enroll {
         /// The instance's 32-digit hexadecimal ID.
         #[arg(long)]
@@ -45,14 +47,43 @@ enum Command {
         /// suits one instance; each further one needs its own, such as kilnd-<name>.
         #[arg(long, default_value = "kilnd")]
         user: String,
-        /// The installed kilnd image that unit runs. Enroll again after replacing it.
+        /// The installed kilnd image that unit runs. scripts/upgrade.sh keeps it current.
         #[arg(long, default_value = kilnd::helper::firecracker::peer::DEFAULT_KILND_PATH)]
         kilnd: PathBuf,
         /// The root-owned Firecracker node policy naming the ledger and the enrollment limit.
-        #[arg(long, default_value = "/etc/kilnd/firecracker-node.json")]
+        #[arg(long, default_value = DEFAULT_POLICY)]
+        policy: PathBuf,
+    },
+    /// Root-only, helper stopped: prints every enrollment as JSON.
+    Enrollments {
+        #[arg(long, default_value = DEFAULT_POLICY)]
+        policy: PathBuf,
+    },
+    /// Root-only, helper stopped: binds every enrolled instance to one installed image, in
+    /// one transaction. Instances, accounts and units stay as they are.
+    RefreshEnrollments {
+        #[arg(long, default_value = kilnd::helper::firecracker::peer::DEFAULT_KILND_PATH)]
+        kilnd: PathBuf,
+        /// Prove the ledger and image would allow it, and write nothing.
+        #[arg(long)]
+        check: bool,
+        #[arg(long, default_value = DEFAULT_POLICY)]
+        policy: PathBuf,
+    },
+    /// Root-only, helper stopped: puts back the images that `enrollments` printed earlier.
+    /// Refused unless the file names exactly the instances enrolled, unchanged.
+    RestoreEnrollments {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long, default_value = DEFAULT_POLICY)]
         policy: PathBuf,
     },
 }
+
+const DEFAULT_POLICY: &str = "/etc/kilnd/firecracker-node.json";
+/// Far more than `max_enrolled_instances` rows could print.
+const MAX_SNAPSHOT_BYTES: u64 = 1 << 20;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -62,36 +93,8 @@ async fn main() -> Result<()> {
     unsafe {
         libc::umask(0o077);
     }
-    if let Some(Command::Enroll {
-        instance,
-        unit,
-        cgroup,
-        user,
-        kilnd,
-        policy,
-    }) = &args.command
-    {
-        let instance = kilnd::model::Id128::parse(instance)
-            .map_err(|_| anyhow::anyhow!("--instance must be a 32-digit hexadecimal ID"))?;
-        if !kilnd.is_absolute() {
-            bail!("--kilnd must be absolute");
-        }
-        let policy = kilnd::helper::firecracker::read_policy(policy, service_uid()?)
-            .map_err(anyhow::Error::msg)
-            .context("Firecracker node policy")?;
-        let done = kilnd::helper::firecracker::enroll_instance(
-            &policy,
-            instance,
-            unit,
-            cgroup.as_deref(),
-            account(user).with_context(|| format!("--user {user}"))?,
-            // SAFETY: geteuid has no preconditions.
-            unsafe { libc::geteuid() },
-            kilnd,
-        )
-        .map_err(anyhow::Error::msg)
-        .context("enroll instance")?;
-        println!("{done}");
+    if let Some(command) = &args.command {
+        println!("{}", root_command(command)?);
         return Ok(());
     }
     // No request can select an executable; the administrator's configured
@@ -178,6 +181,77 @@ async fn main() -> Result<()> {
         node.shutdown();
     }
     served.context("root helper")
+}
+
+/// One of root's ledger commands, which reach it by no socket and answer on stdout.
+fn root_command(command: &Command) -> Result<String> {
+    use kilnd::helper::firecracker as fc;
+    let policy_at = |path: &PathBuf| -> Result<fc::config::NodePolicy> {
+        fc::read_policy(path, service_uid()?)
+            .map_err(anyhow::Error::msg)
+            .context("Firecracker node policy")
+    };
+    match command {
+        Command::Enroll {
+            instance,
+            unit,
+            cgroup,
+            user,
+            kilnd,
+            policy,
+        } => {
+            let instance = kilnd::model::Id128::parse(instance)
+                .map_err(|_| anyhow::anyhow!("--instance must be a 32-digit hexadecimal ID"))?;
+            if !kilnd.is_absolute() {
+                bail!("--kilnd must be absolute");
+            }
+            fc::enroll_instance(
+                &policy_at(policy)?,
+                instance,
+                unit,
+                cgroup.as_deref(),
+                account(user).with_context(|| format!("--user {user}"))?,
+                // SAFETY: geteuid has no preconditions.
+                unsafe { libc::geteuid() },
+                kilnd,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("enroll instance")
+        }
+        Command::Enrollments { policy } => {
+            let rows = fc::list_enrollments(&policy_at(policy)?)
+                .map_err(anyhow::Error::msg)
+                .context("read enrollments")?;
+            Ok(serde_json::to_string(&rows)?)
+        }
+        Command::RefreshEnrollments {
+            kilnd,
+            check,
+            policy,
+        } => {
+            if !kilnd.is_absolute() {
+                bail!("--kilnd must be absolute");
+            }
+            fc::refresh_enrollments(&policy_at(policy)?, kilnd, *check)
+                .map_err(anyhow::Error::msg)
+                .context("refresh enrollments")
+        }
+        Command::RestoreEnrollments { snapshot, policy } => {
+            let file = std::fs::File::open(snapshot).context("open the snapshot")?;
+            let mut text = Vec::new();
+            file.take(MAX_SNAPSHOT_BYTES + 1)
+                .read_to_end(&mut text)
+                .context("read the snapshot")?;
+            if text.len() as u64 > MAX_SNAPSHOT_BYTES {
+                bail!("the snapshot is too large");
+            }
+            let rows: Vec<fc::peer::Enrollment> =
+                serde_json::from_slice(&text).context("parse the snapshot")?;
+            fc::restore_enrollments(&policy_at(policy)?, &rows)
+                .map_err(anyhow::Error::msg)
+                .context("restore enrollments")
+        }
+    }
 }
 
 /// The numeric service UID comes only from the root-controlled account database.

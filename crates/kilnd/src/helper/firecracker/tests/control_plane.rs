@@ -864,7 +864,7 @@ async fn b3_01_linux_connection_pin_follows_the_connecting_process() {
 
 /// Another test's fork can hold a copy of the last enrollment's lock descriptor until its
 /// exec closes it. The installed command runs alone, with the helper stopped.
-fn enroll_past_forks(mut enroll: impl FnMut() -> Result<String, String>) -> Result<String, String> {
+fn enroll_past_forks<T>(mut enroll: impl FnMut() -> Result<T, String>) -> Result<T, String> {
     let mut outcome = enroll();
     for _ in 0..200 {
         if !matches!(&outcome, Err(error) if error.contains("stop kilnd-helper")) {
@@ -976,6 +976,81 @@ async fn b3r_02_enroll_refuses_a_shared_or_privileged_account() {
     assert!(policy(990, 990, 990).is_err());
     assert!(policy(300_001, 990, 0).is_err());
     assert!(policy(990, 990, 0).is_ok());
+}
+
+/// B3F-03: root's upgrade commands, against a real ledger and image. They need the same
+/// node lock enrollment does, and they rebind nothing.
+#[tokio::test]
+async fn b3f_03_refresh_binds_every_instance_to_the_new_image_and_restore_undoes_it() {
+    let fixture = Fixture::unstarted(NodeOptions::default());
+    let config: ChildConfig =
+        serde_json::from_slice(&std::fs::read(fixture.root.join("config.json")).unwrap()).unwrap();
+    let ledger = ledger_config(&config);
+    private_dir(&fixture.root.join("bin"));
+    let (old_image, new_image) = (
+        fixture.root.join("bin/kilnd"),
+        fixture.root.join("bin/kilnd-next"),
+    );
+    for (path, bytes) in [(&old_image, &b"old"[..]), (&new_image, &b"newer"[..])] {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (first, second) = (Id128::random(), Id128::random());
+    for (instance, unit, account) in [
+        (first, "first.service", VICTIM_ACCOUNT),
+        (second, "second.service", ATTACKER_ACCOUNT),
+    ] {
+        enroll_past_forks(|| {
+            super::super::enroll_with(&ledger, 8, instance, unit, None, account, &old_image)
+        })
+        .unwrap();
+    }
+    let before = enroll_past_forks(|| super::super::list_enrollments_with(&ledger)).unwrap();
+    assert_eq!(before.len(), 2);
+
+    let checked =
+        enroll_past_forks(|| super::super::refresh_enrollments_with(&ledger, &new_image, true))
+            .unwrap();
+    assert!(checked.contains('2'), "{checked}");
+    assert_eq!(
+        enroll_past_forks(|| super::super::list_enrollments_with(&ledger)).unwrap(),
+        before,
+        "a check writes nothing"
+    );
+    let missing = fixture.root.join("bin/missing");
+    enroll_past_forks(|| super::super::refresh_enrollments_with(&ledger, &missing, false))
+        .unwrap_err();
+
+    enroll_past_forks(|| super::super::refresh_enrollments_with(&ledger, &new_image, false))
+        .unwrap();
+    let after = enroll_past_forks(|| super::super::list_enrollments_with(&ledger)).unwrap();
+    for (old, new) in before.iter().zip(&after) {
+        assert_eq!(
+            (&old.instance_id, &old.unit, &old.cgroup, old.uid, old.gid),
+            (&new.instance_id, &new.unit, &new.cgroup, new.uid, new.gid),
+        );
+        assert_ne!(old.executable, new.executable);
+        assert_eq!(new.executable.bytes, 5);
+    }
+
+    enroll_past_forks(|| super::super::restore_enrollments_with(&ledger, &before)).unwrap();
+    assert_eq!(
+        enroll_past_forks(|| super::super::list_enrollments_with(&ledger)).unwrap(),
+        before
+    );
+    let stale = enroll_past_forks(|| super::super::restore_enrollments_with(&ledger, &before[..1]))
+        .unwrap_err();
+    assert!(stale.contains("nothing was changed"), "{stale}");
+
+    // With a helper running none of them takes any action.
+    fixture.start().await;
+    for busy in [
+        super::super::list_enrollments_with(&ledger).unwrap_err(),
+        super::super::refresh_enrollments_with(&ledger, &new_image, false).unwrap_err(),
+        super::super::restore_enrollments_with(&ledger, &before).unwrap_err(),
+    ] {
+        assert!(busy.contains("stop kilnd-helper"), "{busy}");
+    }
 }
 
 /// A ledger that binds an instance to root or to the VM identity ranges would break

@@ -692,6 +692,18 @@ pub struct WorkerRecord {
     pub host_boot_id: Option<String>,
 }
 
+/// Root's whole-node image update, in one transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnrolledImagesOutcome {
+    Updated {
+        generation: u64,
+        instances: usize,
+    },
+    /// The rows named aren't exactly the ones enrolled, with the same identity, unit and
+    /// account. Nothing was written.
+    IdentityChanged,
+}
+
 /// One enrolled instance and its account, which is what H partitions by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1284,6 +1296,64 @@ impl Ledger {
                 sha256: parse_sha(sha)?,
             },
         }))
+    }
+
+    /// Every enrollment, for root's upgrade: what to refresh, and what to put back.
+    pub fn enrollments(&self) -> Result<Vec<Enrollment>, LedgerError> {
+        let mut rows = Vec::new();
+        for account in self.enrolled_instances()? {
+            rows.extend(self.enrollment(account.instance_id)?);
+        }
+        Ok(rows)
+    }
+
+    /// Replaces the image of every enrolled instance at once, and nothing else about
+    /// them. `rows` must name every enrolled instance with its stored unit, cgroup and
+    /// account, or nothing changes: an upgrade can't rebind anything, and can't leave
+    /// the node half on one image.
+    pub fn set_enrolled_images(
+        &mut self,
+        rows: &[Enrollment],
+    ) -> Result<EnrolledImagesOutcome, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let total: i64 = tx
+            .prepare_cached("SELECT COUNT(*) FROM instances")?
+            .query_row([], |r| r.get(0))?;
+        let named: std::collections::BTreeSet<_> = rows.iter().map(|r| r.instance_id).collect();
+        if unsigned(total)? != rows.len() as u64 || named.len() != rows.len() {
+            return Ok(EnrolledImagesOutcome::IdentityChanged);
+        }
+        for row in rows {
+            let image = &row.executable;
+            let changed = tx
+                .prepare_cached(
+                    "UPDATE instances SET exe_st_dev = ?6, exe_st_ino = ?7, exe_bytes = ?8,
+                        exe_sha256 = ?9
+                     WHERE instance_id = ?1 AND unit = ?2 AND cgroup = ?3 AND uid = ?4 AND gid = ?5",
+                )?
+                .execute(params![
+                    row.instance_id.to_string(),
+                    row.unit,
+                    row.cgroup,
+                    row.uid,
+                    row.gid,
+                    signed(image.st_dev, "st_dev")?,
+                    signed(image.st_ino, "st_ino")?,
+                    signed(image.bytes, "bytes")?,
+                    image.sha256.to_string(),
+                ])?;
+            if changed != 1 {
+                return Ok(EnrolledImagesOutcome::IdentityChanged);
+            }
+        }
+        let generation = next_generation(&tx)?;
+        commit_tx(tx, &self.fail_next_commit)?;
+        Ok(EnrolledImagesOutcome::Updated {
+            generation,
+            instances: rows.len(),
+        })
     }
 
     fn enrolled_instances(&self) -> Result<Vec<EnrolledAccount>, LedgerError> {

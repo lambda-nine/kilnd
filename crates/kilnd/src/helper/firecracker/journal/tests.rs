@@ -1074,6 +1074,84 @@ fn b3r_02_one_account_serves_one_instance() {
     }));
 }
 
+/// B3F-03: a whole-node image change is one transaction, and it can change nothing else.
+#[test]
+fn b3f_03_images_change_for_all_enrolled_instances_or_for_none() {
+    let temp = temp_ledger(NodeCeilings::default());
+    let mut ledger = Ledger::open(temp.config.clone()).unwrap();
+    let (first, second) = (Id128::from_bytes([0x41; 16]), Id128::from_bytes([0x42; 16]));
+    enroll(&mut ledger, first);
+    enroll(&mut ledger, second);
+    let before = ledger.enrollments().unwrap();
+    assert_eq!(before.len(), 2);
+    let image = EnrolledExecutable {
+        st_dev: 7,
+        st_ino: 8,
+        bytes: 9,
+        sha256: Digest::of(b"next kilnd"),
+    };
+    let next: Vec<Enrollment> = before
+        .iter()
+        .cloned()
+        .map(|row| Enrollment {
+            executable: image,
+            ..row
+        })
+        .collect();
+    let refused = |ledger: &mut Ledger, rows: &[Enrollment]| {
+        let generation = ledger.generation().unwrap();
+        assert_eq!(
+            ledger.set_enrolled_images(rows).unwrap(),
+            EnrolledImagesOutcome::IdentityChanged
+        );
+        assert_eq!(ledger.enrollments().unwrap(), before, "nothing was written");
+        assert_eq!(ledger.generation().unwrap(), generation);
+    };
+    // Every row is named, and only rows that exist.
+    refused(&mut ledger, &next[..1]);
+    refused(&mut ledger, &[next[0].clone(), next[0].clone()]);
+    refused(&mut ledger, &[]);
+    let stranger = Enrollment {
+        instance_id: Id128::from_bytes([0x43; 16]),
+        ..next[1].clone()
+    };
+    refused(&mut ledger, &[next[0].clone(), stranger]);
+    // No binding can travel with the image: one bad row leaves the good one unwritten.
+    for changed in [
+        Enrollment {
+            unit: "other.service".into(),
+            ..next[1].clone()
+        },
+        Enrollment {
+            cgroup: "/system.slice/other.service".into(),
+            ..next[1].clone()
+        },
+        Enrollment {
+            uid: next[1].uid + 1000,
+            ..next[1].clone()
+        },
+        Enrollment {
+            gid: next[1].gid + 1000,
+            ..next[1].clone()
+        },
+    ] {
+        refused(&mut ledger, &[next[0].clone(), changed]);
+    }
+    let generation = ledger.generation().unwrap();
+    assert!(matches!(
+        ledger.set_enrolled_images(&next).unwrap(),
+        EnrolledImagesOutcome::Updated { instances: 2, .. }
+    ));
+    assert_eq!(ledger.enrollments().unwrap(), next);
+    assert!(ledger.generation().unwrap() > generation);
+    // The way back is the same transaction with the earlier rows.
+    assert!(matches!(
+        ledger.set_enrolled_images(&before).unwrap(),
+        EnrolledImagesOutcome::Updated { instances: 2, .. }
+    ));
+    assert_eq!(ledger.enrollments().unwrap(), before);
+}
+
 #[test]
 fn b3r_02_startup_refuses_a_ledger_whose_instances_share_an_account() {
     let table = |rows: &str| {

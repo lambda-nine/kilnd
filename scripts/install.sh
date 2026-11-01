@@ -2,7 +2,8 @@
 # Builds kilnd and kilndctl, installs them in /usr/local/bin, creates the
 # kilnd group (allowed to use the API socket) and the kilnd-helper group (allowed to
 # reach the helper socket, whose own check is the peer's UID), and starts the kilnd
-# service. Further instances: scripts/add-instance.sh.
+# service. A node with a Firecracker policy or further instances upgrades as one
+# transaction (scripts/upgrade.sh). Further instances: scripts/add-instance.sh.
 # Needs kiln installed first (kiln's scripts/install.sh). Run inside the VM
 # as your user:
 #   scripts/install.sh
@@ -16,6 +17,19 @@ getent group kilnd >/dev/null || sudo groupadd --system kilnd
 getent passwd kilnd >/dev/null || sudo useradd --system --gid kilnd --home-dir /nonexistent --shell /usr/sbin/nologin kilnd
 getent group kilnd-helper >/dev/null || sudo groupadd --system kilnd-helper
 sudo usermod -a -G kilnd-helper kilnd
+status=0
+sudo python3 -I scripts/kilnd-maintenance.py needs-transaction || status=$?
+case $status in
+    0)
+        # Enrollment names the image, so replacing it has to be one step with every enrolled
+        # instance. The default instance is enrolled here too if it isn't yet.
+        sudo python3 -I scripts/kilnd-maintenance.py upgrade --bin-dir "$target/release" --enroll-default
+        systemctl --no-pager --lines=5 status kilnd || true
+        exit 0
+        ;;
+    1) ;;
+    *) exit "$status" ;;
+esac
 # Stop the old daemon before transferring its private state. No live SQLite
 # files or ownership locks are moved under a running process.
 sudo systemctl stop kilnd.service 2>/dev/null || true
