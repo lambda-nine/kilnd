@@ -20,7 +20,11 @@ async fn exit1_deadline_does_not_race_response_eof_with_a_redundant_cancel_byte(
         fds::send(&stream, &[]).await.unwrap();
         // Withhold the reply beyond the wire deadline. The server owns that timer;
         // a redundant client byte would race its response close on Linux.
-        assert!(timeout(Duration::from_millis(150), stream.read_u8()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(150), stream.read_u8())
+                .await
+                .is_err()
+        );
         write_frame(
             &mut stream,
             &Response::Firecracker(FirecrackerResponse::Error(GroupError::new(

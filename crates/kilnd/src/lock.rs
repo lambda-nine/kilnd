@@ -7,9 +7,9 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -57,13 +57,7 @@ impl ExclusiveFileLock {
         // inode instead of relying on platform-specific O_CREAT races.
         // SAFETY: directory is live, name is NUL-terminated, and the flags
         // are valid for openat.
-        let mut fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                base_flags,
-            )
-        };
+        let mut fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), base_flags) };
         if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
             // SAFETY: same valid directory/name; mode is consumed by O_CREAT.
             fd = unsafe {
@@ -74,14 +68,11 @@ impl ExclusiveFileLock {
                     0o600,
                 )
             };
-            if fd < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists
+            if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists
             {
                 // SAFETY: a contender created the entry; inspect that exact
                 // no-follow target through the still-pinned directory.
-                fd = unsafe {
-                    libc::openat(directory.as_raw_fd(), name.as_ptr(), base_flags)
-                };
+                fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), base_flags) };
             }
         }
         if fd < 0 {

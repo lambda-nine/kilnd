@@ -361,7 +361,11 @@ pub(super) mod tests {
             f[16] = features;
             let c = capabilities(&f).unwrap();
             assert_eq!(c.require_v1().is_ok(), v1, "{features:#x}");
-            assert_eq!(c.require_create_certainty().is_ok(), certainty, "{features:#x}");
+            assert_eq!(
+                c.require_create_certainty().is_ok(),
+                certainty,
+                "{features:#x}"
+            );
         }
     }
 

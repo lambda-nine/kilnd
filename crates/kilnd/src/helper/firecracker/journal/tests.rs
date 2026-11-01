@@ -367,7 +367,9 @@ fn exit6_replay_after_commit_and_reply_loss_returns_the_identical_bytes() {
     let (first, replayed) = {
         let mut ledger = attached(&fixture.config);
         accepted(ledger.admit_intent(&request(1)).unwrap());
-        ledger.settle_unstarted(request(1).allocation_id).unwrap();
+        ledger
+            .settle_unstarted(instance(), request(1).allocation_id)
+            .unwrap();
         // Commit, then lose the reply by dropping everything before anyone sees it.
         absent(ledger.commit_fence(&fence_request(1)).unwrap())
     };
@@ -402,7 +404,9 @@ fn exit6_a_failed_commit_leaves_no_receipt_and_the_claim_held() {
     let fixture = temp_ledger(NodeCeilings::default());
     let mut ledger = attached(&fixture.config);
     accepted(ledger.admit_intent(&request(1)).unwrap());
-    ledger.settle_unstarted(request(1).allocation_id).unwrap();
+    ledger
+        .settle_unstarted(instance(), request(1).allocation_id)
+        .unwrap();
     let before = ledger.accounting().unwrap();
     ledger.fail_next_commit();
     assert!(matches!(
@@ -438,7 +442,9 @@ fn exit6_unsettled_workers_and_conflicts_forbid_the_fence() {
         FenceOutcome::Unsettled { workers: 1 }
     );
     // An identified worker is not "unstarted".
-    ledger.settle_unstarted(request(1).allocation_id).unwrap();
+    ledger
+        .settle_unstarted(instance(), request(1).allocation_id)
+        .unwrap();
     assert_eq!(
         ledger.commit_fence(&fence_request(1)).unwrap(),
         FenceOutcome::Unsettled { workers: 1 }
@@ -476,7 +482,12 @@ fn exit6_unsettled_workers_and_conflicts_forbid_the_fence() {
         other => panic!("{other:?}"),
     };
     ledger
-        .advance_phase(request(1).allocation_id, generation, "quarantined")
+        .advance_phase(
+            instance(),
+            request(1).allocation_id,
+            generation,
+            "quarantined",
+        )
         .unwrap();
     assert!(matches!(
         ledger.commit_fence(&fence_request(1)).unwrap(),
@@ -523,11 +534,11 @@ fn exit6_stale_writers_lose_the_generation_compare() {
     let (generation, _, _) = accepted(ledger.admit_intent(&request(1)).unwrap());
     let allocation = request(1).allocation_id;
     let newer = ledger
-        .advance_phase(allocation, generation, "preparing")
+        .advance_phase(instance(), allocation, generation, "preparing")
         .unwrap();
     assert!(newer > generation);
     assert!(matches!(
-        ledger.advance_phase(allocation, generation, "stopped"),
+        ledger.advance_phase(instance(), allocation, generation, "stopped"),
         Err(LedgerError::StaleGeneration)
     ));
     match ledger
@@ -565,7 +576,9 @@ fn exit6_lowered_limits_deny_new_work_and_discount_nothing() {
         AdmitOutcome::Capacity { .. }
     ));
     // Cleanup still works under the lowered limit, and only ABSENT frees anything.
-    ledger.settle_unstarted(request(1).allocation_id).unwrap();
+    ledger
+        .settle_unstarted(instance(), request(1).allocation_id)
+        .unwrap();
     absent(ledger.commit_fence(&fence_request(1)).unwrap());
     assert_eq!(ledger.accounting().unwrap().claimed.slots, 2);
 }
@@ -594,7 +607,7 @@ fn exit6_fence_allowance_stops_new_tokens_before_accepted_ones_cannot_fence() {
     // Every token already accepted can still reach its permanent fence.
     for index in [1u8, 2] {
         ledger
-            .settle_unstarted(request(index).allocation_id)
+            .settle_unstarted(instance(), request(index).allocation_id)
             .unwrap();
         let (_, replay) = absent(ledger.commit_fence(&fence_request(index)).unwrap());
         assert!(!replay);
@@ -750,7 +763,9 @@ fn exit3_every_identity_type_collides_atomically_and_never_substitutes() {
     equal.leases.cid = GuestCid(9000);
     accepted(ledger.admit_intent(&equal).unwrap());
     // Fencing the holder frees its identities for a later claim, and only then.
-    ledger.settle_unstarted(request(1).allocation_id).unwrap();
+    ledger
+        .settle_unstarted(instance(), request(1).allocation_id)
+        .unwrap();
     absent(ledger.commit_fence(&fence_request(1)).unwrap());
     let mut reuse = request(22);
     reuse.leases = held;
@@ -795,7 +810,7 @@ fn exit2_a_revocation_seen_at_the_commit_point_leaves_no_row_or_claim() {
 }
 
 #[test]
-fn exit3_allocation_and_sandbox_are_unique_across_every_instance() {
+fn exit3_allocation_and_sandbox_are_unique_within_an_instance_and_nowhere_else() {
     let fixture = temp_ledger(unrestricted());
     let mut ledger = attached(&fixture.config);
     let other = Id128::from_bytes([0x44; 16]);
@@ -814,13 +829,7 @@ fn exit3_allocation_and_sandbox_are_unique_across_every_instance() {
         (generation, worker, true)
     );
     assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
-    // Same allocation from another instance, another plan or another sandbox.
-    let mut foreign = request(1);
-    foreign.instance_id = other;
-    assert!(matches!(
-        ledger.admit_intent(&foreign).unwrap(),
-        AdmitOutcome::Conflict { .. }
-    ));
+    // Same allocation, another plan or another sandbox, in this instance.
     let mut replanned = request(1);
     replanned.plan = b"other".to_vec();
     replanned.plan_digest = Digest::of(&replanned.plan);
@@ -848,6 +857,168 @@ fn exit3_allocation_and_sandbox_are_unique_across_every_instance() {
         AdmitOutcome::InstanceMismatch
     );
     assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
+    // The same allocation and sandbox in another instance are another token entirely.
+    let mut foreign = request(1);
+    foreign.instance_id = other;
+    foreign.leases = sample_leases(9);
+    let (_, _, replay) = accepted(ledger.admit_intent(&foreign).unwrap());
+    assert!(!replay);
+    assert_eq!(ledger.accounting().unwrap().claimed.slots, 2);
+    // Host identities really are one namespace, so those alone still collide.
+    let mut same_lease = request(4);
+    same_lease.instance_id = other;
+    same_lease.leases = sample_leases(9);
+    assert!(matches!(
+        ledger.admit_intent(&same_lease).unwrap(),
+        AdmitOutcome::Collision { .. }
+    ));
+}
+
+#[test]
+fn b3r_01_a_fence_from_another_instance_never_reaches_a_token() {
+    let fixture = temp_ledger(unrestricted());
+    let attacker = Id128::from_bytes([0x44; 16]);
+    {
+        let mut ledger = attached(&fixture.config);
+        enroll(&mut ledger, attacker);
+        ledger
+            .attach_instance(attacker, Id128::from_bytes([0x55; 16]))
+            .unwrap();
+        // The attacker copied the victim's token before C2, and its namespace honestly
+        // has nothing by that name, so its own fence commits.
+        let copied = request(1);
+        let mut aimed = fence_request(1);
+        aimed.instance_id = attacker;
+        let FenceOutcome::Absent { receipt, .. } = ledger.commit_fence(&aimed).unwrap() else {
+            panic!("the attacker's namespace is absent");
+        };
+        let receipt = FencedAbsence::decode(&receipt).unwrap();
+        assert_eq!(receipt.instance_id(), attacker);
+        // Visible only in that namespace, and the victim's Create finds nothing.
+        assert_eq!(
+            ledger
+                .lookup_token(instance(), copied.allocation_id, &copied.plan_digest)
+                .unwrap(),
+            TokenLookup::Unknown
+        );
+        assert_eq!(
+            ledger.inspect(instance(), copied.allocation_id).unwrap(),
+            TokenLookup::Unknown
+        );
+        // That is a permanent row, and it still means nothing to the victim's token.
+        drop(ledger);
+    }
+    let mut ledger = Ledger::open(fixture.config.clone()).unwrap();
+    let copied = request(1);
+    let (_, worker, replay) = accepted(ledger.admit_intent(&copied).unwrap());
+    assert!(!replay);
+    assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
+    assert!(matches!(
+        ledger.commit_fence(&fence_request(1)).unwrap(),
+        FenceOutcome::Unsettled { workers: 1 }
+    ));
+    ledger.settle_worker(worker, "exit:0").unwrap();
+    let FenceOutcome::Absent { receipt, replay } = ledger.commit_fence(&fence_request(1)).unwrap()
+    else {
+        panic!("the victim fences its own token exactly");
+    };
+    assert!(!replay);
+    let receipt = FencedAbsence::decode(&receipt).unwrap();
+    assert_eq!(receipt.instance_id(), instance());
+    assert_eq!(receipt.allocation_id(), copied.allocation_id);
+    assert_eq!(ledger.accounting().unwrap().claimed.slots, 0);
+    // The quota the attacker spent is its own.
+    assert_eq!(
+        never_admitted_fences(ledger.connection(), attacker).unwrap(),
+        1
+    );
+    assert_eq!(
+        never_admitted_fences(ledger.connection(), instance()).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn b3r_01_every_row_a_claim_or_fence_writes_names_its_instance() {
+    let fixture = temp_ledger(unrestricted());
+    let other = Id128::from_bytes([0x44; 16]);
+    let mut ledger = attached(&fixture.config);
+    enroll(&mut ledger, other);
+    ledger
+        .attach_instance(other, Id128::from_bytes([0x55; 16]))
+        .unwrap();
+    let mine = request(1);
+    let (generation, worker, _) = accepted(ledger.admit_intent(&mine).unwrap());
+    let mut theirs = request(1);
+    theirs.instance_id = other;
+    theirs.leases = sample_leases(9);
+    let (their_generation, their_worker, _) = accepted(ledger.admit_intent(&theirs).unwrap());
+    // Advancing, stopping or settling one leaves the other's row exactly as it was.
+    ledger
+        .advance_phase(other, mine.allocation_id, their_generation, "preparing")
+        .unwrap();
+    assert!(matches!(
+        ledger.advance_phase(instance(), mine.allocation_id, their_generation, "stopped"),
+        Err(LedgerError::StaleGeneration)
+    ));
+    ledger.settle_unstarted(other, mine.allocation_id).unwrap();
+    let lookup = ledger
+        .lookup_token(instance(), mine.allocation_id, &mine.plan_digest)
+        .unwrap();
+    let TokenLookup::Active {
+        generation: current,
+        phase,
+        unsettled_workers,
+        ..
+    } = lookup
+    else {
+        panic!("{lookup:?}");
+    };
+    assert_eq!((current, phase.as_str()), (generation, "intent"));
+    assert_eq!(
+        unsettled_workers, 1,
+        "the other instance settled only its own"
+    );
+    ledger.settle_worker(their_worker, "exit:0").unwrap();
+    let mut their_fence = fence_request(1);
+    their_fence.instance_id = other;
+    assert!(matches!(
+        ledger.commit_fence(&their_fence).unwrap(),
+        FenceOutcome::Absent { .. }
+    ));
+    assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
+    let conn = ledger.connection();
+    let held: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM capacity_claims WHERE instance_id = ?1
+             AND released_generation IS NULL",
+            [instance().to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(held, 1);
+    let leases: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM identity_leases WHERE instance_id = ?1
+             AND released_generation IS NULL",
+            [instance().to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(leases, 5);
+    let plans: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM allocation_plans WHERE instance_id = ?1",
+            [instance().to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(plans, 1);
+    ledger.settle_worker(worker, "exit:0").unwrap();
+    assert!(matches!(
+        ledger.commit_fence(&fence_request(1)).unwrap(),
+        FenceOutcome::Absent { .. }
+    ));
 }
 
 #[test]
@@ -939,7 +1110,7 @@ fn exit5_generation_leases_hold_until_the_absence_commit_and_observed_tuples_mus
     assert!(ledger.executable_leased(&identity).unwrap());
     // Only the journaled tuple can be attached as what ran.
     ledger
-        .record_observed_executable(allocation, &identity)
+        .record_observed_executable(instance(), allocation, &identity)
         .unwrap();
     for mutate in [
         Box::new(|i: &mut ExecutableIdentity| i.st_ino += 1)
@@ -953,11 +1124,11 @@ fn exit5_generation_leases_hold_until_the_absence_commit_and_observed_tuples_mus
         mutate(&mut other);
         assert!(
             ledger
-                .record_observed_executable(allocation, &other)
+                .record_observed_executable(instance(), allocation, &other)
                 .is_err()
         );
     }
-    ledger.settle_unstarted(allocation).unwrap();
+    ledger.settle_unstarted(instance(), allocation).unwrap();
     absent(ledger.commit_fence(&fence_request(1)).unwrap());
     assert!(!ledger.executable_leased(&identity).unwrap());
 }
@@ -1004,11 +1175,13 @@ fn exit6_every_unique_key_and_conflict_algorithm_is_guarded() {
         let (_, worker, _) = accepted(ledger.admit_intent(&request(1)).unwrap());
         ledger.record_worker_identity(worker, 1, 2, "boot").unwrap();
         ledger
-            .record_stop(request(1).allocation_id, "test")
+            .record_stop(instance(), request(1).allocation_id, "test")
             .unwrap();
         ledger.settle_worker(worker, "exit:0").unwrap();
         accepted(ledger.admit_intent(&request(2)).unwrap());
-        ledger.settle_unstarted(request(2).allocation_id).unwrap();
+        ledger
+            .settle_unstarted(instance(), request(2).allocation_id)
+            .unwrap();
         absent(ledger.commit_fence(&fence_request(2)).unwrap());
     }
     let conn = defenseless(&fixture.config);
@@ -1037,19 +1210,19 @@ fn exit6_every_unique_key_and_conflict_algorithm_is_guarded() {
         ),
         (
             "allocations",
-            "INSERT OR {c} INTO allocations SELECT 'new', instance_id, sandbox_id, 'new-b', plan_version,
+            "INSERT OR {c} INTO allocations SELECT instance_id, 'new', sandbox_id, 'new-b', plan_version,
                 plan_digest, profile, manifest_sha256, host_spec_sha256, guest_exec_spec_sha256, work_uuid,
                 stop_authority, 'absent', created_generation, updated_generation FROM allocations LIMIT 1".into(),
         ),
         (
             "allocations",
-            "INSERT OR {c} INTO allocations SELECT 'new', instance_id, 'new-s', backend_id, plan_version,
+            "INSERT OR {c} INTO allocations SELECT instance_id, 'new', 'new-s', backend_id, plan_version,
                 plan_digest, profile, manifest_sha256, host_spec_sha256, guest_exec_spec_sha256, work_uuid,
                 stop_authority, 'absent', created_generation, updated_generation FROM allocations LIMIT 1".into(),
         ),
         (
             "allocations",
-            "INSERT OR {c} INTO allocations SELECT allocation_id, instance_id, 'new-s', 'new-b', plan_version,
+            "INSERT OR {c} INTO allocations SELECT instance_id, allocation_id, 'new-s', 'new-b', plan_version,
                 plan_digest, profile, manifest_sha256, host_spec_sha256, guest_exec_spec_sha256, work_uuid,
                 stop_authority, 'absent', created_generation, updated_generation FROM allocations LIMIT 1".into(),
         ),
@@ -1064,68 +1237,68 @@ fn exit6_every_unique_key_and_conflict_algorithm_is_guarded() {
         ),
         (
             "allocation_plans",
-            "INSERT OR {c} INTO allocation_plans SELECT allocation_id, x'00' FROM allocation_plans".into(),
+            "INSERT OR {c} INTO allocation_plans SELECT instance_id, allocation_id, x'00' FROM allocation_plans".into(),
         ),
         (
             "capacity_claims",
-            "INSERT OR {c} INTO capacity_claims SELECT allocation_id, 0, 0, 0, 0, 0, 0, 1, NULL FROM capacity_claims LIMIT 1".into(),
+            "INSERT OR {c} INTO capacity_claims SELECT instance_id, allocation_id, 0, 0, 0, 0, 0, 0, 1, NULL FROM capacity_claims LIMIT 1".into(),
         ),
         (
             "identity_leases",
-            "INSERT OR {c} INTO identity_leases (namespace, kind, value, allocation_id, claimed_generation)
-             SELECT namespace, kind, value, 'other', 1 FROM identity_leases WHERE released_generation IS NULL LIMIT 1".into(),
+            "INSERT OR {c} INTO identity_leases (namespace, kind, value, instance_id, allocation_id, claimed_generation)
+             SELECT namespace, kind, value, instance_id, 'other', 1 FROM identity_leases WHERE released_generation IS NULL LIMIT 1".into(),
         ),
         (
             "identity_leases",
-            "INSERT OR {c} INTO identity_leases (namespace, kind, value, allocation_id, claimed_generation)
-             SELECT namespace, kind, 999999, allocation_id, 1 FROM identity_leases LIMIT 1".into(),
+            "INSERT OR {c} INTO identity_leases (namespace, kind, value, instance_id, allocation_id, claimed_generation)
+             SELECT namespace, kind, 999999, instance_id, allocation_id, 1 FROM identity_leases LIMIT 1".into(),
         ),
         (
             "identity_leases",
-            "INSERT OR {c} INTO identity_leases (id, namespace, kind, value, allocation_id, claimed_generation)
-             SELECT id, namespace, kind, 999999, 'other', 1 FROM identity_leases LIMIT 1".into(),
+            "INSERT OR {c} INTO identity_leases (id, namespace, kind, value, instance_id, allocation_id, claimed_generation)
+             SELECT id, namespace, kind, 999999, instance_id, 'other', 1 FROM identity_leases LIMIT 1".into(),
         ),
         (
             "executable_leases",
-            "INSERT OR {c} INTO executable_leases (allocation_id, role, st_dev, st_ino, bytes, sha256, installation_generation)
-             SELECT allocation_id, role, 0, 0, 0, 'x', 1 FROM executable_leases LIMIT 1".into(),
+            "INSERT OR {c} INTO executable_leases (instance_id, allocation_id, role, st_dev, st_ino, bytes, sha256, installation_generation)
+             SELECT instance_id, allocation_id, role, 0, 0, 0, 'x', 1 FROM executable_leases LIMIT 1".into(),
         ),
         (
             "worker_intents",
-            "INSERT OR {c} INTO worker_intents (allocation_id, mode, operation_generation, allowed_names, cgroup,
+            "INSERT OR {c} INTO worker_intents (instance_id, allocation_id, mode, operation_generation, allowed_names, cgroup,
                 exec_role, exec_st_dev, exec_st_ino, exec_bytes, exec_sha256)
-             SELECT allocation_id, mode, operation_generation, '[]', 'x', 'x', 0, 0, 0, 'x' FROM worker_intents LIMIT 1".into(),
+             SELECT instance_id, allocation_id, mode, operation_generation, '[]', 'x', 'x', 0, 0, 0, 'x' FROM worker_intents LIMIT 1".into(),
         ),
         (
             "worker_intents",
-            "INSERT OR {c} INTO worker_intents (id, allocation_id, mode, operation_generation, allowed_names, cgroup,
+            "INSERT OR {c} INTO worker_intents (id, instance_id, allocation_id, mode, operation_generation, allowed_names, cgroup,
                 exec_role, exec_st_dev, exec_st_ino, exec_bytes, exec_sha256)
-             SELECT id, allocation_id, mode, 999999, '[]', 'x', 'x', 0, 0, 0, 'x' FROM worker_intents LIMIT 1".into(),
+             SELECT id, instance_id, allocation_id, mode, 999999, '[]', 'x', 'x', 0, 0, 0, 'x' FROM worker_intents LIMIT 1".into(),
         ),
         (
             "retired_tokens",
-            "INSERT OR {c} INTO retired_tokens SELECT allocation_id, instance_id, sandbox_id, plan_digest,
+            "INSERT OR {c} INTO retired_tokens SELECT instance_id, allocation_id, sandbox_id, plan_digest,
                 'new-r', 999999, x'00' FROM retired_tokens".into(),
         ),
         (
             "retired_tokens",
-            "INSERT OR {c} INTO retired_tokens SELECT 'new', instance_id, sandbox_id, plan_digest,
+            "INSERT OR {c} INTO retired_tokens SELECT instance_id, 'new', sandbox_id, plan_digest,
                 receipt_id, 999999, x'00' FROM retired_tokens".into(),
         ),
         (
             "retired_tokens",
-            "INSERT OR {c} INTO retired_tokens SELECT 'new', instance_id, sandbox_id, plan_digest,
+            "INSERT OR {c} INTO retired_tokens SELECT instance_id, 'new', sandbox_id, plan_digest,
                 'new-r', helper_generation, x'00' FROM retired_tokens".into(),
         ),
         (
             "stop_events",
-            "INSERT OR {c} INTO stop_events (allocation_id, generation, reason)
-             SELECT allocation_id, generation, 'x' FROM stop_events LIMIT 1".into(),
+            "INSERT OR {c} INTO stop_events (instance_id, allocation_id, generation, reason)
+             SELECT instance_id, allocation_id, generation, 'x' FROM stop_events LIMIT 1".into(),
         ),
         (
             "stop_events",
-            "INSERT OR {c} INTO stop_events (id, allocation_id, generation, reason)
-             SELECT id, allocation_id, 999999, 'x' FROM stop_events LIMIT 1".into(),
+            "INSERT OR {c} INTO stop_events (id, instance_id, allocation_id, generation, reason)
+             SELECT id, instance_id, allocation_id, 999999, 'x' FROM stop_events LIMIT 1".into(),
         ),
         // UPDATE OR <algorithm>: moving a row onto another key.
         (
@@ -1257,7 +1430,7 @@ fn exit6_a_held_claim_cannot_coexist_with_a_fence_or_absent_phase() {
     assert!(
         conn.execute(
             "INSERT INTO retired_tokens VALUES (?1, ?2, 'sb', 'd', 'r', 999, x'00')",
-            params![allocation, instance().to_string()],
+            params![instance().to_string(), allocation],
         )
         .is_err()
     );
@@ -1530,7 +1703,7 @@ fn b3_02_never_admitted_fences_stop_at_the_quota_and_admitted_ones_never_do() {
     accepted(ledger.admit_intent(&request(2)).unwrap());
     for index in [1u8, 2] {
         ledger
-            .settle_unstarted(request(index).allocation_id)
+            .settle_unstarted(instance(), request(index).allocation_id)
             .unwrap();
         let (_, replay) = absent(ledger.commit_fence(&fence_request(index)).unwrap());
         assert!(!replay);

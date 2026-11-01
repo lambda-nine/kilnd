@@ -63,8 +63,10 @@ fn workspace_marker_exists(backend_id: &str, marker: &str) -> bool {
     std::fs::read_to_string(format!("/sys/fs/cgroup/kiln/{backend_id}/cgroup.procs"))
         .unwrap()
         .lines()
-        .any(|pid| std::fs::metadata(format!("/proc/{pid}/root/workspace/{marker}"))
-            .is_ok_and(|metadata| metadata.len() > 0))
+        .any(|pid| {
+            std::fs::metadata(format!("/proc/{pid}/root/workspace/{marker}"))
+                .is_ok_and(|metadata| metadata.len() > 0)
+        })
 }
 
 fn io_fd_count() -> usize {
@@ -266,7 +268,10 @@ async fn lifecycle_against_real_kiln() {
         .await
         .unwrap();
     assert_eq!(e.state, ExecutionState::TimedOut);
-    assert!(workspace_marker_exists(&backend_id, "timeout-ready"), "timeout preceded detached-child readiness");
+    assert!(
+        workspace_marker_exists(&backend_id, "timeout-ready"),
+        "timeout preceded detached-child readiness"
+    );
     assert!(e.stdout.total_bytes_known && e.stderr.total_bytes_known);
     assert_eq!(e.stdout.data, b"\0\xffout");
     assert_eq!(e.stderr.data, b"\0\xfeerr");
@@ -355,8 +360,18 @@ async fn leader_exit_stops_detached_descendants_and_closes_output() {
     }
     let tmp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let m = Arc::new(Manager::new(kiln(), Store::open(&tmp.path().join("state")).unwrap(), Limits::default()));
-    let s = m.create(CreateRequest { memory_bytes: 64 << 20, pids: 64, disk_bytes: 16 << 20, ..Default::default() })
+    let m = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        Limits::default(),
+    ));
+    let s = m
+        .create(CreateRequest {
+            memory_bytes: 64 << 20,
+            pids: 64,
+            disk_bytes: 16 << 20,
+            ..Default::default()
+        })
         .await
         .unwrap();
     let script = r#"
@@ -383,7 +398,14 @@ async fn leader_exit_stops_detached_descendants_and_closes_output() {
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::process::Command::new(kiln_bin())
-            .args(["exec", s.backend_id.as_deref().unwrap(), "--", "sh", "-c", script])
+            .args([
+                "exec",
+                s.backend_id.as_deref().unwrap(),
+                "--",
+                "sh",
+                "-c",
+                script,
+            ])
             .env_clear()
             .env("PATH", kilnd::process::SAFE_PATH)
             .kill_on_drop(true)
@@ -391,21 +413,35 @@ async fn leader_exit_stops_detached_descendants_and_closes_output() {
     )
     .await;
     let typed = m.exec(exec(&s.id, &["sh", "-c", script], 10_000)).await;
-    let survivors = m.exec(exec(&s.id, &["sh", "-c", "pgrep sleep || echo none"], 10_000)).await;
+    let survivors = m
+        .exec(exec(
+            &s.id,
+            &["sh", "-c", "pgrep sleep || echo none"],
+            10_000,
+        ))
+        .await;
     // Remove the sandbox even if the raw CLI timed out or left descendants.
     let deleted = m.delete(&s.id).await;
-    let out = result.expect("kiln exec must close inherited output promptly").unwrap();
+    let out = result
+        .expect("kiln exec must close inherited output promptly")
+        .unwrap();
     assert_eq!(out.status.code(), Some(23));
     assert_eq!(out.stdout, b"detached-stdout\nleader-exit\n");
     assert_eq!(out.stderr, b"detached-stderr\n");
     let typed = typed.unwrap();
-    assert_eq!((typed.state, typed.exit_code), (ExecutionState::Exited, Some(23)));
+    assert_eq!(
+        (typed.state, typed.exit_code),
+        (ExecutionState::Exited, Some(23))
+    );
     assert_eq!(typed.stdout.data, b"detached-stdout\nleader-exit\n");
     assert_eq!(typed.stderr.data, b"detached-stderr\n");
     assert!(typed.stdout.total_bytes_known && typed.stderr.total_bytes_known);
     let survivors = survivors.unwrap();
     assert_eq!(survivors.exit_code, Some(0));
-    assert_eq!(survivors.stdout.data, b"none\n", "normal leader exit stopped its detached descendants");
+    assert_eq!(
+        survivors.stdout.data, b"none\n",
+        "normal leader exit stopped its detached descendants"
+    );
     assert_eq!(deleted.unwrap().state, SandboxState::Deleted);
 }
 
@@ -541,8 +577,20 @@ async fn hidden_registry_mount_does_not_mark_a_live_sandbox_lost() {
         );
         let error = manager.delete(&sandbox_id).await.unwrap_err();
         assert!(error.to_string().contains("cgroup"), "{error}");
-        assert_eq!(manager.get(&sandbox_id, 0).unwrap().0.state, SandboxState::Deleting);
-        assert_eq!(manager.health().await.unwrap().node_resources.reserved.sandboxes, 1);
+        assert_eq!(
+            manager.get(&sandbox_id, 0).unwrap().0.state,
+            SandboxState::Deleting
+        );
+        assert_eq!(
+            manager
+                .health()
+                .await
+                .unwrap()
+                .node_resources
+                .reserved
+                .sandboxes,
+            1
+        );
         return;
     }
     if !enabled() {
@@ -637,7 +685,10 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
         async move {
             m.exec(exec(
                 &id,
-                &["sh", "-c", r#"
+                &[
+                    "sh",
+                    "-c",
+                    r#"
                     setsid sh -c '
                         sleep 30 & child=$!
                         kill -0 "$child" || exit 91
@@ -647,7 +698,8 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
                         wait
                     ' &
                     wait
-                "#],
+                "#,
+                ],
                 60_000,
             ))
             .await
@@ -680,8 +732,10 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
     assert_eq!(execution.state, ExecutionState::Canceled);
     assert_eq!(execution.stdout.data, b"\0\xffout");
     assert_eq!(execution.stderr.data, b"\0\xfeerr");
-    assert!(execution.stdout.total_bytes_known && execution.stderr.total_bytes_known,
-        "both workload streams must reach real EOF before cancellation completes");
+    assert!(
+        execution.stdout.total_bytes_known && execution.stderr.total_bytes_known,
+        "both workload streams must reach real EOF before cancellation completes"
+    );
     assert_eq!(
         execution.failure_reason.as_deref(),
         Some("client disconnected")
@@ -772,7 +826,13 @@ async fn node_reservations_bound_concurrent_real_creates_and_survive_restart() {
     ));
     manager.reconcile().await.unwrap();
     assert_eq!(
-        manager.health().await.unwrap().node_resources.reserved.sandboxes,
+        manager
+            .health()
+            .await
+            .unwrap()
+            .node_resources
+            .reserved
+            .sandboxes,
         2
     );
     assert!(matches!(
@@ -804,7 +864,13 @@ async fn node_reservations_bound_concurrent_real_creates_and_survive_restart() {
         manager.delete(&sandbox.id).await.unwrap();
     }
     assert_eq!(
-        manager.health().await.unwrap().node_resources.reserved.sandboxes,
+        manager
+            .health()
+            .await
+            .unwrap()
+            .node_resources
+            .reserved
+            .sandboxes,
         0
     );
 }

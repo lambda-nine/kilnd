@@ -389,9 +389,20 @@ async fn ambiguous_create_with_unlisted_live_backend_keeps_reservation() {
     assert!(fake.state().sandboxes.contains_key(&unreported));
     assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Failed);
     // Also recover an interrupted Delete written by the old list-only path.
-    m.store.set_sandbox_state(&row.id, SandboxState::Deleting, None, None).unwrap();
-    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
-    assert!(m.reconcile().await.unwrap().still_deleting.contains(&row.id));
+    m.store
+        .set_sandbox_state(&row.id, SandboxState::Deleting, None, None)
+        .unwrap();
+    assert!(matches!(
+        m.delete(&row.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
+    assert!(
+        m.reconcile()
+            .await
+            .unwrap()
+            .still_deleting
+            .contains(&row.id)
+    );
     assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Deleting);
     assert_eq!(
         m.health().await.unwrap().node_resources.reserved.sandboxes,
@@ -677,16 +688,30 @@ async fn delete_queued_behind_compensation_preserves_reused_historical_id() {
         result = &mut deletion => panic!("delete unexpectedly finished: {result:?}"),
         () = std::future::ready(()) => {},
     }
-    fake.state().sandboxes.insert(backend_id.clone(), BackendStatus::Running);
+    fake.state()
+        .sandboxes
+        .insert(backend_id.clone(), BackendStatus::Running);
     gate.release();
     assert!(creator.await.unwrap().is_err());
     assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Failed);
-    assert_eq!(m.health().await.unwrap().node_resources.reserved.sandboxes, 0);
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        0
+    );
     assert_eq!(deletion.await.unwrap().state, SandboxState::Deleted);
-    assert_eq!(fake.state().remove_attempts.as_slice(), std::slice::from_ref(&backend_id));
+    assert_eq!(
+        fake.state().remove_attempts.as_slice(),
+        std::slice::from_ref(&backend_id)
+    );
     assert!(fake.state().sandboxes.contains_key(&backend_id));
-    assert_eq!(m.health().await.unwrap().node_resources.reserved.sandboxes, 0);
-    assert_eq!(m.delete(&row.id).await.unwrap().state, SandboxState::Deleted);
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.sandboxes,
+        0
+    );
+    assert_eq!(
+        m.delete(&row.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
 }
 
 #[tokio::test]
@@ -743,7 +768,11 @@ async fn backend_create_panic_is_recorded_as_failed() {
     );
 }
 
-fn on_disk(dir: &std::path::Path, fake: &FakeRuntime, limits: &Limits) -> Arc<Manager<FakeRuntime>> {
+fn on_disk(
+    dir: &std::path::Path,
+    fake: &FakeRuntime,
+    limits: &Limits,
+) -> Arc<Manager<FakeRuntime>> {
     Arc::new(Manager::new(
         fake.clone(),
         Store::reopen_after_restart(dir),
@@ -792,7 +821,12 @@ async fn definite_create_failure_releases_its_budget_and_survives_restart() {
     for row in &rows {
         assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
         assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
-        assert!(row.failure_reason.as_deref().unwrap().contains("image missing"));
+        assert!(
+            row.failure_reason
+                .as_deref()
+                .unwrap()
+                .contains("image missing")
+        );
     }
     assert_eq!(reserved(&m).await, 0);
 
@@ -815,8 +849,16 @@ async fn definite_create_failure_releases_its_budget_and_survives_restart() {
     assert!(fake.state().remove_attempts.is_empty());
     assert_eq!(fake.state().gc_runs, 0);
     assert_eq!(reserved(&m).await, 2);
-    assert!(fake.state().sandboxes.contains_key(first.backend_id.as_ref().unwrap()));
-    assert!(fake.state().sandboxes.contains_key(second.backend_id.as_ref().unwrap()));
+    assert!(
+        fake.state()
+            .sandboxes
+            .contains_key(first.backend_id.as_ref().unwrap())
+    );
+    assert!(
+        fake.state()
+            .sandboxes
+            .contains_key(second.backend_id.as_ref().unwrap())
+    );
 }
 
 #[tokio::test]
@@ -838,7 +880,10 @@ async fn definite_failure_is_not_released_when_its_durable_update_fails() {
     assert_eq!(row.state, SandboxState::Creating);
     assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
     assert_eq!(reserved(&m).await, 1);
-    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.delete(&row.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
     assert!(matches!(
         m.create(CreateRequest::default()).await,
         Err(Error::ResourceExhausted(_))
@@ -847,12 +892,18 @@ async fn definite_failure_is_not_released_when_its_durable_update_fails() {
 
     // Without the durable marker the typed result is gone: restart is ambiguous.
     let m = on_disk(&state, &fake, &limits);
-    assert_eq!(m.reconcile().await.unwrap().failed, std::slice::from_ref(&row.id));
+    assert_eq!(
+        m.reconcile().await.unwrap().failed,
+        std::slice::from_ref(&row.id)
+    );
     let row = m.get(&row.id, 0).unwrap().0;
     assert_eq!(row.state, SandboxState::Failed);
     assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
     assert_eq!(reserved(&m).await, 1);
-    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.delete(&row.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
 }
 
 #[tokio::test]
@@ -877,7 +928,10 @@ async fn ambiguous_post_allocation_failure_stays_charged_across_restart() {
     // The leak is visible but unowned; it is neither adopted nor removed.
     assert_eq!(m.reconcile().await.unwrap().unmanaged, leaked);
     assert_eq!(reserved(&m).await, 1);
-    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.delete(&row.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
     assert!(fake.state().remove_attempts.is_empty());
     assert!(fake.state().sandboxes.contains_key(&leaked[0]));
 
@@ -887,7 +941,10 @@ async fn ambiguous_post_allocation_failure_stays_charged_across_restart() {
     let m = on_disk(&state, &fake, &limits);
     assert_eq!(m.reconcile().await.unwrap(), Reconciled::default());
     assert_eq!(reserved(&m).await, 1);
-    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.delete(&row.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
     fake.state().fail_create_after_allocation = None;
     assert!(matches!(
         m.create(CreateRequest::default()).await,
@@ -919,9 +976,15 @@ async fn create_panic_stays_charged_across_restart() {
     let m = on_disk(&state, &fake, &limits);
     assert_eq!(m.reconcile().await.unwrap(), Reconciled::default());
     let row = m.get(&id, 0).unwrap().0;
-    assert_eq!((row.state, row.create_certainty), (SandboxState::Failed, CreateCertainty::AllocationAmbiguous));
+    assert_eq!(
+        (row.state, row.create_certainty),
+        (SandboxState::Failed, CreateCertainty::AllocationAmbiguous)
+    );
     assert_eq!(reserved(&m).await, 1);
-    assert!(matches!(m.delete(&id).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.delete(&id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
 }
 
 #[tokio::test]
@@ -947,12 +1010,18 @@ async fn definite_failure_holds_its_reservation_until_published_even_without_a_w
     let row = m.list(true).unwrap().remove(0);
     assert_eq!(row.state, SandboxState::Creating);
     assert_eq!(reserved(&m).await, 1);
-    assert!(matches!(m.delete(&row.id).await, Err(Error::FailedPrecondition(_))));
+    assert!(matches!(
+        m.delete(&row.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
 
     gate.release();
     drain(&m).await;
     assert_eq!(reserved(&m).await, 0);
-    assert_eq!(m.delete(&row.id).await.unwrap().state, SandboxState::Deleted);
+    assert_eq!(
+        m.delete(&row.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
     assert!(fake.state().remove_attempts.is_empty());
 }
 
@@ -975,7 +1044,10 @@ async fn delete_of_a_definite_failure_never_reaches_the_backend_after_any_reload
     // coordination lock, reloads rather than rewriting the terminal row.
     let again = m.prepare_delete(&row.id, row.clone()).unwrap();
     assert_eq!(again, first);
-    assert_eq!(again.create_certainty, CreateCertainty::DefinitelyNotCreated);
+    assert_eq!(
+        again.create_certainty,
+        CreateCertainty::DefinitelyNotCreated
+    );
 
     let backend = fake.state();
     assert!(backend.remove_attempts.is_empty());
@@ -1090,7 +1162,9 @@ async fn create_validates_the_spec() {
             ..Default::default()
         },
         CreateRequest {
-            labels: (0..33).map(|n| (format!("key-{n}"), "value".into())).collect(),
+            labels: (0..33)
+                .map(|n| (format!("key-{n}"), "value".into()))
+                .collect(),
             ..Default::default()
         },
         CreateRequest {
@@ -1129,8 +1203,9 @@ async fn create_validates_the_spec() {
         read_only_root: true,
         writable_paths: (0..16).map(|n| format!("/data/{n}")).collect(),
         labels: {
-            let mut labels: BTreeMap<String, String> =
-                (0..31).map(|n| (format!("key-{n}"), "value".into())).collect();
+            let mut labels: BTreeMap<String, String> = (0..31)
+                .map(|n| (format!("key-{n}"), "value".into()))
+                .collect();
             labels.insert("k".repeat(63), "v".repeat(256));
             labels
         },
@@ -1337,7 +1412,8 @@ async fn closed_queued_exec_never_reaches_the_backend_or_store() {
     });
     // A real 1 ms deadline could expire before the readiness gate on a loaded
     // host, leaving this test waiting forever. Control time around admission.
-    tokio::time::timeout(Duration::from_secs(5), gate.entered()).await
+    tokio::time::timeout(Duration::from_secs(5), gate.entered())
+        .await
         .expect("first exec did not reach its backend gate");
 
     let queued = tokio::spawn({
@@ -1554,7 +1630,13 @@ async fn exec_accepts_exact_boundaries_and_preserves_literal_argv() {
     assert_eq!(fake.state().exec_calls, [execution.argv]);
 
     let exact = vec!["echo".into(), "x".repeat(8186)];
-    assert_eq!(exact.iter().map(|arg: &String| arg.len() + 1).sum::<usize>(), 8192);
+    assert_eq!(
+        exact
+            .iter()
+            .map(|arg: &String| arg.len() + 1)
+            .sum::<usize>(),
+        8192
+    );
     m.exec(ExecRequest {
         sandbox_id: sandbox.id.clone(),
         argv: exact,
@@ -2122,7 +2204,10 @@ async fn lowered_node_budgets_degrade_but_keep_cleanup_available() {
     let health = manager.health().await.unwrap();
     assert!(!health.serving);
     assert!(health.detail.contains("exceed configured budgets"));
-    assert_eq!(manager.get(&sandbox.id, 0).unwrap().0.state, SandboxState::Ready);
+    assert_eq!(
+        manager.get(&sandbox.id, 0).unwrap().0.state,
+        SandboxState::Ready
+    );
     assert_eq!(manager.list(false).unwrap().len(), 1);
     assert!(matches!(
         manager.create(CreateRequest::default()).await,
@@ -2198,8 +2283,20 @@ async fn restart_turns_creating_without_an_id_into_reserved_ambiguous_failed() {
         "restart reconciliation released an ambiguous create"
     );
 
-    assert!(matches!(manager.delete(&crashed_create.id).await, Err(Error::FailedPrecondition(_))));
-    assert_eq!(manager.health().await.unwrap().node_resources.reserved.sandboxes, 1);
+    assert!(matches!(
+        manager.delete(&crashed_create.id).await,
+        Err(Error::FailedPrecondition(_))
+    ));
+    assert_eq!(
+        manager
+            .health()
+            .await
+            .unwrap()
+            .node_resources
+            .reserved
+            .sandboxes,
+        1
+    );
 }
 
 #[tokio::test]
@@ -2317,14 +2414,36 @@ async fn output_policy_keeps_live_reply_but_discards_durable_bytes() {
     for mode in [OutputStorage::Metadata, OutputStorage::None] {
         let mut limits = Limits::default();
         limits.retention.output_storage = mode;
-        let manager = Arc::new(Manager::new(FakeRuntime::default(), Store::open_in_memory().unwrap(), limits));
+        let manager = Arc::new(Manager::new(
+            FakeRuntime::default(),
+            Store::open_in_memory().unwrap(),
+            limits,
+        ));
         let sandbox = manager.create(Default::default()).await.unwrap();
-        let live = manager.exec(ExecRequest { sandbox_id: sandbox.id, argv: vec!["echo".into(), "secret".into()], stdin: vec![], timeout_ms: 0 }).await.unwrap();
+        let live = manager
+            .exec(ExecRequest {
+                sandbox_id: sandbox.id,
+                argv: vec!["echo".into(), "secret".into()],
+                stdin: vec![],
+                timeout_ms: 0,
+            })
+            .await
+            .unwrap();
         assert_eq!(live.stdout.data, b"secret\n");
         let stored = manager.execution(&live.id).unwrap();
         assert!(stored.stdout.data.is_empty());
-        assert_eq!(stored.stdout.total_bytes, if mode == OutputStorage::Metadata { 7 } else { 0 });
-        assert_eq!(stored.stdout.total_bytes_known, mode == OutputStorage::Metadata);
+        assert_eq!(
+            stored.stdout.total_bytes,
+            if mode == OutputStorage::Metadata {
+                7
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            stored.stdout.total_bytes_known,
+            mode == OutputStorage::Metadata
+        );
     }
 }
 
@@ -2335,7 +2454,10 @@ async fn health_deadline_releases_waiters_while_cleanup_stays_owned() {
     let cleanup = FakeGate::default();
     fake.state().version_gate = Some(active.clone());
     fake.state().version_cleanup_gate = Some(cleanup.clone());
-    let waiter = tokio::spawn({ let manager = manager.clone(); async move { manager.health().await.unwrap() } });
+    let waiter = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.health().await.unwrap() }
+    });
     active.entered().await;
     tokio::time::advance(Duration::from_secs(2)).await;
     cleanup.entered().await;
@@ -2346,8 +2468,15 @@ async fn health_deadline_releases_waiters_while_cleanup_stays_owned() {
     assert!(!manager.health().await.unwrap().serving);
     assert_eq!(fake.state().version_calls, 1);
     manager.begin_shutdown();
-    let mut drain = tokio::spawn({ let manager = manager.clone(); async move { manager.drain_operations().await } });
-    assert!(tokio::time::timeout(Duration::from_millis(1), &mut drain).await.is_err());
+    let mut drain = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.drain_operations().await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut drain)
+            .await
+            .is_err()
+    );
     cleanup.release();
     drain.await.unwrap();
     assert_eq!(fake.state().active_version_calls, 0);

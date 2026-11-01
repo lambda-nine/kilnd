@@ -2423,7 +2423,10 @@ async fn exit4_monitor_requests_a_stale_supervisors_stop_without_help_from_h() {
     descriptors_host.set_nonblocking(true).unwrap();
     let descriptors = UnixStream::from_std(descriptors_host).unwrap();
     let (watch_monitor, watch_supervisor) = StdStream::pair().unwrap();
-    let allocation = Id128::random();
+    let allocation = super::identity::AllocationKey {
+        instance: Id128::random(),
+        allocation: Id128::random(),
+    };
     fds::send(&descriptors, &[watch_monitor.as_raw_fd()])
         .await
         .unwrap();

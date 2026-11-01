@@ -419,8 +419,12 @@ fn validated_limits(args: &Args) -> Result<Limits> {
     if limits.max_list_page_size == 0 || limits.max_list_page_size > 1000 {
         bail!("--max-list-page-size must be between 1 and 1000");
     }
-    if args.max_timeout_secs > 3600 { bail!("--max-timeout-secs exceeds helper maximum of 3600"); }
-    if args.max_output_bytes > (1 << 20) { bail!("--max-output-bytes exceeds helper maximum of 1 MiB"); }
+    if args.max_timeout_secs > 3600 {
+        bail!("--max-timeout-secs exceeds helper maximum of 3600");
+    }
+    if args.max_output_bytes > (1 << 20) {
+        bail!("--max-output-bytes exceeds helper maximum of 1 MiB");
+    }
     Ok(limits)
 }
 

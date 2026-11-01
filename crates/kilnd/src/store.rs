@@ -2003,7 +2003,10 @@ fn walk_trusted_directory(
                     && stat.st_mode & libc::S_IFMT == libc::S_IFLNK
                 {
                     if pending.is_empty() {
-                        bail!("{resource} directory must not be a symlink: {}", path.display());
+                        bail!(
+                            "{resource} directory must not be a symlink: {}",
+                            path.display()
+                        );
                     }
                     if stat.st_uid != 0 && stat.st_uid != euid {
                         bail!(
@@ -2014,10 +2017,12 @@ fn walk_trusted_directory(
                     }
                     followed_symlinks += 1;
                     if followed_symlinks > 40 {
-                        bail!("too many symlinks while resolving {resource} path {}", dir.display());
+                        bail!(
+                            "too many symlinks while resolving {resource} path {}",
+                            dir.display()
+                        );
                     }
-                    let target =
-                        read_link_at(directories.last().unwrap(), &name, &path, resource)?;
+                    let target = read_link_at(directories.last().unwrap(), &name, &path, resource)?;
                     let target_steps = path_steps(&target)?;
                     for target_step in target_steps.into_iter().rev() {
                         pending.push_front(target_step);
@@ -2138,7 +2143,10 @@ fn read_link_at(directory: &File, name: &OsStr, path: &Path, resource: &str) -> 
         }
         capacity *= 2;
         if capacity > 65_536 {
-            bail!("{resource} path symlink target is too long: {}", path.display());
+            bail!(
+                "{resource} path symlink target is too long: {}",
+                path.display()
+            );
         }
     }
 }
@@ -5004,7 +5012,8 @@ mod tests {
                 .into_bytes(),
         );
         malformed.push(
-            serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&valid).unwrap()).unwrap(),
+            serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&valid).unwrap())
+                .unwrap(),
         );
         malformed.push(
             text.replace("\"helper_generation\":7", "\"helper_generation\":7.0")
@@ -6193,14 +6202,22 @@ mod tests {
             let store = Store::open(tmp.path()).unwrap();
             store.insert_sandbox(&s).unwrap();
             assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
-            store.fail_create_definitely(&s.id, "image missing").unwrap();
+            store
+                .fail_create_definitely(&s.id, "image missing")
+                .unwrap();
         }
         let store = Store::reopen_after_restart(tmp.path());
         let failed = store.sandbox(&s.id).unwrap().unwrap();
         assert_eq!(failed.state, SandboxState::Failed);
-        assert_eq!(failed.create_certainty, CreateCertainty::DefinitelyNotCreated);
+        assert_eq!(
+            failed.create_certainty,
+            CreateCertainty::DefinitelyNotCreated
+        );
         assert_eq!(failed.failure_reason.as_deref(), Some("image missing"));
-        assert_eq!(store.sandbox_resources().unwrap(), SandboxResources::default());
+        assert_eq!(
+            store.sandbox_resources().unwrap(),
+            SandboxResources::default()
+        );
         assert!(store.owned_backend_ids("fake").unwrap().is_empty());
         // Terminal history keeps the marker without any effect on accounting.
         assert!(
@@ -6215,8 +6232,14 @@ mod tests {
                 .unwrap()
         );
         let deleted = store.sandbox(&s.id).unwrap().unwrap();
-        assert_eq!(deleted.create_certainty, CreateCertainty::DefinitelyNotCreated);
-        assert_eq!(store.sandbox_resources().unwrap(), SandboxResources::default());
+        assert_eq!(
+            deleted.create_certainty,
+            CreateCertainty::DefinitelyNotCreated
+        );
+        assert_eq!(
+            store.sandbox_resources().unwrap(),
+            SandboxResources::default()
+        );
     }
 
     #[test]
@@ -6244,7 +6267,9 @@ mod tests {
         let s = sandbox();
         store.insert_sandbox(&s).unwrap();
         store.reject_failed_updates().unwrap();
-        store.fail_create_definitely(&s.id, "image missing").unwrap_err();
+        store
+            .fail_create_definitely(&s.id, "image missing")
+            .unwrap_err();
         let row = store.sandbox(&s.id).unwrap().unwrap();
         assert_eq!(row.state, SandboxState::Creating);
         assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
@@ -6269,8 +6294,17 @@ mod tests {
             let s = sandbox();
             store.insert_sandbox(&s).unwrap();
             let conn = store.conn();
-            assert!(conn.execute("UPDATE sandboxes SET create_certainty = 'definitely_not_created'", []).is_err());
-            assert!(conn.execute("UPDATE sandboxes SET create_certainty = 'other'", []).is_err());
+            assert!(
+                conn.execute(
+                    "UPDATE sandboxes SET create_certainty = 'definitely_not_created'",
+                    []
+                )
+                .is_err()
+            );
+            assert!(
+                conn.execute("UPDATE sandboxes SET create_certainty = 'other'", [])
+                    .is_err()
+            );
             drop(conn);
             store
                 .fail_create_definitely(&s.id, "image missing")
@@ -6286,7 +6320,11 @@ mod tests {
                     "{state:?}"
                 );
             }
-            assert!(store.set_sandbox_state(&s.id, SandboxState::Failed, Some("ab-1"), None).is_err());
+            assert!(
+                store
+                    .set_sandbox_state(&s.id, SandboxState::Failed, Some("ab-1"), None)
+                    .is_err()
+            );
             let row = store.sandbox(&s.id).unwrap().unwrap();
             assert_eq!(row.state, SandboxState::Failed);
             assert_eq!(row.backend_id, None);
@@ -6493,7 +6531,10 @@ mod tests {
         store
             .set_sandbox_state(&first.id, SandboxState::Deleted, None, None)
             .unwrap();
-        assert_eq!(store.sandbox_resources().unwrap(), SandboxResources::default());
+        assert_eq!(
+            store.sandbox_resources().unwrap(),
+            SandboxResources::default()
+        );
         assert_eq!(
             store.reserve_sandbox(&second, budgets).unwrap(),
             ReserveSandbox::Inserted
@@ -6832,7 +6873,9 @@ mod tests {
     fn refuses_a_non_private_state_directory() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = Store::open(tmp.path()).err().expect("0755 state directory was accepted");
+        let error = Store::open(tmp.path())
+            .err()
+            .expect("0755 state directory was accepted");
         assert!(error.to_string().contains("0700"), "{error:#}");
     }
 
@@ -6846,7 +6889,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let target = tmp.path().join("target");
-        std::fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&target)
+            .unwrap();
         let alias = tmp.path().join("state");
         std::os::unix::fs::symlink(&target, &alias).unwrap();
         let symlink = Store::open(&alias)
@@ -6860,20 +6906,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let target = tmp.path().join("target");
-        std::fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&target)
+            .unwrap();
         let state = target.join("state");
-        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .unwrap();
         std::os::unix::fs::symlink("target", tmp.path().join("inner")).unwrap();
         std::os::unix::fs::symlink(tmp.path().join("inner"), tmp.path().join("outer")).unwrap();
 
         let store = Store::open(&tmp.path().join("outer/state")).unwrap();
-        assert_eq!(
-            store.state_directory_identity().unwrap().unwrap(),
-            {
-                let metadata = std::fs::metadata(&state).unwrap();
-                (metadata.dev(), metadata.ino())
-            }
-        );
+        assert_eq!(store.state_directory_identity().unwrap().unwrap(), {
+            let metadata = std::fs::metadata(&state).unwrap();
+            (metadata.dev(), metadata.ino())
+        });
         drop(store);
 
         std::os::unix::fs::symlink("cycle-b", tmp.path().join("cycle-a")).unwrap();
@@ -6913,7 +6962,10 @@ mod tests {
         let foreign_uid = if entry.metadata.uid() == 0 { 1 } else { 0 };
         let database_error = validate_database_entry(&entry, &database, foreign_uid)
             .expect_err("foreign-owned database was accepted");
-        assert!(database_error.to_string().contains("owned"), "{database_error:#}");
+        assert!(
+            database_error.to_string().contains("owned"),
+            "{database_error:#}"
+        );
     }
 
     #[test]
@@ -6933,13 +6985,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = tmp.path().join("state");
-        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .unwrap();
         let target = tmp.path().join("forged.db");
         std::fs::File::create(&target).unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::os::unix::fs::symlink(&target, state.join("kilnd.db")).unwrap();
 
-        let error = Store::open(&state).err().expect("database symlink was followed");
+        let error = Store::open(&state)
+            .err()
+            .expect("database symlink was followed");
         assert!(error.to_string().contains("kilnd.db"), "{error:#}");
         assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
     }
@@ -6949,7 +7006,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = tmp.path().join("state");
-        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .unwrap();
         let target = tmp.path().join("forged-wal");
         std::fs::File::create(&target).unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -6967,13 +7027,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = tmp.path().join("state");
-        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .unwrap();
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(state.join("kilnd.db"))
             .unwrap();
 
-        let error = Store::open(&state).err().expect("database directory was accepted");
+        let error = Store::open(&state)
+            .err()
+            .expect("database directory was accepted");
         assert!(error.to_string().contains("kilnd.db"), "{error:#}");
     }
 
@@ -6982,12 +7047,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = tmp.path().join("state");
-        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .unwrap();
         let database = state.join("kilnd.db");
         std::fs::File::create(&database).unwrap();
         std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let error = Store::open(&state).err().expect("0644 database was accepted");
+        let error = Store::open(&state)
+            .err()
+            .expect("0644 database was accepted");
         assert!(error.to_string().contains("0600"), "{error:#}");
     }
 
@@ -6996,13 +7066,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = tmp.path().join("state");
-        std::fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .unwrap();
         let target = tmp.path().join("forged.db");
         std::fs::File::create(&target).unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::hard_link(&target, state.join("kilnd.db")).unwrap();
 
-        let error = Store::open(&state).err().expect("hard-linked database was accepted");
+        let error = Store::open(&state)
+            .err()
+            .expect("hard-linked database was accepted");
         assert!(error.to_string().contains("one link"), "{error:#}");
     }
 

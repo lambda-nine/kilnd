@@ -1019,6 +1019,287 @@ async fn b3_03_a_token_id_from_another_instance_touches_only_its_senders_gates()
     ));
 }
 
+#[tokio::test]
+async fn b3r_01_a_copied_token_prefenced_by_another_instance_stays_the_victims() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let attacker_id = Id128::random();
+    let attacker = fixture.runtime(attacker_id, Id128::random());
+    epoch_of(&attacker).await;
+    let victim_id = Id128::random();
+    let victim = fixture.runtime(victim_id, Id128::random());
+    // The victim has finished C0, and C1 holds this exact binding.
+    let victim_context = token(victim_id);
+    let victim_plan = prepared(&victim, &victim_context).await;
+    // The attacker retires the copied ID in its own namespace, which is all it can do.
+    let aimed = CreateContext {
+        instance_id: attacker_id,
+        allocation_id: victim_context.allocation_id,
+        sandbox_id: victim_context.sandbox_id.clone(),
+    };
+    let receipt = fenced(
+        attacker
+            .fence_absent(
+                &aimed,
+                &victim_plan.plan_digest(),
+                deadline(20),
+                &no_cancel(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(receipt.instance_id(), attacker_id);
+    // A helper restart changes nothing about whose token this is.
+    fixture.kill_helper().await;
+    fixture.start().await;
+    let renewed = fixture.runtime(victim_id, runtime_database(&fixture, victim_id));
+    assert!(matches!(
+        renewed
+            .inspect_allocation(
+                &victim_context,
+                &victim_plan.plan_digest(),
+                deadline(5),
+                &no_cancel()
+            )
+            .await
+            .unwrap(),
+        AllocationObservation::Unknown { .. }
+    ));
+    assert!(matches!(
+        raw_create(
+            &fixture,
+            &victim_context,
+            epoch_of(&renewed).await,
+            &victim_plan
+        )
+        .await,
+        CreateReply::Accepted { replay: false, .. }
+    ));
+    let receipt = fenced(
+        renewed
+            .fence_absent(
+                &victim_context,
+                &victim_plan.plan_digest(),
+                deadline(20),
+                &no_cancel(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(receipt.instance_id(), victim_id);
+    assert_eq!(receipt.allocation_id(), victim_context.allocation_id);
+}
+
+#[tokio::test]
+async fn b3r_01_a_fence_with_no_create_also_stays_with_the_victim() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let attacker_id = Id128::random();
+    let attacker = fixture.runtime(attacker_id, Id128::random());
+    let victim_id = Id128::random();
+    let victim = fixture.runtime(victim_id, Id128::random());
+    let victim_context = token(victim_id);
+    let victim_plan = prepared(&victim, &victim_context).await;
+    let aimed = CreateContext {
+        instance_id: attacker_id,
+        allocation_id: victim_context.allocation_id,
+        sandbox_id: victim_context.sandbox_id.clone(),
+    };
+    fenced(
+        attacker
+            .fence_absent(
+                &aimed,
+                &victim_plan.plan_digest(),
+                deadline(20),
+                &no_cancel(),
+            )
+            .await
+            .unwrap(),
+    );
+    // The victim's recovery path: its own exact fence, with no Create at all.
+    let receipt = fenced(
+        victim
+            .fence_absent(
+                &victim_context,
+                &victim_plan.plan_digest(),
+                deadline(20),
+                &no_cancel(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(receipt.instance_id(), victim_id);
+    assert_eq!(
+        fixture.count("SELECT COUNT(*) FROM retired_tokens"),
+        2,
+        "one per namespace, and neither conflicts"
+    );
+}
+
+#[tokio::test]
+async fn b3r_01_a_claim_on_a_copied_token_shares_no_name_with_the_victim() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let attacker_id = Id128::random();
+    let attacker = fixture.runtime(attacker_id, Id128::random());
+    let victim_id = Id128::random();
+    let victim = fixture.runtime(victim_id, Id128::random());
+    let victim_context = token(victim_id);
+    let victim_plan = prepared(&victim, &victim_context).await;
+    // The attacker claims first, with the victim's allocation and sandbox IDs.
+    let aimed = CreateContext {
+        instance_id: attacker_id,
+        allocation_id: victim_context.allocation_id,
+        sandbox_id: victim_context.sandbox_id.clone(),
+    };
+    let aimed_plan = prepared(&attacker, &aimed).await;
+    assert!(matches!(
+        raw_create(&fixture, &aimed, epoch_of(&attacker).await, &aimed_plan).await,
+        CreateReply::Accepted { replay: false, .. }
+    ));
+    assert!(matches!(
+        raw_create(
+            &fixture,
+            &victim_context,
+            epoch_of(&victim).await,
+            &victim_plan
+        )
+        .await,
+        CreateReply::Accepted { replay: false, .. }
+    ));
+    // Node-global host names differ, though each plan binds the same allocation ID.
+    let launch = |plan: &PreparedCreate| -> Value {
+        crate::firecracker::strict_json(plan.backend_plan()).unwrap()["launch"].clone()
+    };
+    let (theirs, mine) = (launch(&aimed_plan), launch(&victim_plan));
+    assert_ne!(theirs["jail_root"], mine["jail_root"]);
+    assert_ne!(theirs["jailer_argv"], mine["jailer_argv"]);
+    assert_eq!(
+        fixture.count(&format!(
+            "SELECT COUNT(*) FROM allocations WHERE allocation_id = '{}'",
+            victim_context.allocation_id
+        )),
+        2
+    );
+    // Each one fences alone, and the other's claim doesn't move.
+    fenced(
+        attacker
+            .fence_absent(
+                &aimed,
+                &aimed_plan.plan_digest(),
+                deadline(20),
+                &no_cancel(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(node_totals(&victim).await.claimed.slots, 1);
+    assert_eq!(fixture.active_allocations(), 1);
+    fenced(
+        victim
+            .fence_absent(
+                &victim_context,
+                &victim_plan.plan_digest(),
+                deadline(20),
+                &no_cancel(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(node_totals(&victim).await.claimed.slots, 0);
+}
+
+/// The report's real manager test: paused after its C1, with the row committed, while a
+/// second attached instance pre-fences what it copied from that row.
+#[tokio::test]
+async fn b3r_01_real_manager_paused_after_c1_keeps_an_exact_path_past_a_prefence() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let attacker_id = Id128::random();
+    let attacker = fixture.runtime(attacker_id, Id128::random());
+    epoch_of(&attacker).await;
+
+    let store = Store::open_in_memory().unwrap();
+    let identity = store.identity().unwrap();
+    let runtime = FirecrackerRuntime::with_helper_uid(
+        fixture.root.join("helper.sock"),
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() },
+        identity.instance_id,
+        identity.database_uuid,
+    );
+    let manager = Arc::new(Manager::new(runtime, store, Limits::default()));
+    let window = format!("H.create.enter.{}", identity.instance_id);
+    fixture.fault(&format!("{window}.hold"));
+    let creating = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .create(CreateRequest {
+                    image: "alpine".into(),
+                    memory_bytes: 512 * MIB,
+                    cpu_millis: 1000,
+                    pids: 128,
+                    disk_bytes: 1 << 30,
+                    network: Network::None,
+                    read_only_root: false,
+                    writable_paths: vec![],
+                    labels: BTreeMap::new(),
+                })
+                .await
+        })
+    };
+    fixture.wait_reached(&window).await;
+    // C1 committed: this is the row a daemon's database holds before C2.
+    let rows = manager.list(true).unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = rows[0].clone();
+    let binding = row.accounting.allocation.clone().unwrap();
+    assert!(row.is_charged());
+    assert_eq!(
+        fixture.count(&format!(
+            "SELECT COUNT(*) FROM allocations WHERE allocation_id = '{}'",
+            binding.allocation_id
+        )),
+        0,
+        "C2 has not happened"
+    );
+    let aimed = CreateContext {
+        instance_id: attacker_id,
+        allocation_id: binding.allocation_id,
+        sandbox_id: row.id.clone(),
+    };
+    let receipt = fenced(
+        attacker
+            .fence_absent(&aimed, &binding.plan_digest, deadline(20), &no_cancel())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(receipt.instance_id(), attacker_id);
+    fixture.clear(&format!("{window}.hold"));
+    // The victim's Create reaches its own C2: the attacker's row is no obstacle.
+    let _ = creating.await.unwrap();
+    assert_eq!(
+        fixture.count(&format!(
+            "SELECT COUNT(*) FROM allocations WHERE allocation_id = '{}' AND instance_id = '{}'",
+            binding.allocation_id, identity.instance_id
+        )),
+        1,
+        "the victim's Create was admitted"
+    );
+    // And it fences exactly, through the manager's own Delete.
+    let deleted = manager.delete(&row.id).await.unwrap();
+    assert_eq!(deleted.state, SandboxState::Deleted);
+    assert!(!deleted.is_charged());
+    let ReservationRelease::Fenced(released) = &deleted.accounting.release else {
+        panic!("{:?}", deleted.accounting.release);
+    };
+    assert_eq!(
+        fixture.count(&format!(
+            "SELECT COUNT(*) FROM retired_tokens WHERE receipt_id = '{released}'
+             AND instance_id = '{}'",
+            identity.instance_id
+        )),
+        1
+    );
+}
+
 /// An expired Create that passes the durable lookup and closes its gate. A daemon could
 /// hold a C1 charge for this one, so unlike a malformed token its gate is never evicted.
 async fn expire(fixture: &Fixture, context: &CreateContext, epoch: Id128, plan: &PreparedCreate) {

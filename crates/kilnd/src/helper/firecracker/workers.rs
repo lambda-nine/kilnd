@@ -9,7 +9,7 @@ use super::config::{self, ExactPlan, PlanInputs, ProfileCatalog};
 use super::executable::{
     self, ExecObservation, ExecutableIdentity, ExecutableTable, Role, WalkPolicy,
 };
-use super::identity::{self, ClaimedIdentities, IdentityLeases, IdentityRanges};
+use super::identity::{self, AllocationKey, ClaimedIdentities, IdentityLeases, IdentityRanges};
 use super::inventory::{NamespaceObservation, NodeObservation, ObservationBackend};
 use super::journal::{
     AccountingSnapshot, AdmitOutcome, AdmitRequest, AttachOutcome, FenceOutcome, FenceRequest,
@@ -942,20 +942,24 @@ pub enum LedgerRequest {
         spec: Box<WorkerIntentSpec>,
     },
     RecordChild {
+        instance: Id128,
         allocation: Id128,
         spec: Box<WorkerIntentSpec>,
         target: ProcessId,
     },
     AdvancePhase {
+        instance: Id128,
         allocation: Id128,
         expected_generation: u64,
         phase: String,
     },
     RecordStop {
+        instance: Id128,
         allocation: Id128,
         reason: String,
     },
     RecordObserved {
+        instance: Id128,
         allocation: Id128,
         actual: ExecutableIdentity,
     },
@@ -964,6 +968,7 @@ pub enum LedgerRequest {
         settlement: String,
     },
     SettleUnstarted {
+        instance: Id128,
         allocation: Id128,
     },
     Fence(Box<FenceRequest>),
@@ -1128,11 +1133,13 @@ fn handle_ledger(
             worker_id: ledger.record_infrastructure_intent(&spec)?,
         },
         LedgerRequest::RecordChild {
+            instance,
             allocation,
             spec,
             target,
         } => {
             let id = ledger.record_child_worker(
+                instance,
                 allocation,
                 &spec,
                 target.pid,
@@ -1142,19 +1149,27 @@ fn handle_ledger(
             LedgerReply::Generation(id as u64)
         }
         LedgerRequest::AdvancePhase {
+            instance,
             allocation,
             expected_generation,
             phase,
         } => LedgerReply::Generation(ledger.advance_phase(
+            instance,
             allocation,
             expected_generation,
             &phase,
         )?),
-        LedgerRequest::RecordStop { allocation, reason } => {
-            LedgerReply::Generation(ledger.record_stop(allocation, &reason)?)
-        }
-        LedgerRequest::RecordObserved { allocation, actual } => {
-            ledger.record_observed_executable(allocation, &actual)?;
+        LedgerRequest::RecordStop {
+            instance,
+            allocation,
+            reason,
+        } => LedgerReply::Generation(ledger.record_stop(instance, allocation, &reason)?),
+        LedgerRequest::RecordObserved {
+            instance,
+            allocation,
+            actual,
+        } => {
+            ledger.record_observed_executable(instance, allocation, &actual)?;
             LedgerReply::Done
         }
         LedgerRequest::Settle {
@@ -1169,8 +1184,11 @@ fn handle_ledger(
             ledger.settle_worker(worker_id, &settlement)?;
             LedgerReply::Done
         }
-        LedgerRequest::SettleUnstarted { allocation } => {
-            ledger.settle_unstarted(allocation)?;
+        LedgerRequest::SettleUnstarted {
+            instance,
+            allocation,
+        } => {
+            ledger.settle_unstarted(instance, allocation)?;
             LedgerReply::Done
         }
         LedgerRequest::Fence(request) => {
@@ -1857,15 +1875,15 @@ fn run_effect(
 pub enum MonitorCommand {
     /// The watch endpoint for this supervisor arrives on the descriptor socket first.
     RegisterWatch {
-        allocation: Id128,
+        allocation: AllocationKey,
     },
     /// The conditional stop authority's concrete target, before it could be needed.
     RegisterTarget {
-        allocation: Id128,
+        allocation: AllocationKey,
         target: ProcessId,
     },
     Forget {
-        allocation: Id128,
+        allocation: AllocationKey,
     },
     Tick,
 }
@@ -1882,18 +1900,18 @@ pub enum MonitorReply {
 pub enum MonitorEvent {
     Status {
         stale_workers: Vec<String>,
-        stale_supervisors: Vec<Id128>,
+        stale_supervisors: Vec<AllocationKey>,
     },
     SupervisorLost {
-        allocation: Id128,
+        allocation: AllocationKey,
     },
     Contained {
-        allocation: Id128,
+        allocation: AllocationKey,
         gone: bool,
     },
     /// Both fixed recovery slots are occupied. The target stays pending in M.
     NoRecovery {
-        allocation: Id128,
+        allocation: AllocationKey,
     },
 }
 
@@ -1908,16 +1926,16 @@ const RECOVERY_IDLE_AFTER_HELPER_LOSS: Duration = Duration::from_secs(3);
 /// third K exists, and a stuck slot simply never frees.
 #[derive(Default)]
 struct StopQueue {
-    targets: HashMap<Id128, ProcessId>,
+    targets: HashMap<AllocationKey, ProcessId>,
     /// Waiting for a free slot, in arrival order.
-    pending: std::collections::VecDeque<Id128>,
+    pending: std::collections::VecDeque<AllocationKey>,
     /// Which allocation each K slot is working on.
-    busy: Vec<Option<Id128>>,
+    busy: Vec<Option<AllocationKey>>,
     /// Proven gone: nothing further to dispatch.
-    finished: std::collections::HashSet<Id128>,
-    reported_blocked: std::collections::HashSet<Id128>,
+    finished: std::collections::HashSet<AllocationKey>,
+    reported_blocked: std::collections::HashSet<AllocationKey>,
     /// Stop requested before H registered any concrete target.
-    awaiting_target: std::collections::HashSet<Id128>,
+    awaiting_target: std::collections::HashSet<AllocationKey>,
 }
 
 impl StopQueue {
@@ -1929,7 +1947,7 @@ impl StopQueue {
     }
 
     /// Requests a stop, once. A target that arrives later inherits an open request.
-    fn request(&mut self, allocation: Id128) {
+    fn request(&mut self, allocation: AllocationKey) {
         if !self.finished.contains(&allocation)
             && !self.pending.contains(&allocation)
             && !self.busy.contains(&Some(allocation))
@@ -1939,14 +1957,14 @@ impl StopQueue {
     }
 
     fn request_all(&mut self) {
-        let all: Vec<Id128> = self.targets.keys().copied().collect();
+        let all: Vec<AllocationKey> = self.targets.keys().copied().collect();
         for allocation in all {
             self.request(allocation);
         }
     }
 
     /// A K slot's answer frees that slot; an unproven stop waits its turn again.
-    fn settle(&mut self, index: usize, allocation: Id128, gone: bool) {
+    fn settle(&mut self, index: usize, allocation: AllocationKey, gone: bool) {
         if self.busy[index] == Some(allocation) {
             self.busy[index] = None;
         }
@@ -1959,7 +1977,7 @@ impl StopQueue {
     }
 
     /// Hands pending stops to free slots. Returns the ones with no slot to take them.
-    fn dispatch(&mut self, recovery: &[UnixDatagram]) -> Vec<Id128> {
+    fn dispatch(&mut self, recovery: &[UnixDatagram]) -> Vec<AllocationKey> {
         let mut index = 0;
         while index < self.busy.len() && !self.pending.is_empty() {
             if self.busy[index].is_some() {
@@ -2001,19 +2019,19 @@ impl StopQueue {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RecoveryDatagram {
-    pub allocation: Id128,
+    pub allocation: AllocationKey,
     pub target: ProcessId,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RecoveryDatagramReply {
-    pub allocation: Id128,
+    pub allocation: AllocationKey,
     pub gone: bool,
 }
 
 struct Watch {
-    allocation: Id128,
+    allocation: AllocationKey,
     stream: std::os::unix::net::UnixStream,
     last_seen: std::time::Instant,
     clean_exit: bool,
@@ -2075,7 +2093,7 @@ pub struct MonitorSockets {
 pub fn monitor_main(mut sockets: MonitorSockets, timings: Timings, mut heartbeat: Heartbeat) {
     let mut watches: Vec<Watch> = Vec::new();
     let mut stops = StopQueue::new(sockets.recovery.len());
-    let mut stale_requested: std::collections::HashSet<Id128> = Default::default();
+    let mut stale_requested: std::collections::HashSet<AllocationKey> = Default::default();
     let mut infra_seen: Vec<std::time::Instant> =
         vec![std::time::Instant::now(); sockets.heartbeats.len()];
     let mut last_helper = std::time::Instant::now();
@@ -2560,7 +2578,14 @@ pub(super) mod tests {
         }
         let recovery = vec![a, b];
         let mut queue = StopQueue::new(2);
-        let ids: Vec<Id128> = (1..=3).map(|n| Id128::from_bytes([n; 16])).collect();
+        // The same allocation ID in another instance is a separate stop.
+        let shared = Id128::from_bytes([9; 16]);
+        let ids: Vec<AllocationKey> = (1..=3)
+            .map(|n| AllocationKey {
+                instance: Id128::from_bytes([n; 16]),
+                allocation: shared,
+            })
+            .collect();
         for (index, id) in ids.iter().enumerate() {
             queue.targets.insert(
                 *id,

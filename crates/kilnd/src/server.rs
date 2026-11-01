@@ -1,8 +1,8 @@
 //! The Unix socket and the server's lifecycle: bind with tight permissions,
 //! serve, and shut down gracefully.
 
-use std::future::Future;
 use std::fs::File;
+use std::future::Future;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, chown};
 use std::path::{Path, PathBuf};
@@ -250,8 +250,7 @@ async fn bind_away_from_after_directory_check(
         _directory_lock: directory_lock,
         _directory: directory.file,
     };
-    chown(&socket_path, None, gid)
-        .with_context(|| format!("chown {}", socket_path.display()))?;
+    chown(&socket_path, None, gid).with_context(|| format!("chown {}", socket_path.display()))?;
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(sock_mode))?;
     listener
         .set_nonblocking(true)
@@ -268,7 +267,10 @@ fn ensure_directory_path_identity(path: &Path, expected: &std::fs::Metadata) -> 
     let observed = std::fs::metadata(path)
         .with_context(|| format!("recheck socket directory {}", path.display()))?;
     if observed.dev() != expected.dev() || observed.ino() != expected.ino() {
-        bail!("socket directory {} changed while preparing bind", path.display());
+        bail!(
+            "socket directory {} changed while preparing bind",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -516,11 +518,11 @@ async fn serve_with_final_wait<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::DirBuilderExt;
     use crate::manager::{CreateRequest, ExecRequest, Limits};
     use crate::model::{ExecutionState, SandboxState};
     use crate::runtime::fake::{FakeGate, FakeRuntime};
     use crate::store::Store;
+    use std::os::unix::fs::DirBuilderExt;
 
     async fn wait_connections(manager: &Manager<FakeRuntime>, expected: u64) {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -575,8 +577,14 @@ mod tests {
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let safe_root = temp.path().join("safe");
         let state_root = temp.path().join("state-root");
-        std::fs::DirBuilder::new().mode(0o700).create(&safe_root).unwrap();
-        std::fs::DirBuilder::new().mode(0o700).create(&state_root).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&safe_root)
+            .unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state_root)
+            .unwrap();
         let safe_directory = safe_root.join("run");
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -589,20 +597,19 @@ mod tests {
         std::os::unix::fs::symlink(&safe_root, &alias).unwrap();
         let socket = alias.join("run/kilnd.sock");
 
-        let error = bind_away_from_after_directory_check(
-            &socket,
-            Some(1),
-            Some(state_identity),
-            || {
+        let error =
+            bind_away_from_after_directory_check(&socket, Some(1), Some(state_identity), || {
                 std::fs::remove_file(&alias).unwrap();
                 std::os::unix::fs::symlink(&state_root, &alias).unwrap();
-            },
-        )
-        .await
-        .err()
-        .expect("replaced socket-directory alias was accepted");
+            })
+            .await
+            .err()
+            .expect("replaced socket-directory alias was accepted");
 
-        assert!(error.to_string().contains("changed while preparing"), "{error:#}");
+        assert!(
+            error.to_string().contains("changed while preparing"),
+            "{error:#}"
+        );
         assert_eq!(
             std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
             0o700

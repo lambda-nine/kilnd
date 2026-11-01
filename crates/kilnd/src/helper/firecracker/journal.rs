@@ -55,10 +55,10 @@ CREATE TABLE instances (
     first_generation INTEGER NOT NULL CHECK (first_generation >= 1)
 ) STRICT;
 CREATE TABLE allocations (
-    allocation_id TEXT PRIMARY KEY,
     instance_id TEXT NOT NULL REFERENCES instances(instance_id),
-    sandbox_id TEXT NOT NULL UNIQUE,
-    backend_id TEXT NOT NULL UNIQUE,
+    allocation_id TEXT NOT NULL,
+    sandbox_id TEXT NOT NULL,
+    backend_id TEXT NOT NULL,
     plan_version INTEGER NOT NULL,
     plan_digest TEXT NOT NULL,
     profile TEXT NOT NULL,
@@ -70,14 +70,21 @@ CREATE TABLE allocations (
     phase TEXT NOT NULL CHECK (phase IN
         ('intent','preparing','stop_intent','stopped','quarantined','absent')),
     created_generation INTEGER NOT NULL CHECK (created_generation >= 1),
-    updated_generation INTEGER NOT NULL CHECK (updated_generation >= created_generation)
+    updated_generation INTEGER NOT NULL CHECK (updated_generation >= created_generation),
+    PRIMARY KEY (instance_id, allocation_id),
+    UNIQUE (instance_id, sandbox_id),
+    UNIQUE (instance_id, backend_id)
 ) STRICT;
 CREATE TABLE allocation_plans (
-    allocation_id TEXT PRIMARY KEY REFERENCES allocations(allocation_id),
-    plan BLOB NOT NULL
+    instance_id TEXT NOT NULL,
+    allocation_id TEXT NOT NULL,
+    plan BLOB NOT NULL,
+    PRIMARY KEY (instance_id, allocation_id),
+    FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
 ) STRICT;
 CREATE TABLE capacity_claims (
-    allocation_id TEXT PRIMARY KEY REFERENCES allocations(allocation_id),
+    instance_id TEXT NOT NULL,
+    allocation_id TEXT NOT NULL,
     memory_bytes INTEGER NOT NULL CHECK (memory_bytes >= 0),
     disk_bytes INTEGER NOT NULL CHECK (disk_bytes >= 0),
     pids INTEGER NOT NULL CHECK (pids >= 0),
@@ -86,23 +93,30 @@ CREATE TABLE capacity_claims (
     host_pids INTEGER NOT NULL CHECK (host_pids >= 0),
     claimed_generation INTEGER NOT NULL CHECK (claimed_generation >= 1),
     released_generation INTEGER CHECK (released_generation IS NULL
-        OR released_generation > claimed_generation)
+        OR released_generation > claimed_generation),
+    PRIMARY KEY (instance_id, allocation_id),
+    FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
 ) STRICT;
 CREATE TABLE identity_leases (
     id INTEGER PRIMARY KEY,
     namespace TEXT NOT NULL CHECK (namespace IN ('uid','gid','cid')),
     kind TEXT NOT NULL CHECK (kind IN ('vmm_uid','relay_uid','vmm_gid','relay_gid','cid')),
     value INTEGER NOT NULL,
-    allocation_id TEXT NOT NULL REFERENCES allocations(allocation_id),
+    instance_id TEXT NOT NULL,
+    allocation_id TEXT NOT NULL,
     claimed_generation INTEGER NOT NULL CHECK (claimed_generation >= 1),
     released_generation INTEGER CHECK (released_generation IS NULL
         OR released_generation > claimed_generation),
-    UNIQUE (allocation_id, kind)
+    UNIQUE (instance_id, allocation_id, kind),
+    FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
 ) STRICT;
+-- The one node-wide uniqueness a claim can meet: these are real kernel identities, and
+-- a preflight picks free ones. A collision is answered exactly, and can then be fenced.
 CREATE UNIQUE INDEX identity_leases_active
     ON identity_leases(namespace, value) WHERE released_generation IS NULL;
 CREATE TABLE executable_leases (
-    allocation_id TEXT NOT NULL REFERENCES allocations(allocation_id),
+    instance_id TEXT NOT NULL,
+    allocation_id TEXT NOT NULL,
     role TEXT NOT NULL,
     st_dev INTEGER NOT NULL,
     st_ino INTEGER NOT NULL,
@@ -114,11 +128,13 @@ CREATE TABLE executable_leases (
     observed_bytes INTEGER,
     observed_sha256 TEXT,
     released_generation INTEGER,
-    PRIMARY KEY (allocation_id, role)
+    PRIMARY KEY (instance_id, allocation_id, role),
+    FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
 ) STRICT;
 CREATE TABLE worker_intents (
     id INTEGER PRIMARY KEY,
-    allocation_id TEXT REFERENCES allocations(allocation_id),
+    instance_id TEXT,
+    allocation_id TEXT,
     mode TEXT NOT NULL,
     operation_generation INTEGER NOT NULL UNIQUE CHECK (operation_generation >= 1),
     allowed_names TEXT NOT NULL,
@@ -132,23 +148,27 @@ CREATE TABLE worker_intents (
     pid INTEGER,
     start_time INTEGER,
     settled_generation INTEGER,
-    settlement TEXT
+    settlement TEXT,
+    CHECK ((instance_id IS NULL) = (allocation_id IS NULL)),
+    FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
 ) STRICT;
 CREATE TABLE retired_tokens (
-    allocation_id TEXT PRIMARY KEY,
     instance_id TEXT NOT NULL REFERENCES instances(instance_id),
+    allocation_id TEXT NOT NULL,
     sandbox_id TEXT NOT NULL,
     plan_digest TEXT NOT NULL,
     receipt_id TEXT NOT NULL UNIQUE,
     helper_generation INTEGER NOT NULL UNIQUE CHECK (helper_generation >= 1),
-    receipt BLOB NOT NULL
+    receipt BLOB NOT NULL,
+    PRIMARY KEY (instance_id, allocation_id)
 ) STRICT;
-CREATE INDEX retired_tokens_by_instance ON retired_tokens(instance_id);
 CREATE TABLE stop_events (
     id INTEGER PRIMARY KEY,
-    allocation_id TEXT NOT NULL REFERENCES allocations(allocation_id),
+    instance_id TEXT NOT NULL,
+    allocation_id TEXT NOT NULL,
     generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
-    reason TEXT NOT NULL
+    reason TEXT NOT NULL,
+    FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
 ) STRICT;
 
 -- Collision guards run before any conflict algorithm can implicitly delete a row.
@@ -189,14 +209,17 @@ BEGIN SELECT RAISE(ABORT, 'an instance binding is permanent'); END;
 
 CREATE TRIGGER allocations_no_replace BEFORE INSERT ON allocations
 WHEN EXISTS (SELECT 1 FROM allocations WHERE rowid = NEW.rowid
-    OR allocation_id = NEW.allocation_id OR sandbox_id = NEW.sandbox_id OR backend_id = NEW.backend_id)
+    OR (instance_id = NEW.instance_id AND (allocation_id = NEW.allocation_id
+        OR sandbox_id = NEW.sandbox_id OR backend_id = NEW.backend_id)))
 BEGIN SELECT RAISE(ABORT, 'an allocation cannot be replaced'); END;
 CREATE TRIGGER allocations_no_replace_update BEFORE UPDATE ON allocations
 WHEN EXISTS (SELECT 1 FROM allocations WHERE rowid != OLD.rowid AND (rowid = NEW.rowid
-    OR allocation_id = NEW.allocation_id OR sandbox_id = NEW.sandbox_id OR backend_id = NEW.backend_id))
+    OR (instance_id = NEW.instance_id AND (allocation_id = NEW.allocation_id
+        OR sandbox_id = NEW.sandbox_id OR backend_id = NEW.backend_id))))
 BEGIN SELECT RAISE(ABORT, 'an allocation cannot be replaced'); END;
 CREATE TRIGGER allocations_no_resurrection BEFORE INSERT ON allocations
-WHEN EXISTS (SELECT 1 FROM retired_tokens WHERE allocation_id = NEW.allocation_id)
+WHEN EXISTS (SELECT 1 FROM retired_tokens WHERE instance_id = NEW.instance_id
+    AND allocation_id = NEW.allocation_id)
 BEGIN SELECT RAISE(ABORT, 'a retired token cannot be allocated'); END;
 CREATE TRIGGER allocations_immutable BEFORE UPDATE ON allocations
 WHEN NEW.rowid IS NOT OLD.rowid OR NEW.allocation_id IS NOT OLD.allocation_id
@@ -217,26 +240,31 @@ WHEN OLD.phase = 'absent'
 BEGIN SELECT RAISE(ABORT, 'an absent allocation cannot change'); END;
 CREATE TRIGGER allocations_absent_needs_release BEFORE UPDATE OF phase ON allocations
 WHEN NEW.phase = 'absent' AND EXISTS (SELECT 1 FROM capacity_claims
-    WHERE allocation_id = NEW.allocation_id AND released_generation IS NULL)
+    WHERE instance_id = NEW.instance_id AND allocation_id = NEW.allocation_id
+    AND released_generation IS NULL)
 BEGIN SELECT RAISE(ABORT, 'absence requires its claim release'); END;
 CREATE TRIGGER allocations_no_delete BEFORE DELETE ON allocations
 BEGIN SELECT RAISE(ABORT, 'an allocation record is permanent'); END;
 
 CREATE TRIGGER allocation_plans_no_replace BEFORE INSERT ON allocation_plans
-WHEN EXISTS (SELECT 1 FROM allocation_plans WHERE rowid = NEW.rowid OR allocation_id = NEW.allocation_id)
+WHEN EXISTS (SELECT 1 FROM allocation_plans WHERE rowid = NEW.rowid
+    OR (instance_id = NEW.instance_id AND allocation_id = NEW.allocation_id))
 BEGIN SELECT RAISE(ABORT, 'a plan cannot be replaced'); END;
 CREATE TRIGGER allocation_plans_no_update BEFORE UPDATE ON allocation_plans
 BEGIN SELECT RAISE(ABORT, 'a plan is immutable'); END;
 -- Plan bytes alone leave when a permanent fence has retired the token.
 CREATE TRIGGER allocation_plans_retained_until_fence BEFORE DELETE ON allocation_plans
-WHEN NOT EXISTS (SELECT 1 FROM retired_tokens WHERE allocation_id = OLD.allocation_id)
+WHEN NOT EXISTS (SELECT 1 FROM retired_tokens WHERE instance_id = OLD.instance_id
+    AND allocation_id = OLD.allocation_id)
 BEGIN SELECT RAISE(ABORT, 'a plan stays until its absence fence'); END;
 
 CREATE TRIGGER capacity_claims_no_replace BEFORE INSERT ON capacity_claims
-WHEN EXISTS (SELECT 1 FROM capacity_claims WHERE rowid = NEW.rowid OR allocation_id = NEW.allocation_id)
+WHEN EXISTS (SELECT 1 FROM capacity_claims WHERE rowid = NEW.rowid
+    OR (instance_id = NEW.instance_id AND allocation_id = NEW.allocation_id))
 BEGIN SELECT RAISE(ABORT, 'a capacity claim cannot be replaced'); END;
 CREATE TRIGGER capacity_claims_immutable BEFORE UPDATE ON capacity_claims
-WHEN NEW.rowid IS NOT OLD.rowid OR NEW.allocation_id IS NOT OLD.allocation_id
+WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
+    OR NEW.allocation_id IS NOT OLD.allocation_id
     OR NEW.memory_bytes IS NOT OLD.memory_bytes OR NEW.disk_bytes IS NOT OLD.disk_bytes
     OR NEW.pids IS NOT OLD.pids OR NEW.host_cpu_millis IS NOT OLD.host_cpu_millis
     OR NEW.virtual_cpu_slots IS NOT OLD.virtual_cpu_slots OR NEW.host_pids IS NOT OLD.host_pids
@@ -248,12 +276,13 @@ BEGIN SELECT RAISE(ABORT, 'a capacity claim is permanent'); END;
 
 CREATE TRIGGER identity_leases_no_replace BEFORE INSERT ON identity_leases
 WHEN EXISTS (SELECT 1 FROM identity_leases WHERE rowid = NEW.rowid
-    OR (allocation_id = NEW.allocation_id AND kind = NEW.kind)
+    OR (instance_id = NEW.instance_id AND allocation_id = NEW.allocation_id AND kind = NEW.kind)
     OR (namespace = NEW.namespace AND value = NEW.value AND released_generation IS NULL))
 BEGIN SELECT RAISE(ABORT, 'an identity lease collides'); END;
 CREATE TRIGGER identity_leases_immutable BEFORE UPDATE ON identity_leases
 WHEN NEW.rowid IS NOT OLD.rowid OR NEW.namespace IS NOT OLD.namespace OR NEW.kind IS NOT OLD.kind
-    OR NEW.value IS NOT OLD.value OR NEW.allocation_id IS NOT OLD.allocation_id
+    OR NEW.value IS NOT OLD.value OR NEW.instance_id IS NOT OLD.instance_id
+    OR NEW.allocation_id IS NOT OLD.allocation_id
     OR NEW.claimed_generation IS NOT OLD.claimed_generation
     OR OLD.released_generation IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'an identity lease only changes by its one release'); END;
@@ -262,10 +291,11 @@ BEGIN SELECT RAISE(ABORT, 'an identity lease is permanent'); END;
 
 CREATE TRIGGER executable_leases_no_replace BEFORE INSERT ON executable_leases
 WHEN EXISTS (SELECT 1 FROM executable_leases WHERE rowid = NEW.rowid
-    OR (allocation_id = NEW.allocation_id AND role = NEW.role))
+    OR (instance_id = NEW.instance_id AND allocation_id = NEW.allocation_id AND role = NEW.role))
 BEGIN SELECT RAISE(ABORT, 'an executable lease cannot be replaced'); END;
 CREATE TRIGGER executable_leases_immutable BEFORE UPDATE ON executable_leases
-WHEN NEW.rowid IS NOT OLD.rowid OR NEW.allocation_id IS NOT OLD.allocation_id OR NEW.role IS NOT OLD.role
+WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
+    OR NEW.allocation_id IS NOT OLD.allocation_id OR NEW.role IS NOT OLD.role
     OR NEW.st_dev IS NOT OLD.st_dev OR NEW.st_ino IS NOT OLD.st_ino OR NEW.bytes IS NOT OLD.bytes
     OR NEW.sha256 IS NOT OLD.sha256
     OR NEW.installation_generation IS NOT OLD.installation_generation
@@ -280,7 +310,8 @@ WHEN EXISTS (SELECT 1 FROM worker_intents WHERE rowid = NEW.rowid
     OR operation_generation = NEW.operation_generation)
 BEGIN SELECT RAISE(ABORT, 'a worker intent cannot be replaced'); END;
 CREATE TRIGGER worker_intents_immutable BEFORE UPDATE ON worker_intents
-WHEN NEW.rowid IS NOT OLD.rowid OR NEW.allocation_id IS NOT OLD.allocation_id OR NEW.mode IS NOT OLD.mode
+WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
+    OR NEW.allocation_id IS NOT OLD.allocation_id OR NEW.mode IS NOT OLD.mode
     OR NEW.operation_generation IS NOT OLD.operation_generation
     OR NEW.allowed_names IS NOT OLD.allowed_names OR NEW.cgroup IS NOT OLD.cgroup
     OR NEW.exec_role IS NOT OLD.exec_role OR NEW.exec_st_dev IS NOT OLD.exec_st_dev
@@ -294,12 +325,13 @@ CREATE TRIGGER worker_intents_no_delete BEFORE DELETE ON worker_intents
 BEGIN SELECT RAISE(ABORT, 'a worker record is permanent'); END;
 
 CREATE TRIGGER retired_tokens_no_replace BEFORE INSERT ON retired_tokens
-WHEN EXISTS (SELECT 1 FROM retired_tokens WHERE rowid = NEW.rowid OR allocation_id = NEW.allocation_id
+WHEN EXISTS (SELECT 1 FROM retired_tokens WHERE rowid = NEW.rowid
+    OR (instance_id = NEW.instance_id AND allocation_id = NEW.allocation_id)
     OR receipt_id = NEW.receipt_id OR helper_generation = NEW.helper_generation)
 BEGIN SELECT RAISE(ABORT, 'a fence cannot be replaced'); END;
 CREATE TRIGGER retired_tokens_need_release BEFORE INSERT ON retired_tokens
-WHEN EXISTS (SELECT 1 FROM capacity_claims WHERE allocation_id = NEW.allocation_id
-    AND released_generation IS NULL)
+WHEN EXISTS (SELECT 1 FROM capacity_claims WHERE instance_id = NEW.instance_id
+    AND allocation_id = NEW.allocation_id AND released_generation IS NULL)
 BEGIN SELECT RAISE(ABORT, 'a fence cannot coexist with a held claim'); END;
 CREATE TRIGGER retired_tokens_no_update BEFORE UPDATE ON retired_tokens
 BEGIN SELECT RAISE(ABORT, 'a fence is immutable'); END;
@@ -645,6 +677,7 @@ pub struct InventorySnapshot {
 #[serde(deny_unknown_fields)]
 pub struct WorkerRecord {
     pub worker_id: i64,
+    pub instance_id: Option<Id128>,
     pub allocation_id: Option<Id128>,
     pub mode: String,
     pub operation_generation: u64,
@@ -854,7 +887,8 @@ fn never_admitted_fences(conn: &Connection, instance: Id128) -> Result<u64, Ledg
     let used: i64 = conn
         .prepare_cached(
             "SELECT COUNT(*) FROM retired_tokens r WHERE r.instance_id = ?1 AND NOT EXISTS
-                (SELECT 1 FROM allocations a WHERE a.allocation_id = r.allocation_id)",
+                (SELECT 1 FROM allocations a WHERE a.instance_id = r.instance_id
+                    AND a.allocation_id = r.allocation_id)",
         )?
         .query_row([instance.to_string()], |r| r.get(0))?;
     unsigned(used)
@@ -1032,10 +1066,13 @@ impl Ledger {
         let incomplete: i64 = conn.query_row(
             "SELECT COUNT(*) FROM allocations a
              WHERE a.phase != 'absent' AND (
-               NOT EXISTS (SELECT 1 FROM allocation_plans p WHERE p.allocation_id = a.allocation_id)
-               OR NOT EXISTS (SELECT 1 FROM capacity_claims c WHERE c.allocation_id = a.allocation_id
+               NOT EXISTS (SELECT 1 FROM allocation_plans p WHERE p.instance_id = a.instance_id
+                           AND p.allocation_id = a.allocation_id)
+               OR NOT EXISTS (SELECT 1 FROM capacity_claims c WHERE c.instance_id = a.instance_id
+                              AND c.allocation_id = a.allocation_id
                               AND c.released_generation IS NULL)
-               OR (SELECT COUNT(*) FROM identity_leases l WHERE l.allocation_id = a.allocation_id
+               OR (SELECT COUNT(*) FROM identity_leases l WHERE l.instance_id = a.instance_id
+                   AND l.allocation_id = a.allocation_id
                    AND l.released_generation IS NULL) != 5)",
             [],
             |r| r.get(0),
@@ -1047,7 +1084,8 @@ impl Ledger {
         }
         let mut plans = conn.prepare(
             "SELECT a.plan_digest, p.plan FROM allocations a
-             JOIN allocation_plans p ON p.allocation_id = a.allocation_id",
+             JOIN allocation_plans p ON p.instance_id = a.instance_id
+                 AND p.allocation_id = a.allocation_id",
         )?;
         let mut rows = plans.query([])?;
         while let Some(row) = rows.next()? {
@@ -1255,66 +1293,68 @@ impl Ledger {
         }
     }
 
+    /// Everything here is keyed by (instance, allocation): the caller's authenticated
+    /// instance is the only namespace a token resolves in. Another instance's row with
+    /// the same allocation ID is a different token, and this cannot see it.
     fn lookup_on(
         conn: &Connection,
         instance: Id128,
         allocation: Id128,
         plan_digest: &Digest,
     ) -> Result<TokenLookup, LedgerError> {
+        let (owner, token) = (instance.to_string(), allocation.to_string());
+        let key = [&owner, &token];
         let fence = conn
             .prepare_cached(
-                "SELECT instance_id, plan_digest, receipt FROM retired_tokens WHERE allocation_id = ?1",
+                "SELECT plan_digest, receipt FROM retired_tokens
+                 WHERE instance_id = ?1 AND allocation_id = ?2",
             )?
-            .query_row([allocation.to_string()], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
-                ))
+            .query_row(key, |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
             })
             .optional()?;
-        if let Some((fence_instance, digest, receipt)) = fence {
-            if fence_instance != instance.to_string() || digest != plan_digest.to_string() {
+        if let Some((digest, receipt)) = fence {
+            if digest != plan_digest.to_string() {
                 return Ok(TokenLookup::Conflict {
-                    reason: "token was retired with a different identity".into(),
+                    reason: "token was retired with a different plan".into(),
                 });
             }
             return Ok(TokenLookup::Fenced { receipt });
         }
         let active = conn
             .prepare_cached(
-                "SELECT instance_id, plan_digest, phase, updated_generation
-                 FROM allocations WHERE allocation_id = ?1",
+                "SELECT plan_digest, phase, updated_generation FROM allocations
+                 WHERE instance_id = ?1 AND allocation_id = ?2",
             )?
-            .query_row([allocation.to_string()], |r| {
+            .query_row(key, |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(2)?,
                 ))
             })
             .optional()?;
-        let Some((active_instance, digest, phase, generation)) = active else {
+        let Some((digest, phase, generation)) = active else {
             return Ok(TokenLookup::Unknown);
         };
-        if active_instance != instance.to_string() || digest != plan_digest.to_string() {
+        if digest != plan_digest.to_string() {
             return Ok(TokenLookup::Conflict {
-                reason: "token is active with a different identity or plan".into(),
+                reason: "token is active with a different plan".into(),
             });
         }
         let unsettled: i64 = conn
             .prepare_cached(
                 "SELECT COUNT(*) FROM worker_intents
-                 WHERE allocation_id = ?1 AND settled_generation IS NULL",
+                 WHERE instance_id = ?1 AND allocation_id = ?2 AND settled_generation IS NULL",
             )?
-            .query_row([allocation.to_string()], |r| r.get(0))?;
+            .query_row(key, |r| r.get(0))?;
         let operation: Option<i64> = conn
             .prepare_cached(
                 "SELECT MIN(operation_generation) FROM worker_intents
-                 WHERE allocation_id = ?1 AND mode = 'supervisor' AND settled_generation IS NULL",
+                 WHERE instance_id = ?1 AND allocation_id = ?2 AND mode = 'supervisor'
+                   AND settled_generation IS NULL",
             )?
-            .query_row([allocation.to_string()], |r| r.get(0))?;
+            .query_row(key, |r| r.get(0))?;
         Ok(TokenLookup::Active {
             generation: unsigned(generation)?,
             phase,
@@ -1338,12 +1378,12 @@ impl Ledger {
         let digest: Option<String> = self
             .conn
             .prepare_cached(
-                "SELECT plan_digest FROM retired_tokens WHERE allocation_id = ?1 AND instance_id = ?2
+                "SELECT plan_digest FROM retired_tokens WHERE instance_id = ?1 AND allocation_id = ?2
                  UNION ALL
-                 SELECT plan_digest FROM allocations WHERE allocation_id = ?1 AND instance_id = ?2
+                 SELECT plan_digest FROM allocations WHERE instance_id = ?1 AND allocation_id = ?2
                  LIMIT 1",
             )?
-            .query_row([allocation.to_string(), instance.to_string()], |r| r.get(0))
+            .query_row([instance.to_string(), allocation.to_string()], |r| r.get(0))
             .optional()?;
         match digest {
             // Another namespace's token and a never-seen one are indistinguishable.
@@ -1386,7 +1426,8 @@ impl Ledger {
             .conn
             .prepare_cached(
                 "SELECT COUNT(*) FROM retired_tokens r WHERE NOT EXISTS
-                    (SELECT 1 FROM allocations a WHERE a.allocation_id = r.allocation_id)",
+                    (SELECT 1 FROM allocations a WHERE a.instance_id = r.instance_id
+                        AND a.allocation_id = r.allocation_id)",
             )?
             .query_row([], |r| r.get(0))?;
         let reserved = never_admitted_pool(&self.config).max(unsigned(never_admitted)?);
@@ -1459,8 +1500,11 @@ impl Ledger {
                 generation, phase, ..
             } => {
                 let sandbox: String = tx.query_row(
-                    "SELECT sandbox_id FROM allocations WHERE allocation_id = ?1",
-                    [request.allocation_id.to_string()],
+                    "SELECT sandbox_id FROM allocations WHERE instance_id = ?1 AND allocation_id = ?2",
+                    [
+                        request.instance_id.to_string(),
+                        request.allocation_id.to_string(),
+                    ],
                     |r| r.get(0),
                 )?;
                 if sandbox != request.sandbox_id {
@@ -1470,8 +1514,12 @@ impl Ledger {
                 }
                 let (worker_id, operation): (i64, i64) = tx.query_row(
                     "SELECT id, operation_generation FROM worker_intents
-                     WHERE allocation_id = ?1 AND mode = 'supervisor' ORDER BY id LIMIT 1",
-                    [request.allocation_id.to_string()],
+                     WHERE instance_id = ?1 AND allocation_id = ?2 AND mode = 'supervisor'
+                     ORDER BY id LIMIT 1",
+                    [
+                        request.instance_id.to_string(),
+                        request.allocation_id.to_string(),
+                    ],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
                 return Ok(AdmitOutcome::Accepted {
@@ -1493,8 +1541,13 @@ impl Ledger {
             return Ok(AdmitOutcome::InstanceMismatch);
         }
         let taken: i64 = tx
-            .prepare_cached("SELECT COUNT(*) FROM allocations WHERE sandbox_id = ?1")?
-            .query_row([&request.sandbox_id], |r| r.get(0))?;
+            .prepare_cached(
+                "SELECT COUNT(*) FROM allocations WHERE instance_id = ?1 AND sandbox_id = ?2",
+            )?
+            .query_row(
+                params![request.instance_id.to_string(), request.sandbox_id],
+                |r| r.get(0),
+            )?;
         if taken != 0 {
             return Ok(AdmitOutcome::Conflict {
                 reason: "sandbox ID is bound to another allocation".into(),
@@ -1538,6 +1591,7 @@ impl Ledger {
         }
         let generation = next_generation(&tx)?;
         let generation_i = signed(generation, "generation")?;
+        let instance = request.instance_id.to_string();
         let allocation = request.allocation_id.to_string();
         tx.prepare_cached(
             "INSERT INTO allocations (allocation_id, instance_id, sandbox_id, backend_id,
@@ -1548,7 +1602,7 @@ impl Ledger {
         )?
         .execute(params![
             allocation,
-            request.instance_id.to_string(),
+            instance,
             request.sandbox_id,
             super::identity::backend_id(request.allocation_id),
             i64::from(request.plan_version),
@@ -1562,15 +1616,18 @@ impl Ledger {
                 .map_err(|e| LedgerError::Config(e.to_string()))?,
             generation_i,
         ])?;
-        tx.prepare_cached("INSERT INTO allocation_plans (allocation_id, plan) VALUES (?1, ?2)")?
-            .execute(params![allocation, request.plan])?;
+        tx.prepare_cached(
+            "INSERT INTO allocation_plans (instance_id, allocation_id, plan) VALUES (?1, ?2, ?3)",
+        )?
+        .execute(params![instance, allocation, request.plan])?;
         let r = &request.reservation;
         tx.prepare_cached(
-            "INSERT INTO capacity_claims (allocation_id, memory_bytes, disk_bytes, pids,
+            "INSERT INTO capacity_claims (instance_id, allocation_id, memory_bytes, disk_bytes, pids,
                 host_cpu_millis, virtual_cpu_slots, host_pids, claimed_generation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?
         .execute(params![
+            instance,
             allocation,
             signed(r.memory_bytes, "memory")?,
             signed(r.disk_bytes, "disk")?,
@@ -1582,23 +1639,26 @@ impl Ledger {
         ])?;
         for (kind, value) in request.leases.rows() {
             tx.prepare_cached(
-                "INSERT INTO identity_leases (namespace, kind, value, allocation_id, claimed_generation)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO identity_leases (namespace, kind, value, instance_id, allocation_id,
+                    claimed_generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?
             .execute(params![
                 kind.namespace(),
                 kind.as_str(),
                 i64::from(value),
+                instance,
                 allocation,
                 generation_i
             ])?;
         }
         for identity in &request.executables {
             tx.prepare_cached(
-                "INSERT INTO executable_leases (allocation_id, role, st_dev, st_ino, bytes, sha256,
-                    installation_generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO executable_leases (instance_id, allocation_id, role, st_dev, st_ino, bytes,
+                    sha256, installation_generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?
             .execute(params![
+                instance,
                 allocation,
                 identity.role.as_str(),
                 signed(identity.st_dev, "device")?,
@@ -1611,7 +1671,7 @@ impl Ledger {
         let operation = next_generation(&tx)?;
         let worker_id = Self::insert_worker_intent(
             &tx,
-            Some(request.allocation_id),
+            Some((request.instance_id, request.allocation_id)),
             &request.supervisor,
             operation,
         )?;
@@ -1633,17 +1693,18 @@ impl Ledger {
 
     fn insert_worker_intent(
         tx: &Transaction<'_>,
-        allocation: Option<Id128>,
+        owner: Option<(Id128, Id128)>,
         spec: &WorkerIntentSpec,
         operation: u64,
     ) -> Result<i64, LedgerError> {
         tx.prepare_cached(
-            "INSERT INTO worker_intents (allocation_id, mode, operation_generation, allowed_names,
-                cgroup, exec_role, exec_st_dev, exec_st_ino, exec_bytes, exec_sha256)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO worker_intents (instance_id, allocation_id, mode, operation_generation,
+                allowed_names, cgroup, exec_role, exec_st_dev, exec_st_ino, exec_bytes, exec_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?
         .execute(params![
-            allocation.map(|id| id.to_string()),
+            owner.map(|(instance, _)| instance.to_string()),
+            owner.map(|(_, allocation)| allocation.to_string()),
             spec.mode,
             signed(operation, "operation generation")?,
             serde_json::to_string(&spec.allowed_names)
@@ -1725,6 +1786,7 @@ impl Ledger {
     /// Adds an effect's owned child (S's fake VM) to the worker table, with identity.
     pub fn record_child_worker(
         &mut self,
+        instance: Id128,
         allocation: Id128,
         spec: &WorkerIntentSpec,
         pid: i32,
@@ -1735,7 +1797,7 @@ impl Ledger {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let operation = next_generation(&tx)?;
-        let id = Self::insert_worker_intent(&tx, Some(allocation), spec, operation)?;
+        let id = Self::insert_worker_intent(&tx, Some((instance, allocation)), spec, operation)?;
         tx.prepare_cached(
             "UPDATE worker_intents SET pid = ?2, start_time = ?3, host_boot_id = ?4 WHERE id = ?1",
         )?
@@ -1748,6 +1810,7 @@ impl Ledger {
     /// compares the generation, so a stale writer cannot pass a newer phase.
     pub fn advance_phase(
         &mut self,
+        instance: Id128,
         allocation: Id128,
         expected_generation: u64,
         phase: &str,
@@ -1758,10 +1821,12 @@ impl Ledger {
         let generation = next_generation(&tx)?;
         let changed = tx
             .prepare_cached(
-                "UPDATE allocations SET phase = ?2, updated_generation = ?3
-                 WHERE allocation_id = ?1 AND updated_generation = ?4 AND phase != 'absent'",
+                "UPDATE allocations SET phase = ?3, updated_generation = ?4
+                 WHERE instance_id = ?1 AND allocation_id = ?2 AND updated_generation = ?5
+                   AND phase != 'absent'",
             )?
             .execute(params![
+                instance.to_string(),
                 allocation.to_string(),
                 phase,
                 signed(generation, "generation")?,
@@ -1776,17 +1841,23 @@ impl Ledger {
 
     /// The later durable record of a stop: an emergency already ran under C2's
     /// authority if the writer was blocked. It never releases anything.
-    pub fn record_stop(&mut self, allocation: Id128, reason: &str) -> Result<u64, LedgerError> {
+    pub fn record_stop(
+        &mut self,
+        instance: Id128,
+        allocation: Id128,
+        reason: &str,
+    ) -> Result<u64, LedgerError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let generation = next_generation(&tx)?;
         let changed = tx
             .prepare_cached(
-                "UPDATE allocations SET phase = 'stop_intent', updated_generation = ?2
-                 WHERE allocation_id = ?1 AND phase != 'absent'",
+                "UPDATE allocations SET phase = 'stop_intent', updated_generation = ?3
+                 WHERE instance_id = ?1 AND allocation_id = ?2 AND phase != 'absent'",
             )?
             .execute(params![
+                instance.to_string(),
                 allocation.to_string(),
                 signed(generation, "generation")?
             ])?;
@@ -1794,9 +1865,11 @@ impl Ledger {
             return Err(LedgerError::NoSuchAllocation);
         }
         tx.prepare_cached(
-            "INSERT INTO stop_events (allocation_id, generation, reason) VALUES (?1, ?2, ?3)",
+            "INSERT INTO stop_events (instance_id, allocation_id, generation, reason)
+             VALUES (?1, ?2, ?3, ?4)",
         )?
         .execute(params![
+            instance.to_string(),
             allocation.to_string(),
             signed(generation, "generation")?,
             reason
@@ -1809,6 +1882,7 @@ impl Ledger {
     /// as well as at the dispatch point; nothing may launder a different identity.
     pub fn record_observed_executable(
         &mut self,
+        instance: Id128,
         allocation: Id128,
         actual: &ExecutableIdentity,
     ) -> Result<(), LedgerError> {
@@ -1818,11 +1892,12 @@ impl Ledger {
         let changed = tx
             .prepare_cached(
                 "UPDATE executable_leases
-                 SET observed_st_dev = ?3, observed_st_ino = ?4, observed_bytes = ?5, observed_sha256 = ?6
-                 WHERE allocation_id = ?1 AND role = ?2 AND st_dev = ?3 AND st_ino = ?4
-                   AND bytes = ?5 AND sha256 = ?6 AND installation_generation = ?7",
+                 SET observed_st_dev = ?4, observed_st_ino = ?5, observed_bytes = ?6, observed_sha256 = ?7
+                 WHERE instance_id = ?1 AND allocation_id = ?2 AND role = ?3 AND st_dev = ?4
+                   AND st_ino = ?5 AND bytes = ?6 AND sha256 = ?7 AND installation_generation = ?8",
             )?
             .execute(params![
+                instance.to_string(),
                 allocation.to_string(),
                 actual.role.as_str(),
                 signed(actual.st_dev, "device")?,
@@ -1859,16 +1934,22 @@ impl Ledger {
 
     /// Rows with no recorded identity never had an open gate: S's gate opens only after
     /// that record. These can settle once no process with a permit could exist.
-    pub fn settle_unstarted(&mut self, allocation: Id128) -> Result<(), LedgerError> {
+    pub fn settle_unstarted(
+        &mut self,
+        instance: Id128,
+        allocation: Id128,
+    ) -> Result<(), LedgerError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let generation = next_generation(&tx)?;
         tx.prepare_cached(
-            "UPDATE worker_intents SET settled_generation = ?2, settlement = 'never-started'
-             WHERE allocation_id = ?1 AND pid IS NULL AND settled_generation IS NULL",
+            "UPDATE worker_intents SET settled_generation = ?3, settlement = 'never-started'
+             WHERE instance_id = ?1 AND allocation_id = ?2 AND pid IS NULL
+               AND settled_generation IS NULL",
         )?
         .execute(params![
+            instance.to_string(),
             allocation.to_string(),
             signed(generation, "generation")?
         ])?;
@@ -1913,8 +1994,11 @@ impl Ledger {
                     });
                 }
                 let sandbox: String = tx.query_row(
-                    "SELECT sandbox_id FROM allocations WHERE allocation_id = ?1",
-                    [request.allocation_id.to_string()],
+                    "SELECT sandbox_id FROM allocations WHERE instance_id = ?1 AND allocation_id = ?2",
+                    [
+                        request.instance_id.to_string(),
+                        request.allocation_id.to_string(),
+                    ],
                     |r| r.get(0),
                 )?;
                 if sandbox != request.sandbox_id {
@@ -1941,26 +2025,28 @@ impl Ledger {
         }
         let generation = next_generation(&tx)?;
         let generation_i = signed(generation, "generation")?;
+        let instance = request.instance_id.to_string();
         let allocation = request.allocation_id.to_string();
         tx.prepare_cached(
-            "UPDATE capacity_claims SET released_generation = ?2
-             WHERE allocation_id = ?1 AND released_generation IS NULL",
+            "UPDATE capacity_claims SET released_generation = ?3
+             WHERE instance_id = ?1 AND allocation_id = ?2 AND released_generation IS NULL",
         )?
-        .execute(params![allocation, generation_i])?;
+        .execute(params![instance, allocation, generation_i])?;
         tx.prepare_cached(
-            "UPDATE identity_leases SET released_generation = ?2
-             WHERE allocation_id = ?1 AND released_generation IS NULL",
+            "UPDATE identity_leases SET released_generation = ?3
+             WHERE instance_id = ?1 AND allocation_id = ?2 AND released_generation IS NULL",
         )?
-        .execute(params![allocation, generation_i])?;
+        .execute(params![instance, allocation, generation_i])?;
         tx.prepare_cached(
-            "UPDATE executable_leases SET released_generation = ?2
-             WHERE allocation_id = ?1 AND released_generation IS NULL",
+            "UPDATE executable_leases SET released_generation = ?3
+             WHERE instance_id = ?1 AND allocation_id = ?2 AND released_generation IS NULL",
         )?
-        .execute(params![allocation, generation_i])?;
+        .execute(params![instance, allocation, generation_i])?;
         tx.prepare_cached(
-            "UPDATE allocations SET phase = 'absent', updated_generation = ?2 WHERE allocation_id = ?1",
+            "UPDATE allocations SET phase = 'absent', updated_generation = ?3
+             WHERE instance_id = ?1 AND allocation_id = ?2",
         )?
-        .execute(params![allocation, generation_i])?;
+        .execute(params![instance, allocation, generation_i])?;
         let receipt_id = Id128::random();
         let receipt = FencedAbsence::new(
             receipt_id,
@@ -1979,15 +2065,17 @@ impl Ledger {
         )?
         .execute(params![
             allocation,
-            request.instance_id.to_string(),
+            instance,
             request.sandbox_id,
             request.plan_digest.to_string(),
             receipt_id.to_string(),
             generation_i,
             receipt,
         ])?;
-        tx.prepare_cached("DELETE FROM allocation_plans WHERE allocation_id = ?1")?
-            .execute([&allocation])?;
+        tx.prepare_cached(
+            "DELETE FROM allocation_plans WHERE instance_id = ?1 AND allocation_id = ?2",
+        )?
+        .execute([&instance, &allocation])?;
         crate::helper::firecracker::workers::fault_point("L.fence.before_commit");
         if crate::helper::firecracker::workers::fault_enabled("L.fence.sync_fail") {
             drop(tx);
@@ -2026,8 +2114,8 @@ impl Ledger {
     pub fn inventory(&self, instance: Id128) -> Result<InventorySnapshot, LedgerError> {
         let mut statement = self.conn.prepare_cached(
             "SELECT a.allocation_id, a.plan_digest, a.phase, a.updated_generation,
-                (SELECT COUNT(*) FROM worker_intents w WHERE w.allocation_id = a.allocation_id
-                    AND w.settled_generation IS NULL)
+                (SELECT COUNT(*) FROM worker_intents w WHERE w.instance_id = a.instance_id
+                    AND w.allocation_id = a.allocation_id AND w.settled_generation IS NULL)
              FROM allocations a WHERE a.instance_id = ?1 AND a.phase != 'absent'
              ORDER BY a.allocation_id LIMIT ?2",
         )?;
@@ -2076,9 +2164,9 @@ impl Ledger {
     pub fn replay(&self) -> Result<ReplaySnapshot, LedgerError> {
         let mut statement = self.conn.prepare(
             "SELECT a.allocation_id, a.plan_digest, a.phase, a.updated_generation,
-                (SELECT COUNT(*) FROM worker_intents w WHERE w.allocation_id = a.allocation_id
-                    AND w.settled_generation IS NULL)
-             FROM allocations a WHERE a.phase != 'absent' ORDER BY a.allocation_id",
+                (SELECT COUNT(*) FROM worker_intents w WHERE w.instance_id = a.instance_id
+                    AND w.allocation_id = a.allocation_id AND w.settled_generation IS NULL)
+             FROM allocations a WHERE a.phase != 'absent' ORDER BY a.instance_id, a.allocation_id",
         )?;
         let mut rows = statement.query([])?;
         let mut active_allocations = Vec::new();
@@ -2092,7 +2180,8 @@ impl Ledger {
             });
         }
         let mut statement = self.conn.prepare(
-            "SELECT id, allocation_id, mode, operation_generation, pid, start_time, host_boot_id
+            "SELECT id, instance_id, allocation_id, mode, operation_generation, pid, start_time,
+                host_boot_id
              FROM worker_intents WHERE settled_generation IS NULL ORDER BY id",
         )?;
         let mut rows = statement.query([])?;
@@ -2100,12 +2189,13 @@ impl Ledger {
         while let Some(row) = rows.next()? {
             unsettled_workers.push(WorkerRecord {
                 worker_id: row.get(0)?,
-                allocation_id: row.get::<_, Option<String>>(1)?.map(parse_id).transpose()?,
-                mode: row.get(2)?,
-                operation_generation: unsigned(row.get(3)?)?,
-                pid: row.get(4)?,
-                start_time: row.get::<_, Option<i64>>(5)?.map(unsigned).transpose()?,
-                host_boot_id: row.get(6)?,
+                instance_id: row.get::<_, Option<String>>(1)?.map(parse_id).transpose()?,
+                allocation_id: row.get::<_, Option<String>>(2)?.map(parse_id).transpose()?,
+                mode: row.get(3)?,
+                operation_generation: unsigned(row.get(4)?)?,
+                pid: row.get(5)?,
+                start_time: row.get::<_, Option<i64>>(6)?.map(unsigned).transpose()?,
+                host_boot_id: row.get(7)?,
             });
         }
         let mut statement = self.conn.prepare(

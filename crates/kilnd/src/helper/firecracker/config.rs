@@ -268,7 +268,14 @@ pub fn build_plan(inputs: PlanInputs) -> Result<ExactPlan, String> {
         "inner_spec": inner,
         "executables": Value::Object(vector),
     });
-    let launch = derive_launch(&substitutions, &inputs.pins)?;
+    // The plan binds the real token; the launch's names come from the instance-scoped
+    // value, because a jail root and a jailer ID are node-global.
+    let mut naming = substitutions.clone();
+    naming["allocation_id"] = json!(super::identity::host_allocation(
+        inputs.instance_id,
+        inputs.allocation_id,
+    ));
+    let launch = derive_launch(&naming, &inputs.pins)?;
     // Two independent derivations of the charge must agree before a plan exists.
     if launch["reservation"] != serde_json::to_value(reservation).map_err(|e| e.to_string())? {
         return Err("contract and reservation formula disagree".into());

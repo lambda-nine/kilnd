@@ -1,7 +1,7 @@
 //! Allocation, UID, GID and CID identities. Each host identity has its own type, so
 //! a VMM UID cannot stand in for a relay UID or a GID. Preflight only *selects*
 //! currently unclaimed candidates; the ledger claims them, or refuses them, at C2.
-use crate::model::Id128;
+use crate::model::{Digest, Id128};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -238,9 +238,34 @@ pub fn new_work_uuid() -> std::io::Result<String> {
     ))
 }
 
-/// The only backend ID an allocation can ever publish.
+/// The only backend ID an allocation can ever publish. It names the allocation inside its
+/// own instance, as the allocation ID does: two instances may hold the same one.
 pub fn backend_id(allocation: Id128) -> String {
     format!("fc-{allocation}")
+}
+
+/// One allocation's identity across the node. An allocation ID means nothing without the
+/// authenticated instance it belongs to, and anything held per allocation is held by this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllocationKey {
+    pub instance: Id128,
+    pub allocation: Id128,
+}
+
+/// What the launch contract's host names are derived from, in place of a bare allocation
+/// ID: jailer IDs and jail roots are node-global, and a copied allocation ID must not reach
+/// another instance's. The same 32 digits the contract's formula takes, so its paths still
+/// fit sockaddr_un, and finding another pair with this value is a SHA-256 second preimage.
+pub fn host_allocation(instance: Id128, allocation: Id128) -> String {
+    let digest =
+        Digest::of(format!("kilnd-firecracker-host-name-v1\0{instance}\0{allocation}").as_bytes());
+    digest.to_string()[..32].to_string()
+}
+
+/// The node-unique name of this allocation's host resources.
+pub fn host_name(instance: Id128, allocation: Id128) -> String {
+    format!("fc-{}", host_allocation(instance, allocation))
 }
 
 #[cfg(test)]
@@ -342,6 +367,23 @@ mod tests {
             ..IdentityRanges::default()
         };
         assert!(wide.validate(999).is_err());
+    }
+
+    #[test]
+    fn b3r_01_a_host_name_belongs_to_one_instance_and_one_allocation() {
+        let (first, second) = (Id128::from_bytes([1; 16]), Id128::from_bytes([2; 16]));
+        let shared = Id128::from_bytes([3; 16]);
+        assert_ne!(host_name(first, shared), host_name(second, shared));
+        assert_ne!(host_name(first, shared), host_name(shared, first));
+        assert_ne!(host_name(first, shared), host_name(first, second));
+        assert_eq!(host_name(first, shared), host_name(first, shared));
+        // The contract's own shape, so every path it derives is the same length.
+        let name = host_name(first, shared);
+        assert_eq!(name.len(), backend_id(shared).len());
+        assert!(name.strip_prefix("fc-").is_some_and(|hex| {
+            hex.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod workers;
 
 use self::config::{MAX_ENROLLED_HARD, NodePolicy, ProfileCatalog};
 use self::executable::{ExecutableIdentity, ExecutableTable, Role, WalkPolicy};
+use self::identity::AllocationKey;
 use self::inventory::{NamespaceObservation, NodeObservation, ObservationBackend, WorkerFreshness};
 use self::journal::{
     AdmitOutcome, AdmitRequest, AttachOutcome, EnrollOutcome, FenceOutcome, FenceRequest,
@@ -320,7 +321,6 @@ impl Drop for GateUse {
 }
 
 struct SupervisorEntry {
-    instance: Id128,
     pid: i32,
     channel: Arc<Channel>,
     worker_id: i64,
@@ -454,7 +454,7 @@ pub struct Node {
     /// Filled from the ledger before serving. Enrollment needs the node lock, which this
     /// helper holds, so the set cannot change while it runs.
     shares: Mutex<Option<HashMap<Id128, Arc<InstanceShare>>>>,
-    supervisors: Mutex<HashMap<Id128, SupervisorEntry>>,
+    supervisors: Mutex<HashMap<AllocationKey, SupervisorEntry>>,
     pending: Mutex<VecDeque<LedgerRequest>>,
     flushing: tokio::sync::Mutex<()>,
     prep_waiters: AtomicUsize,
@@ -1089,10 +1089,18 @@ impl Node {
             match reply {
                 Ok(LedgerReply::Done | LedgerReply::Generation(_)) => {
                     if let (
-                        LedgerRequest::RecordChild { allocation, .. },
+                        LedgerRequest::RecordChild {
+                            instance,
+                            allocation,
+                            ..
+                        },
                         Ok(LedgerReply::Generation(id)),
                     ) = (&record, &reply)
-                        && let Some(entry) = self.supervisors.lock().unwrap().get_mut(allocation)
+                        && let Some(entry) =
+                            self.supervisors.lock().unwrap().get_mut(&AllocationKey {
+                                instance: *instance,
+                                allocation: *allocation,
+                            })
                     {
                         entry.vm_worker = Some(*id as i64);
                     }
@@ -1111,9 +1119,9 @@ impl Node {
 
     /// Irrevocable for this boot: the gate closes, S's permit is revoked and nothing can
     /// reopen either. Later records follow; none of this needs L.
-    fn set_stop_fence(&self, allocation: Id128, reason: &str) {
+    fn set_stop_fence(&self, key: AllocationKey, reason: &str) {
         let mut supervisors = self.supervisors.lock().unwrap();
-        let Some(entry) = supervisors.get_mut(&allocation) else {
+        let Some(entry) = supervisors.get_mut(&key) else {
             return;
         };
         if entry.stop_fenced {
@@ -1122,27 +1130,27 @@ impl Node {
         entry.stop_fenced = true;
         entry.revoked = true;
         entry.revoke_sent = entry.channel.notify(&SupervisorCommand::Revoke);
-        let instance = entry.instance;
         drop(supervisors);
-        if let Some(gate) = self.gate(instance, allocation) {
+        if let Some(gate) = self.gate(key.instance, key.allocation) {
             gate.close(AmbiguousClass::GateClosed);
         }
         self.queue_record(LedgerRequest::RecordStop {
-            allocation,
+            instance: key.instance,
+            allocation: key.allocation,
             reason: reason.into(),
         });
     }
 
     /// Section 4.4's stop path: revoke reuse in memory first, then dispatch K without
     /// any new fsync. Never a receipt or release: journal evidence follows when it can.
-    fn contain_allocation(self: &Arc<Self>, allocation: Id128, reason: &str) {
-        self.set_stop_fence(allocation, reason);
-        self.dispatch_containment(allocation);
+    fn contain_allocation(self: &Arc<Self>, key: AllocationKey, reason: &str) {
+        self.set_stop_fence(key, reason);
+        self.dispatch_containment(key);
     }
 
     /// One K dispatch per subtree at a time, until it is gone. The tick retries, so no
     /// subtree is forgotten while both fixed slots are occupied.
-    fn dispatch_containment(self: &Arc<Self>, allocation: Id128) {
+    fn dispatch_containment(self: &Arc<Self>, allocation: AllocationKey) {
         let target = {
             let mut supervisors = self.supervisors.lock().unwrap();
             let Some(entry) = supervisors.get_mut(&allocation) else {
@@ -1169,7 +1177,7 @@ impl Node {
     }
 
     fn retry_containment(self: &Arc<Self>) {
-        let unfinished: Vec<Id128> = self
+        let unfinished: Vec<AllocationKey> = self
             .supervisors
             .lock()
             .unwrap()
@@ -1185,7 +1193,8 @@ impl Node {
     /// Every live boot, fenced and contained. A monitor that left took its watches and
     /// targets with it, so these boots never get forward effects again, whatever comes.
     fn contain_all(self: &Arc<Self>, reason: &str) {
-        let affected: Vec<Id128> = self.supervisors.lock().unwrap().keys().copied().collect();
+        let affected: Vec<AllocationKey> =
+            self.supervisors.lock().unwrap().keys().copied().collect();
         for allocation in affected {
             self.contain_allocation(allocation, reason);
         }
@@ -2184,6 +2193,9 @@ impl Node {
     /// The detached body of Create. The ordering is the design's: durable token lookup
     /// first, then gate, epoch, deadline and revalidation, then the one C2 transaction.
     async fn create_flow(self: Arc<Self>, token: CreateToken) -> CreateReply {
+        // Holds a real manager's Create after its C1 and before anything here.
+        #[cfg(test)]
+        workers::faults::hold(&format!("H.create.enter.{}", token.instance)).await;
         let Some(share) = self.share(token.instance) else {
             return ambiguous_create(AmbiguousClass::OldEpoch, "this instance is not enrolled");
         };
@@ -2351,9 +2363,9 @@ impl Node {
                 "no verified helper image is pinned".into(),
             );
         };
-        let backend_id = identity::backend_id(token.allocation);
+        let host_name = identity::host_name(token.instance, token.allocation);
         let cgroup = format!(
-            "kilnd-firecracker/{}/{backend_id}/{SUPERVISOR_CGROUP_LEAF}",
+            "kilnd-firecracker/{}/{host_name}/{SUPERVISOR_CGROUP_LEAF}",
             token.instance
         );
         let allowed_names: Vec<String> = ALLOWED_RESOURCES
@@ -2406,7 +2418,7 @@ impl Node {
                     None
                 };
                 if let Some((class, reason)) = refused {
-                    self.abandon_start(token.allocation, reason);
+                    self.abandon_start(token.key(), reason);
                     return reject(class, reason.into());
                 }
                 match self
@@ -2482,12 +2494,16 @@ impl Node {
 
     /// C2 committed but no S will start. The stop is recorded, and the permit that never
     /// had a process settles as never started. The claim itself stays until ABSENT.
-    fn abandon_start(&self, allocation: Id128, reason: &str) {
+    fn abandon_start(&self, key: AllocationKey, reason: &str) {
         self.queue_record(LedgerRequest::RecordStop {
-            allocation,
+            instance: key.instance,
+            allocation: key.allocation,
             reason: reason.into(),
         });
-        self.queue_record(LedgerRequest::SettleUnstarted { allocation });
+        self.queue_record(LedgerRequest::SettleUnstarted {
+            instance: key.instance,
+            allocation: key.allocation,
+        });
     }
 
     /// C3: fork S gated, require M's acknowledged watch, record its identity, journal
@@ -2517,6 +2533,7 @@ impl Node {
         let inherited = self.config.clone();
         let instance = token.instance;
         let allocation = token.allocation;
+        let key = token.key();
         let profile_name = profile.to_string();
         let pid = workers::spawn_process(&keep, move || {
             workers::supervisor_main(SupervisorContext {
@@ -2531,9 +2548,8 @@ impl Node {
         .map_err(unavailable)?;
         let (channel, events) = Channel::spawn(host, CONTROL_QUEUE, 0).map_err(unavailable)?;
         self.supervisors.lock().unwrap().insert(
-            allocation,
+            key,
             SupervisorEntry {
-                instance,
                 pid,
                 channel: channel.clone(),
                 worker_id,
@@ -2551,17 +2567,18 @@ impl Node {
                 revoke_sent: false,
             },
         );
-        tokio::spawn(Self::supervisor_events(self.clone(), allocation, events));
+        tokio::spawn(Self::supervisor_events(self.clone(), key, events));
         // A failure before the gate means S exits on EOF with nothing done. It is not
         // a lost boot: mark it expected, record the stop, and let the exit settle S.
         let abort = |class: AmbiguousClass, reason: String| {
             let mut supervisors = self.supervisors.lock().unwrap();
-            if let Some(entry) = supervisors.get_mut(&allocation) {
+            if let Some(entry) = supervisors.get_mut(&key) {
                 entry.revoked = true;
                 entry.channel.close();
             }
             drop(supervisors);
             self.queue_record(LedgerRequest::RecordStop {
+                instance,
                 allocation,
                 reason: reason.clone(),
             });
@@ -2592,7 +2609,7 @@ impl Node {
             token.deadline.instant,
             monitor_channel.call::<MonitorReply>(
                 Lane::Normal,
-                &MonitorCommand::RegisterWatch { allocation },
+                &MonitorCommand::RegisterWatch { allocation: key },
                 token.deadline.ns,
             ),
         )
@@ -2620,6 +2637,7 @@ impl Node {
             self.ledger_call(
                 Lane::Normal,
                 &LedgerRequest::AdvancePhase {
+                    instance,
                     allocation,
                     expected_generation: generation,
                     phase: "preparing".into(),
@@ -2652,7 +2670,7 @@ impl Node {
         }
         let opened = {
             let mut supervisors = self.supervisors.lock().unwrap();
-            supervisors.get_mut(&allocation).is_some_and(|entry| {
+            supervisors.get_mut(&key).is_some_and(|entry| {
                 !entry.stop_fenced
                     && entry.channel.notify(&SupervisorCommand::Tick)
                     && entry.channel.notify(&SupervisorCommand::OpenGate {
@@ -2674,7 +2692,7 @@ impl Node {
 
     async fn supervisor_events(
         self: Arc<Self>,
-        allocation: Id128,
+        key: AllocationKey,
         mut events: mpsc::Receiver<serde_json::Value>,
     ) {
         while let Some(event) = events.recv().await {
@@ -2684,22 +2702,23 @@ impl Node {
             match event {
                 SupervisorEvent::ExecObserved(observation) => {
                     self.queue_record(LedgerRequest::RecordObserved {
-                        allocation,
+                        instance: key.instance,
+                        allocation: key.allocation,
                         actual: observation.actual,
                     });
                 }
                 SupervisorEvent::ExecRefused { role, reason } => {
                     self.contain_allocation(
-                        allocation,
+                        key,
                         &format!("{} identity mismatch: {reason}", role.as_str()),
                     );
                 }
                 SupervisorEvent::VmStarted(target) => {
-                    self.on_vm_started(allocation, target).await;
+                    self.on_vm_started(key, target).await;
                 }
                 SupervisorEvent::EffectsDone => {}
                 SupervisorEvent::SetupExpired => {
-                    self.contain_allocation(allocation, "setup deadline expired");
+                    self.contain_allocation(key, "setup deadline expired");
                 }
             }
         }
@@ -2707,8 +2726,8 @@ impl Node {
 
     /// The precommitted authority's concrete target reaches M before anything else,
     /// and it needs no ledger write: an emergency works with L already blocked.
-    async fn on_vm_started(self: &Arc<Self>, allocation: Id128, target: ProcessId) {
-        if let Some(entry) = self.supervisors.lock().unwrap().get_mut(&allocation) {
+    async fn on_vm_started(self: &Arc<Self>, key: AllocationKey, target: ProcessId) {
+        if let Some(entry) = self.supervisors.lock().unwrap().get_mut(&key) {
             entry.vm = Some(target);
         }
         let channel = self.monitor.lock().unwrap().worker.channel.clone();
@@ -2716,7 +2735,10 @@ impl Node {
             Duration::from_secs(1),
             channel.call::<MonitorReply>(
                 Lane::Normal,
-                &MonitorCommand::RegisterTarget { allocation, target },
+                &MonitorCommand::RegisterTarget {
+                    allocation: key,
+                    target,
+                },
                 u64::MAX,
             ),
         )
@@ -2727,18 +2749,22 @@ impl Node {
             .supervisors
             .lock()
             .unwrap()
-            .get(&allocation)
+            .get(&key)
             .is_some_and(|entry| entry.stop_fenced);
         if fenced || !matches!(registered, Ok(Ok(MonitorReply::Registered))) {
-            self.contain_allocation(allocation, "subtree target has no monitor");
+            self.contain_allocation(key, "subtree target has no monitor");
         }
         if let Some(image) = self.config.helper_image {
             self.queue_record(LedgerRequest::RecordChild {
-                allocation,
+                instance: key.instance,
+                allocation: key.allocation,
                 spec: Box::new(WorkerIntentSpec {
                     mode: "vm".into(),
                     allowed_names: vec!["vm".into()],
-                    cgroup: format!("fc-{allocation}/vm/vmm"),
+                    cgroup: format!(
+                        "{}/vm/vmm",
+                        identity::host_name(key.instance, key.allocation)
+                    ),
                     image,
                 }),
                 target,
@@ -2776,7 +2802,7 @@ impl Node {
         let mut never_admitted = false;
         match reply {
             Ok(LedgerReply::Lookup(TokenLookup::Fenced { receipt })) => {
-                self.forget_token(&gate, token.allocation);
+                self.forget_token(&gate, token.key());
                 return FenceReply::Absent {
                     receipt: WireBytes(receipt),
                 };
@@ -2892,7 +2918,7 @@ impl Node {
                 // Durable now, with this token's serialization still held.
                 #[cfg(test)]
                 workers::faults::hold(&format!("H.fence.after_commit.{}", token.allocation)).await;
-                self.forget_token(&gate, token.allocation);
+                self.forget_token(&gate, token.key());
                 FenceReply::Absent {
                     receipt: WireBytes(receipt),
                 }
@@ -2924,9 +2950,10 @@ impl Node {
     /// Revokes S and waits for its real exit. Its VM child must also be proven gone. An
     /// unfinished wait reports that, and leaves the gate closed and the claim held.
     async fn settle_permits(&self, token: &FenceToken) -> Result<(), FenceReply> {
+        let key = token.key();
         let target = {
             let mut supervisors = self.supervisors.lock().unwrap();
-            supervisors.get_mut(&token.allocation).map(|entry| {
+            supervisors.get_mut(&key).map(|entry| {
                 entry.revoked = true;
                 entry.channel.notify(&SupervisorCommand::Revoke);
                 (entry.exited.clone(), entry.exit.is_some())
@@ -2946,7 +2973,7 @@ impl Node {
         let vm = {
             let supervisors = self.supervisors.lock().unwrap();
             supervisors
-                .get(&token.allocation)
+                .get(&key)
                 .and_then(|entry| entry.vm.map(|vm| (vm, entry.vm_gone, entry.vm_worker)))
         };
         if let Some((target, known_gone, worker)) = vm {
@@ -2969,6 +2996,7 @@ impl Node {
             .ledger_call(
                 Lane::Reserved,
                 &LedgerRequest::SettleUnstarted {
+                    instance: token.instance,
                     allocation: token.allocation,
                 },
                 token.deadline.ns,
@@ -2987,22 +3015,22 @@ impl Node {
     }
 
     /// The durable fence now answers for this token; its memory can go.
-    fn forget_token(&self, gate: &TokenGate, allocation: Id128) {
+    fn forget_token(&self, gate: &TokenGate, key: AllocationKey) {
         gate.mark_durable();
-        let removed = self.supervisors.lock().unwrap().remove(&allocation);
+        let removed = self.supervisors.lock().unwrap().remove(&key);
         if removed.is_some() {
             self.monitor
                 .lock()
                 .unwrap()
                 .worker
                 .channel
-                .notify(&MonitorCommand::Forget { allocation });
+                .notify(&MonitorCommand::Forget { allocation: key });
         }
     }
 
-    fn freshness(&self, allocation: Id128) -> WorkerFreshness {
+    fn freshness(&self, key: AllocationKey) -> WorkerFreshness {
         let supervisors = self.supervisors.lock().unwrap();
-        match supervisors.get(&allocation) {
+        match supervisors.get(&key) {
             Some(entry) => WorkerFreshness {
                 stop_fenced: entry.stop_fenced,
                 supervisor_stalled: entry.stalled,
@@ -3047,7 +3075,10 @@ impl Node {
             Ok(LedgerReply::Lookup(TokenLookup::Active {
                 generation, phase, ..
             })) => {
-                let fresh = self.freshness(allocation);
+                let fresh = self.freshness(AllocationKey {
+                    instance,
+                    allocation,
+                });
                 if phase == "stopped" {
                     InspectReply::StoppedWithResources { generation }
                 } else if fresh.stop_fenced {
@@ -3112,7 +3143,12 @@ impl Node {
             &journal,
             &namespace,
             self.monitor_healthy(),
-            &|allocation| self.freshness(allocation),
+            &|allocation| {
+                self.freshness(AllocationKey {
+                    instance,
+                    allocation,
+                })
+            },
         );
         FirecrackerResponse::List(ListReply {
             generation: assembled.generation,
@@ -3136,8 +3172,8 @@ impl Node {
             "prep": [self.prep[0].lock().unwrap().pid, self.prep[1].lock().unwrap().pid],
             "monitor": self.monitor.lock().unwrap().worker.pid,
             "recovery": [self.recovery[0].lock().unwrap().pid, self.recovery[1].lock().unwrap().pid],
-            "supervisors": supervisors.iter().map(|(allocation, entry)| {
-                (allocation.to_string(), serde_json::json!({
+            "supervisors": supervisors.iter().map(|(key, entry)| {
+                (key.allocation.to_string(), serde_json::json!({
                     "pid": entry.pid,
                     "exit": entry.exit,
                     "stop_fenced": entry.stop_fenced,
@@ -3200,6 +3236,24 @@ struct FenceToken {
     deadline: WireDeadline,
 }
 
+impl CreateToken {
+    fn key(&self) -> AllocationKey {
+        AllocationKey {
+            instance: self.instance,
+            allocation: self.allocation,
+        }
+    }
+}
+
+impl FenceToken {
+    fn key(&self) -> AllocationKey {
+        AllocationKey {
+            instance: self.instance,
+            allocation: self.allocation,
+        }
+    }
+}
+
 fn infrastructure_spec(kind: SlotKind, image: ExecutableIdentity) -> WorkerIntentSpec {
     WorkerIntentSpec {
         mode: kind.mode().into(),
@@ -3234,7 +3288,7 @@ fn admit_request(
         stop_authority: StopAuthority::standard(format!(
             "kilnd-firecracker/{}/{}",
             token.instance,
-            identity::backend_id(token.allocation)
+            identity::host_name(token.instance, token.allocation)
         )),
         supervisor: WorkerIntentSpec {
             mode: "supervisor".into(),

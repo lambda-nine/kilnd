@@ -914,7 +914,10 @@ mod linux_root {
         assert_eq!(set, 0, "capability fixture: {}", io::Error::last_os_error());
         assert!(open().is_err(), "a file capability must refuse");
         // SAFETY: path and name are live.
-        assert_eq!(unsafe { libc::removexattr(name.as_ptr(), c"security.capability".as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { libc::removexattr(name.as_ptr(), c"security.capability".as_ptr()) },
+            0
+        );
         open().expect("removing the capability restores the positive control");
         // user:nobody:rwx on the digest directory, in the kernel's xattr format.
         let directory = CString::new(store.join(&digest).as_os_str().as_bytes()).unwrap();
@@ -943,10 +946,14 @@ mod linux_root {
         assert_eq!(set, 0, "ACL fixture: {}", io::Error::last_os_error());
         assert!(open().is_err(), "an extended ACL must refuse");
         // SAFETY: path and name are live.
-        assert_eq!(unsafe { libc::removexattr(directory.as_ptr(), c"system.posix_acl_access".as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { libc::removexattr(directory.as_ptr(), c"system.posix_acl_access".as_ptr()) },
+            0
+        );
         // Linux projects the ACL mask into mode bits, and removing the xattr does
         // not restore those bits. Restore the mode before the next independent case.
-        std::fs::set_permissions(store.join(&digest), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(store.join(&digest), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         open().expect("removing the ACL and restoring mode restores the positive control");
         // A symlink ancestor fails.
         let moved = tree.root.join("moved");

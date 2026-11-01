@@ -50,7 +50,11 @@ pub fn validate_allowlist_entry(entry: &str) -> Result<(), String> {
             || prefix.contains('/')
             || !prefix.bytes().all(|byte| byte.is_ascii_digit())
             || address.parse::<Ipv4Addr>().is_err()
-            || prefix.parse::<u8>().ok().filter(|prefix| *prefix <= 32).is_none()
+            || prefix
+                .parse::<u8>()
+                .ok()
+                .filter(|prefix| *prefix <= 32)
+                .is_none()
         {
             return Err(invalid());
         }
@@ -149,7 +153,13 @@ mod tests {
 
     #[test]
     fn allowlist_grammar_is_structural_and_ipv4_only() {
-        let longest_host = format!("{}.{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+        let longest_host = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
         assert_eq!(longest_host.len(), 253);
         validate_allowlist_entry(&format!("{longest_host}:65535")).unwrap();
         assert!(validate_allowlist_entry(&format!("{longest_host}x")).is_err());
@@ -186,15 +196,16 @@ mod tests {
 
     #[test]
     fn writable_paths_are_absolute_canonical_and_not_root() {
-        validate_writable_path(&format!("/{}", "a".repeat(MAX_WRITABLE_PATH_BYTES - 1)))
-            .unwrap();
+        validate_writable_path(&format!("/{}", "a".repeat(MAX_WRITABLE_PATH_BYTES - 1))).unwrap();
         assert!(
             validate_writable_path(&format!("/{}", "a".repeat(MAX_WRITABLE_PATH_BYTES))).is_err()
         );
         for valid in ["/data", "/workspace/雪", "/a/-flag"] {
             validate_writable_path(valid).unwrap();
         }
-        for invalid in ["", "/", "data", "/a/../b", "/a/./b", "/a//b", "/a/", "/a\nb"] {
+        for invalid in [
+            "", "/", "data", "/a/../b", "/a/./b", "/a//b", "/a/", "/a\nb",
+        ] {
             assert!(validate_writable_path(invalid).is_err(), "{invalid:?}");
         }
     }
@@ -208,7 +219,10 @@ mod tests {
         assert!(validate_argv(&[String::new()], 32).is_err());
         assert!(validate_argv(&vec!["x".into(); MAX_ARGC + 1], usize::MAX).is_err());
         let exact = ["x".repeat(MAX_ENCODED_ARGV_BYTES - 8)];
-        assert_eq!(validate_argv(&exact, usize::MAX).unwrap(), exact[0].len() + 1);
+        assert_eq!(
+            validate_argv(&exact, usize::MAX).unwrap(),
+            exact[0].len() + 1
+        );
         let too_large = ["x".repeat(MAX_ENCODED_ARGV_BYTES)];
         assert!(validate_argv(&too_large, usize::MAX).is_err());
     }
