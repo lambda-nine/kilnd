@@ -181,6 +181,16 @@ impl FirecrackerRuntime {
         self.epoch(deadline).await
     }
 
+    /// Attaches as this process, the same proof a serving daemon would have to give, and
+    /// answers the node that accepted it.
+    pub async fn prove_attachment(&self, deadline: Instant) -> Result<Id128, RuntimeError> {
+        self.epoch(deadline).await?;
+        self.node_id
+            .lock()
+            .unwrap()
+            .ok_or_else(|| RuntimeError::Backend("attached with no node ID".into()))
+    }
+
     /// The live epoch, attaching first if needed. Only one live holder may have this
     /// namespace, and a stale connection never revives: the helper issued its epoch.
     async fn epoch(&self, deadline: Instant) -> Result<Id128, RuntimeError> {

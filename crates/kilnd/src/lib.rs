@@ -3,6 +3,7 @@
 //! trait (kiln first), and serves the `kilnd.v1` gRPC API on a Unix socket.
 
 pub mod admission;
+pub mod attachment_check;
 pub mod manager;
 pub mod model;
 pub mod process;

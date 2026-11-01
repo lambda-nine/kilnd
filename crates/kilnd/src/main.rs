@@ -1,13 +1,14 @@
 use std::ffi::CString;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use kilnd::manager::{Limits, Manager};
+use kilnd::model::Id128;
 use kilnd::runtime::kiln::KilnRuntime;
 use kilnd::store::Store;
 use tokio::signal::unix::{SignalKind, signal};
@@ -121,6 +122,35 @@ struct Args {
     shutdown_grace_secs: u64,
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Creates this instance's private state as its own account, if it doesn't exist yet,
+    /// and prints the durable instance ID to enroll. Safe to repeat, and to run as root,
+    /// which gives up every privilege before opening anything in the directory. It serves
+    /// nothing. An existing database of an older schema is upgraded, as a start would.
+    InitState {
+        /// The instance's state directory.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// The account that will own the directory and run the daemon.
+        #[arg(long)]
+        account: String,
+    },
+    /// Attaches to the helper once as this process, then exits. It passes only when run by
+    /// the enrolled account, in the enrolled unit's cgroup, from the enrolled image.
+    CheckAttachment {
+        #[arg(long, default_value = "/var/lib/kilnd")]
+        state_dir: PathBuf,
+        #[arg(long, default_value = "/run/kilnd-helper/helper.sock")]
+        helper_socket: PathBuf,
+        /// Stay attached, holding the state lock, until SIGTERM or SIGINT: as a daemon would.
+        #[arg(long)]
+        hold: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -155,7 +185,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(args)) {
+    let outcome = match args.command {
+        Some(Command::InitState { state_dir, account }) => init_state(&state_dir, &account)
+            .map(|instance| println!("{instance}"))
+            .with_context(|| format!("initialize {}", state_dir.display())),
+        Some(Command::CheckAttachment {
+            state_dir,
+            helper_socket,
+            hold,
+        }) => runtime.block_on(kilnd::attachment_check::run(
+            &state_dir,
+            helper_socket,
+            hold,
+        )),
+        None => runtime.block_on(run(args)),
+    };
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!(error = %format!("{e:#}"), "kilnd failed");
@@ -249,6 +294,97 @@ async fn run(args: Args) -> Result<()> {
     prune_task.await.context("join history pruner")?;
     info!("stopped");
     result
+}
+
+/// The one way an instance's identity comes to exist. Enrollment needs this ID before the
+/// unit may start, so it can't wait for the daemon's first start to generate one.
+fn init_state(state_dir: &Path, account: &str) -> Result<Id128> {
+    if !state_dir.is_absolute() {
+        bail!("--state-dir must be absolute");
+    }
+    let (uid, gid) = account_ids(account)?;
+    if uid == 0 {
+        bail!("kilnd refuses root; name the instance's own account");
+    }
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        prepare_state_as_root(state_dir, uid, gid)?;
+        drop_privileges(uid, gid)?;
+    } else if euid != uid {
+        bail!("run this as root or as {account}");
+    }
+    let store = Store::open(state_dir)?;
+    Ok(store.identity()?.instance_id)
+}
+
+/// Root touches only the final directory, below a path only root controls. Everything
+/// inside it is left for the account to create after root is gone.
+#[cfg(target_os = "linux")]
+fn prepare_state_as_root(state_dir: &Path, uid: u32, gid: u32) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, fchown};
+    if state_dir
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        bail!("--state-dir must not contain '..'");
+    }
+    let parent = state_dir
+        .parent()
+        .context("--state-dir has no parent")?
+        .canonicalize()
+        .context("--state-dir's parent must exist")?;
+    for ancestor in parent.ancestors() {
+        let meta = std::fs::symlink_metadata(ancestor)?;
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            bail!("{} is not root's alone", ancestor.display());
+        }
+    }
+    let created = match std::fs::DirBuilder::new().mode(0o700).create(state_dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error).context("create the state directory"),
+    };
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(state_dir)
+        .context("open the state directory without following links")?;
+    if created {
+        fchown(&directory, Some(uid), Some(gid)).context("give the account its directory")?;
+    } else if directory.metadata()?.uid() != uid {
+        bail!("the state directory belongs to another account");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_state_as_root(_: &Path, _: u32, _: u32) -> Result<()> {
+    bail!("kilnd runs as a service on Linux only");
+}
+
+/// Permanently becomes the account, with no supplementary groups.
+#[cfg(target_os = "linux")]
+fn drop_privileges(uid: u32, gid: u32) -> Result<()> {
+    // SAFETY: none of these has a precondition, and the null list has length zero. The
+    // process is single-threaded here, and libc applies credentials to every thread anyway.
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setresgid(gid, gid, gid) != 0
+            || libc::setresuid(uid, uid, uid) != 0
+        {
+            return Err(std::io::Error::last_os_error()).context("drop to the account");
+        }
+        if libc::geteuid() != uid || libc::getegid() != gid || libc::setuid(0) == 0 {
+            bail!("root privileges were not fully dropped");
+        }
+    }
+    std::env::set_current_dir("/").context("leave the caller's directory")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_privileges(_: u32, _: u32) -> Result<()> {
+    bail!("kilnd runs as a service on Linux only");
 }
 
 fn validated_limits(args: &Args) -> Result<Limits> {
@@ -428,6 +564,28 @@ fn validated_limits(args: &Args) -> Result<Limits> {
     Ok(limits)
 }
 
+/// A named account's UID and primary GID, from the system's account database.
+fn account_ids(name: &str) -> Result<(u32, u32)> {
+    let cname = CString::new(name).context("account name contains NUL")?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer refers to a live, correctly sized buffer.
+    let rc = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() {
+        bail!("no such account: {name}");
+    }
+    Ok((pwd.pw_uid, pwd.pw_gid))
+}
+
 fn group_id(name: &str) -> Result<u32> {
     let cname = CString::new(name).context("group name contains NUL")?;
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
@@ -570,6 +728,94 @@ mod tests {
                 "{flag} {value}"
             );
         }
+    }
+
+    fn own_account_name() -> String {
+        // SAFETY: the static record is read before anything else can replace it.
+        unsafe {
+            let record = libc::getpwuid(libc::geteuid());
+            assert!(!record.is_null());
+            std::ffi::CStr::from_ptr((*record).pw_name)
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+    }
+
+    /// The other half of B3F-01: the daemon's own open reads the ID init-state printed, so
+    /// the ID enrolled can only be the one the daemon will use.
+    #[test]
+    fn b3f_01_init_state_prints_the_identity_the_daemon_will_use() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let account = own_account_name();
+        let first = init_state(&state, &account).unwrap();
+        assert_eq!(init_state(&state, &account).unwrap(), first, "repeatable");
+        assert_eq!(
+            Store::open(&state).unwrap().identity().unwrap().instance_id,
+            first
+        );
+        let other = temp.path().join("other");
+        assert_ne!(init_state(&other, &account).unwrap(), first);
+    }
+
+    #[test]
+    fn b3f_01_init_state_refuses_what_it_cannot_do_safely() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let refused = |dir: &Path, account: &str| {
+            let error = init_state(dir, account).unwrap_err().to_string();
+            assert!(!temp.path().join("state").exists(), "{error}");
+            error
+        };
+        assert!(refused(Path::new("relative"), "root").contains("absolute"));
+        assert!(refused(&state, "no-such-account-b3f").contains("no such account"));
+        assert!(refused(&state, "root").contains("refuses root"));
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            // Another account's state can't be made from here. `daemon` exists on both
+            // Linux and macOS; the account is only looked up.
+            assert!(refused(&state, "daemon").contains("as root or as daemon"));
+        }
+    }
+
+    /// A live daemon's lock also keeps init-state out of its database.
+    #[test]
+    fn b3f_01_init_state_never_shares_a_state_directory_with_a_daemon() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let _daemon = Store::open(&state).unwrap();
+        init_state(&state, &own_account_name()).unwrap_err();
+    }
+
+    #[test]
+    fn subcommands_keep_the_daemons_flags_their_own() {
+        let args = Args::try_parse_from([
+            "kilnd",
+            "init-state",
+            "--state-dir",
+            "/var/lib/kilnd-a",
+            "--account",
+            "kilnd-a",
+        ])
+        .unwrap();
+        assert!(matches!(args.command, Some(Command::InitState { .. })));
+        assert_eq!(args.state_dir, PathBuf::from("/var/lib/kilnd"));
+        assert!(Args::try_parse_from(["kilnd"]).unwrap().command.is_none());
+        assert!(Args::try_parse_from(["kilnd", "init-state", "--account", "a"]).is_err());
+        let check = Args::try_parse_from(["kilnd", "check-attachment"]).unwrap();
+        assert!(matches!(
+            check.command,
+            Some(Command::CheckAttachment { .. })
+        ));
     }
 
     #[tokio::test]
