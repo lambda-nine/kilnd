@@ -163,7 +163,10 @@ authorizes nothing. After that lookup finds nothing, the first rejection closes 
 token's in-memory gate, and only its durable fence ever answers for it again. A later
 cause clearing does not reopen it. Gates are per instance, with a quota: a token whose plan
 was malformed may be evicted, and a full table refuses that instance's new tokens with
-`worker_exhausted`, while tokens the ledger owns and fences are unaffected. Those two
+`worker_exhausted`, while tokens the ledger owns and fences are unaffected. Each instance
+also has a durable quota of fences for tokens the ledger never admitted: past it,
+`fence_absent` for a never-seen token answers `ambiguous {resource_exhausted}` with nothing
+written, and the charge stays. Fences for admitted tokens never meet this quota. Those two
 operations run detached from their waiter, whose disconnect or timeout gets
 `ambiguous {pending}` while permits and ownership stay put. The last four of the 64
 operation slots serve only recovery, and a live attachment occupies none: each enrolled

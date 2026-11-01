@@ -218,7 +218,7 @@ Only one live holder may use an instance ID. Operations carry a helper-generated
 
 **Every post-C1 release requires ABSENT.** C0 rejection creates no daemon row and no reservation. Once C1 commits, the helper first looks up the token under its per-allocation serialization, before revalidation or allocator selection. An existing ABSENT row is returned unchanged; an existing active or conflicting plan is never DefinitelyNotCreated. For a new token rejected before INTENT, `FenceAbsent` closes its admission gate, cancels or invalidates every queued dispatch generation, waits for all previously issued side-effect permits/workers to settle, verifies all derived resources absent, and commits the retired-token entry plus matching ABSENT receipt in one FULL-sync transaction. Only then can the helper return AbsentFenced/DefinitelyNotCreated. A lock alone, absence in one invocation, deadline, error string or empty listing does not suffice. Late requests check the durable fence again before any side effect.
 
-Receipts identify node, instance, allocation, plan digest, monotonically increasing helper generation and kind `AbsentFenced`. A prior candidate collision or revalidation failure with no fence returns AllocationAmbiguous and the daemon keeps its FAILED row charged while fencing is retried. A ledger failure or a stuck accepted worker forbids the receipt. Retired entries remain even when API history expires. Initially reserve a 64 MiB retired-ID ledger allowance; stop accepting new tokens before the space needed to fence already accepted tokens would be exhausted. Never prune fences by age; epoch-safe compaction is separate work. Bound console retention to 64 KiB combined; its mandatory drain/rate policy is in section 5.6.
+Receipts identify node, instance, allocation, plan digest, monotonically increasing helper generation and kind `AbsentFenced`. A prior candidate collision or revalidation failure with no fence returns AllocationAmbiguous and the daemon keeps its FAILED row charged while fencing is retried. A ledger failure or a stuck accepted worker forbids the receipt. Retired entries remain even when API history expires. Initially reserve a 64 MiB retired-ID ledger allowance; stop accepting new tokens before the space needed to fence already accepted tokens would be exhausted. A quarter of that allowance is set aside for tokens the ledger never admitted, divided equally among the policy's possible instances, and each instance's quota is checked in the fence's own transaction. At its quota, FenceAbsent for a never-seen token fails closed with no row written, and the daemon keeps its charge; a token the ledger admitted is never refused by this quota. Admission reserves the whole set-aside up front, so never-admitted fences and admitted tokens together always fit the allowance. Never prune fences by age; epoch-safe compaction is separate work. Bound console retention to 64 KiB combined; its mandatory drain/rate policy is in section 5.6.
 
 **Daemon database boundary (B2):** `/var/lib/kilnd/kilnd.db` is owned by the kilnd service UID: directory 0700, regular single-link database and SQLite sidecars 0600. Installation checks these modes/owners after any legacy root-to-service transfer; startup validates them before opening and again after SQLite setup. These filesystem permissions protect access. A process able to open its own SQLite connection already has kilnd's file authority and is equivalent to a schema/file rewriter. A connection that disables triggers (`SQLITE_DBCONFIG_ENABLE_TRIGGER`) or registers a spoofed validator is explicitly out of scope for SQL guards. Triggers defend kilnd bugs and honest direct-SQL mistakes through standard tools; they cannot bind another connection's configuration or function implementation. The root-owned node ledger above never frees node capacity or host resources without its own ABSENT receipt, whatever this daemon database says. B3/B4 implement that authority; B2 does not claim it exists yet.
 
@@ -1023,9 +1023,10 @@ changed. Conservative readings taken where this document left room:
 - **Slot waits.** Preflight refuses when both P slots are busy. Create revalidation may
   wait among at most 16 waiters up to its wire deadline, or concurrent admission would
   fail on a transient; it never adds a process or borrows K.
-- **Fence headroom.** Each token is bounded at 4096 bytes, and 1024 tokens' worth of the
-  64 MiB allowance stays reserved for C1 rows the helper has not seen. Preflight and C2
-  refuse a new token past that; a fence for an existing token is always allowed.
+- **Fence headroom.** Each token is bounded at 4096 bytes. Space for never-admitted tokens,
+  including C1 rows the helper has not seen, is reserved from the 64 MiB allowance (see the
+  break-it corrections for the quota). Preflight and C2 refuse a new token past that; a
+  fence for an admitted token is always allowed.
 - **POSIX record locks.** Closing any descriptor for a file drops all of a process's locks
   on it, including SQLite's. The ledger therefore inspects its files with `fstatat` once
   a connection can exist. Opening `-shm` after SQLite would release its DMS lock.
@@ -1146,6 +1147,23 @@ intact and four control-plane failures. The decisions below are made; sections 4
   `b3_03_rejected_creates_cannot_block_*` is the review's PoC turned around, and
   `b3_03_ledger_owned_tokens_answer_*` and `b3_03_a_token_id_from_another_instance_*` cover
   the rest.
+- **Never-admitted fence quota** (a gap found while fixing B3-02, not in the review).
+  `commit_fence` on a token the ledger never saw wrote a permanent row with no headroom
+  check, so an attested hostile instance could grow `retired_tokens` past the allowance
+  with random IDs. The allowance's 16384 entries now split as follows: a quarter (4096) is
+  the never-admitted pool, and each instance's quota is the pool over the larger of
+  `max_enrolled_instances` and the enrolled rows: 512 at the default of 8. Quotas therefore
+  sum to within the pool under any policy, including one lowered below its rows. The
+  count is durable, derived from the ledger's own rows inside the fence transaction, so
+  racing fences and restarts can't pass it. At the quota the reply is
+  `ambiguous {resource_exhausted}`, nothing is written, the daemon keeps its charge and
+  release stays safe. H also checks before its P dispatch, so a refused flood occupies no
+  shared P slot. Admitted tokens are outside the quota in both directions. Headroom
+  is now every allocation row, plus the whole pool, plus one, so no fill of the pool can
+  take space from admitted tokens. Preflight refuses this instance's new tokens once a
+  quarter of its quota remains, so that charged C1 rows can still fence.
+  `tests/control_plane.rs::b3_02_a_random_id_fence_flood_*` and
+  `journal/tests.rs::b3_02_never_admitted_*`.
 - **B3-04, workers published after failed journaling.** See section 6.4.
   `b3_04_startup_serves_nothing_*`, `b3_04_startup_that_cannot_journal_*` and
   `b3_04_a_replacement_ledger_stays_private_*`, using the `L.record_infrastructure.fail` and
@@ -1167,10 +1185,8 @@ fails its schema audit, closed, and needs provisioning again.
   authority. The kilnd unit must not set `Delegate=`, so that its cgroup stays root-writable
   only. Running more than one instance on a node needs per-instance accounts or
   `kernel.yama.ptrace_scope` of at least 1, which B7's multi-daemon test should require.
-- **Open, not fixed here: unknown-token fences grow the ledger.** Found while fixing B3-02.
-  `commit_fence` on a token the ledger has never seen writes a permanent retired-token row
-  with no headroom check, because section 4.1 requires fencing C1 tokens that never reached
-  L. An attested hostile instance can therefore grow `retired_tokens` past the 64 MiB
-  allowance with random IDs. Release stays safe (ENOSPC keeps claims held), but this needs a
-  per-instance limit on never-admitted fences. It is an attested instance, so B3-01 narrows
-  who can do it. It should be decided before B4.
+- **Never-admitted fences are a lifetime budget.** Fences are permanent, so a quota spent
+  stays spent until epoch-safe compaction exists. A daemon that really does exhaust it,
+  through many pre-INTENT rejections, keeps those charges until an operator acts. A
+  policy with a lower `max_enrolled_instances` gives each instance more. Compaction and
+  that repair remain separate work (B6).

@@ -19,6 +19,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   UUID authenticates nothing. Enrollment is bounded by policy, with one attachment slot per
   instance. Token gates follow the durable lookup and are partitioned by instance. Workers
   are never published without their journal row. Attachment needs Linux 6.5 or later.
+- Add a durable per-instance quota on fences for tokens the ledger never admitted, so an
+  attested instance can't grow the root ledger with random IDs. At the quota the fence
+  fails closed and the charge stays. Fences for admitted tokens are never refused by it.
 
 - Close B2 recheck findings in schema 10: audit release receipts in trusted Rust
   reads, retain invalid releases as charged/quarantined, degrade Health and refuse

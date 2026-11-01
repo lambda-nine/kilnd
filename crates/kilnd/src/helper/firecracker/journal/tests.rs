@@ -1,8 +1,8 @@
 //! Ledger authority tests, with real SQLite files and no fakes of its behavior.
 #![allow(clippy::type_complexity)]
 use super::*;
-use crate::helper::firecracker::config::MAX_ENROLLED_HARD;
 use crate::helper::firecracker::config::tests::{sample_leases, sample_vector};
+use crate::helper::firecracker::config::{DEFAULT_MAX_ENROLLED, MAX_ENROLLED_HARD};
 use crate::helper::firecracker::identity::{GuestCid, RelayGid, RelayUid, VmmGid, VmmUid};
 use crate::runtime::FencedAbsence;
 use rusqlite::config::DbConfig;
@@ -29,6 +29,7 @@ pub(in crate::helper::firecracker) fn temp_ledger(ceilings: NodeCeilings) -> Tem
         node_id: Id128::from_bytes([0x11; 16]),
         ceilings,
         shared: SharedReserve::default(),
+        max_enrolled: DEFAULT_MAX_ENROLLED,
     };
     Ledger::provision(&config).unwrap();
     TempLedger {
@@ -1431,4 +1432,126 @@ fn b3_02_attach_writes_only_its_own_row_once_and_respects_the_fence_floor() {
         ledger.attach_instance(instance(), database()).unwrap(),
         AttachOutcome::Bound { .. }
     ));
+}
+
+fn never_admitted_request(instance: Id128) -> FenceRequest {
+    FenceRequest {
+        instance_id: instance,
+        allocation_id: Id128::random(),
+        sandbox_id: crate::model::new_id("sb"),
+        plan_digest: Digest::of(b"never admitted"),
+        observations: "permits=settled;namespace=absent".into(),
+    }
+}
+
+#[test]
+fn b3_02_never_admitted_fence_quotas_sum_within_the_allowance_and_reserve_their_space() {
+    let allowance = SharedReserve::default().fence_allowance_bytes;
+    assert_eq!(allowance, 64 * MIB);
+    for limit in [1, 2, DEFAULT_MAX_ENROLLED, MAX_ENROLLED_HARD] {
+        let fixture = temp_ledger(unrestricted());
+        let mut config = fixture.config.clone();
+        config.max_enrolled = limit;
+        let ledger = Ledger::open(config.clone()).unwrap();
+        let quota = never_admitted_quota(ledger.connection(), &config).unwrap();
+        assert!(quota > 0, "{limit}");
+        assert!(
+            quota * u64::from(limit) * FENCE_ENTRY_BOUND <= allowance,
+            "{limit}: {quota}"
+        );
+        // Admission reserves the whole pool, used or not, so the pool and every
+        // admitted token's entry together can never exceed the allowance.
+        assert!(never_admitted_pool(&config) * FENCE_ENTRY_BOUND <= allowance);
+        assert!(ledger.fence_headroom().unwrap());
+    }
+    // A policy lowered under its existing rows shrinks shares; it can't inflate the sum.
+    let fixture = temp_ledger(unrestricted());
+    let mut config = fixture.config.clone();
+    config.max_enrolled = 1;
+    let mut ledger = Ledger::open(config.clone()).unwrap();
+    let solo = never_admitted_quota(ledger.connection(), &config).unwrap();
+    for byte in 0..4 {
+        enroll(&mut ledger, Id128::from_bytes([byte; 16]));
+    }
+    let shared = never_admitted_quota(ledger.connection(), &config).unwrap();
+    assert_eq!(shared, solo / 4);
+    // An allowance smaller than the pool's floor still caps it.
+    config.shared.fence_allowance_bytes = 100 * FENCE_ENTRY_BOUND;
+    assert_eq!(never_admitted_pool(&config), 100);
+}
+
+#[test]
+fn b3_02_never_admitted_fences_stop_at_the_quota_and_admitted_ones_never_do() {
+    let fixture = temp_ledger(unrestricted());
+    let mut config = fixture.config.clone();
+    config.max_enrolled = MAX_ENROLLED_HARD;
+    let mut ledger = Ledger::open(config.clone()).unwrap();
+    enroll(&mut ledger, instance());
+    ledger.attach_instance(instance(), database()).unwrap();
+    let other = Id128::from_bytes([0x44; 16]);
+    enroll(&mut ledger, other);
+    accepted(ledger.admit_intent(&request(1)).unwrap());
+    let quota = never_admitted_quota(ledger.connection(), &config).unwrap();
+    assert_eq!(quota, 4096 / u64::from(MAX_ENROLLED_HARD));
+    for used in 0..quota {
+        assert!(ledger.never_admitted_fence_allowed(instance()).unwrap());
+        // New tokens stop early, with a quarter left for tokens already charged at C1.
+        assert_eq!(
+            ledger.pre_intent_headroom(instance()).unwrap(),
+            used < quota - quota / 4,
+            "{used}"
+        );
+        absent(
+            ledger
+                .commit_fence(&never_admitted_request(instance()))
+                .unwrap(),
+        );
+    }
+    assert!(!ledger.never_admitted_fence_allowed(instance()).unwrap());
+    // At the quota: refused, and nothing written, not even a generation.
+    let generation = ledger.generation().unwrap();
+    let changes = ledger.connection().total_changes();
+    let refused = never_admitted_request(instance());
+    for _ in 0..3 {
+        assert_eq!(
+            ledger.commit_fence(&refused).unwrap(),
+            FenceOutcome::QuotaExhausted { quota }
+        );
+    }
+    assert_eq!(ledger.connection().total_changes(), changes);
+    assert_eq!(ledger.generation().unwrap(), generation);
+    assert_eq!(
+        ledger
+            .lookup_token(instance(), refused.allocation_id, &refused.plan_digest)
+            .unwrap(),
+        TokenLookup::Unknown
+    );
+    // Fences for tokens the ledger admitted are outside this quota, before and after.
+    accepted(ledger.admit_intent(&request(2)).unwrap());
+    for index in [1u8, 2] {
+        ledger
+            .settle_unstarted(request(index).allocation_id)
+            .unwrap();
+        let (_, replay) = absent(ledger.commit_fence(&fence_request(index)).unwrap());
+        assert!(!replay);
+    }
+    // They don't count against it either, and neither does a replay.
+    assert!(!ledger.never_admitted_fence_allowed(instance()).unwrap());
+    assert_eq!(
+        never_admitted_fences(ledger.connection(), instance()).unwrap(),
+        quota
+    );
+    // Another instance's quota is its own.
+    assert_eq!(
+        never_admitted_fences(ledger.connection(), other).unwrap(),
+        0
+    );
+    assert!(ledger.never_admitted_fence_allowed(other).unwrap());
+    assert!(ledger.pre_intent_headroom(other).unwrap());
+    absent(ledger.commit_fence(&never_admitted_request(other)).unwrap());
+    // The count survives reopening: it is durable, not remembered.
+    drop(ledger);
+    let reopened = Ledger::open(config).unwrap();
+    assert!(!reopened.never_admitted_fence_allowed(instance()).unwrap());
+    assert!(reopened.never_admitted_fence_allowed(other).unwrap());
 }

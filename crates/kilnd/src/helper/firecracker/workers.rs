@@ -914,6 +914,9 @@ pub enum LedgerRequest {
         allocation: Id128,
         plan_digest: Digest,
     },
+    NeverAdmittedFenceAllowed {
+        instance: Id128,
+    },
     Inspect {
         instance: Id128,
         allocation: Id128,
@@ -989,6 +992,7 @@ pub enum LedgerReply {
         reason: String,
     },
     Lookup(TokenLookup),
+    NeverAdmittedFenceAllowed(bool),
     PreflightSnapshot {
         claimed: ClaimedIdentities,
         retired_or_active: bool,
@@ -1069,6 +1073,9 @@ fn handle_ledger(
             allocation,
             plan_digest,
         } => LedgerReply::Lookup(ledger.lookup_token(instance, allocation, &plan_digest)?),
+        LedgerRequest::NeverAdmittedFenceAllowed { instance } => {
+            LedgerReply::NeverAdmittedFenceAllowed(ledger.never_admitted_fence_allowed(instance)?)
+        }
         LedgerRequest::Inspect {
             instance,
             allocation,
@@ -1082,7 +1089,7 @@ fn handle_ledger(
                 ledger.inspect(instance, allocation)?,
                 TokenLookup::Unknown
             ),
-            headroom: ledger.fence_headroom()?,
+            headroom: ledger.fence_headroom()? && ledger.pre_intent_headroom(instance)?,
         },
         LedgerRequest::Admit { request, authority } => {
             fault_point("L.admit");

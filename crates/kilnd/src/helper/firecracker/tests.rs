@@ -112,6 +112,7 @@ fn ledger_config(config: &ChildConfig) -> LedgerConfig {
         node_id: config.node_id,
         ceilings: config.options.ceilings,
         shared,
+        max_enrolled: config.options.max_enrolled,
     }
 }
 

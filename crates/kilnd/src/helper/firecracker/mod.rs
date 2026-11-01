@@ -2773,6 +2773,7 @@ impl Node {
                 token.deadline.with_grace(),
             )
             .await;
+        let mut never_admitted = false;
         match reply {
             Ok(LedgerReply::Lookup(TokenLookup::Fenced { receipt })) => {
                 self.forget_token(&gate, token.allocation);
@@ -2785,7 +2786,7 @@ impl Node {
                 return ambiguous_fence(AmbiguousClass::Conflict, reason);
             }
             Ok(LedgerReply::Lookup(TokenLookup::Active { .. })) => gate.mark_durable(),
-            Ok(LedgerReply::Lookup(TokenLookup::Unknown)) => {}
+            Ok(LedgerReply::Lookup(TokenLookup::Unknown)) => never_admitted = true,
             Ok(LedgerReply::Unavailable { reason } | LedgerReply::Failed { reason }) => {
                 return ambiguous_fence(AmbiguousClass::LedgerUnavailable, reason);
             }
@@ -2810,6 +2811,37 @@ impl Node {
         }
         // From here no new permit can be issued, whatever this attempt concludes.
         gate.close(AmbiguousClass::GateClosed);
+        // Refuse at the quota here, before this instance can occupy a shared P slot. The
+        // commit below checks again in its own transaction, and that is the authority.
+        if never_admitted {
+            let allowed = self
+                .ledger_call(
+                    Lane::Reserved,
+                    &LedgerRequest::NeverAdmittedFenceAllowed {
+                        instance: token.instance,
+                    },
+                    token.deadline.ns,
+                )
+                .await;
+            match allowed {
+                Ok(LedgerReply::NeverAdmittedFenceAllowed(true)) => {}
+                Ok(LedgerReply::NeverAdmittedFenceAllowed(false)) => {
+                    return ambiguous_fence(
+                        AmbiguousClass::ResourceExhausted,
+                        "this instance has used its quota of never-admitted fences",
+                    );
+                }
+                Ok(LedgerReply::Unavailable { reason } | LedgerReply::Failed { reason }) => {
+                    return ambiguous_fence(AmbiguousClass::LedgerUnavailable, reason);
+                }
+                _ => {
+                    return ambiguous_fence(
+                        AmbiguousClass::LedgerUnavailable,
+                        "the ledger did not answer the fence quota",
+                    );
+                }
+            }
+        }
         if let Err(reply) = self.settle_permits(&token).await {
             return reply;
         }
@@ -2871,6 +2903,10 @@ impl Node {
             Ok(LedgerReply::Fence(FenceOutcome::Unsettled { workers })) => ambiguous_fence(
                 AmbiguousClass::PermitsUnsettled,
                 format!("{workers} worker records remain unsettled"),
+            ),
+            Ok(LedgerReply::Fence(FenceOutcome::QuotaExhausted { quota })) => ambiguous_fence(
+                AmbiguousClass::ResourceExhausted,
+                format!("this instance has used its {quota} never-admitted fences"),
             ),
             Ok(LedgerReply::Expired) => {
                 ambiguous_fence(AmbiguousClass::Expired, "fence deadline expired")
@@ -3268,6 +3304,7 @@ pub fn production_config(policy: NodePolicy, service_uid: u32) -> NodeConfig {
             node_id: policy.node_id,
             ceilings: policy.ceilings,
             shared: config::SharedReserve::default(),
+            max_enrolled: policy.max_enrolled_instances,
         },
         ranges: policy.identity_ranges,
         profiles,
@@ -3305,6 +3342,7 @@ pub fn provision_ledger(policy: &NodePolicy) -> Result<(), String> {
         node_id: policy.node_id,
         ceilings: policy.ceilings,
         shared: config::SharedReserve::default(),
+        max_enrolled: policy.max_enrolled_instances,
     })
     .map_err(|e| e.to_string())
 }
@@ -3324,6 +3362,7 @@ pub fn enroll_instance(
         node_id: policy.node_id,
         ceilings: policy.ceilings,
         shared: config::SharedReserve::default(),
+        max_enrolled: policy.max_enrolled_instances,
     };
     enroll_with(
         &config,

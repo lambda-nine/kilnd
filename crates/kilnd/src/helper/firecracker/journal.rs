@@ -27,6 +27,9 @@ pub const FENCE_ENTRY_BOUND: u64 = 4096;
 /// Headroom kept for tokens the helper has not seen yet: a daemon may hold a C1 row
 /// that never reached L. Admission stops before fencing them would not fit.
 pub const PRE_INTENT_TOKEN_MARGIN: u64 = 1024;
+/// A quarter of the fence allowance is set aside for tokens that never reach admission,
+/// divided equally among possible instances. Admission stops before it needs that share.
+const NEVER_ADMITTED_SHARE: u64 = 4;
 /// A complete inventory is bounded to this many active allocations.
 pub const MAX_ACTIVE_LISTED: usize = 1024;
 
@@ -140,6 +143,7 @@ CREATE TABLE retired_tokens (
     helper_generation INTEGER NOT NULL UNIQUE CHECK (helper_generation >= 1),
     receipt BLOB NOT NULL
 ) STRICT;
+CREATE INDEX retired_tokens_by_instance ON retired_tokens(instance_id);
 CREATE TABLE stop_events (
     id INTEGER PRIMARY KEY,
     allocation_id TEXT NOT NULL REFERENCES allocations(allocation_id),
@@ -558,6 +562,11 @@ pub enum FenceOutcome {
     Unsettled {
         workers: u64,
     },
+    /// A token the ledger never admitted, from an instance that has used its whole quota
+    /// of those fences. Nothing was written, and the daemon keeps its charge.
+    QuotaExhausted {
+        quota: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,6 +673,8 @@ pub struct LedgerConfig {
     pub node_id: Id128,
     pub ceilings: NodeCeilings,
     pub shared: SharedReserve,
+    /// Root policy's enrollment limit, which sizes each instance's share of the allowance.
+    pub max_enrolled: u32,
 }
 
 pub struct Ledger {
@@ -815,6 +826,38 @@ fn next_generation(tx: &Transaction<'_>) -> Result<u64, LedgerError> {
     tx.prepare_cached("UPDATE generation_counter SET value = ?1 WHERE id = 1")?
         .execute([next])?;
     unsigned(next)
+}
+
+/// Allowance entries set aside for all instances' never-admitted fences together. Never
+/// more than the allowance, and at least the margin for tokens L hasn't seen yet.
+fn never_admitted_pool(config: &LedgerConfig) -> u64 {
+    let tokens = config.shared.fence_allowance_bytes / FENCE_ENTRY_BOUND;
+    (tokens / NEVER_ADMITTED_SHARE)
+        .max(PRE_INTENT_TOKEN_MARGIN)
+        .min(tokens)
+}
+
+/// One instance's share. A lowered policy can leave more rows than its limit, so the
+/// divisor follows the rows too, and the quotas always sum to within the pool.
+fn never_admitted_quota(conn: &Connection, config: &LedgerConfig) -> Result<u64, LedgerError> {
+    let enrolled: i64 = conn
+        .prepare_cached("SELECT COUNT(*) FROM instances")?
+        .query_row([], |r| r.get(0))?;
+    let capacity = unsigned(enrolled)?
+        .max(u64::from(config.max_enrolled))
+        .max(1);
+    Ok(never_admitted_pool(config) / capacity)
+}
+
+/// Permanent fences this instance holds for tokens with no admission record.
+fn never_admitted_fences(conn: &Connection, instance: Id128) -> Result<u64, LedgerError> {
+    let used: i64 = conn
+        .prepare_cached(
+            "SELECT COUNT(*) FROM retired_tokens r WHERE r.instance_id = ?1 AND NOT EXISTS
+                (SELECT 1 FROM allocations a WHERE a.allocation_id = r.allocation_id)",
+        )?
+        .query_row([instance.to_string()], |r| r.get(0))?;
+    unsigned(used)
 }
 
 fn claim_totals(conn: &Connection) -> Result<ClaimTotals, LedgerError> {
@@ -1333,20 +1376,40 @@ impl Ledger {
     /// Whether one more token still fits, with every active token and the pre-intent
     /// margin already counted. Permanent fences never give their space back.
     pub fn fence_headroom(&self) -> Result<bool, LedgerError> {
-        let retired: i64 = self
+        // Every admitted token, active or retired, holds one entry. Never-admitted fences
+        // are reserved whole, up front, so no quota can eat what admitted tokens need.
+        let allocations: i64 = self
             .conn
-            .prepare_cached("SELECT COUNT(*) FROM retired_tokens")?
+            .prepare_cached("SELECT COUNT(*) FROM allocations")?
             .query_row([], |r| r.get(0))?;
-        let active: i64 = self
+        let never_admitted: i64 = self
             .conn
-            .prepare_cached("SELECT COUNT(*) FROM allocations WHERE phase != 'absent'")?
+            .prepare_cached(
+                "SELECT COUNT(*) FROM retired_tokens r WHERE NOT EXISTS
+                    (SELECT 1 FROM allocations a WHERE a.allocation_id = r.allocation_id)",
+            )?
             .query_row([], |r| r.get(0))?;
-        let needed = unsigned(retired)?
-            .checked_add(unsigned(active)?)
-            .and_then(|tokens| tokens.checked_add(PRE_INTENT_TOKEN_MARGIN + 1))
+        let reserved = never_admitted_pool(&self.config).max(unsigned(never_admitted)?);
+        let needed = unsigned(allocations)?
+            .checked_add(reserved)
+            .and_then(|tokens| tokens.checked_add(1))
             .and_then(|tokens| tokens.checked_mul(FENCE_ENTRY_BOUND))
             .ok_or(LedgerError::Overflow("fence headroom"))?;
         Ok(needed <= self.config.shared.fence_allowance_bytes)
+    }
+
+    /// Whether this instance may still fence a token the ledger never admitted.
+    pub fn never_admitted_fence_allowed(&self, instance: Id128) -> Result<bool, LedgerError> {
+        let used = never_admitted_fences(&self.conn, instance)?;
+        Ok(used < never_admitted_quota(&self.conn, &self.config)?)
+    }
+
+    /// New tokens stop while a quarter of the quota remains, for tokens a daemon already
+    /// charged at C1. Fences for those keep working up to the quota itself.
+    pub fn pre_intent_headroom(&self, instance: Id128) -> Result<bool, LedgerError> {
+        let quota = never_admitted_quota(&self.conn, &self.config)?;
+        let used = never_admitted_fences(&self.conn, instance)?;
+        Ok(used < quota - quota / 4)
     }
 
     fn ledger_bytes(&self) -> Result<u64, LedgerError> {
@@ -1868,6 +1931,11 @@ impl Ledger {
                     return Ok(FenceOutcome::Conflict {
                         reason: "this namespace was never attached".into(),
                     });
+                }
+                // Inside this transaction, so racing fences can't pass it together.
+                let quota = never_admitted_quota(&tx, &self.config)?;
+                if never_admitted_fences(&tx, request.instance_id)? >= quota {
+                    return Ok(FenceOutcome::QuotaExhausted { quota });
                 }
             }
         }

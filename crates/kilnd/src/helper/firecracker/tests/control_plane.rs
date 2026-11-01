@@ -1176,6 +1176,127 @@ fn runtime_database(fixture: &Fixture, instance: Id128) -> Id128 {
     Id128::parse(&text).unwrap()
 }
 
+/// One never-admitted fence: a fresh random ID the helper has never seen.
+async fn random_fence(runtime: Arc<FirecrackerRuntime>, instance: Id128) -> Result<(), String> {
+    runtime
+        .fence_absent(
+            &token(instance),
+            &Digest::of(Id128::random().to_string().as_bytes()),
+            deadline(20),
+            &no_cancel(),
+        )
+        .await
+        .map(|receipt| {
+            fenced(receipt);
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tokio::test]
+async fn b3_02_a_random_id_fence_flood_stops_at_its_quota_and_spares_other_instances() {
+    // A share small enough to reach quickly: 4096 entries across 32 possible instances.
+    let quota = 128;
+    let fixture = Fixture::new(NodeOptions {
+        max_enrolled: 32,
+        ..NodeOptions::default()
+    })
+    .await;
+    let hostile_id = Id128::random();
+    let hostile = fixture.runtime(hostile_id, Id128::random());
+    let victim_id = Id128::random();
+    let victim = fixture.runtime(victim_id, Id128::random());
+    // Real work on each side, plus a token prepared now and admitted only at the quota.
+    let admitted = token(hostile_id);
+    let admitted_plan = prepared(&hostile, &admitted).await;
+    create_accepted(&fixture, &hostile, &admitted, &admitted_plan).await;
+    let late = token(hostile_id);
+    let late_plan = prepared(&hostile, &late).await;
+    let owned = token(victim_id);
+    let owned_plan = prepared(&victim, &owned).await;
+    create_accepted(&fixture, &victim, &owned, &owned_plan).await;
+
+    let hostile_rows =
+        format!("SELECT COUNT(*) FROM retired_tokens WHERE instance_id = '{hostile_id}'");
+    // The flood, in parallel, until the helper starts refusing it by quota. Some attempts
+    // can find both P slots busy; those just don't count.
+    let mut exhausted = false;
+    for _ in 0..200 {
+        let mut batch = Vec::new();
+        for _ in 0..4 {
+            batch.push(tokio::spawn(random_fence(hostile.clone(), hostile_id)));
+        }
+        for attempt in batch {
+            if let Err(error) = attempt.await.unwrap() {
+                exhausted |= error.contains("ResourceExhausted");
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+    assert!(exhausted, "the flood was never refused");
+    assert_eq!(fixture.count(&hostile_rows), quota, "exactly the quota");
+    // More of it writes no row at all.
+    let generation = fixture.count("SELECT value FROM generation_counter");
+    for _ in 0..20 {
+        let error = random_fence(hostile.clone(), hostile_id).await.unwrap_err();
+        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert!(error.contains("stays charged"), "{error}");
+    }
+    assert_eq!(fixture.count(&hostile_rows), quota);
+    assert_eq!(
+        fixture.count("SELECT value FROM generation_counter"),
+        generation
+    );
+    assert_eq!(
+        fixture.count("SELECT COUNT(*) FROM allocations"),
+        2,
+        "the flood admitted nothing"
+    );
+
+    // The victim is untouched: its never-admitted fences under its own quota, a new
+    // Preflight and Create, and the token the ledger already owns.
+    for _ in 0..8 {
+        random_fence(victim.clone(), victim_id).await.unwrap();
+    }
+    let fresh = token(victim_id);
+    let fresh_plan = prepared(&victim, &fresh).await;
+    create_accepted(&fixture, &victim, &fresh, &fresh_plan).await;
+    for (context, plan) in [(&owned, &owned_plan), (&fresh, &fresh_plan)] {
+        fenced(
+            victim
+                .fence_absent(context, &plan.plan_digest(), deadline(20), &no_cancel())
+                .await
+                .unwrap(),
+        );
+    }
+
+    // At its quota the hostile instance gets no new token, and the tokens the ledger
+    // admitted still fence, including one admitted after the quota ran out.
+    let refused = hostile
+        .prepare(&token(hostile_id), &spec(), deadline(5), &no_cancel())
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("headroom"), "{refused}");
+    create_accepted(&fixture, &hostile, &late, &late_plan).await;
+    for (context, plan) in [(&admitted, &admitted_plan), (&late, &late_plan)] {
+        fenced(
+            hostile
+                .fence_absent(context, &plan.plan_digest(), deadline(20), &no_cancel())
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(fixture.active_allocations(), 0);
+    // The refusal is durable across a helper restart, where nothing in memory helps.
+    fixture.kill_helper().await;
+    fixture.start().await;
+    let renewed = fixture.runtime(hostile_id, runtime_database(&fixture, hostile_id));
+    let error = random_fence(renewed, hostile_id).await.unwrap_err();
+    assert!(error.contains("ResourceExhausted"), "{error}");
+    assert_eq!(fixture.count(&hostile_rows), quota + 2);
+}
+
 const INFRASTRUCTURE_ROWS: i64 = 6;
 
 #[tokio::test]

@@ -312,6 +312,8 @@ pub enum AmbiguousClass {
     PermitsUnsettled,
     ResourcesPresent,
     ObservationUnavailable,
+    /// This instance has used its quota of fences for never-admitted tokens.
+    ResourceExhausted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
