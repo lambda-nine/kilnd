@@ -100,6 +100,9 @@ scripts/integration-test.sh          # dedicated admission stress, root + real k
 scripts/daemon-singleton-regressions.sh # duplicate starts preserve active work
 scripts/state-path-regressions.sh    # ownership, mode, type, link and symlink defenses
 sudo python3 -I scripts/phase0-regressions.py # real peer UIDs, helper, privilege, retention
+# install, add-instance and every way an upgrade can fail, between two builds, under a
+# hostile account's connections; see the script for what it needs
+sudo python3 -I scripts/deployment-regressions.py --bin-a DIR --bin-b DIR
 scripts/smoke.sh                     # through the installed service
 ```
 
@@ -134,22 +137,30 @@ sudo kilnd-helper --firecracker-policy /etc/kilnd/firecracker-node.json --firecr
 The first command creates the ledger, once, and refuses if any ledger file exists; do
 not delete a ledger to recover from an error, because that discards every claim.
 
-Each kilnd instance is then enrolled by root, with the helper stopped, naming its Unix
-account and the unit that serves it, and reading the installed image's identity. One
-instance can keep the `kilnd` account:
+Each kilnd instance is then enrolled by root under the ID its own state holds. Rerun
+`scripts/install.sh` once the helper has the policy, and the default instance is enrolled
+under the `kilnd` account. Every further instance gets its own account and group, its
+`kilnd@<name>` unit and its enrollment, in one command, with no ID to supply:
 
 ```sh
-sudo systemctl stop kilnd-helper.service
-sudo kilnd-helper enroll --instance <32 hex digits> --unit kilnd.service
-sudo systemctl start kilnd-helper.service
+scripts/add-instance.sh <name>
 ```
 
-Every further instance needs its own account, which `scripts/add-instance.sh` creates with
-its own group, along with the `kilnd@<name>` unit and the enrollment:
+Both take the same steps. `kilnd init-state --state-dir <dir> --account <account>` creates the
+private state as that account and prints its durable instance ID, root enrolls exactly that
+ID, and only then does the unit start. Repeating a step is harmless: init-state answers with
+the same ID.
 
-```sh
-scripts/add-instance.sh <name> <32 hex digits>
-```
+Enrollment needs the node lock, and any enrolled account can connect to the helper's socket,
+so the helper would just come back if only its service were stopped. These commands mask
+`kilnd-helper.socket`, stop it along with the helper and every daemon that requires it, then
+mask the service, so nothing can start any of them. A running sandbox keeps running. When the
+work is done, by success, failure or signal, the same command unmasks them and starts
+exactly what was running. This is brief, but it stops every instance on the node. If the
+command is killed outright, activation stays unavailable until `scripts/upgrade.sh --recover`,
+or until the next maintenance command, either of which finishes the job. The masks live in
+`/run/systemd/system.control`, because `systemctl mask --runtime` has no effect on a unit
+installed in `/etc`, and a reboot clears them.
 
 Enrollment refuses an account another instance holds, root, the helper's own account and
 anything in the policy's VM identity ranges, and the helper refuses a ledger that breaks
@@ -158,8 +169,43 @@ database are its own account's, mode 0700. `kilnd@<name>` is for instances on th
 backend: the helper refuses an enrolled account's kiln requests, so until B7 can select that
 backend such a daemon stops at startup reconciliation.
 
-Enroll again whenever `/usr/local/bin/kilnd` is replaced: until then that instance can't
-attach. `--cgroup` names the unit's cgroup if it isn't `/system.slice/<unit>`, and the unit
+An enrollment names the installed image, so replacing `/usr/local/bin/kilnd` by hand leaves
+every instance unable to attach. On a node with a policy or further instances,
+`scripts/install.sh` runs the whole replacement as one transaction, `scripts/upgrade.sh`:
+
+```sh
+scripts/install.sh                  # builds, then upgrades in place
+scripts/upgrade.sh <directory>      # the same with kilnd, kilnd-helper, kilndctl already built
+scripts/upgrade.sh --recover        # finishes an upgrade killed partway
+```
+
+1. **Before stopping anything,** it refuses new images that don't run.
+2. It discovers every instance (`kilnd.service` and `kilnd@*`), records which are running,
+   and stops them all, with activation unavailable as above.
+3. **Before replacing anything,** it refuses if the ledger can't be read or refreshed, if an
+   enrollment isn't a standard unit bound to its current account, or if it can't keep a copy of
+   a running instance's database.
+4. It moves the old images aside by rename, keeping their inodes, installs the new images and
+   units, and refreshes every enrollment's image in one ledger transaction. An instance's ID,
+   account and unit can't change, and an instance that isn't running is refreshed too.
+5. With everything still down, the new image opens each running instance's state, which
+   performs any schema upgrade before a client or a reconciliation can see it. The ID it
+   finds must be the enrolled one.
+6. It starts exactly what was running. The default instance must stay up and answer Health.
+
+Any failure or signal at any point puts back the old images, under their old inodes, the
+enrollments and the units, and starts what was running. A database is put back only if its
+schema changed, since the old image couldn't open it; otherwise the one in place is the newer
+truth, and replacing it could forget a reservation. If a daemon may have served on a schema
+that goes back, what it held is kept under `/var/lib/kilnd-helper/failed-upgrades`, and the
+command says so. A kill leaves `/var/lib/kilnd-helper/upgrade` for `--recover` or the next
+maintenance command to undo, including after a reboot.
+
+A hostile instance can make its own state unusable and so make the upgrade refuse. The message
+names that instance. Stop it (`systemctl disable --now kilnd@<name>`) and upgrade the rest: its
+enrollment is refreshed, and its state is left alone.
+
+`--cgroup` names the unit's cgroup if it isn't `/system.slice/<unit>`, and the unit
 must not set `Delegate=`. A policy's `max_enrolled_instances` limits the total (default 8).
 This needs Linux 6.5 or later. Ledgers from earlier B3 builds fail their audit and must be
 provisioned again.
@@ -264,7 +310,7 @@ without the registered receipt validator cannot insert release evidence. Older
 binaries refuse schema 9.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
-  restart.
+  restart. On a Firecracker node this is a transaction; see above.
 - **State path:** `--state-dir` must be absolute. Its real ancestors must be
   trusted and non-writable, and every nested symlink alias must be owned by
   root or the service UID (a trusted sticky temporary directory is allowed).

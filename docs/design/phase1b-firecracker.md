@@ -1260,3 +1260,56 @@ report says: the production-disabled no-image branch must not survive enabling p
 - **Shared node budgets.** One instance can still spend the node's capacity and its admitted
   token allowance, as the design intends.
 - **Root.** Root modifying policy, enrollment or the ledger stays out of this model.
+
+## B3 deployment corrections (November 1, 2026)
+
+The Daybreak Blue final recheck (`reviews/2026-11-01-b3-final.md`) found the security core
+sound and the deployment path broken in three ways. The decisions are made, and
+`docs/setup.md` is the operator's account. Root's maintenance commands now live in one
+script, `scripts/kilnd-maintenance.py`, with `scripts/add-instance.sh` and
+`scripts/upgrade.sh` as its doors, and `scripts/deployment-regressions.py` runs them against
+the installed services.
+
+- **B3F-01, an enrolled ID the daemon would not use.** An instance's identity now has one
+  origin: `kilnd init-state`, which root may run, because it creates only the final directory
+  below a path root alone controls, hands it to the account, and gives up every privilege
+  before opening anything inside. The script enrolls exactly the ID it prints, and only then
+  starts the unit. `add-instance.sh` no longer takes an ID, and the default instance takes
+  the same steps from `install.sh`.
+- **B3F-02, socket activation racing enrollment.** The maintenance window is non-activatable.
+  Stopping the socket stops every daemon through `Requires=`, so the window records what was
+  running first, in `/run`, and puts back exactly that on any end, or on the next command after
+  a kill. One correction to the plan we first wrote: `systemctl mask --runtime` does nothing
+  to a unit installed in `/etc`, which outranks `/run/systemd/system`, so the masks go in
+  `/run/systemd/system.control`, which outranks `/etc`, and each is verified by its
+  `LoadState`. Another: masking a live unit discards its loaded settings, so a masked helper
+  would stop with the default `KillMode` and take running sandboxes with it. The socket is
+  masked first, which already makes activation impossible, and the service only once stopped.
+- **B3F-03, upgrades split between stale and refused images.** Upgrades are one transaction:
+  `kilnd-helper refresh-enrollments` replaces every row's image in one ledger transaction and
+  can touch nothing else, `restore-enrollments` undoes it from `enrollments`' output under the
+  same rule, and the images move by rename, so a rollback's old image has its old inode and
+  the old rows are true again. Each running instance's new image opens its state before anything
+  serves, so a failed schema upgrade reaches no client. A database goes back only if its
+  schema changed, since otherwise the one in place is newer and replacing it could lose a
+  reservation, and a schema that may have served is kept aside. File work in a state directory
+  runs as that instance's account, so root follows nothing a hostile instance planted.
+
+**Real attachment is now testable.** `kilnd check-attachment` attaches once from the process
+that runs it, and `--hold` stays attached until signaled. No daemon attaches yet, so this is
+the only way to run the real proof, the unit's cgroup, account and image, against the installed
+helper. A runtime `ExecStartPre=` or `ExecStart=` drop-in gives it the unit's context.
+
+**Known limits, accepted or open:**
+
+- **B7: template units aren't verified by staying up.** A `kilnd@` daemon stops at startup
+  reconciliation until B7, then gives up under `StartLimit`, so an upgrade can't tell a broken
+  one from a correct one by its state, and neither can the window's "exactly what was running".
+  The upgrade relies on init-state opening its state and on its enrollment matching the
+  installed image. B7 must make `settle()` require those units to stay up, as it does the
+  default instance.
+- **A hostile instance can refuse an upgrade** by breaking its own state, though only until
+  the operator stops it, and the refusal names it. A database it fills also costs a snapshot's
+  disk, and snapshots are only taken of running instances.
+- **Every maintenance command stops every instance,** because the node lock is global. Adding
+  an instance takes under a second of that on the test VM; an upgrade takes a few seconds more.

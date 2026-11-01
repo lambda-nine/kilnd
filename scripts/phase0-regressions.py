@@ -23,7 +23,8 @@ SOCKET = f'/run/{STATE}/kilnd.sock'
 def run(args, *, uid=None, ok=True, input=None):
     def credentials():
         account = pwd.getpwnam(uid)
-        os.setgroups([])
+        # The account's real groups: its supplementary kilnd-helper is what reaches the socket.
+        os.setgroups(os.getgrouplist(account.pw_name, account.pw_gid))
         os.setgid(account.pw_gid)
         os.setuid(account.pw_uid)
     p = subprocess.run(args, text=True, input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

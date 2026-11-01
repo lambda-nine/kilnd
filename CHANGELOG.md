@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B3 deployment: `kilnd init-state` creates an instance's private state as its own
+  account and prints its durable ID, which `scripts/add-instance.sh <name>` and the default
+  instance's install then enroll before the unit starts; add-instance no longer takes an ID.
+  Enrollment runs with activation masked, so no connection can bring the helper back, and
+  restores exactly what was running, on a signal too. `scripts/upgrade.sh`, which
+  `scripts/install.sh` runs on a configured node, replaces the images, refreshes every
+  enrollment in one ledger transaction and restarts what was running, or puts everything back.
+  New: `kilnd check-attachment`, `kilnd-helper enrollments`, `refresh-enrollments` and
+  `restore-enrollments`, and `scripts/deployment-regressions.py`.
 - Phase 1b B3: each enrolled Firecracker instance runs under its own Unix account, recorded
   by `kilnd-helper enroll --user` and refused if shared, root, the helper's or in a VM
   identity range, with `deploy/kilnd@.service` and `scripts/add-instance.sh`. Attachment
