@@ -4,6 +4,7 @@ use super::protocol::*;
 use super::{fds, socket::Socket, write_frame};
 use crate::model::CreateCertainty;
 use crate::runtime::{ExecFinish, ExecSpec, Runtime, kiln_direct::DirectKilnRuntime};
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -17,9 +18,13 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 /// Connections being framed and classified, each for at most two seconds. A peer that
 /// keeps more than this many silent connections open can still delay framing itself;
-/// nothing can make every raw connection fair. The guarantee is below: once framed, a
-/// recovery request has dispatch capacity that normal operations can never occupy.
+/// nothing can make every raw connection fair. The guarantees are below: an enrolled
+/// account always has its own few, and once framed, a recovery request has dispatch
+/// capacity that normal operations can never occupy.
 const FRAMING_SLOTS: usize = 128;
+/// Framing slots only this enrolled account can use, so another account holding every
+/// shared one can't keep it from reaching its attach queue. Enrollment bounds the total.
+const RESERVED_FRAMING_SLOTS: usize = 4;
 /// Section 6.1's 64 operations: 60 for anything, 4 reserved for inspection and recovery.
 const NORMAL_OPERATION_SLOTS: usize = 60;
 const RESERVED_RECOVERY_SLOTS: usize = 4;
@@ -27,6 +32,7 @@ const RESERVED_RECOVERY_SLOTS: usize = 4;
 /// The separate capacities of one listener.
 struct Budgets {
     framing: Arc<Semaphore>,
+    reserved_framing: std::sync::Mutex<HashMap<u32, Arc<Semaphore>>>,
     normal: Arc<Semaphore>,
     recovery: Arc<Semaphore>,
 }
@@ -35,9 +41,28 @@ impl Budgets {
     fn new() -> Self {
         Self {
             framing: Arc::new(Semaphore::new(FRAMING_SLOTS)),
+            reserved_framing: Default::default(),
             normal: Arc::new(Semaphore::new(NORMAL_OPERATION_SLOTS)),
             recovery: Arc::new(Semaphore::new(RESERVED_RECOVERY_SLOTS)),
         }
+    }
+
+    /// A framing slot for this connection: an enrolled account's own first, so its other
+    /// connections leave the shared ones free, and the shared ones after that.
+    fn admit_framing(&self, uid: u32, enrolled: bool) -> Option<OwnedSemaphorePermit> {
+        if enrolled {
+            let reserved = self
+                .reserved_framing
+                .lock()
+                .unwrap()
+                .entry(uid)
+                .or_insert_with(|| Arc::new(Semaphore::new(RESERVED_FRAMING_SLOTS)))
+                .clone();
+            if let Ok(permit) = reserved.try_acquire_owned() {
+                return Some(permit);
+            }
+        }
+        self.framing.clone().try_acquire_owned().ok()
     }
 
     /// A slot for a classified request. Recovery prefers its reserve and may use a free
@@ -90,10 +115,11 @@ pub async fn serve_with_firecracker(
             continue;
         };
         // The kiln account, or an account root enrolled for a Firecracker instance.
-        if peer_uid != uid && !firecracker.as_ref().is_some_and(|n| n.admits_uid(peer_uid)) {
+        let enrolled = firecracker.as_ref().is_some_and(|n| n.admits_uid(peer_uid));
+        if peer_uid != uid && !enrolled {
             continue;
         }
-        let Ok(framing) = budgets.framing.clone().try_acquire_owned() else {
+        let Some(framing) = budgets.admit_framing(peer_uid, enrolled) else {
             continue;
         };
         let runtime = runtime.clone();
@@ -497,5 +523,30 @@ mod tests {
         ] {
             assert_eq!(request.is_recovery(), reserved, "{request:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn b3r_03_an_account_holding_every_shared_framing_slot_leaves_others_theirs() {
+        let budgets = Budgets::new();
+        let (attacker, victim) = (1000, 1001);
+        let mut held = Vec::new();
+        while let Some(permit) = budgets.admit_framing(attacker, true) {
+            held.push(permit);
+        }
+        assert_eq!(held.len(), FRAMING_SLOTS + RESERVED_FRAMING_SLOTS);
+        // Nothing left for the kiln account's own unenrolled traffic, as before.
+        assert!(budgets.admit_framing(2000, false).is_none());
+        // The victim's own are untouched, and bounded too.
+        for _ in 0..RESERVED_FRAMING_SLOTS {
+            held.push(budgets.admit_framing(victim, true).unwrap());
+        }
+        assert!(budgets.admit_framing(victim, true).is_none());
+        drop(held);
+        assert!(budgets.admit_framing(2000, false).is_some());
     }
 }

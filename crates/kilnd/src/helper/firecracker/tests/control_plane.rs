@@ -3,6 +3,7 @@
 //! same binary or a copy of it, so the helper examines their real UID, start time and
 //! image. Only the cgroup is a stand-in where a test can't place a process in one: the
 //! root Linux run of the same scenario uses the kernel's.
+use super::super::MAX_ATTACH_WAITERS;
 use super::*;
 use crate::helper::firecracker::journal::EnrollOutcome;
 use crate::helper::firecracker::peer::{EnrolledExecutable, Enrollment};
@@ -15,9 +16,7 @@ const ROOT_PTRACE_ENV: &str = "KILND_B3_NO_PTRACE_TARGET";
 const VICTIM_UNIT: &str = "victim.service";
 /// Numeric accounts need no passwd entry to run a process, so nothing is left behind.
 const VICTIM_ACCOUNT: (u32, u32) = (64_100, 64_100);
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const ATTACKER_ACCOUNT: (u32, u32) = (64_101, 64_101);
-#[allow(dead_code)]
 const STRANGER_ACCOUNT: (u32, u32) = (64_102, 64_102);
 
 /// This test binary's real identity, which the image its peer processes run must match.
@@ -357,6 +356,18 @@ impl Fixture {
         placement.place(child.id() as i32, cgroup);
         std::fs::write(out.with_extension("go"), b"").unwrap();
         Peer { child, out }
+    }
+
+    /// This instance's attachment has ended, whatever others hold.
+    #[cfg(target_os = "linux")]
+    async fn wait_detached_of(&self, _instance: Id128) {
+        for _ in 0..3000 {
+            if self.census().await["attached"].as_u64() <= Some(1) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the holder's attachment did not end");
     }
 
     async fn wait_detached(&self) {
@@ -851,6 +862,20 @@ async fn b3_01_linux_connection_pin_follows_the_connecting_process() {
     );
 }
 
+/// Another test's fork can hold a copy of the last enrollment's lock descriptor until its
+/// exec closes it. The installed command runs alone, with the helper stopped.
+fn enroll_past_forks(mut enroll: impl FnMut() -> Result<String, String>) -> Result<String, String> {
+    let mut outcome = enroll();
+    for _ in 0..200 {
+        if !matches!(&outcome, Err(error) if error.contains("stop kilnd-helper")) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        outcome = enroll();
+    }
+    outcome
+}
+
 #[tokio::test]
 async fn b3_01_enroll_checks_its_unit_image_limit_and_the_helper_lock() {
     let fixture = Fixture::unstarted(NodeOptions::default());
@@ -863,7 +888,9 @@ async fn b3_01_enroll_checks_its_unit_image_limit_and_the_helper_lock() {
     std::fs::set_permissions(&kilnd, std::fs::Permissions::from_mode(0o755)).unwrap();
     let enroll = |instance: Id128, unit: &str, limit: u32, image: &Path| {
         let account = super::super::peer::fixture_account(instance);
-        super::super::enroll_with(&ledger, limit, instance, unit, None, account, image)
+        enroll_past_forks(|| {
+            super::super::enroll_with(&ledger, limit, instance, unit, None, account, image)
+        })
     };
     let first = Id128::random();
     let done = enroll(first, "kilnd.service", 2, &kilnd).unwrap();
@@ -910,7 +937,9 @@ async fn b3_01_enroll_checks_its_unit_image_limit_and_the_helper_lock() {
     assert!(done.contains("updated"), "{done}");
     // With a helper running this takes no action at all.
     fixture.start().await;
-    let busy = enroll(first, "kilnd.service", 2, &kilnd).unwrap_err();
+    let account = super::super::peer::fixture_account(first);
+    let busy = super::super::enroll_with(&ledger, 2, first, "kilnd.service", None, account, &kilnd)
+        .unwrap_err();
     assert!(busy.contains("stop kilnd-helper"), "{busy}");
 }
 
@@ -925,7 +954,9 @@ async fn b3r_02_enroll_refuses_a_shared_or_privileged_account() {
     std::fs::write(&kilnd, b"kilnd image").unwrap();
     std::fs::set_permissions(&kilnd, std::fs::Permissions::from_mode(0o755)).unwrap();
     let enroll = |instance: Id128, unit: &str, account: (u32, u32)| {
-        super::super::enroll_with(&ledger, 8, instance, unit, None, account, &kilnd)
+        enroll_past_forks(|| {
+            super::super::enroll_with(&ledger, 8, instance, unit, None, account, &kilnd)
+        })
     };
     enroll(Id128::random(), "first.service", VICTIM_ACCOUNT).unwrap();
     let shared = enroll(Id128::random(), "second.service", VICTIM_ACCOUNT).unwrap_err();
@@ -1094,6 +1125,434 @@ async fn b3_02_no_flood_of_attachments_can_starve_an_enrolled_instance() {
         assert!(holder.version(deadline(5), &no_cancel()).await.is_ok());
     }
     assert_eq!(fixture.census().await["attached"], 8);
+}
+
+/// The report's PoC turned around: the victim has no live attachment, L is stalled, and
+/// every queue an attacker can reach is full. The real service still gets its proof.
+async fn targeted_attach_scenario(evidence: PeerEvidence) {
+    let fixture = Fixture::unstarted(NodeOptions {
+        auto_enroll: false,
+        peers: evidence,
+        ..NodeOptions::default()
+    });
+    let placement = Placement {
+        evidence,
+        root: fixture.root.clone(),
+        created: Mutex::default(),
+    };
+    let victim = Id128::random();
+    let attacker = Id128::random();
+    let victim_cgroup = placement.cgroup_of(VICTIM_UNIT);
+    let attacker_cgroup = placement.cgroup_of("attacker.service");
+    let elsewhere = placement.cgroup_of("elsewhere.service");
+    assert!(matches!(
+        fixture.enroll_as(victim, VICTIM_UNIT, &victim_cgroup, 8, VICTIM_ACCOUNT),
+        EnrollOutcome::Enrolled { .. }
+    ));
+    assert!(matches!(
+        fixture.enroll_as(
+            attacker,
+            "attacker.service",
+            &attacker_cgroup,
+            8,
+            ATTACKER_ACCOUNT
+        ),
+        EnrollOutcome::Enrolled { .. }
+    ));
+    #[cfg(target_os = "linux")]
+    if matches!(evidence, PeerEvidence::Real) {
+        fixture.allow_other_accounts();
+    }
+    fixture.start().await;
+    let image = std::env::current_exe().unwrap();
+    let plan = |instance| PeerPlan {
+        root: fixture.root.clone(),
+        instance,
+        database: Id128::random(),
+        stolen_epoch: None,
+        create: false,
+        operations: Vec::new(),
+        fence: None,
+        hold: false,
+    };
+
+    // Make L stop between requests. A sacrificial wrong-cgroup request gets L to the
+    // next loop, where the deterministic fault holds it before another proof.
+    fixture.fault("L.loop.stall");
+    let sacrificial = fixture.spawn_peer_as(
+        &plan(attacker),
+        &placement,
+        &elsewhere,
+        &image,
+        "sacrificial",
+        ATTACKER_ACCOUNT,
+    );
+    assert!(sacrificial.report().await.attach.is_err());
+    fixture.wait_reached("L.loop").await;
+
+    // Naming the victim gets the attacker, and an account root never enrolled, nothing:
+    // these are refused with L stalled, so they can't have queued for it.
+    let mut aimed = Vec::new();
+    for index in 0..=MAX_ATTACH_WAITERS {
+        aimed.push(fixture.spawn_peer_as(
+            &plan(victim),
+            &placement,
+            &elsewhere,
+            &image,
+            &format!("aimed-{index}"),
+            ATTACKER_ACCOUNT,
+        ));
+    }
+    let stranger = fixture.spawn_peer_as(
+        &plan(victim),
+        &placement,
+        &elsewhere,
+        &image,
+        "stranger",
+        STRANGER_ACCOUNT,
+    );
+    for peer in &aimed {
+        let refused = peer.report().await.attach.unwrap_err();
+        assert!(
+            refused.contains("not enrolled under this account"),
+            "{refused}"
+        );
+    }
+    assert!(stranger.report().await.attach.is_err());
+
+    // The attacker's own queue fills: one proof and eight waiting, all doomed.
+    let mut own = Vec::new();
+    for index in 0..=MAX_ATTACH_WAITERS {
+        own.push(fixture.spawn_peer_as(
+            &plan(attacker),
+            &placement,
+            &elsewhere,
+            &image,
+            &format!("own-{index}"),
+            ATTACKER_ACCOUNT,
+        ));
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let overflow = fixture.spawn_peer_as(
+        &plan(attacker),
+        &placement,
+        &elsewhere,
+        &image,
+        "overflow",
+        ATTACKER_ACCOUNT,
+    );
+    let refused = overflow.report().await.attach.unwrap_err();
+    assert!(refused.contains("too many attach attempts"), "{refused}");
+
+    // None of that touched the victim's queue: its real service waits for L, unrefused.
+    let service = fixture.spawn_peer(
+        &plan(victim),
+        &placement,
+        &victim_cgroup,
+        &image,
+        "victim-while-flooded",
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !service.out.with_extension("report").exists(),
+        "the service was answered while L was stalled"
+    );
+    fixture.clear("L.loop.stall");
+    let report = service.report().await;
+    assert!(report.attach.is_ok(), "{:?}", report.attach);
+    for peer in own {
+        let refused = peer.report().await.attach.unwrap_err();
+        assert!(refused.contains("not the enrolled service"), "{refused}");
+    }
+}
+
+#[tokio::test]
+async fn b3r_03_wrong_account_and_wrong_cgroup_peers_cannot_touch_a_victims_attach() {
+    targeted_attach_scenario(PeerEvidence::Markers).await;
+}
+
+/// The same with two real accounts, SO_PEERCRED and the kernel's cgroups.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "needs root on Linux: run in the VM"]
+async fn b3r_03_linux_root_real_accounts_cannot_touch_a_victims_attach() {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+    targeted_attach_scenario(PeerEvidence::Real).await;
+}
+
+/// What one probe process, run under a real account, tries against the helper socket.
+#[cfg(target_os = "linux")]
+const PROBE_ENV: &str = "KILND_B3_PROBE";
+
+/// Exits 0 only if the helper said nothing at all to a kiln request, or keeps silent
+/// connections open until killed. Run as a separate process under another real account.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "re-exec target for real-account probes"]
+fn account_probe_child() {
+    let Ok(probe) = std::env::var(PROBE_ENV) else {
+        return;
+    };
+    let (mode, socket) = probe.split_once(':').unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        if mode == "silent" {
+            // Every framing slot this account can reach, for as long as it is allowed.
+            let mut held = Vec::new();
+            loop {
+                if let Ok(stream) = UnixStream::connect(socket).await {
+                    held.push(stream);
+                }
+                if held.len() >= 256 {
+                    held.remove(0);
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        assert!(kiln_probe(Path::new(socket)).await.is_err());
+    });
+}
+
+/// One kiln request, as far as the helper lets it go.
+#[cfg(target_os = "linux")]
+async fn kiln_probe(socket: &Path) -> std::io::Result<Response> {
+    let request = Request {
+        version: VERSION,
+        timeout_ms: 2000,
+        deadline_ns: wire_deadline(2),
+        operation: Operation::Kiln(KilnRequest::Capabilities { id: None }),
+    };
+    let mut stream = UnixStream::connect(socket).await?;
+    fds::send(&stream, &[]).await?;
+    write_frame(&mut stream, &request).await?;
+    fds::receive(&stream).await?;
+    read_frame::<Response>(&mut stream).await
+}
+
+#[cfg(target_os = "linux")]
+fn probe_as(account: (u32, u32), mode: &str, socket: &Path) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "helper::firecracker::tests::control_plane::account_probe_child",
+            "--test-threads=1",
+        ])
+        .env(PROBE_ENV, format!("{mode}:{}", socket.display()))
+        .uid(account.0)
+        .gid(account.1)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// The listener's half, with real accounts: an account root never enrolled gets no frame
+/// read, an enrolled one gets no kiln, and one holding every framing slot it can reach
+/// doesn't keep another from attaching.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "needs root on Linux: run in the VM"]
+async fn b3r_linux_root_the_listener_tells_real_accounts_apart() {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+    let evidence = PeerEvidence::Real;
+    let fixture = Fixture::unstarted(NodeOptions {
+        auto_enroll: false,
+        peers: evidence,
+        ..NodeOptions::default()
+    });
+    let placement = Placement {
+        evidence,
+        root: fixture.root.clone(),
+        created: Mutex::default(),
+    };
+    let (victim, attacker) = (Id128::random(), Id128::random());
+    let victim_cgroup = placement.cgroup_of(VICTIM_UNIT);
+    let attacker_cgroup = placement.cgroup_of("attacker.service");
+    fixture.enroll_as(victim, VICTIM_UNIT, &victim_cgroup, 8, VICTIM_ACCOUNT);
+    fixture.enroll_as(
+        attacker,
+        "attacker.service",
+        &attacker_cgroup,
+        8,
+        ATTACKER_ACCOUNT,
+    );
+    fixture.allow_other_accounts();
+    fixture.start().await;
+    let socket = fixture.root.join("helper.sock");
+
+    // The control: the service account does get an answer from kiln's side.
+    assert!(kiln_probe(&socket).await.is_ok());
+    // An enrolled account gets nothing about kiln, and neither does a stranger.
+    for account in [ATTACKER_ACCOUNT, STRANGER_ACCOUNT] {
+        let status = probe_as(account, "kiln", &socket).status().unwrap();
+        assert!(status.success(), "{account:?} heard from kiln");
+    }
+
+    // The attacker holds every framing slot it can. The victim attaches anyway.
+    let mut silent = probe_as(ATTACKER_ACCOUNT, "silent", &socket)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let image = std::env::current_exe().unwrap();
+    let plan = PeerPlan {
+        root: fixture.root.clone(),
+        instance: victim,
+        database: Id128::random(),
+        stolen_epoch: None,
+        create: true,
+        operations: vec![],
+        fence: None,
+        hold: false,
+    };
+    let service = fixture.spawn_peer(&plan, &placement, &victim_cgroup, &image, "under-flood");
+    let report = service.report().await;
+    let _ = silent.kill();
+    let _ = silent.wait();
+    assert!(report.attach.is_ok(), "{:?}", report.attach);
+    // That Create really committed, under this instance's account alone.
+    assert_eq!(
+        fixture.count(&format!(
+            "SELECT COUNT(*) FROM allocations WHERE instance_id = '{victim}'"
+        )),
+        1
+    );
+}
+
+/// B3R-01 with a real second account: the attacker can fence the copied ID only in its
+/// own namespace, and the victim's token is still its own afterward.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "needs root on Linux: run in the VM"]
+async fn b3r_01_linux_root_a_prefence_from_a_real_second_account_stays_its_own() {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+    let evidence = PeerEvidence::Real;
+    let fixture = Fixture::unstarted(NodeOptions {
+        auto_enroll: false,
+        peers: evidence,
+        ..NodeOptions::default()
+    });
+    let placement = Placement {
+        evidence,
+        root: fixture.root.clone(),
+        created: Mutex::default(),
+    };
+    let (victim, attacker) = (Id128::random(), Id128::random());
+    let victim_cgroup = placement.cgroup_of(VICTIM_UNIT);
+    let attacker_cgroup = placement.cgroup_of("attacker.service");
+    fixture.enroll_as(victim, VICTIM_UNIT, &victim_cgroup, 8, VICTIM_ACCOUNT);
+    fixture.enroll_as(
+        attacker,
+        "attacker.service",
+        &attacker_cgroup,
+        8,
+        ATTACKER_ACCOUNT,
+    );
+    fixture.allow_other_accounts();
+    fixture.start().await;
+    let image = std::env::current_exe().unwrap();
+    // The victim creates, holding its attachment, so the token and its fence are real.
+    let database = Id128::random();
+    let holder = fixture.spawn_peer(
+        &PeerPlan {
+            root: fixture.root.clone(),
+            instance: victim,
+            database,
+            stolen_epoch: None,
+            create: true,
+            operations: vec![],
+            fence: None,
+            hold: true,
+        },
+        &placement,
+        &victim_cgroup,
+        &image,
+        "victim",
+    );
+    let held = holder.report().await;
+    let fence = held.fence_request.clone().unwrap();
+    let FirecrackerOperation::FenceAbsent { allocation_id, .. } = &fence else {
+        unreachable!();
+    };
+    let allocation_id = *allocation_id;
+    // The attacker sends the victim's exact fence under its own attachment.
+    let aimed = fixture.spawn_peer_as(
+        &PeerPlan {
+            root: fixture.root.clone(),
+            instance: attacker,
+            database: Id128::random(),
+            stolen_epoch: None,
+            create: false,
+            operations: vec![],
+            fence: Some(fence.clone()),
+            hold: false,
+        },
+        &placement,
+        &attacker_cgroup,
+        &image,
+        "attacker",
+        ATTACKER_ACCOUNT,
+    );
+    let aimed = aimed.report().await;
+    assert!(aimed.attach.is_ok(), "{:?}", aimed.attach);
+    assert!(
+        matches!(
+            aimed.fence,
+            Some(FirecrackerResponse::Fence(FenceReply::Absent { .. }))
+        ),
+        "{:?}",
+        aimed.fence
+    );
+    // Its row is its own, and the victim's claim did not move.
+    let count = |sql: String| fixture.count(&sql);
+    assert_eq!(
+        count(format!(
+            "SELECT COUNT(*) FROM retired_tokens WHERE allocation_id = '{allocation_id}'
+             AND instance_id = '{attacker}'"
+        )),
+        1
+    );
+    assert_eq!(
+        count(format!(
+            "SELECT COUNT(*) FROM retired_tokens WHERE instance_id = '{victim}'"
+        )),
+        0
+    );
+    assert_eq!(fixture.active_allocations(), 1);
+    // The victim's own account, next process, fences exactly.
+    drop(holder);
+    fixture.wait_detached_of(victim).await;
+    let successor = fixture.spawn_peer(
+        &PeerPlan {
+            root: fixture.root.clone(),
+            instance: victim,
+            database,
+            stolen_epoch: None,
+            create: false,
+            operations: vec![],
+            fence: Some(fence),
+            hold: false,
+        },
+        &placement,
+        &victim_cgroup,
+        &image,
+        "successor",
+    );
+    let report = successor.report().await;
+    assert!(
+        matches!(
+            report.fence,
+            Some(FirecrackerResponse::Fence(FenceReply::Absent { .. }))
+        ),
+        "{:?}",
+        report.fence
+    );
+    assert_eq!(fixture.active_allocations(), 0);
 }
 
 #[tokio::test]

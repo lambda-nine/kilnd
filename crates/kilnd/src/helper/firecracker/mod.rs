@@ -48,8 +48,9 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-/// Attach attempts that may wait for one instance's turn with L. A hostile process
-/// cannot use these to hold anything: a refused proof gives the turn straight back.
+/// Attach attempts that may wait for one enrolled account's turn with L. Only that account
+/// can join them, and it cannot use them to hold anything: a refused proof gives the turn
+/// straight back. L's attach lane has a place for every account's one proof.
 const MAX_ATTACH_WAITERS: usize = 8;
 /// Rejected-token memory for the node, divided equally among possible instances. The
 /// ledger stays authoritative for every token it owns, so this bounds memory, not answers.
@@ -282,7 +283,7 @@ struct Shares {
 }
 
 struct InstanceShare {
-    /// FIFO: one proof at a time for this instance, and its one attachment slot.
+    /// FIFO: one proof at a time for this instance's account, and its one attachment slot.
     attach_turn: Arc<Semaphore>,
     attach_waiters: AtomicUsize,
     detached: Arc<Semaphore>,
@@ -1943,25 +1944,32 @@ impl Node {
         if self.config.test.auto_enroll && self.share(instance).is_none() {
             self.test_enroll(instance, peer_pid).await;
         }
-        let Some(share) = self.share(instance) else {
+        // The queue is chosen by what the kernel says about this peer, never by the
+        // instance it names, so nothing unproven can reach another instance's queue.
+        let peer_uid = self.observed_uid(peer, instance);
+        let serves_it = {
+            let shares = self.shares.lock().unwrap();
+            shares.as_ref().and_then(|s| s.by_uid.get(&peer_uid)) == Some(&instance)
+        };
+        let share = self.share(instance).filter(|_| serves_it);
+        let Some(share) = share else {
             return group_error(
                 GroupErrorKind::Unauthorized,
-                "this instance is not enrolled",
+                "this instance is not enrolled under this account",
             );
         };
-        let peer_uid = self.observed_uid(peer, instance);
         if self.holder_alive(instance) {
             return group_error(
                 GroupErrorKind::AlreadyAttached,
                 "another live holder has this instance",
             );
         }
-        // This instance's own queue, so nothing another instance does can fill it.
+        // This account's own queue, so nothing another account does can fill it.
         if share.attach_waiters.fetch_add(1, Ordering::AcqRel) >= MAX_ATTACH_WAITERS {
             share.attach_waiters.fetch_sub(1, Ordering::AcqRel);
             return group_error(
                 GroupErrorKind::ResourceExhausted,
-                "too many attach attempts for this instance",
+                "too many attach attempts from this account",
             );
         }
         let turn =
