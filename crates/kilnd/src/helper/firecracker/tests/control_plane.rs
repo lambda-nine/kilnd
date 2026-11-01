@@ -1306,8 +1306,8 @@ fn account_probe_child() {
                 if let Ok(stream) = UnixStream::connect(socket).await {
                     held.push(stream);
                 }
-                if held.len() >= 256 {
-                    held.remove(0);
+                if held.len() >= 800 {
+                    held.drain(..400);
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
@@ -1398,7 +1398,16 @@ async fn b3r_linux_root_the_listener_tells_real_accounts_apart() {
     let mut silent = probe_as(ATTACKER_ACCOUNT, "silent", &socket)
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The control: the shared slots really are gone, even for the service account.
+    let mut crowded_out = false;
+    for _ in 0..100 {
+        if kiln_probe(&socket).await.is_err() {
+            crowded_out = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(crowded_out, "the flood never filled the framing slots");
     let image = std::env::current_exe().unwrap();
     let plan = PeerPlan {
         root: fixture.root.clone(),

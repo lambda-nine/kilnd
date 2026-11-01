@@ -28,4 +28,11 @@ for line in sys.stdin:
 ')
 [ -n "$lib" ] || { echo "library test binary not found" >&2; exit 1; }
 sudo "$lib" --ignored --test-threads=1 --nocapture exit5_linux_root
-sudo "$lib" --ignored --test-threads=1 --nocapture b3_linux_root
+# The per-instance account tests run processes under other real accounts, which need to
+# reach this image, wherever the build directory is. Numeric accounts leave no users behind.
+copy=$(mktemp -d)
+trap 'rm -rf "$copy"' EXIT
+install -m 755 "$lib" "$copy/kilnd-lib-tests"
+chmod 755 "$copy"
+sudo "$copy/kilnd-lib-tests" --ignored --test-threads=1 --nocapture b3_linux_root
+sudo "$copy/kilnd-lib-tests" --ignored --test-threads=1 --nocapture b3r_
