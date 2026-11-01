@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B3: each enrolled Firecracker instance runs under its own Unix account, recorded
+  by `kilnd-helper enroll --user` and refused if shared, root, the helper's or in a VM
+  identity range, with `deploy/kilnd@.service` and `scripts/add-instance.sh`. Attachment
+  requires that account, so instance isolation no longer depends on Yama. Allocation identity
+  and every ledger row a claim or fence writes are keyed by (instance, allocation ID), and
+  attach queues by the peer's kernel-reported UID, so one instance can no longer pre-fence
+  another's token or fill its attach queue. The helper socket's group is now `kilnd-helper`,
+  and enrolled accounts get no kiln requests. Earlier B3 ledgers must be provisioned again.
 - Phase 1b B3: add the typed Firecracker helper group (disabled by default), approved
   plan verification, the root node ledger with durable claims and permanent absence
   fences, protected retained-descriptor executable handling, and fixed L/P/S/M/K worker

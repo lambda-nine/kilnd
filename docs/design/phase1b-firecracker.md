@@ -206,21 +206,21 @@ Bind `--chroot-base-dir` to the pinned helper-owned root-private hierarchy as we
 
 Generate a cryptographic 128-bit `allocation_id` before reservation. It is distinct from the existing 64-bit public sandbox ID, and never reused. Backend ID is `fc-` plus 32 lowercase hexadecimal digits. Store `allocation_id` and the private plan in dedicated columns; **do not prefill `backend_id`**. Schema 7 treats FAILED-with-backend-ID as compensated and uncharged: pre-filling that column would create an early-release bug.
 
-Each helper record has a version, node/instance/allocation/sandbox IDs, generation, plan/manifest/spec/launch digests, the full reservation, phase, independently typed VMM and relay UID/GID leases, CID, deterministic names, host boot ID, worker/supervisor/jailer/VMM PID and start time, cgroup inodes, expected/observed executable device/inode/size/digests and installation generations, artifact/work inodes, loop device/backing identity, tmpfs mount ID, work UUID, nonce, exec state and stop/absence evidence. Allocation IDs are unique across the entire node, not merely within an instance. Generations compare-and-update; they never blindly overwrite newer evidence.
+Each helper record has a version, node/instance/allocation/sandbox IDs, generation, plan/manifest/spec/launch digests, the full reservation, phase, independently typed VMM and relay UID/GID leases, CID, deterministic names, host boot ID, worker/supervisor/jailer/VMM PID and start time, cgroup inodes, expected/observed executable device/inode/size/digests and installation generations, artifact/work inodes, loop device/backing identity, tmpfs mount ID, work UUID, nonce, exec state and stop/absence evidence. An allocation's identity is (instance, allocation ID): the same ID in another instance is another token, and every ledger row and in-memory table is keyed by the pair. Generations compare-and-update; they never blindly overwrite newer evidence.
 
 **One root-owned node ledger is authoritative:** `/var/lib/kilnd-helper/firecracker/node.db`, SQLite WAL with synchronous=FULL, foreign keys enabled, 0600 files/sidecars under a pinned root-owned 0700 directory. One persistent node lock excludes a second helper even if it selects a different instance namespace; the installed service uses one fixed root-owned node policy/ledger path. The ledger process alone opens SQLite and uses fixed prepared statements. It stores allocation intents, capacity claims, identity ownership, worker intents, terminal receipts and permanent retired-token fences in transactions. This replaces the first draft's independent JSON files: a JSON export is diagnostic, never allocation or release authority. SQLite and this bounded schema are now explicitly part of the root TCB. File staging still uses fdatasync and parent-directory fsync; sync ledger directory creation too. Never store tenant stdout/argv/stdin in the ledger.
 
-**Instances are enrolled by root.** `kilnd-helper enroll --instance <id> --unit <systemd unit>` runs as root or from the installer, never over the kilnd socket. It takes the node lock, so it runs with the helper stopped, and writes the instance's row in the node ledger: the expected systemd unit, that unit's exact cgroup, and the installed kilnd image's device, inode, size and digest, read through the protected walk (root-owned, not writable by anyone else, single link, no setuid, setgid, ACL or file capability). Each unit serves one instance. Replacing the kilnd image requires enrolling again. Root policy's `max_enrolled_instances` (default 8, at most 64) bounds the total; lowering it removes nothing. Removing an enrollment is B6's repair flow.
+**Instances are enrolled by root, each under its own Unix account.** `kilnd-helper enroll --instance <id> --unit <systemd unit> --user <account>` runs as root or from the installer, never over the kilnd socket. It takes the node lock, so it runs with the helper stopped, and writes the instance's row in the node ledger: the account's UID and GID, the expected systemd unit, that unit's exact cgroup, and the installed kilnd image's device, inode, size and digest, read through the protected walk (root-owned, not writable by anyone else, single link, no setuid, setgid, ACL or file capability). Each unit serves one instance and each account serves one instance. Enrollment refuses a UID or GID bound to another instance, root, the helper's own account and anything inside the VM identity ranges; a single instance can keep the `kilnd` account, and each further one gets `kilnd-<name>` from `scripts/add-instance.sh` and `deploy/kilnd@.service`. Startup refuses a ledger that breaks any of this. Each instance's state directory and database belong to its own account, mode 0700, so cross-instance signals, ptrace and file access are all cross-UID operations and depend on no host sysctl. Replacing the kilnd image requires enrolling again. Root policy's `max_enrolled_instances` (default 8, at most 64) bounds the total; lowering it removes nothing. Removing an enrollment is B6's repair flow.
 
-Before Preflight, `AttachInstance` establishes a long-lived authenticated control connection. It succeeds only when the connecting process runs as the kilnd UID (real, effective, saved and filesystem), sits in exactly the enrolled unit's cgroup (a child cgroup does not count), and runs the enrolled image by device, inode, size and digest. Stat fields are compared before hashing, so only the enrolled inode is ever hashed. The connection's own pidfd (`SO_PEERPIDFD`, Linux 6.5 or later, and refused without it) pins the connector. L reads `/proc/<pid>` through one pidfd and directory descriptor and rechecks the start time afterward, and H requires the connector still alive after L answers, so a reused PID cannot lend its identity. **The database UUID is only a reconciliation identifier, never an authenticator:** copying a daemon's files gives a process nothing. It is recorded by the first attestation and a mismatch closes admission. An unenrolled instance ID is refused with no ledger call and no state.
+Before Preflight, `AttachInstance` establishes a long-lived authenticated control connection. It succeeds only when SO_PEERCRED and `/proc` both show the connecting process running as the instance's enrolled account (real, effective, saved and filesystem UID and GID), sits in exactly the enrolled unit's cgroup (a child cgroup does not count), and runs the enrolled image by device, inode, size and digest. Stat fields are compared before hashing, so only the enrolled inode is ever hashed. The connection's own pidfd (`SO_PEERPIDFD`, Linux 6.5 or later, and refused without it) pins the connector. L reads `/proc/<pid>` through one pidfd and directory descriptor and rechecks the start time afterward, and H requires the connector still alive after L answers, so a reused PID cannot lend its identity. **The database UUID is only a reconciliation identifier, never an authenticator:** copying a daemon's files gives a process nothing. It is recorded by the first attestation and a mismatch closes admission. An unenrolled instance ID, or one this account doesn't serve, is refused with no ledger call and no state.
 
-Only one live holder may use an instance ID. Operations carry a helper-generated connection epoch, invalidated on detach/restart, and the attested process's pidfd must still be alive for it to count. Create and FenceAbsent from any process other than the live holder are refused before any lookup: they get no token fact and allocate nothing. Accepted work remains ledger-owned after detach; a new connection cannot clear its claims. Multiple distinct instances are supported, but share the same node ledger and budgets (section 7.3).
+Only one live holder may use an instance ID. Operations carry a helper-generated connection epoch, invalidated on detach/restart, and the attested process's pidfd must still be alive for it to count. Create and FenceAbsent from any process other than the live holder are refused before any lookup: they get no token fact and allocate nothing. Accepted work remains ledger-owned after detach; a new connection cannot clear its claims. Multiple distinct instances are supported, under distinct accounts, and share the same node ledger and budgets (section 7.3).
 
 **Every post-C1 release requires ABSENT.** C0 rejection creates no daemon row and no reservation. Once C1 commits, the helper first looks up the token under its per-allocation serialization, before revalidation or allocator selection. An existing ABSENT row is returned unchanged; an existing active or conflicting plan is never DefinitelyNotCreated. For a new token rejected before INTENT, `FenceAbsent` closes its admission gate, cancels or invalidates every queued dispatch generation, waits for all previously issued side-effect permits/workers to settle, verifies all derived resources absent, and commits the retired-token entry plus matching ABSENT receipt in one FULL-sync transaction. Only then can the helper return AbsentFenced/DefinitelyNotCreated. A lock alone, absence in one invocation, deadline, error string or empty listing does not suffice. Late requests check the durable fence again before any side effect.
 
 Receipts identify node, instance, allocation, plan digest, monotonically increasing helper generation and kind `AbsentFenced`. A prior candidate collision or revalidation failure with no fence returns AllocationAmbiguous and the daemon keeps its FAILED row charged while fencing is retried. A ledger failure or a stuck accepted worker forbids the receipt. Retired entries remain even when API history expires. Initially reserve a 64 MiB retired-ID ledger allowance; stop accepting new tokens before the space needed to fence already accepted tokens would be exhausted. A quarter of that allowance is set aside for tokens the ledger never admitted, divided equally among the policy's possible instances, and each instance's quota is checked in the fence's own transaction. At its quota, FenceAbsent for a never-seen token fails closed with no row written, and the daemon keeps its charge; a token the ledger admitted is never refused by this quota. Admission reserves the whole set-aside up front, so never-admitted fences and admitted tokens together always fit the allowance. Never prune fences by age; epoch-safe compaction is separate work. Bound console retention to 64 KiB combined; its mandatory drain/rate policy is in section 5.6.
 
-**Daemon database boundary (B2):** `/var/lib/kilnd/kilnd.db` is owned by the kilnd service UID: directory 0700, regular single-link database and SQLite sidecars 0600. Installation checks these modes/owners after any legacy root-to-service transfer; startup validates them before opening and again after SQLite setup. These filesystem permissions protect access. A process able to open its own SQLite connection already has kilnd's file authority and is equivalent to a schema/file rewriter. A connection that disables triggers (`SQLITE_DBCONFIG_ENABLE_TRIGGER`) or registers a spoofed validator is explicitly out of scope for SQL guards. Triggers defend kilnd bugs and honest direct-SQL mistakes through standard tools; they cannot bind another connection's configuration or function implementation. The root-owned node ledger above never frees node capacity or host resources without its own ABSENT receipt, whatever this daemon database says. B3/B4 implement that authority; B2 does not claim it exists yet.
+**Daemon database boundary (B2):** `/var/lib/kilnd/kilnd.db`, or `/var/lib/kilnd-<name>/kilnd.db` for a further instance, is owned by that instance's account: directory 0700, regular single-link database and SQLite sidecars 0600. Installation checks these modes/owners after any legacy root-to-service transfer; startup validates them before opening and again after SQLite setup. These filesystem permissions protect access. A process able to open its own SQLite connection already has kilnd's file authority and is equivalent to a schema/file rewriter. A connection that disables triggers (`SQLITE_DBCONFIG_ENABLE_TRIGGER`) or registers a spoofed validator is explicitly out of scope for SQL guards. Triggers defend kilnd bugs and honest direct-SQL mistakes through standard tools; they cannot bind another connection's configuration or function implementation. The root-owned node ledger above never frees node capacity or host resources without its own ABSENT receipt, whatever this daemon database says. B3/B4 implement that authority; B2 does not claim it exists yet.
 
 ## 4.2 Two coordinated state machines
 
@@ -461,7 +461,7 @@ Install pinned binaries under section 3.4's protected content-addressed tree. `J
 /opt/kilnd/exec/sha256/J_SHA/jailer
 ```
 
-For allocation `A` (32 hex digits), jailer ID is `fc-A`, jail root is `/var/lib/kilnd-helper/jails/firecracker/fc-A/root`, and allocation cgroup is `kilnd-firecracker/I/fc-A` relative to the cgroup v2 root. `I` is the instance ID; the helper pins all ancestors. Derived `/run/vsock.sock` paths must fit Linux's Unix socket length before allocation. Section 7.1's bounded tmpfs is mounted before jailer can write anything.
+For allocation `A` (32 hex digits), jailer ID is `fc-A`, jail root is `/var/lib/kilnd-helper/jails/firecracker/fc-A/root`, and allocation cgroup is `kilnd-firecracker/I/fc-A` relative to the cgroup v2 root. `I` is the instance ID; the helper pins all ancestors. A jailer ID and jail root are node-global, so the helper gives this contract's formula, in place of the bare token, the first 32 hex digits of SHA-256 over a fixed label, `I` and the allocation ID (see the B3 recheck corrections). The formula, its fixtures and every path length are unchanged, and the plan's own `allocation_id` substitution is still the real token. Derived `/run/vsock.sock` paths must fit Linux's Unix socket length before allocation. Section 7.1's bounded tmpfs is mounted before jailer can write anything.
 
 The allocation parent has `memory.max=939524096` (896 MiB), `memory.swap.max=0`, `memory.oom.group=1`, `pids.max=32`, `cpu.max="100000 100000"`, and no direct tasks. Enable memory/pids/cpu controllers through its internal nodes. Leaf `control` contains S and preparation tasks; leaf `relay` has `memory.max=16777216`, `pids.max=4`, `cpu.max="5000 100000"`. Internal `vm` contains leaves `vmm` and `console`; the console leaf has `memory.max=4194304`, `pids.max=2`, `cpu.max="5000 100000"`. Other descendants inherit the parent ceilings. These are component caps **inside** the total, not additional reservations. There is no late migration of already allocated guest RAM. S remains in `control`; its gated J child enters the verified `vm/vmm` leaf before exec. The monitor and recovery workers stay outside all allocation parents.
 
@@ -616,7 +616,7 @@ Reserve shared infrastructure **once per node**, before any session: 128 MiB RAM
 
 The 512 MiB profile needs its own approved contract and workload validation; it cannot preserve the current 512 MiB inner default. Four smaller guests also require a four-slot CPU/PID policy. If “3 GiB node” means **physical RAM**, reserve at least 512 MiB for other host/services first: a 2560 MiB backend budget including shared workers permits two 768 MiB guests or three 512 MiB guests. These are arithmetic planning limits; the 128 MiB per-session and 128 MiB shared memory allowances still require B7 measurement.
 
-Daemons report node totals from the helper ledger, with freshness/generation and unavailable status when it cannot be read, rather than presenting a local sum as global. Keep owner-filtered API lists and private per-instance metadata; global totals reveal no other session identities. Each enrolled instance has one attachment slot, its own queue for attach attempts, its own share of the 128 detached operations, and its own quota of 4096/N non-durable token gates (N is the policy's enrollment maximum), none of them drawn from a common pool. Attach writes only its own row, once, and that first binding refuses past the fence-headroom floor; a reattachment writes nothing. AttachInstance and startup reconciliation compare database UUID/instance, all owned allocations and helper receipts before admitting. A missing/stale/restored daemon DB never reduces helper charges. Unknown or conflicting ownership quarantines admission; helper-ledger loss/corruption disables Create/Exec for the node until resource inventory and operator repair establish authority. Never recreate an empty ledger over possibly live resources. Helper restart replays all unreleased claims before serving; raw node capacity is not recalculated from idle PSS or currently visible PIDs.
+Daemons report node totals from the helper ledger, with freshness/generation and unavailable status when it cannot be read, rather than presenting a local sum as global. Keep owner-filtered API lists and private per-instance metadata; global totals reveal no other session identities. Each enrolled instance has one attachment slot, a queue for attach attempts that only its own account can join, a few framing slots of its own, its own share of the 128 detached operations, and its own quota of 4096/N non-durable token gates (N is the policy's enrollment maximum), none of them drawn from a common pool. Attach writes only its own row, once, and that first binding refuses past the fence-headroom floor; a reattachment writes nothing. AttachInstance and startup reconciliation compare database UUID/instance, all owned allocations and helper receipts before admitting. A missing/stale/restored daemon DB never reduces helper charges. Unknown or conflicting ownership quarantines admission; helper-ledger loss/corruption disables Create/Exec for the node until resource inventory and operator repair establish authority. Never recreate an empty ledger over possibly live resources. Helper restart replays all unreleased claims before serving; raw node capacity is not recalculated from idle PSS or currently visible PIDs.
 
 No pool members initially. A future pool of one is a fresh cold-booted, never-used guest with the same global claim vector, leaving two active 768 MiB sessions while holding one spare under this policy. Assignment needs an atomic ledger ownership transfer and new identity handshake; it never releases/reclaims capacity in the middle, reuses a tenant disk or clones a snapshot.
 
@@ -765,7 +765,7 @@ All production assertions below are **required future tests**, not tests perform
 - Host/guest deadline clocks have unrelated origins; queueing/preflight/setup consume one host budget. Guest never gets a reset on reconnect. Test pre-cancel, timeout at dispatch, result-vs-cancel races, missing result EOF, genuine exits 124–127 and signal 15, hung capture reader, cleanup-error precedence and reusable=false publication before unlocking queued work.
 - Executable replacement properties (KR-05): replace each source parent or installed name after hashing and before dispatch, including J, V, formatter and every separate worker image. An unchanged plan cannot authorize a different device/inode/digest, even when a replacement has identical bytes. Cover writable/ACL-granted ancestors, non-root rename authority, symlinks/hardlinks, stale descriptor generations, interpreter/loader substitution and FD close/reuse. C0 rejection has zero session effects; later mismatch remains charged until ABSENT. Fakes model both expected and **actual executed** tuples, not only argv or prior hashes.
 - Root transport regressions from protocol v3 remain: receipt withheld/early/duplicate/cross-connection, SCM_RIGHTS injection, descriptor leaks, mutated O_NONBLOCK, stalled stdin/stdout, expired non-exec deadline, 64-slot exhaustion and recovery. Firecracker adds no root path or arbitrary command primitive.
-- Ownership: foreign caller cannot Probe/Exec/Delete or inspect output via the new fields, root retains authorized visibility, pagination filters first, helper only accepts the exact service UID. Wrong instance/allocation/plan IDs never reach another session.
+- Ownership: foreign caller cannot Probe/Exec/Delete or inspect output via the new fields, root retains authorized visibility, pagination filters first, helper only accepts the exact service UID for kiln, and for Firecracker only the account enrolled for the instance named. Wrong instance/allocation/plan IDs never reach another session.
 
 - Enforce typed release evidence at the SQL layer: direct updates cannot free C1 using FAILED/backend ID/boolean, a missing/wrong-kind/wrong-identity receipt, forged legacy provenance, foreign-key-disabled connection or evidence mutation. Migration/pruning and fake-runtime paths all exercise the same constraints.
 - Deterministically queue two identical Creates. Make the first fail before INTENT, pause ABSENT fsync, and verify failure publication stays charged. After fsync/publication, remove the collision and release the duplicate; it must return the same fence. Repeat catalog mismatch/restoration, expired deadline, panic, capacity exhaustion and lost reply; test old connection epochs after AttachInstance replacement.
@@ -1173,20 +1173,90 @@ intact and four control-plane failures. The decisions below are made; sections 4
 stays schema version 1 because no B3 ledger has shipped; a ledger from an earlier B3 build
 fails its schema audit, closed, and needs provisioning again.
 
-**Known limits, accepted or open:**
+**Known limits, accepted or open.** The B3 recheck corrections below revised the two about
+service accounts, since instances no longer share one.
 
-- **Same-UID flooding.** Any same-UID process can still fill the 128 framing slots (already
-  accepted above), and can keep one instance's eight attach waiters busy with attempts that
-  L refuses. That delays a new attachment but cannot displace a holder or take a slot, and
-  only attempts refused by proof are involved. It is the same class as raw framing.
-- **Same-UID processes in general.** Enrolled units sharing one service UID can signal each
-  other, and can ptrace each other unless Yama restricts it. A compromised daemon's
-  children inside its own unit pass the proof for that instance, which is that unit's own
-  authority. The kilnd unit must not set `Delegate=`, so that its cgroup stays root-writable
-  only. Running more than one instance on a node needs per-instance accounts or
-  `kernel.yama.ptrace_scope` of at least 1, which B7's multi-daemon test should require.
+- **Flooding by one's own account.** A process under an instance's own account can keep that
+  instance's eight attach waiters busy with attempts L refuses. That delays only its own
+  new attachment, and is that account's own authority.
+- **Children of a compromised daemon.** Its children inside its own unit pass the proof for
+  that instance, which is that unit's own authority. The kilnd unit must not set
+  `Delegate=`, so that its cgroup stays root-writable only.
 - **Never-admitted fences are a lifetime budget.** Fences are permanent, so a quota spent
   stays spent until epoch-safe compaction exists. A daemon that really does exhaust it,
   through many pre-INTENT rejections, keeps those charges until an operator acts. A
   policy with a lower `max_enrolled_instances` gives each instance more. Compaction and
   that repair remain separate work (B6).
+
+## B3 recheck corrections (November 1, 2026)
+
+The Daybreak Blue recheck (`reviews/2026-10-31-b3-recheck.md`) found the first four failures
+repaired and three cross-instance ones left, all from enrolled instances sharing one Unix
+UID. These decisions are made; sections 4.1, 6.1, 6.2, 6.4 and 7.3 reflect them.
+
+- **B3R-01, a copied token pre-fenced by another instance.** A hostile instance could read a
+  victim's C1 row and fence its allocation ID first, which the node-global key made
+  permanent for the victim. Allocation identity is now (instance, allocation ID). Every
+  table a claim or fence writes has that composite key, as do `sandbox_id` and `backend_id`
+  uniqueness, and every lookup resolves only in the caller's authenticated instance. A
+  fence row from one instance cannot conflict with another's token: the attacker spends its
+  own quota and retires a name in its own namespace. H's supervisors and M's stop queue use
+  the same pair, so a stop for one can't land on the other.
+  `tests/control_plane.rs::b3r_01_*` includes the report's real manager test, paused after
+  C1, and `journal/tests.rs::b3r_01_*` the ledger's half; the same with two real accounts is
+  `b3r_01_linux_root_*`.
+- **Node-global names stay node-global.** Three things really are one namespace. UID, GID and
+  CID leases are kernel identities, so their active-lease index stays node-wide; a preflight
+  picks free ones, and a collision answers exactly and can be fenced. Capacity stays one
+  budget, by design. And jailer IDs and jail roots are node-global paths: two instances with
+  the same allocation ID must not share one, and the longer path an instance directory
+  would make doesn't fit `sockaddr_un`. So names come from a digest of (instance, allocation
+  ID), reaching one of another instance's is a SHA-256 second preimage, and B1's frozen
+  contract and fixtures didn't need to change. S and K follow the plan's names in B4.
+  `backend_id` stays `fc-<allocation>`: it names an allocation inside its own instance, and
+  is what the daemon stores.
+- **B3R-02, instance isolation relied on Yama.** Each enrolled instance now has its own UID
+  and GID, section 4.1. Cross-instance memory access, signals and database reads are
+  cross-UID, so the Yama prerequisite is gone rather than enforced.
+  `b3r_02_linux_root_another_account_cannot_reach_memory_signals_or_state_at_yama_zero` sets
+  scope 0, shows the instance's own account can open the daemon's memory, and shows another
+  account can't; the original setting is restored. The ledger's `UNIQUE` columns and
+  triggers refuse a shared account, its open audit refuses a ledger with one, and H refuses
+  to serve any instance if a row names root, the helper or a VM identity range.
+- **Kiln stays the service account's.** The listener admits the `kilnd` account and enrolled
+  accounts, before reading anything. kiln's registry has no instances, so an enrolled account
+  that isn't the service account gets no reply to a kiln request. Until B7 can select
+  Firecracker, a `kilnd@<name>` daemon therefore stops at its kiln startup reconciliation.
+- **The socket's group.** `kilnd-helper` is new, for reaching the helper socket and nothing
+  else. Adding instances to the `kilnd` group instead would give each one the default
+  instance's API socket. The socket's real check is still the peer's UID.
+- **B3R-03, an unproven peer could fill a victim's attach queue.** A waiter's queue was chosen
+  by the instance the request named. It is now chosen by the peer's SO_PEERCRED UID, and an
+  account joins only the queue of the instance it serves: anything else, including an
+  account nobody enrolled, is refused before queueing, with no L call. L's attach lane has a
+  place for one proof per account. Each enrolled account also has four framing slots of its
+  own, because a queue is no use to a connection that can't be framed.
+  `b3r_03_wrong_account_and_wrong_cgroup_peers_cannot_touch_a_victims_attach` is the report's
+  PoC turned around, with L stalled and every queue the attacker can reach full, and
+  `b3r_03_linux_root_*` and `b3r_linux_root_the_listener_tells_real_accounts_apart` run it
+  under real accounts.
+
+**Schema.** `instances` gains `uid` and `gid`, and allocation tables gain `instance_id`. Still
+version 1, since no B3 ledger has shipped: an earlier one fails its schema audit, closed, and
+needs provisioning again.
+
+**The recheck's other PoCs.** `03-production-worker-journal-bypass.md` remains B7's gate, as the
+report says: the production-disabled no-image branch must not survive enabling profiles.
+
+**Known limits, accepted or open:**
+
+- **Raw connections and operation slots across accounts.** An enrolled account can still fill
+  the 128 shared framing slots, and the 60 normal and 4 recovery operation slots, until their
+  deadlines. A daemon's attachment survives this and so does a fresh attach, because neither
+  uses those operation slots, but another attached instance's Create, Inspect, List and Fence
+  can be refused `resource_exhausted` while it lasts. Nothing is released and work is not
+  lost, and a retry succeeds once the attacker's requests end. This used to be a same-UID
+  limit; it now crosses accounts, and B7's multi-daemon test should measure it.
+- **Shared node budgets.** One instance can still spend the node's capacity and its admitted
+  token allowance, as the design intends.
+- **Root.** Root modifying policy, enrollment or the ledger stays out of this model.

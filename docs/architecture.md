@@ -162,8 +162,9 @@ processes ([protocol](helper-protocol.md#firecracker-group-schema-1),
 no `--firecracker-policy` the group answers Disabled. With one, a node ledger and
 fixed workers run, and the production manifest gate still refuses every profile, so
 every Preflight is a C0 refusal. Only an instance root enrolled can attach, and only from
-its enrolled systemd unit and installed kilnd image; each has its own attachment slot,
-detached-work share and rejected-token quota. Startup serves nothing until every worker
+its own Unix account, enrolled systemd unit and installed kilnd image; each has its own
+attachment slot and queue, detached-work share and rejected-token quota, and allocation IDs
+are keyed by instance throughout. Startup serves nothing until every worker
 has its journal row.
 
 `node.db` is SQLite in WAL/FULL with foreign keys on and `trusted_schema` off, in a

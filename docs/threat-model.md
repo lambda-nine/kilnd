@@ -176,10 +176,14 @@ sandbox compromises the host.
   shared-kernel isolation, not a boundary for hostile multi-tenant workloads.
   Daemon-local sums are never node totals for a backend with a node authority.
 - **A compromised service account cannot take over another instance.** Root enrolls each
-  instance with its unit and image, and attachment proves both, so copied daemon files
-  give nothing. Units sharing one service UID can still signal each other, and ptrace
-  each other unless Yama restricts it: a node with several instances needs per-instance
-  accounts or `kernel.yama.ptrace_scope` of at least 1.
+  instance under its own Unix account, with its unit and image, and attachment proves all
+  three. Enrollment and startup refuse two instances on one UID or GID, and refuse root, the
+  helper's account and the VM identity ranges. So another instance's memory, signals and
+  database are cross-UID to the kernel, with no dependence on Yama or any other sysctl, and
+  its daemon files can't be copied in the first place. Its allocation IDs mean nothing
+  outside its own namespace, and its attach queue accepts only its own account. Instances
+  still share the node's capacity, and an account can still fill the helper's shared framing
+  and operation slots until their deadlines: refused work is retried, and nothing is released.
 - **The node ledger is part of the root trusted base,** with SQLite and its schema.
   Its triggers stop mistakes through SQL. They cannot stop root or anything with file
   authority: `SQLITE_DBCONFIG_ENABLE_TRIGGER`, a schema rewrite, or a rollback of the
@@ -276,8 +280,9 @@ sandbox compromises the host.
   process. Root is reachable only through the [typed helper surface](helper-protocol.md):
   six kiln verbs, bounded frames and helper-created descriptor-only stdio, independent
   validation, no shell, fixed executable/argv and a cleared environment. The
-  helper socket is root-owned and checks the exact service UID; sandbox UIDs,
-  root and ordinary group members are rejected before parsing. The daemon
+  helper socket is root-owned and checks the exact service UID for kiln; sandbox UIDs,
+  root and ordinary group members are rejected before parsing, and an account root enrolled
+  for a Firecracker instance can use only that instance's requests. The daemon
   checks that the helper peer is root. A compromised service account can call
   those operations for any kiln backend, including unmanaged ones: per-caller
   policy lives in kilnd. The helper and its shared direct adapter/process/

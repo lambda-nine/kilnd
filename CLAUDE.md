@@ -42,8 +42,9 @@ through its CLI. Read [README.md](README.md),
 
 ## Privilege boundary
 
-Production kilnd refuses root and runs as the non-login `kilnd` account, with
-no capabilities. Only `kilnd-helper` runs root, using its typed private socket
+Production kilnd refuses root and runs as the non-login `kilnd` account, or a
+`kilnd-<name>` account of its own for each further Firecracker instance, with no
+capabilities. Only `kilnd-helper` runs root, using its typed private socket
 protocol (`docs/helper-protocol.md`). Keep helper validators, fd constraints,
 deadlines, peer UID checks and shared process/cleanup evidence fail-closed.
 `KilnRuntime` is a helper client; `DirectKilnRuntime` is for the helper and

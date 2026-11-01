@@ -3,11 +3,11 @@
 The API daemon runs as the `kilnd` system account with an empty capability set.
 It cannot invoke a privileged executable or read kiln's registry. `KilnRuntime`
 connects to `/run/kilnd-helper/helper.sock`. systemd owns that socket as
-`root:kilnd 0660` in a `root:kilnd 0750` directory; tmpfiles recreates its parent
-at boot. The independent `kilnd-helper` service runs as root. It accepts only
-connections whose kernel peer UID equals the configured `kilnd` account's UID,
-including rejecting root connections. API group membership alone grants no
-helper access. The daemon verifies that its helper peer is root.
+`root:kilnd-helper 0660` in a `root:kilnd-helper 0750` directory; tmpfiles recreates its
+parent at boot. The independent `kilnd-helper` service runs as root. It accepts only
+connections whose kernel peer UID equals the configured `kilnd` account's UID, or an account
+root enrolled for a Firecracker instance, and only the `kilnd` account gets kiln requests.
+It rejects root connections. Group membership alone grants no helper access. The daemon verifies that its helper peer is root.
 
 The helper accepts a private v3 typed request enum. Its outer `operation` enum
 has `kiln` and `firecracker` variants, each separately validated. The Firecracker
@@ -137,14 +137,18 @@ command or environment. Identities are typed 128-bit IDs and digests, profiles a
 | `fence_absent {allocation_id, sandbox_id, plan_digest}` | 30 s | The permanent receipt, byte for byte, or `ambiguous {class}` |
 
 An instance must be enrolled by root first (`kilnd-helper enroll`, which takes the node
-lock and uses no socket). Attachment succeeds only for a process running as the kilnd
-UID, in exactly the enrolled unit's cgroup, from the enrolled image by device, inode, size
-and digest, and anything else gets `unauthorized`. The connection's `SO_PEERPIDFD` pins
+lock and uses no socket), under a Unix account no other instance holds. Attachment succeeds
+only for a process running as that account by SO_PEERCRED and `/proc`, in exactly the
+enrolled unit's cgroup, from the enrolled image by device, inode, size and digest, and
+anything else gets `unauthorized`. A peer whose account doesn't serve the instance it names is
+refused before it can queue, and each account has its own queue of attach attempts and a
+few framing slots of its own. The connection's `SO_PEERPIDFD` pins
 that process, so Linux 6.5 or later is required. The database UUID authenticates nothing.
 
 Only one live attachment may hold an instance ID. Every other operation needs the
-helper-issued epoch from that connection, and the same peer PID, whose process must still
-be alive. An epoch dies with its connection or the helper; accepted work and its claims
+helper-issued epoch from that connection, and the same peer PID and UID, whose process must
+still be alive. Allocation IDs resolve only in that authenticated instance: the same ID in
+another instance is a different token, and neither can see or block the other. An epoch dies with its connection or the helper; accepted work and its claims
 do not. An attested service whose stored database UUID differs gets
 `admission_open: false`, and can only read.
 

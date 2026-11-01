@@ -76,8 +76,8 @@ the old daemon `--kiln` flag. The helper alone has a root-controlled `--kiln`
 path, defaulting to the pinned `/usr/local/bin/kiln`.
 
 The API socket is `kilnd:kilnd 0660` under `/run/kilnd` (0750). The helper is
-`root:kilnd 0660` under `/run/kilnd-helper` (0750) and checks the exact service
-UID, rejecting other group members and root. Do not grant callers access to
+`root:kilnd-helper 0660` under `/run/kilnd-helper` (0750) and checks the exact service
+UID, rejecting other group members and root; `kilnd-helper` exists only to reach it. Do not grant callers access to
 the `kilnd` account itself. See [helper protocol and trust](helper-protocol.md). To use the socket without sudo:
 `sudo usermod -aG kilnd $USER`, then open a new shell.
 
@@ -134,8 +134,9 @@ sudo kilnd-helper --firecracker-policy /etc/kilnd/firecracker-node.json --firecr
 The first command creates the ledger, once, and refuses if any ledger file exists; do
 not delete a ledger to recover from an error, because that discards every claim.
 
-Each kilnd instance is then enrolled by root, with the helper stopped, naming the unit
-that serves it and reading the installed image's identity:
+Each kilnd instance is then enrolled by root, with the helper stopped, naming its Unix
+account and the unit that serves it, and reading the installed image's identity. One
+instance can keep the `kilnd` account:
 
 ```sh
 sudo systemctl stop kilnd-helper.service
@@ -143,10 +144,25 @@ sudo kilnd-helper enroll --instance <32 hex digits> --unit kilnd.service
 sudo systemctl start kilnd-helper.service
 ```
 
+Every further instance needs its own account, which `scripts/add-instance.sh` creates with
+its own group, along with the `kilnd@<name>` unit and the enrollment:
+
+```sh
+scripts/add-instance.sh <name> <32 hex digits>
+```
+
+Enrollment refuses an account another instance holds, root, the helper's own account and
+anything in the policy's VM identity ranges, and the helper refuses a ledger that breaks
+those rules. That separation needs no Yama setting. Each instance's state directory and
+database are its own account's, mode 0700. `kilnd@<name>` is for instances on the Firecracker
+backend: the helper refuses an enrolled account's kiln requests, so until B7 can select that
+backend such a daemon stops at startup reconciliation.
+
 Enroll again whenever `/usr/local/bin/kilnd` is replaced: until then that instance can't
 attach. `--cgroup` names the unit's cgroup if it isn't `/system.slice/<unit>`, and the unit
 must not set `Delegate=`. A policy's `max_enrolled_instances` limits the total (default 8).
-This needs Linux 6.5 or later.
+This needs Linux 6.5 or later. Ledgers from earlier B3 builds fail their audit and must be
+provisioned again.
 
 Startup problems leave kiln running and the group disabled or Unavailable. Every
 profile is refused by the disabled gate until a reviewed release (B7). Do not expect a
