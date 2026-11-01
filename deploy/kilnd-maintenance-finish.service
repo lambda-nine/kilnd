@@ -1,0 +1,17 @@
+# The second half of a boot's recovery. The guard can't start what it holds back: those units
+# wait for it to exit. Once they have had their turn, this starts anything recorded as running
+# that boot did not, and only then removes the marker. If a unit won't come back it fails, and
+# the marker and the transaction stay for scripts/upgrade.sh --recover. See docs/setup.md.
+[Unit]
+Description=Finish interrupted kilnd maintenance after boot's own starts
+ConditionPathExists=/var/lib/kilnd-helper/maintenance.json
+Requires=kilnd-maintenance-guard.service
+After=kilnd-maintenance-guard.service kilnd-helper.socket kilnd-helper.service kilnd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/kilnd/upgrade.sh --recover
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

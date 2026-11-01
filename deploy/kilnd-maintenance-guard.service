@@ -1,0 +1,25 @@
+# Keeps a node closed across a reboot in the middle of maintenance. The masks that hold every
+# unit down during a window live in /run, and a reboot clears them, so this runs before any of
+# them can start. While the marker /var/lib/kilnd-helper/maintenance.json says work may be half
+# done it undoes that work, and if it can't, it fails, and everything that Requires= it stays
+# down until scripts/upgrade.sh --recover succeeds. kilnd@.service orders itself after this
+# from its own side: a Before= here can't name a template. See docs/setup.md.
+[Unit]
+Description=Recover interrupted kilnd maintenance before anything activates
+# Sockets start before basic.target, so this can't take the default dependencies.
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target
+Before=sockets.target kilnd-helper.socket kilnd-helper.service kilnd.service shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+# Passed once per boot: within one, the masks hold, and a window's own starts must not wait here.
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/kilnd/upgrade.sh --recover --boot
+# Everything normal waits on sockets.target, so a stuck recovery must end in failing closed.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=sockets.target multi-user.target

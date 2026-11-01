@@ -1,6 +1,8 @@
 [Unit]
 Description=Private kilnd privilege-helper socket
-After=systemd-tmpfiles-setup.service
+# Nothing activates while an interrupted maintenance command is unfinished.
+Requires=kilnd-maintenance-guard.service
+After=systemd-tmpfiles-setup.service kilnd-maintenance-guard.service
 
 [Socket]
 ListenStream=/run/kilnd-helper/helper.sock

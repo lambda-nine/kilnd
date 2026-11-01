@@ -1,7 +1,7 @@
 [Unit]
 Description=Minimal privileged kiln operations for kilnd
-Requires=kilnd-helper.socket
-After=kilnd-helper.socket kiln-dns.service
+Requires=kilnd-helper.socket kilnd-maintenance-guard.service
+After=kilnd-helper.socket kiln-dns.service kilnd-maintenance-guard.service
 Wants=kiln-dns.service
 
 [Service]

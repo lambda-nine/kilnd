@@ -4,11 +4,22 @@ stops every instance, repeatedly, so don't run it on a node you care about.
 
   sudo python3 -I scripts/deployment-regressions.py --bin-a DIR --bin-b DIR
 
+A reboot here is simulated, by clearing /run and starting units as boot would. A real one is
+two steps, and the VM reboots between them, in the middle of an upgrade:
+
+  sudo python3 -I scripts/deployment-regressions.py --bin-a DIR --bin-b DIR --reboot-arm POINT
+  sudo python3 -I scripts/deployment-regressions.py --reboot-verify
+
+POINT is `graceful`, a `systemctl reboot` while an upgrade waits at its refresh, or a step as
+in CRASH_HARNESS, such as rename:3, at which the upgrade itself reboots with no sync at all.
+
 DIR holds kilnd, kilnd-helper and kilndctl, and the two must be different builds. The node
 must have kilnd installed from --bin-a, by scripts/install.sh, and no Firecracker policy or
 ledger: this makes its own and removes them, with its accounts, whatever happens. It adds no
 manifest or profile, so production Firecracker stays disabled throughout. It covers B3F-01,
-B3F-02 and B3F-03 from reviews/2026-11-01-b3-final.md, including every way an upgrade can fail.
+B3F-02 and B3F-03 from reviews/2026-11-01-b3-final.md, including every way an upgrade can fail,
+and B3D-01 and B3D-02 from reviews/2026-11-01-b3-deploy-recheck.md: a reboot at every step of a
+maintenance command, and restores that fail.
 """
 import argparse
 import glob
@@ -39,7 +50,16 @@ NAMES = ('t1', 't2', 't3')
 STAY_ATTACHED = '/run/systemd/system/kilnd@.service.d'
 JOURNAL = '/var/lib/kilnd-helper/upgrade/journal.json'
 STAGE = BIN + '/.kilnd-upgrade'
-WINDOW_RECORD = '/run/kilnd-maintenance.window.json'
+WINDOW_RECORD = '/var/lib/kilnd-helper/maintenance.json'
+LOCK = '/run/kilnd-maintenance.lock'
+MASK_DIR = '/run/systemd/system.control'
+GUARD = 'kilnd-maintenance-guard.service'
+FINISH = 'kilnd-maintenance-finish.service'
+MAINTENANCE = os.path.join(REPO, 'scripts/kilnd-maintenance.py')
+RECOVERY_REQUIRED = 3
+# Survives the reboot in a real reboot test, with what that test compares against afterwards.
+REBOOT_DIR = '/var/lib/kilnd-reboot-test'
+REBOOT_STAY_ATTACHED = '/etc/systemd/system/kilnd@.service.d/90-stay-attached.conf'
 FAILED_DIR = '/var/lib/kilnd-helper/failed-upgrades'
 SANDBOXES = []
 
@@ -113,6 +133,10 @@ def sha(path):
 def image(path):
     meta = os.stat(path)
     return (meta.st_dev, meta.st_ino, meta.st_size, sha(path))
+
+
+def binding(row):
+    return tuple(row[k] for k in ('instance_id', 'unit', 'cgroup', 'uid', 'gid'))
 
 
 def row_image(row):
@@ -256,10 +280,13 @@ def wait_active(*names):
 
 def cleanup():
     """Whatever happened, the node goes back to one instance with no Firecracker group."""
+    # A boot recovery a failed test left going would start what this is about to remove.
+    sh('systemctl', 'stop', FINISH, check=False)
     script('upgrade.sh', '--recover', check=False)
     for sandbox in SANDBOXES:
         sh(BIN + '/kilndctl', 'rm', sandbox, check=False)
     shutil.rmtree(STAY_ATTACHED, ignore_errors=True)
+    shutil.rmtree(os.path.dirname(REBOOT_STAY_ATTACHED), ignore_errors=True)
     for name in NAMES:
         unit = 'kilnd@%s.service' % name
         sh('systemctl', 'disable', '--now', unit, check=False)
@@ -699,13 +726,452 @@ def test_03_upgrade(args, scratch, first, second, sandbox):
     passed('upgrade B -> A restarts exactly the active units, and a stopped one is still enrolled')
 
 
+# The maintenance script, unchanged but for dying at exactly one step, as a power failure would:
+# nothing it has not already made durable can be counted on. `reboot:` does it with a real
+# reboot and no sync. fail-unmask: makes every unmask fail, with no crash at all.
+CRASH_HARNESS = r"""
+import importlib.util, os, signal, subprocess, sys, time
+script, point = sys.argv[1], sys.argv[2]
+sys.argv = [script, *sys.argv[3:]]
+spec = importlib.util.spec_from_file_location('kilnd_maintenance', script)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+how, _, rest = point.partition('/')
+if rest:
+    point = rest
+def die():
+    if how == 'reboot':
+        subprocess.run(['systemctl', 'reboot', '--force', '--force'])
+        time.sleep(600)
+    os.kill(os.getpid(), signal.SIGKILL)
+def after(name, when=lambda *a, **k: True):
+    real = getattr(m, name)
+    def wrapped(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if when(*args, **kwargs):
+            die()
+        return result
+    setattr(m, name, wrapped)
+def nth(number):
+    seen = [0]
+    def counted(*_args, **_kwargs):
+        seen[0] += 1
+        return seen[0] == int(number)
+    return counted
+kind, _, number = point.partition(':')
+if kind == 'marker':
+    after('write_json', lambda path, _v: path == m.WINDOW_RECORD)
+elif kind == 'masked':
+    after('mask_runtime')
+elif kind == 'journal':
+    after('write_json', lambda path, _v: path == m.JOURNAL)
+elif kind == 'phase':
+    after('set_phase', lambda _j, phase: phase == number)
+elif kind == 'rename':
+    after('rename_durably', nth(number))
+elif kind == 'unit-file':
+    after('install_file', lambda _s, destination, _m: destination in m.MANAGED_FILES.values())
+elif kind == 'migrated':
+    after('init_state', nth(number))
+elif kind == 'settling':
+    def dying(*_args, **_kwargs):
+        die()
+    m.settle = dying
+elif kind == 'discarded':
+    after('discard_transaction')
+elif kind == 'enrolled':
+    after('enroll')
+elif kind == 'fail-unmask':
+    def refuse(_units):
+        raise RuntimeError('injected unmask failure')
+    m.unmask_runtime = refuse
+else:
+    raise SystemExit('no such step: ' + point)
+m.main()
+"""
+
+
+def harness(point, *argv, wait=True):
+    command = [sys.executable, '-I', '-c', CRASH_HARNESS, MAINTENANCE, point, *argv]
+    if not wait:
+        return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=600, check=False)
+
+
+def crash(point, *argv):
+    done = harness(point, *argv)
+    assert done.returncode == -signal.SIGKILL, '%s: exit %d, never reached it:\n%s' % (
+        point, done.returncode, done.stderr)
+    assert os.path.exists(WINDOW_RECORD), point + ': no marker on disk'
+
+
+def down_as_after_a_reboot():
+    """Everything a reboot takes away: every process, every mask, the rest of /run."""
+    names = [*units(), GUARD, FINISH]
+    sh('systemctl', 'stop', *names, check=False)
+    for path in glob.glob(MASK_DIR + '/kilnd-helper.*'):
+        os.unlink(path)
+    for path in (LOCK, HELPER_SOCKET):
+        if os.path.lexists(path):
+            os.unlink(path)
+    sh('systemctl', 'daemon-reload')
+    sh('systemctl', 'reset-failed', *names, check=False)
+    for unit in names:
+        assert active(unit) in ('inactive', 'failed'), unit + ' survived the reboot'
+    assert load_state('kilnd-helper.socket') == load_state('kilnd-helper.service') == 'loaded'
+
+
+def enabled_units():
+    return [u for u in units() if sh('systemctl', 'is-enabled', u, check=False).stdout.strip() == 'enabled']
+
+
+def monotonic_stamp(unit, prop):
+    return int(sh('systemctl', 'show', '--property=' + prop, '--value', unit).stdout.strip() or 0)
+
+
+def boot_as_after_a_reboot():
+    """One transaction, as boot queues it. All that orders it is what the units declare, and
+    while the guard runs nothing behind it may have got past."""
+    sh('systemctl', 'start', '--no-block', *enabled_units(), FINISH)
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        guard = active(GUARD)
+        if guard in ('active', 'failed'):
+            return guard
+        if guard == 'activating':
+            for unit in units():
+                state = active(unit)
+                # It only counts if the guard was still running after that was seen.
+                if state not in ('inactive', 'failed') and active(GUARD) == 'activating':
+                    raise AssertionError('%s is %s behind the guard' % (unit, state))
+        time.sleep(0.01)
+    raise AssertionError('the guard never finished')
+
+
+def guard_came_first():
+    done = monotonic_stamp(GUARD, 'ExecMainExitTimestampMonotonic')
+    assert done, 'the guard did not run'
+    for unit in ('kilnd-helper.socket', 'kilnd.service'):
+        started = monotonic_stamp(unit, 'ActiveEnterTimestampMonotonic')
+        assert started >= done, '%s started %d, the guard finished %d' % (unit, started, done)
+
+
+def wait_marker_gone():
+    deadline = time.monotonic() + 180
+    while (os.path.exists(WINDOW_RECORD) or active(FINISH) == 'activating') and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not os.path.exists(WINDOW_RECORD), 'the marker is still there: ' + sh(
+        'journalctl', '-u', FINISH, '-n', '20', '--no-pager', '-o', 'cat').stdout
+
+
+def reboot_and_recover(what):
+    down_as_after_a_reboot()
+    guard = boot_as_after_a_reboot()
+    assert guard == 'active', '%s: guard %s:\n%s' % (what, guard, sh(
+        'journalctl', '-u', GUARD, '-n', '20', '--no-pager', '-o', 'cat').stdout)
+    # Only now has boot's own start of each happened, and each stamp is this boot's.
+    wait_marker_gone()
+    guard_came_first()
+
+
+def fail_start(unit):
+    directory = '/run/systemd/system/%s.d' % unit
+    os.makedirs(directory, exist_ok=True)
+    with open(directory + '/90-fail-start.conf', 'w') as file:
+        file.write('[Service]\nExecStartPre=/bin/false\n')
+    sh('systemctl', 'daemon-reload')
+    return directory
+
+
+def expect_recovery_required(done, what, journal):
+    assert done.returncode == RECOVERY_REQUIRED, '%s: exit %d, wanted %d:\n%s' % (
+        what, done.returncode, RECOVERY_REQUIRED, done.stderr)
+    assert os.path.exists(WINDOW_RECORD), what + ': the record went'
+    assert os.path.exists(JOURNAL) == journal, what + ': journal'
+    assert os.path.exists(STAGE) == journal, what + ': stage'
+
+
+def test_04_failed_restores(args, scratch):
+    """B3D-02: a restore that fails keeps what it needs, until a retry puts everything back."""
+    out('--- B3D-02')
+    before = snapshot_node()
+    no_refresh = fake_build(scratch + '/no-refresh', args.bin_b, helper=(
+        '#!/bin/sh\ncase "$1 $*" in refresh-enrollments*--check*) exec REAL "$@" ;; '
+        'refresh-enrollments*) echo "refresh failed" >&2; exit 9 ;; esac\nexec REAL "$@"\n'))
+    add = ('add-instance', 't3')
+    upgrade = ('upgrade', '--bin-dir', no_refresh)
+    for command, journal, name in ((add, False, 'add-instance'), (upgrade, True, 'upgrade rollback')):
+        done = harness('fail-unmask', *command)
+        expect_recovery_required(done, name + ', unmask', journal)
+        assert 'injected unmask failure' in done.stderr, done.stderr
+        assert load_state('kilnd-helper.socket') == 'masked', 'nothing lifted it, so nothing starts'
+        script('upgrade.sh', '--recover')
+        assert_same_node(before, name + ', unmask retried')
+        passed('%s: an unmask failure keeps its record, and --recover finishes it' % name)
+        for unit, what in (('kilnd-helper.service', 'helper'), ('kilnd.service', 'daemon')):
+            directory = fail_start(unit)
+            try:
+                done = sh(sys.executable, '-I', MAINTENANCE, *command, check=False, timeout=600)
+                expect_recovery_required(done, '%s, %s start' % (name, what), journal)
+                assert unit in done.stderr, done.stderr
+                record = json.load(open(WINDOW_RECORD, encoding='utf-8'))
+                assert record['stage'] == 'restored', record
+                # Still failing, and still kept.
+                again = script('upgrade.sh', '--recover', check=False)
+                expect_recovery_required(again, '%s, %s retried too early' % (name, what), journal)
+            finally:
+                shutil.rmtree(directory)
+                sh('systemctl', 'daemon-reload')
+            script('upgrade.sh', '--recover')
+            assert_same_node(before, '%s, %s start retried' % (name, what))
+            passed('%s: a %s start failure keeps its record, and --recover finishes it' % (name, what))
+
+
+def test_05_reboot(args, scratch):
+    """B3D-01: a reboot at any step, with the masks gone, opens nothing until recovery is done."""
+    out('--- B3D-01')
+    a, b = args.bin_a, args.bin_b
+    for unit in (GUARD, FINISH):
+        done = sh('systemd-analyze', 'verify', '/etc/systemd/system/' + unit, check=False)
+        assert 'cycle' not in done.stderr + done.stdout, done.stderr
+    passed('the guard and finish units verify, with no ordering cycle')
+    # A unit that ran but isn't enabled comes back too: boot wouldn't, and the record says so.
+    sh('systemctl', 'disable', 'kilnd@t3.service')
+    # And one that's stopped and not enabled stays stopped. A stopped, enabled one starts, as at
+    # any boot.
+    sh('systemctl', 'disable', 'kilnd@t2.service')
+    before = snapshot_node()
+    assert before['units']['kilnd@t3.service']
+    upgrade = ('upgrade', '--bin-dir', b)
+    for point in ('marker:', 'masked:', 'journal:', 'phase:replacing', 'rename:1', 'rename:2', 'rename:3',
+                  'rename:4', 'rename:5', 'rename:6', 'unit-file:', 'phase:refreshed', 'migrated:1',
+                  'migrated:2', 'phase:starting', 'settling:'):
+        crash(point, *upgrade)
+        reboot_and_recover(point)
+        assert_same_node(before, 'reboot at ' + point)
+        passed('reboot at %s of an upgrade: nothing started before the guard, and all is back' % point)
+
+    for point in ('phase:committed', 'discarded:'):
+        crash(point, *upgrade)
+        reboot_and_recover(point)
+        assert sha(KILND) == sha(b + '/kilnd'), point + ': it had committed'
+        assert not os.path.exists(JOURNAL) and not os.path.exists(STAGE)
+        assert all(active(u) in ('active', 'activating') for u, was in before['units'].items() if was)
+        # A new upgrade, so new inodes, with the same bindings and exactly the same units.
+        script('upgrade.sh', a)
+        assert sha(KILND) == sha(a + '/kilnd')
+        after = snapshot_node()
+        assert after['units'] == before['units'], after['units']
+        assert [binding(r) for r in after['rows']] == [binding(r) for r in before['rows']]
+        before = after
+        passed('reboot at %s of an upgrade: it stays committed, and the marker goes last' % point)
+
+    for point in ('marker:', 'masked:', 'enrolled:'):
+        crash(point, 'add-instance', 't3')
+        reboot_and_recover(point)
+        assert_same_node(before, 'add-instance reboot at ' + point)
+        passed('reboot at %s of add-instance: all is back' % point)
+
+    # A schema the old image can't open: serving on it is prevented, and it goes back.
+    bump = ('"$real" "$@" || exit $?\nsetpriv --reuid="$5" --regid="$5" --clear-groups %s -I -c '
+            '"import sqlite3,sys;sqlite3.connect(sys.argv[1]).execute(\'PRAGMA user_version=99\')" '
+            '"$3/kilnd.db"\n' % sys.executable)
+    migrating = fake_build(scratch + '/migrate-reboot', b, kilnd=(
+        '#!/bin/sh\nreal=REAL\ncase "$1" in init-state) ' + bump + 'exit 0 ;; --version) exec "$real" "$@" ;; esac\n'
+        'exec "$real" "$@"\n'))
+    wanted = schema_of('kilnd', '/var/lib/kilnd')
+    crash('migrated:2', 'upgrade', '--bin-dir', migrating)
+    assert schema_of('kilnd', '/var/lib/kilnd') == 99 or schema_of('kilnd-t1', '/var/lib/kilnd-t1') == 99
+    reboot_and_recover('between migrations')
+    assert schema_of('kilnd', '/var/lib/kilnd') == wanted
+    assert schema_of('kilnd-t1', '/var/lib/kilnd-t1') == schema_of('kilnd-t2', '/var/lib/kilnd-t2')
+    assert not os.path.exists(FAILED_DIR), 'nothing had served, so nothing is kept'
+    assert_same_node(before, 'reboot between migrations')
+    passed('reboot between two migrations: both go back, and nothing had served')
+    crash('settling:', 'upgrade', '--bin-dir', migrating)
+    reboot_and_recover('after migrating and starting')
+    assert schema_of('kilnd', '/var/lib/kilnd') == wanted
+    assert glob.glob(FAILED_DIR + '/*/*/kilnd.db'), 'what may have served is kept'
+    shutil.rmtree(FAILED_DIR)
+    assert_same_node(before, 'reboot once started')
+    passed('reboot once started on a new schema: it goes back, and what it held is kept')
+
+    # Recovery that can't finish: down it all stays, by the guard alone, until an operator's retry.
+    no_restore = fake_build(scratch + '/no-restore', b, helper=(
+        '#!/bin/sh\ncase "$1" in restore-enrollments) echo "restore failed" >&2; exit 9 ;; esac\n'
+        'exec REAL "$@"\n'))
+    crash('phase:refreshed', 'upgrade', '--bin-dir', no_restore)
+    down_as_after_a_reboot()
+    guard = boot_as_after_a_reboot()
+    assert guard == 'failed', guard
+    deadline = time.monotonic() + 30
+    while active(FINISH) == 'activating' and time.monotonic() < deadline:
+        time.sleep(0.1)
+    time.sleep(1)
+    for unit in units():
+        assert active(unit) in ('inactive', 'failed'), '%s is %s with the guard failed' % (unit, active(unit))
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect(HELPER_SOCKET)
+        raise AssertionError('the helper socket listens with the guard failed')
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    assert sh('systemctl', 'start', 'kilnd-helper.socket', check=False).returncode != 0
+    assert sh('systemctl', 'start', 'kilnd.service', check=False).returncode != 0
+    assert os.path.exists(WINDOW_RECORD) and os.path.exists(JOURNAL)
+    passed('a guard that cannot recover fails, and the socket and every daemon stay down')
+    shutil.copy2(a + '/kilnd-helper', STAGE + '/tool/kilnd-helper')
+    script('upgrade.sh', '--recover')
+    assert_same_node(before, 'recovered by hand after a failed guard')
+    passed('--recover finishes it after a failed guard, and activation opens')
+
+    # A unit that won't start at the end of a boot's recovery leaves the marker.
+    crash('rename:3', *upgrade)
+    directory = fail_start('kilnd.service')
+    try:
+        down_as_after_a_reboot()
+        assert boot_as_after_a_reboot() == 'active'
+        deadline = time.monotonic() + 120
+        while active(FINISH) != 'failed' and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert active(FINISH) == 'failed', active(FINISH)
+        assert os.path.exists(WINDOW_RECORD) and os.path.exists(JOURNAL), 'its retry state went'
+    finally:
+        shutil.rmtree(directory)
+        sh('systemctl', 'daemon-reload')
+    script('upgrade.sh', '--recover')
+    assert_same_node(before, 'a failed start after a boot recovery')
+    passed('a start that fails after boot recovery keeps the marker for --recover')
+
+    # A node whose units are from before the guard is fenced before its first upgrade changes it.
+    plain = {}
+    for name in ('kilnd-helper.socket', 'kilnd-helper.service', 'kilnd.service', 'kilnd@.service'):
+        path = '/etc/systemd/system/' + name
+        with open(path, encoding='utf-8') as file:
+            plain[path] = file.read()
+        stripped = ''.join(l.replace(' ' + GUARD, '') for l in plain[path].splitlines(True)
+                           if l != 'Requires=' + GUARD + '\n')
+        assert GUARD not in stripped, name
+        with open(path, 'w', encoding='utf-8') as file:
+            file.write(stripped)
+    sh('systemctl', 'daemon-reload')
+    older = snapshot_node()
+    crash('rename:3', *upgrade)
+    shown = sh('systemctl', 'show', '--property=Requires,After', 'kilnd.service').stdout
+    assert shown.count(GUARD) == 2, shown
+    reboot_and_recover('a first upgrade from before the guard')
+    assert_same_node(older, 'a first upgrade from before the guard')
+    shown = sh('systemctl', 'show', '--property=Requires,After', 'kilnd.service').stdout
+    assert shown.count(GUARD) == 2, 'its rollback took the guard away: ' + shown
+    passed('reboot during a first upgrade from units older than the guard, and they keep it')
+    for path, text in plain.items():
+        with open(path, 'w', encoding='utf-8') as file:
+            file.write(text)
+    sh(sys.executable, '-I', MAINTENANCE, 'install-fence')
+    assert not glob.glob('/etc/systemd/system/*.d/10-maintenance-guard.conf')
+    sh('systemctl', 'daemon-reload')
+    assert_same_node(before, 'units restored')
+
+
+def reboot_arm(args):
+    """Up to the point of rebooting, with what verification needs kept on disk."""
+    point = args.reboot_arm
+    if os.path.exists(POLICY) or (os.path.isdir(LEDGER) and os.listdir(LEDGER)):
+        sys.exit('this node already has a Firecracker policy or ledger; it needs one with neither')
+    shutil.rmtree(REBOOT_DIR, ignore_errors=True)
+    os.makedirs(REBOOT_DIR, mode=0o755)
+    assert sha(KILND) == sha(args.bin_a + '/kilnd')
+    provision_policy()
+    # In /etc this time, because /run won't still have it.
+    os.makedirs(os.path.dirname(REBOOT_STAY_ATTACHED), exist_ok=True)
+    with open(REBOOT_STAY_ATTACHED, 'w', encoding='utf-8') as file:
+        file.write('[Service]\nExecStart=\nExecStart=%s check-attachment '
+                   '--state-dir /var/lib/kilnd-%%i --hold\n' % KILND)
+    sh('systemctl', 'daemon-reload')
+    sh(sys.executable, '-I', MAINTENANCE, 'upgrade', '--bin-dir', args.bin_a, '--enroll-default')
+    script('add-instance.sh', 't1')
+    script('add-instance.sh', 't2')
+    wait_active('kilnd.service', 'kilnd@t1.service', 'kilnd@t2.service')
+    sh('systemctl', 'disable', 'kilnd@t2.service')  # Running, not enabled: the marker's to restore.
+    before = snapshot_node()
+    with open(REBOOT_DIR + '/before.json', 'w', encoding='utf-8') as file:
+        json.dump({'node': before, 'point': point,
+                   'boot': open('/proc/sys/kernel/random/boot_id', encoding='utf-8').read().strip()}, file)
+    build = fake_build(REBOOT_DIR + '/build', args.bin_b, helper=(
+        '#!/bin/sh\ncase "$1 $*" in refresh-enrollments*--check*) exec REAL "$@" ;; '
+        'refresh-enrollments*) touch %s/at-refresh; sleep 600 ;; esac\nexec REAL "$@"\n' % REBOOT_DIR))
+    os.sync()
+    if point == 'graceful':
+        sh('systemd-run', '--unit=kilnd-reboot-test-upgrade', '--collect', sys.executable, '-I', MAINTENANCE,
+           'upgrade', '--bin-dir', build)
+        deadline = time.monotonic() + 120
+        while not os.path.exists(REBOOT_DIR + '/at-refresh'):
+            assert time.monotonic() < deadline, 'the upgrade never reached the refresh'
+            time.sleep(0.05)
+        assert sha(KILND) != sha(args.bin_a + '/kilnd'), 'it should have replaced the images'
+        out('at the refresh, images replaced, journal %s' % json.load(open(JOURNAL, encoding='utf-8'))['phase'])
+        subprocess.Popen(['systemctl', 'reboot'], start_new_session=True)
+        return
+    # The harness reboots with no sync, at that step.
+    harness('reboot/' + point, 'upgrade', '--bin-dir', args.bin_b, wait=True)
+    raise AssertionError('still here after the step: ' + point)
+
+
+def reboot_verify():
+    with open(REBOOT_DIR + '/before.json', encoding='utf-8') as file:
+        saved = json.load(file)
+    before = saved['node']
+    before['images'] = {name: tuple(identity) for name, identity in before['images'].items()}
+    boot = open('/proc/sys/kernel/random/boot_id', encoding='utf-8').read().strip()
+    assert boot != saved['boot'], 'this is the same boot'
+    try:
+        deadline = time.monotonic() + 300
+        while active(GUARD) == 'activating' and time.monotonic() < deadline:
+            time.sleep(0.2)
+        guard_log = sh('journalctl', '-b', '-u', GUARD, '--no-pager', '-o', 'short-monotonic').stdout
+        out(guard_log.strip())
+        assert active(GUARD) == 'active', 'guard %s' % active(GUARD)
+        wait_marker_gone()
+        guard_came_first()
+        passed('the guard ran this boot and finished before the socket and daemon started')
+        finish_log = sh('journalctl', '-b', '-u', FINISH, '--no-pager', '-o', 'short-monotonic').stdout
+        out(finish_log.strip())
+        log = sh('journalctl', '-b', '--no-pager', '-o', 'cat').stdout
+        assert 'ordering cycle' not in log.lower() or 'kilnd' not in log.lower().split('ordering cycle')[1][:200]
+        before['units'] = {u: v for u, v in before['units'].items() if u in units()}
+        assert_same_node(before, 'a real reboot at ' + saved['point'])
+        deadline = time.monotonic() + 30
+        while sh(BIN + '/kilndctl', 'health', check=False).returncode != 0:
+            assert time.monotonic() < deadline, 'kilnd never answered'
+            time.sleep(0.2)
+        passed('a real reboot at %s: same images, enrollments, units and state' % saved['point'])
+    finally:
+        cleanup()
+        shutil.rmtree(REBOOT_DIR, ignore_errors=True)
+    out('ALL PASS')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--bin-a', required=True)
-    parser.add_argument('--bin-b', required=True)
+    parser.add_argument('--bin-a')
+    parser.add_argument('--bin-b')
+    parser.add_argument('--reboot-arm')
+    parser.add_argument('--reboot-verify', action='store_true')
     args = parser.parse_args()
     if os.geteuid() != 0:
         sys.exit('this needs root')
+    if args.reboot_verify:
+        reboot_verify()
+        return
+    if not args.bin_a or not args.bin_b:
+        parser.error('--bin-a and --bin-b are required')
+    if args.reboot_arm:
+        reboot_arm(args)
+        return
     if os.path.exists(POLICY) or (os.path.isdir(LEDGER) and os.listdir(LEDGER)):
         sys.exit('this node already has a Firecracker policy or ledger; it needs one with neither')
     scratch = tempfile.mkdtemp(prefix='kilnd-deployment-')
@@ -731,6 +1197,8 @@ def main():
         first, second = test_01_identity(args)
         test_02_activation(args, sandbox)
         test_03_upgrade(args, scratch, first, second, sandbox)
+        test_04_failed_restores(args, scratch)
+        test_05_reboot(args, scratch)
     finally:
         cleanup()
         shutil.rmtree(scratch, ignore_errors=True)

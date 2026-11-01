@@ -4,13 +4,20 @@
   add-instance NAME              scripts/add-instance.sh
   upgrade --bin-dir DIR          scripts/upgrade.sh, and scripts/install.sh when configured
   recover                        finishes whatever a killed or crashed command left
+  recover --boot                 kilnd-maintenance-guard.service's half of that, at boot
+  install-fence                  installs the boot guard, for scripts/install.sh
   needs-transaction              exit 0 if this node can only be changed by `upgrade`
+
+Exit status: 0 done, 1 failed and undone, 2 refused with nothing changed, 3 recovery required:
+something could not be put back, its record is kept, and `recover` tries again.
 
 Enrollment and refreshing need the node lock, which only a stopped helper leaves free,
 and every enrolled instance may connect to the helper's socket. So activation is made
 impossible first: both activation units are runtime-masked, then stopped along with every
-daemon that requires them. A record of what was running lets the end of the window, a signal
-or a later `recover` put back exactly that. See docs/setup.md.
+daemon that requires them. A durable record of what was running exists before any of that. It
+lets the end of the window, a signal or a later `recover` put back exactly that, and while it
+exists after a reboot, which clears the masks, the boot guard keeps every unit down until the
+node is whole again. See docs/setup.md.
 
 File work inside an instance's state directory runs as that instance's account, because
 root must not follow what a hostile instance left there.
@@ -41,10 +48,14 @@ HELPER_SOCKET = '/run/kilnd-helper/helper.sock'
 DEFAULT_POLICY = '/etc/kilnd/firecracker-node.json'
 DEFAULT_LEDGER_DIR = '/var/lib/kilnd-helper/firecracker'
 LOCK = '/run/kilnd-maintenance.lock'
-WINDOW_RECORD = '/run/kilnd-maintenance.window.json'
+# The persistent maintenance marker and the window's record, in one fsynced file. It is written
+# before anything changes and removed last. Its stage is 'open' while anything may be half done,
+# which keeps the boot guard failing, and 'restored' once only starting units is left.
+WINDOW_RECORD = '/var/lib/kilnd-helper/maintenance.json'
 # `systemctl mask --runtime` writes to /run/systemd/system, which /etc/systemd/system outranks,
 # so it silently does nothing to a unit installed in /etc. This directory outranks /etc
-# (systemd.unit(5)), and like the rest of /run it is gone after a reboot.
+# (systemd.unit(5)), and like the rest of /run it is gone after a reboot, when the boot guard
+# (deploy/kilnd-maintenance-guard.service) takes over from it.
 MASK_DIR = '/run/systemd/system.control'
 # On disk, so a reboot in the middle can still be undone. The images move by rename, which
 # keeps the inode enrollment names, so they stay on the installed images' filesystem.
@@ -59,16 +70,29 @@ MANAGED_FILES = {
     'kilnd@.service': '/etc/systemd/system/kilnd@.service',
     'kilnd-helper.conf': '/etc/tmpfiles.d/kilnd-helper.conf',
 }
+# Not part of an upgrade's transaction: they go in before one starts, stay through its rollback,
+# and are what recovers it. A unit installed by an older build gets the guard from a drop-in.
+FENCE_DIR = '/usr/local/libexec/kilnd'
+FENCE_TOOLS = ('kilnd-maintenance.py', 'upgrade.sh')
+GUARD = 'kilnd-maintenance-guard.service'
+FENCE_UNITS = (GUARD, 'kilnd-maintenance-finish.service')
+GUARDED_UNITS = ('kilnd-helper.socket', 'kilnd-helper.service', 'kilnd.service', 'kilnd@.service')
+UNIT_DIR = '/etc/systemd/system'
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 # How long a restarted default daemon must stay up, and be given, before it counts.
 SETTLE_SECONDS = 5
 START_SECONDS = 60
 PHASES = ('prepared', 'replacing', 'refreshed', 'starting', 'committed')
+RECOVERY_REQUIRED = 3
 
 
 class Refused(Exception):
     """Nothing was replaced, and the node is as it was."""
+
+
+class RecoveryRequired(Exception):
+    """Something could not be put back. Its record is kept, for `recover` to try again."""
 
 
 class Interrupted(BaseException):
@@ -164,6 +188,9 @@ def unmask_runtime(units):
         if os.path.islink(path) and os.readlink(path) == '/dev/null':
             os.unlink(path)
     systemctl('daemon-reload')
+    for unit in units:
+        if is_masked(unit_state(unit)):
+            raise RuntimeError('%s is still masked' % unit)
 
 
 def daemon_units():
@@ -212,6 +239,42 @@ def write_atomic(path, text):
     fsync_dir(os.path.dirname(path))
 
 
+def make_private_dir(path):
+    """A directory a reboot must still find, with the entry that names it durable too."""
+    if not os.path.isdir(path):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        fsync_dir(os.path.dirname(path))
+
+
+def make_public_dir(path):
+    """Like any directory of the system's, whatever this process's own umask makes of it."""
+    if not os.path.isdir(path):
+        previous = os.umask(0o022)
+        try:
+            os.makedirs(path, mode=0o755, exist_ok=True)
+        finally:
+            os.umask(previous)
+        fsync_dir(os.path.dirname(path))
+
+
+def copy_durably(source, destination):
+    temporary = destination + '.kilnd-copy'
+    shutil.copy2(source, temporary)
+    fd = os.open(temporary, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(temporary, destination)
+    fsync_dir(os.path.dirname(destination))
+
+
+def rename_durably(source, destination):
+    os.rename(source, destination)
+    fsync_dir(os.path.dirname(source))
+    fsync_dir(os.path.dirname(destination))
+
+
 def write_json(path, value):
     write_atomic(path, json.dumps(value, indent=1, sort_keys=True))
 
@@ -233,7 +296,8 @@ def acquire_lock():
 
 
 class Window:
-    """The time activation is unavailable. Its record exists before anything changes."""
+    """The time activation is unavailable. Its record exists before anything changes, and
+    outlasts the masks: whatever a failure or a reboot left, it says what to put back."""
 
     def __init__(self):
         self.record = read_json(WINDOW_RECORD) if os.path.exists(WINDOW_RECORD) else None
@@ -250,7 +314,8 @@ class Window:
                     'running': state.get('ActiveState') in ('active', 'activating', 'reloading'),
                     'masked': is_masked(state),
                 }
-            self.record = {'units': units}
+            self.record = {'units': units, 'stage': 'open'}
+            make_private_dir(os.path.dirname(WINDOW_RECORD))
             write_json(WINDOW_RECORD, self.record)
         self.enforce()
 
@@ -279,10 +344,32 @@ class Window:
         if os.path.lexists(HELPER_SOCKET):
             os.unlink(HELPER_SOCKET)
 
-    def release(self):
-        """Back to what was running: never more, and every unit whatever another's result."""
+    def require_down(self):
+        """At boot the guard's ordering holds every unit back, and stopping them would cancel
+        the starts boot has queued. This only proves that nothing got past it."""
+        for unit in sorted({*self.record['units'], *ACTIVATION, *daemon_units()}):
+            active = unit_state(unit).get('ActiveState')
+            if active not in (None, '', 'inactive', 'failed'):
+                raise RuntimeError('%s is %s during recovery' % (unit, active))
+        if helper_listening():
+            raise RuntimeError('something still listens at ' + HELPER_SOCKET)
+
+    def mark_restored(self):
+        """The node is whole. Only starting units is left, so the guard may let them start."""
+        if self.record.get('stage') != 'restored':
+            self.record['stage'] = 'restored'
+            write_json(WINDOW_RECORD, self.record)
+
+    def release(self, restored=True):
+        """Back to what was running: never more, and every unit whatever another's result.
+        restored=False is an upgrade starting its new images, which can still be undone."""
         errors = []
         units = self.record['units']
+        if restored:
+            try:
+                self.mark_restored()
+            except OSError as error:
+                errors.append('record: %s' % error)
         try:
             unmask_runtime([u for u in ACTIVATION if u in units and not units[u]['masked']])
         except (OSError, RuntimeError) as error:
@@ -303,8 +390,10 @@ class Window:
         return errors
 
     def finish(self):
+        """Last of all, and only with everything it recorded put back."""
         if os.path.exists(WINDOW_RECORD):
             os.unlink(WINDOW_RECORD)
+            fsync_dir(os.path.dirname(WINDOW_RECORD))
         self.record = None
 
     def running_daemons(self):
@@ -312,16 +401,28 @@ class Window:
         return [u for u in units if u not in ACTIVATION and units[u]['running']]
 
     def close(self):
-        """Ends a window whose work is over, with nothing able to interrupt it."""
+        """Ends a window whose work is over, with nothing able to interrupt it. Any error keeps
+        the record, and the masks it could not lift, for `recover` to try again."""
         if self.record is None:
             return []
         hold_signals()
         try:
             errors = self.release()
-            self.finish()
+            if not errors:
+                errors = settled(self.running_daemons())
+            if not errors:
+                self.finish()
         finally:
             catch_signals()
         return errors
+
+
+def close_window(window):
+    errors = window.close()
+    if errors:
+        for error in errors:
+            log('restore: ' + error)
+        raise RecoveryRequired('; '.join(errors))
 
 
 # What an instance's account does in its own state directory. It starts from this one
@@ -472,7 +573,8 @@ def find_policy():
 
 
 def needs_transaction():
-    return find_policy() is not None or any(u != 'kilnd.service' for u in daemon_units())
+    return (os.path.exists(WINDOW_RECORD) or os.path.exists(JOURNAL) or find_policy() is not None
+            or any(u != 'kilnd.service' for u in daemon_units()))
 
 
 def helper_rows(helper, policy):
@@ -517,6 +619,55 @@ def install_file(source, destination, mode):
     finally:
         os.close(fd)
     os.rename(temporary, destination)
+    fsync_dir(os.path.dirname(destination))
+
+
+def install_fence(deploy_dir):
+    """The boot guard goes in before the first marker that needs it, as a copy of this script
+    on root's own filesystem, so that a node can recover before anything else is mounted. An
+    installed unit from before the guard gets the dependency from a drop-in, which stays through
+    a rollback to that unit and goes once the unit carries it itself."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for name in FENCE_UNITS:
+        if not os.path.exists(os.path.join(deploy_dir, name)):
+            raise Refused('%s is missing %s' % (deploy_dir, name))
+    for name in FENCE_TOOLS:
+        if not os.path.exists(os.path.join(here, name)):
+            raise Refused('%s is missing %s' % (here, name))
+    make_private_dir(os.path.dirname(WINDOW_RECORD))
+    make_public_dir(FENCE_DIR)
+    for name in FENCE_TOOLS:
+        if os.path.realpath(os.path.join(FENCE_DIR, name)) != os.path.join(here, name):
+            install_file(os.path.join(here, name), os.path.join(FENCE_DIR, name), 0o755)
+    fsync_dir(os.path.dirname(FENCE_DIR))
+    for name in FENCE_UNITS:
+        install_file(os.path.join(deploy_dir, name), os.path.join(UNIT_DIR, name), 0o644)
+    for unit in GUARDED_UNITS:
+        installed = os.path.join(UNIT_DIR, unit)
+        directory = installed + '.d'
+        dropin = os.path.join(directory, '10-maintenance-guard.conf')
+        carries = False
+        if os.path.exists(installed):
+            with open(installed) as file:
+                carries = GUARD in file.read()
+        if os.path.exists(installed) and not carries:
+            make_public_dir(directory)
+            write_atomic(dropin, '[Unit]\nRequires=%s\nAfter=%s\n' % (GUARD, GUARD))
+            os.chmod(dropin, 0o644)
+            fsync_dir(UNIT_DIR)
+        elif os.path.exists(dropin):
+            os.unlink(dropin)
+            fsync_dir(directory)
+    systemctl('daemon-reload')
+    systemctl('enable', '--quiet', *FENCE_UNITS)
+    for target in ('sockets.target', 'multi-user.target'):
+        wants = os.path.join(UNIT_DIR, target + '.wants')
+        if os.path.isdir(wants):
+            fsync_dir(wants)
+    fsync_dir(UNIT_DIR)
+    # With nothing to recover this passes at once, and stays active until the next boot, so a
+    # window's own starts don't wait on it.
+    systemctl('start', GUARD)
 
 
 def provision_default(window, policy):
@@ -529,10 +680,11 @@ def provision_default(window, policy):
             instance = init_state(os.path.join(BIN, 'kilnd'), '/var/lib/kilnd', 'kilnd')
             enroll(policy, instance, 'kilnd.service', 'kilnd')
             log('default instance %s enrolled' % instance)
-    finally:
-        errors = window.close()
-    if errors:
-        raise RuntimeError('; '.join(errors))
+    except BaseException as failure:
+        log('enrolling the default instance failed: %s' % failure)
+        close_window(window)
+        raise
+    close_window(window)
 
 
 def cmd_add_instance(args):
@@ -551,26 +703,28 @@ def cmd_add_instance(args):
         raise Refused('this node has no Firecracker policy; see docs/setup.md')
     user = 'kilnd-' + name
     unit = 'kilnd@%s.service' % name
-    if run(('getent', 'group', user), check=False).returncode != 0:
-        run(('groupadd', '--system', user))
-    if run(('getent', 'passwd', user), check=False).returncode != 0:
-        run(('useradd', '--system', '--gid', user, '--home-dir', '/nonexistent',
-             '--shell', '/usr/sbin/nologin', user))
-    install_file(os.path.join(args.deploy_dir, 'kilnd@.service'),
-                 MANAGED_FILES['kilnd@.service'], 0o644)
-    systemctl('daemon-reload')
+    install_fence(args.deploy_dir)
     window = Window()
     try:
         window.open()
+        if run(('getent', 'group', user), check=False).returncode != 0:
+            run(('groupadd', '--system', user))
+        if run(('getent', 'passwd', user), check=False).returncode != 0:
+            run(('useradd', '--system', '--gid', user, '--home-dir', '/nonexistent',
+                 '--shell', '/usr/sbin/nologin', user))
+        install_file(os.path.join(args.deploy_dir, 'kilnd@.service'),
+                     MANAGED_FILES['kilnd@.service'], 0o644)
+        systemctl('daemon-reload')
         instance = init_state(os.path.join(BIN, 'kilnd'), '/var/lib/' + user, user)
         # A template instance's cgroup sits in the slice systemd makes for that template.
         enroll(policy, instance, unit, user, cgroup='/system.slice/system-kilnd.slice/' + unit)
         # Only an enrolled account has any business reaching the helper's socket.
         run(('usermod', '-a', '-G', 'kilnd-helper', user))
-    finally:
-        errors = window.close()
-    if errors:
-        raise RuntimeError('; '.join(errors))
+    except BaseException as failure:
+        log('add-instance failed: %s' % failure)
+        close_window(window)
+        raise
+    close_window(window)
     systemctl('enable', '--quiet', unit)
     # Enrolled and enabled: whether it stays up says nothing about this command. See release.
     systemctl('start', '--no-block', unit)
@@ -585,13 +739,13 @@ def stage_images(bin_dir):
     shutil.rmtree(STAGE, ignore_errors=True)
     for part in ('', '/new', '/old', '/tool'):
         os.mkdir(STAGE + part, 0o700)
+        fsync_dir(os.path.dirname(STAGE + part))
     for image in IMAGES:
         source = os.path.join(bin_dir, image)
         meta = os.lstat(source)
         if not stat.S_ISREG(meta.st_mode):
             raise Refused(source + ' is not a regular file')
         install_file(source, os.path.join(STAGE, 'new', image), 0o755)
-        fsync_dir(os.path.join(STAGE, 'new'))
         done = run((os.path.join(STAGE, 'new', image), '--version'), check=False)
         if done.returncode != 0:
             raise Refused('%s does not run: %s' % (source, done.stderr.strip()))
@@ -636,14 +790,16 @@ def cmd_upgrade(args):
     lock = acquire_lock()
     finish_interrupted()
     policy = find_policy()
-    os.makedirs(os.path.dirname(TXN_DIR), mode=0o700, exist_ok=True)
+    make_private_dir(os.path.dirname(TXN_DIR))
     try:
         stage_images(args.bin_dir)
+        install_fence(args.deploy_dir)
     except BaseException:
         shutil.rmtree(STAGE, ignore_errors=True)
         raise
     # Exists only with the stage complete, and always holds a journal before the window.
     os.mkdir(TXN_DIR, 0o700)
+    fsync_dir(os.path.dirname(TXN_DIR))
     window = Window()
     journal = None
     try:
@@ -666,8 +822,9 @@ def cmd_upgrade(args):
                        'started': False, 'had_image': {}, 'files': {}, 'instances': {}, 'rows': None}
         complete = rollback(journal, window)
         if not complete:
-            log('the rollback is incomplete: fix what it reported, then run scripts/upgrade.sh --recover')
-            raise SystemExit(3) from failure
+            log('the upgrade failed: %s' % failure)
+            raise RecoveryRequired('the rollback is incomplete: fix what it reported, '
+                                   'then run scripts/upgrade.sh --recover') from failure
         if isinstance(failure, Refused):
             raise
         if isinstance(failure, Interrupted):
@@ -675,10 +832,10 @@ def cmd_upgrade(args):
             raise SystemExit(1) from failure
         log('the upgrade failed and was undone: %s' % failure)
         raise SystemExit(1) from failure
-    # Committed. Past this point there is nothing to undo.
+    # Committed, durably. Past this point there is nothing to undo, and the marker goes last.
     hold_signals()
-    shutil.rmtree(STAGE, ignore_errors=True)
-    shutil.rmtree(TXN_DIR, ignore_errors=True)
+    discard_transaction()
+    window.finish()
     catch_signals()
     log('upgraded %d enrollments; %s running again' %
         (len(journal['rows'] or []), ', '.join(journal['restarted']) or 'nothing'))
@@ -734,23 +891,24 @@ def upgrade_transaction(args, journal, window):
             'snapshot': destination,
         }
     os.mkdir(TXN_DIR + '/files', 0o700)
+    fsync_dir(TXN_DIR)
+    if os.path.isdir(os.path.join(TXN_DIR, 'state')):
+        fsync_dir(os.path.join(TXN_DIR, 'state'))
     for name, path in MANAGED_FILES.items():
         if not os.path.exists(os.path.join(args.deploy_dir, name)):
             raise Refused('%s is missing %s' % (args.deploy_dir, name))
         kept = None
         if os.path.exists(path):
             kept = os.path.join(TXN_DIR, 'files', name)
-            shutil.copy2(path, kept)
+            copy_durably(path, kept)
         journal['files'][path] = kept
     set_phase(journal, 'replacing')
 
     for image in IMAGES:
         installed = os.path.join(BIN, image)
         if os.path.exists(installed):
-            os.rename(installed, os.path.join(STAGE, 'old', image))
-        os.rename(os.path.join(STAGE, 'new', image), installed)
-    fsync_dir(BIN)
-    fsync_dir(os.path.join(STAGE, 'old'))
+            rename_durably(installed, os.path.join(STAGE, 'old', image))
+        rename_durably(os.path.join(STAGE, 'new', image), installed)
     for name, path in MANAGED_FILES.items():
         install_file(os.path.join(args.deploy_dir, name), path, 0o644)
     systemctl('daemon-reload')
@@ -778,13 +936,12 @@ def upgrade_transaction(args, journal, window):
 
     journal['started'] = True
     set_phase(journal, 'starting')
-    errors = window.release()
+    errors = window.release(restored=False)
     if errors:
         raise RuntimeError('; '.join(errors))
     settle(running)
     journal['restarted'] = running
     set_phase(journal, 'committed')
-    window.finish()
 
 
 def helper_rows_retrying(helper, policy):
@@ -805,7 +962,16 @@ def run_refusing(argv):
         raise Refused(done.stderr.strip() or 'refused')
 
 
-def settle(running):
+def settled(running):
+    """settle() for restoring what ran before, whose answer to Health was its own business."""
+    try:
+        settle(running, health=False)
+    except RuntimeError as error:
+        return [str(error)]
+    return []
+
+
+def settle(running, health=True):
     """The default instance serves, so it must stay up and answer. A kilnd@ daemon stops at
     startup reconciliation by design until B7, then gives up, so its state proves nothing
     yet: its start was requested, init-state has already proved the image opens its state,
@@ -822,6 +988,8 @@ def settle(running):
             if steady_since is None or steady_since[1] != restarts:
                 steady_since = (time.monotonic(), restarts)
             elif time.monotonic() - steady_since[0] >= SETTLE_SECONDS:
+                if not health:
+                    return
                 if run((os.path.join(BIN, 'kilndctl'), 'health'), check=False).returncode == 0:
                     return
         else:
@@ -831,10 +999,22 @@ def settle(running):
         time.sleep(0.25)
 
 
-def rollback(journal, window):
-    """Undoes an upgrade from whatever point it reached. Safe to repeat. A step that fails
-    keeps the journal and the window so `recover` can try again; nothing unenrolled or
-    half-installed starts in the meantime."""
+def discard_transaction():
+    shutil.rmtree(STAGE, ignore_errors=True)
+    shutil.rmtree(TXN_DIR, ignore_errors=True)
+    fsync_dir(BIN)
+    parent = os.path.dirname(TXN_DIR)
+    if os.path.isdir(parent):
+        fsync_dir(parent)
+
+
+def rollback(journal, window, boot=False):
+    """Undoes an upgrade from whatever point it reached. Safe to repeat. Returns True only when
+    the node is whole. A step that fails returns False and keeps the journal, the stage and the
+    window, so `recover` can try again; nothing unenrolled or half-installed starts in the
+    meantime. Once every file is back only starting units is left, and a retry does only that,
+    without stopping what did come back. At boot those starts belong to boot, whose units can't
+    run until the guard running this exits: kilnd-maintenance-finish.service does the rest."""
     hold_signals()
     errors = []
     if journal is None:
@@ -848,54 +1028,67 @@ def rollback(journal, window):
             errors.append('%s: %s' % (what, error))
             log('rollback: %s: %s' % (what, error))
     if window.record is None and journal.get('prior'):
-        window.record = {'units': journal['prior']}
+        window.record = {'units': journal['prior'], 'stage': 'open'}
         attempt('record the window', lambda: write_json(WINDOW_RECORD, window.record))
+    if not journal.get('rolled_back'):
+        if window.record is not None:
+            attempt('stop everything', window.require_down if boot else window.enforce)
+        phase = journal.get('phase', 'prepared')
+        replaced = PHASES.index(phase) >= PHASES.index('replacing')
+        if replaced:
+            def restore_files():
+                for path, kept in journal['files'].items():
+                    if kept is None:
+                        if os.path.exists(path):
+                            os.unlink(path)
+                            fsync_dir(os.path.dirname(path))
+                    else:
+                        copy_durably(kept, path)
+                systemctl('daemon-reload')
+            attempt('restore unit files', restore_files)
+
+            def restore_images():
+                for image in IMAGES:
+                    old = os.path.join(STAGE, 'old', image)
+                    installed = os.path.join(BIN, image)
+                    if os.path.exists(old):
+                        os.replace(old, installed)
+                        fsync_dir(os.path.join(STAGE, 'old'))
+                    elif not journal['had_image'].get(image, True) and os.path.exists(installed):
+                        os.unlink(installed)
+                    fsync_dir(BIN)
+            attempt('restore images', restore_images)
+
+            if journal.get('rows') is not None and journal.get('policy'):
+                def restore_ledger():
+                    run((os.path.join(STAGE, 'tool/kilnd-helper'), 'restore-enrollments',
+                         '--policy', journal['policy'], '--snapshot', TXN_DIR + '/enrollments.json'))
+                attempt('restore enrollments', restore_ledger)
+
+            for unit, kept in journal['instances'].items():
+                attempt('restore the state of ' + unit,
+                        lambda u=unit, k=kept: restore_instance(u, k, journal.get('started')))
+        if errors:
+            return False
+        if os.path.isdir(TXN_DIR):
+            journal['rolled_back'] = True
+            attempt('record the rollback', lambda: write_json(JOURNAL, journal))
+        if errors:
+            return False
+    if boot:
+        if window.record is not None:
+            attempt('record the rollback', window.mark_restored)
+        return not errors
     if window.record is not None:
-        attempt('stop everything', window.enforce)
-    phase = journal.get('phase', 'prepared')
-    replaced = PHASES.index(phase) >= PHASES.index('replacing')
-    if replaced:
-        def restore_files():
-            for path, kept in journal['files'].items():
-                if kept is None:
-                    if os.path.exists(path):
-                        os.unlink(path)
-                else:
-                    temporary = path + '.kilnd-old'
-                    shutil.copy2(kept, temporary)
-                    os.rename(temporary, path)
-            systemctl('daemon-reload')
-        attempt('restore unit files', restore_files)
-
-        def restore_images():
-            for image in IMAGES:
-                old = os.path.join(STAGE, 'old', image)
-                installed = os.path.join(BIN, image)
-                if os.path.exists(old):
-                    os.replace(old, installed)
-                elif not journal['had_image'].get(image, True) and os.path.exists(installed):
-                    os.unlink(installed)
-            fsync_dir(BIN)
-        attempt('restore images', restore_images)
-
-        if journal.get('rows') is not None and journal.get('policy'):
-            def restore_ledger():
-                run((os.path.join(STAGE, 'tool/kilnd-helper'), 'restore-enrollments',
-                     '--policy', journal['policy'], '--snapshot', TXN_DIR + '/enrollments.json'))
-            attempt('restore enrollments', restore_ledger)
-
-        for unit, kept in journal['instances'].items():
-            attempt('restore the state of ' + unit,
-                    lambda u=unit, k=kept: restore_instance(u, k, journal.get('started')))
-    if errors:
-        return False
-    errors.extend(window.release() if window.record is not None else [])
+        errors.extend(window.release())
+        if not errors:
+            errors.extend(settled(window.running_daemons()))
     if errors:
         for error in errors:
             log('rollback: ' + error)
+        return False
+    discard_transaction()
     window.finish()
-    shutil.rmtree(STAGE, ignore_errors=True)
-    shutil.rmtree(TXN_DIR, ignore_errors=True)
     return True
 
 
@@ -919,46 +1112,76 @@ def restore_instance(unit, kept, started):
     restore_state(kept['account'], kept['state'], kept['snapshot'])
 
 
-def finish_interrupted():
-    """Whatever a killed command left, before anything new starts."""
+def finish_interrupted(boot=False):
+    """Whatever a killed command left, before anything new starts. The record goes last, so a
+    crash in here is met by the same steps. At boot nothing is stopped or started: see rollback."""
     if os.path.exists(JOURNAL):
         journal = read_json(JOURNAL)
         window = Window()
         if journal['phase'] == 'committed':
             log('finishing a committed upgrade')
-            window.finish()
-            shutil.rmtree(STAGE, ignore_errors=True)
-            shutil.rmtree(TXN_DIR, ignore_errors=True)
+            discard_transaction()
+            if boot and window.record is not None:
+                window.mark_restored()
+            else:
+                window.finish()
             return
-        log('undoing an interrupted upgrade')
-        complete = rollback(journal, window)
+        log('finishing the rollback of an upgrade' if journal.get('rolled_back')
+            else 'undoing an interrupted upgrade')
+        complete = rollback(journal, window, boot=boot)
         catch_signals()
         if not complete:
-            raise SystemExit(3)
+            raise RecoveryRequired('the rollback is incomplete: fix what it reported, '
+                                   'then run scripts/upgrade.sh --recover')
         return
-    if os.path.exists(TXN_DIR) or os.path.exists(STAGE):
-        # Stopped before its journal existed, so nothing had been replaced.
-        window = Window()
-        if window.record is not None:
-            log('restoring what was running before an interrupted upgrade')
-            window.enforce()
-            for error in window.close():
-                log(error)
-        shutil.rmtree(STAGE, ignore_errors=True)
-        shutil.rmtree(TXN_DIR, ignore_errors=True)
-        return
+    # Stopped before its journal existed, so nothing had been replaced.
+    interrupted_upgrade = os.path.exists(TXN_DIR) or os.path.exists(STAGE)
     window = Window()
-    if window.record is not None:
-        log('restoring what was running before an interrupted command')
+    if window.record is None:
+        if interrupted_upgrade:
+            discard_transaction()
+        return
+    log('restoring what was running before an interrupted %s'
+        % ('upgrade' if interrupted_upgrade else 'command'))
+    if boot:
+        window.require_down()
+        if interrupted_upgrade:
+            discard_transaction()
+        window.mark_restored()
+        return
+    if window.record.get('stage') != 'restored':
         window.enforce()
-        for error in window.close():
-            log(error)
+    if interrupted_upgrade:
+        discard_transaction()
+    close_window(window)
 
 
-def cmd_recover(_args):
+def activation_safe():
+    """Whether units may start with what this node holds: true of a transaction that committed
+    or was undone, and of a record with only starting units left."""
+    if os.path.exists(JOURNAL):
+        journal = read_json(JOURNAL)
+        if journal['phase'] != 'committed' and not journal.get('rolled_back'):
+            return False
+    record = read_json(WINDOW_RECORD) if os.path.exists(WINDOW_RECORD) else None
+    return record is None or record.get('stage') == 'restored'
+
+
+def cmd_recover(args):
+    """At boot it refuses a live command's lock as anything else does, which keeps units down."""
+    if args.boot and activation_safe():
+        return
+    lock = acquire_lock()
+    finish_interrupted(boot=args.boot)
+    log('the rest starts with the node' if args.boot and os.path.exists(WINDOW_RECORD)
+        else 'nothing is left to recover')
+    os.close(lock)
+
+
+def cmd_install_fence(args):
     lock = acquire_lock()
     finish_interrupted()
-    log('nothing is left to recover')
+    install_fence(args.deploy_dir)
     os.close(lock)
 
 
@@ -975,7 +1198,12 @@ def main():
     upgrade.add_argument('--deploy-dir', default=os.path.join(repo, 'deploy'))
     upgrade.add_argument('--enroll-default', action='store_true')
     upgrade.set_defaults(run=cmd_upgrade)
-    commands.add_parser('recover').set_defaults(run=cmd_recover)
+    recover = commands.add_parser('recover')
+    recover.add_argument('--boot', action='store_true')
+    recover.set_defaults(run=cmd_recover)
+    fence = commands.add_parser('install-fence')
+    fence.add_argument('--deploy-dir', default=os.path.join(repo, 'deploy'))
+    fence.set_defaults(run=cmd_install_fence)
     commands.add_parser('needs-transaction').set_defaults(
         run=lambda _: sys.exit(0 if needs_transaction() else 1))
     args = parser.parse_args()
@@ -987,9 +1215,15 @@ def main():
     except Refused as refusal:
         log('refused, nothing changed: %s' % refusal)
         sys.exit(2)
+    except RecoveryRequired as required:
+        log('recovery required: %s' % required)
+        sys.exit(RECOVERY_REQUIRED)
     except Interrupted as interruption:
         log('interrupted by %s' % interruption)
         sys.exit(1)
+    except ValueError as error:
+        log('recovery required: unreadable record: %s' % error)
+        sys.exit(RECOVERY_REQUIRED)
     except (OSError, RuntimeError) as error:
         log(str(error))
         sys.exit(1)

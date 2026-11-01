@@ -14,7 +14,8 @@ through its CLI. Read [README.md](README.md),
   `CARGO_TARGET_DIR=$HOME/.cache/kilnd-target` keeps Linux builds out of
   `target/`.
 - **Checks before every commit:** `cargo test --locked`,
-  `cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`.
+  `cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`,
+  `python3 -I scripts/kilnd-maintenance-tests.py`.
   CI runs them with Rust 1.88 (the MSRV).
 - **Privileged checks** for anything touching the runtime adapter, process
   handling, reconciliation, the socket or shutdown, in the VM after
@@ -23,7 +24,8 @@ through its CLI. Read [README.md](README.md),
   `scripts/state-path-regressions.sh`,
   `sudo python3 -I scripts/phase0-regressions.py` and `scripts/smoke.sh`. Changes to
   `install.sh`, `add-instance.sh`, `upgrade.sh`, `kilnd-maintenance.py` or the units also run
-  `sudo python3 -I scripts/deployment-regressions.py` between two builds.
+  `sudo python3 -I scripts/deployment-regressions.py` between two builds, and its
+  `--reboot-arm` and `--reboot-verify` around a real reboot of the VM.
   The integration script also runs the dedicated-child admission FD/RSS,
   slow-client, queue and concurrent-Health stress regression.
 - **kiln stays in its own repository** (`~/Projects/lambda-nine/kiln`). Never

@@ -66,7 +66,8 @@ scripts/install.sh
 
 `scripts/install.sh` builds and installs `kilnd`, `kilnd-helper` and
 `kilndctl`, creates the non-login `kilnd` account/group, and installs the
-hardened daemon/helper services plus the helper socket and tmpfiles config.
+hardened daemon/helper services, the helper socket and tmpfiles config, and the boot guard
+for interrupted maintenance.
 It stops the daemon before validating and transferring old root-owned state
 and API runtime-directory entries to the service account. Unsafe links,
 ownership, modes or unexpected entries abort the transfer; originals are
@@ -103,6 +104,8 @@ sudo python3 -I scripts/phase0-regressions.py # real peer UIDs, helper, privileg
 # install, add-instance and every way an upgrade can fail, between two builds, under a
 # hostile account's connections; see the script for what it needs
 sudo python3 -I scripts/deployment-regressions.py --bin-a DIR --bin-b DIR
+# recovery from a reboot at each step, or from a failed restore, with systemd faked; runs anywhere
+python3 -I scripts/kilnd-maintenance-tests.py
 scripts/smoke.sh                     # through the installed service
 ```
 
@@ -160,7 +163,29 @@ exactly what was running. This is brief, but it stops every instance on the node
 command is killed outright, activation stays unavailable until `scripts/upgrade.sh --recover`,
 or until the next maintenance command, either of which finishes the job. The masks live in
 `/run/systemd/system.control`, because `systemctl mask --runtime` has no effect on a unit
-installed in `/etc`, and a reboot clears them.
+installed in `/etc`.
+
+A reboot clears those masks, so they only hold within one boot. Across a reboot the fence is
+`kilnd-maintenance-guard.service`, which `scripts/install.sh`, or any maintenance command, puts
+in place first, and which the helper socket, the helper and every kilnd unit `Requires=` and
+are ordered after. Before anything changes, each maintenance command writes and fsyncs a marker,
+`/var/lib/kilnd-helper/maintenance.json`, which also records what was running. The marker goes
+last, after every restore and start, or after a commit, is durable.
+
+At boot, while the marker says work may be half done, the guard runs `upgrade.sh --recover --boot`
+from its own copy in `/usr/local/libexec/kilnd`, and everything behind it waits:
+
+- **It succeeds:** the images, unit files, enrollments and state are back, and boot starts what's
+  enabled. `kilnd-maintenance-finish.service` then starts anything else recorded as running, and
+  removes the marker. A reboot does not count as restored until that has happened.
+- **It fails:** the socket and every daemon stay down, and `systemctl start` on any of them fails,
+  for as long as it keeps failing. `journalctl -u kilnd-maintenance-guard` says why. Fix that and run
+  `scripts/upgrade.sh --recover`, which opens activation once it succeeds.
+
+Any maintenance command exits with status 3 when something could not be put back, including a
+unit that would not start again. It keeps its record, and an upgrade its journal and stage, and
+`scripts/upgrade.sh --recover` tries again without stopping what did come back. The next
+maintenance command does the same first, and refuses to go on until that succeeds.
 
 Enrollment refuses an account another instance holds, root, the helper's own account and
 anything in the policy's VM identity ranges, and the helper refuses a ledger that breaks
@@ -199,7 +224,9 @@ schema changed, since the old image couldn't open it; otherwise the one in place
 truth, and replacing it could forget a reservation. If a daemon may have served on a schema
 that goes back, what it held is kept under `/var/lib/kilnd-helper/failed-upgrades`, and the
 command says so. A kill leaves `/var/lib/kilnd-helper/upgrade` for `--recover` or the next
-maintenance command to undo, including after a reboot.
+maintenance command to undo. A reboot leaves it for the boot guard, which undoes the upgrade
+before anything can start, or keeps it all down if it can't. Once the upgrade has committed, a
+reboot keeps the new images, and only the cleanup remains.
 
 A hostile instance can make its own state unusable and so make the upgrade refuse. The message
 names that instance. Stop it (`systemctl disable --now kilnd@<name>`) and upgrade the rest: its

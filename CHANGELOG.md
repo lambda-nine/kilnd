@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B3 deployment: interrupted maintenance is fenced across a reboot and retried after a
+  failed restore. Each command now writes `/var/lib/kilnd-helper/maintenance.json`, fsynced,
+  before anything changes, and removes it last. `kilnd-maintenance-guard.service` runs
+  `upgrade.sh --recover --boot` before the helper socket and every kilnd unit, which `Requires=`
+  it, so a node comes back whole or stays down, and `kilnd-maintenance-finish.service` finishes
+  the starts. Any error restoring a unit keeps the record, and an upgrade's journal and stage, and
+  exits 3 until `--recover` succeeds. New: `scripts/kilnd-maintenance-tests.py`, also in CI, and
+  reboot and failed-restore regressions in `scripts/deployment-regressions.py`.
 - Phase 1b B3 deployment: `kilnd init-state` creates an instance's private state as its own
   account and prints its durable ID, which `scripts/add-instance.sh <name>` and the default
   instance's install then enroll before the unit starts; add-instance no longer takes an ID.

@@ -93,6 +93,8 @@ sudo install -m 644 deploy/kilnd-helper.socket /etc/systemd/system/kilnd-helper.
 sudo install -m 644 deploy/kilnd-helper.service /etc/systemd/system/kilnd-helper.service
 sudo install -m 644 deploy/kilnd.service /etc/systemd/system/kilnd.service
 sudo install -m 644 deploy/kilnd@.service /etc/systemd/system/kilnd@.service
+# Every unit above requires the boot guard.
+sudo python3 -I scripts/kilnd-maintenance.py install-fence
 sudo systemctl daemon-reload
 sudo systemctl enable --now kilnd-helper.socket
 sudo systemctl enable --now kilnd-helper.service

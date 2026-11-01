@@ -1,8 +1,8 @@
 [Unit]
 Description=Unprivileged kilnd sandbox control daemon
 Documentation=https://github.com/lambda-nine/kilnd
-Requires=kilnd-helper.socket
-After=kilnd-helper.socket kilnd-helper.service
+Requires=kilnd-helper.socket kilnd-maintenance-guard.service
+After=kilnd-helper.socket kilnd-helper.service kilnd-maintenance-guard.service
 Wants=kilnd-helper.service
 
 [Service]
