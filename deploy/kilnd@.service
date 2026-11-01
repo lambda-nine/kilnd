@@ -1,5 +1,6 @@
 # One further kilnd instance, under its own Unix account: scripts/add-instance.sh makes
-# the account kilnd-<name> and enrolls it. kilnd.service stays the single-instance default.
+# the account kilnd-<name>, its state and its enrollment, in that order, and then starts this
+# unit. kilnd.service stays the single-instance default.
 # Must not set Delegate=: the unit's cgroup stays root-writable only, which attachment
 # relies on. The kiln backend is kilnd.service's alone: the helper refuses an enrolled
 # account's kiln requests, so until B7 can select Firecracker this daemon stops at its

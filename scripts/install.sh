@@ -82,6 +82,9 @@ sudo install -m 644 deploy/kilnd@.service /etc/systemd/system/kilnd@.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now kilnd-helper.socket
 sudo systemctl enable --now kilnd-helper.service
+# The same first step every instance takes: its private state and its durable ID exist
+# before its unit starts. Nothing is enrolled here until a node policy is installed.
+echo "default instance: $(sudo kilnd init-state --state-dir /var/lib/kilnd --account kilnd)"
 sudo systemctl enable kilnd
 sudo systemctl restart kilnd
 systemctl --no-pager --lines=5 status kilnd
