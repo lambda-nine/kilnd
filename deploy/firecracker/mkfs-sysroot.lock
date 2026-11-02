@@ -1,0 +1,10 @@
+# The private mkfs.xfs build sysroot: exact Ubuntu noble arm64 debs, each SHA-256 pinned.
+# scripts/build-phase1b-tools.sh fetches these by file name from Launchpad's primary-archive
+# file store (https://launchpad.net/ubuntu/+archive/primary/+files/<file>), which keeps every
+# published version, and refuses any file whose digest differs. Format: <sha256>  <file>.
+ec784dd46511ee35dbeded42158453325a076ab0934f80c140b5b2af17e23bb3  uuid-dev_2.39.3-9ubuntu6.6_arm64.deb
+6eb614e62d79b11c294f1c971e3e116345075eff6b76b14e7224c81f89169877  libblkid-dev_2.39.3-9ubuntu6.6_arm64.deb
+5d607d80816888faff84fa7da094c39e0189f5b42b7a4c13e78d7e778f31288b  liburcu-dev_0.14.0-3.1build1_arm64.deb
+ca28cd762e337576c933a4267a211971c71c69d9f2efc34c1bd5671bffc92331  liburcu8t64_0.14.0-3.1build1_arm64.deb
+95ded11d1e752fd75e7f7c1e0c6d683524b4fe110f4d036e150e34a93b44e244  libinih-dev_55-1ubuntu2_arm64.deb
+23d18c07781216e17ba29cb894f1c1e5671d1718fb1ca7bc238e2b2be25a56ee  libinih1_55-1ubuntu2_arm64.deb

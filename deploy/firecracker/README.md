@@ -70,19 +70,29 @@ scripts/build-phase1b-tools.sh --out "$HOME/b4-build/out"
 
 The script does the following:
 
-- Verifies the source tarball and applies this patch.
+- Verifies the source tarball and, before applying it, that the patch is the approved one
+  (`PATCH_SHA256`). `--patch` can only name another copy of the same bytes; any other patch
+  fails the build.
 - Builds `cargo build --locked --release -p jailer --target aarch64-unknown-linux-musl` with
   toolchain 1.97.0, using fixed paths and `--remap-path-prefix`, so the digest doesn't depend
   on OUT or `$HOME`.
-- Builds a static, stripped `mkfs.xfs` 6.6.0 against a private sysroot unpacked from
-  `apt-get download` debs.
-- Checks that both outputs are static (no `PT_INTERP`, no `DT_NEEDED`) and prints their
-  SHA-256 digests.
+- Builds a static, stripped `mkfs.xfs` 6.6.0 against a private sysroot unpacked from the six
+  exact debs in [`mkfs-sysroot.lock`](mkfs-sysroot.lock). Each is fetched by its pool file
+  name from Launchpad's primary-archive file store
+  (`https://launchpad.net/ubuntu/+archive/primary/+files/<file>`), which keeps every
+  published version, and must match its SHA-256. Nothing comes from `apt-get` or the host's
+  package indexes. (snapshot.ubuntu.com answers 401 for `ubuntu-ports`, so it can't serve
+  arm64.)
+- Checks that both outputs are static (no `PT_INTERP`, no `DT_NEEDED`) and that each equals
+  its approved digest (`JAILER_SHA256`, `MKFS_SHA256`) before moving it into OUT. A
+  mismatch fails the build and leaves no output under the final name.
 
-The script never uses sudo.
+The script never uses sudo. Changing any approved digest is a reviewed edit of the script
+and this table.
 
-Digests from 2026-11-02, built twice from different `--out` directories with identical
-results:
+Approved digests, first from 2026-11-02 (built twice from different `--out` directories
+with identical results) and reproduced on 2026-11-02 from the pinned sysroot, so pinning
+did not change them:
 
 | Artifact | SHA-256 |
 |----------|---------|
@@ -92,9 +102,11 @@ results:
 | source `xfsprogs-6.6.0.tar.xz` | `50ca2f4676df8fab4cb4c3ef3dd512d5551e6844d40a65a31d5b8e03593d22df` |
 | `mkfs.xfs` | `9571cecc3e015742c19d1e762fb4389b15f7ff0746f52af55fd2879c96e160ab` |
 
-The `mkfs.xfs` digest also depends on the Ubuntu noble gcc and on the deb versions that
-`apt-get download` fetched: util-linux 2.39.3-9ubuntu6.6, liburcu 0.14.0-3.1build1 and
-libinih 55-1ubuntu2.
+The sysroot is util-linux 2.39.3-9ubuntu6.6 (`uuid-dev`, `libblkid-dev`), liburcu
+0.14.0-3.1build1 (`liburcu-dev`, `liburcu8t64`) and libinih 55-1ubuntu2 (`libinih-dev`,
+`libinih1`), each hashed in the lock. The compilers stay the host's: Rust 1.97.0 from the
+tree's `rust-toolchain.toml` and the Ubuntu noble gcc. A different gcc that changes the
+output is caught by the `mkfs.xfs` digest check rather than producing another binary.
 
 `mkfs.xfs` is built with `--disable-blkid`, which has two consequences:
 
