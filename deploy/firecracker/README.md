@@ -83,9 +83,19 @@ The script does the following:
   published version, and must match its SHA-256. Nothing comes from `apt-get` or the host's
   package indexes. (snapshot.ubuntu.com answers 401 for `ubuntu-ports`, so it can't serve
   arm64.)
-- Checks that both outputs are static (no `PT_INTERP`, no `DT_NEEDED`) and that each equals
-  its approved digest (`JAILER_SHA256`, `MKFS_SHA256`) before moving it into OUT. A
-  mismatch fails the build and leaves no output under the final name.
+- Downloads, verifies, builds and stages everything in a private `mktemp -d` directory, mode
+  0700, removed on exit. Nothing but the two outputs is written under OUT.
+- Checks that both outputs are static (no `PT_INTERP`, no `DT_NEEDED`) and that each staged
+  copy equals its approved digest (`JAILER_SHA256`, `MKFS_SHA256`). It then publishes each
+  with a rename inside OUT and hashes the *published* name: that comparison, after
+  publishing, is the gate. A mismatch removes the published output and exits non-zero, and a
+  final comparison of both published names must pass before the build reports success.
+- Trusts the build UID and every process running as it (shell, cargo, rustup, compilers,
+  PATH): mode 0700 keeps other users out of the private directory, not that UID. An output
+  replaced before its post-publish comparison fails the build; one replaced in OUT after the
+  script exits is outside its promise, so installers compare digests again.
+  `scripts/build-phase1b-tools-swap-check.sh` replaces the staged jailer after its first hash
+  and passes only if the build fails at the post-publish gate and no jailer is left in OUT.
 
 The script never uses sudo. Changing any approved digest is a reviewed edit of the script
 and this table.

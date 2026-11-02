@@ -6,9 +6,20 @@
 #   OUT/mkfs.xfs  xfsprogs 6.6.0 mkfs.xfs, static glibc ELF, stripped
 # Every input is SHA-256 pinned: both source archives, the jailer patch (also when --patch
 # names another copy of it) and every deb of the mkfs sysroot (deploy/firecracker/
-# mkfs-sysroot.lock). Both outputs must equal their approved digests below or the build
-# fails. Builds happen only under OUT (default $HOME/b4-build/out); cargo's crate cache stays
-# in CARGO_HOME. See deploy/firecracker/README.md.
+# mkfs-sysroot.lock). Everything is downloaded, verified, built and staged in a private
+# mktemp directory (mode 0700) that is removed on exit. Each output is published into OUT
+# (default $HOME/b4-build/out) with a rename inside OUT, and then the published name is
+# hashed and compared with its approved digest below: that comparison, after publishing,
+# is the gate. A mismatch removes the published output and fails the build, and a final
+# comparison of both published names must pass before the build succeeds. cargo's crate
+# cache stays in CARGO_HOME. See deploy/firecracker/README.md.
+#
+# Trust: the build UID and every process running as it (its shell, cargo, rustup, the
+# compilers, PATH) are trusted; mode 0700 keeps other non-root users out of the private
+# directory, not that UID. The gate catches an output replaced at any point before its
+# post-publish comparison; one replaced in OUT after the build has exited is outside what
+# this script can promise, so installers compare the digest again (scripts/b4-vm-tests.sh
+# and the production catalog both do).
 #
 # Usage: scripts/build-phase1b-tools.sh [--out DIR] [--patch FILE]
 set -eu
@@ -65,6 +76,16 @@ mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 PATCH=$(cd "$(dirname "$PATCH")" && pwd)/$(basename "$PATCH")
 
+# The private build directory: mode 0700, owned by this user, removed on any exit.
+work=$(mktemp -d "${TMPDIR:-/tmp}/b4-tools.XXXXXX")
+cleanup() {
+    rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
+chmod 0700 "$work"
+[ "$(stat -c '%u %a' "$work")" = "$(id -u) 700" ] || die "private build directory is not 0700 and ours"
+
 # fetch URL FILE SHA256: download once, always verify.
 fetch() {
     if [ ! -f "$2" ]; then
@@ -80,6 +101,23 @@ require_sha() {
     [ "$actual" = "$2" ] || die "$3 SHA-256 is $actual, not the approved $2"
 }
 
+# publish STAGED NAME SHA256: checks the private staged file, renames a copy into OUT
+# under its final name, then hashes the published name. A mismatch there removes it and
+# fails the build: the post-publish comparison is the gate.
+publish() {
+    require_sha "$1" "$3" "staged $2"
+    rm -f "$OUT/$2"
+    incoming=$(mktemp "$OUT/.$2.XXXXXX")
+    cp "$1" "$incoming"
+    chmod 0755 "$incoming"
+    mv -f "$incoming" "$OUT/$2"
+    published=$(sha256sum "$OUT/$2" | cut -d' ' -f1)
+    if [ "$published" != "$3" ]; then
+        rm -f "$OUT/$2"
+        die "published $2 SHA-256 is $published, not the approved $3; removed it"
+    fi
+}
+
 # require_static FILE: an ELF with no program interpreter and no dynamic section.
 require_static() {
     file -b "$1" | grep -q 'statically linked' || die "$1 is not statically linked: $(file -b "$1")"
@@ -91,18 +129,17 @@ require_static() {
     fi
 }
 
-downloads="$OUT/downloads"
-mkdir -p "$downloads"
+downloads="$work/downloads"
+mkdir -p "$downloads" "$work/stage"
 
 # --- jailer ------------------------------------------------------------------------------
 echo "==> jailer v${FC_VERSION} + kilnd-handoff1"
 fetch "$FC_URL" "$downloads/firecracker-v${FC_VERSION}.tar.gz" "$FC_SHA256"
 
-# Fixed paths, remapped below, so the binary's digest does not depend on OUT or $HOME.
-fc_src="$OUT/src/firecracker-${FC_VERSION}"
-rm -rf "$OUT/src"
-mkdir -p "$OUT/src"
-tar -xzf "$downloads/firecracker-v${FC_VERSION}.tar.gz" -C "$OUT/src"
+# Paths remapped below, so the binary's digest does not depend on where it was built.
+fc_src="$work/src/firecracker-${FC_VERSION}"
+mkdir -p "$work/src"
+tar -xzf "$downloads/firecracker-v${FC_VERSION}.tar.gz" -C "$work/src"
 [ -d "$fc_src" ] || die "unexpected tarball layout"
 # The approved patch only, whichever path names it.
 require_sha "$PATCH" "$PATCH_SHA256" "patch $PATCH"
@@ -114,25 +151,22 @@ cargo_home=${CARGO_HOME:-$HOME/.cargo}
 # RUSTFLAGS replaces the tree's build.rustflags, so repeat its -Ccodegen-units=1.
 (
     cd "$fc_src"
-    CARGO_TARGET_DIR="$OUT/cargo-target" \
+    CARGO_TARGET_DIR="$work/cargo-target" \
     RUSTFLAGS="-Ccodegen-units=1 --remap-path-prefix=$fc_src=/firecracker --remap-path-prefix=$cargo_home=/cargo" \
         cargo build --locked --release -p jailer --target "$FC_TARGET"
 )
-jailer_bin="$OUT/cargo-target/$FC_TARGET/release/jailer"
+jailer_bin="$work/cargo-target/$FC_TARGET/release/jailer"
 require_static "$jailer_bin"
 [ "$("$jailer_bin" --version | head -n 1)" = "$JAILER_VERSION_LINE" ] \
     || die "jailer --version is not '$JAILER_VERSION_LINE'"
-rm -f "$OUT/jailer"
-cp "$jailer_bin" "$OUT/jailer.tmp"
-require_sha "$OUT/jailer.tmp" "$JAILER_SHA256" "jailer"
-mv "$OUT/jailer.tmp" "$OUT/jailer"
+cp "$jailer_bin" "$work/stage/jailer"
+publish "$work/stage/jailer" jailer "$JAILER_SHA256"
 
 # --- mkfs.xfs ----------------------------------------------------------------------------
 echo "==> mkfs.xfs ${XFS_VERSION} (static)"
 fetch "$XFS_URL" "$downloads/xfsprogs-${XFS_VERSION}.tar.xz" "$XFS_SHA256"
 
-xfs_dir="$OUT/xfs"
-rm -rf "$xfs_dir"
+xfs_dir="$work/xfs"
 mkdir -p "$xfs_dir/sysroot"
 # Headers and static libraries come from the exact distribution debs in the lock, each
 # verified, unpacked into a private sysroot; nothing is installed on the host.
@@ -160,17 +194,29 @@ tar -xJf "$downloads/xfsprogs-${XFS_VERSION}.tar.xz" -C "$xfs_dir"
     CPPFLAGS="$inc" CFLAGS="-O2 -ffile-prefix-map=$xfs_dir=/xfs $inc" LDFLAGS="-L$sysroot/usr/lib/aarch64-linux-gnu" \
         ./configure --enable-static=yes --enable-shared=no --disable-gettext --disable-blkid \
         --disable-editline --disable-libicu --disable-scrub --disable-lto >"$xfs_dir/configure.log" 2>&1 \
-        || die "configure failed; see $xfs_dir/configure.log"
-    make -j4 LLDFLAGS=-all-static >"$xfs_dir/make.log" 2>&1 || die "make failed; see $xfs_dir/make.log"
+        || { tail -n 40 "$xfs_dir/configure.log" >&2; die "configure failed"; }
+    make -j4 LLDFLAGS=-all-static >"$xfs_dir/make.log" 2>&1 \
+        || { tail -n 40 "$xfs_dir/make.log" >&2; die "make failed"; }
 )
 mkfs_bin="$xfs_dir/xfsprogs-${XFS_VERSION}/mkfs/mkfs.xfs"
 strip "$mkfs_bin"
 require_static "$mkfs_bin"
 "$mkfs_bin" -V | grep -qx "mkfs.xfs version ${XFS_VERSION}" || die "mkfs.xfs -V is not ${XFS_VERSION}"
-rm -f "$OUT/mkfs.xfs"
-cp "$mkfs_bin" "$OUT/mkfs.xfs.tmp"
-require_sha "$OUT/mkfs.xfs.tmp" "$MKFS_SHA256" "mkfs.xfs"
-mv "$OUT/mkfs.xfs.tmp" "$OUT/mkfs.xfs"
+cp "$mkfs_bin" "$work/stage/mkfs.xfs"
+publish "$work/stage/mkfs.xfs" mkfs.xfs "$MKFS_SHA256"
 
-echo "==> done: both outputs equal their approved digests"
-(cd "$OUT" && sha256sum jailer mkfs.xfs)
+# The final gate: both published names, again, compared rather than printed.
+status=0
+for pair in "jailer $JAILER_SHA256" "mkfs.xfs $MKFS_SHA256"; do
+    set -- $pair
+    actual=$(sha256sum "$OUT/$1" | cut -d' ' -f1)
+    if [ "$actual" != "$2" ]; then
+        rm -f "$OUT/$1"
+        echo "build-phase1b-tools: published $1 SHA-256 is $actual, not the approved $2; removed it" >&2
+        status=1
+    fi
+done
+[ "$status" -eq 0 ] || exit 1
+echo "==> done: both published outputs equal their approved digests"
+echo "$JAILER_SHA256  jailer"
+echo "$MKFS_SHA256  mkfs.xfs"
