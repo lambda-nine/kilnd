@@ -974,6 +974,12 @@ pub enum LedgerRequest {
         allocation: Id128,
         actual: ExecutableIdentity,
     },
+    /// A retained descriptor's tuple, inferred from its confirmed exec, never observed.
+    RecordInferred {
+        instance: Id128,
+        allocation: Id128,
+        inferred: ExecutableIdentity,
+    },
     RecordResource {
         instance: Id128,
         allocation: Id128,
@@ -1210,6 +1216,14 @@ fn handle_ledger(
             actual,
         } => {
             ledger.record_observed_executable(instance, allocation, &actual)?;
+            LedgerReply::Done
+        }
+        LedgerRequest::RecordInferred {
+            instance,
+            allocation,
+            inferred,
+        } => {
+            ledger.record_inferred_executable(instance, allocation, &inferred)?;
             LedgerReply::Done
         }
         LedgerRequest::RecordResource {

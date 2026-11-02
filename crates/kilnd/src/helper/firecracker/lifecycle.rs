@@ -64,7 +64,9 @@ impl Node {
         // but they never authorize a further effect.
         let evidence_only = matches!(
             record,
-            SupervisorRecord::Observed(_) | SupervisorRecord::Child { .. }
+            SupervisorRecord::Observed(_)
+                | SupervisorRecord::InferredFromRetainedFd(_)
+                | SupervisorRecord::Child { .. }
         );
         let lane = Lane::Normal;
         let ok = match record {
@@ -170,6 +172,19 @@ impl Node {
                         instance: key.instance,
                         allocation: key.allocation,
                         actual,
+                    },
+                    u64::MAX,
+                )
+                .await,
+                Ok(LedgerReply::Done)
+            ),
+            SupervisorRecord::InferredFromRetainedFd(inferred) => matches!(
+                self.ledger_call(
+                    lane,
+                    &LedgerRequest::RecordInferred {
+                        instance: key.instance,
+                        allocation: key.allocation,
+                        inferred,
                     },
                     u64::MAX,
                 )

@@ -256,6 +256,17 @@ impl Real {
         })
     }
 
+    /// How the lease's observed tuple is known: `proc_exe` or `retained_fd`.
+    fn evidence(&self, allocation: Id128, role: Role) -> Option<String> {
+        self.fixture.read(|view| {
+            view.query_row(
+                "SELECT observation FROM executable_leases WHERE allocation_id = ?1 AND role = ?2",
+                params![allocation.to_string(), role.as_str()],
+                |r| r.get(0),
+            )
+        })
+    }
+
     async fn wait_phase(&self, allocation: Id128, phase: &str) {
         let end = std::time::Instant::now() + Duration::from_secs(60);
         loop {
@@ -394,6 +405,21 @@ async fn b4_linux_root_create_boots_and_remove_leaves_nothing() {
         for role in [Role::Jailer, Role::Firecracker, Role::MkfsXfs] {
             let (expected, observed) = real.lease(context.allocation_id, role);
             assert_eq!(expected, observed, "{} actual identity", role.as_str());
+        }
+        // J and V were read from their running images; the short-lived formatter's
+        // tuple is the retained descriptor's, recorded as inferred from its confirmed
+        // exec, never as observed (B4 break-it finding 5).
+        for (role, kind) in [
+            (Role::Jailer, "proc_exe"),
+            (Role::Firecracker, "proc_exe"),
+            (Role::MkfsXfs, "retained_fd"),
+        ] {
+            assert_eq!(
+                real.evidence(context.allocation_id, role).as_deref(),
+                Some(kind),
+                "{} evidence",
+                role.as_str()
+            );
         }
         let actual = vmm_image(&real, context.allocation_id, vmm.pid);
         let (expected, _) = real.lease(context.allocation_id, Role::Firecracker);
@@ -1828,6 +1854,13 @@ async fn b4_linux_root_kr05_replacement_races_run_only_the_retained_inodes() {
     for role in [Role::Jailer, Role::Firecracker, Role::MkfsXfs] {
         let (expected, observed) = real.lease(context.allocation_id, role);
         assert_eq!(expected, observed, "{}", role.as_str());
+        // Under the test exec stop even the formatter's image is read from /proc.
+        assert_eq!(
+            real.evidence(context.allocation_id, role).as_deref(),
+            Some("proc_exe"),
+            "{}",
+            role.as_str()
+        );
     }
     remove_to_absent(&real, &runtime, &context, "unprivileged race").await;
 

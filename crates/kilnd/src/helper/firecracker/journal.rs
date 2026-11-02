@@ -130,7 +130,12 @@ CREATE TABLE executable_leases (
     observed_st_ino INTEGER,
     observed_bytes INTEGER,
     observed_sha256 TEXT,
+    -- How the observed tuple is known: 'proc_exe' was read from the running process's
+    -- image; 'retained_fd' is the verified retained descriptor's tuple, inferred from a
+    -- confirmed execveat of it (a short-lived formatter has no stable image to read).
+    observation TEXT CHECK (observation IS NULL OR observation IN ('proc_exe','retained_fd')),
     released_generation INTEGER,
+    CHECK ((observation IS NULL) = (observed_st_dev IS NULL)),
     PRIMARY KEY (instance_id, allocation_id, role),
     FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
 ) STRICT;
@@ -317,6 +322,7 @@ WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
     OR NEW.sha256 IS NOT OLD.sha256
     OR NEW.installation_generation IS NOT OLD.installation_generation
     OR (OLD.observed_st_dev IS NOT NULL AND NEW.observed_st_dev IS NOT OLD.observed_st_dev)
+    OR (OLD.observation IS NOT NULL AND NEW.observation IS NOT OLD.observation)
     OR OLD.released_generation IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'an executable lease is immutable'); END;
 CREATE TRIGGER executable_leases_no_delete BEFORE DELETE ON executable_leases
@@ -2206,13 +2212,35 @@ impl Ledger {
         Ok(generation)
     }
 
-    /// The tuple that actually ran, attached to its lease. A mismatch is refused here
-    /// as well as at the dispatch point; nothing may launder a different identity.
+    /// The tuple that actually ran, read from the running process's image, attached to
+    /// its lease. A mismatch is refused here as well as at the dispatch point; nothing
+    /// may launder a different identity.
     pub fn record_observed_executable(
         &mut self,
         instance: Id128,
         allocation: Id128,
         actual: &ExecutableIdentity,
+    ) -> Result<(), LedgerError> {
+        self.record_executable_evidence(instance, allocation, actual, "proc_exe")
+    }
+
+    /// The retained descriptor's verified tuple, inferred as what ran from a confirmed
+    /// `execveat` of exactly that descriptor, and recorded as such: never as observed.
+    pub fn record_inferred_executable(
+        &mut self,
+        instance: Id128,
+        allocation: Id128,
+        inferred: &ExecutableIdentity,
+    ) -> Result<(), LedgerError> {
+        self.record_executable_evidence(instance, allocation, inferred, "retained_fd")
+    }
+
+    fn record_executable_evidence(
+        &mut self,
+        instance: Id128,
+        allocation: Id128,
+        actual: &ExecutableIdentity,
+        observation: &str,
     ) -> Result<(), LedgerError> {
         let tx = self
             .conn
@@ -2220,7 +2248,8 @@ impl Ledger {
         let changed = tx
             .prepare_cached(
                 "UPDATE executable_leases
-                 SET observed_st_dev = ?4, observed_st_ino = ?5, observed_bytes = ?6, observed_sha256 = ?7
+                 SET observed_st_dev = ?4, observed_st_ino = ?5, observed_bytes = ?6,
+                     observed_sha256 = ?7, observation = ?9
                  WHERE instance_id = ?1 AND allocation_id = ?2 AND role = ?3 AND st_dev = ?4
                    AND st_ino = ?5 AND bytes = ?6 AND sha256 = ?7 AND installation_generation = ?8",
             )?
@@ -2233,6 +2262,7 @@ impl Ledger {
                 signed(actual.bytes, "size")?,
                 actual.sha256.to_string(),
                 signed(actual.installation_generation, "installation generation")?,
+                observation,
             ])?;
         if changed != 1 {
             return Err(LedgerError::Corrupt(

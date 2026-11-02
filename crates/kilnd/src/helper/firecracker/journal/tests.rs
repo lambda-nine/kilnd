@@ -1302,9 +1302,60 @@ fn exit5_generation_leases_hold_until_the_absence_commit_and_observed_tuples_mus
                 .is_err()
         );
     }
+    // A recorded observation's kind is permanent: no later inference relabels it.
+    assert!(
+        ledger
+            .record_inferred_executable(instance(), allocation, &identity)
+            .is_err()
+    );
     ledger.settle_unstarted(instance(), allocation).unwrap();
     absent(ledger.commit_fence(&fence_request(1)).unwrap());
     assert!(!ledger.executable_leased(&identity).unwrap());
+}
+
+/// B4 break-it finding 5: a retained descriptor's tuple inferred from a confirmed exec
+/// is recorded as `retained_fd`, distinct from a `proc_exe` observation, under the
+/// same exact-match rule, and it cannot be relabelled afterwards.
+#[test]
+fn inferred_executables_are_recorded_as_retained_fd_not_observed() {
+    let fixture = temp_ledger(NodeCeilings::default());
+    let mut ledger = attached(&fixture.config);
+    accepted(ledger.admit_intent(&request(1)).unwrap());
+    let allocation = request(1).allocation_id;
+    let vector = sample_vector();
+    let mut other = vector[1];
+    other.st_ino += 1;
+    assert!(
+        ledger
+            .record_inferred_executable(instance(), allocation, &other)
+            .is_err(),
+        "an inference must still match the lease exactly"
+    );
+    ledger
+        .record_inferred_executable(instance(), allocation, &vector[1])
+        .unwrap();
+    ledger
+        .record_observed_executable(instance(), allocation, &vector[0])
+        .unwrap();
+    let kinds: Vec<(String, Option<String>)> = {
+        let conn = Connection::open(fixture.config.directory.join(LEDGER_DB)).unwrap();
+        let mut statement = conn
+            .prepare("SELECT role, observation FROM executable_leases ORDER BY role")
+            .unwrap();
+        statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert!(kinds.contains(&(vector[1].role.as_str().to_string(), Some("retained_fd".into()))));
+    assert!(kinds.contains(&(vector[0].role.as_str().to_string(), Some("proc_exe".into()))));
+    assert!(
+        ledger
+            .record_observed_executable(instance(), allocation, &vector[1])
+            .is_err(),
+        "an inference is never relabelled as observed"
+    );
 }
 
 /// A connection with every optional defense off that plain SQL can set, as the

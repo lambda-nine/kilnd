@@ -37,8 +37,13 @@ pub enum SupervisorRecord {
     Phase { from: Vec<String>, to: String },
     /// A gated child's identity (J or V), recorded before it is released or adopted.
     Child { role: ChildRole, process: ProcessId },
-    /// The tuple that actually ran, compared with the journal by L as well.
+    /// The tuple that actually ran, read from the running process's image and compared
+    /// with the journal by L as well.
     Observed(ExecutableIdentity),
+    /// The retained descriptor's verified tuple, after its `execveat` is confirmed to
+    /// have succeeded. Evidence of what was executed by descriptor, not an observation
+    /// of the process image; L records it as `retained_fd`.
+    InferredFromRetainedFd(ExecutableIdentity),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -695,6 +700,19 @@ mod linux {
             ));
         }
         let observe = super::super::workers::fault_enabled("S.exec_stop");
+        // The exec report: close-on-exec, so a successful execveat closes it unwritten
+        // and a failed one writes its errno first. Only a confirmed exec of the retained
+        // descriptor lets S record that descriptor's tuple, and then as an inference.
+        let mut report = [0 as RawFd; 2];
+        cvt(unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) })?;
+        // SAFETY: new owned descriptors.
+        let (report_read, report_write) = unsafe {
+            (
+                OwnedFd::from_raw_fd(report[0]),
+                OwnedFd::from_raw_fd(report[1]),
+            )
+        };
+        let report_raw = report_write.as_raw_fd();
         // SAFETY: S is single-threaded; the child only arranges descriptors and execs.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -713,12 +731,14 @@ mod linux {
                     libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
                 }
                 let keep = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
-                executable::close_all_except(&[keep]);
+                executable::close_all_except(&[keep, report_raw]);
                 let error = executable::exec_retained(keep, &argv, &[]);
-                let _ = error;
+                let errno = error.raw_os_error().unwrap_or(libc::EIO).to_be_bytes();
+                libc::write(report_raw, errno.as_ptr().cast(), errno.len());
                 libc::_exit(127);
             }
         }
+        drop(report_write);
         if observe {
             // The first stop is the exec trap.
             let mut status = 0;
@@ -735,8 +755,44 @@ mod linux {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
                 return Err(Abort::Refused("formatter actual image differs".into()));
             }
-        } else {
-            link.record(SupervisorRecord::Observed(mkfs))?;
+        }
+        // Production (and, after the trap, the test path): the report closes unwritten
+        // only if execveat of the retained descriptor succeeded.
+        let mut failed = Vec::new();
+        let read_fd = report_read.as_raw_fd();
+        let exec = link.wait_for(Duration::from_secs(10), || {
+            let mut entry = libc::pollfd {
+                fd: read_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live entry; zero timeout.
+            if unsafe { libc::poll(&mut entry, 1, 0) } <= 0 {
+                return Ok(None);
+            }
+            let mut chunk = [0u8; 4];
+            // SAFETY: chunk is writable; poll reported data or end of file.
+            let n = unsafe { libc::read(read_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            failed.extend_from_slice(&chunk[..n as usize]);
+            Ok(Some(()))
+        });
+        drop(report_read);
+        if let Err(abort) = exec {
+            // SAFETY: our own child.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            return Err(abort);
+        }
+        if !failed.is_empty() {
+            return Err(Abort::Refused(format!(
+                "the formatter's execveat failed ({} report bytes); nothing ran",
+                failed.len()
+            )));
+        }
+        if !observe {
+            link.record(SupervisorRecord::InferredFromRetainedFd(mkfs))?;
         }
         let status = link.wait_for(Duration::from_secs(60), || waitpid_nohang(pid))?;
         if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
