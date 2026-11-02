@@ -127,8 +127,10 @@ try:
     assert int(helper_status['Seccomp'])==2, helper_status['Seccomp']
     families=run(['systemctl','show','-p','RestrictAddressFamilies','--value','kilnd-helper']).stdout.split()
     assert set(families)=={'AF_UNIX','AF_NETLINK','AF_INET'}, families
+    # Phase 0's set plus B4's CAP_SETPCAP (8), CAP_SYS_CHROOT (18) and CAP_MKNOD (27) for the
+    # Firecracker jailer. Only S keeps those three: kiln children and L/P/M/K drop them.
     for field in ('CapEff','CapPrm','CapBnd'):
-        assert int(helper_status[field].strip(),16)==0x2010eb, (field,helper_status[field])
+        assert int(helper_status[field].strip(),16)==0x2010eb|1<<8|1<<18|1<<27, (field,helper_status[field])
     assert int(helper_status['CapAmb'].strip(),16)==0x80, helper_status['CapAmb']
     before=len(os.listdir(f'/proc/{helper_pid}/fd'))
     valid={'version':3,'timeout_ms':1000,'deadline_ns':time.monotonic_ns()+1_000_000_000,'operation':{'kiln':'ls'}}
