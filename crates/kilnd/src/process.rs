@@ -36,6 +36,10 @@ pub(crate) const FIRECRACKER_LAUNCH_CAPABILITIES: [u32; 3] = [27, 18, 8]; // MKN
 /// `PR_SET_NO_NEW_PRIVS`, verified, so no later exec can raise one from the bounding set.
 /// The helper is root with `CAP_SETPCAP`, so it always takes the strict path.
 ///
+/// Capability sets belong to the calling thread. Every caller is a single-threaded child
+/// right after fork (a worker before its loop, a backend child before exec), so that thread
+/// is the whole process.
+///
 /// Allocation-free and async-signal-safe: it runs between fork and exec.
 #[cfg(target_os = "linux")]
 pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
@@ -544,7 +548,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn capability_masks() -> [(String, u64); 5] {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        // Capability sets are per thread, and libtest runs this on a worker thread.
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
         ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"].map(|name| {
             let value = status
                 .lines()

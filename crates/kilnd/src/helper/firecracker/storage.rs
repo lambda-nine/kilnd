@@ -1030,7 +1030,8 @@ mod linux {
             JAIL_MARKER,
             libc::O_RDONLY | libc::O_NOFOLLOW,
             0,
-        )?;
+        )
+        .map_err(|e| io::Error::new(e.kind(), format!("jail marker is not ours: {e}")))?;
         let stat = fstat(&marker)?;
         let expected = identity.marker();
         #[allow(clippy::unnecessary_cast)]
