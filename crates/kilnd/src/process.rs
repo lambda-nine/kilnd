@@ -28,13 +28,16 @@ pub(crate) const FIRECRACKER_LAUNCH_CAPABILITIES: [u32; 3] = [27, 18, 8]; // MKN
 
 /// Drops the launch-only capabilities from every set and proves it, failing closed.
 ///
-/// Every `prctl`, `capget` and `capset` result is checked. On success none of the three
-/// capabilities is in the effective, permitted, inheritable, ambient or bounding set.
-/// One case cannot drop a bounding bit: a process without `CAP_SETPCAP` in its permitted
-/// set (an unprivileged test runner), for which the kernel refuses `PR_CAPBSET_DROP`.
-/// Such a process holds none of the three in any other set, and it gets
-/// `PR_SET_NO_NEW_PRIVS`, verified, so no later exec can raise one from the bounding set.
-/// The helper is root with `CAP_SETPCAP`, so it always takes the strict path.
+/// Every `prctl`, `capget`, `capset` and `getresuid` result is checked. On success none of
+/// the three capabilities is in the effective, permitted, inheritable, ambient or bounding
+/// set. One case cannot drop a bounding bit: a verified unprivileged process (an
+/// unprivileged test runner), for which the kernel refuses `PR_CAPBSET_DROP`. It may take
+/// the `PR_SET_NO_NEW_PRIVS` fallback, verified, so no later exec can raise a bit from the
+/// bounding set, only if, before anything is changed, its real, effective and saved UIDs
+/// are all non-zero, it lacks permitted `CAP_SETPCAP`, and it holds none of the three in
+/// its effective, permitted, inheritable or ambient set. Anything else that cannot drop a
+/// bounding bit, UID 0 without `CAP_SETPCAP` included, is an error. The helper is root
+/// with `CAP_SETPCAP`, so it always takes the strict path.
 ///
 /// Capability sets belong to the calling thread. Every caller is a single-threaded child
 /// right after fork (a worker before its loop, a backend child before exec), so that thread
@@ -83,6 +86,32 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
     let mut data = [empty; 2];
     capget(&mut data)?;
     let can_setpcap = data[0].permitted & (1 << SETPCAP) != 0;
+    // Fallback eligibility, decided from the kernel's state before anything changes.
+    let (mut ruid, mut euid, mut suid) = (0, 0, 0);
+    // SAFETY: three live, writable uid_t values.
+    if unsafe { libc::getresuid(&mut ruid, &mut euid, &mut suid) } != 0 {
+        return Err(last());
+    }
+    let mut holds_launch_bits =
+        (data[0].effective | data[0].permitted | data[0].inheritable) & mask != 0;
+    for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
+        // SAFETY: prctl with constant integer arguments.
+        let ambient = unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_IS_SET as libc::c_ulong,
+                cap as libc::c_ulong,
+                0,
+                0,
+            )
+        };
+        if ambient < 0 {
+            return Err(last());
+        }
+        holds_launch_bits |= ambient != 0;
+    }
+    let may_fall_back =
+        !can_setpcap && ruid != 0 && euid != 0 && suid != 0 && !holds_launch_bits;
     // The bounding set, CAP_SETPCAP last: dropping a bounding bit needs it.
     let mut inert_bounding = false;
     for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
@@ -97,7 +126,7 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
         // SAFETY: as above.
         if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
             let error = last();
-            if error.raw_os_error() == Some(libc::EPERM) && !can_setpcap {
+            if error.raw_os_error() == Some(libc::EPERM) && may_fall_back {
                 inert_bounding = true;
                 continue;
             }
@@ -624,6 +653,51 @@ mod tests {
         }
     }
 
+    /// Drops only CAP_SETPCAP from this thread's effective, permitted and inheritable
+    /// sets, leaving UID 0 and all three launch bits in the bounding set.
+    #[cfg(target_os = "linux")]
+    fn drop_setpcap_only() {
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Data {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        let mut header = Header {
+            version: 0x2008_0522,
+            pid: 0,
+        };
+        let mut data = [Data {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // SAFETY: header and two data words are live, correctly sized storage.
+        unsafe {
+            assert_eq!(
+                libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()),
+                0
+            );
+        }
+        let bit = 1u32 << 8;
+        data[0].effective &= !bit;
+        data[0].permitted &= !bit;
+        data[0].inheritable &= !bit;
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(
+                libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()),
+                0
+            );
+        }
+    }
+
     /// Runs one case in a fresh copy of this test binary, so the filter and the dropped
     /// capabilities never touch the test runner. Returns the exit code and stdout.
     #[cfg(target_os = "linux")]
@@ -659,6 +733,7 @@ mod tests {
             "deny_capset" => deny_syscall(libc::SYS_capset, libc::EPERM as u32),
             "deny_prctl" => deny_syscall(libc::SYS_prctl, libc::EPERM as u32),
             "fake_capset" => deny_syscall(libc::SYS_capset, 0),
+            "root_without_setpcap" => drop_setpcap_only(),
             other => panic!("unknown case {other}"),
         }
         // The worker entry point: it returns only when the drop is proven.
@@ -714,7 +789,18 @@ mod tests {
         let mask = launch_mask();
         let effective = capability_masks()[2].1;
         assert_eq!(effective & mask, mask, "the fixture lacks the B4 launch capabilities");
-        for case in ["deny_capget", "deny_capset", "deny_prctl", "fake_capset"] {
+        // The last case is B4 recheck finding 5 (was
+        // `poc_b4_recheck_root_reaches_no_new_privs_fallback`): UID 0 without permitted
+        // CAP_SETPCAP cannot drop its bounding bits and is not the verified unprivileged
+        // caller the NoNewPrivs fallback is for, so it exits too.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+        for case in [
+            "deny_capget",
+            "deny_capset",
+            "deny_prctl",
+            "fake_capset",
+            "root_without_setpcap",
+        ] {
             let (code, stdout) = run_capability_case(case);
             assert!(stdout.contains("CAPDROP before"), "{case}: {stdout}");
             assert!(
