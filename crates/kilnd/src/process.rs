@@ -20,58 +20,185 @@ use crate::model::Captured;
 /// caller's variables never reach the backend.
 pub const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Capabilities only the Firecracker supervisor's jailer needs: device nodes, chroot and
+/// the VMM's bounding-set drop. Every other helper child gives them up, so legacy kiln
+/// children and the L/P/M/K workers keep exactly the pre-B4 set.
+#[cfg(target_os = "linux")]
+pub(crate) const FIRECRACKER_LAUNCH_CAPABILITIES: [u32; 3] = [27, 18, 8]; // MKNOD, SYS_CHROOT, SETPCAP
+
+/// Drops the launch-only capabilities from every set and proves it, failing closed.
+///
+/// Every `prctl`, `capget` and `capset` result is checked. On success none of the three
+/// capabilities is in the effective, permitted, inheritable, ambient or bounding set.
+/// One case cannot drop a bounding bit: a process without `CAP_SETPCAP` in its permitted
+/// set (an unprivileged test runner), for which the kernel refuses `PR_CAPBSET_DROP`.
+/// Such a process holds none of the three in any other set, and it gets
+/// `PR_SET_NO_NEW_PRIVS`, verified, so no later exec can raise one from the bounding set.
+/// The helper is root with `CAP_SETPCAP`, so it always takes the strict path.
+///
+/// Allocation-free and async-signal-safe: it runs between fork and exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const VERSION_3: u32 = 0x2008_0522;
+    const SETPCAP: u32 = 8;
+    let mask: u32 = FIRECRACKER_LAUNCH_CAPABILITIES
+        .iter()
+        .fold(0, |mask, cap| mask | (1u32 << cap));
+    let last = || io::Error::last_os_error();
+    let capget = |data: &mut [Data; 2]| -> io::Result<()> {
+        let mut header = Header {
+            version: VERSION_3,
+            pid: 0,
+        };
+        // SAFETY: header and two data words are live, correctly sized storage.
+        if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
+            return Err(last());
+        }
+        if header.version != VERSION_3 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok(())
+    };
+    let empty = Data {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    let mut data = [empty; 2];
+    capget(&mut data)?;
+    let can_setpcap = data[0].permitted & (1 << SETPCAP) != 0;
+    // The bounding set, CAP_SETPCAP last: dropping a bounding bit needs it.
+    let mut inert_bounding = false;
+    for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
+        // SAFETY: prctl with constant integer arguments.
+        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) };
+        if present < 0 {
+            return Err(last());
+        }
+        if present == 0 {
+            continue;
+        }
+        // SAFETY: as above.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
+            let error = last();
+            if error.raw_os_error() == Some(libc::EPERM) && !can_setpcap {
+                inert_bounding = true;
+                continue;
+            }
+            return Err(error);
+        }
+    }
+    // Ambient bits, explicitly; clearing inheritable below would also clear them.
+    for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_LOWER as libc::c_ulong,
+                cap as libc::c_ulong,
+                0,
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(last());
+        }
+    }
+    data[0].effective &= !mask;
+    data[0].permitted &= !mask;
+    data[0].inheritable &= !mask;
+    let mut header = Header {
+        version: VERSION_3,
+        pid: 0,
+    };
+    // SAFETY: header and data are live, correctly sized storage.
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) } != 0 {
+        return Err(last());
+    }
+    if inert_bounding {
+        // SAFETY: as above.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(last());
+        }
+    }
+    // Verify every set from the kernel, not from what was asked for.
+    let mut after = [empty; 2];
+    capget(&mut after)?;
+    if (after[0].effective | after[0].permitted | after[0].inheritable) & mask != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
+        // SAFETY: as above.
+        let ambient = unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_IS_SET as libc::c_ulong,
+                cap as libc::c_ulong,
+                0,
+                0,
+            )
+        };
+        if ambient != 0 {
+            return Err(if ambient < 0 {
+                last()
+            } else {
+                io::Error::from_raw_os_error(libc::EPERM)
+            });
+        }
+        // SAFETY: as above.
+        let bounding = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) };
+        if bounding < 0 {
+            return Err(last());
+        }
+        if bounding != 0 && !inert_bounding {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+    }
+    if inert_bounding {
+        // SAFETY: as above.
+        let nnp = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+        if nnp != 1 || after[0].permitted & (1 << SETPCAP) != 0 {
+            return Err(if nnp < 0 {
+                last()
+            } else {
+                io::Error::from_raw_os_error(libc::EPERM)
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A helper worker's first act: drop the launch-only capabilities or exit at once,
+/// before any worker loop. A failure here never continues with them held.
+#[cfg(target_os = "linux")]
+pub(crate) fn require_firecracker_launch_capabilities_dropped() {
+    if drop_firecracker_launch_capabilities().is_err() {
+        // SAFETY: leave without unwinding or running any further worker code.
+        unsafe { libc::_exit(LAUNCH_CAPABILITY_EXIT) }
+    }
+}
+
+/// The exit status of a worker whose capability drop failed.
+#[cfg(target_os = "linux")]
+pub(crate) const LAUNCH_CAPABILITY_EXIT: i32 = 76;
+
 /// Shared post-fork setup for every backend process.
 ///
 /// # Safety
 /// Runs between `fork` and `exec`; keep this limited to async-signal-safe
 /// operations and allocation-free error construction.
-/// Capabilities only the Firecracker supervisor's jailer needs: device nodes, chroot and
-/// the VMM's bounding-set drop. Every other helper child gives them up, so legacy kiln
-/// children and the L/P/M/K workers keep exactly the pre-B4 set. Dropping is allowed
-/// without privilege; a bounding bit this process cannot drop was never usable by it.
-#[cfg(target_os = "linux")]
-pub(crate) fn drop_firecracker_launch_capabilities() {
-    const MKNOD: u32 = 27;
-    const SYS_CHROOT: u32 = 18;
-    const SETPCAP: u32 = 8;
-    // SAFETY: prctl and the raw capget/capset syscalls are async-signal-safe and take
-    // only local, correctly sized storage.
-    unsafe {
-        // CAP_SETPCAP last: dropping a bounding bit needs it.
-        for cap in [MKNOD, SYS_CHROOT, SETPCAP] {
-            libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
-        }
-        #[repr(C)]
-        struct Header {
-            version: u32,
-            pid: i32,
-        }
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct Data {
-            effective: u32,
-            permitted: u32,
-            inheritable: u32,
-        }
-        let mut header = Header {
-            version: 0x2008_0522,
-            pid: 0,
-        };
-        let mut data = [Data {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        }; 2];
-        if libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) == 0 {
-            let clear = !((1u32 << MKNOD) | (1u32 << SYS_CHROOT) | (1u32 << SETPCAP));
-            data[0].effective &= clear;
-            data[0].permitted &= clear;
-            data[0].inheritable &= clear;
-            libc::syscall(libc::SYS_capset, &mut header, data.as_ptr());
-        }
-    }
-}
-
 pub(crate) unsafe fn prepare_child(expected_parent: libc::pid_t) -> io::Result<()> {
     // Rust ignores SIGPIPE, and an embedding shell or service may ignore the
     // standard lifecycle signals. Ignored dispositions survive exec, so give
@@ -90,7 +217,9 @@ pub(crate) unsafe fn prepare_child(expected_parent: libc::pid_t) -> io::Result<(
     }
     #[cfg(target_os = "linux")]
     {
-        drop_firecracker_launch_capabilities();
+        // A failed or unverified drop refuses the exec: the child exits without running
+        // the backend.
+        drop_firecracker_launch_capabilities()?;
         // SAFETY: prctl is async-signal-safe and uses constant arguments.
         if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
             return Err(io::Error::last_os_error());
@@ -407,6 +536,208 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Instant;
     use tokio::io::{AsyncRead, ReadBuf};
+
+    /// The child half of the capability-drop regressions: `KILND_CAP_DROP_CASE` names
+    /// a fault to inject (or `none`); the child prints what it saw and exits.
+    #[cfg(target_os = "linux")]
+    const CAP_DROP_CASE: &str = "KILND_CAP_DROP_CASE";
+
+    #[cfg(target_os = "linux")]
+    fn capability_masks() -> [(String, u64); 5] {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"].map(|name| {
+            let value = status
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}:\t")))
+                .unwrap();
+            (name.to_string(), u64::from_str_radix(value, 16).unwrap())
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn launch_mask() -> u64 {
+        FIRECRACKER_LAUNCH_CAPABILITIES
+            .iter()
+            .fold(0, |mask, cap| mask | (1u64 << cap))
+    }
+
+    /// Installs a seccomp filter answering one syscall with `errno` (0 fakes success
+    /// without running it). Irreversible: only ever in a dedicated child process.
+    #[cfg(target_os = "linux")]
+    fn deny_syscall(nr: libc::c_long, errno: u32) {
+        #[repr(C)]
+        struct SockFilter {
+            code: u16,
+            jt: u8,
+            jf: u8,
+            k: u32,
+        }
+        #[repr(C)]
+        struct SockFprog {
+            len: u16,
+            filter: *mut SockFilter,
+        }
+        const BPF_LD_W_ABS: u16 = 0x20;
+        const BPF_JMP_JEQ_K: u16 = 0x15;
+        const BPF_RET_K: u16 = 0x06;
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+        let mut filter = [
+            SockFilter {
+                code: BPF_LD_W_ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            SockFilter {
+                code: BPF_JMP_JEQ_K,
+                jt: 0,
+                jf: 1,
+                k: nr as u32,
+            },
+            SockFilter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ERRNO | errno,
+            },
+            SockFilter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            },
+        ];
+        let program = SockFprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // SAFETY: the program outlives the call; the filter applies to this thread.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(libc::prctl(libc::PR_SET_SECCOMP, 2, &program), 0);
+        }
+    }
+
+    /// Runs one case in a fresh copy of this test binary, so the filter and the dropped
+    /// capabilities never touch the test runner. Returns the exit code and stdout.
+    #[cfg(target_os = "linux")]
+    fn run_capability_case(case: &str) -> (Option<i32>, String) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process::tests::capability_drop_child",
+                "--include-ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CAP_DROP_CASE, case)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "a child of the capability-drop regressions, not a test by itself"]
+    fn capability_drop_child() {
+        let Ok(case) = std::env::var(CAP_DROP_CASE) else {
+            return;
+        };
+        println!("CAPDROP before {:?}", capability_masks());
+        match case.as_str() {
+            "none" => {}
+            "deny_capget" => deny_syscall(libc::SYS_capget, libc::EPERM as u32),
+            "deny_capset" => deny_syscall(libc::SYS_capset, libc::EPERM as u32),
+            "deny_prctl" => deny_syscall(libc::SYS_prctl, libc::EPERM as u32),
+            "fake_capset" => deny_syscall(libc::SYS_capset, 0),
+            other => panic!("unknown case {other}"),
+        }
+        // The worker entry point: it returns only when the drop is proven.
+        require_firecracker_launch_capabilities_dropped();
+        let masks = capability_masks();
+        let nnp = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+        println!("CAPDROP returned {masks:?} nnp={nnp}");
+        // SAFETY: leave without running the rest of the harness in this child.
+        unsafe { libc::_exit(0) }
+    }
+
+    /// The drop proves itself in every set, as any user. An unprivileged runner cannot
+    /// drop bounding bits, so it must come out with no_new_privs instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_capability_drop_is_verified_in_every_set() {
+        let (code, stdout) = run_capability_case("none");
+        assert_eq!(code, Some(0), "{stdout}");
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("CAPDROP returned "))
+            .unwrap_or_else(|| panic!("{stdout}"));
+        let mask = launch_mask();
+        for name in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+            let value = line
+                .split(&format!("(\"{name}\", "))
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("{name} in {line}"));
+            assert_eq!(value & mask, 0, "{name} kept a launch capability: {line}");
+        }
+        let bounding = line
+            .split("(\"CapBnd\", ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap();
+        assert!(
+            bounding & mask == 0 || line.ends_with("nnp=1"),
+            "bounding bits stayed usable: {line}"
+        );
+    }
+
+    /// B4 break-it finding 3, fail-closed: with each capability call made to fail (or to
+    /// claim success without acting), the worker entry exits before any worker code,
+    /// with the launch capabilities never reported dropped. Run as root under the helper
+    /// unit's bounding set by scripts/b4-vm-tests.sh; without them the faults are moot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root with the B4 launch capabilities: run scripts/b4-vm-tests.sh"]
+    fn b4_linux_root_worker_capability_drop_fails_closed() {
+        let mask = launch_mask();
+        let effective = capability_masks()[2].1;
+        assert_eq!(effective & mask, mask, "the fixture lacks the B4 launch capabilities");
+        for case in ["deny_capget", "deny_capset", "deny_prctl", "fake_capset"] {
+            let (code, stdout) = run_capability_case(case);
+            assert!(stdout.contains("CAPDROP before"), "{case}: {stdout}");
+            assert!(
+                !stdout.contains("CAPDROP returned"),
+                "{case}: the worker continued: {stdout}"
+            );
+            assert_eq!(code, Some(LAUNCH_CAPABILITY_EXIT), "{case}: {stdout}");
+            eprintln!("B4 evidence: {case} exited {LAUNCH_CAPABILITY_EXIT} before any worker code");
+        }
+        // And the strict path as root: every set, bounding included, without the bits.
+        let (code, stdout) = run_capability_case("none");
+        assert_eq!(code, Some(0), "{stdout}");
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("CAPDROP returned "))
+            .unwrap();
+        assert!(line.ends_with("nnp=0"), "root drops bounding bits itself: {line}");
+        for name in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+            let value: u64 = line
+                .split(&format!("(\"{name}\", "))
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap();
+            assert_eq!(value & mask, 0, "{name}: {line}");
+        }
+        eprintln!("B4 evidence: strict drop {line}");
+    }
 
     #[cfg(target_os = "linux")]
     struct IsolatedProcessGroup {

@@ -1295,10 +1295,10 @@ pub fn ledger_main(
     // test process itself, holding the unit's whole set, so only that fixture keeps them.
     #[cfg(all(target_os = "linux", test))]
     if !faults::present("L.keep_launch_capabilities") {
-        crate::process::drop_firecracker_launch_capabilities();
+        crate::process::require_firecracker_launch_capabilities_dropped();
     }
     #[cfg(all(target_os = "linux", not(test)))]
-    crate::process::drop_firecracker_launch_capabilities();
+    crate::process::require_firecracker_launch_capabilities_dropped();
     let mut ledger = Ledger::open(config);
     loop {
         heartbeat.beat();
@@ -1585,7 +1585,7 @@ fn verify_leases(config: &NodeConfig, expected: &[ExecutableIdentity]) -> Result
 /// but has no ledger, no write path and no session side effect.
 pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat: Heartbeat) {
     #[cfg(target_os = "linux")]
-    crate::process::drop_firecracker_launch_capabilities();
+    crate::process::require_firecracker_launch_capabilities_dropped();
     loop {
         heartbeat.beat();
         fault_point("P.loop");
@@ -2379,7 +2379,7 @@ pub struct MonitorSockets {
 /// A stale S watch requests its stop as well. S keeps its slot and permit charged.
 pub fn monitor_main(mut sockets: MonitorSockets, timings: Timings, mut heartbeat: Heartbeat) {
     #[cfg(target_os = "linux")]
-    crate::process::drop_firecracker_launch_capabilities();
+    crate::process::require_firecracker_launch_capabilities_dropped();
     let mut watches: Vec<Watch> = Vec::new();
     let mut stops = StopQueue::new(sockets.recovery.len());
     let mut stale_requested: std::collections::HashSet<AllocationKey> = Default::default();
@@ -2700,7 +2700,7 @@ fn remove_cgroup(
 /// containment, never a durable receipt.
 pub fn recovery_main(mut endpoint: Endpoint, monitor: UnixDatagram, mut heartbeat: Heartbeat) {
     #[cfg(target_os = "linux")]
-    crate::process::drop_firecracker_launch_capabilities();
+    crate::process::require_firecracker_launch_capabilities_dropped();
     let _ = monitor.set_nonblocking(true);
     let mut helper_gone = false;
     let mut last_dispatch = std::time::Instant::now();
