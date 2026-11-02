@@ -571,17 +571,23 @@ After the node-global C2 claim and real free-space check, P uses `openat(O_CREAT
 
 `-K` prevents discard undoing preallocation. Format only the new inode before exposure; verify identity before/after and sync file/parent. Never mkfs/repair a disk after a guest has written it. The backing file stays root-owned 0600 and inaccessible to jail UID/GID.
 
-Expose the work volume as a **helper-owned loop block device**, size limit exactly W, rather than a writable regular backing file inside the jail. Persist LOOP_INTENT with the chosen slot's major/minor, backing device/inode, offset=0, size limit and logical block size (512) **before** LOOP_CONFIGURE/binding, then persist the verified attachment before exposure. An unexpectedly busy slot is a conflict, never permission to replace its backing. Binding, cleanup and crash recovery validate all of those identities: before LOOP_CLR_FD, on the same opened slot descriptor that then detaches it, cleanup requires the full recorded tuple, including the kernel's `BLKGETSIZE64` and `BLKSSZGET`. The recorded backing inode bound with any other offset, size limit or block size is Unknown: left bound and charged, never detached. Bind only the device node as `/work`, owned U:G and mode 0600; no loop-control device, host `/dev` directory or backing-file path enters the jail. The unprivileged VMM cannot grow/truncate the root-owned backing file or resize the block device. Disable discard/unmap paths that could punch holes in the allocation guarantee. B4 must prove the pinned Firecracker synchronous block backend accepts this fixed-size block device and cannot enlarge/rebind it under the VMM credentials/seccomp; an unsupported backend fails closed, without a regular-file fallback. Loop attachment is privileged typed storage work, never a caller-selected device.
+Expose the work volume as a **helper-owned loop block device**, size limit exactly W, rather than a writable regular backing file inside the jail. Persist LOOP_INTENT with the chosen slot's major/minor, backing device/inode, offset=0, size limit and logical block size (512) **before** LOOP_CONFIGURE/binding. LOOP_CONFIGURE sets `LO_FLAGS_AUTOCLEAR`; on the configuring descriptor S then reads the attachment's generation, its disk sequence number (`BLKGETDISKSEQ`), and journals it with the boot ID as the `loop` record. Only then does it clear autoclear on that descriptor (`LOOP_SET_STATUS64` writing back exactly what `LOOP_GET_STATUS64` returned, less the flag) and re-verify the tuple and generation, so a crash before the record leaves no attachment once S's descriptor closes. An unexpectedly busy slot is a conflict, never permission to replace its backing. Binding, cleanup and crash recovery validate all of those identities: before LOOP_CLR_FD, on the same opened slot descriptor that then detaches it, cleanup requires the journaled boot ID, the full recorded tuple (including the kernel's `BLKGETSIZE64` and `BLKSSZGET`) and the journaled disk sequence number, read again immediately before the ioctl. The recorded backing inode bound with any other offset, size limit or block size, or with another disk sequence number (detached and rebound, even with the exact tuple), is Unknown: left bound and charged, never detached. A slot with only an intent is never detached: its autoclear attachment is waited out briefly and otherwise Unknown. A generation from another boot is gone by definition and the slot is not touched. Bind only the device node as `/work`, owned U:G and mode 0600; no loop-control device, host `/dev` directory or backing-file path enters the jail. The unprivileged VMM cannot grow/truncate the root-owned backing file or resize the block device. Disable discard/unmap paths that could punch holes in the allocation guarantee. B4 must prove the pinned Firecracker synchronous block backend accepts this fixed-size block device and cannot enlarge/rebind it under the VMM credentials/seccomp; an unsupported backend fails closed, without a regular-file fallback. Loop attachment is privileged typed storage work, never a caller-selected device.
 
 Guest init mounts vdb at `/var/lib/kiln/runs` with `nosuid,nodev,noexec,prjquota`. Kiln's persistent sandbox project quota bounds blocks and inodes, probed before Ready. Test direct work-path execution denied and normal overlay execution allowed. Guest root can bypass its inner quota but cannot exceed W; this is a physical outer bound, not trust in guest enforcement.
 
-**Every writable jail byte and inode is bounded from the first jailer write.** Before launching J, S mounts a private tmpfs with `size=16M,nr_inodes=1024,mode=0700,nosuid` on the allocation's jail directory, so the entire jail root (a directory on it) lies inside the bound. The mount carries an allocation-specific identity journaled before it exists: source `kilnd-jail-<nonce>` and, beside the jail root and outside the VMM's chroot, a root-only 0400 marker holding the same random 128-bit nonce. The tmpfs is created detached (`fsopen`/`fsmount`), its marker and jail root are written there, and only then is it attached onto the jail directory's descriptor (`move_mount`), so no crash leaves a mount without its identity. Charge its pages/metadata to the allocation; include its full 16 MiB in the provisional host memory allowance. Executing the VMM and accessing KVM require exec/device access, so do not falsely specify noexec/nodev on this whole mount. Kernel/rootfs/config/identity are verified read-only bind mounts; `/work` is the bounded block device. No other writable bind, host filesystem or external logging path exists. The VMM executable is a read-only bind of the retained approved inode, not a writable jailer copy; check that remaining cache/control files fit the cap before accepting this profile. Node metadata and immutable-store headroom are reserved separately below.
+**Every writable jail byte and inode is bounded from the first jailer write.** Before launching J, S mounts a private tmpfs with `size=16M,nr_inodes=1024,mode=0700,nosuid` on the allocation's jail directory, so the entire jail root (a directory on it) lies inside the bound. The mount carries an allocation-specific source `kilnd-jail-<nonce>` and, beside the jail root and outside the VMM's chroot, a root-only 0400 marker holding the same random 128-bit nonce, both journaled before it exists. The tmpfs is created detached (`fsopen`/`fsmount`) and its marker and jail root are written there. S then reads the mount's 64-bit unique mount ID (`statx` with `STATX_MNT_ID_UNIQUE`, Linux 6.8+; a kernel that does not report it refuses the launch, with no fallback) from the detached mount descriptor and journals it with the boot ID, and only then attaches it onto the jail directory's descriptor (`move_mount`). Each read-only bind is made the same way: `open_tree(OPEN_TREE_CLONE)` of the verified descriptor, `mount_setattr` to read-only/nosuid/nodev/private while detached, its unique ID journaled for all five before any is attached, then `move_mount`. A detached mount dies with its descriptor, so no crash leaves an attached mount whose unique ID was never journaled. Charge its pages/metadata to the allocation; include its full 16 MiB in the provisional host memory allowance. Executing the VMM and accessing KVM require exec/device access, so do not falsely specify noexec/nodev on this whole mount. Kernel/rootfs/config/identity are verified read-only bind mounts; `/work` is the bounded block device. No other writable bind, host filesystem or external logging path exists. The VMM executable is a read-only bind of the retained approved inode, not a writable jailer copy; check that remaining cache/control files fit the cap before accepting this profile. Node metadata and immutable-store headroom are reserved separately below.
 
 The pinned jailer chowns `/`, `/dev`, `/dev/net` and `/run` to its UID, so root ownership before launch alone is insufficient. After J's expected exit and V's identity validation, S stops V through its pidfd. It hardens the root, `/dev` and `/dev/net` to root-owned 0755 and cache files to root-owned 0444, preserving only the explicitly needed device-node U:G access. It independently verifies that `/firecracker` remains the root-owned 0555 read-only bind of the expected inode, leaves only `/run` writable by U:G, checks the resulting mount tree and resumes V. Do this before Ready; a missing/failed hardening step retires the VM. Even a malicious pre-hardening VMM, a retained writable FD or unexpected path creation remains bounded by the **whole-jail** tmpfs cap. Fixed artifact mounts are read-only independent of chmod. All walks/hardening use pinned directory descriptors, no-follow opens and mount IDs; reject replacement entries instead of following links.
 
 An optional host XFS project quota can narrow the host session-storage allowance, but is not its security mechanism. Portability relies on the preallocated root-only W backing file, exact-size loop exposure, mandatory whole-jail tmpfs byte/inode cap and fixed-size helper metadata. Fill files, sockets and inodes as U:G in B4 and show the node journal/recovery headroom stays available. Quota/ENOSPC faults retire only the affected allocation and never relax these limits.
 
-Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no lazy unmount as absence proof) only after proving each is the journaled one immediately before its own unmount, detaches the loop device with the verified full binding tuple, proves no pending loop attachment/holder, removes the private backing file and bounded control files, syncs parents and removes the empty cgroup. A crash after loop setup but before recorded attachment requires inventory of the reserved slot/backing identity; ambiguity stays charged. Refuse unknown inodes/mounts/devices. A mount is the allocation's only by its journaled source and marker (and its recorded tuple, once recorded), never by its deterministic path: the kernel reuses mount IDs and inode numbers, so a fresh replacement can match the whole `{mount_id, st_dev, st_ino}` tuple. After recovery, any loss of that identity is Unknown and stays charged. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
+Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no lazy unmount as absence proof) only after proving each is the journaled one immediately before its own unmount, detaches the loop device with the verified journaled generation and full binding tuple, proves no pending loop attachment/holder, removes the private backing file and bounded control files, syncs parents and removes the empty cgroup. A crash after LOOP_CONFIGURE but before the recorded generation leaves an autoclear attachment that goes with S's descriptor; anything still bound to the backing inode without a journaled generation is ambiguous and stays charged. Refuse unknown inodes/mounts/devices. A mount is the allocation's only if the unique mount ID at its path, read immediately before its unmount, is the journaled one from this boot; its reusable `{mount_id, st_dev, st_ino}`, source and marker must also match but are secondary, because the kernel hands a fresh replacement the whole reusable tuple and root can copy the source and marker. A mount is never the allocation's by its deterministic path or a contract bind name: a bind under the jail whose unique ID was never journaled is Unknown, quarantined and charged, with nothing unmounted. A live owner holds the descriptors the journaled IDs were read from; after a crash, cleanup uses only the journaled unique IDs and boot ID.
+
+**Teardown fault model (B4 recheck, November 2, 2026).** Copyable markers and check-then-ioctl sequences cannot beat a concurrent host-root actor, so B4's exact-identity guarantee is defined by kernel IDs that are never reused within a boot, plus the boot ID (`/proc/sys/kernel/random/boot_id`), journaled with every identity: a different boot ID means every recorded mount and loop attachment is gone by definition.
+
+- *In scope:* root replacing a resource before cleanup, at any crash point — a fresh tmpfs or bind at the path, or a loop slot detached and rebound, with any tuple. That is refused: the unique ID or disk sequence number differs, the allocation is Unknown and stays charged, and the replacement is left exactly as it is.
+- *Out of scope:* host root mutating one of our own resources in place, during teardown — for example `LOOP_SET_STATUS64` on our attachment between cleanup's comparison and `LOOP_CLR_FD`, which leaves the disk sequence number unchanged. Host root is trusted and the kernel has no compare-and-clear; detaching an attachment whose generation (disk sequence number and backing inode) matches is correct, because it is ours.
+- *Kernel facts relied on,* verified on the VM's 6.8.0-147 by `b4_linux_root_kernel_generation_ids_are_never_reused`: a replacement tmpfs gets a new unique mount ID although the reusable tuple is reused; a detached mount keeps its unique ID when attached; detach plus reattach of the same slot, inode and tuple changes the disk sequence number; `LOOP_SET_STATUS64` does not. Also observed: while cleanup's descriptor on a slot is open, another opener's `LOOP_CLR_FD` only marks it autoclear and a rebinding `LOOP_CONFIGURE` fails `EBUSY`, so a replacement cannot land inside cleanup's own comparison-to-clear window. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
 
 ## 7.2 Durable reservation vector
 
@@ -1457,6 +1463,11 @@ VM by `scripts/b4-vm-tests.sh` under exactly the helper unit's bounding set; raw
 
 ## B4 break-it corrections (November 2, 2026)
 
+*Amended by the B4 recheck corrections below:* the marker and reusable tuple of item 1 are
+now secondary to the journaled unique mount ID, an unjournaled bind is no longer ours by its
+name, item 2's tuple is joined by the disk sequence number, item 3's fallback is root-strict,
+item 4's gate moved after publishing, and item 5's record waits for exit status 0.
+
 Daybreak Blue's B4 review (`reviews/2026-11-02-b4-breakit.md`, PoCs in `reviews/poc-b4/`)
 found destructive cleanup acting on replacements, a fail-open capability path, unpinned
 build inputs and mislabelled formatter evidence. All five findings are accepted and fixed
@@ -1569,3 +1580,110 @@ again: `integration-test.sh`, `daemon-singleton-regressions.sh`, `state-path-reg
 `kilnd-maintenance-tests.py`, `deployment-regressions.py` between two builds and its
 `--reboot-arm graceful`/`--reboot-verify` around a real reboot. The VM was then restored
 to installed main `734e275` with its schema-7 database.
+
+## B4 recheck corrections (November 2, 2026)
+
+Daybreak Blue's recheck of `38aee62` (`reviews/2026-11-02-b4-recheck.md`, PoCs in
+`reviews/poc-b4-recheck/`) broke all five corrections with adversarial variants: a copied
+marker and an unjournaled bind name authorized replacement mounts, a loop retuned between
+comparison and `LOOP_CLR_FD` was detached, the build published an output swapped after its
+check, a formatter that died before `execveat` produced `retained_fd` evidence, and UID 0
+reached the unprivileged capability fallback. All five are accepted. The lead's fault-model
+decision is recorded in section 7.1 (*Teardown fault model*): identity comes from kernel IDs
+never reused within a boot, plus the boot ID; root replacing a resource before cleanup is in
+scope and refused; root mutating our own resource in place during teardown is out of scope.
+
+**1. Mounts: unique mount IDs.** `JailMount` and every `BindMount` gain `boot_id` and
+`unique_id` (`STATX_MNT_ID_UNIQUE`). `storage::prepare_jail` builds the tmpfs detached and
+reads both IDs from the mount descriptor; S journals `jail_mount`, then
+`storage::attach_jail` attaches it and requires the path to show the journaled IDs.
+`storage::prepare_bind` clones each verified descriptor with `open_tree(OPEN_TREE_CLONE)`
+and sets read-only/nosuid/nodev/private with `mount_setattr` while detached; S journals
+`jail_binds` for all five before `storage::attach_bind` attaches any. `unmount_jail` requires
+this boot's ID on every record and, on a fresh `O_PATH` no-follow descriptor immediately
+before each unmount, the journaled unique ID; the reusable tuple, source and marker are
+still compared, as secondary checks. A mounted bind with no journaled record is Unknown:
+nothing is unmounted and the allocation stays charged. A kernel that does not report
+`STATX_MNT_ID_UNIQUE` fails `mount_identity` and so refuses the launch; there is no
+fallback. New crash boundaries `S.after.jail_record`, `S.after.bind_record` and
+`S.after.first_bind` cover the journaled-but-not-yet-attached states.
+
+**2. Loops: disk sequence numbers.** `ResourceRecord::Loop` becomes
+`Loop { binding, generation }`, where `LoopGeneration` is the boot ID and the
+`BLKGETDISKSEQ` read on the configuring descriptor. Attachment is autoclear until that
+record is durable (`storage::attach_loop`, then `storage::persist_loop`), so the window
+between `LOOP_CONFIGURE` and the journal leaves no unrecorded binding behind a crash; the
+new boundary `S.after.loop_record` covers the window between the record and clearing
+autoclear. `detach_loop(binding, generation)` compares the full tuple and then, immediately
+before `LOOP_CLR_FD` on the same descriptor, the disk sequence number. A different number is
+Unknown; a generation from another boot is Free without touching the slot; an intent with no
+generation is never detached. On this kernel a replacement inside cleanup's window is not
+even possible: with cleanup's descriptor open, another opener's `LOOP_CLR_FD` only sets
+autoclear and a rebinding `LOOP_CONFIGURE` fails `EBUSY`. `LOOP_SET_STATUS64` on our own
+attachment keeps its disk sequence number and is detached, as the out-of-scope case.
+
+**3. Build publish.** `scripts/build-phase1b-tools.sh` downloads, verifies, builds and
+stages in a private `mktemp -d` directory (0700, removed on exit). It hashes each staged
+output, publishes it with a rename inside OUT, then hashes the published name: that
+comparison is the enforced gate, and a mismatch removes the output and exits non-zero. A
+final comparison of both published names replaces the old diagnostic print. The build UID
+and its processes are documented as trusted. The PoC `build-output-swap.sh` became
+`scripts/build-phase1b-tools-swap-check.sh`, which swaps the staged jailer after its first
+hash and passes only if the build fails at the post-publish gate with no jailer left in OUT.
+
+**4. Formatter evidence.** S records `InferredFromRetainedFd` only after `waitpid` reports
+exit status 0. The report pipe's errno still refuses a failed `execveat` with its
+diagnostic, but its unwritten end of file no longer counts as proof of exec: pre-exec death
+or any non-zero status records no executable evidence.
+
+**5. Capability fallback.** `drop_firecracker_launch_capabilities` decides fallback
+eligibility before changing anything: real, effective and saved UIDs all non-zero
+(`getresuid`), no permitted `CAP_SETPCAP`, and none of the three launch bits in the
+effective, permitted, inheritable or ambient set. Anything else that cannot drop a bounding
+bit, UID 0 without `CAP_SETPCAP` included, returns an error and the worker `_exit(76)`s.
+
+**Regressions.** The PoCs are privileged regressions that must refuse:
+`storage::tests::b4_linux_root_cleanup_refuses_a_copied_marker_replacement` (was
+`poc_b4_recheck_spoofed_marker_unmounts_replacement`),
+`storage::tests::b4_linux_root_cleanup_refuses_an_unrecorded_or_replaced_bind` (was
+`poc_b4_recheck_unrecorded_bind_replacement_is_unmounted`; also a journaled bind replaced by
+another inode or by a fresh bind of the same inode),
+`storage::tests::b4_linux_root_detach_refuses_a_rebound_generation` (same slot, inode and
+tuple rebound before cleanup: Unknown and left bound; the in-window attempt fails `EBUSY`),
+`storage::tests::b4_linux_root_detach_of_a_retuned_own_generation_is_out_of_scope` (records
+that an in-place `LOOP_SET_STATUS64` keeps the generation and is detached),
+`storage::tests::b4_linux_root_an_unjournaled_attachment_clears_itself`,
+`tests::lifecycle::b4_linux_root_formatter_death_before_exec_records_no_evidence` (was
+`poc_b4_recheck_preexec_death_falsifies_retained_fd_evidence`), the `root_without_setpcap`
+case of `process::tests::b4_linux_root_worker_capability_drop_fails_closed` (was
+`poc_b4_recheck_root_reaches_no_new_privs_fallback`), and the kernel-behaviour test
+`storage::tests::b4_linux_root_kernel_generation_ids_are_never_reused`. The real-chain
+stale-resource test adds the work file rebound with the exact journaled tuple, refused on its
+disk sequence number.
+
+**Results (November 2, 2026, in `kiln` on Linux 6.8.0-147, raw output in
+`reviews/2026-11-02-b4-fixes2-vm/`).** Before any code relied on them, a standalone C probe
+run as root confirmed the kernel facts: across 199 replacement tmpfs mounts the reusable
+`{mount_id, st_dev, st_ino}` was reused every time and the unique mount ID never; a detached
+mount's unique ID was unchanged by `move_mount`; detach plus reattach of the same slot,
+inode and tuple moved the disk sequence number (16 → 18); `LOOP_SET_STATUS64` left it
+unchanged. `scripts/b4-vm-tests.sh` then ran all 20 root tests at `d625179` and all passed
+in 1121.7 s: the 13 existing exit tests and regressions, with the crash matrix's four new
+boundaries, and the seven new ones. The copied-marker replacement reused the whole tuple and
+was refused on its unique ID; a bind replaced by a fresh bind of the very same inode was
+refused the same way; the real-chain work file rebound with the exact tuple was refused on
+its disk sequence number (114, journaled 108) and left bound and charged; inside cleanup's
+window the rebinding `LOOP_CONFIGURE` failed `EBUSY`; the in-place retune kept its sequence
+number and was detached; the pre-exec formatter death recorded no evidence; and
+`root_without_setpcap` exited 76. The cleanup check found no owned VMM, loop, mount, cgroup
+or file. The tool build reproduced both approved digests from its private directory, and
+`build-phase1b-tools-swap-check.sh` passed: the swapped jailer failed the build at the
+post-publish gate and was removed. With `d625179` installed, `integration-test.sh`,
+`daemon-singleton-regressions.sh`, `state-path-regressions.sh`, `phase0-regressions.py`,
+`smoke.sh` and `kilnd-maintenance-tests.py` passed, as did `deployment-regressions.py`
+between two builds (all 69 checks) and its `--reboot-arm graceful`/`--reboot-verify` around a
+real reboot of the VM. The VM was then restored to installed main `734e275` with its schema-7
+database. A station restart interrupted the first
+suite run (on the uncommitted fix, after its first 12 tests, crash matrix included, had
+passed); the VM came back with no mount, loop or cgroup left, and the full rerun above is
+the evidence.

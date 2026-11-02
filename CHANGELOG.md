@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B4 recheck corrections. Teardown identity now comes from kernel IDs never reused
+  within a boot, journaled with the boot ID: the jail tmpfs's and every bind's
+  `STATX_MNT_ID_UNIQUE` (Linux 6.8+, no fallback), taken from the detached mount descriptor
+  and journaled before it is attached, and the loop attachment's `BLKGETDISKSEQ`. Cleanup
+  requires the journaled ID at the path, or on the loop descriptor, immediately before each
+  unmount or `LOOP_CLR_FD`; the old tuple, source and marker are secondary. An unjournaled
+  bind is Unknown, never inferred from its name. Loops attach with autoclear until their
+  generation is journaled. The tool build stages privately and gates on the published
+  digests. The formatter's `retained_fd` evidence waits for exit status 0. UID 0 without
+  `CAP_SETPCAP` no longer takes the `NoNewPrivs` fallback and exits 76.
 - Phase 1b B4 break-it corrections. Cleanup acts only on exact journaled identity: each jail
   tmpfs gets an allocation-specific source and a root-only nonce marker, journaled before it
   is mounted, and is built detached and attached whole. Its binds are journaled, and every

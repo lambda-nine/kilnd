@@ -182,10 +182,17 @@ sandbox compromises the host.
   backing file. The jailer's extra capabilities (`CAP_MKNOD`, `CAP_SYS_CHROOT`,
   `CAP_SETPCAP`) reach only S and its jailer: every other helper worker and kiln child
   drops them, verifies every capability set and exits rather than continue on any
-  failure. Cleanup unmounts and detaches only by exact journaled identity: a jail tmpfs's
-  allocation-specific source and root-only marker nonce, its recorded binds, and a loop
-  slot's full tuple. Mount IDs and inode numbers are reused, so a replacement at the same
-  path is refused and left in place, and the allocation stays charged. kiln itself remains experimental shared-kernel isolation, not a boundary
+  failure. Cleanup unmounts and detaches only by exact journaled identity, taken from kernel IDs
+  never reused within a boot and journaled with the boot ID: each jail mount's and bind's
+  unique mount ID (`STATX_MNT_ID_UNIQUE`, journaled before it is attached), and a loop
+  attachment's disk sequence number with its full tuple. The reusable mount ID, inode,
+  source and marker are secondary checks only, and a bind that was never journaled is never
+  inferred from its name. The fault model is explicit: host root replacing one of these
+  resources before cleanup, at any crash point, is refused, left in place and the allocation
+  stays charged; host root mutating our own resource in place during teardown (for example
+  `LOOP_SET_STATUS64` on our attachment) is out of scope, because host root is trusted and the
+  kernel has no compare-and-clear. The Phase 1b tool build trusts its build UID and that
+  UID's processes, and gates on the digests of the outputs it published. kiln itself remains experimental shared-kernel isolation, not a boundary
   for hostile multi-tenant workloads.
 - **A compromised service account cannot take over another instance.** Root enrolls each
   instance under its own Unix account, with its unit and image, and attachment proves all
