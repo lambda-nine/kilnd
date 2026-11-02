@@ -3,6 +3,7 @@
 //! never absence, an empty listing is never proof, and another instance's identities
 //! never appear: node totals come from `Accounting` alone.
 use super::journal::{InventoryRecord, InventorySnapshot};
+use super::supervisor::RecordedLoop;
 use crate::helper::protocol::{ListRecord, ListStatus};
 use crate::model::Id128;
 use serde::{Deserialize, Serialize};
@@ -48,13 +49,20 @@ pub enum ObservationBackend {
 }
 
 impl ObservationBackend {
-    pub fn observe_allocation(&self, instance: Id128, allocation: Id128) -> NamespaceObservation {
-        let _ = (instance, allocation);
+    /// `loops` are the journal's loop records for this allocation: the real backend
+    /// observes each recorded slot itself, not only slots backed in the work directory.
+    pub fn observe_allocation(
+        &self,
+        instance: Id128,
+        allocation: Id128,
+        loops: &[RecordedLoop],
+    ) -> NamespaceObservation {
+        let _ = (instance, allocation, loops);
         match self {
             Self::Disabled => NamespaceObservation::Unknown {
                 reason: "resource observation is disabled before B4".into(),
             },
-            Self::Real => real::observe_allocation(instance, allocation),
+            Self::Real => real::observe_allocation(instance, allocation, loops),
             #[cfg(test)]
             Self::FakeDirectory(root) => fake::observe_allocation(root, instance, allocation),
         }
@@ -101,9 +109,13 @@ mod real {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn observe_allocation(instance: Id128, allocation: Id128) -> NamespaceObservation {
+    pub fn observe_allocation(
+        instance: Id128,
+        allocation: Id128,
+        loops: &[RecordedLoop],
+    ) -> NamespaceObservation {
         let (paths, cgroup) = paths(instance, allocation);
-        match crate::helper::firecracker::storage::observe_presence(&paths, &cgroup) {
+        match crate::helper::firecracker::storage::observe_presence(&paths, &cgroup, loops) {
             Ok(presence) if presence.names.is_empty() => NamespaceObservation::Absent,
             Ok(presence) => NamespaceObservation::Present {
                 names: presence.names,
@@ -115,7 +127,7 @@ mod real {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub fn observe_allocation(_: Id128, _: Id128) -> NamespaceObservation {
+    pub fn observe_allocation(_: Id128, _: Id128, _: &[RecordedLoop]) -> NamespaceObservation {
         NamespaceObservation::Unknown {
             reason: "real observation needs Linux".into(),
         }
@@ -483,7 +495,7 @@ mod tests {
         let backend = ObservationBackend::Disabled;
         let (i, a) = (Id128::from_bytes([1; 16]), Id128::from_bytes([2; 16]));
         assert!(matches!(
-            backend.observe_allocation(i, a),
+            backend.observe_allocation(i, a, &[]),
             NamespaceObservation::Unknown { .. }
         ));
         assert!(matches!(
@@ -498,20 +510,20 @@ mod tests {
         let (i, a) = (Id128::from_bytes([1; 16]), Id128::from_bytes([2; 16]));
         let backend = ObservationBackend::FakeDirectory(temp.path().to_path_buf());
         assert_eq!(
-            backend.observe_allocation(i, a),
+            backend.observe_allocation(i, a, &[]),
             NamespaceObservation::Absent
         );
         let directory = fake::allocation_dir(temp.path(), i, a);
         std::fs::create_dir_all(&directory).unwrap();
         assert_eq!(
-            backend.observe_allocation(i, a),
+            backend.observe_allocation(i, a, &[]),
             NamespaceObservation::Present {
                 names: vec![".".into()]
             }
         );
         std::fs::write(directory.join("work.xfs"), b"").unwrap();
         assert_eq!(
-            backend.observe_allocation(i, a),
+            backend.observe_allocation(i, a, &[]),
             NamespaceObservation::Present {
                 names: vec!["work.xfs".into()]
             }

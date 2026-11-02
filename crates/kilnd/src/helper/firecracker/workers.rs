@@ -1378,6 +1378,9 @@ pub enum PrepRequest {
     ObserveAllocation {
         instance: Id128,
         allocation: Id128,
+        /// The journal's loop slots for this allocation: each is observed on the slot
+        /// itself, since a replacement need not be backed inside the work directory.
+        loops: Vec<super::supervisor::RecordedLoop>,
     },
     ObserveNode {
         instance: Id128,
@@ -1660,9 +1663,14 @@ pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat:
             PrepRequest::ObserveAllocation {
                 instance,
                 allocation,
+                loops,
             } => {
                 fault_point("P.observe");
-                PrepReply::Allocation(config.observation.observe_allocation(instance, allocation))
+                PrepReply::Allocation(
+                    config
+                        .observation
+                        .observe_allocation(instance, allocation, &loops),
+                )
             }
             PrepRequest::ObserveNode { instance, known } => {
                 fault_point("P.observe");

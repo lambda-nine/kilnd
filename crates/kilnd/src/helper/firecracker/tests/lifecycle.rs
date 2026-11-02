@@ -336,10 +336,20 @@ fn created_generation(real: &Real, allocation: Id128) -> u64 {
 
 /// Everything this allocation could own on the host. Empty is the absence barrier's
 /// own evidence, read independently of the helper.
-pub(super) fn host_leftovers(context: &CreateContext, vmm: Option<ProcessId>) -> Vec<String> {
+pub(super) fn host_leftovers(
+    real: &Real,
+    context: &CreateContext,
+    vmm: Option<ProcessId>,
+) -> Vec<String> {
     let (paths, cgroup) =
         super::super::inventory::real_paths(context.instance_id, context.allocation_id);
-    let mut left = storage::observe_presence(&paths, &cgroup).unwrap().names;
+    let mut recorded = super::super::supervisor::RecordedResources::default();
+    for record in real.resources(context.allocation_id) {
+        recorded.absorb(&record);
+    }
+    let mut left = storage::observe_presence(&paths, &cgroup, &recorded.loops)
+        .unwrap()
+        .names;
     if let Some(vmm) = vmm
         && let ProcessState::Running { start_time } = super::super::workers::process_state(vmm.pid)
         && start_time == vmm.start_time
@@ -436,7 +446,7 @@ async fn b4_linux_root_create_boots_and_remove_leaves_nothing() {
         assert_eq!(real.phase(context.allocation_id), "booting");
         let reply = remove(&real, &runtime, &context).await;
         assert!(is_absent(&reply), "{reply:?}\n{}", real.fixture.log());
-        assert_eq!(host_leftovers(&context, Some(vmm)), Vec::<String>::new());
+        assert_eq!(host_leftovers(&real, &context, Some(vmm)), Vec::<String>::new());
         // Idempotent: the same receipt again.
         let again = remove(&real, &runtime, &context).await;
         assert_eq!(again, reply);
@@ -630,7 +640,7 @@ async fn remove_to_absent(
         real.fixture.log()
     );
     assert_eq!(
-        host_leftovers(context, vmm),
+        host_leftovers(real, context, vmm),
         Vec::<String>::new(),
         "{label}"
     );
@@ -1541,64 +1551,8 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
     );
     std::fs::remove_file(&paths.work_file).unwrap();
     remove_to_absent(&real, &runtime, &context, "after the replaced work file").await;
-    // A loop slot rebound to an unrelated file stays bound to it.
-    let (runtime, context, _) = create(&real).await;
-    real.wait_phase(context.allocation_id, "booting").await;
-    assert!(matches!(
-        stop_within(&real, &runtime, &context, 30).await,
-        StopReply::Stopped { .. }
-    ));
-    let binding = real
-        .resources(context.allocation_id)
-        .into_iter()
-        .find_map(|record| match record {
-            super::super::supervisor::ResourceRecord::Loop { binding, .. } => Some(binding),
-            _ => None,
-        })
-        .unwrap();
-    let device = format!("/dev/loop{}", binding.minor);
-    assert!(
-        Command::new("losetup")
-            .args(["-d", &device])
-            .status()
-            .unwrap()
-            .success()
-    );
-    wait_until("slot free", || {
-        !Path::new(&format!(
-            "/sys/block/loop{}/loop/backing_file",
-            binding.minor
-        ))
-        .exists()
-    })
-    .await;
-    let other = real.fixture.root.join("unrelated.img");
-    std::fs::write(&other, vec![0u8; 1 << 20]).unwrap();
-    assert!(
-        Command::new("losetup")
-            .args([&device, other.to_str().unwrap()])
-            .status()
-            .unwrap()
-            .success()
-    );
-    remove_to_absent(&real, &runtime, &context, "after the rebound loop slot").await;
-    let backing = std::fs::read_to_string(format!(
-        "/sys/block/loop{}/loop/backing_file",
-        binding.minor
-    ))
-    .unwrap();
-    assert_eq!(
-        backing.trim(),
-        other.to_str().unwrap(),
-        "the unrelated binding was left alone"
-    );
-    assert!(
-        Command::new("losetup")
-            .args(["-d", &device])
-            .status()
-            .unwrap()
-            .success()
-    );
+    // The journaled slot rebound to an unrelated file is a replacement since B4 recheck 2:
+    // b4_linux_root_cleanup_refuses_a_foreign_backing_loop_replacement.
     // B4 break-it finding 2: the recorded slot rebound to the allocation's own backing
     // file with another offset or size limit is not the journaled binding. Remove
     // leaves it bound and the allocation charged until the operator unbinds it.
@@ -1743,6 +1697,182 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
     remove_to_absent(&real, &runtime, &context, "after the replaced jail mount").await;
 }
 
+/// B4 recheck 2, finding 1 (PoC `poc_b4_recheck2_foreign_loop_replacement_is_accepted`):
+/// root detaches the journaled loop and rebinds its slot to a foreign inode before
+/// cleanup. Remove refuses it, the allocation stays charged and the replacement stays
+/// bound; the slot itself reads as present. Once cleanup has journaled the release of
+/// its generation, a later binding in that slot is not the allocation's and a retry
+/// reaches ABSENT around it. Without that record (a crash between the detach and it),
+/// the same later binding is Unknown and charged.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs root, KVM and the B4 artifacts: run scripts/b4-vm-tests.sh"]
+async fn b4_linux_root_cleanup_refuses_a_foreign_backing_loop_replacement() {
+    use super::super::supervisor::ResourceRecord;
+    let real = Real::new(NodeOptions::default()).await;
+    let foreign = real.fixture.root.join("foreign.img");
+    std::fs::write(&foreign, vec![0u8; 1 << 20]).unwrap();
+    let foreign_text = foreign.to_str().unwrap().to_string();
+    let journaled = |allocation: Id128| {
+        real.resources(allocation)
+            .into_iter()
+            .find_map(|record| match record {
+                ResourceRecord::Loop {
+                    binding,
+                    generation,
+                } => Some((binding, generation)),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let released = |allocation: Id128| {
+        real.resources(allocation)
+            .into_iter()
+            .any(|record| matches!(record, ResourceRecord::LoopReleased { .. }))
+    };
+    let backing = |minor: u32| {
+        std::fs::read_to_string(format!("/sys/block/loop{minor}/loop/backing_file"))
+            .map(|text| text.trim().to_string())
+            .ok()
+    };
+    let losetup = |args: &[&str]| {
+        assert!(
+            Command::new("losetup").args(args).status().unwrap().success(),
+            "losetup {args:?}"
+        );
+    };
+    let unbind = |minor: u32| async move {
+        assert!(
+            Command::new("losetup")
+                .args(["-d", &format!("/dev/loop{minor}")])
+                .status()
+                .unwrap()
+                .success()
+        );
+        wait_until("slot free", || {
+            !Path::new(&format!("/sys/block/loop{minor}/loop/backing_file")).exists()
+        })
+        .await;
+    };
+    // A refusal names the loop; a transient answer from a just-exited S is retried.
+    let refused = |reply: &FenceReply| match reply {
+        FenceReply::Ambiguous { message, .. } => message.contains("loop"),
+        _ => false,
+    };
+
+    // 1. The journaled slot rebound to a foreign inode: refused, charged, left bound.
+    let (runtime, context, _) = create(&real).await;
+    real.wait_phase(context.allocation_id, "booting").await;
+    assert!(matches!(
+        stop_within(&real, &runtime, &context, 30).await,
+        StopReply::Stopped { .. }
+    ));
+    let (binding, generation) = journaled(context.allocation_id);
+    let device = format!("/dev/loop{}", binding.minor);
+    unbind(binding.minor).await;
+    losetup(&[device.as_str(), foreign_text.as_str()]);
+    let replacement = storage::current_generation(binding.minor).unwrap();
+    assert_ne!(replacement.diskseq, generation.diskseq);
+    let mut reply = remove(&real, &runtime, &context).await;
+    for _ in 0..5 {
+        if refused(&reply) || is_absent(&reply) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        reply = remove(&real, &runtime, &context).await;
+    }
+    assert!(refused(&reply), "foreign replacement: {reply:?}");
+    assert_eq!(
+        backing(binding.minor).as_deref(),
+        Some(foreign_text.as_str()),
+        "the replacement survived"
+    );
+    assert!(claim_held(&real, context.allocation_id), "refusal keeps the charge");
+    assert!(!released(context.allocation_id), "nothing was released");
+    let slot = format!("loop{}", binding.minor);
+    assert!(
+        host_leftovers(&real, &context, None).contains(&slot),
+        "the absence observation sees the journaled slot"
+    );
+    eprintln!(
+        "B4 evidence: loop{} rebound to a foreign inode, diskseq {} != journaled {}: \
+         Remove refused, charged, replacement left bound",
+        binding.minor, replacement.diskseq, generation.diskseq
+    );
+    unbind(binding.minor).await;
+    remove_to_absent(&real, &runtime, &context, "after the foreign replacement").await;
+
+    // 2. Cleanup released the generation, then died: the slot bound again before the
+    // retry is not the allocation's, and the retry reaches ABSENT around it.
+    let (runtime, context, _) = create(&real).await;
+    real.wait_phase(context.allocation_id, "booting").await;
+    assert!(matches!(
+        stop_within(&real, &runtime, &context, 30).await,
+        StopReply::Stopped { .. }
+    ));
+    let (binding, _) = journaled(context.allocation_id);
+    let device = format!("/dev/loop{}", binding.minor);
+    real.fixture.fault("S.step.cleanup_files.panic");
+    let reply = remove(&real, &runtime, &context).await;
+    real.fixture.clear("S.step.cleanup_files.panic");
+    assert!(!is_absent(&reply), "{reply:?}");
+    assert!(released(context.allocation_id), "the release was journaled");
+    assert_eq!(backing(binding.minor), None, "the generation was detached");
+    losetup(&[device.as_str(), foreign_text.as_str()]);
+    remove_to_absent(&real, &runtime, &context, "after a released slot was reused").await;
+    assert_eq!(
+        backing(binding.minor).as_deref(),
+        Some(foreign_text.as_str()),
+        "the later binding was left alone"
+    );
+    eprintln!(
+        "B4 evidence: loop{} released by cleanup and bound again: retry reached ABSENT, \
+         the later binding untouched",
+        binding.minor
+    );
+    unbind(binding.minor).await;
+
+    // 3. Cleanup died between the detach and the release record: the same later binding
+    // is a replacement of a journaled generation, so the retry refuses it.
+    let (runtime, context, _) = create(&real).await;
+    real.wait_phase(context.allocation_id, "booting").await;
+    assert!(matches!(
+        stop_within(&real, &runtime, &context, 30).await,
+        StopReply::Stopped { .. }
+    ));
+    let (binding, _) = journaled(context.allocation_id);
+    let device = format!("/dev/loop{}", binding.minor);
+    real.fixture.fault("S.after.loop_detach.panic");
+    let reply = remove(&real, &runtime, &context).await;
+    real.fixture.clear("S.after.loop_detach.panic");
+    assert!(!is_absent(&reply), "{reply:?}");
+    assert!(!released(context.allocation_id), "no release was journaled");
+    assert_eq!(backing(binding.minor), None, "the generation was detached");
+    losetup(&[device.as_str(), foreign_text.as_str()]);
+    let mut reply = remove(&real, &runtime, &context).await;
+    for _ in 0..5 {
+        if refused(&reply) || is_absent(&reply) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        reply = remove(&real, &runtime, &context).await;
+    }
+    assert!(refused(&reply), "unreleased slot bound again: {reply:?}");
+    assert!(claim_held(&real, context.allocation_id), "charged");
+    assert_eq!(
+        backing(binding.minor).as_deref(),
+        Some(foreign_text.as_str()),
+        "the later binding was left alone"
+    );
+    eprintln!(
+        "B4 evidence: loop{} detached but its release not journaled, then bound again: \
+         refused and charged",
+        binding.minor
+    );
+    unbind(binding.minor).await;
+    remove_to_absent(&real, &runtime, &context, "after the unreleased slot").await;
+    std::fs::remove_file(&foreign).unwrap();
+}
+
 /// Exit 7: the prelaunch charge. The node claim exists before any host effect, J sits
 /// in the charged `vm/vmm` leaf before it executes, the VMM's memory is charged there
 /// from launch under the contract's limits, and the claim survives STOPPED until ABSENT.
@@ -1758,7 +1888,7 @@ async fn b4_linux_root_prelaunch_charge_is_held_from_c2_through_absent() {
         "C2 claim before any effect"
     );
     assert_eq!(
-        host_leftovers(&context, None),
+        host_leftovers(&real, &context, None),
         Vec::<String>::new(),
         "no effect yet"
     );
@@ -2093,7 +2223,7 @@ async fn b4_linux_root_scoped_gc_removes_only_proven_dead_allocations() {
         outcome(other.allocation_id),
         GcOutcome::Skipped { .. }
     ));
-    assert_eq!(host_leftovers(&dead, Some(dead_vmm)), Vec::<String>::new());
+    assert_eq!(host_leftovers(&real, &dead, Some(dead_vmm)), Vec::<String>::new());
     assert!(
         running(real.vmm(live.allocation_id).unwrap()),
         "the live boot is untouched"

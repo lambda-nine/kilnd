@@ -166,11 +166,14 @@ pub enum LoopOutcome {
     /// The slot is free, or the journaled generation belongs to an earlier boot: nothing
     /// of ours is attached there.
     Free,
-    /// The slot is bound to another backing file: left exactly as it was.
+    /// Only for an intent with no journaled generation: the candidate slot is bound to
+    /// another backing file, which may be another allocation's. Left exactly as it was.
     NotOurs,
-    /// The slot is bound to our backing inode, but not as the journaled generation: another
-    /// offset, size limit or block size, another disk sequence number (detached and
-    /// rebound), or no journaled generation at all. Left bound; cleanup stays charged.
+    /// The slot is bound, but not as the journaled generation: with a generation
+    /// journaled, anything else in its slot (another backing file, another offset, size
+    /// limit or block size, another disk sequence number) is a replacement (section 7.1);
+    /// with only an intent, our backing inode is still bound. Left bound; cleanup stays
+    /// charged.
     Unknown,
 }
 
@@ -1037,10 +1040,12 @@ mod linux {
     /// tuple, and the journaled disk sequence number, read again immediately before the
     /// ioctl. Then it waits until that generation and every holder is gone.
     ///
-    /// A generation from another boot is gone by definition and nothing is touched. A
-    /// slot with no journaled generation is never detached: the attachment was made with
-    /// autoclear and its owner is dead, so it is waited out briefly and otherwise
-    /// Unknown. Fault model (design section 7.1): root replacing the binding before
+    /// A generation from another boot is gone by definition and nothing is touched. With
+    /// this boot's generation journaled, a slot bound to anything else is Unknown,
+    /// whatever its backing file. A slot with no journaled generation is never detached:
+    /// the attachment was made with autoclear and its owner is dead, so it is waited out
+    /// briefly and otherwise Unknown; only there is another backing file NotOurs, since
+    /// a busy candidate slot can be another allocation's. Fault model (design section 7.1): root replacing the binding before
     /// cleanup is refused; root mutating our own generation in place during teardown
     /// (`LOOP_SET_STATUS64` leaves the sequence number unchanged) is outside it, because
     /// the kernel has no compare-and-clear and host root is trusted.
@@ -1064,8 +1069,10 @@ mod linux {
         let before = diskseq(&device)?;
         match match_slot(&device, binding)? {
             SlotMatch::Free => return Ok(LoopOutcome::Free),
-            SlotMatch::OtherBacking => return Ok(LoopOutcome::NotOurs),
-            SlotMatch::Differs => return Ok(LoopOutcome::Unknown),
+            // A generation was journaled for this slot, so whatever else is bound there
+            // replaced it after a detach, with any backing file or tuple: Unknown, never
+            // another allocation's to ignore (section 7.1).
+            SlotMatch::OtherBacking | SlotMatch::Differs => return Ok(LoopOutcome::Unknown),
             SlotMatch::Exact => {}
         }
         #[cfg(test)]
@@ -1168,6 +1175,35 @@ mod linux {
         Ok(LoopGeneration {
             boot_id: boot_id()?,
             diskseq: diskseq(&device)?,
+        })
+    }
+
+    /// Whether a recorded loop slot still holds this allocation's attachment or a
+    /// replacement of it, read on the slot itself by major and minor. A generation from
+    /// another boot is gone. With this boot's generation journaled, a bound slot is
+    /// present whatever it holds: the generation itself, or a replacement, which is
+    /// Unknown and charged (section 7.1). With only an intent, the slot is present while
+    /// it is bound to our backing inode; another backing file there can be another
+    /// allocation's. Only a free slot is absence. A released generation is the caller's
+    /// to skip: cleanup proved it gone and journaled that.
+    pub fn recorded_loop_present(
+        binding: &LoopBinding,
+        generation: Option<&LoopGeneration>,
+    ) -> io::Result<bool> {
+        if let Some(generation) = generation
+            && generation.boot_id != boot_id()?
+        {
+            return Ok(false);
+        }
+        let device = match open_loop(binding.minor, false) {
+            Ok(device) => device,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(match match_slot(&device, binding)? {
+            SlotMatch::Free => false,
+            SlotMatch::OtherBacking => generation.is_some(),
+            SlotMatch::Exact | SlotMatch::Differs => true,
         })
     }
 
@@ -2100,9 +2136,14 @@ mod linux {
     }
 
     /// Every owned name still present for one allocation: cgroup, mounts, jail and
-    /// work directories, and loop slots backed inside the work directory. Read
-    /// failures are errors, never absence.
-    pub fn observe_presence(paths: &AllocationPaths, cgroup: &str) -> io::Result<Presence> {
+    /// work directories, every journaled loop slot that is not released and still
+    /// bound (see [`recorded_loop_present`]), and loop slots backed inside the work
+    /// directory. Read failures are errors, never absence.
+    pub fn observe_presence(
+        paths: &AllocationPaths,
+        cgroup: &str,
+        loops: &[super::super::supervisor::RecordedLoop],
+    ) -> io::Result<Presence> {
         let mut names = Vec::new();
         if super::super::cgroup::exists(cgroup)? {
             names.push("cgroup".into());
@@ -2121,7 +2162,14 @@ mod linux {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        for minor in loops_backed_in(&paths.work_dir)? {
+        let mut slots = std::collections::BTreeSet::new();
+        for recorded in loops.iter().filter(|l| !l.released) {
+            if recorded_loop_present(&recorded.binding, recorded.generation.as_ref())? {
+                slots.insert(recorded.binding.minor);
+            }
+        }
+        slots.extend(loops_backed_in(&paths.work_dir)?);
+        for minor in slots {
             names.push(format!("loop{minor}"));
         }
         names.sort();
@@ -2807,6 +2855,84 @@ mod tests {
             "B4 evidence: inside the window LOOP_CLR_FD only marked autoclear and the \
              rebinding failed ({error}); cleanup detached the journaled generation {}",
             rebound.diskseq
+        );
+    }
+
+    /// B4 recheck 2 (was `poc_b4_recheck2_foreign_loop_replacement_is_accepted`): the
+    /// journaled slot detached and rebound to another backing inode is a replacement,
+    /// not another allocation's binding. Detach is Unknown and leaves it bound, and the
+    /// slot itself reads as present, so neither cleanup nor the absence observation can
+    /// pass it. Only an intent with no journaled generation keeps NotOurs, and a
+    /// generation from another boot is gone without touching the slot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and CAP_SYS_ADMIN: run scripts/b4-vm-tests.sh"]
+    fn b4_linux_root_detach_refuses_a_foreign_backing_generation() {
+        use std::os::unix::fs::MetadataExt;
+        const W: u64 = 16 * 1024 * 1024;
+        let (backing, original, binding, journaled) = scratch_loop("loop-foreign", W);
+        unbind_loop(binding.minor);
+        let foreign_path = std::env::temp_dir().join(format!(
+            "b4-loop-foreign-replacement-{}.img",
+            std::process::id()
+        ));
+        let foreign = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&foreign_path)
+            .unwrap();
+        foreign.set_len(W).unwrap();
+        let foreign_meta = foreign.metadata().unwrap();
+        let device = format!("/dev/loop{}", binding.minor);
+        let bound = losetup(&[
+            "--sizelimit",
+            "16777216",
+            device.as_str(),
+            foreign_path.to_str().unwrap(),
+        ]);
+        let replacement = current_generation(binding.minor);
+        let outcome = detach_loop(&binding, Some(&journaled));
+        let present = recorded_loop_present(&binding, Some(&journaled));
+        let intent_only = detach_loop(&binding, None);
+        let intent_present = recorded_loop_present(&binding, None);
+        let earlier_boot = LoopGeneration {
+            boot_id: "00000000-0000-4000-8000-000000000000".into(),
+            diskseq: journaled.diskseq,
+        };
+        let other_boot = detach_loop(&binding, Some(&earlier_boot));
+        let other_boot_present = recorded_loop_present(&binding, Some(&earlier_boot));
+        let still = std::fs::read_to_string(format!(
+            "/sys/block/loop{}/loop/backing_file",
+            binding.minor
+        ));
+        unbind_loop(binding.minor);
+        drop((foreign, original));
+        std::fs::remove_file(&foreign_path).unwrap();
+        std::fs::remove_file(&backing).unwrap();
+
+        assert!(bound, "losetup onto the freed slot");
+        assert_ne!(
+            (foreign_meta.dev(), foreign_meta.ino()),
+            (binding.backing_dev, binding.backing_ino)
+        );
+        let replacement = replacement.unwrap();
+        assert_ne!(replacement.diskseq, journaled.diskseq);
+        assert_eq!(outcome.unwrap(), LoopOutcome::Unknown);
+        assert!(present.unwrap(), "the journaled slot reads as present");
+        assert_eq!(intent_only.unwrap(), LoopOutcome::NotOurs);
+        assert!(!intent_present.unwrap(), "an intent-only candidate slot");
+        assert_eq!(other_boot.unwrap(), LoopOutcome::Free);
+        assert!(!other_boot_present.unwrap(), "another boot's generation");
+        assert_eq!(
+            still.unwrap().trim(),
+            foreign_path.to_str().unwrap(),
+            "the replacement survived"
+        );
+        eprintln!(
+            "B4 evidence: loop{} rebound to another inode, diskseq {} != journaled {}: \
+             Unknown, present and left bound; intent-only NotOurs kept",
+            binding.minor, replacement.diskseq, journaled.diskseq
         );
     }
 

@@ -60,13 +60,15 @@ impl Node {
             .unwrap()
             .get(&key)
             .is_none_or(|entry| entry.stop_fenced);
-        // Observations and child identities are evidence, recorded even after a fence,
-        // but they never authorize a further effect.
+        // Observations, child identities and a cleanup's loop release are evidence,
+        // recorded even after a fence (a cleanup S is always fenced), but they never
+        // authorize a further effect.
         let evidence_only = matches!(
             record,
             SupervisorRecord::Observed(_)
                 | SupervisorRecord::InferredFromRetainedFd(_)
                 | SupervisorRecord::Child { .. }
+                | SupervisorRecord::Resource(ResourceRecord::LoopReleased { .. })
         );
         let lane = Lane::Normal;
         let ok = match record {
@@ -244,7 +246,7 @@ impl Node {
         .unwrap_or(Err(CallError::Full))
     }
 
-    async fn allocation_state(
+    pub(super) async fn allocation_state(
         &self,
         key: AllocationKey,
         deadline: WireDeadline,

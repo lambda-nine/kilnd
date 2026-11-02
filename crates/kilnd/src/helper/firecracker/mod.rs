@@ -3196,11 +3196,31 @@ impl Node {
         if let Err(reply) = self.settle_permits(&token).await {
             return reply;
         }
+        // A journaled allocation's loop slots are observed on the slots themselves: a
+        // replacement there need not be backed inside the work directory (section 7.1).
+        let mut recorded = supervisor::RecordedResources::default();
+        if !never_admitted {
+            match self.allocation_state(token.key(), token.deadline).await {
+                Ok(Some(state)) => {
+                    for record in &state.resources {
+                        recorded.absorb(record);
+                    }
+                }
+                Ok(None) => {
+                    return ambiguous_fence(
+                        AmbiguousClass::LedgerUnavailable,
+                        "an active token has no journal record",
+                    );
+                }
+                Err(reason) => return ambiguous_fence(AmbiguousClass::LedgerUnavailable, reason),
+            }
+        }
         let observation = self
             .prep_call(
                 PrepRequest::ObserveAllocation {
                     instance: token.instance,
                     allocation: token.allocation,
+                    loops: recorded.loops,
                 },
                 token.deadline,
             )

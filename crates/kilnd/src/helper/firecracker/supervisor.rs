@@ -71,6 +71,15 @@ pub enum ResourceRecord {
         binding: LoopBinding,
         generation: LoopGeneration,
     },
+    /// Cleanup proved the journaled generation gone from its slot: it detached it, or
+    /// found the slot free. Whatever that slot holds afterwards is not this
+    /// allocation's, so a retry or the absence observation never mistakes a later
+    /// attachment there for a replacement. Evidence, not authority: recorded after the
+    /// stop fence too.
+    LoopReleased {
+        binding: LoopBinding,
+        generation: LoopGeneration,
+    },
     /// The jail tmpfs's source and marker nonce, journaled before it is created.
     JailIntent(JailIdentity),
     /// The detached tmpfs's unique mount ID, journaled before it is attached.
@@ -92,6 +101,7 @@ impl ResourceRecord {
             Self::PrivateFiles { .. } => "private_files",
             Self::LoopIntent(_) => "loop_intent",
             Self::Loop { .. } => "loop",
+            Self::LoopReleased { .. } => "loop_released",
             Self::JailIntent(_) => "jail_intent",
             Self::JailMount(_) => "jail_mount",
             Self::JailBinds(_) => "jail_binds",
@@ -131,6 +141,7 @@ impl RecordedResources {
                     self.loops.push(RecordedLoop {
                         binding: *binding,
                         generation: None,
+                        released: false,
                     });
                 }
             }
@@ -138,12 +149,29 @@ impl RecordedResources {
                 binding,
                 generation,
             } => match self.loops.iter_mut().find(|l| l.binding == *binding) {
-                Some(recorded) => recorded.generation = Some(generation.clone()),
+                Some(recorded) => {
+                    recorded.generation = Some(generation.clone());
+                    recorded.released = false;
+                }
                 None => self.loops.push(RecordedLoop {
                     binding: *binding,
                     generation: Some(generation.clone()),
+                    released: false,
                 }),
             },
+            // Only the exact journaled generation is released.
+            ResourceRecord::LoopReleased {
+                binding,
+                generation,
+            } => {
+                if let Some(recorded) = self
+                    .loops
+                    .iter_mut()
+                    .find(|l| l.binding == *binding && l.generation.as_ref() == Some(generation))
+                {
+                    recorded.released = true;
+                }
+            }
             ResourceRecord::JailIntent(identity) => self.jail = Some(identity.clone()),
             ResourceRecord::JailMount(mount) => self.jail_mount = Some(mount.clone()),
             ResourceRecord::JailBinds(binds) => self.jail_binds = Some(binds.clone()),
@@ -158,6 +186,9 @@ impl RecordedResources {
 pub struct RecordedLoop {
     pub binding: LoopBinding,
     pub generation: Option<LoopGeneration>,
+    /// Cleanup journaled that this generation is gone (`loop_released`).
+    #[serde(default)]
+    pub released: bool,
 }
 
 /// The parts of a verified plan S acts on, parsed once.
@@ -1453,25 +1484,53 @@ mod linux {
             },
         )?;
         link.step("cleanup_loop")?;
-        for recorded_loop in &recorded.loops {
+        // Generations this cleanup detached or found gone: their slots may be bound
+        // again by anyone from that moment, and that is not ours.
+        let mut released = Vec::new();
+        for recorded_loop in recorded.loops.iter().filter(|l| !l.released) {
             let binding = &recorded_loop.binding;
-            match storage::detach_loop(binding, recorded_loop.generation.as_ref())? {
-                storage::LoopOutcome::Detached
-                | storage::LoopOutcome::Free
-                | storage::LoopOutcome::NotOurs => {}
-                storage::LoopOutcome::Unknown => {
+            let generation = recorded_loop.generation.as_ref();
+            match storage::detach_loop(binding, generation)? {
+                storage::LoopOutcome::Detached | storage::LoopOutcome::Free => {
+                    link.after("loop_detach");
+                    if let Some(generation) = generation {
+                        link.record(SupervisorRecord::Resource(ResourceRecord::LoopReleased {
+                            binding: *binding,
+                            generation: generation.clone(),
+                        }))?;
+                    }
+                    released.push(*binding);
+                }
+                // Another backing file in a slot that only an intent names: possibly
+                // another allocation's, never touched.
+                storage::LoopOutcome::NotOurs if generation.is_none() => {}
+                storage::LoopOutcome::NotOurs | storage::LoopOutcome::Unknown => {
                     return Err(Abort::Refused(format!(
-                        "loop{} holds our backing file but not the journaled generation",
+                        "loop{} is bound but not as the journaled generation",
                         binding.minor
                     )));
                 }
             }
         }
-        // A slot backed in our directory that no record names: refused, never guessed.
-        let leftover = storage::loops_backed_in(&plan.paths.work_dir)?;
+        // The journaled slots themselves, by major and minor, then any slot backed in our
+        // directory that no record names: refused, never guessed.
+        let mut leftover = std::collections::BTreeSet::new();
+        for recorded_loop in recorded
+            .loops
+            .iter()
+            .filter(|l| !l.released && !released.contains(&l.binding))
+        {
+            if storage::recorded_loop_present(
+                &recorded_loop.binding,
+                recorded_loop.generation.as_ref(),
+            )? {
+                leftover.insert(recorded_loop.binding.minor);
+            }
+        }
+        leftover.extend(storage::loops_backed_in(&plan.paths.work_dir)?);
         if !leftover.is_empty() {
             return Err(Abort::Refused(format!(
-                "unrecorded loop slots remain: {leftover:?}"
+                "loop slots remain bound: {leftover:?}"
             )));
         }
         link.step("cleanup_files")?;
