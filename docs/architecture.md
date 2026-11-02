@@ -195,7 +195,9 @@ patched jailer by retained descriptor through a bootstrap gate, adopts and valid
 VMM, hardens the jail and journals BOOTING; every resource is journaled through L before
 or as S owns it. Stop, Remove and scoped Gc contain through K's pinned-inode
 `cgroup.kill`, clean up through a journaled cleanup-only S, and release only through the
-existing ABSENT fence after a real namespace observation. Production still serves no
+existing ABSENT fence after a real namespace observation. Cleanup acts only on exact
+journaled identities (the jail tmpfs's source and marker nonce, its binds, the loop
+slot's full tuple) and refuses anything else, so it stays charged. Production still serves no
 profile and nothing reports READY.
 
 ## State machine

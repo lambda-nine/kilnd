@@ -181,7 +181,11 @@ sandbox compromises the host.
   which loop allows any writer, did not re-enable hole punching), and cannot touch the
   backing file. The jailer's extra capabilities (`CAP_MKNOD`, `CAP_SYS_CHROOT`,
   `CAP_SETPCAP`) reach only S and its jailer: every other helper worker and kiln child
-  drops them. kiln itself remains experimental shared-kernel isolation, not a boundary
+  drops them, verifies every capability set and exits rather than continue on any
+  failure. Cleanup unmounts and detaches only by exact journaled identity: a jail tmpfs's
+  allocation-specific source and root-only marker nonce, its recorded binds, and a loop
+  slot's full tuple. Mount IDs and inode numbers are reused, so a replacement at the same
+  path is refused and left in place, and the allocation stays charged. kiln itself remains experimental shared-kernel isolation, not a boundary
   for hostile multi-tenant workloads.
 - **A compromised service account cannot take over another instance.** Root enrolls each
   instance under its own Unix account, with its unit and image, and attachment proves all

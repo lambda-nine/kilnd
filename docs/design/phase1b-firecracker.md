@@ -571,17 +571,17 @@ After the node-global C2 claim and real free-space check, P uses `openat(O_CREAT
 
 `-K` prevents discard undoing preallocation. Format only the new inode before exposure; verify identity before/after and sync file/parent. Never mkfs/repair a disk after a guest has written it. The backing file stays root-owned 0600 and inaccessible to jail UID/GID.
 
-Expose the work volume as a **helper-owned loop block device**, size limit exactly W, rather than a writable regular backing file inside the jail. Persist LOOP_INTENT with the chosen slot's major/minor, backing device/inode, offset=0 and size limit **before** LOOP_CONFIGURE/binding, then persist the verified attachment before exposure. An unexpectedly busy slot is a conflict, never permission to replace its backing. Binding, cleanup and crash recovery validate all of those identities. Bind only the device node as `/work`, owned U:G and mode 0600; no loop-control device, host `/dev` directory or backing-file path enters the jail. The unprivileged VMM cannot grow/truncate the root-owned backing file or resize the block device. Disable discard/unmap paths that could punch holes in the allocation guarantee. B4 must prove the pinned Firecracker synchronous block backend accepts this fixed-size block device and cannot enlarge/rebind it under the VMM credentials/seccomp; an unsupported backend fails closed, without a regular-file fallback. Loop attachment is privileged typed storage work, never a caller-selected device.
+Expose the work volume as a **helper-owned loop block device**, size limit exactly W, rather than a writable regular backing file inside the jail. Persist LOOP_INTENT with the chosen slot's major/minor, backing device/inode, offset=0, size limit and logical block size (512) **before** LOOP_CONFIGURE/binding, then persist the verified attachment before exposure. An unexpectedly busy slot is a conflict, never permission to replace its backing. Binding, cleanup and crash recovery validate all of those identities: before LOOP_CLR_FD, on the same opened slot descriptor that then detaches it, cleanup requires the full recorded tuple, including the kernel's `BLKGETSIZE64` and `BLKSSZGET`. The recorded backing inode bound with any other offset, size limit or block size is Unknown: left bound and charged, never detached. Bind only the device node as `/work`, owned U:G and mode 0600; no loop-control device, host `/dev` directory or backing-file path enters the jail. The unprivileged VMM cannot grow/truncate the root-owned backing file or resize the block device. Disable discard/unmap paths that could punch holes in the allocation guarantee. B4 must prove the pinned Firecracker synchronous block backend accepts this fixed-size block device and cannot enlarge/rebind it under the VMM credentials/seccomp; an unsupported backend fails closed, without a regular-file fallback. Loop attachment is privileged typed storage work, never a caller-selected device.
 
 Guest init mounts vdb at `/var/lib/kiln/runs` with `nosuid,nodev,noexec,prjquota`. Kiln's persistent sandbox project quota bounds blocks and inodes, probed before Ready. Test direct work-path execution denied and normal overlay execution allowed. Guest root can bypass its inner quota but cannot exceed W; this is a physical outer bound, not trust in guest enforcement.
 
-**Every writable jail byte and inode is bounded from the first jailer write.** Before launching J, S mounts the entire jail root as private tmpfs with `size=16M,nr_inodes=1024,mode=0700,nosuid`. Charge its pages/metadata to the allocation; include its full 16 MiB in the provisional host memory allowance. Executing the VMM and accessing KVM require exec/device access, so do not falsely specify noexec/nodev on this whole mount. Kernel/rootfs/config/identity are verified read-only bind mounts; `/work` is the bounded block device. No other writable bind, host filesystem or external logging path exists. The VMM executable is a read-only bind of the retained approved inode, not a writable jailer copy; check that remaining cache/control files fit the cap before accepting this profile. Node metadata and immutable-store headroom are reserved separately below.
+**Every writable jail byte and inode is bounded from the first jailer write.** Before launching J, S mounts a private tmpfs with `size=16M,nr_inodes=1024,mode=0700,nosuid` on the allocation's jail directory, so the entire jail root (a directory on it) lies inside the bound. The mount carries an allocation-specific identity journaled before it exists: source `kilnd-jail-<nonce>` and, beside the jail root and outside the VMM's chroot, a root-only 0400 marker holding the same random 128-bit nonce. The tmpfs is created detached (`fsopen`/`fsmount`), its marker and jail root are written there, and only then is it attached onto the jail directory's descriptor (`move_mount`), so no crash leaves a mount without its identity. Charge its pages/metadata to the allocation; include its full 16 MiB in the provisional host memory allowance. Executing the VMM and accessing KVM require exec/device access, so do not falsely specify noexec/nodev on this whole mount. Kernel/rootfs/config/identity are verified read-only bind mounts; `/work` is the bounded block device. No other writable bind, host filesystem or external logging path exists. The VMM executable is a read-only bind of the retained approved inode, not a writable jailer copy; check that remaining cache/control files fit the cap before accepting this profile. Node metadata and immutable-store headroom are reserved separately below.
 
 The pinned jailer chowns `/`, `/dev`, `/dev/net` and `/run` to its UID, so root ownership before launch alone is insufficient. After J's expected exit and V's identity validation, S stops V through its pidfd. It hardens the root, `/dev` and `/dev/net` to root-owned 0755 and cache files to root-owned 0444, preserving only the explicitly needed device-node U:G access. It independently verifies that `/firecracker` remains the root-owned 0555 read-only bind of the expected inode, leaves only `/run` writable by U:G, checks the resulting mount tree and resumes V. Do this before Ready; a missing/failed hardening step retires the VM. Even a malicious pre-hardening VMM, a retained writable FD or unexpected path creation remains bounded by the **whole-jail** tmpfs cap. Fixed artifact mounts are read-only independent of chmod. All walks/hardening use pinned directory descriptors, no-follow opens and mount IDs; reject replacement entries instead of following links.
 
 An optional host XFS project quota can narrow the host session-storage allowance, but is not its security mechanism. Portability relies on the preallocated root-only W backing file, exact-size loop exposure, mandatory whole-jail tmpfs byte/inode cap and fixed-size helper metadata. Fill files, sockets and inodes as U:G in B4 and show the node journal/recovery headroom stays available. Quota/ENOSPC faults retire only the affected allocation and never relax these limits.
 
-Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no lazy unmount as absence proof), detaches the loop device with verified backing identity, proves no pending loop attachment/holder, removes the private backing file and bounded control files, syncs parents and removes the empty cgroup. A crash after loop setup but before recorded attachment requires inventory of the reserved slot/backing identity; ambiguity stays charged. Refuse unknown inodes/mounts/devices. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
+Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no lazy unmount as absence proof) only after proving each is the journaled one immediately before its own unmount, detaches the loop device with the verified full binding tuple, proves no pending loop attachment/holder, removes the private backing file and bounded control files, syncs parents and removes the empty cgroup. A crash after loop setup but before recorded attachment requires inventory of the reserved slot/backing identity; ambiguity stays charged. Refuse unknown inodes/mounts/devices. A mount is the allocation's only by its journaled source and marker (and its recorded tuple, once recorded), never by its deterministic path: the kernel reuses mount IDs and inode numbers, so a fresh replacement can match the whole `{mount_id, st_dev, st_ino}` tuple. After recovery, any loss of that identity is Unknown and stays charged. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
 
 ## 7.2 Durable reservation vector
 
@@ -1350,10 +1350,13 @@ S, opens S's gate with the verified plan, and S:
    `LOOP_CONFIGURE`s, verifies the binding with `LOOP_GET_STATUS64` and `BLKGETSIZE64`,
    sets the slot's `discard_max_bytes` to 0 and journals the attachment. A busy slot is a
    conflict and another free slot gets its own intent;
-6. creates the jail directory, mounts the private tmpfs (`size=16M,nr_inodes=1024,mode=0700`,
-   `nosuid`) and journals its mount ID, bind-mounts kernel, root, config, identity and the
-   retained VMM inode read-only from their descriptors' `/proc/self/fd` links, and creates
-   the `/work` node;
+6. creates the jail directory, journals the jail intent (a fresh nonce: tmpfs source
+   `kilnd-jail-<nonce>` and marker), builds the private tmpfs (`size=16M,nr_inodes=1024,
+   mode=0700`, `nosuid`) detached with its root-only marker and jail root, attaches it onto
+   the jail directory and journals its mount ID, device and the tmpfs and jail-root inodes
+   (revised after the break-it review, below), bind-mounts kernel, root, config, identity
+   and the retained VMM inode read-only from their descriptors' `/proc/self/fd` links,
+   journals the five binds' mount IDs and inodes, and creates the `/work` node;
 7. journals SPAWN_INTENT, forks the gated launch child, journals J's identity and releases
    it. The child joins `vm/vmm` (proved by `/proc/self/cgroup`), unshares an empty network
    namespace, sets core limit 0, umask 077, `/dev/null` stdin and the console pipe, then
@@ -1419,7 +1422,8 @@ Gc runs Remove only for this instance's named allocations that are stopped or pr
   append-only `resource_events` table with B3's guard triggers. No B3 ledger has shipped; an
   earlier one fails its schema audit, closed.
 - **Test seams** are `cfg(test)` only: fault markers, a ptrace exec stop that lets S read the
-  short-lived formatter's `/proc` exe, a credential perturbation, a console dump and the
+  short-lived formatter's `/proc` exe (production records the formatter as inferred from its
+  retained descriptor instead, below), a credential perturbation, a console dump and the
   `TestDispatchProbe` operation that exposes the dispatch fence a later Exec must consult.
   The root tests' helper image is the static test binary itself, installed in the protected
   store and executed from it, so H's self-check and every fork-only worker's image are real.
@@ -1430,7 +1434,7 @@ VM by `scripts/b4-vm-tests.sh` under exactly the helper unit's bounding set; raw
 
 | B4 exit criterion | Test | Result on November 2, 2026 |
 |---|---|---|
-| Real teardown at every crash boundary leaves no owned VM, loop, mount, worker or file once ABSENT is reported | `b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left` (17 step boundaries, 8 effect-before-record boundaries, S killed after BOOTING, helper killed while BOOTING and during mkfs) and `b4_linux_root_create_boots_and_remove_leaves_nothing` | Passed: each boundary stayed charged until ABSENT, and an independent host check found nothing left |
+| Real teardown at every crash boundary leaves no owned VM, loop, mount, worker or file once ABSENT is reported | `b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left` (17 step boundaries, 8 effect-before-record boundaries, 18 and 9 after the break-it corrections, S killed after BOOTING, helper killed while BOOTING and during mkfs) and `b4_linux_root_create_boots_and_remove_leaves_nothing` | Passed: each boundary stayed charged until ABSENT, and an independent host check found nothing left |
 | Killing S before and after J exits, with H healthy, fences at once, contains the live VMM and admits no new dispatch; J's zero exit is not V's | `b4_linux_root_supervisor_death_before_and_after_jailer_exit_fences_and_contains` | Passed: V exited 5–11 ms after SIGKILL of S; a J released only after S died was contained before any boot; V's own death fenced |
 | Real UID, GID, Groups and every capability mask; a bounding-set mismatch stops the launch | `b4_linux_root_real_credentials_and_a_bounding_mismatch_stops_the_launch` | Passed for an unequal (300101/300201) and an equal (300301/300301) pair: empty Groups, all five masks zero, NoNewPrivs 1, Seccomp 2; one bounding bit refused before BOOTING |
 | VMM-credential byte, inode, socket, symlink and work-resize attacks hit the mandatory bounds without consuming journal headroom | `b4_linux_root_vmm_credential_attacks_hit_the_mandatory_bounds` | Passed: 16,732,160 bytes then ENOSPC, 952 inodes then ENOSPC, no write outside `/run`, binds read-only, `/work` stayed W with BLKDISCARD and hole punching refused (also after LOOP_SET_STATUS64), W stayed allocated, ledger filesystem unchanged |
@@ -1450,3 +1454,118 @@ VM by `scripts/b4-vm-tests.sh` under exactly the helper unit's bounding set; raw
   itself; nothing allocation-owned remains in them after ABSENT.
 - **Exec and READY are B5's.** `TestDispatchProbe` exposes the dispatch fence; the
   interrupted-dispatch case has nothing to interrupt until Exec exists.
+
+## B4 break-it corrections (November 2, 2026)
+
+Daybreak Blue's B4 review (`reviews/2026-11-02-b4-breakit.md`, PoCs in `reviews/poc-b4/`)
+found destructive cleanup acting on replacements, a fail-open capability path, unpinned
+build inputs and mislabelled formatter evidence. All five findings are accepted and fixed
+in the direction the review gave; launch and containment were not changed.
+
+**1. Jail mount identity.** The shared `kilnd-jail` tag is gone. Each allocation's tmpfs has
+the journaled identity of section 7.1: S records `jail_intent` (a fresh 128-bit nonce) before
+mounting, builds the tmpfs detached with `fsopen`/`fsconfig`/`fsmount`, writes the root-only
+0400 marker `.kilnd-jail` and the jail root `root/` into it, and `move_mount`s it onto the
+jail directory's descriptor, then makes exactly that mount private through its own
+descriptor. So the tmpfs now sits at `fc-<H>` rather than at `fc-<H>/root`. The jail root is
+a directory on it, still entirely inside the 16 MiB/1024-inode bound (the marker and root
+directory cost two inodes and one page), and the marker is outside the VMM's chroot, so a
+pre-hardening VMM cannot remove or rewrite it. The frozen contract's `"root": "tmpfs"` and
+its mount data are unchanged; the bootstrap's `jail_root_identity` is the jail root
+directory's statx tuple, which the patched jailer already checks. `JailMount` records
+`mount_id`, `st_dev`, the tmpfs root's `st_ino` and the jail root's `root_ino`, and the
+binds are journaled as `jail_binds` (name, mount ID and the bound file's device and inode).
+The ledger's `resource_events.kind` accepts `jail_intent` and `jail_binds`. Cleanup
+(`storage::unmount_jail`) checks the whole tree before changing anything, and again
+immediately before each unmount:
+
+- the jail directory has exactly one mount, a tmpfs with the journaled source;
+- a fresh no-follow descriptor on it has that mount ID and the recorded tuple, once recorded;
+- its marker is the root-only single-link file holding exactly the journaled nonce;
+- every nested mount is a contract bind name directly on that tmpfs (parent ID), read-only,
+  and equal to its `jail_binds` record when there is one. A bind made before its record
+  is ours by name on our verified tmpfs.
+
+Nothing mounted is nothing to do (a restarted production helper's mounts died with its
+namespace). A mount with no journaled identity, another source, a missing or foreign
+marker, a changed tuple or any unknown nested mount is refused and left in place, so the
+allocation stays charged; ownership is never inferred from the path. A live S holds the
+mounted jail directory open, so a non-lazy unmount of it fails under its owner. New
+boundaries `S.step.jail_mount` (after the intent, before the mount) and `S.after.binds`
+join the crash matrix, and the stall test stalls `jail_mount`, the real mount.
+
+**2. Loop tuple.** `LoopBinding` gains `block_size` (512, set by `LOOP_CONFIGURE`).
+`verify_loop` and `detach_loop` share one comparison on one opened slot descriptor:
+major/minor, backing device/inode, offset, size limit, `BLKGETSIZE64` and `BLKSSZGET`.
+Detach issues `LOOP_CLR_FD` on that same descriptor only for an exact match. Another backing
+file stays NotOurs, as before. Our inode with any other offset, size limit or block size is
+the new `LoopOutcome::Unknown`: left bound, and cleanup refuses, so the allocation stays
+charged.
+
+**3. Capability drop.** `process::drop_firecracker_launch_capabilities` returns a Result
+and checks every `prctl`, `capget` and `capset`. It reads each bounding bit, drops it
+(CAP_SETPCAP last), lowers the ambient bits and clears effective/permitted/inheritable, then
+re-reads every set from the kernel and fails unless CAP_MKNOD, CAP_SYS_CHROOT and CAP_SETPCAP
+are absent from all five. L, P, M and K call `require_firecracker_launch_capabilities_dropped`,
+which `_exit(76)`s before their loop on any error. A backend child's pre-exec hook returns the
+error, so the exec never happens. One conservative reading: a process without CAP_SETPCAP in
+its permitted set (an unprivileged test runner) cannot drop bounding bits at all. It holds
+none of the three in any other set, so it gets `PR_SET_NO_NEW_PRIVS`, verified, which keeps a
+later exec from raising them. The helper runs as root with CAP_SETPCAP, so it always takes the
+strict path.
+
+**4. Build provenance.** `scripts/build-phase1b-tools.sh` takes the mkfs sysroot from
+`deploy/firecracker/mkfs-sysroot.lock`: six exact arm64 debs (util-linux 2.39.3-9ubuntu6.6,
+liburcu 0.14.0-3.1build1, libinih 55-1ubuntu2), each SHA-256 pinned and fetched by file
+name from Launchpad's primary-archive file store. snapshot.ubuntu.com answers 401 for
+`ubuntu-ports`, so it cannot serve arm64; nothing comes from `apt-get` or host package
+indexes. The patch must equal `PATCH_SHA256` whatever `--patch` names, and each output must
+equal `JAILER_SHA256`/`MKFS_SHA256` before it is moved into OUT. The pinned sysroot reproduces
+the approved digests, so neither changed: jailer
+`42e9dea3ed1b94292464c9af0286ea0eaf09934ac0b92b439fc3e76b55e8ad11`, mkfs.xfs
+`9571cecc3e015742c19d1e762fb4389b15f7ff0746f52af55fd2879c96e160ab`, patch
+`e54547ff520a91a25f4b292f450163f972505a383374f23b099a4f4414b0ff5d`. Compilers stay the host's
+(Rust 1.97.0 from the Firecracker tree, Ubuntu noble gcc); a compiler change that alters an
+output now fails the digest check instead of producing another binary.
+
+**5. Formatter evidence.** Production no longer records the expected mkfs.xfs tuple as
+`Observed`. The formatter child gets a close-on-exec report pipe. A failed `execveat` writes
+its errno and the launch is refused with no evidence recorded. Only a confirmed exec (the
+pipe closes unwritten) lets S send the new `SupervisorRecord::InferredFromRetainedFd`, which L
+checks under the same exact-match rule. `executable_leases.observation` says how each
+observed tuple is known: `proc_exe` (read from the running image: J, V, and the formatter
+under the test exec stop) or `retained_fd` (inferred from the confirmed exec of the verified
+descriptor), and it cannot change once set. Recovery and Gc do not consult observed tuples;
+the live checks that refuse a launch are unchanged.
+
+**Regressions.** The PoCs are now root tests run by `scripts/b4-vm-tests.sh`:
+`storage::tests::b4_linux_root_cleanup_refuses_a_replacement_jail_mount` (a replacement
+tmpfs with the allocation's own source, a foreign marker, no journaled identity, a foreign
+nested mount and a mismatched bind record are refused and left mounted; the genuine tree is
+removed), `storage::tests::b4_linux_root_detach_refuses_the_same_inode_with_another_loop_tuple`
+(offset, size limit, both, and block size), and
+`process::tests::b4_linux_root_worker_capability_drop_fails_closed` (seccomp-injected
+`capget`, `capset` and `prctl` failures and a `capset` that claims success without acting
+each exit 76 before worker code; the strict root drop clears all five sets). The real-chain
+stale-resource test adds the work file rebound with another offset or size limit and a
+replacement jail tmpfs carrying the allocation's own source. The create test checks the
+evidence kinds, and the unprivileged `launch_capability_drop_is_verified_in_every_set` runs
+in CI.
+
+**Results (November 2, 2026, in `kiln`, raw output in `reviews/2026-11-02-b4-fixes-vm/`).**
+`scripts/b4-vm-tests.sh` ran all 13 root tests: the ten exit tests above with the new
+cases and boundaries, and the three new regressions. The 13 are ten lifecycle, two storage
+and one process test. Twelve passed at `a1ccd10`. The capability regression first failed
+on a test defect: it read `/proc/self/status`, but capability sets are per thread and
+libtest runs the child case on a worker thread. It passed at `6d84364`, which reads
+`/proc/thread-self/status`; the mount-replacement test was rerun there too. The kernel
+again handed the replacement tmpfs the recorded tuple (`mount_id 127, st_dev 50, st_ino
+1`); cleanup refused it because the marker was not there. Each injected capability
+fault exited 76 before any worker code, and the strict root drop left exactly the pre-B4
+set (`0x2010eb`) in every mask. After each run the cleanup check found no owned VMM,
+loop, mount, cgroup or file. With `6d84364` installed, the earlier privileged suites passed
+again: `integration-test.sh`, `daemon-singleton-regressions.sh`, `state-path-regressions.sh`,
+`phase0-regressions.py` (the helper's set with the jailer capabilities), `smoke.sh`,
+`kilnd-maintenance-tests.py`, `deployment-regressions.py` between two builds and its
+`--reboot-arm graceful`/`--reboot-verify` around a real reboot. The VM was then restored
+to installed main `734e275` with its schema-7 database.

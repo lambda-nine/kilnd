@@ -6,6 +6,17 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B4 break-it corrections. Cleanup acts only on exact journaled identity: each jail
+  tmpfs gets an allocation-specific source and a root-only nonce marker, journaled before it
+  is mounted, and is built detached and attached whole. Its binds are journaled, and every
+  mount is re-verified just before its unmount. Loop detach requires the full recorded tuple,
+  block size included, on the descriptor that issues `LOOP_CLR_FD`. Mismatches are refused
+  and stay charged. Helper workers and kiln children verify the launch-capability drop in
+  every set and exit on any failure. The tool build pins its sysroot debs
+  (`deploy/firecracker/mkfs-sysroot.lock`), the patch and both output digests. The
+  formatter's tuple is recorded as inferred from its retained descriptor
+  (`observation = retained_fd`) after a confirmed exec, not as observed. The ledger keeps
+  schema 1: a B4 ledger must be provisioned again.
 - Phase 1b B4: real Firecracker host lifecycle in `kilnd-helper`, test-approved only. S
   creates the allocation's cgroup tree, a fully preallocated XFS work disk exposed through a
   fixed-size loop device with discard disabled, and a bounded private tmpfs jail with
