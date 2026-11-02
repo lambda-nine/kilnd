@@ -649,7 +649,11 @@ async fn b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left() {
             "cgroup",
             "work_file",
             "loop_configure",
+            "loop_record",
+            "jail_record",
             "jail",
+            "bind_record",
+            "first_bind",
             "binds",
             "fork_jailer",
             "continue_jailer",
@@ -1522,7 +1526,7 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
         .resources(context.allocation_id)
         .into_iter()
         .find_map(|record| match record {
-            super::super::supervisor::ResourceRecord::Loop(binding) => Some(binding),
+            super::super::supervisor::ResourceRecord::Loop { binding, .. } => Some(binding),
             _ => None,
         })
         .unwrap();
@@ -1584,7 +1588,7 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
         .resources(context.allocation_id)
         .into_iter()
         .find_map(|record| match record {
-            super::super::supervisor::ResourceRecord::Loop(binding) => Some(binding),
+            super::super::supervisor::ResourceRecord::Loop { binding, .. } => Some(binding),
             _ => None,
         })
         .unwrap();
@@ -1621,6 +1625,40 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
         eprintln!("B4 evidence: same work inode, different {label}: refused, left bound");
         unbind().await;
     }
+    // B4 recheck finding 2: the exact journaled tuple, rebound to the same slot and work
+    // inode, is another attachment generation. Only its disk sequence number differs.
+    let generation = real
+        .resources(context.allocation_id)
+        .into_iter()
+        .find_map(|record| match record {
+            super::super::supervisor::ResourceRecord::Loop { generation, .. } => Some(generation),
+            _ => None,
+        })
+        .unwrap();
+    let exact = binding.size_limit.to_string();
+    assert!(
+        Command::new("losetup")
+            .args(["--sizelimit", exact.as_str(), device.as_str(), paths.work_file.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    storage::verify_loop(&binding).unwrap();
+    let rebound = storage::current_generation(binding.minor).unwrap();
+    assert_ne!(rebound.diskseq, generation.diskseq);
+    let reply = remove(&real, &runtime, &context).await;
+    assert!(!is_absent(&reply), "same tuple, new generation: {reply:?}");
+    assert_eq!(
+        std::fs::read_to_string(&backing_file).unwrap().trim(),
+        paths.work_file.to_str().unwrap(),
+        "the rebinding was detached"
+    );
+    assert!(claim_held(&real, context.allocation_id), "a new generation: charged");
+    eprintln!(
+        "B4 evidence: same tuple rebound, diskseq {} != journaled {}: refused, left bound",
+        rebound.diskseq, generation.diskseq
+    );
+    unbind().await;
     remove_to_absent(&real, &runtime, &context, "after the retuned loop slot").await;
     // B4 break-it finding 1: a fresh tmpfs mounted in place of the allocation's own,
     // carrying the allocation's own source string, is refused and left mounted.

@@ -14,6 +14,7 @@ use super::executable::{self, Role};
 use super::storage;
 use super::storage::{
     AllocationPaths, BindMount, Credentials, FileIdentity, JailIdentity, JailMount, LoopBinding,
+    LoopGeneration,
 };
 use super::workers::{
     ProcessId, Received, SupervisorCommand, SupervisorContext, SupervisorEvent, fault_point,
@@ -64,11 +65,18 @@ pub enum ResourceRecord {
         config: FileIdentity,
     },
     LoopIntent(LoopBinding),
-    Loop(LoopBinding),
-    /// The jail tmpfs's source and marker nonce, journaled before it is mounted.
+    /// The attachment's generation, journaled while it is still an autoclear binding
+    /// held by S's configuring descriptor.
+    Loop {
+        binding: LoopBinding,
+        generation: LoopGeneration,
+    },
+    /// The jail tmpfs's source and marker nonce, journaled before it is created.
     JailIntent(JailIdentity),
+    /// The detached tmpfs's unique mount ID, journaled before it is attached.
     JailMount(JailMount),
-    /// The five read-only artifact binds, journaled once they exist.
+    /// The five detached read-only clones' unique mount IDs, journaled before any is
+    /// attached.
     JailBinds(Vec<BindMount>),
     Vmm {
         process: ProcessId,
@@ -83,7 +91,7 @@ impl ResourceRecord {
             Self::WorkFile(_) => "work_file",
             Self::PrivateFiles { .. } => "private_files",
             Self::LoopIntent(_) => "loop_intent",
-            Self::Loop(_) => "loop",
+            Self::Loop { .. } => "loop",
             Self::JailIntent(_) => "jail_intent",
             Self::JailMount(_) => "jail_mount",
             Self::JailBinds(_) => "jail_binds",
@@ -100,8 +108,9 @@ pub struct RecordedResources {
     pub work_file: Option<FileIdentity>,
     pub identity_file: Option<FileIdentity>,
     pub config_file: Option<FileIdentity>,
-    /// Every loop slot ever intended for this allocation, attached or not.
-    pub loops: Vec<LoopBinding>,
+    /// Every loop slot ever intended for this allocation, attached or not, with the
+    /// attachment's generation once it was journaled.
+    pub loops: Vec<RecordedLoop>,
     pub jail: Option<JailIdentity>,
     pub jail_mount: Option<JailMount>,
     pub jail_binds: Option<Vec<BindMount>>,
@@ -117,17 +126,38 @@ impl RecordedResources {
                 self.identity_file = Some(*identity);
                 self.config_file = Some(*config);
             }
-            ResourceRecord::LoopIntent(binding) | ResourceRecord::Loop(binding) => {
-                if !self.loops.contains(binding) {
-                    self.loops.push(*binding);
+            ResourceRecord::LoopIntent(binding) => {
+                if !self.loops.iter().any(|l| l.binding == *binding) {
+                    self.loops.push(RecordedLoop {
+                        binding: *binding,
+                        generation: None,
+                    });
                 }
             }
+            ResourceRecord::Loop {
+                binding,
+                generation,
+            } => match self.loops.iter_mut().find(|l| l.binding == *binding) {
+                Some(recorded) => recorded.generation = Some(generation.clone()),
+                None => self.loops.push(RecordedLoop {
+                    binding: *binding,
+                    generation: Some(generation.clone()),
+                }),
+            },
             ResourceRecord::JailIntent(identity) => self.jail = Some(identity.clone()),
-            ResourceRecord::JailMount(mount) => self.jail_mount = Some(*mount),
+            ResourceRecord::JailMount(mount) => self.jail_mount = Some(mount.clone()),
             ResourceRecord::JailBinds(binds) => self.jail_binds = Some(binds.clone()),
             ResourceRecord::Vmm { process, .. } => self.vmm = Some(*process),
         }
     }
+}
+
+/// One intended loop slot and, once journaled, its attachment's generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedLoop {
+    pub binding: LoopBinding,
+    pub generation: Option<LoopGeneration>,
 }
 
 /// The parts of a verified plan S acts on, parsed once.
@@ -860,7 +890,7 @@ mod linux {
         link.event(&SupervisorEvent::PreparationDone);
         link.step("loop")?;
         let mut attempts = 0;
-        let binding = loop {
+        let (binding, attached) = loop {
             attempts += 1;
             let minor = storage::free_loop_slot()?;
             let binding = LoopBinding {
@@ -877,9 +907,9 @@ mod linux {
             )))?;
             link.step("loop_configure")?;
             match storage::attach_loop(&binding, &work) {
-                Ok(()) => {
+                Ok(attached) => {
                     link.after("loop_configure");
-                    break binding;
+                    break (binding, attached);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempts < 4 => {
                     continue;
@@ -887,7 +917,14 @@ mod linux {
                 Err(error) => return Err(error.into()),
             }
         };
-        link.record(SupervisorRecord::Resource(ResourceRecord::Loop(binding)))?;
+        // The generation is journaled while the binding is still autoclear: a crash
+        // before this record leaves no attachment once S's descriptor closes.
+        link.record(SupervisorRecord::Resource(ResourceRecord::Loop {
+            binding,
+            generation: attached.generation.clone(),
+        }))?;
+        link.after("loop_record");
+        storage::persist_loop(&binding, attached)?;
         drop(work);
         link.step("jail")?;
         let jail_identity = storage::new_jail_identity()?;
@@ -895,9 +932,14 @@ mod linux {
             jail_identity.clone(),
         )))?;
         link.step("jail_mount")?;
-        let (jail, root, mount) = storage::create_jail(&plan.paths, &jail_identity)?;
+        let detached = storage::prepare_jail(&plan.paths, &jail_identity)?;
+        let mount = detached.record.clone();
+        link.record(SupervisorRecord::Resource(ResourceRecord::JailMount(
+            mount.clone(),
+        )))?;
+        link.after("jail_record");
+        let (jail, root) = storage::attach_jail(&plan.paths, &jail_identity, detached)?;
         link.after("jail");
-        link.record(SupervisorRecord::Resource(ResourceRecord::JailMount(mount)))?;
         link.step("binds")?;
         let config = link.context().config.clone();
         let profile = config
@@ -924,10 +966,21 @@ mod linux {
             ("identity", &identity_open),
             ("firecracker", &vmm_file),
         ] {
-            binds.push(storage::bind_read_only(&root, &plan.paths, name, source)?);
+            binds.push(storage::prepare_bind(&root, name, source)?);
+        }
+        // Every clone's unique ID is durable before any is attached, so a bind under
+        // the jail that no record names can only be a replacement.
+        link.record(SupervisorRecord::Resource(ResourceRecord::JailBinds(
+            binds.iter().map(|b| b.record.clone()).collect(),
+        )))?;
+        link.after("bind_record");
+        for (index, bind) in binds.into_iter().enumerate() {
+            storage::attach_bind(&root, bind)?;
+            if index == 0 {
+                link.after("first_bind");
+            }
         }
         link.after("binds");
-        link.record(SupervisorRecord::Resource(ResourceRecord::JailBinds(binds)))?;
         storage::work_node(&root, binding.minor, plan.uid, plan.gid)?;
         drop((kernel, rootfs, config_open, identity_open));
         let jailer = expected_identity(expected, Role::Jailer)?;
@@ -1391,14 +1444,15 @@ mod linux {
             },
         )?;
         link.step("cleanup_loop")?;
-        for binding in &recorded.loops {
-            match storage::detach_loop(binding)? {
+        for recorded_loop in &recorded.loops {
+            let binding = &recorded_loop.binding;
+            match storage::detach_loop(binding, recorded_loop.generation.as_ref())? {
                 storage::LoopOutcome::Detached
                 | storage::LoopOutcome::Free
                 | storage::LoopOutcome::NotOurs => {}
                 storage::LoopOutcome::Unknown => {
                     return Err(Abort::Refused(format!(
-                        "loop{} holds our backing file but not the recorded binding",
+                        "loop{} holds our backing file but not the journaled generation",
                         binding.minor
                     )));
                 }
