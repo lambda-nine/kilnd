@@ -20,11 +20,15 @@ ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/proc/sys /sys /dev
 InaccessiblePaths=-/dev/kmsg -/proc/kmsg
-# Firecracker's root node ledger. No policy is configured by default, so nothing opens
-# it, and nothing here launches a VM: its capabilities arrive in B4 after review.
-ReadWritePaths=/var/lib/kiln /run/kiln /sys/fs/cgroup /proc/sys/net/ipv4/ip_forward -/var/lib/kilnd-helper
-# Namespace/mount setup, network policy, UID maps, quota setup and cleanup.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
+# Firecracker's root node ledger, jails and private work disks under /var/lib/kilnd-helper.
+# No policy is configured by default, so nothing opens them, and until B7 approves a
+# production manifest no profile is served and nothing launches a VM. Loop devices'
+# sysfs queue attributes are writable so each allocation's discard can be disabled.
+ReadWritePaths=/var/lib/kiln /run/kiln /sys/fs/cgroup /proc/sys/net/ipv4/ip_forward -/var/lib/kilnd-helper -/sys/devices/virtual/block
+# Namespace/mount setup, network policy, UID maps, quota setup and cleanup. Firecracker
+# (B4) adds the jailer's device nodes (CAP_MKNOD), chroot/pivot_root (CAP_SYS_CHROOT)
+# and the VMM's zero bounding set (CAP_SETPCAP); there is no CAP_SYS_PTRACE.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD CAP_SYS_CHROOT CAP_SETPCAP
 # With explicit User=root, systemd's seccomp credential transition otherwise
 # drops effective CAP_SETUID; retain it for kiln's UID-map setup.
 AmbientCapabilities=CAP_SETUID

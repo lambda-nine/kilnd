@@ -167,14 +167,22 @@ sandbox compromises the host.
   they are not measurements of current RSS, task count or disk usage. CPU is
   intentionally schedulable and may be overcommitted rather than reserved. A
   legacy row's zero CPU, vCPU and host-PID values mean not reserved, not free.
-- **The Firecracker backend cannot launch anything yet.** B3 adds the typed helper
-  group, the root node ledger, approved plan verification and the fixed worker
-  processes, all disabled by default and with fake resources only under test. The
-  production manifest gate refuses every profile, no READY reply exists, and `main.rs`
-  selects kiln only. No VM, jailer, guest, jail, cgroup or disk exists: B4, B5 and B7
-  own them and their proofs. kilnd still runs kiln only, and that remains experimental
-  shared-kernel isolation, not a boundary for hostile multi-tenant workloads.
-  Daemon-local sums are never node totals for a backend with a node authority.
+- **The Firecracker backend launches only under test.** B4 adds the real host lifecycle:
+  a cgroup tree, a fully preallocated private work disk exposed through a fixed-size loop
+  device with discard disabled, a bounded private tmpfs jail with read-only artifact binds,
+  the patched jailer (`deploy/firecracker/`) executed by retained descriptor with a
+  verified zero capability set, Stop, Remove, scoped Gc and the real absence observation.
+  Production still serves no profile: the manifest gate refuses every catalog until B7, no
+  READY exists without B5's broker, and `main.rs` selects kiln only. The B4 root tests
+  approve a catalog through a `cfg(test)` gate only. Firecracker's own isolation and its
+  seccomp filter are trusted, not re-proven: a VMM-credential process without that filter
+  still meets the jail's 16 MiB and 1024-inode caps, cannot write outside `/run`, cannot
+  resize or deallocate the work disk (on the 6.8 kernel tested, even `LOOP_SET_STATUS64`,
+  which loop allows any writer, did not re-enable hole punching), and cannot touch the
+  backing file. The jailer's extra capabilities (`CAP_MKNOD`, `CAP_SYS_CHROOT`,
+  `CAP_SETPCAP`) reach only S and its jailer: every other helper worker and kiln child
+  drops them. kiln itself remains experimental shared-kernel isolation, not a boundary
+  for hostile multi-tenant workloads.
 - **A compromised service account cannot take over another instance.** Root enrolls each
   instance under its own Unix account, with its unit and image, and attachment proves all
   three. Enrollment and startup refuse two instances on one UID or GID, and refuse root, the
@@ -191,8 +199,11 @@ sandbox compromises the host.
   receipts, a rolled-back generation counter and lost claims, but a coordinated rollback
   of database and WAL is undetected, and a removed WAL can lose its last commits.
 - **A dynamically linked executable is unsupported, not bound.** Only static images
-  can be approved. Until a release ships a static helper and pins it, a node cannot
-  satisfy the helper-image self-check whatever the gate says.
+  can be approved. B4's root tests run a static (`crt-static`) build as the helper image
+  and pass its self-check, but `scripts/install.sh` still installs the dynamic helper: a
+  static glibc helper would lose NSS-based resolution for kiln's allowlists. Until B7
+  ships and pins a static helper, a node cannot satisfy the self-check whatever the gate
+  says.
 - **Deadlines are not hard real time.** SQLite and filesystem work is
   synchronous. Deadline delivery can be delayed by that work, and an expired
   recorded execution retains admission until backend cleanup and terminal

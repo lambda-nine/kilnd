@@ -219,7 +219,53 @@ pub enum FirecrackerOperation {
         sandbox_id: String,
         plan_digest: Digest,
     },
+    /// Authorized containment: journal the stop, kill the VM subtree and prove it
+    /// empty. No disk deletion and never a release. `expected_generation` is the
+    /// allocation's C2 generation, naming the exact boot.
+    Stop {
+        allocation_id: Id128,
+        expected_generation: u64,
+        reason: StopReason,
+    },
+    /// Stop, remove exactly the owned resources and persist ABSENT. Idempotent.
+    Remove {
+        allocation_id: Id128,
+    },
+    /// Section 8.2's scoped collection: only named, proven dead or stopped allocations.
+    Gc {
+        allocation_ids: Vec<Id128>,
+    },
+    /// Test-only: whether a reusable dispatch would be admitted at this instant. There
+    /// is no Exec in B4; this exposes the fence that a later Exec must consult.
+    #[cfg(test)]
+    TestDispatchProbe {
+        allocation_id: Id128,
+    },
 }
+
+/// Why a stop was requested. Typed, never free text from a caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    Delete,
+    Interrupted,
+    Unhealthy,
+    Operator,
+}
+
+impl StopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Interrupted => "interrupted",
+            Self::Unhealthy => "unhealthy",
+            Self::Operator => "operator",
+        }
+    }
+}
+
+/// The most allocations one Firecracker Gc may name (section 6.1).
+pub const MAX_FIRECRACKER_GC_IDS: usize = 1024;
 
 impl FirecrackerOperation {
     /// Section 6.1's per-operation budget; a wire deadline can only be shorter.
@@ -227,8 +273,13 @@ impl FirecrackerOperation {
         match self {
             Self::AttachInstance { .. } | Self::Accounting | Self::Inspect { .. } => 5_000,
             Self::Capabilities => 2_000,
-            Self::Preflight { .. } | Self::List | Self::FenceAbsent { .. } => 30_000,
+            Self::Preflight { .. } | Self::List | Self::FenceAbsent { .. } | Self::Gc { .. } => {
+                30_000
+            }
             Self::Create { .. } => 120_000,
+            Self::Stop { .. } | Self::Remove { .. } => 60_000,
+            #[cfg(test)]
+            Self::TestDispatchProbe { .. } => 2_000,
         }
     }
 
@@ -237,7 +288,12 @@ impl FirecrackerOperation {
     pub fn is_recovery(&self) -> bool {
         matches!(
             self,
-            Self::Capabilities | Self::Inspect { .. } | Self::FenceAbsent { .. }
+            Self::Capabilities
+                | Self::Inspect { .. }
+                | Self::FenceAbsent { .. }
+                | Self::Stop { .. }
+                | Self::Remove { .. }
+                | Self::Gc { .. }
         )
     }
 }
@@ -287,6 +343,18 @@ impl FirecrackerRequest {
                 Ok(())
             }
             FirecrackerOperation::FenceAbsent { sandbox_id, .. } => sandbox(sandbox_id),
+            FirecrackerOperation::Stop { .. } | FirecrackerOperation::Remove { .. } => Ok(()),
+            FirecrackerOperation::Gc { allocation_ids } => {
+                let unique: std::collections::BTreeSet<_> = allocation_ids.iter().collect();
+                if allocation_ids.len() > MAX_FIRECRACKER_GC_IDS
+                    || unique.len() != allocation_ids.len()
+                {
+                    return Err("Gc takes at most 1024 unique allocation IDs".into());
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            FirecrackerOperation::TestDispatchProbe { .. } => Ok(()),
         }
     }
 }
@@ -455,6 +523,42 @@ pub enum InspectReply {
     },
 }
 
+/// A host stop receipt, or why there is none. Never a release.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum StopReply {
+    /// STOPPED is durable: the VM subtree is proven empty and the VMM gone.
+    Stopped {
+        generation: u64,
+        observations: String,
+    },
+    /// No proof yet. The stop stays requested and the allocation stays charged.
+    Unknown { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum GcOutcome {
+    Removed {
+        receipt: ReceiptBytes,
+    },
+    /// Live, quarantined, unknown or another instance's: untouched.
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        class: AmbiguousClass,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcResult {
+    pub allocation_id: Id128,
+    pub outcome: GcOutcome,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListStatus {
@@ -499,6 +603,14 @@ pub enum FirecrackerResponse {
     Inspect(InspectReply),
     List(ListReply),
     Fence(FenceReply),
+    Stop(StopReply),
+    /// Remove's answer has Fence's shape: ABSENT's receipt, or charged and ambiguous.
+    Remove(FenceReply),
+    Gc(Vec<GcResult>),
+    #[cfg(test)]
+    TestDispatch {
+        admitted: bool,
+    },
     Error(GroupError),
 }
 

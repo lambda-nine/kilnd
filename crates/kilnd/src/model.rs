@@ -199,6 +199,10 @@ impl Digest {
     pub fn parse(value: &str) -> Result<Self, String> {
         parse_lower_hex(value, "SHA-256 digest").map(Self)
     }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Display for Digest {

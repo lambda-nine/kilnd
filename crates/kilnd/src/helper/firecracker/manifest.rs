@@ -255,7 +255,7 @@ pub fn read_bounded(
     Ok(raw)
 }
 
-fn open_regular(
+pub(crate) fn open_regular(
     bundle: &ProtectedDir,
     name: &str,
     owner_uid: u32,

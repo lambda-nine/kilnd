@@ -186,7 +186,17 @@ An installed executable is retained by descriptor after a no-symlink walk from `
 with owner, mode, ACL and link checks, and every later check uses that descriptor.
 A restart reopens only the exact journaled tuple, so a replacement inode with
 identical bytes is refused. These are unprivileged property tests and root Linux
-tests in B3; only B4 launches anything.
+tests in B3.
+
+B4 adds the real host lifecycle ([design](design/phase1b-firecracker.md#b4-implementation-notes-november-2-2026)):
+`cgroup`, `storage`, `supervisor`, `monitor` and `lifecycle`. S builds the allocation's
+cgroup tree, preallocated loop-backed work disk and bounded tmpfs jail, launches the
+patched jailer by retained descriptor through a bootstrap gate, adopts and validates the
+VMM, hardens the jail and journals BOOTING; every resource is journaled through L before
+or as S owns it. Stop, Remove and scoped Gc contain through K's pinned-inode
+`cgroup.kill`, clean up through a journaled cleanup-only S, and release only through the
+existing ABSENT fence after a real namespace observation. Production still serves no
+profile and nothing reports READY.
 
 ## State machine
 

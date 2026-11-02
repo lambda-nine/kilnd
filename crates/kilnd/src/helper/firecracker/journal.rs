@@ -70,7 +70,8 @@ CREATE TABLE allocations (
     work_uuid TEXT NOT NULL,
     stop_authority TEXT NOT NULL,
     phase TEXT NOT NULL CHECK (phase IN
-        ('intent','preparing','stop_intent','stopped','quarantined','absent')),
+        ('intent','preparing','spawn_intent','booting','stop_intent','stopped','cleaning',
+         'quarantined','absent')),
     created_generation INTEGER NOT NULL CHECK (created_generation >= 1),
     updated_generation INTEGER NOT NULL CHECK (updated_generation >= created_generation),
     PRIMARY KEY (instance_id, allocation_id),
@@ -170,6 +171,18 @@ CREATE TABLE stop_events (
     allocation_id TEXT NOT NULL,
     generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
     reason TEXT NOT NULL,
+    FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
+) STRICT;
+-- What S owns, journaled before or as it comes to own it: append-only, the latest row
+-- of a kind is current. Cleanup and absence observation compare against these.
+CREATE TABLE resource_events (
+    id INTEGER PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    allocation_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN
+        ('cgroup','work_file','private_files','loop_intent','loop','jail_mount','vmm')),
+    detail TEXT NOT NULL,
+    generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
     FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
 ) STRICT;
 
@@ -348,10 +361,22 @@ CREATE TRIGGER stop_events_no_update BEFORE UPDATE ON stop_events
 BEGIN SELECT RAISE(ABORT, 'a stop event is immutable'); END;
 CREATE TRIGGER stop_events_no_delete BEFORE DELETE ON stop_events
 BEGIN SELECT RAISE(ABORT, 'a stop event is permanent'); END;
+
+CREATE TRIGGER resource_events_no_replace BEFORE INSERT ON resource_events
+WHEN EXISTS (SELECT 1 FROM resource_events WHERE rowid = NEW.rowid OR generation = NEW.generation)
+BEGIN SELECT RAISE(ABORT, 'a resource event cannot be replaced'); END;
+CREATE TRIGGER resource_events_not_after_absent BEFORE INSERT ON resource_events
+WHEN EXISTS (SELECT 1 FROM allocations WHERE instance_id = NEW.instance_id
+    AND allocation_id = NEW.allocation_id AND phase = 'absent')
+BEGIN SELECT RAISE(ABORT, 'an absent allocation owns nothing new'); END;
+CREATE TRIGGER resource_events_no_update BEFORE UPDATE ON resource_events
+BEGIN SELECT RAISE(ABORT, 'a resource event is immutable'); END;
+CREATE TRIGGER resource_events_no_delete BEFORE DELETE ON resource_events
+BEGIN SELECT RAISE(ABORT, 'a resource event is permanent'); END;
 ";
 
 /// Every table with its write-guard surface, for the guard matrix.
-pub const GUARDED_TABLES: [&str; 11] = [
+pub const GUARDED_TABLES: [&str; 12] = [
     "node_identity",
     "generation_counter",
     "instances",
@@ -363,6 +388,7 @@ pub const GUARDED_TABLES: [&str; 11] = [
     "worker_intents",
     "retired_tokens",
     "stop_events",
+    "resource_events",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -571,6 +597,18 @@ pub enum TokenLookup {
         unsettled_workers: u64,
         supervisor_operation: Option<u64>,
     },
+}
+
+/// One active allocation as cleanup sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllocationState {
+    pub sandbox_id: String,
+    pub plan_digest: Digest,
+    pub phase: String,
+    pub created_generation: u64,
+    pub plan: Vec<u8>,
+    pub resources: Vec<super::supervisor::ResourceRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1964,6 +2002,168 @@ impl Ledger {
         }
         commit_tx(tx, &self.fail_next_commit)?;
         Ok(generation)
+    }
+
+    /// One owned resource, appended. Refused once the allocation is absent.
+    pub fn record_resource(
+        &mut self,
+        instance: Id128,
+        allocation: Id128,
+        record: &super::supervisor::ResourceRecord,
+    ) -> Result<u64, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation = next_generation(&tx)?;
+        let detail =
+            serde_json::to_string(record).map_err(|e| LedgerError::Config(e.to_string()))?;
+        let changed = tx
+            .prepare_cached(
+                "UPDATE allocations SET updated_generation = ?3
+                 WHERE instance_id = ?1 AND allocation_id = ?2
+                   AND phase IN ('preparing','spawn_intent','booting','stop_intent','stopped','cleaning')",
+            )?
+            .execute(params![
+                instance.to_string(),
+                allocation.to_string(),
+                signed(generation, "generation")?
+            ])?;
+        if changed != 1 {
+            return Err(LedgerError::NoSuchAllocation);
+        }
+        tx.prepare_cached(
+            "INSERT INTO resource_events (instance_id, allocation_id, kind, detail, generation)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute(params![
+            instance.to_string(),
+            allocation.to_string(),
+            record.kind(),
+            detail,
+            signed(generation, "generation")?
+        ])?;
+        commit_tx(tx, &self.fail_next_commit)?;
+        Ok(generation)
+    }
+
+    /// A conditional phase change: only from one of `from`, never out of `absent`.
+    pub fn set_phase(
+        &mut self,
+        instance: Id128,
+        allocation: Id128,
+        from: &[String],
+        to: &str,
+    ) -> Result<u64, LedgerError> {
+        if to == "absent" || from.iter().any(|f| f == "absent") || from.is_empty() {
+            return Err(LedgerError::Config(
+                "absence is committed only by a fence".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .prepare_cached(
+                "SELECT phase FROM allocations WHERE instance_id = ?1 AND allocation_id = ?2",
+            )?
+            .query_row([instance.to_string(), allocation.to_string()], |r| r.get(0))
+            .optional()?;
+        let Some(current) = current else {
+            return Err(LedgerError::NoSuchAllocation);
+        };
+        if !from.contains(&current) {
+            return Err(LedgerError::StaleGeneration);
+        }
+        let generation = next_generation(&tx)?;
+        tx.prepare_cached(
+            "UPDATE allocations SET phase = ?3, updated_generation = ?4
+             WHERE instance_id = ?1 AND allocation_id = ?2",
+        )?
+        .execute(params![
+            instance.to_string(),
+            allocation.to_string(),
+            to,
+            signed(generation, "generation")?
+        ])?;
+        commit_tx(tx, &self.fail_next_commit)?;
+        Ok(generation)
+    }
+
+    /// Everything cleanup needs for one active allocation: its plan, identity and every
+    /// recorded resource, in order.
+    pub fn allocation_state(
+        &self,
+        instance: Id128,
+        allocation: Id128,
+    ) -> Result<Option<AllocationState>, LedgerError> {
+        let key = [instance.to_string(), allocation.to_string()];
+        let row = self
+            .conn
+            .prepare_cached(
+                "SELECT a.sandbox_id, a.plan_digest, a.phase, a.created_generation, p.plan
+                 FROM allocations a JOIN allocation_plans p
+                   ON p.instance_id = a.instance_id AND p.allocation_id = a.allocation_id
+                 WHERE a.instance_id = ?1 AND a.allocation_id = ?2",
+            )?
+            .query_row(key.clone(), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .optional()?;
+        let Some((sandbox_id, digest, phase, created, plan)) = row else {
+            return Ok(None);
+        };
+        let mut statement = self.conn.prepare_cached(
+            "SELECT detail FROM resource_events WHERE instance_id = ?1 AND allocation_id = ?2
+             ORDER BY generation",
+        )?;
+        let mut rows = statement.query(key)?;
+        let mut resources = Vec::new();
+        while let Some(row) = rows.next()? {
+            let detail: String = row.get(0)?;
+            resources.push(
+                serde_json::from_str(&detail)
+                    .map_err(|e| LedgerError::Corrupt(format!("resource record: {e}")))?,
+            );
+        }
+        Ok(Some(AllocationState {
+            sandbox_id,
+            plan_digest: parse_sha(digest)?,
+            phase,
+            created_generation: unsigned(created)?,
+            plan,
+            resources,
+        }))
+    }
+
+    /// A cleanup worker's intent for one allocation, journaled before it is forked.
+    pub fn record_allocation_worker_intent(
+        &mut self,
+        instance: Id128,
+        allocation: Id128,
+        spec: &WorkerIntentSpec,
+    ) -> Result<(i64, u64), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let phase: Option<String> = tx
+            .prepare_cached(
+                "SELECT phase FROM allocations WHERE instance_id = ?1 AND allocation_id = ?2",
+            )?
+            .query_row([instance.to_string(), allocation.to_string()], |r| r.get(0))
+            .optional()?;
+        if phase.is_none() || phase.as_deref() == Some("absent") {
+            return Err(LedgerError::NoSuchAllocation);
+        }
+        let operation = next_generation(&tx)?;
+        let id = Self::insert_worker_intent(&tx, Some((instance, allocation)), spec, operation)?;
+        commit_tx(tx, &self.fail_next_commit)?;
+        Ok((id, operation))
     }
 
     /// The later durable record of a stop: an emergency already ran under C2's

@@ -59,6 +59,14 @@ struct NodeOptions {
     /// Enroll on first attach, for tests that are about something else.
     auto_enroll: bool,
     peers: PeerEvidence,
+    /// B4: the real chain from the protected store, under a verified helper image.
+    #[serde(default)]
+    real: bool,
+    /// B4: narrowed VMM/relay UID and GID ranges, for unequal and equal typed pairs.
+    #[serde(default)]
+    uid: Option<(u32, u32)>,
+    #[serde(default)]
+    gid: Option<(u32, u32)>,
 }
 
 /// Where a fixture helper reads an attaching peer's cgroup and account. The start time,
@@ -86,6 +94,9 @@ impl Default for NodeOptions {
             max_enrolled: DEFAULT_MAX_ENROLLED,
             auto_enroll: true,
             peers: PeerEvidence::AnyCgroup,
+            real: false,
+            uid: None,
+            gid: None,
         }
     }
 }
@@ -135,9 +146,23 @@ fn node_fixture_child() {
         .build()
         .unwrap();
     runtime.block_on(async move {
-        let walk = walk_for(&config.root);
+        let walk = if config.options.real {
+            WalkPolicy::production()
+        } else {
+            walk_for(&config.root)
+        };
         let profile = load_profile(&walk, ManifestGate::TestApproved, &config.catalog).unwrap();
-        let helper_image = profile.table.identity(Role::KilndHelper);
+        // The real chain proves H runs the protected installed image, as production does.
+        let helper_image = if config.options.real {
+            #[cfg(target_os = "linux")]
+            {
+                super::storage::prepare_jail_base().unwrap();
+                limit_to_unit_capabilities();
+            }
+            Some(super::executable::verify_self_image(&profile.table).unwrap())
+        } else {
+            profile.table.identity(Role::KilndHelper)
+        };
         let effects = config
             .options
             .effects
@@ -150,14 +175,27 @@ fn node_fixture_child() {
         let node_config = NodeConfig {
             node_id: config.node_id,
             ledger: ledger_config(&config),
-            ranges: IdentityRanges {
-                cid: config.options.cid.0..=config.options.cid.1,
-                ..IdentityRanges::default()
+            ranges: {
+                let mut ranges = IdentityRanges {
+                    cid: config.options.cid.0..=config.options.cid.1,
+                    ..IdentityRanges::default()
+                };
+                if let Some((first, last)) = config.options.uid {
+                    ranges.uid = first..=last;
+                }
+                if let Some((first, last)) = config.options.gid {
+                    ranges.gid = first..=last;
+                }
+                ranges
             },
             profiles: vec![profile],
             walk,
             gate: ManifestGate::TestApproved,
-            observation: ObservationBackend::FakeDirectory(config.root.join("fake")),
+            observation: if config.options.real {
+                ObservationBackend::Real
+            } else {
+                ObservationBackend::FakeDirectory(config.root.join("fake"))
+            },
             timings: Timings {
                 tick: Duration::from_millis(20),
                 heartbeat: Duration::from_millis(100),
@@ -172,6 +210,7 @@ fn node_fixture_child() {
                 effects,
                 fake_root: Some(config.root.join("fake")),
                 auto_enroll: config.options.auto_enroll,
+                real: config.options.real,
                 peers: match config.options.peers {
                     PeerEvidence::AnyCgroup => TestPeers {
                         directory: None,
@@ -239,6 +278,71 @@ fn node_fixture_child() {
         .await
         .unwrap();
     });
+}
+
+/// The real fixture's helper keeps only deploy/kilnd-helper.service's bounding set, so
+/// the root tests prove the chain needs nothing more (no CAP_SYS_PTRACE in particular).
+#[cfg(target_os = "linux")]
+fn limit_to_unit_capabilities() {
+    // CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID, SETUID, SETPCAP, NET_ADMIN, SYS_CHROOT,
+    // SYS_ADMIN and MKNOD.
+    const KEEP: [u32; 11] = [0, 1, 3, 5, 6, 7, 8, 12, 18, 21, 27];
+    let unit = include_str!("../../../../../deploy/kilnd-helper.service");
+    for name in ["CAP_SYS_CHROOT", "CAP_MKNOD", "CAP_SETPCAP"] {
+        assert!(unit.contains(name), "the unit grants {name}");
+    }
+    let mut mask: u64 = 0;
+    for cap in KEEP {
+        mask |= 1 << cap;
+    }
+    // SAFETY: plain capability syscalls on this single fixture process, before workers.
+    unsafe {
+        for cap in 0..64u32 {
+            if !KEEP.contains(&cap) && libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 {
+                break;
+            }
+        }
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Data {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        let mut header = Header {
+            version: 0x2008_0522,
+            pid: 0,
+        };
+        let mut data = [Data {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        assert_eq!(
+            libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()),
+            0
+        );
+        for (index, word) in data.iter_mut().enumerate() {
+            let keep = (mask >> (32 * index)) as u32;
+            word.effective &= keep;
+            word.permitted &= keep;
+            word.inheritable = 0;
+        }
+        assert_eq!(
+            libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()),
+            0
+        );
+    }
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+    assert!(
+        status.lines().any(|l| l == format!("CapBnd:\t{mask:016x}")),
+        "{status}"
+    );
 }
 
 struct Fixture {
@@ -378,7 +482,11 @@ impl Fixture {
             .unwrap();
         let child = {
             let _guard = crate::process::spawn_guard();
-            Command::new(std::env::current_exe().unwrap())
+            // The real chain runs H from its protected installed image.
+            let image = std::fs::read_to_string(self.root.join("helper-image"))
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| std::env::current_exe().unwrap());
+            Command::new(image)
                 .args([
                     "--ignored",
                     "--exact",
@@ -2460,14 +2568,17 @@ async fn exit4_monitor_requests_a_stale_supervisors_stop_without_help_from_h() {
         .unwrap();
     assert!(matches!(registered, MonitorReply::Registered));
     drop(watch_monitor);
-    let target = ProcessId {
+    let target = super::monitor::StopTarget::process(ProcessId {
         pid: i32::MAX - 11,
         start_time: 5,
-    };
+    });
     let registered: MonitorReply = channel
         .call(
             super::workers::Lane::Normal,
-            &MonitorCommand::RegisterTarget { allocation, target },
+            &MonitorCommand::RegisterTarget {
+                allocation,
+                target: target.clone(),
+            },
             u64::MAX,
         )
         .await
@@ -4761,7 +4872,8 @@ fn exit5_linux_root_production_policy_provisions_once_and_serves_no_profile() {
     );
     assert!(config.helper_image.is_none());
     assert_eq!(config.gate, ManifestGate::ProductionDisabled);
-    assert_eq!(config.observation, ObservationBackend::Disabled);
+    // B4 observes the real owned namespaces; with no profile, none can be owned.
+    assert_eq!(config.observation, ObservationBackend::Real);
     drop(config);
     // A writable ancestor refuses the policy itself.
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o720)).unwrap();
@@ -4776,3 +4888,5 @@ fn fixture_child_does_nothing_without_its_environment() {
 }
 
 mod control_plane;
+#[cfg(target_os = "linux")]
+mod lifecycle;

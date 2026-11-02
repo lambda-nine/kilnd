@@ -1313,3 +1313,140 @@ helper. A runtime `ExecStartPre=` or `ExecStart=` drop-in gives it the unit's co
   disk, and snapshots are only taken of running instances.
 - **Every maintenance command stops every instance,** because the node lock is global. Adding
   an instance takes under a second of that on the test VM; an upgrade takes a few seconds more.
+
+## B4 implementation notes (November 2, 2026)
+
+B4 implements section 11's B4 scope: real host allocation, the patched jailer and the
+release Firecracker VMM launched by retained descriptor, supervision, Stop, Remove and
+scoped Gc, against a fixed guest that listens for nothing. No semantic constraint changed.
+Production stays disabled: `ManifestGate::ProductionDisabled` still refuses every catalog
+profile, so no installed helper serves one, and the root tests approve their catalog only
+through the `cfg(test)` gate. A boot ends at BOOTING; no reply or journal phase is READY.
+
+**New modules** (`crates/kilnd/src/helper/firecracker/`): `cgroup.rs` (the allocation tree
+from the plan's recipe, joins proven by `/proc/self/cgroup`, `cgroup.kill` and removal by
+pinned inode), `storage.rs` (private work directory, preallocated backing file, loop
+binding, jail tmpfs, read-only binds, hardening, teardown and the absence observation),
+`supervisor.rs` (S's pipeline, records and cleanup), `monitor.rs` (stop targets M holds and
+K executes) and `lifecycle.rs` (H's record handling, Stop, Remove and Gc). The jailer patch
+and the static tool build are in `deploy/firecracker/` and `scripts/build-phase1b-tools.sh`.
+
+**The launch, in order.** After C2 and PREPARING, H leases one of the two node P slots to
+S, opens S's gate with the verified plan, and S:
+
+1. sets `PR_SET_CHILD_SUBREAPER`; creates `kilnd-firecracker/<I>/fc-<H>` with its
+   `control`, `relay`, `vm`, `vm/vmm` and `vm/console` children and the recipe's limits,
+   and journals their inodes. H registers the `vm` node with M as a stop target before
+   acknowledging, so containment never waits for a VMM PID. S then joins `control`;
+2. re-opens and re-hashes `Image` and `rootfs.squashfs` through the protected bundle walk,
+   with heartbeats between chunks;
+3. creates the private 0700 work directory, `openat(O_CREAT|O_EXCL|O_NOFOLLOW)`s the backing
+   file and journals its inode, fallocates W in full and checks `st_blocks`, then runs
+   `mkfs.xfs -q -f -K -m uuid=<work_uuid> <path>` by `execveat` of the retained formatter
+   descriptor, comparing the inode before and after and syncing file and directory;
+4. writes the KID1 identity block and the canonical `/config.json`, journals both, and
+   returns the P lease;
+5. journals LOOP_INTENT (slot, backing device/inode, offset 0, size limit W), then
+   `LOOP_CONFIGURE`s, verifies the binding with `LOOP_GET_STATUS64` and `BLKGETSIZE64`,
+   sets the slot's `discard_max_bytes` to 0 and journals the attachment. A busy slot is a
+   conflict and another free slot gets its own intent;
+6. creates the jail directory, mounts the private tmpfs (`size=16M,nr_inodes=1024,mode=0700`,
+   `nosuid`) and journals its mount ID, bind-mounts kernel, root, config, identity and the
+   retained VMM inode read-only from their descriptors' `/proc/self/fd` links, and creates
+   the `/work` node;
+7. journals SPAWN_INTENT, forks the gated launch child, journals J's identity and releases
+   it. The child joins `vm/vmm` (proved by `/proc/self/cgroup`), unshares an empty network
+   namespace, sets core limit 0, umask 077, `/dev/null` stdin and the console pipe, then
+   arranges FDs 3/4 and `execveat`s the retained jailer;
+8. sends the bootstrap record; at `RDY1`, reads `/proc/<J>/exe` through the pinned process,
+   journals the observed tuple, checks it and J's descriptors (exactly 0–4), and sends
+   `CONT`;
+9. requires J's exit status 0, adopts V only if the PID file names the single task in
+   `vm/vmm` and S is its parent, pins it by pidfd, journals V's identity, observed image and
+   `/proc/<V>/status` credentials, and refuses on any mask, ID or descriptor difference;
+10. stops V, hardens the jail, checks the mount tree and `/firecracker`, continues V and
+    journals BOOTING.
+
+Every step heartbeats, reads every queued command first and checks the original Create
+deadline. Any refusal or Revoke contains the `vm` subtree before S exits; what exists
+stays charged for Remove.
+
+**Stop, Remove and Gc.** Stop journals STOP_INTENT, revokes S in memory, has K kill the
+pinned `vm` node and the recorded VMM until K proves both gone and S has exited, then
+journals STOPPED. Remove does that, settles J's and V's rows, journals CLEANING, starts a
+journaled cleanup-only S (in `control` while the tree exists) that unmounts, detaches the
+recorded loop slots, removes the jail and work directories exactly, then K removes the
+empty tree and the existing fence path observes the real namespaces and commits ABSENT.
+Gc runs Remove only for this instance's named allocations that are stopped or proven dead.
+
+**Conservative readings taken:**
+
+- **`/work` is a node, not a bind.** S `mknod`s the loop device's block node in the jail
+  tmpfs, owned U:G 0600, instead of bind-mounting the host `/dev/loopN`, whose ownership
+  would otherwise change host-wide. The device and its exposure are the same.
+- **P's slot for session preparation.** The two node P slots are leased to S for hashing,
+  fallocate, mkfs and the private files, which run in S's `control` leaf, charged to the
+  allocation, while that P process takes no other job. One preparation per allocation, at
+  most two across the node.
+- **The console is drained by S.** D is B5's. Until then S drains the console pipe
+  continuously and keeps a 64 KiB prefix; nothing reaches logs. R is B5's too: relay leases
+  are claimed at C2 and unused.
+- **Stop's `expected_generation`** is the allocation's C2 generation, naming the boot. Any
+  other value is refused as Unknown.
+- **Every Stop revokes S.** A stopped boot is never reused, so cleanup is always a fresh,
+  journaled cleanup-only S. A lost S takes the same path.
+- **Hardening narrows device access.** `/dev/kvm` and `/dev/urandom` stay U:G 0600;
+  `/dev/net/tun` and `/dev/userfaultfd` become root 0600, since networking and restore are out
+  of scope. Any unexpected entry, link or type retires the VM.
+- **An unrecorded work file** (a crash between create and its record) is owned by its fixed
+  name inside the root-only 0700 work directory. A recorded one must match its inode; a
+  replacement is refused, not deleted. An unrecorded loop slot backed in that directory is
+  refused, never guessed.
+- **No CAP_SYS_PTRACE.** `/proc/<V>/exe` and `/proc/<V>/fd` are ptrace-read checks. As B3's L
+  does, S takes V's filesystem IDs for those opens and restores them at once.
+- **The jailer's capabilities are scoped.** The unit adds `CAP_MKNOD`, `CAP_SYS_CHROOT` and
+  `CAP_SETPCAP`. L, P, M, K and every legacy kiln child drop them from their bounding,
+  effective, permitted and inheritable sets at start, so only S and its J hold them.
+- **The jail base is a private bind of itself.** `/var/lib/kilnd-helper/jails` is made a
+  private mount at helper start, so jail mounts never propagate to another namespace. Under
+  the unit's `ProtectSystem=strict` they live in the helper's own mount namespace, which a
+  helper restart replaces; a restarted helper then finds no old mounts, and loop bindings,
+  which are not namespaced, are still detached by identity.
+- **Real observation in production too.** `ObservationBackend::Real` replaces `Disabled` in
+  the production configuration: FenceAbsent for a never-admitted token now observes the real
+  owned names instead of always answering Unknown.
+- **Ledger schema stays 1.** New phases (`spawn_intent`, `booting`, `cleaning`) and an
+  append-only `resource_events` table with B3's guard triggers. No B3 ledger has shipped; an
+  earlier one fails its schema audit, closed.
+- **Test seams** are `cfg(test)` only: fault markers, a ptrace exec stop that lets S read the
+  short-lived formatter's `/proc` exe, a credential perturbation, a console dump and the
+  `TestDispatchProbe` operation that exposes the dispatch fence a later Exec must consult.
+  The root tests' helper image is the static test binary itself, installed in the protected
+  store and executed from it, so H's self-check and every fork-only worker's image are real.
+
+**Exit tests** (`crates/kilnd/src/helper/firecracker/tests/lifecycle.rs`, run as root in the
+VM by `scripts/b4-vm-tests.sh` under exactly the helper unit's bounding set; raw output in
+`reviews/2026-11-02-b4-vm/`):
+
+| B4 exit criterion | Test | Result on November 2, 2026 |
+|---|---|---|
+| Real teardown at every crash boundary leaves no owned VM, loop, mount, worker or file once ABSENT is reported | `b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left` (17 step boundaries, 8 effect-before-record boundaries, S killed after BOOTING, helper killed while BOOTING and during mkfs) and `b4_linux_root_create_boots_and_remove_leaves_nothing` | Passed: each boundary stayed charged until ABSENT, and an independent host check found nothing left |
+| Killing S before and after J exits, with H healthy, fences at once, contains the live VMM and admits no new dispatch; J's zero exit is not V's | `b4_linux_root_supervisor_death_before_and_after_jailer_exit_fences_and_contains` | Passed: V exited 5–11 ms after SIGKILL of S; a J released only after S died was contained before any boot; V's own death fenced |
+| Real UID, GID, Groups and every capability mask; a bounding-set mismatch stops the launch | `b4_linux_root_real_credentials_and_a_bounding_mismatch_stops_the_launch` | Passed for an unequal (300101/300201) and an equal (300301/300301) pair: empty Groups, all five masks zero, NoNewPrivs 1, Seccomp 2; one bounding bit refused before BOOTING |
+| VMM-credential byte, inode, socket, symlink and work-resize attacks hit the mandatory bounds without consuming journal headroom | `b4_linux_root_vmm_credential_attacks_hit_the_mandatory_bounds` | Passed: 16,732,160 bytes then ENOSPC, 952 inodes then ENOSPC, no write outside `/run`, binds read-only, `/work` stayed W with BLKDISCARD and hole punching refused (also after LOOP_SET_STATUS64), W stayed allocated, ledger filesystem unchanged |
+| Stalling every blocking class and exhausting the pools leaves Capabilities, Inspect and Stop progressing | `b4_linux_root_stalled_classes_and_full_pools_keep_capabilities_inspect_and_stop` | Passed: hashing, work directory, fallocate, mkfs, private-file fsync, cgroup, mount and bind stalls; both P slots full; L stalled (bounded Unknown, VM contained anyway); inventory stalled; both K slots stuck (bounded Unknown, no K replaced) |
+| Stale PID and inode tests protect unrelated resources | `b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources` | Passed: a live process with another start time and a replaced cgroup were untouched; a replaced work file was refused and survived; a rebound loop slot stayed bound |
+| The prelaunch charge is proved | `b4_linux_root_prelaunch_charge_is_held_from_c2_through_absent` | Passed: claim before any effect, J in `vm/vmm` before it executed, the VMM's memory charged there from launch (about 400 MiB at BOOTING under the 896 MiB limit), held through STOPPED until ABSENT |
+| KR-05 races as a non-root UID and the root name swap at both launch boundaries, for J, V and the formatter, against the journal | `b4_linux_root_kr05_replacement_races_run_only_the_retained_inodes` | Passed: the attacker renamed its source tree and was denied every protected ancestor; swapping the installed jailer, Firecracker and mkfs.xfs names at their boundaries left the observed device, inode and digest equal to the journal; every fork-only worker ran the installed helper image; P, M and K held no launch capability |
+| Scoped GC | `b4_linux_root_scoped_gc_removes_only_proven_dead_allocations` | Passed: only the dead allocation was removed; a live one, an unknown token and another instance's were skipped |
+
+**Known limits, accepted or open:**
+
+- **A static production helper is B7's.** The root tests run a `crt-static` build as the
+  helper image. `scripts/install.sh` still installs the dynamic helper, because static glibc
+  would lose NSS-based resolution for kiln's allowlists.
+- **Instance-level directories persist.** `work/<instance>` and the
+  `kilnd-firecracker/<instance>` cgroup node outlive their allocations, like the instance
+  itself; nothing allocation-owned remains in them after ABSENT.
+- **Exec and READY are B5's.** `TestDispatchProbe` exposes the dispatch fence; the
+  interrupted-dispatch case has nothing to interrupt until Exec exists.

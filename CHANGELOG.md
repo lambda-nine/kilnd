@@ -6,6 +6,19 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B4: real Firecracker host lifecycle in `kilnd-helper`, test-approved only. S
+  creates the allocation's cgroup tree, a fully preallocated XFS work disk exposed through a
+  fixed-size loop device with discard disabled, and a bounded private tmpfs jail with
+  read-only artifact binds; it launches the patched jailer (`deploy/firecracker/`, built by
+  `scripts/build-phase1b-tools.sh`) by retained descriptor through a bootstrap gate, verifies
+  the jailer's and VMM's actual images and the VMM's zero capability masks, hardens the jail
+  and journals BOOTING. New helper operations `stop`, `remove` and `gc`; Remove releases only
+  through the ABSENT fence after the real absence observation. The helper unit gains
+  `CAP_MKNOD`, `CAP_SYS_CHROOT` and `CAP_SETPCAP`, which only S and its jailer keep, and write
+  access to loop devices' sysfs queue settings. The node ledger gains phases and an
+  append-only `resource_events` table (schema still 1: a B3 ledger must be provisioned
+  again). Production still serves no profile and nothing reports READY. New: root
+  regressions in `scripts/b4-vm-tests.sh`.
 - Phase 1b B3 deployment: interrupted maintenance is fenced across a reboot and retried after a
   failed restore. Each command now writes `/var/lib/kilnd-helper/maintenance.json`, fsynced,
   before anything changes, and removes it last. `kilnd-maintenance-guard.service` runs

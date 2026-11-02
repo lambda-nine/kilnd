@@ -25,6 +25,53 @@ pub const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 /// # Safety
 /// Runs between `fork` and `exec`; keep this limited to async-signal-safe
 /// operations and allocation-free error construction.
+/// Capabilities only the Firecracker supervisor's jailer needs: device nodes, chroot and
+/// the VMM's bounding-set drop. Every other helper child gives them up, so legacy kiln
+/// children and the L/P/M/K workers keep exactly the pre-B4 set. Dropping is allowed
+/// without privilege; a bounding bit this process cannot drop was never usable by it.
+#[cfg(target_os = "linux")]
+pub(crate) fn drop_firecracker_launch_capabilities() {
+    const MKNOD: u32 = 27;
+    const SYS_CHROOT: u32 = 18;
+    const SETPCAP: u32 = 8;
+    // SAFETY: prctl and the raw capget/capset syscalls are async-signal-safe and take
+    // only local, correctly sized storage.
+    unsafe {
+        // CAP_SETPCAP last: dropping a bounding bit needs it.
+        for cap in [MKNOD, SYS_CHROOT, SETPCAP] {
+            libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
+        }
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Data {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        let mut header = Header {
+            version: 0x2008_0522,
+            pid: 0,
+        };
+        let mut data = [Data {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        if libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) == 0 {
+            let clear = !((1u32 << MKNOD) | (1u32 << SYS_CHROOT) | (1u32 << SETPCAP));
+            data[0].effective &= clear;
+            data[0].permitted &= clear;
+            data[0].inheritable &= clear;
+            libc::syscall(libc::SYS_capset, &mut header, data.as_ptr());
+        }
+    }
+}
+
 pub(crate) unsafe fn prepare_child(expected_parent: libc::pid_t) -> io::Result<()> {
     // Rust ignores SIGPIPE, and an embedding shell or service may ignore the
     // standard lifecycle signals. Ignored dispositions survive exec, so give
@@ -43,6 +90,7 @@ pub(crate) unsafe fn prepare_child(expected_parent: libc::pid_t) -> io::Result<(
     }
     #[cfg(target_os = "linux")]
     {
+        drop_firecracker_launch_capabilities();
         // SAFETY: prctl is async-signal-safe and uses constant arguments.
         if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
             return Err(io::Error::last_os_error());

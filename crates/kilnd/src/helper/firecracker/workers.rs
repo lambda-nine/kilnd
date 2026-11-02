@@ -58,6 +58,13 @@ pub mod faults {
         let _ = DIRECTORY.set(directory);
     }
 
+    /// Writes a test artifact next to the fault markers, if a fixture installed them.
+    pub fn write(name: &str, bytes: &[u8]) {
+        if let Some(directory) = DIRECTORY.get() {
+            let _ = std::fs::write(directory.join(name), bytes);
+        }
+    }
+
     pub fn present(name: &str) -> bool {
         DIRECTORY
             .get()
@@ -834,6 +841,8 @@ pub struct ProfileRuntime {
     pub table: ExecutableTable,
     pub pins: Value,
     pub manifest_sha256: Digest,
+    /// Every declared artifact's pin. S re-verifies the kernel and root on each create.
+    pub artifacts: BTreeMap<String, super::manifest::ArtifactPin>,
 }
 
 /// What a test may inject. This whole struct is absent from production builds.
@@ -845,6 +854,8 @@ pub struct TestInjection {
     /// Root's enrollment, done on first attach, for tests about something else.
     pub auto_enroll: bool,
     pub peers: super::peer::TestPeers,
+    /// B4's root tests: S runs the real chain instead of fake effects.
+    pub real: bool,
 }
 
 /// Fake side effects, performed for real by S under its permit: an owned file or a
@@ -963,6 +974,27 @@ pub enum LedgerRequest {
         allocation: Id128,
         actual: ExecutableIdentity,
     },
+    RecordResource {
+        instance: Id128,
+        allocation: Id128,
+        record: super::supervisor::ResourceRecord,
+    },
+    SetPhase {
+        instance: Id128,
+        allocation: Id128,
+        from: Vec<String>,
+        to: String,
+    },
+    AllocationState {
+        instance: Id128,
+        allocation: Id128,
+    },
+    /// A cleanup S's intent, journaled before it is forked.
+    AllocationWorkerIntent {
+        instance: Id128,
+        allocation: Id128,
+        spec: Box<WorkerIntentSpec>,
+    },
     Settle {
         worker_id: i64,
         settlement: String,
@@ -1013,6 +1045,11 @@ pub enum LedgerReply {
     },
     Generation(u64),
     Done,
+    State(Option<Box<super::journal::AllocationState>>),
+    WorkerIntent {
+        worker_id: i64,
+        operation_generation: u64,
+    },
     Fence(FenceOutcome),
     Accounting(Box<AccountingSnapshot>),
     Inventory(InventorySnapshot),
@@ -1175,6 +1212,36 @@ fn handle_ledger(
             ledger.record_observed_executable(instance, allocation, &actual)?;
             LedgerReply::Done
         }
+        LedgerRequest::RecordResource {
+            instance,
+            allocation,
+            record,
+        } => {
+            fault_point("L.record_resource");
+            LedgerReply::Generation(ledger.record_resource(instance, allocation, &record)?)
+        }
+        LedgerRequest::SetPhase {
+            instance,
+            allocation,
+            from,
+            to,
+        } => LedgerReply::Generation(ledger.set_phase(instance, allocation, &from, &to)?),
+        LedgerRequest::AllocationState {
+            instance,
+            allocation,
+        } => LedgerReply::State(ledger.allocation_state(instance, allocation)?.map(Box::new)),
+        LedgerRequest::AllocationWorkerIntent {
+            instance,
+            allocation,
+            spec,
+        } => {
+            let (worker_id, operation_generation) =
+                ledger.record_allocation_worker_intent(instance, allocation, &spec)?;
+            LedgerReply::WorkerIntent {
+                worker_id,
+                operation_generation,
+            }
+        }
         LedgerRequest::Settle {
             worker_id,
             settlement,
@@ -1223,6 +1290,15 @@ pub fn ledger_main(
     revocations: Arc<RevocationTable>,
     expiring: fn(&LedgerRequest) -> bool,
 ) {
+    // L reads an attaching peer's `/proc/<pid>/exe`, which needs L's capabilities to
+    // cover the peer's. A production peer holds none. The B4 root tests' peer is the root
+    // test process itself, holding the unit's whole set, so only that fixture keeps them.
+    #[cfg(all(target_os = "linux", test))]
+    if !faults::present("L.keep_launch_capabilities") {
+        crate::process::drop_firecracker_launch_capabilities();
+    }
+    #[cfg(all(target_os = "linux", not(test)))]
+    crate::process::drop_firecracker_launch_capabilities();
     let mut ledger = Ledger::open(config);
     loop {
         heartbeat.beat();
@@ -1291,6 +1367,8 @@ pub enum PrepRequest {
     },
     ObserveNode {
         instance: Id128,
+        /// The journal's allocations, to map digest host names back.
+        known: Vec<Id128>,
     },
     VerifyLeases {
         expected: Vec<ExecutableIdentity>,
@@ -1506,6 +1584,8 @@ fn verify_leases(config: &NodeConfig, expected: &[ExecutableIdentity]) -> Result
 /// P: one of two fixed job slots. Read-only: it can hash and read owned namespaces
 /// but has no ledger, no write path and no session side effect.
 pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat: Heartbeat) {
+    #[cfg(target_os = "linux")]
+    crate::process::drop_firecracker_launch_capabilities();
     loop {
         heartbeat.beat();
         fault_point("P.loop");
@@ -1570,9 +1650,9 @@ pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat:
                 fault_point("P.observe");
                 PrepReply::Allocation(config.observation.observe_allocation(instance, allocation))
             }
-            PrepRequest::ObserveNode { instance } => {
+            PrepRequest::ObserveNode { instance, known } => {
                 fault_point("P.observe");
-                PrepReply::Node(config.observation.observe_node(instance))
+                PrepReply::Node(config.observation.observe_node(instance, &known))
             }
             PrepRequest::VerifyLeases { expected } => match verify_leases(&config, &expected) {
                 Ok(()) => PrepReply::LeasesVerified,
@@ -1598,6 +1678,22 @@ pub enum SupervisorCommand {
         /// The original Create deadline: start authority for every forward effect ends
         /// here, whatever the waiter or this process is doing.
         deadline_ns: u64,
+        /// The verified plan's canonical bytes. Present for a real launch; absent only
+        /// for the fake-effect fixtures, which compile only under `cfg(test)`.
+        plan: Option<String>,
+        /// The C2 generation, bound into J's bootstrap record.
+        plan_generation: u64,
+    },
+    /// H's durable answer to one `Record`, in order. `ok == false` ends forward work.
+    Recorded {
+        seq: u64,
+        ok: bool,
+    },
+    /// A cleanup-only S: stop what remains and remove exactly the owned resources.
+    Cleanup {
+        deadline_ns: u64,
+        plan: String,
+        resources: super::supervisor::RecordedResources,
     },
     /// A fence revoked every future permit: stop and exit.
     Revoke,
@@ -1616,6 +1712,25 @@ pub enum SupervisorEvent {
     EffectsDone,
     /// Forward setup ran out of its original deadline. S stops here with nothing further.
     SetupExpired,
+    /// Something S must make durable before it proceeds; H answers with `Recorded`.
+    Record {
+        seq: u64,
+        record: super::supervisor::SupervisorRecord,
+    },
+    /// Hashing, fallocate, mkfs and the private files are done: the P lease returns.
+    PreparationDone,
+    /// V was validated, hardened and journaled BOOTING. Never READY in B4.
+    Booting,
+    /// The launch stopped before BOOTING; what exists stays charged for Remove.
+    LaunchRefused {
+        reason: String,
+    },
+    /// V exited on its own while S lived.
+    VmExited,
+    CleanedUp,
+    CleanupFailed {
+        reason: String,
+    },
 }
 
 /// What a supervisor owns besides itself. It reaches other processes only through
@@ -1630,7 +1745,7 @@ pub struct SupervisorContext {
     pub watch: std::os::unix::net::UnixStream,
 }
 
-fn send_watch_byte(watch: &std::os::unix::net::UnixStream, byte: u8) {
+pub(super) fn send_watch_byte(watch: &std::os::unix::net::UnixStream, byte: u8) {
     // SAFETY: the byte is readable and the socket is owned.
     unsafe {
         libc::send(
@@ -1720,6 +1835,39 @@ pub fn supervisor_main(mut context: SupervisorContext) {
                         allowed_names,
                         expected,
                         deadline_ns,
+                        plan: Some(plan),
+                        plan_generation,
+                        ..
+                    } => {
+                        let _ = allowed_names;
+                        if gated {
+                            fault_point("S.gate");
+                            real_supervisor(
+                                &mut context,
+                                &plan,
+                                &expected,
+                                deadline_ns,
+                                plan_generation,
+                            );
+                            return;
+                        }
+                    }
+                    SupervisorCommand::Cleanup {
+                        deadline_ns,
+                        plan,
+                        resources,
+                    } => {
+                        if gated {
+                            real_cleanup(&mut context, &plan, &resources, deadline_ns);
+                            return;
+                        }
+                    }
+                    SupervisorCommand::Recorded { .. } => {}
+                    SupervisorCommand::OpenGate {
+                        allowed_names,
+                        expected,
+                        deadline_ns,
+                        plan: None,
                         ..
                     } => {
                         last_helper = std::time::Instant::now();
@@ -1786,6 +1934,142 @@ pub fn supervisor_main(mut context: SupervisorContext) {
             }
         }
     }
+}
+
+/// The real launch: run the pipeline, then the steady loop. Every way out contains the
+/// VM subtree first; resources stay for Remove, which needs ABSENT to release them.
+#[cfg(target_os = "linux")]
+fn real_supervisor(
+    context: &mut SupervisorContext,
+    plan: &str,
+    expected: &[ExecutableIdentity],
+    deadline_ns: u64,
+    plan_generation: u64,
+) {
+    use super::supervisor::{Abort, LaunchPlan, Link, SteadyEnd};
+    let parsed = match LaunchPlan::parse(plan.as_bytes()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let _ = context.control.send(
+                0,
+                &SupervisorEvent::LaunchRefused {
+                    reason: error.to_string(),
+                },
+                Duration::from_secs(1),
+            );
+            send_watch_byte(&context.watch, b'E');
+            return;
+        }
+    };
+    let mut created = None;
+    let mut link = Link::new(context, deadline_ns);
+    let result =
+        super::supervisor::launch(&mut link, &parsed, expected, plan_generation, &mut created);
+    let end = match result {
+        Ok(mut booted) => {
+            link.event(&SupervisorEvent::Booting);
+            // After BOOTING, no forward deadline applies: the steady loop only watches.
+            match super::supervisor::steady(&mut link, &mut booted) {
+                SteadyEnd::VmExited => {
+                    link.event(&SupervisorEvent::VmExited);
+                    let _ = super::supervisor::contain(&parsed, created.as_ref());
+                    // Stay owned until H revokes: cleanup is Remove's, by its own S.
+                    loop {
+                        link.beat();
+                        match link.poll(Duration::from_millis(20)) {
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+                SteadyEnd::Revoked | SteadyEnd::HelperGone => {}
+            }
+            None
+        }
+        Err(abort) => Some(abort),
+    };
+    let _ = super::supervisor::contain(&parsed, created.as_ref());
+    match end {
+        Some(Abort::Expired) => link.event(&SupervisorEvent::SetupExpired),
+        Some(Abort::Refused(reason)) => link.event(&SupervisorEvent::LaunchRefused { reason }),
+        Some(Abort::Revoked | Abort::HelperGone) | None => {}
+    }
+    drop(link);
+    send_watch_byte(&context.watch, b'E');
+}
+
+#[cfg(not(target_os = "linux"))]
+fn real_supervisor(
+    context: &mut SupervisorContext,
+    _: &str,
+    _: &[ExecutableIdentity],
+    _: u64,
+    _: u64,
+) {
+    let _ = context.control.send(
+        0,
+        &SupervisorEvent::LaunchRefused {
+            reason: "real launches need Linux".into(),
+        },
+        Duration::from_secs(1),
+    );
+    send_watch_byte(&context.watch, b'E');
+}
+
+/// A cleanup-only S: contain, unmount, detach and remove, then report and exit.
+#[cfg(target_os = "linux")]
+fn real_cleanup(
+    context: &mut SupervisorContext,
+    plan: &str,
+    resources: &super::supervisor::RecordedResources,
+    deadline_ns: u64,
+) {
+    use super::supervisor::{Abort, LaunchPlan, Link};
+    let event = match LaunchPlan::parse(plan.as_bytes()) {
+        Err(error) => SupervisorEvent::CleanupFailed {
+            reason: error.to_string(),
+        },
+        Ok(parsed) => {
+            let mut link = Link::new(context, deadline_ns);
+            // A tree that still exists charges this work to its allocation.
+            if let Some(identity) = resources.cgroup
+                && super::cgroup::exists(&parsed.cgroup).unwrap_or(false)
+            {
+                let _ = super::cgroup::join(
+                    &format!("{}/control", parsed.cgroup),
+                    identity.control_ino,
+                );
+            }
+            let result = super::supervisor::cleanup(&mut link, &parsed, resources);
+            drop(link);
+            match result {
+                Ok(()) => SupervisorEvent::CleanedUp,
+                Err(Abort::Refused(reason)) => SupervisorEvent::CleanupFailed { reason },
+                Err(other) => SupervisorEvent::CleanupFailed {
+                    reason: format!("{other:?}"),
+                },
+            }
+        }
+    };
+    let _ = context.control.send(0, &event, Duration::from_secs(1));
+    send_watch_byte(&context.watch, b'E');
+}
+
+#[cfg(not(target_os = "linux"))]
+fn real_cleanup(
+    context: &mut SupervisorContext,
+    _: &str,
+    _: &super::supervisor::RecordedResources,
+    _: u64,
+) {
+    let _ = context.control.send(
+        0,
+        &SupervisorEvent::CleanupFailed {
+            reason: "cleanup needs Linux".into(),
+        },
+        Duration::from_secs(1),
+    );
+    send_watch_byte(&context.watch, b'E');
 }
 
 /// S leaves without another effect. Anything it already owns stays for H to fence,
@@ -1883,7 +2167,7 @@ pub enum MonitorCommand {
     /// The conditional stop authority's concrete target, before it could be needed.
     RegisterTarget {
         allocation: AllocationKey,
-        target: ProcessId,
+        target: super::monitor::StopTarget,
     },
     Forget {
         allocation: AllocationKey,
@@ -1929,7 +2213,7 @@ const RECOVERY_IDLE_AFTER_HELPER_LOSS: Duration = Duration::from_secs(3);
 /// third K exists, and a stuck slot simply never frees.
 #[derive(Default)]
 struct StopQueue {
-    targets: HashMap<AllocationKey, ProcessId>,
+    targets: HashMap<AllocationKey, super::monitor::StopTarget>,
     /// Waiting for a free slot, in arrival order.
     pending: std::collections::VecDeque<AllocationKey>,
     /// Which allocation each K slot is working on.
@@ -1989,7 +2273,7 @@ impl StopQueue {
             }
             let allocation = self.pending.pop_front().expect("checked nonempty");
             // No concrete target yet: the request stays open for when H registers one.
-            let Some(target) = self.targets.get(&allocation).copied() else {
+            let Some(target) = self.targets.get(&allocation).cloned() else {
                 self.awaiting_target.insert(allocation);
                 continue;
             };
@@ -2023,7 +2307,7 @@ impl StopQueue {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RecoveryDatagram {
     pub allocation: AllocationKey,
-    pub target: ProcessId,
+    pub target: super::monitor::StopTarget,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2094,6 +2378,8 @@ pub struct MonitorSockets {
 /// H's silence requests every registered stop, and M owns that work through H's death.
 /// A stale S watch requests its stop as well. S keeps its slot and permit charged.
 pub fn monitor_main(mut sockets: MonitorSockets, timings: Timings, mut heartbeat: Heartbeat) {
+    #[cfg(target_os = "linux")]
+    crate::process::drop_firecracker_launch_capabilities();
     let mut watches: Vec<Watch> = Vec::new();
     let mut stops = StopQueue::new(sockets.recovery.len());
     let mut stale_requested: std::collections::HashSet<AllocationKey> = Default::default();
@@ -2239,7 +2525,11 @@ pub fn monitor_main(mut sockets: MonitorSockets, timings: Timings, mut heartbeat
                             let reply = if stops.targets.len() < MAX_MONITOR_TARGETS
                                 || stops.targets.contains_key(&allocation)
                             {
-                                stops.targets.insert(allocation, target);
+                                stops
+                                    .targets
+                                    .entry(allocation)
+                                    .and_modify(|known| known.merge(&target))
+                                    .or_insert(target);
                                 // An already-stale or lost S may have just started this
                                 // subtree, and its stop request still stands.
                                 if stale_requested.contains(&allocation)
@@ -2354,25 +2644,63 @@ pub fn monitor_main(mut sockets: MonitorSockets, timings: Timings, mut heartbeat
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RecoveryRequest {
     Kill {
-        target: ProcessId,
+        target: super::monitor::StopTarget,
     },
     Probe {
-        target: ProcessId,
+        target: super::monitor::StopTarget,
         boot_id: Option<String>,
+    },
+    /// Removes an allocation's empty cgroup tree after S exited (section 6.4).
+    RemoveCgroup {
+        relative: String,
+        identity: Option<super::cgroup::CgroupIdentity>,
     },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RecoveryReply {
-    Killed { gone: bool },
-    Probed { gone: bool },
+    Killed {
+        gone: bool,
+    },
+    Probed {
+        gone: bool,
+    },
+    Removed {
+        state: Option<super::cgroup::NodeState>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_empty(target: Option<&super::cgroup::CgroupTarget>) -> bool {
+    let Some(target) = target else { return true };
+    match super::cgroup::open_node(&target.path) {
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+        Ok(node) => {
+            super::cgroup::inode(&node).is_ok_and(|ino| ino != target.st_ino)
+                || super::cgroup::populated(&node).is_ok_and(|p| !p)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_empty(target: Option<&super::cgroup::CgroupTarget>) -> bool {
+    target.is_none()
+}
+
+fn remove_cgroup(
+    relative: &str,
+    identity: Option<&super::cgroup::CgroupIdentity>,
+) -> Option<super::cgroup::NodeState> {
+    super::cgroup::remove_tree(relative, identity).ok()
 }
 
 /// K: independent of L and S. It uses already-authorized identity only and never
 /// hashes, formats, inventories or waits on the ledger. Its result is evidence for
 /// containment, never a durable receipt.
 pub fn recovery_main(mut endpoint: Endpoint, monitor: UnixDatagram, mut heartbeat: Heartbeat) {
+    #[cfg(target_os = "linux")]
+    crate::process::drop_firecracker_launch_capabilities();
     let _ = monitor.set_nonblocking(true);
     let mut helper_gone = false;
     let mut last_dispatch = std::time::Instant::now();
@@ -2404,7 +2732,7 @@ pub fn recovery_main(mut endpoint: Endpoint, monitor: UnixDatagram, mut heartbea
             if let Ok(request) = serde_json::from_slice::<RecoveryDatagram>(&bytes[..n]) {
                 last_dispatch = std::time::Instant::now();
                 fault_point("K.kill");
-                let gone = kill_target(request.target);
+                let gone = super::monitor::execute(&request.target);
                 if let Ok(reply) = serde_json::to_vec(&RecoveryDatagramReply {
                     allocation: request.allocation,
                     gone,
@@ -2427,19 +2755,28 @@ pub fn recovery_main(mut endpoint: Endpoint, monitor: UnixDatagram, mut heartbea
                     RecoveryRequest::Kill { target } => {
                         fault_point("K.kill");
                         RecoveryReply::Killed {
-                            gone: kill_target(target),
+                            gone: super::monitor::execute(&target),
                         }
                     }
                     RecoveryRequest::Probe { target, boot_id } => {
                         let rebooted = boot_id.is_some_and(|boot| boot != host_boot_id());
-                        RecoveryReply::Probed {
-                            gone: rebooted
-                                || match process_state(target.pid) {
+                        let process_gone = target.process.is_none_or(|process| {
+                            rebooted
+                                || match process_state(process.pid) {
                                     ProcessState::Gone | ProcessState::Zombie => true,
                                     ProcessState::Running { start_time } => {
-                                        start_time != target.start_time
+                                        start_time != process.start_time
                                     }
-                                },
+                                }
+                        });
+                        RecoveryReply::Probed {
+                            gone: process_gone && cgroup_empty(target.cgroup.as_ref()),
+                        }
+                    }
+                    RecoveryRequest::RemoveCgroup { relative, identity } => {
+                        fault_point("K.remove_cgroup");
+                        RecoveryReply::Removed {
+                            state: remove_cgroup(&relative, identity.as_ref()),
                         }
                     }
                 };
@@ -2592,10 +2929,10 @@ pub(super) mod tests {
         for (index, id) in ids.iter().enumerate() {
             queue.targets.insert(
                 *id,
-                ProcessId {
+                super::super::monitor::StopTarget::process(ProcessId {
                     pid: 1000 + index as i32,
                     start_time: 1,
-                },
+                }),
             );
         }
         queue.request_all();

@@ -135,6 +135,9 @@ command or environment. Identities are typed 128-bit IDs and digests, profiles a
 | `inspect {allocation_id}` | 5 s | `present_busy`, `stopped_with_resources`, `absent_fenced`, `incompatible` or `unknown`. A missing record is `unknown` |
 | `list` | 30 s | This namespace's records with `complete`; anything stale or unexplained makes it incomplete |
 | `fence_absent {allocation_id, sandbox_id, plan_digest}` | 30 s | The permanent receipt, byte for byte, or `ambiguous {class}` |
+| `stop {allocation_id, expected_generation, reason}` | 60 s | `stopped {generation, observations}` once STOP_INTENT is durable, the `vm` subtree is proven empty and S has exited, or `unknown {reason}`. Never a release. `expected_generation` is the C2 generation; `reason` is `delete`, `interrupted`, `unhealthy` or `operator` |
+| `remove {allocation_id}` | 60 s | Stop, exact cleanup and the ABSENT fence: the permanent receipt, or `ambiguous {class}` with the charge held. Idempotent; an unknown token is `ambiguous {conflict}` (only `fence_absent` fences those) |
+| `gc {allocation_ids}` | 30 s | At most 1024 unique IDs. Per ID: `removed {receipt}`, `skipped {reason}` (live, quarantined, unknown or another instance's) or `failed {class}`. Empty is a no-op |
 
 An instance must be enrolled by root first (`kilnd-helper enroll`, which takes the node
 lock and uses no socket), under a Unix account no other instance holds. Attachment succeeds
@@ -208,9 +211,16 @@ keeps its slot and its charge. M's stop work over the two K slots is a bounded p
 set: a target waits for a slot's own reply instead of being dropped when both are
 busy. M owns that set through H's death until every target settles, with no ownership
 timeout. Private heartbeats keep idle K slots available while another K is stuck;
-ledger replay remains a fallback. A K that can't finish leaves the stop unknown and charged. In this build S's side
-effects are test-injected fake files and a fake child process. Production S performs
-none, and reports the retained-descriptor identity it would dispatch.
+ledger replay remains a fallback. A K that can't finish leaves the stop unknown and charged.
+
+From B4, S performs the real launch (design section "B4 implementation notes"): every
+resource is journaled through H before or as it is owned (`record` / `recorded`, in order),
+the `vm` node becomes M's stop target before J exists, and the launch ends at BOOTING. K's
+stop is `cgroup.kill` on that pinned node, compared by inode, plus a pidfd signal to the
+recorded VMM, compared by start time; a replaced node or reused PID is left alone. S's
+session preparation holds one of the two P slots. Remove's cleanup runs in a fresh,
+journaled cleanup-only S, and K removes the empty tree. A Stop whose ledger does not answer
+within a second still revokes and contains under C2's authority, and answers `unknown`.
 
 ## Trust and failure analysis
 

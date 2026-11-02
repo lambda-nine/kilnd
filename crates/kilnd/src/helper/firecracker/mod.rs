@@ -1,15 +1,21 @@
-//! B3: approved plans, the root node ledger and the concrete worker model, with fake
-//! resources only. This module is H's side of the group: bounded framing has already
-//! happened, and everything here is in-memory checks and dispatch to worker processes.
-//! It performs no filesystem, SQLite, hashing or `/proc` work on the socket runtime.
-//! No code path launches a VM, a jailer or Firecracker, and no reply can say READY.
+//! B3's approved plans, root node ledger and concrete worker model, with B4's real
+//! host lifecycle: allocation, the jailer/VMM launch, supervision, stop and removal.
+//! This module is H's side of the group: bounded framing has already happened, and
+//! everything here is in-memory checks and dispatch to worker processes. It performs
+//! no filesystem, SQLite, hashing or `/proc` work on the socket runtime. No reply can
+//! say READY: that needs B5's broker, and production profiles stay refused until B7.
+pub mod cgroup;
 pub mod config;
 pub mod executable;
 pub mod identity;
 pub mod inventory;
 pub mod journal;
+mod lifecycle;
 pub mod manifest;
+pub mod monitor;
 pub mod peer;
+pub mod storage;
+pub mod supervisor;
 pub mod workers;
 
 use self::config::{MAX_ENROLLED_HARD, NodePolicy, ProfileCatalog};
@@ -21,6 +27,7 @@ use self::journal::{
     LedgerConfig, StopAuthority, TokenLookup, WorkerIntentSpec,
 };
 use self::manifest::ManifestGate;
+use self::monitor::StopTarget;
 use self::peer::{Enrollment, PeerAttestor, PeerCredentials, PeerPin};
 use self::workers::{
     AdmissionAuthority, CallError, Channel, Endpoint, Heartbeat, Lane, LedgerReply, LedgerRequest,
@@ -29,9 +36,10 @@ use self::workers::{
     SupervisorCommand, SupervisorContext, SupervisorEvent, Timings, try_reap,
 };
 use super::protocol::{
-    AccountingReply, AmbiguousClass, CapabilitiesReply, CreateReply, FIRECRACKER_GROUP_VERSION,
-    FenceReply, FirecrackerOperation, FirecrackerRequest, FirecrackerResponse, GroupError,
-    GroupErrorKind, InspectReply, ListReply, WireBytes, WorkerHealth, WorkersHealth,
+    self, AccountingReply, AmbiguousClass, CapabilitiesReply, CreateReply,
+    FIRECRACKER_GROUP_VERSION, FenceReply, FirecrackerOperation, FirecrackerRequest,
+    FirecrackerResponse, GroupError, GroupErrorKind, InspectReply, ListReply, WireBytes,
+    WorkerHealth, WorkersHealth,
 };
 use crate::lock::ExclusiveFileLock;
 use crate::model::{Digest, Id128, SandboxSpec};
@@ -86,6 +94,15 @@ pub struct WireDeadline {
 }
 
 impl WireDeadline {
+    /// An earlier instant on the same clocks: the monotonic nanosecond value moves back
+    /// by exactly as much. Never later than the original deadline.
+    fn from_instant(instant: Instant) -> Self {
+        let now = Instant::now();
+        let ns = workers::monotonic_ns()
+            .saturating_add(instant.saturating_duration_since(now).as_nanos() as u64);
+        Self { instant, ns }
+    }
+
     fn expired(&self) -> bool {
         Instant::now() >= self.instant
     }
@@ -330,11 +347,27 @@ impl Drop for GateUse {
     }
 }
 
+/// A cleanup-only S's reported result, filled by its event and read after its exit.
+type CleanupOutcome = Arc<Mutex<Option<Result<(), String>>>>;
+
 struct SupervisorEntry {
     pid: i32,
     channel: Arc<Channel>,
     worker_id: i64,
-    vm: Option<ProcessId>,
+    /// Everything M and K need to stop this boot: the `vm` subtree from the moment it
+    /// exists, and the validated VMM once published.
+    vm: Option<StopTarget>,
+    /// The plan's executable vector, for J's and V's journal rows.
+    expected: Vec<ExecutableIdentity>,
+    /// J's and V's worker rows, settled once each is provably gone.
+    children: Vec<(i64, ProcessId)>,
+    /// V was validated, hardened and journaled BOOTING.
+    booted: bool,
+    /// A cleanup-only S's result, when this entry's S is one.
+    cleanup: Option<CleanupOutcome>,
+    /// One of the two node-wide preparation slots, leased to this S's session hashing,
+    /// fallocate and mkfs in its `control` leaf until it reports them done or exits.
+    prep: Option<PrepLease>,
     vm_worker: Option<i64>,
     vm_gone: bool,
     /// Revoked by a fence: S's exit after this is expected, not a loss.
@@ -349,6 +382,33 @@ struct SupervisorEntry {
     kill_inflight: bool,
     /// The revoke actually reached S's bounded write queue.
     revoke_sent: bool,
+}
+
+impl SupervisorEntry {
+    fn new(pid: i32, channel: Arc<Channel>, worker_id: i64) -> Self {
+        Self {
+            pid,
+            channel,
+            worker_id,
+            vm: None,
+            expected: Vec::new(),
+            children: Vec::new(),
+            booted: false,
+            cleanup: None,
+            prep: None,
+            vm_worker: None,
+            vm_gone: false,
+            revoked: false,
+            exit: None,
+            exited: Arc::new(CancellationToken::new()),
+            settle_queued: false,
+            stop_fenced: false,
+            stalled: false,
+            contained: None,
+            kill_inflight: false,
+            revoke_sent: false,
+        }
+    }
 }
 
 struct WorkerSlot {
@@ -465,6 +525,8 @@ pub struct Node {
     /// helper holds, so the set cannot change while it runs.
     shares: Mutex<Option<Shares>>,
     supervisors: Mutex<HashMap<AllocationKey, SupervisorEntry>>,
+    /// Remove's per-allocation serialization; a concurrent Remove is told to retry.
+    removing: Mutex<std::collections::HashSet<AllocationKey>>,
     pending: Mutex<VecDeque<LedgerRequest>>,
     flushing: tokio::sync::Mutex<()>,
     prep_waiters: AtomicUsize,
@@ -645,7 +707,7 @@ impl Node {
     /// Starts L, P, M and K before any traffic is accepted, replays every unreleased
     /// claim, and only then returns. The caller's listener serves nothing until then.
     pub async fn start(config: NodeConfig) -> Result<Arc<Self>, NodeError> {
-        let directory = executable::walk_directory(&config.walk, &config.ledger.directory)
+        let directory = executable::walk_directory(&config.ledger.policy, &config.ledger.directory)
             .map_err(|e| NodeError::Config(e.to_string()))?;
         // A previous helper's L holds this until it has seen its EOF and finished.
         let lock_wait = Instant::now() + LOCK_WAIT;
@@ -711,6 +773,7 @@ impl Node {
             attachments: Mutex::default(),
             shares: Mutex::new(None),
             supervisors: Mutex::default(),
+            removing: Mutex::default(),
             pending: Mutex::default(),
             flushing: tokio::sync::Mutex::new(()),
             prep_waiters: AtomicUsize::new(0),
@@ -960,7 +1023,7 @@ impl Node {
                         && self.is_current_infrastructure(target.pid) => {}
                 Some(target) => {
                     let gone = self
-                        .probe_process(target, worker.host_boot_id.clone())
+                        .probe_process(StopTarget::process(target), worker.host_boot_id.clone())
                         .await
                         .unwrap_or(false);
                     if gone {
@@ -971,7 +1034,10 @@ impl Node {
                     } else if worker.mode == "vm" {
                         // An owned subtree that outlived its helper: stop it under
                         // the conditional authority, then prove it gone.
-                        let gone = self.dispatch_kill(target).await.unwrap_or(false);
+                        let gone = self
+                            .dispatch_kill(StopTarget::process(target))
+                            .await
+                            .unwrap_or(false);
                         if gone {
                             self.queue_record(LedgerRequest::Settle {
                                 worker_id: worker.worker_id,
@@ -1063,6 +1129,22 @@ impl Node {
         reply_rx.await.map_err(|_| CallError::Closed)?
     }
 
+    /// A preparation slot for S's own session work: the same bounded waiters and wire
+    /// deadline as revalidation. The P process stays idle while S holds its lease.
+    async fn queued_prep_lease(&self, deadline: WireDeadline) -> Option<PrepLease> {
+        if self.prep_waiters.fetch_add(1, Ordering::AcqRel) >= MAX_PREP_WAITERS {
+            self.prep_waiters.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        let mut lease = self.try_prep_slot();
+        while lease.is_none() && !deadline.expired() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            lease = self.try_prep_slot();
+        }
+        self.prep_waiters.fetch_sub(1, Ordering::AcqRel);
+        lease
+    }
+
     /// Create's revalidation may wait for a slot: at most a fixed number of waiters,
     /// and never past its wire deadline. Nothing here adds a process or borrows K.
     async fn queued_prep_call(
@@ -1096,7 +1178,7 @@ impl Node {
 
     /// One reserved K slot, then the other. A stuck slot stays occupied by its original
     /// process; this only moves on to the other fixed slot and never spawns a third.
-    async fn dispatch_kill(&self, target: ProcessId) -> Option<bool> {
+    async fn dispatch_kill(&self, target: StopTarget) -> Option<bool> {
         for slot in &self.recovery {
             let channel = {
                 let slot = slot.lock().unwrap();
@@ -1105,10 +1187,12 @@ impl Node {
                 }
                 slot.channel.clone()
             };
-            let request = RecoveryRequest::Kill { target };
+            let request = RecoveryRequest::Kill {
+                target: target.clone(),
+            };
             let call = channel.call::<RecoveryReply>(Lane::Normal, &request, u64::MAX);
             if let Ok(Ok(RecoveryReply::Killed { gone })) =
-                tokio::time::timeout(Duration::from_millis(750), call).await
+                tokio::time::timeout(Duration::from_millis(2_750), call).await
             {
                 return Some(gone);
             }
@@ -1116,7 +1200,7 @@ impl Node {
         None
     }
 
-    async fn probe_process(&self, target: ProcessId, boot_id: Option<String>) -> Option<bool> {
+    async fn probe_process(&self, target: StopTarget, boot_id: Option<String>) -> Option<bool> {
         for slot in &self.recovery {
             let channel = {
                 let slot = slot.lock().unwrap();
@@ -1126,7 +1210,7 @@ impl Node {
                 slot.channel.clone()
             };
             let request = RecoveryRequest::Probe {
-                target,
+                target: target.clone(),
                 boot_id: boot_id.clone(),
             };
             let call = channel.call::<RecoveryReply>(Lane::Normal, &request, u64::MAX);
@@ -1224,10 +1308,10 @@ impl Node {
             let Some(entry) = supervisors.get_mut(&allocation) else {
                 return;
             };
-            match entry.vm {
+            match &entry.vm {
                 Some(target) if !entry.vm_gone && !entry.kill_inflight => {
                     entry.kill_inflight = true;
-                    target
+                    target.clone()
                 }
                 _ => return,
             }
@@ -1355,7 +1439,7 @@ impl Node {
         tokio::spawn(async move {
             for orphan in orphans {
                 let gone = node
-                    .probe_process(orphan.target, orphan.boot_id.clone())
+                    .probe_process(StopTarget::process(orphan.target), orphan.boot_id.clone())
                     .await
                     .unwrap_or(false);
                 if gone {
@@ -1427,6 +1511,7 @@ impl Node {
                     && let Some(evidence) = try_reap(entry.pid)
                 {
                     entry.exit = Some(evidence.clone());
+                    entry.prep = None;
                     entry.exited.cancel();
                     entry.channel.close();
                     if !entry.revoked {
@@ -1826,6 +1911,108 @@ impl Node {
                     .await;
                 FirecrackerResponse::Fence(reply)
             }
+            FirecrackerOperation::Stop {
+                allocation_id,
+                expected_generation,
+                reason,
+            } => {
+                let (Some(share), true) = (self.share(instance), self.is_holder(instance, peer))
+                else {
+                    return FirecrackerResponse::Stop(protocol::StopReply::Unknown {
+                        reason: "this process does not hold the instance".into(),
+                    });
+                };
+                if !self.epoch_valid(instance, epoch, peer) {
+                    return group_error(
+                        GroupErrorKind::StaleEpoch,
+                        "connection epoch is not current for this instance",
+                    );
+                }
+                let node = self.clone();
+                let key = AllocationKey {
+                    instance,
+                    allocation: allocation_id,
+                };
+                let reply = self
+                    .run_detached(
+                        &share,
+                        deadline,
+                        cancel,
+                        allocation_id,
+                        protocol::StopReply::Unknown {
+                            reason: "stop outcome not yet known".into(),
+                        },
+                        move || async move {
+                            node.stop_flow(key, expected_generation, reason, deadline)
+                                .await
+                        },
+                    )
+                    .await;
+                FirecrackerResponse::Stop(reply)
+            }
+            FirecrackerOperation::Remove { allocation_id } => {
+                let (Some(share), true) = (self.share(instance), self.is_holder(instance, peer))
+                else {
+                    return FirecrackerResponse::Remove(ambiguous_fence(
+                        AmbiguousClass::OldEpoch,
+                        "this process does not hold the instance",
+                    ));
+                };
+                let node = self.clone();
+                let token = lifecycle::RemoveToken {
+                    instance,
+                    epoch,
+                    peer,
+                    allocation: allocation_id,
+                    deadline,
+                };
+                let reply = self
+                    .run_detached(
+                        &share,
+                        deadline,
+                        cancel,
+                        allocation_id,
+                        ambiguous_fence(AmbiguousClass::Pending, "removal outcome not yet known"),
+                        move || node.remove_flow(token),
+                    )
+                    .await;
+                FirecrackerResponse::Remove(reply)
+            }
+            FirecrackerOperation::Gc { allocation_ids } => {
+                let (Some(share), true) = (self.share(instance), self.is_holder(instance, peer))
+                else {
+                    return group_error(
+                        GroupErrorKind::Unauthorized,
+                        "this process does not hold the instance",
+                    );
+                };
+                if !self.epoch_valid(instance, epoch, peer) {
+                    return group_error(
+                        GroupErrorKind::StaleEpoch,
+                        "connection epoch is not current for this instance",
+                    );
+                }
+                let node = self.clone();
+                let anchor = allocation_ids
+                    .first()
+                    .copied()
+                    .unwrap_or_else(Id128::random);
+                let reply = self
+                    .run_detached(&share, deadline, cancel, anchor, Vec::new(), move || {
+                        node.gc_flow(instance, epoch, peer, allocation_ids, deadline)
+                    })
+                    .await;
+                FirecrackerResponse::Gc(reply)
+            }
+            #[cfg(test)]
+            FirecrackerOperation::TestDispatchProbe { allocation_id } => {
+                FirecrackerResponse::TestDispatch {
+                    admitted: self.reusable_dispatch(AllocationKey {
+                        instance,
+                        allocation: allocation_id,
+                    }),
+                }
+            }
             operation => {
                 if !self.epoch_valid(instance, epoch, peer) {
                     return group_error(
@@ -2166,7 +2353,7 @@ impl Node {
             broker_protocol: 1,
             helper_version: env!("CARGO_PKG_VERSION").into(),
             enabled: true,
-            launch_enabled: false,
+            launch_enabled: !self.config.profiles.is_empty() && self.real_plan(b"{}").is_some(),
             profiles: self
                 .config
                 .profiles
@@ -2634,26 +2821,9 @@ impl Node {
         })
         .map_err(unavailable)?;
         let (channel, events) = Channel::spawn(host, CONTROL_QUEUE, 0).map_err(unavailable)?;
-        self.supervisors.lock().unwrap().insert(
-            key,
-            SupervisorEntry {
-                pid,
-                channel: channel.clone(),
-                worker_id,
-                vm: None,
-                vm_worker: None,
-                vm_gone: false,
-                revoked: false,
-                exit: None,
-                exited: Arc::new(CancellationToken::new()),
-                settle_queued: false,
-                stop_fenced: false,
-                stalled: false,
-                contained: None,
-                kill_inflight: false,
-                revoke_sent: false,
-            },
-        );
+        let mut entry = SupervisorEntry::new(pid, channel.clone(), worker_id);
+        entry.expected = expected.clone();
+        self.supervisors.lock().unwrap().insert(key, entry);
         tokio::spawn(Self::supervisor_events(self.clone(), key, events));
         // A failure before the gate means S exits on EOF with nothing done. It is not
         // a lost boot: mark it expected, record the stop, and let the exit settle S.
@@ -2733,9 +2903,24 @@ impl Node {
             ),
         )
         .await;
+        let admitted_generation = generation;
         let Ok(Ok(LedgerReply::Generation(generation))) = advanced else {
             return Err(step_failed("the ledger did not record PREPARING"));
         };
+        // A real launch carries the verified plan; the fake fixtures carry none.
+        let real_plan = self.real_plan(&token.plan);
+        // Session preparation counts against the node's two P slots (section 6.4).
+        if real_plan.is_some() {
+            let Some(lease) = self.queued_prep_lease(token.deadline).await else {
+                return Err(abort(
+                    AmbiguousClass::WorkerExhausted,
+                    "no preparation slot became free before the deadline".into(),
+                ));
+            };
+            if let Some(entry) = self.supervisors.lock().unwrap().get_mut(&key) {
+                entry.prep = Some(lease);
+            }
+        }
         // The last check before S may act. Each of these can have changed during C3.
         if !self.revocations.is_current(&authority) {
             return Err(abort(
@@ -2765,6 +2950,8 @@ impl Node {
                         allowed_names,
                         expected,
                         deadline_ns: token.deadline.ns,
+                        plan: real_plan.clone(),
+                        plan_generation: admitted_generation,
                     })
             })
         };
@@ -2775,6 +2962,16 @@ impl Node {
             ));
         }
         Ok(generation)
+    }
+
+    /// The canonical plan S launches from. Production always launches for real; the
+    /// B3 fixtures keep their fake effects unless a test asks for the real chain.
+    fn real_plan(&self, plan: &[u8]) -> Option<String> {
+        #[cfg(test)]
+        if !self.config.test.real {
+            return None;
+        }
+        String::from_utf8(plan.to_vec()).ok()
     }
 
     async fn supervisor_events(
@@ -2807,6 +3004,52 @@ impl Node {
                 SupervisorEvent::SetupExpired => {
                     self.contain_allocation(key, "setup deadline expired");
                 }
+                SupervisorEvent::Record { seq, record } => {
+                    let ok = self.on_record(key, record).await;
+                    let channel = self
+                        .supervisors
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .map(|entry| entry.channel.clone());
+                    if let Some(channel) = channel {
+                        channel.notify(&SupervisorCommand::Recorded { seq, ok });
+                    }
+                }
+                SupervisorEvent::PreparationDone => {
+                    if let Some(entry) = self.supervisors.lock().unwrap().get_mut(&key) {
+                        entry.prep = None;
+                    }
+                }
+                SupervisorEvent::Booting => {
+                    if let Some(entry) = self.supervisors.lock().unwrap().get_mut(&key) {
+                        entry.booted = true;
+                    }
+                }
+                SupervisorEvent::LaunchRefused { reason } => {
+                    self.contain_allocation(key, &format!("launch refused: {reason}"));
+                }
+                SupervisorEvent::VmExited => {
+                    if let Some(entry) = self.supervisors.lock().unwrap().get_mut(&key) {
+                        entry.vm_gone = false;
+                    }
+                    self.contain_allocation(key, "the VMM exited");
+                }
+                SupervisorEvent::CleanedUp | SupervisorEvent::CleanupFailed { .. } => {
+                    let result = match event {
+                        SupervisorEvent::CleanupFailed { reason } => Err(reason),
+                        _ => Ok(()),
+                    };
+                    if let Some(slot) = self
+                        .supervisors
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .and_then(|entry| entry.cleanup.clone())
+                    {
+                        *slot.lock().unwrap() = Some(result);
+                    }
+                }
             }
         }
     }
@@ -2814,22 +3057,13 @@ impl Node {
     /// The precommitted authority's concrete target reaches M before anything else,
     /// and it needs no ledger write: an emergency works with L already blocked.
     async fn on_vm_started(self: &Arc<Self>, key: AllocationKey, target: ProcessId) {
-        if let Some(entry) = self.supervisors.lock().unwrap().get_mut(&key) {
-            entry.vm = Some(target);
-        }
-        let channel = self.monitor.lock().unwrap().worker.channel.clone();
-        let registered = tokio::time::timeout(
-            Duration::from_secs(1),
-            channel.call::<MonitorReply>(
-                Lane::Normal,
-                &MonitorCommand::RegisterTarget {
-                    allocation: key,
-                    target,
-                },
-                u64::MAX,
-            ),
-        )
-        .await;
+        let registered = self.register_target(key, StopTarget::process(target)).await;
+        let real = self
+            .supervisors
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|entry| entry.vm.as_ref().is_some_and(|vm| vm.cgroup.is_some()));
         // Without M's copy, this subtree has lost independent supervision. A fence that
         // landed first also needs the target it could not have known about.
         let fenced = self
@@ -2838,8 +3072,12 @@ impl Node {
             .unwrap()
             .get(&key)
             .is_some_and(|entry| entry.stop_fenced);
-        if fenced || !matches!(registered, Ok(Ok(MonitorReply::Registered))) {
+        if fenced || !registered {
             self.contain_allocation(key, "subtree target has no monitor");
+        }
+        // A real VMM's row came from S's own record, against the plan's VMM image.
+        if real {
+            return;
         }
         if let Some(image) = self.config.helper_image {
             self.queue_record(LedgerRequest::RecordChild {
@@ -3059,9 +3297,12 @@ impl Node {
         }
         let vm = {
             let supervisors = self.supervisors.lock().unwrap();
-            supervisors
-                .get(&key)
-                .and_then(|entry| entry.vm.map(|vm| (vm, entry.vm_gone, entry.vm_worker)))
+            supervisors.get(&key).and_then(|entry| {
+                entry
+                    .vm
+                    .clone()
+                    .map(|vm| (vm, entry.vm_gone, entry.vm_worker))
+            })
         };
         if let Some((target, known_gone, worker)) = vm {
             let gone = known_gone || self.probe_process(target, None).await.unwrap_or(false);
@@ -3166,7 +3407,7 @@ impl Node {
                     instance,
                     allocation,
                 });
-                if phase == "stopped" {
+                if phase == "stopped" || phase == "cleaning" {
                     InspectReply::StoppedWithResources { generation }
                 } else if fresh.stop_fenced {
                     InspectReply::Unknown {
@@ -3218,7 +3459,13 @@ impl Node {
             }
         };
         let namespace = match self
-            .prep_call(PrepRequest::ObserveNode { instance }, deadline)
+            .prep_call(
+                PrepRequest::ObserveNode {
+                    instance,
+                    known: journal.records.iter().map(|r| r.allocation_id).collect(),
+                },
+                deadline,
+            )
             .await
         {
             Ok(PrepReply::Node(observation)) => observation,
@@ -3266,7 +3513,7 @@ impl Node {
                     "stop_fenced": entry.stop_fenced,
                     "stalled": entry.stalled,
                     "contained": entry.contained,
-                    "vm": entry.vm.map(|vm| vm.pid),
+                    "vm": entry.vm.as_ref().and_then(|vm| vm.process).map(|vm| vm.pid),
                 }))
             }).collect::<serde_json::Map<_, _>>(),
             "closed_gates": self.shares.lock().unwrap().iter().flat_map(|shares| shares.by_instance.values()).map(|share| {
@@ -3407,6 +3654,7 @@ pub fn load_profile(
         table,
         pins: verified.pins,
         manifest_sha256: verified.sha256,
+        artifacts: verified.artifacts,
     })
 }
 
@@ -3451,7 +3699,7 @@ pub fn production_config(policy: NodePolicy, helper_uid: u32) -> NodeConfig {
         profiles,
         walk,
         gate: ManifestGate::ProductionDisabled,
-        observation: ObservationBackend::Disabled,
+        observation: ObservationBackend::Real,
         timings: Timings::default(),
         helper_image,
         helper_uid,

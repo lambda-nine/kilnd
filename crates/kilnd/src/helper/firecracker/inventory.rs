@@ -39,6 +39,9 @@ pub enum NodeObservation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservationBackend {
     Disabled,
+    /// B4's real owned namespaces: cgroup tree, jail and work directories, mounts and
+    /// loop slots, all derived from the instance-scoped host name.
+    Real,
     /// A private directory of fake resources, injected only by internal tests.
     #[cfg(test)]
     FakeDirectory(std::path::PathBuf),
@@ -51,22 +54,133 @@ impl ObservationBackend {
             Self::Disabled => NamespaceObservation::Unknown {
                 reason: "resource observation is disabled before B4".into(),
             },
+            Self::Real => real::observe_allocation(instance, allocation),
             #[cfg(test)]
             Self::FakeDirectory(root) => fake::observe_allocation(root, instance, allocation),
         }
     }
 
-    pub fn observe_node(&self, instance: Id128) -> NodeObservation {
-        let _ = instance;
+    pub fn observe_node(&self, instance: Id128, known: &[Id128]) -> NodeObservation {
+        let _ = (instance, known);
         match self {
             Self::Disabled => NodeObservation::Unknown {
                 reason: "resource observation is disabled before B4".into(),
             },
+            Self::Real => real::observe_node(instance, known),
             #[cfg(test)]
             Self::FakeDirectory(root) => fake::observe_node(root, instance),
         }
     }
 }
+
+/// The real owned namespaces. Host names are digests, so a node listing maps them back
+/// only through the journal's own allocations; any other name makes it incomplete.
+mod real {
+    use super::*;
+    use crate::helper::firecracker::identity::{host_allocation, host_name};
+    use crate::helper::firecracker::storage::{AllocationPaths, JAIL_BASE, WORK_BASE};
+
+    pub fn paths(instance: Id128, allocation: Id128) -> (AllocationPaths, String) {
+        let host = host_name(instance, allocation);
+        let _ = host_allocation(instance, allocation);
+        let jail_dir = std::path::Path::new(JAIL_BASE)
+            .join("firecracker")
+            .join(&host);
+        let work_dir = std::path::Path::new(WORK_BASE)
+            .join(instance.to_string())
+            .join(&host);
+        (
+            AllocationPaths {
+                jail_root: jail_dir.join("root"),
+                jail_dir,
+                work_file: work_dir.join(crate::helper::firecracker::storage::WORK_FILE),
+                work_dir,
+            },
+            format!("kilnd-firecracker/{instance}/{host}"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn observe_allocation(instance: Id128, allocation: Id128) -> NamespaceObservation {
+        let (paths, cgroup) = paths(instance, allocation);
+        match crate::helper::firecracker::storage::observe_presence(&paths, &cgroup) {
+            Ok(presence) if presence.names.is_empty() => NamespaceObservation::Absent,
+            Ok(presence) => NamespaceObservation::Present {
+                names: presence.names,
+            },
+            Err(error) => NamespaceObservation::Unknown {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn observe_allocation(_: Id128, _: Id128) -> NamespaceObservation {
+        NamespaceObservation::Unknown {
+            reason: "real observation needs Linux".into(),
+        }
+    }
+
+    fn names_in(path: &std::path::Path) -> Result<Vec<String>, String> {
+        match std::fs::read_dir(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+            Err(error) => Err(error.to_string()),
+            Ok(entries) => {
+                let mut names = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                    if names.len() > super::super::journal::MAX_ACTIVE_LISTED + 8 {
+                        return Err("namespace exceeds the listing bound".into());
+                    }
+                }
+                Ok(names)
+            }
+        }
+    }
+
+    pub fn observe_node(instance: Id128, known: &[Id128]) -> NodeObservation {
+        let by_host: std::collections::HashMap<String, Id128> = known
+            .iter()
+            .map(|allocation| (host_name(instance, *allocation), *allocation))
+            .collect();
+        let mut allocations = BTreeSet::new();
+        let work = std::path::Path::new(WORK_BASE).join(instance.to_string());
+        let cgroup = std::path::Path::new(crate::helper::firecracker::cgroup::CGROUP_ROOT)
+            .join(crate::helper::firecracker::cgroup::FIRECRACKER_TREE)
+            .join(instance.to_string());
+        for directory in [work, cgroup] {
+            let names = match names_in(&directory) {
+                Ok(names) => names,
+                Err(reason) => return NodeObservation::Unknown { reason },
+            };
+            for name in names {
+                // cgroupfs control files are not allocations.
+                if !name.starts_with("fc-") {
+                    if directory.starts_with(crate::helper::firecracker::cgroup::CGROUP_ROOT) {
+                        continue;
+                    }
+                    return NodeObservation::Unknown {
+                        reason: format!("unrecognized namespace entry {name}"),
+                    };
+                }
+                match by_host.get(&name) {
+                    Some(allocation) => {
+                        allocations.insert(*allocation);
+                    }
+                    None => {
+                        return NodeObservation::Unknown {
+                            reason: format!("owned name {name} has no journal record"),
+                        };
+                    }
+                }
+            }
+        }
+        NodeObservation::Observed { allocations }
+    }
+}
+
+pub use real::paths as real_paths;
 
 /// The fake namespace: `<root>/<instance>/fc-<allocation>/<resource>` files. Real
 /// directory reads run in workers, so stalling them exercises the real process model.
@@ -187,9 +301,10 @@ fn status_of(record: &InventoryRecord, freshness: &WorkerFreshness) -> ListStatu
         return ListStatus::Unknown;
     }
     match record.phase.as_str() {
-        "intent" | "preparing" => ListStatus::Busy,
+        // A booting VM is busy: B4 has no READY, and nothing is reusable yet.
+        "intent" | "preparing" | "spawn_intent" | "booting" => ListStatus::Busy,
         "stop_intent" | "quarantined" => ListStatus::Quarantined,
-        "stopped" => ListStatus::StoppedWithResources,
+        "stopped" | "cleaning" => ListStatus::StoppedWithResources,
         _ => ListStatus::Unknown,
     }
 }
@@ -372,7 +487,7 @@ mod tests {
             NamespaceObservation::Unknown { .. }
         ));
         assert!(matches!(
-            backend.observe_node(i),
+            backend.observe_node(i, &[]),
             NodeObservation::Unknown { .. }
         ));
     }
@@ -402,14 +517,14 @@ mod tests {
             }
         );
         assert_eq!(
-            backend.observe_node(i),
+            backend.observe_node(i, &[]),
             NodeObservation::Observed {
                 allocations: [a].into()
             }
         );
         std::fs::create_dir(temp.path().join(i.to_string()).join("looks-like-mine")).unwrap();
         assert!(matches!(
-            backend.observe_node(i),
+            backend.observe_node(i, &[]),
             NodeObservation::Unknown { .. }
         ));
     }

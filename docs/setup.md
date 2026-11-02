@@ -112,10 +112,33 @@ scripts/smoke.sh                     # through the installed service
 The smoke test restarts and kills kilnd, so don't run it on a node with
 sandboxes you care about.
 
+### Firecracker B4 regressions (real VMs, test approval only)
+
+These launch real Firecracker microVMs in the VM under the shared VM lock. They need
+nested KVM, the release Firecracker v1.17.0 binary and a kiln-guest bundle's `Image` and
+`rootfs.squashfs` (the schema-1 guest, which listens for nothing, so a boot ends at
+BOOTING). Production is untouched: the catalog is approved only by a `cfg(test)` gate.
+
+```sh
+# Once: the patched jailer and a static mkfs.xfs, both SHA-256 pinned (no sudo).
+scripts/build-phase1b-tools.sh --out "$HOME/b4-build/out"
+# The privileged suite; B4_TOOLS, B4_VMM and B4_GUEST override the inputs.
+scripts/b4-vm-tests.sh                 # every b4_linux_root test, or pass a name filter
+```
+
+`b4-vm-tests.sh` builds the library tests statically (`crt-static`), because that binary
+is installed in the protected store as the helper image and the contract approves static
+ELFs only. It installs under `/opt/kilnd`, uses `/var/lib/kilnd-helper/{jails,work}` and
+`/sys/fs/cgroup/kilnd-firecracker`, and its `scripts/b4-vm-cleanup.py` removes all of it
+and fails if any owned VMM, loop device, mount, cgroup or file is left. Its output is
+under `CARGO_TARGET_DIR` (default `~/.cache/kilnd-target-static`).
+
 ## Firecracker group (disabled by default)
 
-`scripts/install.sh` leaves this off: no policy, no ledger, unchanged capabilities and
-no VM launch. It only creates `/var/lib/kilnd-helper/firecracker` as root 0700.
+`scripts/install.sh` leaves this off: no policy, no ledger and no VM launch. It only
+creates `/var/lib/kilnd-helper/firecracker` as root 0700. The helper unit's bounding set
+includes the jailer's `CAP_MKNOD`, `CAP_SYS_CHROOT` and `CAP_SETPCAP` from B4, but only a
+Firecracker supervisor keeps them: every other helper worker and kiln child drops them.
 
 B3 infrastructure can be exercised with a root-owned policy file, mode 0644 or
 tighter, whose whole path is root-owned and not writable by anyone else:
