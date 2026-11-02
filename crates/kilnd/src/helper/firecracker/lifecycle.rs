@@ -747,7 +747,7 @@ impl Node {
         if !channel.notify(&SupervisorCommand::Cleanup {
             deadline_ns: deadline.ns,
             plan,
-            resources: recorded.clone(),
+            resources: Box::new(recorded.clone()),
         }) {
             channel.close();
             return Err("the cleanup worker could not be given its work".into());

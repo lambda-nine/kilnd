@@ -1693,7 +1693,7 @@ pub enum SupervisorCommand {
     Cleanup {
         deadline_ns: u64,
         plan: String,
-        resources: super::supervisor::RecordedResources,
+        resources: Box<super::supervisor::RecordedResources>,
     },
     /// A fence revoked every future permit: stop and exit.
     Revoke,

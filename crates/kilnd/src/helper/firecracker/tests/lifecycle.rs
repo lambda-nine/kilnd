@@ -607,6 +607,7 @@ async fn b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left() {
         "loop",
         "loop_configure",
         "jail",
+        "jail_mount",
         "binds",
         "spawn_intent",
         "release_jailer",
@@ -623,6 +624,7 @@ async fn b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left() {
             "work_file",
             "loop_configure",
             "jail",
+            "binds",
             "fork_jailer",
             "continue_jailer",
             "adopt",
@@ -1240,7 +1242,7 @@ async fn b4_linux_root_stalled_classes_and_full_pools_keep_capabilities_inspect_
         "mkfs",
         "private_files",
         "cgroup",
-        "jail",
+        "jail_mount",
         "binds",
     ] {
         let fault = format!("S.step.{step}.stall");
@@ -1410,7 +1412,9 @@ async fn b4_linux_root_stalled_classes_and_full_pools_keep_capabilities_inspect_
 /// Exit 6: stale PIDs and replaced inodes protect unrelated resources. A live process
 /// whose start time differs is never signaled; a replaced cgroup is never killed; a
 /// replaced work file is refused, not deleted; a loop slot rebound to another file is
-/// left bound.
+/// left bound; the slot rebound to the allocation's own file with another offset or
+/// size limit is refused and left bound; a replacement jail tmpfs is refused and left
+/// mounted.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "needs root, KVM and the B4 artifacts: run scripts/b4-vm-tests.sh"]
 async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
@@ -1539,6 +1543,114 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
             .unwrap()
             .success()
     );
+    // B4 break-it finding 2: the recorded slot rebound to the allocation's own backing
+    // file with another offset or size limit is not the journaled binding. Remove
+    // leaves it bound and the allocation charged until the operator unbinds it.
+    let (runtime, context, _) = create(&real).await;
+    real.wait_phase(context.allocation_id, "booting").await;
+    assert!(matches!(
+        stop_within(&real, &runtime, &context, 30).await,
+        StopReply::Stopped { .. }
+    ));
+    let (paths, _) =
+        super::super::inventory::real_paths(context.instance_id, context.allocation_id);
+    let binding = real
+        .resources(context.allocation_id)
+        .into_iter()
+        .find_map(|record| match record {
+            super::super::supervisor::ResourceRecord::Loop(binding) => Some(binding),
+            _ => None,
+        })
+        .unwrap();
+    let device = format!("/dev/loop{}", binding.minor);
+    let backing_file = format!("/sys/block/loop{}/loop/backing_file", binding.minor);
+    let unbind = || async {
+        assert!(
+            Command::new("losetup")
+                .args(["-d", &device])
+                .status()
+                .unwrap()
+                .success()
+        );
+        wait_until("slot free", || !Path::new(&backing_file).exists()).await;
+    };
+    unbind().await;
+    let half = (binding.size_limit / 2).to_string();
+    let shorter = (binding.size_limit - 4096).to_string();
+    for (label, args) in [
+        ("offset", vec!["--offset", "4096", "--sizelimit", shorter.as_str()]),
+        ("size limit", vec!["--sizelimit", half.as_str()]),
+    ] {
+        let mut all = args.clone();
+        all.extend([device.as_str(), paths.work_file.to_str().unwrap()]);
+        assert!(Command::new("losetup").args(&all).status().unwrap().success());
+        let reply = remove(&real, &runtime, &context).await;
+        assert!(!is_absent(&reply), "{label}: {reply:?}");
+        assert_eq!(
+            std::fs::read_to_string(&backing_file).unwrap().trim(),
+            paths.work_file.to_str().unwrap(),
+            "{label}: the other binding was detached"
+        );
+        assert!(claim_held(&real, context.allocation_id), "{label}: charged");
+        eprintln!("B4 evidence: same work inode, different {label}: refused, left bound");
+        unbind().await;
+    }
+    remove_to_absent(&real, &runtime, &context, "after the retuned loop slot").await;
+    // B4 break-it finding 1: a fresh tmpfs mounted in place of the allocation's own,
+    // carrying the allocation's own source string, is refused and left mounted.
+    let (runtime, context, _) = create(&real).await;
+    real.wait_phase(context.allocation_id, "booting").await;
+    assert!(matches!(
+        stop_within(&real, &runtime, &context, 30).await,
+        StopReply::Stopped { .. }
+    ));
+    let (paths, _) =
+        super::super::inventory::real_paths(context.instance_id, context.allocation_id);
+    let identity = real
+        .resources(context.allocation_id)
+        .into_iter()
+        .find_map(|record| match record {
+            super::super::supervisor::ResourceRecord::JailIntent(identity) => Some(identity),
+            _ => None,
+        })
+        .unwrap();
+    let run = |program: &str, args: &[&str]| {
+        assert!(
+            Command::new(program).args(args).status().unwrap().success(),
+            "{program} {args:?}"
+        );
+    };
+    for name in storage::BINDS {
+        run("umount", &[paths.jail_root.join(name).to_str().unwrap()]);
+    }
+    run("umount", &[paths.jail_dir.to_str().unwrap()]);
+    run(
+        "mount",
+        &[
+            "-t",
+            "tmpfs",
+            "-o",
+            storage::JAIL_TMPFS_DATA,
+            &identity.source(),
+            paths.jail_dir.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir(&paths.jail_root).unwrap();
+    let reply = remove(&real, &runtime, &context).await;
+    assert!(!is_absent(&reply), "{reply:?}");
+    let mounts =
+        storage::parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo").unwrap())
+            .unwrap();
+    assert!(
+        storage::mounts_under(&mounts, &paths.jail_dir)
+            .iter()
+            .any(|m| m.mount_point == paths.jail_dir && m.source == identity.source()),
+        "the replacement survived"
+    );
+    assert!(claim_held(&real, context.allocation_id), "refusal keeps the charge");
+    eprintln!("B4 evidence: replacement jail tmpfs with the allocation's source: refused");
+    run("umount", &[paths.jail_dir.to_str().unwrap()]);
+    remove_to_absent(&real, &runtime, &context, "after the replaced jail mount").await;
 }
 
 /// Exit 7: the prelaunch charge. The node claim exists before any host effect, J sits

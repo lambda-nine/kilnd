@@ -12,7 +12,9 @@ use super::executable::ExecutableIdentity;
 use super::executable::{self, Role};
 #[cfg(target_os = "linux")]
 use super::storage;
-use super::storage::{AllocationPaths, Credentials, FileIdentity, JailMount, LoopBinding};
+use super::storage::{
+    AllocationPaths, BindMount, Credentials, FileIdentity, JailIdentity, JailMount, LoopBinding,
+};
 use super::workers::{
     ProcessId, Received, SupervisorCommand, SupervisorContext, SupervisorEvent, fault_point,
     monotonic_ns,
@@ -58,7 +60,11 @@ pub enum ResourceRecord {
     },
     LoopIntent(LoopBinding),
     Loop(LoopBinding),
+    /// The jail tmpfs's source and marker nonce, journaled before it is mounted.
+    JailIntent(JailIdentity),
     JailMount(JailMount),
+    /// The five read-only artifact binds, journaled once they exist.
+    JailBinds(Vec<BindMount>),
     Vmm {
         process: ProcessId,
         credentials: Credentials,
@@ -73,7 +79,9 @@ impl ResourceRecord {
             Self::PrivateFiles { .. } => "private_files",
             Self::LoopIntent(_) => "loop_intent",
             Self::Loop(_) => "loop",
+            Self::JailIntent(_) => "jail_intent",
             Self::JailMount(_) => "jail_mount",
+            Self::JailBinds(_) => "jail_binds",
             Self::Vmm { .. } => "vmm",
         }
     }
@@ -89,7 +97,9 @@ pub struct RecordedResources {
     pub config_file: Option<FileIdentity>,
     /// Every loop slot ever intended for this allocation, attached or not.
     pub loops: Vec<LoopBinding>,
+    pub jail: Option<JailIdentity>,
     pub jail_mount: Option<JailMount>,
+    pub jail_binds: Option<Vec<BindMount>>,
     pub vmm: Option<ProcessId>,
 }
 
@@ -107,7 +117,9 @@ impl RecordedResources {
                     self.loops.push(*binding);
                 }
             }
+            ResourceRecord::JailIntent(identity) => self.jail = Some(identity.clone()),
             ResourceRecord::JailMount(mount) => self.jail_mount = Some(*mount),
+            ResourceRecord::JailBinds(binds) => self.jail_binds = Some(binds.clone()),
             ResourceRecord::Vmm { process, .. } => self.vmm = Some(*process),
         }
     }
@@ -370,6 +382,10 @@ pub struct Booted {
     pub vmm: ProcessId,
     pub vmm_pidfd: std::os::fd::OwnedFd,
     pub console: Option<Console>,
+    /// The mounted jail directory, held while this S lives: the jail tmpfs cannot be
+    /// unmounted (only lazily detached) under its owner.
+    #[cfg(target_os = "linux")]
+    pub jail: std::fs::File,
 }
 
 #[cfg(target_os = "linux")]
@@ -798,6 +814,7 @@ mod linux {
                 backing_ino: work_identity.st_ino,
                 offset: 0,
                 size_limit: plan.work_bytes,
+                block_size: storage::LOOP_BLOCK_SIZE,
             };
             link.record(SupervisorRecord::Resource(ResourceRecord::LoopIntent(
                 binding,
@@ -817,7 +834,12 @@ mod linux {
         link.record(SupervisorRecord::Resource(ResourceRecord::Loop(binding)))?;
         drop(work);
         link.step("jail")?;
-        let (root, mount) = storage::create_jail(&plan.paths)?;
+        let jail_identity = storage::new_jail_identity()?;
+        link.record(SupervisorRecord::Resource(ResourceRecord::JailIntent(
+            jail_identity.clone(),
+        )))?;
+        link.step("jail_mount")?;
+        let (jail, root, mount) = storage::create_jail(&plan.paths, &jail_identity)?;
         link.after("jail");
         link.record(SupervisorRecord::Resource(ResourceRecord::JailMount(mount)))?;
         link.step("binds")?;
@@ -838,6 +860,7 @@ mod linux {
             unsafe { File::from_raw_fd(cvt(libc::fcntl(vmm_fd, libc::F_DUPFD_CLOEXEC, 3))?) };
         let config_open = storage::open_private(&dir, storage::CONFIG_FILE)?;
         let identity_open = storage::open_private(&dir, storage::IDENTITY_FILE)?;
+        let mut binds = Vec::new();
         for (name, source) in [
             ("kernel", &kernel),
             ("rootfs", &rootfs),
@@ -845,8 +868,10 @@ mod linux {
             ("identity", &identity_open),
             ("firecracker", &vmm_file),
         ] {
-            storage::bind_read_only(&root, &plan.paths, name, source)?;
+            binds.push(storage::bind_read_only(&root, &plan.paths, name, source)?);
         }
+        link.after("binds");
+        link.record(SupervisorRecord::Resource(ResourceRecord::JailBinds(binds)))?;
         storage::work_node(&root, binding.minor, plan.uid, plan.gid)?;
         drop((kernel, rootfs, config_open, identity_open));
         let jailer = expected_identity(expected, Role::Jailer)?;
@@ -870,6 +895,7 @@ mod linux {
             vmm,
             plan_generation,
             binding,
+            jail,
         )?;
         Ok(booted)
     }
@@ -886,6 +912,7 @@ mod linux {
         vmm: ExecutableIdentity,
         plan_generation: u64,
         binding: LoopBinding,
+        jail: File,
     ) -> Result<Booted, Abort> {
         let (control_s, control_j) = std::os::unix::net::UnixStream::pair()?;
         let mut gate = [0 as RawFd; 2];
@@ -962,7 +989,7 @@ mod linux {
             executable::JailRootIdentity {
                 mount_id: mount.mount_id,
                 st_dev: mount.st_dev,
-                st_ino: mount.st_ino,
+                st_ino: mount.root_ino,
             },
         );
         let label = plan.launch["executable_paths"]["firecracker"]
@@ -1092,6 +1119,7 @@ mod linux {
             vmm: v,
             vmm_pidfd: v_pidfd,
             console: link.console.take(),
+            jail,
         })
     }
 
@@ -1298,13 +1326,26 @@ mod linux {
             return Err(Abort::Refused("the recorded VMM is still running".into()));
         }
         link.step("cleanup_unmount")?;
-        storage::unmount_jail(&plan.paths)?;
+        storage::unmount_jail(
+            &plan.paths,
+            storage::JailRecords {
+                identity: recorded.jail.as_ref(),
+                mount: recorded.jail_mount.as_ref(),
+                binds: recorded.jail_binds.as_deref(),
+            },
+        )?;
         link.step("cleanup_loop")?;
         for binding in &recorded.loops {
             match storage::detach_loop(binding)? {
                 storage::LoopOutcome::Detached
                 | storage::LoopOutcome::Free
                 | storage::LoopOutcome::NotOurs => {}
+                storage::LoopOutcome::Unknown => {
+                    return Err(Abort::Refused(format!(
+                        "loop{} holds our backing file but not the recorded binding",
+                        binding.minor
+                    )));
+                }
             }
         }
         // A slot backed in our directory that no record names: refused, never guessed.
