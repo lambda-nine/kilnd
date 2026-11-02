@@ -28,15 +28,35 @@ const LIMIT_FILES: [&str; 5] = [
     "cpu.max",
 ];
 
-/// The inode numbers of a created tree. Kill and removal compare against these before
-/// acting, so a replaced directory is refused rather than signaled or removed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The inode numbers of a created tree and the boot it was created in. Kill and
+/// removal compare against these before acting, so a replaced directory is refused
+/// rather than signaled or removed. cgroupfs (kernfs) inode numbers are never reused
+/// within a boot but start again at each boot, so a tree recorded in another boot is
+/// gone by definition and anything at its path now is a replacement (section 7.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CgroupIdentity {
+    pub boot_id: String,
     pub parent_ino: u64,
     pub control_ino: u64,
+    pub relay_ino: u64,
     pub vm_ino: u64,
     pub vmm_ino: u64,
+    pub console_ino: u64,
+}
+
+impl CgroupIdentity {
+    /// The recorded inode of one of [`NODES`].
+    pub fn node_ino(&self, node: &str) -> Option<u64> {
+        match node {
+            "control" => Some(self.control_ino),
+            "relay" => Some(self.relay_ino),
+            "vm" => Some(self.vm_ino),
+            "vm/vmm" => Some(self.vmm_ino),
+            "vm/console" => Some(self.console_ino),
+            _ => None,
+        }
+    }
 }
 
 /// A stop target's cgroup: the internal `vm` node holding J, V and the console.
@@ -281,10 +301,13 @@ pub fn create_tree(relative: &str, recipe: &Value) -> io::Result<CgroupIdentity>
         inodes.insert(name, child.metadata()?.ino());
     }
     Ok(CgroupIdentity {
+        boot_id: super::storage::boot_id()?,
         parent_ino: parent.metadata()?.ino(),
         control_ino: inodes["control"],
+        relay_ino: inodes["relay"],
         vm_ino: inodes["vm"],
         vmm_ino: inodes["vm/vmm"],
+        console_ino: inodes["vm/console"],
     })
 }
 
@@ -368,8 +391,45 @@ pub fn kill_node(target: &CgroupTarget, wait: Duration) -> io::Result<NodeState>
     }
 }
 
+/// `cgroup.kill` on a recorded tree's `vm` node, compared by inode. A record from
+/// another boot names a tree that is gone by definition: anything at its path now is a
+/// replacement, never signaled.
+#[cfg(target_os = "linux")]
+pub fn kill_recorded(
+    relative: &str,
+    identity: &CgroupIdentity,
+    wait: Duration,
+) -> io::Result<NodeState> {
+    let path = format!("{relative}/vm");
+    if identity.boot_id != super::storage::boot_id()? {
+        return match open_node(&path) {
+            Ok(_) => Ok(NodeState::Replaced),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(NodeState::Absent),
+            Err(error) => Err(error),
+        };
+    }
+    kill_node(
+        &CgroupTarget {
+            path,
+            st_ino: identity.vm_ino,
+        },
+        wait,
+    )
+}
+
+/// One of [`NODES`] below an opened allocation parent.
+#[cfg(target_os = "linux")]
+fn open_child(parent: &File, name: &str) -> io::Result<File> {
+    match name.split_once('/') {
+        Some((base, leaf)) => open_at(&open_at(parent, base, true)?, leaf, true),
+        None => open_at(parent, name, true),
+    }
+}
+
 /// Removes an allocation's tree bottom-up after proving it empty. Missing nodes are
-/// fine (a reboot or an earlier attempt removed them); a replaced parent is refused.
+/// fine (a reboot or an earlier attempt removed them). With a recorded identity, a tree
+/// recorded in another boot that is present again, a replaced parent or any replaced
+/// recorded child is refused before anything is removed.
 #[cfg(target_os = "linux")]
 pub fn remove_tree(relative: &str, identity: Option<&CgroupIdentity>) -> io::Result<NodeState> {
     let parent = match open_node(relative) {
@@ -377,10 +437,23 @@ pub fn remove_tree(relative: &str, identity: Option<&CgroupIdentity>) -> io::Res
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(NodeState::Absent),
         Err(error) => return Err(error),
     };
-    if let Some(identity) = identity
-        && parent.metadata()?.ino() != identity.parent_ino
-    {
-        return Ok(NodeState::Replaced);
+    if let Some(identity) = identity {
+        if identity.boot_id != super::storage::boot_id()?
+            || parent.metadata()?.ino() != identity.parent_ino
+        {
+            return Ok(NodeState::Replaced);
+        }
+        for name in NODES {
+            match open_child(&parent, name) {
+                Ok(child) => {
+                    if Some(child.metadata()?.ino()) != identity.node_ino(name) {
+                        return Ok(NodeState::Replaced);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
     if populated(&parent)? {
         return Ok(NodeState::Populated);
@@ -475,6 +548,9 @@ mod unsupported {
     pub fn remove_tree(_: &str, _: Option<&CgroupIdentity>) -> io::Result<NodeState> {
         Err(no())
     }
+    pub fn kill_recorded(_: &str, _: &CgroupIdentity, _: Duration) -> io::Result<NodeState> {
+        Err(no())
+    }
     pub fn exists(_: &str) -> io::Result<bool> {
         Err(no())
     }
@@ -526,6 +602,75 @@ mod tests {
         assert!(limits(&json!({"cpu.max": "1;rm"})).is_err());
         assert!(controllers(&json!({"controllers": ["memory", "pids", "cpu"]})).is_ok());
         assert!(controllers(&json!({"controllers": ["memory", "pids", "io"]})).is_err());
+    }
+
+    /// B4 recheck 2 sweep: a recorded tree is removed only while it and every recorded
+    /// node are the journaled inodes of this boot. A replaced child, or a tree at the
+    /// path again after a reboot (a record from another boot), is Replaced: nothing is
+    /// signaled or removed, and the replacement survives.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and a cgroup2 root: run scripts/b4-vm-tests.sh"]
+    fn b4_linux_root_cgroup_cleanup_refuses_replaced_nodes_and_other_boots() {
+        let instance = format!("{FIRECRACKER_TREE}/b4-sweep-{}", std::process::id());
+        let relative = format!("{instance}/fc-sweep");
+        let base = std::path::Path::new(CGROUP_ROOT).join(&relative);
+        let make = || {
+            std::fs::create_dir_all(base.join("vm/vmm")).unwrap();
+            for name in NODES {
+                std::fs::create_dir_all(base.join(name)).unwrap();
+            }
+            let ino = |name: &str| std::fs::metadata(base.join(name)).unwrap().ino();
+            CgroupIdentity {
+                boot_id: super::super::storage::boot_id().unwrap(),
+                parent_ino: std::fs::metadata(&base).unwrap().ino(),
+                control_ino: ino("control"),
+                relay_ino: ino("relay"),
+                vm_ino: ino("vm"),
+                vmm_ino: ino("vm/vmm"),
+                console_ino: ino("vm/console"),
+            }
+        };
+        let identity = make();
+        // A replaced child: root removed the empty relay leaf and made another.
+        std::fs::remove_dir(base.join("relay")).unwrap();
+        std::fs::create_dir(base.join("relay")).unwrap();
+        let replaced_child = remove_tree(&relative, Some(&identity));
+        let child_survived = base.join("relay").exists();
+        // The whole tree, recorded in another boot and present again at the path.
+        std::fs::remove_dir(base.join("relay")).unwrap();
+        let identity = make();
+        let earlier = CgroupIdentity {
+            boot_id: "00000000-0000-4000-8000-000000000000".into(),
+            ..identity.clone()
+        };
+        let other_boot_kill = kill_recorded(&relative, &earlier, Duration::from_millis(100));
+        let other_boot_remove = remove_tree(&relative, Some(&earlier));
+        let tree_survived = base.join("vm/vmm").exists();
+        // The journaled tree itself is killed and removed.
+        let own_kill = kill_recorded(&relative, &identity, Duration::from_millis(500));
+        let own_remove = remove_tree(&relative, Some(&identity));
+        let gone = !base.exists();
+        if !gone {
+            for name in NODES.iter().rev() {
+                let _ = std::fs::remove_dir(base.join(name));
+            }
+            let _ = std::fs::remove_dir(&base);
+        }
+        let _ = std::fs::remove_dir(std::path::Path::new(CGROUP_ROOT).join(&instance));
+
+        assert_eq!(replaced_child.unwrap(), NodeState::Replaced);
+        assert!(child_survived, "the replaced child was removed");
+        assert_eq!(other_boot_kill.unwrap(), NodeState::Replaced);
+        assert_eq!(other_boot_remove.unwrap(), NodeState::Replaced);
+        assert!(tree_survived, "another boot's record removed the tree");
+        assert_eq!(own_kill.unwrap(), NodeState::Empty);
+        assert_eq!(own_remove.unwrap(), NodeState::Absent);
+        assert!(gone, "the journaled tree remains");
+        eprintln!(
+            "B4 evidence: a replaced cgroup child and another boot's record were refused \
+             and left in place; the journaled tree was removed"
+        );
     }
 
     #[test]

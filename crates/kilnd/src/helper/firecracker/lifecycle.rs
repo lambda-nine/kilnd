@@ -276,10 +276,19 @@ impl Node {
         }
         let mut target = StopTarget {
             process: recorded.vmm,
-            cgroup: recorded.cgroup.map(|identity| super::cgroup::CgroupTarget {
-                path: format!("{}/vm", allocation_cgroup(key)),
-                st_ino: identity.vm_ino,
-            }),
+            // A tree recorded in another boot is gone; its inode numbers can name a
+            // replacement now, which is never signaled. An unreadable boot ID keeps it.
+            cgroup: recorded
+                .cgroup
+                .as_ref()
+                .filter(|identity| {
+                    let host = workers::host_boot_id();
+                    host == "unknown" || identity.boot_id == host
+                })
+                .map(|identity| super::cgroup::CgroupTarget {
+                    path: format!("{}/vm", allocation_cgroup(key)),
+                    st_ino: identity.vm_ino,
+                }),
         };
         if let Some(known) = self
             .supervisors
@@ -585,7 +594,7 @@ impl Node {
         // K removes the empty tree now that no S is inside it.
         let relative = allocation_cgroup(key);
         let removed = self
-            .recovery_remove_cgroup(&relative, recorded.cgroup)
+            .recovery_remove_cgroup(&relative, recorded.cgroup.clone())
             .await;
         match removed {
             Some(super::cgroup::NodeState::Absent) => {}
@@ -623,7 +632,7 @@ impl Node {
             };
             let request = RecoveryRequest::RemoveCgroup {
                 relative: relative.to_string(),
-                identity,
+                identity: identity.clone(),
             };
             let call = channel.call::<RecoveryReply>(Lane::Normal, &request, u64::MAX);
             if let Ok(Ok(RecoveryReply::Removed { state })) =

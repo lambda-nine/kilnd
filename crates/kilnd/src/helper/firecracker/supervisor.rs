@@ -130,7 +130,7 @@ pub struct RecordedResources {
 impl RecordedResources {
     pub fn absorb(&mut self, record: &ResourceRecord) {
         match record {
-            ResourceRecord::Cgroup(identity) => self.cgroup = Some(*identity),
+            ResourceRecord::Cgroup(identity) => self.cgroup = Some(identity.clone()),
             ResourceRecord::WorkFile(identity) => self.work_file = Some(*identity),
             ResourceRecord::PrivateFiles { identity, config } => {
                 self.identity_file = Some(*identity);
@@ -894,9 +894,11 @@ mod linux {
         cvt(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) })?;
         link.step("cgroup")?;
         let identity = cgroup::create_tree(&plan.cgroup, &recipe["cgroups"])?;
-        *created = Some(identity);
+        *created = Some(identity.clone());
         link.after("cgroup");
-        link.record(SupervisorRecord::Resource(ResourceRecord::Cgroup(identity)))?;
+        link.record(SupervisorRecord::Resource(ResourceRecord::Cgroup(
+            identity.clone(),
+        )))?;
         link.step("join")?;
         cgroup::join(&format!("{}/control", plan.cgroup), identity.control_ino)?;
         link.step("artifacts")?;
@@ -910,7 +912,7 @@ mod linux {
         link.record(SupervisorRecord::Resource(ResourceRecord::WorkFile(first)))?;
         link.step("fallocate")?;
         let work_identity = storage::preallocate(&work, plan.work_bytes)?;
-        if (work_identity.st_dev, work_identity.st_ino) != (first.st_dev, first.st_ino) {
+        if work_identity.generation() != first.generation() {
             return Err(Abort::Refused("work inode changed".into()));
         }
         link.step("mkfs")?;
@@ -1441,7 +1443,9 @@ mod linux {
     ) -> io::Result<cgroup::NodeState> {
         let path = format!("{}/vm", plan.cgroup);
         let st_ino = match identity {
-            Some(identity) => identity.vm_ino,
+            Some(identity) => {
+                return cgroup::kill_recorded(&plan.cgroup, identity, Duration::from_secs(2));
+            }
             // Unrecorded: the deterministic name under C2 is ours, so use what is there.
             None => match cgroup::open_node(&path) {
                 Ok(node) => cgroup::inode(&node)?,

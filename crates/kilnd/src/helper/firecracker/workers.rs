@@ -2054,7 +2054,7 @@ fn real_cleanup(
         Ok(parsed) => {
             let mut link = Link::new(context, deadline_ns);
             // A tree that still exists charges this work to its allocation.
-            if let Some(identity) = resources.cgroup
+            if let Some(identity) = &resources.cgroup
                 && super::cgroup::exists(&parsed.cgroup).unwrap_or(false)
             {
                 let _ = super::cgroup::join(

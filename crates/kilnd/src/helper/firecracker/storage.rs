@@ -29,13 +29,25 @@ pub const LOOP_MAJOR: u32 = 7;
 /// The identity block's fixed size and magic (section 3.3).
 pub const IDENTITY_BYTES: usize = 4096;
 
-/// A file's node-local identity.
+/// A file's node-local identity. The inode number alone is reused once a file is
+/// deleted, so a replacement file can carry ours; its birth time (`statx` with
+/// `STATX_BTIME`, which no system call sets) is that of the replacement. A filesystem
+/// that does not report birth times refuses the launch, with no fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIdentity {
     pub st_dev: u64,
     pub st_ino: u64,
     pub bytes: u64,
+    pub btime_sec: i64,
+    pub btime_nsec: u32,
+}
+
+impl FileIdentity {
+    /// The fields that name one inode generation: device, inode and birth time.
+    pub fn generation(&self) -> (u64, u64, i64, u32) {
+        (self.st_dev, self.st_ino, self.btime_sec, self.btime_nsec)
+    }
 }
 
 /// A loop slot chosen for one work file, journaled before LOOP_CONFIGURE. Every field is
@@ -720,6 +732,39 @@ mod linux {
         }
     }
 
+    /// The identity of a descriptor (`name` empty) or of a name in a directory, without
+    /// following it, birth time included.
+    fn statx_identity(fd: RawFd, name: &str) -> io::Result<FileIdentity> {
+        let c = cstr(name)?;
+        let mut flags = libc::AT_SYMLINK_NOFOLLOW;
+        if name.is_empty() {
+            flags |= libc::AT_EMPTY_PATH;
+        }
+        // SAFETY: statx writes into the zeroed buffer; c is NUL-terminated.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        cvt(unsafe {
+            libc::statx(
+                fd,
+                c.as_ptr(),
+                flags,
+                libc::STATX_BASIC_STATS | libc::STATX_BTIME,
+                &mut stx,
+            )
+        })?;
+        if stx.stx_mask & libc::STATX_BTIME == 0 {
+            return Err(io::Error::other(
+                "the filesystem reports no birth time (STATX_BTIME)",
+            ));
+        }
+        Ok(FileIdentity {
+            st_dev: libc::makedev(stx.stx_dev_major, stx.stx_dev_minor),
+            st_ino: stx.stx_ino,
+            bytes: stx.stx_size,
+            btime_sec: stx.stx_btime.tv_sec,
+            btime_nsec: stx.stx_btime.tv_nsec,
+        })
+    }
+
     /// `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` of the backing file, root 0600.
     pub fn create_work_file(dir: &File) -> io::Result<(File, FileIdentity)> {
         let file = openat_raw(
@@ -728,15 +773,8 @@ mod linux {
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
             0o600,
         )?;
-        let meta = file.metadata()?;
-        Ok((
-            file,
-            FileIdentity {
-                st_dev: meta.dev(),
-                st_ino: meta.ino(),
-                bytes: meta.len(),
-            },
-        ))
+        let identity = statx_identity(file.as_raw_fd(), "")?;
+        Ok((file, identity))
     }
 
     /// Full preallocation: mode-0 fallocate, then a block count check. Unsupported
@@ -755,12 +793,7 @@ mod linux {
         if stat.st_size as u64 != bytes || allocated < bytes {
             return Err(io::Error::other("work file is not fully allocated"));
         }
-        let meta = file.metadata()?;
-        Ok(FileIdentity {
-            st_dev: meta.dev(),
-            st_ino: meta.ino(),
-            bytes: meta.len(),
-        })
+        statx_identity(file.as_raw_fd(), "")
     }
 
     /// The allocated bytes of a backing file, for the work-resize/discard evidence.
@@ -771,16 +804,11 @@ mod linux {
 
     /// The identity of a name in a directory, without following it.
     pub fn identity_at(dir: &File, name: &str) -> io::Result<Option<FileIdentity>> {
-        match fstatat(dir, name) {
-            Ok(stat) =>
-            {
-                #[allow(clippy::unnecessary_cast)]
-                Ok(Some(FileIdentity {
-                    st_dev: stat.st_dev as u64,
-                    st_ino: stat.st_ino as u64,
-                    bytes: stat.st_size as u64,
-                }))
-            }
+        if name.is_empty() {
+            return Err(invalid("empty name"));
+        }
+        match statx_identity(dir.as_raw_fd(), name) {
+            Ok(identity) => Ok(Some(identity)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
@@ -797,13 +825,9 @@ mod linux {
         )?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        let meta = file.metadata()?;
+        let identity = statx_identity(file.as_raw_fd(), "")?;
         dir.sync_all()?;
-        Ok(FileIdentity {
-            st_dev: meta.dev(),
-            st_ino: meta.ino(),
-            bytes: meta.len(),
-        })
+        Ok(identity)
     }
 
     pub fn open_private(dir: &File, name: &str) -> io::Result<File> {
@@ -2093,8 +2117,9 @@ mod linux {
     }
 
     /// Removes the private work directory's three owned files and then the directory.
-    /// A recorded identity must match; an unrecorded file is ours only by its fixed
-    /// name inside this root-only directory. Anything else is refused.
+    /// A recorded identity must match, birth time included, so a replacement that
+    /// reuses the inode number is refused too; an unrecorded file is ours only by its
+    /// fixed name inside this root-only directory. Anything else is refused.
     pub fn remove_work(
         paths: &AllocationPaths,
         recorded: &std::collections::BTreeMap<String, FileIdentity>,
@@ -2114,8 +2139,12 @@ mod linux {
                 return Err(io::Error::other(format!("{name} is not an owned file")));
             }
             if let Some(identity) = recorded.get(&name) {
+                let seen = identity_at(&dir, &name)?
+                    .ok_or_else(|| io::Error::other(format!("{name} vanished")))?;
                 #[allow(clippy::unnecessary_cast)]
-                if (stat.st_dev as u64, stat.st_ino as u64) != (identity.st_dev, identity.st_ino) {
+                if (stat.st_dev as u64, stat.st_ino as u64) != (seen.st_dev, seen.st_ino)
+                    || seen.generation() != identity.generation()
+                {
                     return Err(io::Error::other(format!("{name} was replaced")));
                 }
             }
@@ -2933,6 +2962,67 @@ mod tests {
             "B4 evidence: loop{} rebound to another inode, diskseq {} != journaled {}: \
              Unknown, present and left bound; intent-only NotOurs kept",
             binding.minor, replacement.diskseq, journaled.diskseq
+        );
+    }
+
+    /// B4 recheck 2 sweep: a work file's inode number is reused once it is deleted, so
+    /// a replacement can carry the journaled `(st_dev, st_ino)`. Its birth time differs,
+    /// and cleanup refuses it and leaves it in place. Inode reuse is the filesystem's
+    /// choice, so a recorded identity with a later birth time stands in when the kernel
+    /// does not reuse the number here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: run scripts/b4-vm-tests.sh"]
+    fn b4_linux_root_cleanup_refuses_a_work_file_reusing_the_inode() {
+        prepare_jail_base().unwrap();
+        let paths = scratch_paths();
+        let dir = create_work_dir(&paths).unwrap();
+        let (file, journaled) = create_work_file(&dir).unwrap();
+        drop(file);
+        std::fs::remove_file(&paths.work_file).unwrap();
+        // Root's replacement under the same name, retried until the inode is reused.
+        let mut reused = false;
+        let mut replacement = journaled;
+        for _ in 0..64 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let (file, seen) = create_work_file(&dir).unwrap();
+            drop(file);
+            replacement = seen;
+            if (seen.st_dev, seen.st_ino) == (journaled.st_dev, journaled.st_ino) {
+                reused = true;
+                break;
+            }
+            std::fs::remove_file(&paths.work_file).unwrap();
+        }
+        let recorded_identity = if reused {
+            journaled
+        } else {
+            FileIdentity {
+                btime_sec: replacement.btime_sec - 1,
+                ..replacement
+            }
+        };
+        let recorded = std::collections::BTreeMap::from([(WORK_FILE.to_string(), recorded_identity)]);
+        let refused = remove_work(&paths, &recorded);
+        let survived = identity_at(&dir, WORK_FILE).unwrap();
+        let own = std::collections::BTreeMap::from([(WORK_FILE.to_string(), replacement)]);
+        let removed = remove_work(&paths, &own);
+        let _ = std::fs::remove_dir(paths.work_dir.parent().unwrap());
+
+        let error = refused.expect_err("a replacement that reuses the inode was removed");
+        assert!(error.to_string().contains("was replaced"), "{error}");
+        assert_eq!(survived, Some(replacement), "the replacement survived");
+        assert_ne!(replacement.generation(), recorded_identity.generation());
+        removed.unwrap();
+        eprintln!(
+            "B4 evidence: work file replaced {} the inode number {}: birth time {}.{:09} != \
+             journaled {}.{:09}; refused, left in place",
+            if reused { "reusing" } else { "(simulated reuse of)" },
+            replacement.st_ino,
+            replacement.btime_sec,
+            replacement.btime_nsec,
+            recorded_identity.btime_sec,
+            recorded_identity.btime_nsec
         );
     }
 
