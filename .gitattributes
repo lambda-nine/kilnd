@@ -2,3 +2,5 @@
 crates/kilnd/tests/fixtures/firecracker/** -text
 # Groups: is empty in /proc/<pid>/status, so this golden line ends in a tab.
 crates/kilnd/tests/fixtures/firecracker/vmm-status.txt -whitespace
+# Pinned upstream patches: byte-exact for their digests; diff context lines are whitespace-only.
+deploy/firecracker/*.patch -text -whitespace

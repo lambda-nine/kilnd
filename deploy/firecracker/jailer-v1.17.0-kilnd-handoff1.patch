@@ -1,0 +1,1591 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 38616a3..1155da9 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -798,6 +798,8 @@ dependencies = [
+  "libc",
+  "log-instrument",
+  "regex",
++ "serde",
++ "serde_json",
+  "thiserror 2.0.20",
+  "utils",
+  "vmm-sys-util",
+diff --git a/src/jailer/Cargo.toml b/src/jailer/Cargo.toml
+index 286523b..0131250 100644
+--- a/src/jailer/Cargo.toml
++++ b/src/jailer/Cargo.toml
+@@ -18,6 +18,8 @@ tracing = ["log-instrument", "utils/tracing"]
+ libc = "0.2.186"
+ log-instrument = { path = "../log-instrument", optional = true }
+ regex = { version = "1.12.3", default-features = false, features = ["std"] }
++serde = { version = "1.0.228", features = ["derive"] }
++serde_json = "1.0.150"
+ thiserror = "2.0.18"
+ vmm-sys-util = "0.15.0"
+ 
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index 2841006..26f58f0 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -1,15 +1,16 @@
+ // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-use std::ffi::{CStr, CString, OsString};
+-use std::fs::{self, File, OpenOptions, Permissions, canonicalize, read_to_string};
++use std::ffi::{CStr, CString};
++use std::fs::{self, File, OpenOptions, Permissions, read_to_string};
+ use std::io;
+ use std::io::Write;
+-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
++use std::os::unix::fs::PermissionsExt;
++#[cfg(target_arch = "aarch64")]
++use std::os::unix::fs::{OpenOptionsExt, fchown};
+ use std::os::unix::io::AsRawFd;
+-use std::os::unix::process::CommandExt;
+ use std::path::{Component, Path, PathBuf};
+-use std::process::{Command, Stdio, exit, id};
++use std::process::{exit, id};
+ 
+ use utils::arg_parser::UtilsArgParserError::MissingValue;
+ use utils::time::{ClockType, get_time_us};
+@@ -19,6 +20,7 @@ use vmm_sys_util::syscall::SyscallReturnCode;
+ use crate::JailerError;
+ use crate::cgroup::{CgroupConfiguration, CgroupConfigurationBuilder};
+ use crate::chroot::chroot;
++use crate::handoff;
+ use crate::resource_limits::{FSIZE_ARG, NO_FILE_ARG, ResourceLimits};
+ 
+ pub const PROC_MOUNTS: &str = "/proc/mounts";
+@@ -118,7 +120,8 @@ enum UserfaultfdParseError {
+ pub struct Env {
+     id: String,
+     chroot_dir: PathBuf,
+-    exec_file_path: PathBuf,
++    // kilnd-handoff1: `--exec-file` is a label; only its basename is used, inside the jail.
++    exec_file_name: String,
+     uid: u32,
+     gid: u32,
+     netns: Option<String>,
+@@ -173,21 +176,15 @@ impl Env {
+         let exec_file = arguments
+             .single_value("exec-file")
+             .ok_or_else(|| JailerError::ArgumentParsing(MissingValue("exec-file".to_string())))?;
+-        let (exec_file_path, exec_file_name) = Env::validate_exec_file(exec_file)?;
++        let exec_file_name = Env::validate_exec_file(exec_file)?;
+ 
+         let chroot_base = arguments.single_value("chroot-base-dir").ok_or_else(|| {
+             JailerError::ArgumentParsing(MissingValue("chroot-base-dir".to_string()))
+         })?;
+-        let mut chroot_dir = canonicalize(chroot_base)
+-            .map_err(|err| JailerError::Canonicalize(PathBuf::from(&chroot_base), err))?;
+-
+-        if !chroot_dir.is_dir() {
+-            return Err(JailerError::NotADirectory(chroot_dir));
+-        }
+-
+-        chroot_dir.push(&exec_file_name);
+-        chroot_dir.push(id);
+-        chroot_dir.push("root");
++        // kilnd-handoff1: the same lexical path the bootstrap validated by statx; no
++        // canonicalization, so the jail root identity S pinned is the one chrooted into.
++        let chroot_dir = handoff::contract_chroot_dir(chroot_base, &exec_file_name, id)
++            .map_err(JailerError::ExecFileLabel)?;
+ 
+         let uid_str = arguments
+             .single_value("uid")
+@@ -279,7 +276,7 @@ impl Env {
+         Ok(Env {
+             id: id.to_owned(),
+             chroot_dir,
+-            exec_file_path,
++            exec_file_name,
+             uid,
+             gid,
+             netns,
+@@ -307,23 +304,10 @@ impl Env {
+         self.uid
+     }
+ 
+-    fn validate_exec_file(exec_file: &str) -> Result<(PathBuf, String), JailerError> {
+-        let exec_file_path = canonicalize(exec_file)
+-            .map_err(|err| JailerError::Canonicalize(PathBuf::from(exec_file), err))?;
+-
+-        if !exec_file_path.is_file() {
+-            return Err(JailerError::NotAFile(exec_file_path));
+-        }
+-
+-        let exec_file_name = exec_file_path
+-            .file_name()
+-            .ok_or_else(|| JailerError::ExtractFileName(exec_file_path.clone()))?
+-            .to_str()
+-            // Safe to unwrap as the original `exec_file` is `String`.
+-            .unwrap()
+-            .to_string();
+-
+-        Ok((exec_file_path, exec_file_name))
++    // kilnd-handoff1: a label check only. No canonicalize, no is_file, no filesystem access;
++    // the executable is FD 3 and is never opened by path.
++    fn validate_exec_file(exec_file: &str) -> Result<String, JailerError> {
++        handoff::exec_file_basename(exec_file).map_err(JailerError::ExecFileLabel)
+     }
+ 
+     fn parse_resource_limits(
+@@ -392,7 +376,7 @@ impl Env {
+                         .into_empty_result()
+                         .map_err(JailerError::SetSid)?;
+                 }
+-                Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
++                self.exec_command(chroot_exec_file)
+             }
+             child_pid => {
+                 // Save the PID of the process running the exec file provided
+@@ -487,58 +471,6 @@ impl Env {
+             .map_err(|err| JailerError::ChangeFileOwner(folder_path.to_owned(), err))
+     }
+ 
+-    fn copy_exec_to_chroot(&mut self) -> Result<OsString, JailerError> {
+-        let exec_file_name = self
+-            .exec_file_path
+-            .file_name()
+-            .ok_or_else(|| JailerError::ExtractFileName(self.exec_file_path.clone()))?;
+-        let jailer_exec_file_path = self.chroot_dir.join(exec_file_name);
+-
+-        // We do a copy instead of a hard-link for 2 reasons
+-        // 1. hard-linking is not possible if the file is in another device
+-        // 2. while hardlinking would save up disk space and also memory by sharing parts of the
+-        //    Firecracker binary (like the executable .text section), this latter part is not
+-        //    desirable in Firecracker's threat model. Copying prevents 2 Firecracker processes from
+-        //    sharing memory.
+-        let mut src_file = OpenOptions::new()
+-            .read(true)
+-            .open(&self.exec_file_path)
+-            .map_err(|err| JailerError::Open(self.exec_file_path.clone(), err))?;
+-        let src_file_metadata = src_file
+-            .metadata()
+-            .map_err(|err| JailerError::Metadata(self.exec_file_path.clone(), err))?;
+-        let src_file_mode = src_file_metadata.mode();
+-        let mut dst_file = OpenOptions::new()
+-            .write(true)
+-            .create(true)
+-            // Don't allow symlinks
+-            .custom_flags(libc::O_NOFOLLOW)
+-            .mode(src_file_mode)
+-            .open(&jailer_exec_file_path)
+-            .map_err(|err| JailerError::Open(jailer_exec_file_path.clone(), err))?;
+-        let dst_file_metadata = dst_file
+-            .metadata()
+-            .map_err(|err| JailerError::Metadata(jailer_exec_file_path.clone(), err))?;
+-        if 1 < dst_file_metadata.nlink() {
+-            return Err(JailerError::HardLink(jailer_exec_file_path.clone()));
+-        }
+-
+-        // Mark destination file as owned by the specified uid/gid
+-        fchown(&dst_file, Some(self.uid()), Some(self.gid()))
+-            .map_err(|err| JailerError::ChangeFileOwner(jailer_exec_file_path.clone(), err))?;
+-
+-        // Ignore the output since it is not interesting in this case
+-        _ = std::io::copy(&mut src_file, &mut dst_file).map_err(|err| {
+-            JailerError::Copy(
+-                self.exec_file_path.clone(),
+-                jailer_exec_file_path.clone(),
+-                err,
+-            )
+-        })?;
+-
+-        Ok(exec_file_name.to_owned())
+-    }
+-
+     fn join_netns(path: &str) -> Result<(), JailerError> {
+         // The fd backing the file will be automatically dropped at the end of the scope
+         let netns =
+@@ -550,22 +482,24 @@ impl Env {
+             .map_err(JailerError::SetNetNs)
+     }
+ 
+-    fn exec_command(&self, chroot_exec_file: PathBuf) -> io::Error {
+-        Command::new(chroot_exec_file)
+-            .args(["--id", &self.id])
+-            .args(["--start-time-us", &self.start_time_us.to_string()])
+-            .args([
+-                "--start-time-cpu-us",
+-                &get_time_us(ClockType::ProcessCpu).to_string(),
+-            ])
+-            .args(["--parent-cpu-time-us", &self.jailer_cpu_time_us.to_string()])
+-            .stdin(Stdio::inherit())
+-            .stdout(Stdio::inherit())
+-            .stderr(Stdio::inherit())
+-            .uid(self.uid())
+-            .gid(self.gid())
+-            .args(&self.extra_args)
+-            .exec()
++    // kilnd-handoff1: replaces `Command::exec`. Same argv in the same order; V clears
++    // groups, ambient/inheritable/bounding capabilities, sets GID then UID, zeroes every
++    // capability set, sets no_new_privs, verifies all of it (71 on failure) and execs FD 3
++    // with execveat(AT_EMPTY_PATH) and an empty environment (72 if it returns).
++    fn exec_command(&self, chroot_exec_file: PathBuf) -> ! {
++        let mut argv = vec![
++            chroot_exec_file.to_string_lossy().into_owned(),
++            "--id".to_string(),
++            self.id.clone(),
++            "--start-time-us".to_string(),
++            self.start_time_us.to_string(),
++            "--start-time-cpu-us".to_string(),
++            get_time_us(ClockType::ProcessCpu).to_string(),
++            "--parent-cpu-time-us".to_string(),
++            self.jailer_cpu_time_us.to_string(),
++        ];
++        argv.extend(self.extra_args.iter().cloned());
++        handoff::drop_privileges_and_exec(self.uid(), self.gid(), &argv)
+     }
+ 
+     #[cfg(target_arch = "aarch64")]
+@@ -644,8 +578,9 @@ impl Env {
+     }
+ 
+     pub fn run(mut self) -> Result<(), JailerError> {
+-        let exec_file_name = self.copy_exec_to_chroot()?;
+-        let chroot_exec_file = PathBuf::from("/").join(exec_file_name);
++        // kilnd-handoff1: no copy_exec_to_chroot. S already bind-mounted the verified VMM
++        // read-only at <jail root>/<basename>; the jailer neither copies, chowns nor opens it.
++        let chroot_exec_file = PathBuf::from("/").join(&self.exec_file_name);
+ 
+         // Join the specified network namespace, if applicable.
+         if let Some(ref path) = self.netns {
+@@ -772,7 +707,7 @@ impl Env {
+             self.exec_into_new_pid_ns(chroot_exec_file)
+         } else {
+             self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
+-            Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
++            self.exec_command(chroot_exec_file)
+         }
+     }
+ }
+@@ -781,7 +716,6 @@ impl Env {
+ mod tests {
+     #![allow(clippy::undocumented_unsafe_blocks)]
+ 
+-    use std::fs::create_dir_all;
+     use std::os::linux::fs::MetadataExt;
+ 
+     use vmm_sys_util::rand;
+@@ -1048,39 +982,27 @@ mod tests {
+         dup2(file1.as_raw_fd(), file2.as_raw_fd()).unwrap();
+     }
+ 
++    // kilnd-handoff1: `--exec-file` is a label; existence and file type are never checked.
+     #[test]
+     fn test_validate_exec_file() {
+-        // Success case
++        assert_eq!(
++            Env::validate_exec_file("/this/file/does/not/exist/firecracker").unwrap(),
++            "firecracker"
++        );
+         let pseudo_exec_file_path = get_pseudo_exec_file_path();
+-        let pseudo_exec_file_dir = Path::new(&pseudo_exec_file_path).parent().unwrap();
+-        create_dir_all(pseudo_exec_file_dir).unwrap();
+-        File::create(&pseudo_exec_file_path).unwrap();
+-        Env::validate_exec_file(&pseudo_exec_file_path).unwrap();
+-
+-        // Error case 1: No such file exists
+-        std::fs::remove_file(&pseudo_exec_file_path).unwrap();
+         assert_eq!(
+-            format!(
+-                "{}",
+-                Env::validate_exec_file(&pseudo_exec_file_path).unwrap_err()
+-            ),
+-            format!(
+-                "Failed to canonicalize path {}: No such file or directory (os error 2)",
+-                pseudo_exec_file_path
+-            )
++            Env::validate_exec_file(&pseudo_exec_file_path).unwrap(),
++            "pseudo_firecracker_exec_file"
+         );
+-
+-        // Error case 2: Not a file
+         std::fs::create_dir_all("/tmp/firecracker_test_dir").unwrap();
+         assert_eq!(
+-            format!(
+-                "{}",
+-                Env::validate_exec_file("/tmp/firecracker_test_dir").unwrap_err()
+-            ),
+-            "/tmp/firecracker_test_dir is not a file"
++            Env::validate_exec_file("/tmp/firecracker_test_dir").unwrap(),
++            "firecracker_test_dir"
+         );
+-
+         std::fs::remove_dir_all("/tmp/firecracker_test_dir").unwrap();
++        Env::validate_exec_file("relative/firecracker").unwrap_err();
++        Env::validate_exec_file("/a/../firecracker").unwrap_err();
++        Env::validate_exec_file("/a/firecracker/").unwrap_err();
+     }
+ 
+     #[test]
+@@ -1205,61 +1127,37 @@ mod tests {
+         }
+     }
+ 
++    // kilnd-handoff1: copy_exec_to_chroot is gone; Env never touches the exec-file path.
+     #[test]
+-    fn test_copy_exec_to_chroot() {
+-        // Create a standard environment.
+-        let arg_parser = build_arg_parser();
+-        let mut args = arg_parser.arguments().clone();
++    fn test_exec_file_is_label_only() {
+         let mut mock_cgroups = MockCgroupFs::new().unwrap();
+         mock_cgroups.add_v1_mounts().unwrap();
+-
+-        // Create tmp resources for `exec_file` and `chroot_base`.
+-        let exec_file_path = get_pseudo_exec_file_path();
+-        let exec_file_dir = Path::new(&exec_file_path).parent().unwrap();
+-        fs::create_dir_all(exec_file_dir).unwrap();
+-        File::create(&exec_file_path).unwrap();
+         let some_dir = TempDir::new().unwrap();
+-        let some_dir_path = some_dir.as_path().to_str().unwrap();
+-
+-        fs::write(&exec_file_path, "some_content").unwrap();
+         let some_arg_vals = ArgVals {
+             id: "bd65600d-8669-4903-8a14-af88203add38",
+-            exec_file: exec_file_path.as_str(),
++            exec_file: "/opt/kilnd/exec/sha256/does-not-exist/firecracker",
+             uid: "1001",
+             gid: "1002",
+-            chroot_base: some_dir_path,
+-            netns: Some("zzzns"),
++            chroot_base: some_dir.as_path().to_str().unwrap(),
++            netns: None,
+             daemonize: false,
+-            new_pid_ns: false,
++            new_pid_ns: true,
+             cgroups: Vec::new(),
+             resource_limits: Vec::new(),
+             parent_cgroup: None,
+         };
+-        let exec_file_name = Path::new(&some_arg_vals.exec_file).file_name().unwrap();
+-        fs::write(some_arg_vals.exec_file, "some_content").unwrap();
++        let arg_parser = build_arg_parser();
++        let mut args = arg_parser.arguments().clone();
+         args.parse(&make_args(&some_arg_vals)).unwrap();
+-        let mut env =
+-            Env::new(&args, 0, 0, mock_cgroups.proc_mounts_path.to_str().unwrap()).unwrap();
+-
+-        // Create the required chroot dir hierarchy.
+-        fs::create_dir_all(env.chroot_dir()).expect("Could not create dir hierarchy.");
+-
++        let env = Env::new(&args, 0, 0, mock_cgroups.proc_mounts_path.to_str().unwrap()).unwrap();
++        assert_eq!(env.exec_file_name, "firecracker");
+         assert_eq!(
+-            env.copy_exec_to_chroot().unwrap(),
+-            exec_file_name.to_os_string()
++            env.chroot_dir(),
++            some_dir
++                .as_path()
++                .join("firecracker/bd65600d-8669-4903-8a14-af88203add38/root")
+         );
+-        let dest_path = env.chroot_dir.join(exec_file_name);
+-        // Check that `fs::copy()` copied src content and permission bits to destination.
+-        let metadata_src = fs::metadata(&env.exec_file_path).unwrap();
+-        let metadata_dest = fs::metadata(&dest_path).unwrap();
+-        let content_src = fs::read(&env.exec_file_path).unwrap();
+-        let content_dest = fs::read(&dest_path).unwrap();
+-        assert_eq!(content_src, content_dest);
+-        assert_eq!(content_dest, b"some_content");
+-        assert_eq!(metadata_src.permissions(), metadata_dest.permissions());
+-
+-        // Clean up the environment.
+-        fs::remove_dir_all(env.chroot_dir()).expect("Could not remove dir hierarchy.");
++        assert!(!Path::new(&some_arg_vals.exec_file).exists());
+     }
+ 
+     #[test]
+diff --git a/src/jailer/src/handoff.rs b/src/jailer/src/handoff.rs
+new file mode 100644
+index 0000000..8538b00
+--- /dev/null
++++ b/src/jailer/src/handoff.rs
+@@ -0,0 +1,1078 @@
++// Copyright 2026 Estrada Systems LLC. All Rights Reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++//! kilnd handoff (`kilnd-handoff1`): descriptor handoff, bootstrap gate and capability drop.
++//!
++//! The supervisor (S) execs this jailer (J) by descriptor with exactly FD 3 (read-only,
++//! verified Firecracker executable) and FD 4 (AF_UNIX stream socket to S) beyond stdio. J
++//! reads a canonical bootstrap record from FD 4, proves FD 3 and the jail root are the
++//! exact objects S pinned, answers `RDY1` and waits for `CONT` before any setup. The VMM
++//! child (V) drops every privilege, verifies the result and execs FD 3 with `execveat`.
++//! There is no pathname exec, no copy of the executable and no fallback.
++//!
++//! Exit codes: 70 bootstrap refusal (before any setup), 71 V failed to drop or verify
++//! privileges (no exec), 72 `execveat` returned.
++
++use std::ffi::CString;
++use std::fmt::Display;
++use std::os::unix::ffi::OsStrExt;
++use std::os::unix::fs::MetadataExt;
++use std::path::{Component, Path, PathBuf};
++
++use serde::{Deserialize, Serialize};
++use utils::arg_parser::Arguments;
++use utils::validators;
++
++/// The verified VMM executable, read-only.
++pub const VMM_FD: libc::c_int = 3;
++/// The AF_UNIX stream control socket to S.
++pub const CONTROL_FD: libc::c_int = 4;
++/// First descriptor closed at entry.
++const FIRST_CLOSED_FD: libc::c_uint = 5;
++
++pub const EXIT_BOOTSTRAP: i32 = 70;
++pub const EXIT_PRIVILEGE_DROP: i32 = 71;
++pub const EXIT_EXEC: i32 = 72;
++
++pub const MAX_RECORD_BYTES: usize = 4096;
++const READY: &[u8; 4] = b"RDY1";
++const CONTINUE: &[u8; 4] = b"CONT";
++
++/// Bootstrap record. Fields are declared in alphabetical order so that serde_json's
++/// serialization is the canonical (sorted-key, no whitespace) encoding.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct BootstrapRecord {
++    pub exec_file_label: String,
++    pub jail_root_identity: JailRootIdentity,
++    pub plan_generation: u64,
++    pub version: u32,
++    pub vmm_identity: VmmIdentity,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct JailRootIdentity {
++    pub mount_id: u64,
++    pub st_dev: u64,
++    pub st_ino: u64,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct VmmIdentity {
++    pub bytes: u64,
++    pub sha256: String,
++    pub st_dev: u64,
++    pub st_ino: u64,
++}
++
++/// Paths derived from the contract argv without touching the filesystem.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ContractPaths {
++    pub exec_file_label: String,
++    pub exec_file_name: String,
++    pub chroot_dir: PathBuf,
++}
++
++/// Refuses the bootstrap: one line on stderr, exit 70, no setup.
++#[allow(clippy::exit)] // A refusal ends J before any setup; nothing needs unwinding.
++pub fn refuse(message: impl Display) -> ! {
++    eprintln!("jailer: kilnd bootstrap refused: {message}");
++    std::process::exit(EXIT_BOOTSTRAP)
++}
++
++fn errno() -> i32 {
++    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
++}
++
++fn os_error(what: &str) -> String {
++    format!("{what}: {}", std::io::Error::last_os_error())
++}
++
++// ---------------------------------------------------------------------------------------
++// Step 1: descriptor sanitization.
++
++/// Closes every inherited descriptor from 5 upwards (replaces upstream's close of 3..MAX).
++pub fn close_inherited_fds() -> Result<(), String> {
++    // SAFETY: closing a descriptor range this process owns.
++    let rc = unsafe {
++        libc::syscall(
++            libc::SYS_close_range,
++            FIRST_CLOSED_FD,
++            libc::c_uint::MAX,
++            0 as libc::c_uint,
++        )
++    };
++    if rc != 0 {
++        return Err(os_error("close_range(5, UINT_MAX)"));
++    }
++    Ok(())
++}
++
++/// FD 3 must be a regular file opened O_RDONLY, FD 4 an AF_UNIX SOCK_STREAM socket. Both
++/// then become close-on-exec, so neither can survive into Firecracker.
++pub fn check_bootstrap_fds() -> Result<(), String> {
++    // SAFETY: querying a descriptor; a closed one reports EBADF.
++    let flags = unsafe { libc::fcntl(VMM_FD, libc::F_GETFL) };
++    if flags < 0 {
++        return Err(os_error("FD 3"));
++    }
++    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
++        return Err("FD 3 is not opened O_RDONLY".into());
++    }
++    let stat = fstat(VMM_FD).map_err(|e| format!("FD 3: {e}"))?;
++    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
++        return Err("FD 3 is not a regular file".into());
++    }
++    if sockopt_int(CONTROL_FD, libc::SO_TYPE)? != libc::SOCK_STREAM {
++        return Err("FD 4 is not a SOCK_STREAM socket".into());
++    }
++    if sockopt_int(CONTROL_FD, libc::SO_DOMAIN)? != libc::AF_UNIX {
++        return Err("FD 4 is not an AF_UNIX socket".into());
++    }
++    for fd in [VMM_FD, CONTROL_FD] {
++        // SAFETY: setting descriptor flags on a live descriptor.
++        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
++            return Err(os_error(&format!("FD {fd} FD_CLOEXEC")));
++        }
++    }
++    Ok(())
++}
++
++fn sockopt_int(fd: libc::c_int, option: libc::c_int) -> Result<libc::c_int, String> {
++    let mut value: libc::c_int = 0;
++    let mut length: libc::socklen_t = 4; // sizeof(int)
++    // SAFETY: the output pointers are live and sized for an int option.
++    let rc = unsafe {
++        libc::getsockopt(
++            fd,
++            libc::SOL_SOCKET,
++            option,
++            (&mut value as *mut libc::c_int).cast(),
++            &mut length,
++        )
++    };
++    if rc != 0 {
++        return Err(os_error(&format!("FD {fd} is not a socket")));
++    }
++    Ok(value)
++}
++
++fn fstat(fd: libc::c_int) -> Result<libc::stat, String> {
++    // SAFETY: zeroed stat is valid storage for fstat to fill.
++    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
++    // SAFETY: stat is live storage.
++    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
++        return Err(os_error("fstat"));
++    }
++    Ok(stat)
++}
++
++// ---------------------------------------------------------------------------------------
++// Contract argv.
++
++/// The `--exec-file` value is only a label: an absolute UTF-8 path with no `.`, `..` or
++/// empty components. Returns its basename. Never touches the filesystem.
++pub fn exec_file_basename(label: &str) -> Result<String, String> {
++    let rest = label
++        .strip_prefix('/')
++        .ok_or_else(|| format!("--exec-file {label:?} is not absolute"))?;
++    let parts: Vec<&str> = rest.split('/').collect();
++    if parts
++        .iter()
++        .any(|part| part.is_empty() || *part == "." || *part == "..")
++    {
++        return Err(format!(
++            "--exec-file {label:?} has an empty, '.' or '..' component"
++        ));
++    }
++    // `rest` is non-empty here ("/" alone yields one empty component).
++    Ok(parts[parts.len() - 1].to_string())
++}
++
++/// `<chroot-base-dir>/<exec-file basename>/<id>/root`, lexically, without canonicalization.
++pub fn contract_chroot_dir(
++    chroot_base: &str,
++    exec_file_name: &str,
++    id: &str,
++) -> Result<PathBuf, String> {
++    let base = Path::new(chroot_base);
++    if !base.is_absolute()
++        || base
++            .components()
++            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
++    {
++        return Err(format!(
++            "--chroot-base-dir {chroot_base:?} must be absolute without '.' or '..'"
++        ));
++    }
++    validators::validate_instance_id(id).map_err(|e| format!("--id: {e}"))?;
++    Ok(base.join(exec_file_name).join(id).join("root"))
++}
++
++/// Refuses every option the kilnd contract never uses and derives the paths.
++pub fn contract_paths(arguments: &Arguments) -> Result<ContractPaths, String> {
++    if arguments.flag_present("daemonize") {
++        return Err("--daemonize is not part of the kilnd contract".into());
++    }
++    if arguments.single_value("netns").is_some() {
++        return Err("--netns is not part of the kilnd contract".into());
++    }
++    if arguments.multiple_values("cgroup").is_some() {
++        return Err("--cgroup is not part of the kilnd contract".into());
++    }
++    if !arguments.flag_present("new-pid-ns") {
++        return Err("--new-pid-ns is required by the kilnd contract".into());
++    }
++    let id = arguments.single_value("id").ok_or("--id is missing")?;
++    let label = arguments
++        .single_value("exec-file")
++        .ok_or("--exec-file is missing")?;
++    let chroot_base = arguments
++        .single_value("chroot-base-dir")
++        .ok_or("--chroot-base-dir is missing")?;
++    let exec_file_name = exec_file_basename(label)?;
++    let chroot_dir = contract_chroot_dir(chroot_base, &exec_file_name, id)?;
++    Ok(ContractPaths {
++        exec_file_label: label.clone(),
++        exec_file_name,
++        chroot_dir,
++    })
++}
++
++// ---------------------------------------------------------------------------------------
++// Step 2: bootstrap record.
++
++fn read_exact_fd(fd: libc::c_int, buf: &mut [u8]) -> Result<(), String> {
++    let mut done = 0;
++    while done < buf.len() {
++        // SAFETY: the destination is the live unfilled tail of `buf`.
++        let n = unsafe { libc::read(fd, buf[done..].as_mut_ptr().cast(), buf.len() - done) };
++        if n < 0 {
++            if errno() == libc::EINTR {
++                continue;
++            }
++            return Err(os_error("read FD 4"));
++        }
++        if n == 0 {
++            return Err(format!("EOF on FD 4 after {done} of {} bytes", buf.len()));
++        }
++        done += n.unsigned_abs();
++    }
++    Ok(())
++}
++
++fn write_all_fd(fd: libc::c_int, buf: &[u8]) -> Result<(), String> {
++    let mut done = 0;
++    while done < buf.len() {
++        // SAFETY: the source is the live unsent tail of `buf`; MSG_NOSIGNAL avoids SIGPIPE.
++        let n = unsafe {
++            libc::send(
++                fd,
++                buf[done..].as_ptr().cast(),
++                buf.len() - done,
++                libc::MSG_NOSIGNAL,
++            )
++        };
++        if n < 0 {
++            if errno() == libc::EINTR {
++                continue;
++            }
++            return Err(os_error("write FD 4"));
++        }
++        done += n.unsigned_abs();
++    }
++    Ok(())
++}
++
++/// Parses and canonically checks a record.
++pub fn parse_record(raw: &[u8]) -> Result<BootstrapRecord, String> {
++    if raw.is_empty() || raw.len() > MAX_RECORD_BYTES {
++        return Err(format!("record length {} out of range", raw.len()));
++    }
++    let record: BootstrapRecord =
++        serde_json::from_slice(raw).map_err(|e| format!("record: {e}"))?;
++    let canonical = serde_json::to_vec(&record).map_err(|e| format!("record: {e}"))?;
++    if canonical != raw {
++        return Err("record is not canonical".into());
++    }
++    if record.version != 1 {
++        return Err(format!("record version {} is not 1", record.version));
++    }
++    let digest = record.vmm_identity.sha256.as_bytes();
++    if digest.len() != 64
++        || !digest
++            .iter()
++            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
++    {
++        return Err("vmm_identity.sha256 is not 64 lowercase hex digits".into());
++    }
++    Ok(record)
++}
++
++/// Reads `u32` big-endian length L (1..=4096) then exactly L bytes from `fd`.
++pub fn read_record(fd: libc::c_int) -> Result<BootstrapRecord, String> {
++    let mut length = [0u8; 4];
++    read_exact_fd(fd, &mut length)?;
++    let length = u32::from_be_bytes(length) as usize;
++    if length == 0 || length > MAX_RECORD_BYTES {
++        return Err(format!("record length {length} out of range"));
++    }
++    let mut raw = vec![0u8; length];
++    read_exact_fd(fd, &mut raw)?;
++    parse_record(&raw)
++}
++
++// ---------------------------------------------------------------------------------------
++// Step 3: validation.
++
++/// The kernel's `struct statx` (256 bytes), defined locally so the musl target needs no
++/// libc binding.
++#[repr(C)]
++#[derive(Debug)]
++struct Statx {
++    stx_mask: u32,
++    stx_blksize: u32,
++    stx_attributes: u64,
++    stx_nlink: u32,
++    stx_uid: u32,
++    stx_gid: u32,
++    stx_mode: u16,
++    spare0: u16,
++    stx_ino: u64,
++    stx_size: u64,
++    stx_blocks: u64,
++    stx_attributes_mask: u64,
++    stx_times: [[u64; 2]; 4],
++    stx_rdev_major: u32,
++    stx_rdev_minor: u32,
++    stx_dev_major: u32,
++    stx_dev_minor: u32,
++    stx_mnt_id: u64,
++    spare: [u64; 13],
++}
++
++const STATX_INO: u32 = 0x100;
++const STATX_MNT_ID: u32 = 0x1000;
++
++fn statx_nofollow(path: &Path) -> Result<Statx, String> {
++    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
++    // SAFETY: an all-zero statx is valid storage.
++    let mut stx: Statx = unsafe { std::mem::zeroed() };
++    // SAFETY: path is NUL-terminated and stx is 256 bytes of live storage.
++    let rc = unsafe {
++        libc::syscall(
++            libc::SYS_statx,
++            libc::AT_FDCWD,
++            c_path.as_ptr(),
++            libc::AT_SYMLINK_NOFOLLOW,
++            STATX_INO | STATX_MNT_ID,
++            &mut stx as *mut Statx,
++        )
++    };
++    if rc != 0 {
++        return Err(os_error(&format!("statx {}", path.display())));
++    }
++    if stx.stx_mask & (STATX_INO | STATX_MNT_ID) != (STATX_INO | STATX_MNT_ID) {
++        return Err(format!(
++            "statx {} lacks STATX_INO|STATX_MNT_ID",
++            path.display()
++        ));
++    }
++    Ok(stx)
++}
++
++/// SHA-256 of FD's first `bytes` bytes via `pread` from offset 0; the descriptor's own
++/// offset is never used. Requires EOF exactly at `bytes`.
++fn sha256_fd(fd: libc::c_int, bytes: u64) -> Result<String, String> {
++    let mut hasher = Sha256::new();
++    let mut buf = vec![0u8; 1 << 16];
++    let mut offset: u64 = 0;
++    loop {
++        let position =
++            libc::off_t::try_from(offset).map_err(|_| "FD 3 offset overflow".to_string())?;
++        // SAFETY: buf is live storage of the given length.
++        let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), position) };
++        if n < 0 {
++            if errno() == libc::EINTR {
++                continue;
++            }
++            return Err(os_error("pread FD 3"));
++        }
++        if n == 0 {
++            break;
++        }
++        let n = n.unsigned_abs();
++        hasher.update(&buf[..n]);
++        offset += n as u64;
++        if offset > bytes {
++            return Err("FD 3 is longer than vmm_identity.bytes".into());
++        }
++    }
++    if offset != bytes {
++        return Err("FD 3 is shorter than vmm_identity.bytes".into());
++    }
++    Ok(hex(&hasher.finish()))
++}
++
++/// Proves FD 3, the label and the jail root match the record.
++pub fn validate(record: &BootstrapRecord, paths: &ContractPaths) -> Result<(), String> {
++    let vmm = &record.vmm_identity;
++    let stat = fstat(VMM_FD).map_err(|e| format!("FD 3: {e}"))?;
++    #[allow(clippy::unnecessary_cast)]
++    let (dev, ino) = (stat.st_dev as u64, stat.st_ino as u64);
++    let size = u64::try_from(stat.st_size).map_err(|_| "FD 3 has a negative size".to_string())?;
++    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
++        || dev != vmm.st_dev
++        || ino != vmm.st_ino
++        || size != vmm.bytes
++    {
++        return Err("FD 3 dev/ino/size differ from vmm_identity".into());
++    }
++    if sha256_fd(VMM_FD, size)? != vmm.sha256 {
++        return Err("FD 3 SHA-256 differs from vmm_identity".into());
++    }
++    if record.exec_file_label.as_bytes() != paths.exec_file_label.as_bytes() {
++        return Err("exec_file_label differs from --exec-file".into());
++    }
++
++    let root = statx_nofollow(&paths.chroot_dir)?;
++    let root_dev = libc::makedev(root.stx_dev_major, root.stx_dev_minor) as u64;
++    let jail = &record.jail_root_identity;
++    if u32::from(root.stx_mode) & libc::S_IFMT != libc::S_IFDIR
++        || root_dev != jail.st_dev
++        || root.stx_ino != jail.st_ino
++        || root.stx_mnt_id != jail.mount_id
++    {
++        return Err(format!(
++            "jail root {} differs from jail_root_identity",
++            paths.chroot_dir.display()
++        ));
++    }
++
++    let exec_in_jail = paths.chroot_dir.join(&paths.exec_file_name);
++    let meta = std::fs::symlink_metadata(&exec_in_jail)
++        .map_err(|e| format!("{}: {e}", exec_in_jail.display()))?;
++    if !meta.file_type().is_file() || meta.dev() != dev || meta.ino() != ino {
++        return Err(format!(
++            "{} is not FD 3's regular file",
++            exec_in_jail.display()
++        ));
++    }
++    let c_path = CString::new(exec_in_jail.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
++    // SAFETY: an all-zero statvfs is valid storage.
++    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
++    // SAFETY: path is NUL-terminated and vfs is live storage.
++    if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
++        return Err(os_error(&format!("statvfs {}", exec_in_jail.display())));
++    }
++    if vfs.f_flag & libc::ST_RDONLY == 0 {
++        return Err(format!(
++            "{} is not on a read-only mount",
++            exec_in_jail.display()
++        ));
++    }
++    Ok(())
++}
++
++// ---------------------------------------------------------------------------------------
++// Step 4: gate.
++
++/// Writes `RDY1`, then requires exactly `CONT`.
++pub fn gate(fd: libc::c_int) -> Result<(), String> {
++    write_all_fd(fd, READY)?;
++    let mut answer = [0u8; 4];
++    read_exact_fd(fd, &mut answer)?;
++    if &answer != CONTINUE {
++        return Err(format!("gate answer {answer:?} is not CONT"));
++    }
++    Ok(())
++}
++
++/// Steps 1-4 in order. Any failure exits 70 before setup.
++pub fn bootstrap(arguments: &Arguments) {
++    if let Err(e) = check_bootstrap_fds() {
++        refuse(e);
++    }
++    let paths = contract_paths(arguments).unwrap_or_else(|e| refuse(e));
++    let record = read_record(CONTROL_FD).unwrap_or_else(|e| refuse(e));
++    if let Err(e) = validate(&record, &paths) {
++        refuse(e);
++    }
++    if let Err(e) = gate(CONTROL_FD) {
++        refuse(e);
++    }
++}
++
++// ---------------------------------------------------------------------------------------
++// Step 6: V's capability drop and descriptor exec.
++
++#[repr(C)]
++struct CapHeader {
++    version: u32,
++    pid: libc::c_int,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, PartialEq, Eq)]
++struct CapData {
++    effective: u32,
++    permitted: u32,
++    inheritable: u32,
++}
++
++const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
++const PR_CAP_AMBIENT: libc::c_int = 47;
++const PR_CAP_AMBIENT_IS_SET: libc::c_ulong = 1;
++const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
++const PR_CAPBSET_READ: libc::c_int = 23;
++const PR_CAPBSET_DROP: libc::c_int = 24;
++const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
++const PR_GET_NO_NEW_PRIVS: libc::c_int = 39;
++const MAX_CAP: libc::c_ulong = 63;
++
++fn drop_fail(message: impl Display) -> ! {
++    eprintln!("jailer: kilnd privilege drop failed: {message}");
++    // SAFETY: _exit is always safe; no destructors or atexit handlers run.
++    unsafe { libc::_exit(EXIT_PRIVILEGE_DROP) }
++}
++
++fn capget() -> Result<[CapData; 2], String> {
++    let mut header = CapHeader {
++        version: LINUX_CAPABILITY_VERSION_3,
++        pid: 0,
++    };
++    let mut data = [CapData::default(); 2];
++    // SAFETY: header and two data words are live storage for version 3.
++    let rc = unsafe {
++        libc::syscall(
++            libc::SYS_capget,
++            &mut header as *mut CapHeader,
++            data.as_mut_ptr(),
++        )
++    };
++    if rc != 0 {
++        return Err(os_error("capget"));
++    }
++    Ok(data)
++}
++
++fn capset(data: &[CapData; 2]) -> Result<(), String> {
++    let mut header = CapHeader {
++        version: LINUX_CAPABILITY_VERSION_3,
++        pid: 0,
++    };
++    // SAFETY: header and two data words are live storage for version 3.
++    let rc = unsafe {
++        libc::syscall(
++            libc::SYS_capset,
++            &mut header as *mut CapHeader,
++            data.as_ptr(),
++        )
++    };
++    if rc != 0 {
++        return Err(os_error("capset"));
++    }
++    Ok(())
++}
++
++fn prctl(option: libc::c_int, a2: libc::c_ulong, a3: libc::c_ulong) -> libc::c_int {
++    // SAFETY: prctl with integer arguments only.
++    unsafe { libc::prctl(option, a2, a3, 0 as libc::c_ulong, 0 as libc::c_ulong) }
++}
++
++/// Walks 0..=63 with `probe`, which returns Ok(true) for "still set". Returns the first
++/// capability number the kernel rejects with EINVAL (one past its last capability).
++fn cap_walk(
++    what: &str,
++    mut probe: impl FnMut(libc::c_ulong) -> libc::c_int,
++    require_clear: bool,
++) -> Result<libc::c_ulong, String> {
++    for cap in 0..=MAX_CAP {
++        match probe(cap) {
++            0 => {}
++            1 if !require_clear => {}
++            -1 if errno() == libc::EINVAL => return Ok(cap),
++            -1 => return Err(os_error(&format!("{what} {cap}"))),
++            other => return Err(format!("{what} {cap} still set ({other})")),
++        }
++    }
++    Ok(MAX_CAP + 1)
++}
++
++fn raw_syscall_ok(rc: libc::c_long, what: &str) -> Result<(), String> {
++    if rc != 0 {
++        return Err(os_error(what));
++    }
++    Ok(())
++}
++
++/// The frozen `capability_drop_order`, steps 1-7.
++fn drop_privileges(uid: u32, gid: u32) -> Result<libc::c_ulong, String> {
++    // 1. Supplementary groups.
++    // SAFETY: an empty group list.
++    let rc = unsafe {
++        libc::syscall(
++            libc::SYS_setgroups,
++            0 as libc::size_t,
++            std::ptr::null::<libc::gid_t>(),
++        )
++    };
++    raw_syscall_ok(rc, "setgroups(0)")?;
++    // 2. Ambient set, then the inheritable set (effective/permitted kept for now).
++    if prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0) != 0 {
++        return Err(os_error("PR_CAP_AMBIENT_CLEAR_ALL"));
++    }
++    let mut caps = capget()?;
++    for word in caps.iter_mut() {
++        word.inheritable = 0;
++    }
++    capset(&caps)?;
++    // 3. Every bounding bit, while still privileged.
++    let bounding_end = cap_walk(
++        "PR_CAPBSET_DROP",
++        |cap| prctl(PR_CAPBSET_DROP, cap, 0),
++        false,
++    )?;
++    if bounding_end == 0 {
++        return Err("kernel reports no capabilities".into());
++    }
++    // 4-5. GID then UID: real, effective and saved. Without SECBIT_KEEP_CAPS the kernel
++    // clears permitted and effective when every UID leaves 0.
++    // SAFETY: integer arguments only.
++    let rc = unsafe { libc::syscall(libc::SYS_setresgid, gid, gid, gid) };
++    raw_syscall_ok(rc, "setresgid")?;
++    // SAFETY: integer arguments only.
++    let rc = unsafe { libc::syscall(libc::SYS_setresuid, uid, uid, uid) };
++    raw_syscall_ok(rc, "setresuid")?;
++    // 6. All three sets explicitly zero.
++    capset(&[CapData::default(); 2])?;
++    // 7. no_new_privs.
++    if prctl(PR_SET_NO_NEW_PRIVS, 1, 0) != 0 {
++        return Err(os_error("PR_SET_NO_NEW_PRIVS"));
++    }
++    Ok(bounding_end)
++}
++
++/// Step 8: proves the drop before exec.
++fn verify_privileges(uid: u32, gid: u32, bounding_end: libc::c_ulong) -> Result<(), String> {
++    // SAFETY: size 0 only queries the count.
++    let groups = unsafe {
++        libc::syscall(
++            libc::SYS_getgroups,
++            0 as libc::c_int,
++            std::ptr::null_mut::<libc::gid_t>(),
++        )
++    };
++    if groups != 0 {
++        return Err(format!("getgroups reports {groups} groups"));
++    }
++    let (mut r, mut e, mut s): (libc::uid_t, libc::uid_t, libc::uid_t) = (0, 0, 0);
++    // SAFETY: three live output words.
++    let rc = unsafe {
++        libc::syscall(
++            libc::SYS_getresuid,
++            &mut r as *mut _,
++            &mut e as *mut _,
++            &mut s as *mut _,
++        )
++    };
++    raw_syscall_ok(rc, "getresuid")?;
++    if (r, e, s) != (uid, uid, uid) {
++        return Err(format!("resuid is {r}/{e}/{s}, not {uid}"));
++    }
++    let (mut r, mut e, mut s): (libc::gid_t, libc::gid_t, libc::gid_t) = (0, 0, 0);
++    // SAFETY: three live output words.
++    let rc = unsafe {
++        libc::syscall(
++            libc::SYS_getresgid,
++            &mut r as *mut _,
++            &mut e as *mut _,
++            &mut s as *mut _,
++        )
++    };
++    raw_syscall_ok(rc, "getresgid")?;
++    if (r, e, s) != (gid, gid, gid) {
++        return Err(format!("resgid is {r}/{e}/{s}, not {gid}"));
++    }
++    if capget()? != [CapData::default(); 2] {
++        return Err("effective/permitted/inheritable not all zero".into());
++    }
++    let read_end = cap_walk(
++        "PR_CAPBSET_READ",
++        |cap| prctl(PR_CAPBSET_READ, cap, 0),
++        true,
++    )?;
++    let ambient_end = cap_walk(
++        "PR_CAP_AMBIENT_IS_SET",
++        |cap| prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap),
++        true,
++    )?;
++    if read_end != bounding_end || ambient_end != bounding_end {
++        return Err(format!(
++            "capability range differs: drop {bounding_end}, bounding {read_end}, ambient {ambient_end}"
++        ));
++    }
++    if prctl(PR_GET_NO_NEW_PRIVS, 0, 0) != 1 {
++        return Err("no_new_privs is not set".into());
++    }
++    Ok(())
++}
++
++/// V's whole tail: restore the default signal disposition and mask the way Rust's
++/// `Command::exec` did upstream, drop and verify every privilege (71 on any failure), then
++/// `execveat(3, "", argv, [], AT_EMPTY_PATH)`. 72 if it returns. No other exec exists.
++pub fn drop_privileges_and_exec(uid: u32, gid: u32, argv: &[String]) -> ! {
++    let argv: Vec<CString> = argv
++        .iter()
++        .map(|arg| CString::new(arg.as_bytes()))
++        .collect::<Result<_, _>>()
++        .unwrap_or_else(|e| drop_fail(format!("argv: {e}")));
++    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
++    argv_ptrs.push(std::ptr::null());
++    let envp: [*const libc::c_char; 1] = [std::ptr::null()];
++
++    // Rust's std ignores SIGPIPE; Command::exec reset it and the signal mask for the child.
++    // SAFETY: plain signal-state calls with valid arguments.
++    unsafe {
++        let mut empty: libc::sigset_t = std::mem::zeroed();
++        libc::sigemptyset(&mut empty);
++        if libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) != 0
++            || libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR
++        {
++            drop_fail("reset signal state");
++        }
++    }
++
++    let bounding_end = drop_privileges(uid, gid).unwrap_or_else(|e| drop_fail(e));
++    if let Err(e) = verify_privileges(uid, gid, bounding_end) {
++        drop_fail(e);
++    }
++
++    // SAFETY: argv/envp are NULL-terminated arrays of live C strings; FD 3 is the verified
++    // executable. Returns only on failure.
++    unsafe {
++        libc::syscall(
++            libc::SYS_execveat,
++            VMM_FD,
++            c"".as_ptr(),
++            argv_ptrs.as_ptr(),
++            envp.as_ptr(),
++            libc::AT_EMPTY_PATH,
++        );
++    }
++    eprintln!(
++        "jailer: kilnd execveat(3) failed: {}",
++        std::io::Error::last_os_error()
++    );
++    // SAFETY: _exit is always safe.
++    unsafe { libc::_exit(EXIT_EXEC) }
++}
++
++// ---------------------------------------------------------------------------------------
++// SHA-256 (FIPS 180-4). Small and self-contained: `sha2` is not in Firecracker's lock.
++
++const K: [u32; 64] = [
++    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++];
++
++#[derive(Debug)]
++pub struct Sha256 {
++    state: [u32; 8],
++    block: [u8; 64],
++    filled: usize,
++    length: u64,
++}
++
++impl Sha256 {
++    pub fn new() -> Self {
++        Sha256 {
++            state: [
++                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
++                0x5be0cd19,
++            ],
++            block: [0; 64],
++            filled: 0,
++            length: 0,
++        }
++    }
++
++    fn compress(&mut self) {
++        let mut w = [0u32; 64];
++        for (i, chunk) in self.block.chunks_exact(4).enumerate() {
++            w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
++        }
++        for i in 16..64 {
++            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
++            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
++            w[i] = w[i - 16]
++                .wrapping_add(s0)
++                .wrapping_add(w[i - 7])
++                .wrapping_add(s1);
++        }
++        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
++        for i in 0..64 {
++            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
++            let ch = (e & f) ^ (!e & g);
++            let t1 = h
++                .wrapping_add(s1)
++                .wrapping_add(ch)
++                .wrapping_add(K[i])
++                .wrapping_add(w[i]);
++            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
++            let maj = (a & b) ^ (a & c) ^ (b & c);
++            let t2 = s0.wrapping_add(maj);
++            h = g;
++            g = f;
++            f = e;
++            e = d.wrapping_add(t1);
++            d = c;
++            c = b;
++            b = a;
++            a = t1.wrapping_add(t2);
++        }
++        for (s, v) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
++            *s = s.wrapping_add(v);
++        }
++    }
++
++    pub fn update(&mut self, mut data: &[u8]) {
++        self.length = self.length.wrapping_add(data.len() as u64);
++        while !data.is_empty() {
++            let take = (64 - self.filled).min(data.len());
++            self.block[self.filled..self.filled + take].copy_from_slice(&data[..take]);
++            self.filled += take;
++            data = &data[take..];
++            if self.filled == 64 {
++                self.compress();
++                self.filled = 0;
++            }
++        }
++    }
++
++    pub fn finish(mut self) -> [u8; 32] {
++        let bits = self.length.wrapping_mul(8);
++        self.block[self.filled] = 0x80;
++        self.block[self.filled + 1..].fill(0);
++        if self.filled >= 56 {
++            self.compress();
++            self.block.fill(0);
++        }
++        self.block[56..].copy_from_slice(&bits.to_be_bytes());
++        self.compress();
++        let mut out = [0u8; 32];
++        for (chunk, word) in out.chunks_exact_mut(4).zip(self.state) {
++            chunk.copy_from_slice(&word.to_be_bytes());
++        }
++        out
++    }
++}
++
++fn hex(bytes: &[u8]) -> String {
++    const DIGITS: &[u8; 16] = b"0123456789abcdef";
++    let mut out = String::with_capacity(bytes.len() * 2);
++    for b in bytes {
++        out.push(DIGITS[(b >> 4) as usize] as char);
++        out.push(DIGITS[(b & 0xf) as usize] as char);
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    #![allow(clippy::undocumented_unsafe_blocks)]
++
++    use super::*;
++
++    fn sha(data: &[u8]) -> String {
++        let mut h = Sha256::new();
++        h.update(data);
++        hex(&h.finish())
++    }
++
++    #[test]
++    fn test_sha256_known_answers() {
++        assert_eq!(
++            sha(b""),
++            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++        );
++        assert_eq!(
++            sha(b"abc"),
++            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
++        );
++        assert_eq!(
++            sha(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
++            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
++        );
++        assert_eq!(
++            sha(&vec![b'a'; 1_000_000]),
++            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
++        );
++        // Split updates across block boundaries give the same digest.
++        let data: Vec<u8> = (0..1000u32).map(|i| i.to_le_bytes()[0]).collect();
++        let mut h = Sha256::new();
++        for chunk in data.chunks(37) {
++            h.update(chunk);
++        }
++        assert_eq!(hex(&h.finish()), sha(&data));
++    }
++
++    const GOOD: &str = concat!(
++        r#"{"exec_file_label":"/opt/kilnd/exec/sha256/"#,
++        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
++        r#"/firecracker","jail_root_identity":{"mount_id":42,"st_dev":7,"st_ino":9},"#,
++        r#""plan_generation":3,"version":1,"vmm_identity":{"bytes":100,"sha256":""#,
++        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
++        r#"","st_dev":7,"st_ino":11}}"#
++    );
++
++    #[test]
++    fn test_parse_record_canonical() {
++        let record = parse_record(GOOD.as_bytes()).unwrap();
++        assert_eq!(record.version, 1);
++        assert_eq!(record.plan_generation, 3);
++        assert_eq!(record.jail_root_identity.mount_id, 42);
++        assert_eq!(record.vmm_identity.st_ino, 11);
++        assert_eq!(serde_json::to_vec(&record).unwrap(), GOOD.as_bytes());
++    }
++
++    #[test]
++    fn test_parse_record_rejects() {
++        let cases = [
++            // Whitespace.
++            GOOD.replacen(":42", ": 42", 1),
++            format!("{GOOD}\n"),
++            // Key order.
++            GOOD.replacen(
++                r#""plan_generation":3,"version":1"#,
++                r#""version":1,"plan_generation":3"#,
++                1,
++            ),
++            // Unknown and duplicate fields.
++            GOOD.replacen(r#""version":1"#, r#""version":1,"x":1"#, 1),
++            GOOD.replacen(r#""version":1"#, r#""version":1,"version":1"#, 1),
++            // Version, digest shape.
++            GOOD.replacen(r#""version":1"#, r#""version":2"#, 1),
++            GOOD.replacen(r#""sha256":"0123"#, r#""sha256":"0A23"#, 1),
++            GOOD.replacen(r#""sha256":"0123"#, r#""sha256":"123"#, 1),
++            // Missing field.
++            GOOD.replacen(r#""plan_generation":3,"#, "", 1),
++            String::new(),
++        ];
++        for case in cases {
++            assert!(parse_record(case.as_bytes()).is_err(), "accepted {case}");
++        }
++        parse_record(&[b' '; MAX_RECORD_BYTES + 1]).unwrap_err();
++    }
++
++    #[test]
++    fn test_read_record_framing() {
++        let mut fds = [0; 2];
++        let socketpair = |fds: &mut [libc::c_int; 2]| {
++            assert_eq!(
++                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
++                0
++            );
++        };
++        // Good record, written in two pieces.
++        socketpair(&mut fds);
++        let mut message = u32::try_from(GOOD.len()).unwrap().to_be_bytes().to_vec();
++        message.extend_from_slice(GOOD.as_bytes());
++        write_all_fd(fds[1], &message[..10]).unwrap();
++        write_all_fd(fds[1], &message[10..]).unwrap();
++        assert_eq!(read_record(fds[0]).unwrap().plan_generation, 3);
++        // Gate: CONT continues, anything else and EOF refuse.
++        write_all_fd(fds[1], b"CONT").unwrap();
++        gate(fds[0]).unwrap();
++        write_all_fd(fds[1], b"STOP").unwrap();
++        gate(fds[0]).unwrap_err();
++        write_all_fd(fds[1], b"CO").unwrap();
++        unsafe { libc::close(fds[1]) };
++        gate(fds[0]).unwrap_err();
++        unsafe { libc::close(fds[0]) };
++        // Bad lengths and EOF.
++        for length in [0u32, u32::try_from(MAX_RECORD_BYTES).unwrap() + 1] {
++            socketpair(&mut fds);
++            write_all_fd(fds[1], &length.to_be_bytes()).unwrap();
++            read_record(fds[0]).unwrap_err();
++            unsafe { libc::close(fds[0]) };
++            unsafe { libc::close(fds[1]) };
++        }
++        socketpair(&mut fds);
++        write_all_fd(fds[1], &100u32.to_be_bytes()).unwrap();
++        write_all_fd(fds[1], b"{}").unwrap();
++        unsafe { libc::close(fds[1]) };
++        read_record(fds[0]).unwrap_err();
++        unsafe { libc::close(fds[0]) };
++    }
++
++    #[test]
++    fn test_exec_file_label() {
++        assert_eq!(
++            exec_file_basename("/opt/kilnd/exec/sha256/ab/firecracker").unwrap(),
++            "firecracker"
++        );
++        for bad in [
++            "",
++            "/",
++            "firecracker",
++            "./firecracker",
++            "/opt//firecracker",
++            "/opt/./firecracker",
++            "/opt/../firecracker",
++            "/opt/firecracker/",
++            "/opt/firecracker/.",
++            "/opt/firecracker/..",
++        ] {
++            assert!(exec_file_basename(bad).is_err(), "accepted {bad:?}");
++        }
++    }
++
++    #[test]
++    fn test_contract_chroot_dir() {
++        assert_eq!(
++            contract_chroot_dir("/var/lib/kilnd-helper/jails", "firecracker", "fc-1").unwrap(),
++            PathBuf::from("/var/lib/kilnd-helper/jails/firecracker/fc-1/root")
++        );
++        contract_chroot_dir("relative", "firecracker", "fc-1").unwrap_err();
++        contract_chroot_dir("/a/../b", "firecracker", "fc-1").unwrap_err();
++        contract_chroot_dir("/a", "firecracker", "../x").unwrap_err();
++    }
++
++    #[test]
++    fn test_sha256_fd_uses_pread() {
++        let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
++        std::fs::write(file.as_path(), b"abc").unwrap();
++        let f = std::fs::File::open(file.as_path()).unwrap();
++        use std::io::Read;
++        use std::os::unix::io::AsRawFd;
++        let mut one = [0u8; 1];
++        (&f).read_exact(&mut one).unwrap();
++        assert_eq!(
++            sha256_fd(f.as_raw_fd(), 3).unwrap(),
++            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
++        );
++        sha256_fd(f.as_raw_fd(), 2).unwrap_err();
++        sha256_fd(f.as_raw_fd(), 4).unwrap_err();
++    }
++
++    #[test]
++    fn test_statx_layout() {
++        assert_eq!(std::mem::size_of::<Statx>(), 256);
++        let stx = statx_nofollow(Path::new("/")).unwrap();
++        let stat = std::fs::symlink_metadata("/").unwrap();
++        assert_eq!(stx.stx_ino, stat.ino());
++        assert_eq!(
++            libc::makedev(stx.stx_dev_major, stx.stx_dev_minor) as u64,
++            stat.dev()
++        );
++    }
++}
+diff --git a/src/jailer/src/main.rs b/src/jailer/src/main.rs
+index 0daed7d..0fa4636 100644
+--- a/src/jailer/src/main.rs
++++ b/src/jailer/src/main.rs
+@@ -10,16 +10,17 @@ use env::PROC_MOUNTS;
+ use utils::arg_parser::{ArgParser, Argument, UtilsArgParserError as ParsingError};
+ use utils::time::{ClockType, get_time_us};
+ use utils::validators;
+-use vmm_sys_util::syscall::SyscallReturnCode;
+ 
+ use crate::env::Env;
+ 
+ mod cgroup;
+ mod chroot;
+ mod env;
++mod handoff;
+ mod resource_limits;
+ 
+-const JAILER_VERSION: &str = env!("CARGO_PKG_VERSION");
++// kilnd-handoff1: the descriptor-handoff jailer is versioned apart from stock 1.17.0.
++const JAILER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-kilnd-handoff1");
+ 
+ #[derive(Debug, thiserror::Error)]
+ pub enum JailerError {
+@@ -76,6 +77,8 @@ pub enum JailerError {
+     Dup2(io::Error),
+     #[error("Failed to exec into Firecracker: {0}")]
+     Exec(io::Error),
++    #[error("Invalid exec-file label or chroot path: {0}")]
++    ExecFileLabel(String),
+     #[error("{}", format!("Failed to extract filename from path {:?}", .0).replace('\"', ""))]
+     ExtractFileName(PathBuf),
+     #[error("{}", format!("Failed to open file {:?}: {}", .0, .1).replace('\"', ""))]
+@@ -255,21 +258,12 @@ pub fn readln_special<T: AsRef<Path> + Debug>(file_path: &T) -> Result<String, J
+ }
+ 
+ fn close_fds_by_close_range() -> Result<(), JailerError> {
+-    // First try using the close_range syscall to close all open FDs in the range of 3..UINT_MAX
+-    // SAFETY: if the syscall is not available then ENOSYS will be returned
+-    SyscallReturnCode(unsafe {
+-        libc::syscall(
+-            libc::SYS_close_range,
+-            3,
+-            libc::c_uint::MAX,
+-            libc::CLOSE_RANGE_UNSHARE,
+-        )
+-    })
+-    .into_empty_result()
+-    .map_err(JailerError::CloseRange)
++    // kilnd-handoff1: close every inherited FD from 5 upwards; 3 (the verified VMM) and 4
++    // (the control socket) are the bootstrap descriptors and are checked next.
++    handoff::close_inherited_fds().map_err(|err| JailerError::CloseRange(io::Error::other(err)))
+ }
+ 
+-// Closes all FDs other than 0 (STDIN), 1 (STDOUT) and 2 (STDERR)
++// Closes all FDs other than 0-2 (stdio) and the bootstrap FDs 3 and 4.
+ fn close_inherited_fds() -> Result<(), JailerError> {
+     // We use the close_range syscall which is available on kernels > 5.9.
+     close_fds_by_close_range()?;
+@@ -278,7 +272,7 @@ fn close_inherited_fds() -> Result<(), JailerError> {
+ 
+ fn sanitize_process() -> Result<(), JailerError> {
+     // First thing to do is make sure we don't keep any inherited FDs
+-    // other that IN, OUT and ERR.
++    // other than stdio and the bootstrap FDs 3 and 4.
+     close_inherited_fds()?;
+ 
+     // Cleanup environment variables.
+@@ -323,13 +317,13 @@ fn main() -> Result<(), JailerError> {
+ }
+ 
+ fn main_exec() -> Result<(), JailerError> {
+-    sanitize_process()
+-        .unwrap_or_else(|err| panic!("Failed to sanitize the Jailer process: {}", err));
++    // kilnd-handoff1: every failure before the bootstrap gate passes exits 70 with no setup.
++    sanitize_process().unwrap_or_else(|err| handoff::refuse(err));
+ 
+     let mut arg_parser = build_arg_parser();
+     arg_parser
+         .parse_from_cmdline()
+-        .map_err(JailerError::ArgumentParsing)?;
++        .unwrap_or_else(|err| handoff::refuse(JailerError::ArgumentParsing(err)));
+     let arguments = arg_parser.arguments();
+ 
+     if arguments.flag_present("help") {
+@@ -344,6 +338,10 @@ fn main_exec() -> Result<(), JailerError> {
+         return Ok(());
+     }
+ 
++    // kilnd-handoff1 steps 1-4: FD 3/4 checks, contract argv, bootstrap record, validation
++    // and the RDY1/CONT gate. Nothing below runs unless S answered CONT.
++    handoff::bootstrap(arguments);
++
+     Env::new(
+         arguments,
+         get_time_us(ClockType::Monotonic),
+@@ -388,7 +386,8 @@ mod tests {
+ 
+         test_fn().unwrap();
+ 
+-        for fd in fds {
++        // kilnd-handoff1: 3 and 4 are the bootstrap FDs and stay open; all others close.
++        for fd in fds.into_iter().filter(|fd| *fd > 4) {
+             let is_fd_opened = unsafe { libc::fcntl(fd, libc::F_GETFD) } == 0;
+             assert!(!is_fd_opened);
+         }
