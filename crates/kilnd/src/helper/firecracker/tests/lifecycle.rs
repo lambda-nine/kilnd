@@ -443,6 +443,32 @@ async fn b4_linux_root_create_boots_and_remove_leaves_nothing() {
     }
 }
 
+/// B4 recheck finding 4 (was `poc_b4_recheck_preexec_death_falsifies_retained_fd_evidence`):
+/// the report pipe's unwritten end of file does not distinguish a successful exec from a
+/// child that died before `execveat`. The formatter's tuple is recorded only after its
+/// exit status 0, so this child's `_exit(126)` before exec leaves no executable evidence
+/// and the launch never boots.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs root and the B4 artifacts: run scripts/b4-vm-tests.sh"]
+async fn b4_linux_root_formatter_death_before_exec_records_no_evidence() {
+    let real = Real::new(NodeOptions::default()).await;
+    real.fixture.fault("S.formatter_die_before_exec");
+    let (runtime, context, _plan) = create(&real).await;
+    wait_until("formatter supervisor exit", || {
+        worker_pid(&real, context.allocation_id, "supervisor").is_some_and(|s| !running(s))
+    })
+    .await;
+    real.fixture.clear("S.formatter_die_before_exec");
+    assert_ne!(real.phase(context.allocation_id), "booting");
+    assert_eq!(
+        real.evidence(context.allocation_id, Role::MkfsXfs),
+        None,
+        "the child exited before exec, so no executable evidence is truthful"
+    );
+    eprintln!("B4 evidence: formatter _exit(126) before execveat: no mkfs evidence recorded");
+    remove_to_absent(&real, &runtime, &context, "formatter death before exec").await;
+}
+
 // Shared helpers for the exit tests below.
 
 async fn inspect(

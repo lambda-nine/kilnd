@@ -730,9 +730,14 @@ mod linux {
             ));
         }
         let observe = super::super::workers::fault_enabled("S.exec_stop");
+        // Test-only: the child dies before execveat, which also closes the report pipe
+        // unwritten.
+        let die_before_exec = super::super::workers::fault_enabled("S.formatter_die_before_exec");
         // The exec report: close-on-exec, so a successful execveat closes it unwritten
-        // and a failed one writes its errno first. Only a confirmed exec of the retained
-        // descriptor lets S record that descriptor's tuple, and then as an inference.
+        // and a failed one writes its errno first, for the refusal's diagnostic. An
+        // unwritten end of file is not proof of exec: a child that dies before execveat
+        // closes it the same way. Only the formatter's exit status 0 lets S record the
+        // retained descriptor's tuple, and then as an inference.
         let mut report = [0 as RawFd; 2];
         cvt(unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) })?;
         // SAFETY: new owned descriptors.
@@ -762,6 +767,9 @@ mod linux {
                 }
                 let keep = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
                 executable::close_all_except(&[keep, report_raw]);
+                if die_before_exec {
+                    libc::_exit(126);
+                }
                 let error = executable::exec_retained(keep, &argv, &[]);
                 let errno = error.raw_os_error().unwrap_or(libc::EIO).to_be_bytes();
                 libc::write(report_raw, errno.as_ptr().cast(), errno.len());
@@ -821,12 +829,13 @@ mod linux {
                 failed.len()
             )));
         }
-        if !observe {
-            link.record(SupervisorRecord::InferredFromRetainedFd(mkfs))?;
-        }
         let status = link.wait_for(Duration::from_secs(60), || waitpid_nohang(pid))?;
         if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            // Pre-exec death and failed formatting alike: no executable evidence.
             return Err(Abort::Refused(format!("formatter failed: status {status}")));
+        }
+        if !observe {
+            link.record(SupervisorRecord::InferredFromRetainedFd(mkfs))?;
         }
         let after = storage::identity_at(dir, storage::WORK_FILE)?;
         if after != Some(identity) {
