@@ -15,7 +15,7 @@
 use std::io;
 use std::time::Duration;
 
-use kilnd_broker_protocol::budget::{Budget, ExchangeBudget, ExecBudget};
+use kilnd_broker_protocol::budget::{Budget, ExchangeBudget, ExecBudget, SharedBudget};
 use kilnd_broker_protocol::exchange::{HostConnection, HostEvent};
 use kilnd_broker_protocol::message::{
     BrokerState, Cancel, CancelAck, Channel, ErrorReply, Exec, ExecResult, Hello, HelloReply,
@@ -398,16 +398,34 @@ pub async fn probe<S: AsyncRead + AsyncWrite + Unpin>(
     run.await.unwrap_or_else(|fail| failed(job, fail, false))
 }
 
-/// `Cancel` on its own control connection, which never waits on the exec writer.
+/// `Cancel` on its own control connection, which never waits on the exec writer. With
+/// the execution's shared budget, its frames count against that execution (design 5.6:
+/// both channels count; Cancel is budgeted once per token).
 pub async fn cancel<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     job: u64,
     expected: &Expected,
     cancel: Cancel,
     deadline: Instant,
+    shared: Option<SharedBudget<ExecBudget>>,
+) -> RelayReport {
+    match shared {
+        Some(budget) => cancel_with(stream, job, expected, cancel, deadline, budget).await,
+        None => {
+            cancel_with(stream, job, expected, cancel, deadline, ExchangeBudget::default()).await
+        }
+    }
+}
+
+async fn cancel_with<S: AsyncRead + AsyncWrite + Unpin, B: Budget>(
+    stream: S,
+    job: u64,
+    expected: &Expected,
+    cancel: Cancel,
+    deadline: Instant,
+    mut budget: B,
 ) -> RelayReport {
     let run = async {
-        let mut budget = ExchangeBudget::default();
         let (mut link, _) = open(stream, expected, Channel::Control, &mut budget).await?;
         let id = Id128::random().map_err(|e| Fail::Broken(e.to_string()))?;
         let by = stage().min(deadline);
@@ -446,6 +464,7 @@ pub async fn exec<S, I, O, E>(
     mut stdin: I,
     mut stdout: O,
     mut stderr: E,
+    mut budget: SharedBudget<ExecBudget>,
     accepted: impl FnOnce(Id128),
 ) -> RelayReport
 where
@@ -480,7 +499,6 @@ where
             dispatched: false,
         };
     }
-    let mut budget = ExecBudget::new(exec.max_output, exec.max_output);
     let (mut link, _) = match open(stream, expected, Channel::Exec, &mut budget).await {
         Ok(opened) => opened,
         Err(fail) => return failed(job, fail, false),
@@ -767,6 +785,7 @@ pub mod relay {
                 }
             });
             let busy = std::rc::Rc::new(std::cell::Cell::new((false, false)));
+            let budgets: Budgets = Default::default();
             while let Ok(Some(job)) = read_job(&mut reader).await {
                 let id = job.job();
                 let fds = match job_fds(&descriptors, id, job.descriptors()).await {
@@ -798,8 +817,9 @@ pub mod relay {
                 });
                 let tx = tx.clone();
                 let busy = busy.clone();
+                let budgets = budgets.clone();
                 tokio::task::spawn_local(async move {
-                    let report = run_job(job, fds, &tx).await;
+                    let report = run_job(job, fds, &tx, &budgets).await;
                     let _ = tx.send(report);
                     let (e, c) = busy.get();
                     busy.set(if exec { (false, c) } else { (e, false) });
@@ -808,10 +828,17 @@ pub mod relay {
         });
     }
 
+    /// Each in-flight execution's guest-to-host budget, by token, which its Cancel
+    /// exchange also charges.
+    type Budgets = std::rc::Rc<
+        std::cell::RefCell<std::collections::HashMap<Id128, SharedBudget<ExecBudget>>>,
+    >;
+
     async fn run_job(
         job: RelayJob,
         fds: Vec<OwnedFd>,
         tx: &tokio::sync::mpsc::UnboundedSender<RelayReport>,
+        budgets: &Budgets,
     ) -> RelayReport {
         let id = job.job();
         let mut fds = fds.into_iter();
@@ -840,7 +867,10 @@ pub mod relay {
                 cancel: request,
                 deadline_ns,
                 ..
-            } => cancel(vsock, id, &expected, request, instant_of(deadline_ns)).await,
+            } => {
+                let shared = budgets.borrow().get(&request.token).cloned();
+                cancel(vsock, id, &expected, request, instant_of(deadline_ns), shared).await
+            }
             RelayJob::Exec {
                 expected,
                 exec: request,
@@ -863,7 +893,13 @@ pub mod relay {
                         dispatched: false,
                     };
                 };
-                exec(
+                let token = request.token;
+                let budget = SharedBudget::new(ExecBudget::new(
+                    request.max_output,
+                    request.max_output,
+                ));
+                budgets.borrow_mut().insert(token, budget.clone());
+                let report = exec(
                     vsock,
                     id,
                     &expected,
@@ -872,11 +908,14 @@ pub mod relay {
                     stdin,
                     stdout,
                     stderr,
+                    budget,
                     |token| {
                         let _ = tx.send(RelayReport::Accepted { job: id, token });
                     },
                 )
-                .await
+                .await;
+                budgets.borrow_mut().remove(&token);
+                report
             }
         }
     }

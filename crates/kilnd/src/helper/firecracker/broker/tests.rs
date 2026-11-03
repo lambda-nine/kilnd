@@ -378,7 +378,7 @@ async fn probe_and_cancel_on_their_own_connections() {
             reason: CancelReason::Timeout,
         };
         assert!(matches!(
-            cancel(host, 4, &ready, request, soon(5)).await,
+            cancel(host, 4, &ready, request, soon(5), None).await,
             RelayReport::CancelAcked { ack, .. } if ack.active
         ));
     })
@@ -419,6 +419,7 @@ async fn run_exec(
         relay_in,
         relay_out,
         relay_err,
+        kilnd_broker_protocol::budget::SharedBudget::new(ExecBudget::new(1 << 20, 1 << 20)),
         |_| accepted.set(true),
     )
     .await;

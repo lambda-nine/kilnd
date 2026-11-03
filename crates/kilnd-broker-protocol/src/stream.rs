@@ -28,11 +28,14 @@ pub enum Due {
     FirstByte { first: Instant, then: Duration },
 }
 
-/// Reads frames travelling `direction` from `R`.
+/// Reads frames travelling `direction` from `R`. Any timeout, codec error or I/O
+/// error poisons the reader: every later call returns that error, so no retry can
+/// finish a partial frame under a fresh deadline. The connection must be closed.
 pub struct FrameReader<R> {
     inner: R,
     decoder: FrameDecoder,
     first_byte_at: Option<Instant>,
+    failed: Option<ProtocolError>,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -45,6 +48,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             inner,
             decoder,
             first_byte_at: None,
+            failed: None,
         }
     }
 
@@ -65,6 +69,21 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// The next frame, or `None` on a clean EOF at a frame boundary. The budget is
     /// charged from the header before any payload byte is read.
     pub async fn read_frame<B: Budget + ?Sized>(
+        &mut self,
+        due: Due,
+        budget: &mut B,
+    ) -> Result<Option<Frame>> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
+        let result = self.read_frame_inner(due, budget).await;
+        if let Err(error) = &result {
+            self.failed = Some(error.clone());
+        }
+        result
+    }
+
+    async fn read_frame_inner<B: Budget + ?Sized>(
         &mut self,
         due: Due,
         budget: &mut B,
@@ -110,21 +129,30 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
     /// The clean end of stream after a terminal frame. A byte instead is trailing data.
     pub async fn read_eof(&mut self, by: Instant) -> Result<()> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         let mut buf = [0u8; 1];
-        match timeout_at(by, self.inner.read(&mut buf)).await {
+        let result = match timeout_at(by, self.inner.read(&mut buf)).await {
             Err(_) => Err(ProtocolError::Timeout(Stage::Eof)),
             Ok(Err(error)) => Err(error.into()),
             Ok(Ok(0)) => Ok(()),
             Ok(Ok(_)) => Err(ProtocolError::TrailingBytes),
+        };
+        if let Err(error) = &result {
+            self.failed = Some(error.clone());
         }
+        result
     }
 }
 
-/// Writes frames travelling `direction` to `W`, numbering them from zero.
+/// Writes frames travelling `direction` to `W`, numbering them from zero. A failed or
+/// timed-out write leaves the stream position unknown, so it poisons the writer.
 pub struct FrameWriter<W> {
     inner: W,
     direction: Direction,
     sequence: Sequence,
+    failed: Option<ProtocolError>,
 }
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
@@ -137,6 +165,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
             inner,
             direction,
             sequence,
+            failed: None,
         }
     }
 
@@ -159,6 +188,9 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         payload: &[u8],
         by: Instant,
     ) -> Result<()> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         if kind.direction() != self.direction {
             return Err(ProtocolError::WrongDirection {
                 kind,
@@ -167,7 +199,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         }
         let mut next = self.sequence;
         let frame = encode_frame(kind, request_id, next.take()?, payload)?;
-        match timeout_at(by, async {
+        let result = match timeout_at(by, async {
             self.inner.write_all(&frame).await?;
             self.inner.flush().await
         })
@@ -179,11 +211,18 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
                 self.sequence = next;
                 Ok(())
             }
+        };
+        if let Err(error) = &result {
+            self.failed = Some(error.clone());
         }
+        result
     }
 
     /// Closes the write half (a clean EOF for the peer) by `by`.
     pub async fn finish(&mut self, by: Instant) -> Result<()> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         match timeout_at(by, self.inner.shutdown()).await {
             Err(_) => Err(ProtocolError::Timeout(Stage::Write)),
             Ok(Err(error)) => Err(error.into()),

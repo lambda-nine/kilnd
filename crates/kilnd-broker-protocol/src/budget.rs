@@ -154,3 +154,32 @@ impl Budget for HostBudget {
         Ok(())
     }
 }
+
+/// One budget shared by several readers of the same execution (its exec connection and
+/// any Cancel exchange for its token). Every reader charges the same counters, and the
+/// shared state is borrowed only inside `admit`, a synchronous call: no reader holds it
+/// across an await, so a stalled reader on one channel never blocks another's admission.
+pub struct SharedBudget<B>(std::rc::Rc<std::cell::RefCell<B>>);
+
+impl<B> Clone for SharedBudget<B> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<B: Budget> SharedBudget<B> {
+    pub fn new(budget: B) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(budget)))
+    }
+
+    /// Reads the shared counters.
+    pub fn with<T>(&self, read: impl FnOnce(&B) -> T) -> T {
+        read(&self.0.borrow())
+    }
+}
+
+impl<B: Budget> Budget for SharedBudget<B> {
+    fn admit(&mut self, header: &Header) -> Result<()> {
+        self.0.borrow_mut().admit(header)
+    }
+}

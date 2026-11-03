@@ -631,3 +631,100 @@ async fn futures_join(
     }
     out
 }
+
+/// Daybreak B5 milestone 1 finding 3: a timed-out reader or writer is poisoned, so no
+/// retry can complete a partial frame under a fresh deadline.
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_stream_is_poisoned_for_every_later_call() {
+    let (host, mut guest) = duplex(4096);
+    let (mut reader, _) = host_reader(host);
+    let frame = stdout_frame(0, 4);
+    guest.write_all(&frame[..1]).await.unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        reader
+            .read_frame(Due::By(start + TWO), &mut ExecBudget::new(64, 64))
+            .await,
+        Err(ProtocolError::Timeout(Stage::Frame))
+    );
+    // The rest of the frame arrives; a retry under a new deadline still fails.
+    guest.write_all(&frame[1..]).await.unwrap();
+    assert_eq!(
+        reader
+            .read_frame(Due::By(Instant::now() + TWO), &mut ExecBudget::new(64, 64))
+            .await,
+        Err(ProtocolError::Timeout(Stage::Frame))
+    );
+    assert_eq!(
+        reader.read_eof(Instant::now() + TWO).await,
+        Err(ProtocolError::Timeout(Stage::Frame))
+    );
+    // A writer whose write timed out is poisoned too.
+    let (host, _never_reads) = duplex(1024);
+    let mut writer = FrameWriter::new(host, Direction::HostToGuest);
+    let big = Message::Stdin(vec![0; 8192]);
+    assert_eq!(
+        writer
+            .send(Id128([1; 16]), &big, Instant::now() + TWO)
+            .await,
+        Err(ProtocolError::Timeout(Stage::Write))
+    );
+    assert_eq!(
+        writer
+            .send(
+                Id128([1; 16]),
+                &Message::Stdin(vec![1]),
+                Instant::now() + TWO
+            )
+            .await,
+        Err(ProtocolError::Timeout(Stage::Write))
+    );
+}
+
+/// Daybreak B5 milestone 1 finding 1: the execution's budget is shared by its exec and
+/// Cancel readers through a synchronous admission, so a stalled exec read never blocks
+/// the control channel's CancelAck, and both still count against one budget.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_exec_reader_never_blocks_cancel_admission_on_a_shared_budget() {
+    use kilnd_broker_protocol::budget::SharedBudget;
+    let budget = SharedBudget::new(ExecBudget::new(1024, 1024));
+    // The exec channel: one byte, then nothing until its deadline.
+    let (exec_host, mut exec_guest) = duplex(4096);
+    exec_guest
+        .write_all(&stdout_frame(0, 4)[..1])
+        .await
+        .unwrap();
+    let mut exec_budget = budget.clone();
+    let (mut exec_reader, _) = host_reader(exec_host);
+    let local = tokio::task::LocalSet::new();
+    let stalled = local.spawn_local(async move {
+        exec_reader
+            .read_frame(
+                Due::By(Instant::now() + Duration::from_secs(60)),
+                &mut exec_budget,
+            )
+            .await
+    });
+    local.run_until(tokio::task::yield_now()).await;
+    // The control channel delivers a CancelAck at once.
+    let (control_host, control_guest) = duplex(4096);
+    let mut w = guest_writer(control_guest);
+    let ack = Message::CancelAck(CancelAck {
+        token: Id128([1; 16]),
+        active: true,
+    });
+    w.send(Id128([2; 16]), &ack, far()).await.unwrap();
+    let (mut control_reader, _) = host_reader(control_host);
+    let mut control_budget = budget.clone();
+    let start = Instant::now();
+    let frame = control_reader
+        .read_frame(Due::By(start + TWO), &mut control_budget)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.kind(), Kind::CancelAck);
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    assert_eq!(budget.with(|b| b.frames()), 1);
+    drop(exec_guest);
+    let _ = local.run_until(stalled).await;
+}

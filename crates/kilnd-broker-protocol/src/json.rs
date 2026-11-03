@@ -99,7 +99,8 @@ impl Scanner<'_> {
         }
         self.at += 1;
         self.whitespace();
-        let mut keys: Vec<String> = Vec::new();
+        // A set, so a wide object costs O(n log n), not quadratic comparisons.
+        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         if self.peek() == Some(b'}') {
             self.at += 1;
             return Ok(());
@@ -110,10 +111,9 @@ impl Scanner<'_> {
             }
             let key = self.string()?;
             // Compared decoded, so `"a"` and `"\u0061"` are the same key.
-            if keys.contains(&key) {
+            if !keys.insert(key) {
                 return Err(ProtocolError::JsonDuplicateKey);
             }
-            keys.push(key);
             self.whitespace();
             if self.peek() != Some(b':') {
                 return self.syntax();
