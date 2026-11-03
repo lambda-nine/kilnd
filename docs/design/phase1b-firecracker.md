@@ -589,6 +589,29 @@ Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no laz
 - *Out of scope:* host root mutating one of our own resources in place, during teardown — for example `LOOP_SET_STATUS64` on our attachment between cleanup's comparison and `LOOP_CLR_FD`, which leaves the disk sequence number unchanged. Host root is trusted and the kernel has no compare-and-clear; detaching an attachment whose generation (disk sequence number and backing inode) matches is correct, because it is ours.
 - *Kernel facts relied on,* verified on the VM's 6.8.0-147 by `b4_linux_root_kernel_generation_ids_are_never_reused`: a replacement tmpfs gets a new unique mount ID although the reusable tuple is reused; a detached mount keeps its unique ID when attached; detach plus reattach of the same slot, inode and tuple changes the disk sequence number; `LOOP_SET_STATUS64` does not. B4 recheck 2 added, on the same kernel: ext4 gave a recreated work file the deleted file's inode number at once, with a later birth time (`b4_linux_root_cleanup_refuses_a_work_file_reusing_the_inode`). Also observed: while cleanup's descriptor on a slot is open, another opener's `LOOP_CLR_FD` only marks it autoclear and a rebinding `LOOP_CONFIGURE` fails `EBUSY`, so a replacement cannot land inside cleanup's own comparison-to-clear window. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
 
+**The destructive-action invariant (B4 recheck 3, November 2, 2026).** No destructive action may run on a resource unless the caller holds proof that the resource's current generation equals a durable journaled generation from the current boot. A resource with no such proof is Unknown: it stays charged, nothing is done to it, and it never counts toward ABSENT. The destructive actions are signals (`pidfd_send_signal`, `kill`), writes to `cgroup.kill`, `rmdir` of a cgroup or directory, `unlink` of a file, `umount2` and `LOOP_CLR_FD`. The type system enforces it: `crates/kilnd/src/helper/firecracker/proven.rs` holds one proof type per resource kind (`ProvenProcess`, `ProvenCgroupVm` and `ProvenCgroupTree`, `ProvenFile`, `ProvenDir`, `ProvenMount`, `ProvenLoop`), none `Clone` and none constructible outside that module. Only its verification functions make them, each from the journaled identity, the current boot ID and the live kernel object, returning `Result<Proven*, Unprovable>` (`Gone`, `Replaced` or `Unknown`). Every destructive helper takes its proof, and the raw system calls appear nowhere else in the helper: the CI unit test `proven::tests::no_destructive_call_outside_the_gate` fails if one does, apart from the allow-list below. Each check stays as close to its action as the kernel allows, which is the decided residual window: a pidfd for processes, the `vm` node's descriptor for `cgroup.kill` with its children re-listed just before, the parent's descriptor with the child's inode or birth time re-read just before each `rmdir` and `unlinkat`, the loop descriptor the generation was compared on, and for mounts a fresh descriptor's unique mount ID read just before `umount2` on `/proc/self/fd/<parent>/<name>` (that descriptor must be closed first, or a non-lazy unmount is busy).
+
+- *Boot ID everywhere.* Every durable process identity (`ProcessId`, so `ResourceRecord::Vmm`, `StopTarget`, M's and K's targets and the worker rows) carries a validated boot ID. A process whose PID and start time match is proven only when its journaled boot ID is this boot's. A different boot ID only shows that the journaled process is gone, and never leads to a signal. An absent or invalid one, from an older row, proves nothing: that process is never signaled and stays charged until it is provably gone. An unreadable host boot ID is an error, never `unknown`.
+- *The cgroup tree.* `cgroup.kill` needs `ProvenCgroupVm`: the boot ID and the journaled inodes of the parent, `vm`, `vm/vmm` and `vm/console`, and no other cgroup anywhere below `vm`. A replaced or unexpected child is Replaced, with no signal. Removal needs `ProvenCgroupTree`, which covers every node and admits no other cgroup below the parent. H's monitor target, K's emergency target, `kill_recorded`, `contain` and `remove_tree` all go through these.
+- *No identity-free deletion.* An intent is journaled before the cgroup tree, the work and jail directories and each work file are created, and the generation right after creation, before the next step. Work files are created unlinked (`O_TMPFILE`), journaled, then linked, so no crash leaves a named file without a generation. A present object with only an intent, or with no record at all, is Unknown, and nothing is deleted by its deterministic name. An intent-only object that verifiably is not present is fine. Remove reloads the allocation's complete journal after the stop fence, so a record S committed after Remove's first read is honoured.
+
+| Destructive call (`crates/kilnd/src/helper/`) | Site | Proof taken |
+|---|---|---|
+| `pidfd_send_signal` (SIGKILL, SIGSTOP, SIGCONT) | `proven::signal`, used by `proven::kill_and_wait` / `stop_process` (K, S's `stop_vm`) and S's hardening of V | `ProvenProcess` |
+| `kill` (macOS fixtures only, no pidfd) | `proven::signal` | `ProvenProcess` (start time and boot ID compared just before) |
+| `kill(SIGKILL)` of S's formatter | `proven::UnreapedChild::kill_unreaped` | `UnreapedChild`, made only by `proven::fork_child`; never after it is reaped |
+| write to `cgroup.kill` | `proven::kill_cgroup_vm`, via `cgroup::kill_recorded` (H, M, K, S's `contain`, cleanup) | `ProvenCgroupVm` |
+| cgroup `rmdir` (`unlinkat(AT_REMOVEDIR)`) | `proven::remove_cgroup_tree`, via `cgroup::remove_tree` (K) | `ProvenCgroupTree` |
+| directory `rmdir` | `proven::remove_directory`, via `storage::remove_jail_dirs` and `storage::remove_work` | `ProvenDir` |
+| `unlinkat` of a work, identity or config file | `proven::unlink_file`, via `storage::remove_work` | `ProvenFile` |
+| `umount2` of each bind and the jail tmpfs | `proven::unmount`, via `storage::unmount_jail` | `ProvenMount` |
+| `LOOP_CLR_FD` | `proven::clear_loop`, via `storage::detach_loop` | `ProvenLoop` |
+| `unlinkat` of a temporary name | `executable.rs`, the private executable copy | Allow-listed: the helper's own temporary name in the root-only store, created `O_EXCL` by the same function; never tenant-reachable or replaced by name |
+| `pidfd_send_signal` with signal 0 | `peer.rs`, `pidfd_alive` | Allow-listed: a liveness probe, not a signal |
+| `kill(pid, 0)` | `workers.rs`, macOS `process_state` | Allow-listed: an existence probe, not a signal |
+
+Test fixtures (the `tests` modules and files) are excluded from the gate. Nothing else in `crates/kilnd/src/helper/` calls `kill`, `pidfd_send_signal`, `cgroup.kill`, `rmdir`, `unlink(at)`, `remove_file`, `remove_dir`, `umount` or `LOOP_CLR_FD`.
+
 ## 7.2 Durable reservation vector
 
 Add an explicit stored reservation independent of `SandboxSpec`. Do not recalculate surviving reservations from today's defaults or a newly selected bundle. Schema migration preserves all legacy kiln charges exactly. The new Firecracker formula is versioned in the stored plan:
@@ -1696,6 +1719,11 @@ the evidence.
 
 ## B4 recheck 2 corrections (November 2, 2026)
 
+*Amended by the B4 recheck 3 corrections below:* in the sweep, an unrecorded work file, jail
+or work directory, or cgroup is no longer ours by its name but Unknown; H's stop target keeps
+another boot's tree, which K's proof refuses; the VMM and every worker identity carry the boot
+ID; and every kill and removal goes through section 7.1's proof types.
+
 Daybreak Blue's second recheck of `ee79331` (`reviews/2026-11-02-b4-recheck2.md`, PoC in
 `reviews/poc-b4-recheck2/`) confirmed the five earlier corrections and found one in-scope
 replacement that still reached ABSENT: root detaches the journaled loop and rebinds its slot
@@ -1791,3 +1819,124 @@ were left out, and `history_sequence` went back to 272. The schema-10 file is ke
 `/root/kilnd-db-backups/` in the VM. `734e275` was reinstalled (`kilnd` SHA-256 `c39c3f3b…`);
 `quick_check` passed, health as the `kilnd` account served, and the legacy ambiguous failure's
 64 MiB/128 PID/16 MiB charge was still held.
+
+## B4 recheck 3 corrections (November 2, 2026)
+
+Daybreak Blue's third recheck of `eead82c` (`reviews/2026-11-02-b4-recheck3.md`, PoCs in
+`reviews/poc-b4-recheck3/`) found three more destructive paths that acted before identity
+was proved: a replaced `vm/vmm` child killed through its unchanged `vm` parent, cgroups and
+work files created before their identity record and then deleted by deterministic name (also
+reachable through Remove's stale pre-fence snapshot), and process stop targets that signalled
+from PID and start time alone, with no boot ID. All three are accepted. Four rounds had each
+found another such path, so the lead decided to stop patching sites and make this a single
+invariant enforced by the type system. It is recorded in section 7.1 (*The
+destructive-action invariant*), with the inventory of every destructive call in the helper.
+
+**1. Proof types.** `helper/firecracker/proven.rs` is the only place the helper signals,
+writes `cgroup.kill`, removes a cgroup, directory or file, unmounts or clears a loop. Each
+action takes a proof that only that module's verification function can make, from the
+journaled identity, the current boot ID and the live kernel object. `Unprovable` is `Gone`
+(provably nothing of ours: nothing at the name, an exited process, a free slot, another
+boot's record with nothing there), `Replaced` (something else holds the name; never touched)
+or `Unknown` (no journaled generation, a missing or invalid boot ID, unreadable evidence;
+never touched, stays charged). `storage::detach_loop`, `unmount_jail`, `remove_jail_dirs`,
+`remove_work`, `cgroup::kill_recorded`, `remove_tree`, `monitor::execute` and S's own
+signals now reach the kernel only through it. `cgroup::kill_node`, `CgroupTarget`,
+`workers::kill_target` and `supervisor::pidfd_signal` are gone. S's formatter, its own
+unreaped child, is signalled through `UnreapedChild`, which only `proven::fork_child`
+makes and which never signals a reaped PID.
+
+**2. Boot ID everywhere.** `ProcessId` gains `boot_id` (a validated `BootId`, serialized as
+the kernel prints it). S identifies J and V with this boot's ID, L journals a child's
+identity with the boot ID S read and refuses one without it, and `RecordWorker` and
+`RecordInfrastructure` fail when the host boot ID is unreadable: `host_boot_id()` returns
+an error, never `unknown`. Recovery builds each worker row's identity with its stored boot
+ID; a missing or malformed one (an older row) parses to none. `RecoveryRequest::Probe` drops
+its separate `boot_id` field. `proven::prove_process` opens the pidfd, then compares the
+start time and the boot ID: no match is Gone; a match from another boot is Gone; a match
+with no boot ID, or with the host's unreadable, is Unknown. So K's emergency stop and the VM
+worker's recovery kill never signal such a process; it stays an orphan, charged, until it is
+provably gone.
+
+**3. The cgroup tree.** M's, H's and K's cgroup targets are `CgroupStopTarget`: the
+allocation path and its journaled `CgroupIdentity`, or none while only the intent is
+journaled. `ProvenCgroupVm` checks the boot ID and the parent's, `vm`'s, `vm/vmm`'s and
+`vm/console`'s inodes and that `vm` has no other child and its leaves none, and
+`kill_cgroup_vm` re-lists the children through the `vm` descriptor immediately before it
+writes `cgroup.kill` there. A replacement is `NodeState::Replaced` with no signal; a tree with
+no journaled generation is the new `NodeState::Unknown`. K counts only Absent or Empty as
+gone. `ProvenCgroupTree` admits nothing below the parent but the five journaled nodes, and
+`remove_cgroup_tree` re-reads each inode through its parent's descriptor before its `rmdir`.
+A Stop whose target has only a cgroup intent and finds a tree there answers Unknown at once
+instead of retrying to its deadline.
+
+**4. No identity-free deletion.** New resource kinds `intent`, `work_dir` and `jail_dir`.
+S journals `intent` before the cgroup tree, the work directory, the work file, the private
+files and the jail directory; `work_dir` and `jail_dir` (the directory's device, inode and
+birth time) right after each `mkdir`, before anything else is created in or on it. The work,
+identity and config files are created unlinked with `O_TMPFILE`, journaled, then linked with
+`linkat` through `/proc/self/fd` (no `CAP_DAC_READ_SEARCH` needed) and checked at their name,
+so a crash before the record leaves no name at all; S also checks the private files it opens
+for the binds are the journaled generations. Cleanup's `contain` and K's `remove_tree` with
+no journaled identity return Unknown for anything present, and `remove_jail_dirs` and
+`remove_work` require a `ProvenDir` and a `ProvenFile` for every entry before deleting
+anything; an absent intent-only object is fine. New crash boundaries:
+`S.after.cgroup_intent`, `S.after.work_link`, `S.after.private_link` (nothing left, ABSENT),
+and `S.after.work_dir` and `S.after.jail_dir` (an unjournaled directory). With
+`S.after.cgroup`, the latter two now leave an object that is never ours by its name: Remove
+refuses, keeps the charge and leaves it in place until the operator removes it.
+
+**5. Stale snapshot.** `remove_inner` reloads the allocation's complete journal after the
+stop fence and S's settlement and builds cleanup's `RecordedResources` and K's cgroup removal
+from it, so a record S committed between Remove's first read and the fence is honoured.
+
+**6. Completeness.** The inventory in section 7.1 lists every destructive call in
+`crates/kilnd/src/helper/` and the proof each takes. The three allow-listed exceptions are
+the executable store's own temporary name and two signal-0 liveness probes.
+`proven::tests::no_destructive_call_outside_the_gate` scans every helper source outside the
+test fixtures and fails on any such call outside `proven.rs` or the allow-list; it runs in CI.
+
+**Regressions.** The four PoCs are regressions that must refuse and leave the replacement
+untouched: `cgroup::tests::b4_linux_root_a_replaced_vm_child_is_never_killed` (was
+`poc_b4_recheck3_replaced_vmm_child_is_killed`; also an unexpected `vm/extra` child),
+`cgroup::tests::b4_linux_root_an_unrecorded_cgroup_is_unknown_and_left` (was
+`poc_b4_recheck3_unrecorded_cgroup_replacement_is_removed`),
+`storage::tests::b4_linux_root_unrecorded_work_files_and_directories_are_unknown` (was
+`poc_b4_recheck3_unrecorded_work_replacement_is_removed`; also an unrecorded work directory
+and an unpublished unlinked file) and the unprivileged CI test
+`proven::tests::a_process_target_without_this_boot_is_never_signaled` (was
+`poc_b4_recheck3_process_stop_target_has_no_boot_identity`; a missing boot ID is Unknown and
+unsignalled, another boot's is gone and unsignalled, this boot's is stopped). The stale
+snapshot regression is
+`tests::lifecycle::b4_linux_root_remove_honours_a_record_committed_before_the_fence`: S
+stalls after creating its work directory, Remove reads the journal and is held, S journals
+the directory and dies, and Remove reaches ABSENT with nothing left. The crash matrix covers
+the new boundaries above.
+
+**Results (November 2, 2026, in `kiln` on Linux 6.8.0-147, raw output in
+`reviews/2026-11-02-b4-fixes4-vm/`).** The tool build reproduced both approved digests.
+`scripts/b4-vm-tests.sh` ran all 28 root tests and all passed in 1243.0 s: the 24 earlier
+exit tests and regressions, the crash matrix with its new boundaries included, and the four
+new ones. That run was at the pre-commit tree of `26c2583`, which differs only in one
+evidence message of `b4_linux_root_a_replaced_vm_child_is_never_killed`; that test passed
+again at `26c2583`. The replaced `vm/vmm` (inode 24114, journaled 24132) and an unexpected
+`vm/extra` child were Replaced with no `cgroup.kill`, and their processes survived. An
+unrecorded tree, work file (ext4 generation `(64769, 786706, 1793668403, 326573925)`) and
+work directory were Unknown and left in place. In the crash matrix, `S.after.cgroup`,
+`S.after.work_dir` and `S.after.jail_dir` each left their object; Remove refused it
+(PermitsUnsettled for the tree, ResourcesPresent for the directories) and kept the charge,
+and after the operator removed the object Remove reached ABSENT. Every other boundary,
+`S.after.work_file` and the new link boundaries included, reached ABSENT with nothing left.
+The stale-snapshot regression reached ABSENT; with the post-fence reload removed it failed
+on `the work directory is not proven ours: ... no generation was journaled`, so the reload is
+what it proves. The cleanup check found no owned VMM, loop, mount, cgroup or file. With
+`26c2583` installed, `integration-test.sh`, `daemon-singleton-regressions.sh`,
+`state-path-regressions.sh`, `phase0-regressions.py`, `smoke.sh` and
+`kilnd-maintenance-tests.py` passed, as did `deployment-regressions.py` between two builds
+(all 69 checks) and its `--reboot-arm graceful` and `--reboot-verify` around a real reboot of
+the VM. Before any B4 build was installed, `kilnd` was stopped and `/var/lib/kilnd/` was
+copied byte-for-byte to a root-only backup (`kilnd.db` SHA-256 `aec74dc4…`, schema 7). After
+the suites, that copy was restored and compared byte-for-byte (`cmp`), and main `734e275`
+was reinstalled (`kilnd` SHA-256 `c39c3f3b…`, `kilnd-helper` `ccb2946f…`, `kilndctl`
+`850f5392…`). Its database is schema 7 with `quick_check` ok, and health as the `kilnd`
+account reports serving.

@@ -6,6 +6,19 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B4 recheck 3 corrections. Every destructive helper action (signals,
+  `cgroup.kill`, cgroup and directory `rmdir`, file `unlink`, `umount2`, `LOOP_CLR_FD`) now
+  requires a proof type from the new `helper/firecracker/proven.rs` that the resource is a
+  durable journaled generation from the current boot; a CI test fails on any such call
+  elsewhere. Process identities and stop targets carry a validated boot ID (an older row
+  without one is never signaled and stays charged), and an unreadable host boot ID is an
+  error. `cgroup.kill` proves the whole `vm` subtree first, so a replaced child is Replaced
+  with no signal. Intents are journaled before the cgroup tree, directories and files; the
+  directories' generations right after `mkdir`; work files are created unlinked and linked
+  only once journaled. An object present with no journaled generation is Unknown, never
+  deleted by its name. Remove reloads the journal after its stop fence. New ledger resource
+  kinds `intent`, `work_dir` and `jail_dir`; the ledger keeps schema 1.
+
 - Phase 1b B4 recheck 2 corrections. A journaled loop slot rebound to another backing file
   is Unknown and charged, not NotOurs; NotOurs remains only for an intent-only slot. Cleanup's
   leftover check and the absence observation read each journaled slot by major and minor, and

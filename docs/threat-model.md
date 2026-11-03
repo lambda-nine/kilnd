@@ -194,7 +194,17 @@ sandbox compromises the host.
   resources before cleanup, at any crash point, is refused, left in place and the allocation
   stays charged; host root mutating our own resource in place during teardown (for example
   `LOOP_SET_STATUS64` on our attachment) is out of scope, because host root is trusted and the
-  kernel has no compare-and-clear. The Phase 1b tool build trusts its build UID and that
+  kernel has no compare-and-clear. Since B4 recheck 3 this is one invariant the type system
+  enforces: no signal, `cgroup.kill`, `rmdir`, `unlink`, `umount2` or `LOOP_CLR_FD` runs
+  unless the caller holds a proof (`helper/firecracker/proven.rs`, the only place those calls
+  are made, checked by a CI test) that the resource's current generation is a durable
+  journaled generation from the current boot. Every process identity carries the boot ID; a
+  missing, invalid or unreadable one proves nothing and is never signaled. `cgroup.kill`
+  needs the journaled inodes of the whole `vm` subtree, so a replaced or extra child is never
+  killed through its parent. An object at a deterministic name with only an intent, or no
+  record, journaled is Unknown: nothing is deleted by its name and the allocation stays
+  charged until the operator removes it. Work files are journaled while still unlinked, and
+  Remove re-reads the journal after its stop fence. The Phase 1b tool build trusts its build UID and that
   UID's processes, and gates on the digests of the outputs it published. kiln itself remains experimental shared-kernel isolation, not a boundary
   for hostile multi-tenant workloads.
 - **A compromised service account cannot take over another instance.** Root enrolls each
