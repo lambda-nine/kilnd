@@ -2571,6 +2571,7 @@ async fn exit4_monitor_requests_a_stale_supervisors_stop_without_help_from_h() {
     let target = super::monitor::StopTarget::process(ProcessId {
         pid: i32::MAX - 11,
         start_time: 5,
+        boot_id: None,
     });
     let registered: MonitorReply = channel
         .call(

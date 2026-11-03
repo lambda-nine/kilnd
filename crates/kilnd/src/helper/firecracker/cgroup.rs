@@ -59,13 +59,17 @@ impl CgroupIdentity {
     }
 }
 
-/// A stop target's cgroup: the internal `vm` node holding J, V and the console.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A stop target's cgroup: the allocation's tree and whatever generation the journal
+/// holds for it. The kill is proven against the whole `vm` subtree, never one inode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CgroupTarget {
-    /// Relative to the cgroup2 root, e.g. `kilnd-firecracker/<I>/fc-<H>/vm`.
-    pub path: String,
-    pub st_ino: u64,
+pub struct CgroupStopTarget {
+    /// The allocation parent, relative to the cgroup2 root:
+    /// `kilnd-firecracker/<I>/fc-<H>`.
+    pub relative: String,
+    /// The journaled generation, absent while only an intent is journaled: a tree at the
+    /// path is then Unknown, never signaled.
+    pub identity: Option<CgroupIdentity>,
 }
 
 /// Checks a relative path names a node in this subtree: plain components only.
@@ -103,7 +107,7 @@ fn open_root() -> io::Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_at(parent: &File, name: &str, directory: bool) -> io::Result<File> {
+pub(super) fn open_at(parent: &File, name: &str, directory: bool) -> io::Result<File> {
     let name = std::ffi::CString::new(name).map_err(|_| invalid("cgroup name"))?;
     let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
     flags |= if directory {
@@ -148,7 +152,7 @@ fn mkdir_at(parent: &File, name: &str) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_control(node: &File, name: &str, value: &str) -> io::Result<()> {
+pub(super) fn write_control(node: &File, name: &str, value: &str) -> io::Result<()> {
     use std::io::Write;
     let mut file = open_at(node, name, false)?;
     file.write_all(value.as_bytes())
@@ -359,134 +363,71 @@ pub enum NodeState {
     Empty,
     /// The node still holds a task after the bounded wait.
     Populated,
-    /// The directory at that path is a different inode: nothing was done to it.
+    /// The tree at that path, or a node or child in it, is not the journaled one (another
+    /// inode, an unexpected child, or a record from another boot with something at its
+    /// path): nothing was signaled or removed.
     Replaced,
+    /// Something is at the path but no generation was journaled for it (an intent alone,
+    /// or no record), or its identity could not be read: nothing was signaled or
+    /// removed, and it is never ours by its deterministic name.
+    Unknown,
 }
 
-/// `cgroup.kill` against one pinned node, then a bounded wait for populated=0. The
-/// inode is compared first, so a replacement directory is never signaled.
 #[cfg(target_os = "linux")]
-pub fn kill_node(target: &CgroupTarget, wait: Duration) -> io::Result<NodeState> {
-    let node = match open_node(&target.path) {
-        Ok(node) => node,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(NodeState::Absent),
-        Err(error) => return Err(error),
-    };
-    if node.metadata()?.ino() != target.st_ino {
-        return Ok(NodeState::Replaced);
-    }
-    if !populated(&node)? {
-        return Ok(NodeState::Empty);
-    }
-    write_control(&node, "cgroup.kill", "1")?;
-    let end = std::time::Instant::now() + wait;
-    loop {
-        if !populated(&node)? {
-            return Ok(NodeState::Empty);
-        }
-        if std::time::Instant::now() >= end {
-            return Ok(NodeState::Populated);
-        }
-        std::thread::sleep(Duration::from_millis(5));
+fn unproven_state(refusal: super::proven::Unprovable) -> NodeState {
+    use super::proven::Unprovable;
+    match refusal {
+        Unprovable::Gone => NodeState::Absent,
+        Unprovable::Replaced(_) => NodeState::Replaced,
+        Unprovable::Unknown(_) => NodeState::Unknown,
     }
 }
 
-/// `cgroup.kill` on a recorded tree's `vm` node, compared by inode. A record from
-/// another boot names a tree that is gone by definition: anything at its path now is a
-/// replacement, never signaled.
+/// `cgroup.kill` on an allocation's `vm` subtree, only through a [`ProvenCgroupVm`]:
+/// this boot, the parent, `vm`, `vm/vmm` and `vm/console` all the journaled inodes and
+/// no other cgroup below `vm`, checked before the kill. A replaced child is Replaced
+/// with no signal; a tree at the path with no journaled generation is Unknown.
+///
+/// [`ProvenCgroupVm`]: super::proven::ProvenCgroupVm
 #[cfg(target_os = "linux")]
 pub fn kill_recorded(
     relative: &str,
-    identity: &CgroupIdentity,
+    identity: Option<&CgroupIdentity>,
     wait: Duration,
 ) -> io::Result<NodeState> {
-    let path = format!("{relative}/vm");
-    if identity.boot_id != super::storage::boot_id()? {
-        return match open_node(&path) {
-            Ok(_) => Ok(NodeState::Replaced),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(NodeState::Absent),
-            Err(error) => Err(error),
-        };
+    match super::proven::prove_cgroup_vm(relative, identity) {
+        Ok(proof) => super::proven::kill_cgroup_vm(&proof, wait),
+        Err(refusal) => Ok(unproven_state(refusal)),
     }
-    kill_node(
-        &CgroupTarget {
-            path,
-            st_ino: identity.vm_ino,
-        },
-        wait,
-    )
 }
 
-/// One of [`NODES`] below an opened allocation parent.
+/// Whether the journaled `vm` subtree is provably empty: absent, or proven and
+/// unpopulated. A replaced or unrecorded subtree is not.
 #[cfg(target_os = "linux")]
-fn open_child(parent: &File, name: &str) -> io::Result<File> {
-    match name.split_once('/') {
-        Some((base, leaf)) => open_at(&open_at(parent, base, true)?, leaf, true),
-        None => open_at(parent, name, true),
+pub fn vm_empty(relative: &str, identity: Option<&CgroupIdentity>) -> bool {
+    use super::proven::Unprovable;
+    match super::proven::prove_cgroup_vm(relative, identity) {
+        Ok(proof) => super::proven::vm_populated(&proof).is_ok_and(|p| !p),
+        Err(Unprovable::Gone) => true,
+        Err(_) => false,
     }
 }
 
-/// Removes an allocation's tree bottom-up after proving it empty. Missing nodes are
-/// fine (a reboot or an earlier attempt removed them). With a recorded identity, a tree
-/// recorded in another boot that is present again, a replaced parent or any replaced
-/// recorded child is refused before anything is removed.
+/// Removes an allocation's tree bottom-up, only through a [`ProvenCgroupTree`]: this
+/// boot, the parent and every present node the journaled inodes, and no other cgroup
+/// anywhere below. Nothing at the path is Absent. Something there with no journaled
+/// generation is Unknown and stays; a replacement is Replaced and stays.
+///
+/// [`ProvenCgroupTree`]: super::proven::ProvenCgroupTree
 #[cfg(target_os = "linux")]
 pub fn remove_tree(relative: &str, identity: Option<&CgroupIdentity>) -> io::Result<NodeState> {
-    let parent = match open_node(relative) {
-        Ok(node) => node,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(NodeState::Absent),
-        Err(error) => return Err(error),
-    };
-    if let Some(identity) = identity {
-        if identity.boot_id != super::storage::boot_id()?
-            || parent.metadata()?.ino() != identity.parent_ino
-        {
-            return Ok(NodeState::Replaced);
-        }
-        for name in NODES {
-            match open_child(&parent, name) {
-                Ok(child) => {
-                    if Some(child.metadata()?.ino()) != identity.node_ino(name) {
-                        return Ok(NodeState::Replaced);
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
+    if !valid_relative(relative) {
+        return Err(invalid("cgroup path outside the Firecracker subtree"));
     }
-    if populated(&parent)? {
-        return Ok(NodeState::Populated);
+    match super::proven::prove_cgroup_tree(relative, identity) {
+        Ok(proof) => super::proven::remove_cgroup_tree(proof),
+        Err(refusal) => Ok(unproven_state(refusal)),
     }
-    for name in NODES.iter().rev() {
-        let (base, leaf) = match name.rsplit_once('/') {
-            Some((base, leaf)) => match open_at(&parent, base, true) {
-                Ok(base) => (base, leaf),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            },
-            None => (parent.try_clone()?, *name),
-        };
-        let c = std::ffi::CString::new(leaf).map_err(|_| invalid("cgroup name"))?;
-        // SAFETY: c is NUL-terminated; AT_REMOVEDIR removes only an empty cgroup.
-        if unsafe { libc::unlinkat(base.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::NotFound {
-                return Err(error);
-            }
-        }
-    }
-    let (base, leaf) = relative.rsplit_once('/').ok_or_else(|| invalid("path"))?;
-    let base = open_node(base)?;
-    let c = std::ffi::CString::new(leaf).map_err(|_| invalid("cgroup name"))?;
-    // SAFETY: as above.
-    if unsafe { libc::unlinkat(base.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error);
-        }
-    }
-    Ok(NodeState::Absent)
 }
 
 /// Whether the allocation's parent exists.
@@ -542,14 +483,18 @@ mod unsupported {
     pub fn procs(_: &File) -> io::Result<Vec<i32>> {
         Err(no())
     }
-    pub fn kill_node(_: &CgroupTarget, _: Duration) -> io::Result<NodeState> {
-        Err(no())
-    }
     pub fn remove_tree(_: &str, _: Option<&CgroupIdentity>) -> io::Result<NodeState> {
         Err(no())
     }
-    pub fn kill_recorded(_: &str, _: &CgroupIdentity, _: Duration) -> io::Result<NodeState> {
+    pub fn kill_recorded(
+        _: &str,
+        _: Option<&CgroupIdentity>,
+        _: Duration,
+    ) -> io::Result<NodeState> {
         Err(no())
+    }
+    pub fn vm_empty(_: &str, _: Option<&CgroupIdentity>) -> bool {
+        false
     }
     pub fn exists(_: &str) -> io::Result<bool> {
         Err(no())
@@ -644,11 +589,11 @@ mod tests {
             boot_id: "00000000-0000-4000-8000-000000000000".into(),
             ..identity.clone()
         };
-        let other_boot_kill = kill_recorded(&relative, &earlier, Duration::from_millis(100));
+        let other_boot_kill = kill_recorded(&relative, Some(&earlier), Duration::from_millis(100));
         let other_boot_remove = remove_tree(&relative, Some(&earlier));
         let tree_survived = base.join("vm/vmm").exists();
         // The journaled tree itself is killed and removed.
-        let own_kill = kill_recorded(&relative, &identity, Duration::from_millis(500));
+        let own_kill = kill_recorded(&relative, Some(&identity), Duration::from_millis(500));
         let own_remove = remove_tree(&relative, Some(&identity));
         let gone = !base.exists();
         if !gone {
@@ -670,6 +615,142 @@ mod tests {
         eprintln!(
             "B4 evidence: a replaced cgroup child and another boot's record were refused \
              and left in place; the journaled tree was removed"
+        );
+    }
+
+    /// A scratch allocation tree like `create_tree`'s, with its journaled identity.
+    #[cfg(target_os = "linux")]
+    fn scratch_tree(relative: &str) -> CgroupIdentity {
+        let base = std::path::Path::new(CGROUP_ROOT).join(relative);
+        std::fs::create_dir_all(base.join("vm/vmm")).unwrap();
+        for name in NODES {
+            std::fs::create_dir_all(base.join(name)).unwrap();
+        }
+        let ino = |name: &str| std::fs::metadata(base.join(name)).unwrap().ino();
+        CgroupIdentity {
+            boot_id: super::super::storage::boot_id().unwrap(),
+            parent_ino: std::fs::metadata(&base).unwrap().ino(),
+            control_ino: ino("control"),
+            relay_ino: ino("relay"),
+            vm_ino: ino("vm"),
+            vmm_ino: ino("vm/vmm"),
+            console_ino: ino("vm/console"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scrub_tree(relative: &str, extra: &[&str]) {
+        let base = std::path::Path::new(CGROUP_ROOT).join(relative);
+        for name in extra.iter().chain(NODES.iter().rev()) {
+            let _ = std::fs::remove_dir(base.join(name));
+        }
+        let _ = std::fs::remove_dir(&base);
+        let _ = std::fs::remove_dir(base.parent().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sleeper_in(node: &std::path::Path) -> std::process::Child {
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(node.join("cgroup.procs"), child.id().to_string()).unwrap();
+        child
+    }
+
+    /// B4 recheck 3 finding 1, the PoC as a regression: root replaced the journaled
+    /// `vm/vmm` leaf (or added a child below `vm`) and put an unrelated process in it.
+    /// The `vm` parent is still the journaled inode, but `cgroup.kill` on it would kill
+    /// that process, so the proof covers every child: the kill is Replaced with no
+    /// signal, removal is Replaced, and the replacement and its process survive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and a cgroup2 root: run scripts/b4-vm-tests.sh"]
+    fn b4_linux_root_a_replaced_vm_child_is_never_killed() {
+        let instance = format!("{FIRECRACKER_TREE}/b4-recheck3-{}", std::process::id());
+        let relative = format!("{instance}/fc-child-kill");
+        let base = std::path::Path::new(CGROUP_ROOT).join(&relative);
+        let identity = scratch_tree(&relative);
+        let journaled_vmm = identity.vmm_ino;
+        std::fs::remove_dir(base.join("vm/vmm")).unwrap();
+        std::fs::create_dir(base.join("vm/vmm")).unwrap();
+        let replacement_ino = std::fs::metadata(base.join("vm/vmm")).unwrap().ino();
+        let mut foreign = sleeper_in(&base.join("vm/vmm"));
+        let replaced_kill = kill_recorded(&relative, Some(&identity), Duration::from_secs(1));
+        let replaced_remove = remove_tree(&relative, Some(&identity));
+        let replaced_survived = foreign.try_wait().unwrap().is_none() && base.join("vm/vmm").exists();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        // An extra child below the journaled vm node, with our own vmm intact.
+        std::fs::remove_dir(base.join("vm/vmm")).unwrap();
+        std::fs::create_dir(base.join("vm/vmm")).unwrap();
+        let identity = CgroupIdentity {
+            vmm_ino: std::fs::metadata(base.join("vm/vmm")).unwrap().ino(),
+            ..identity
+        };
+        std::fs::create_dir(base.join("vm/extra")).unwrap();
+        let mut stranger = sleeper_in(&base.join("vm/extra"));
+        let extra_kill = kill_recorded(&relative, Some(&identity), Duration::from_secs(1));
+        let extra_empty = vm_empty(&relative, Some(&identity));
+        let extra_survived = stranger.try_wait().unwrap().is_none();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        std::fs::remove_dir(base.join("vm/extra")).unwrap();
+        // The journaled tree itself, with a process of its own: killed and removed.
+        let mut own = sleeper_in(&base.join("vm/vmm"));
+        let own_kill = kill_recorded(&relative, Some(&identity), Duration::from_secs(2));
+        let own_status = own.wait().unwrap();
+        let own_remove = remove_tree(&relative, Some(&identity));
+        let gone = !base.exists();
+        scrub_tree(&relative, &["vm/extra"]);
+
+        assert_eq!(replaced_kill.unwrap(), NodeState::Replaced);
+        assert_eq!(replaced_remove.unwrap(), NodeState::Replaced);
+        assert!(replaced_survived, "the replaced child or its process was touched");
+        assert_eq!(extra_kill.unwrap(), NodeState::Replaced);
+        assert!(!extra_empty, "a subtree with a foreign child is not proven empty");
+        assert!(extra_survived, "a process in an unexpected child was killed");
+        assert_eq!(own_kill.unwrap(), NodeState::Empty);
+        assert!(!own_status.success());
+        assert_eq!(own_remove.unwrap(), NodeState::Absent);
+        assert!(gone);
+        eprintln!(
+            "B4 evidence: vm/vmm inode {replacement_ino} replaced journaled {journaled_vmm} and an \
+             unexpected vm/extra were Replaced with no cgroup.kill; their processes \
+             survived; the journaled tree was killed and removed",
+        );
+    }
+
+    /// B4 recheck 3 finding 2, the cgroup PoC as a regression: a tree at the
+    /// allocation's path with no journaled generation (the crash after `create_tree`,
+    /// before its record, or a root replacement there) is Unknown. Nothing is signaled
+    /// or removed by its deterministic name; a path with nothing at it is Absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and a cgroup2 root: run scripts/b4-vm-tests.sh"]
+    fn b4_linux_root_an_unrecorded_cgroup_is_unknown_and_left() {
+        let instance = format!("{FIRECRACKER_TREE}/b4-recheck3-{}", std::process::id());
+        let relative = format!("{instance}/fc-unrecorded");
+        let base = std::path::Path::new(CGROUP_ROOT).join(&relative);
+        let absent_kill = kill_recorded(&relative, None, Duration::from_millis(100));
+        let absent_remove = remove_tree(&relative, None);
+        scratch_tree(&relative);
+        let mut inside = sleeper_in(&base.join("vm/vmm"));
+        let kill = kill_recorded(&relative, None, Duration::from_millis(500));
+        let empty = vm_empty(&relative, None);
+        let process_survived = inside.try_wait().unwrap().is_none();
+        let _ = inside.kill();
+        let _ = inside.wait();
+        let remove = remove_tree(&relative, None);
+        let tree_survived = base.join("vm/vmm").exists();
+        scrub_tree(&relative, &[]);
+
+        assert_eq!(absent_kill.unwrap(), NodeState::Absent);
+        assert_eq!(absent_remove.unwrap(), NodeState::Absent);
+        assert_eq!(kill.unwrap(), NodeState::Unknown);
+        assert!(!empty, "an unrecorded tree is not proven empty");
+        assert!(process_survived, "an unrecorded tree was signaled");
+        assert_eq!(remove.unwrap(), NodeState::Unknown);
+        assert!(tree_survived, "an unrecorded tree was removed by its name");
+        eprintln!(
+            "B4 evidence: an unrecorded cgroup tree was Unknown: not signaled, not removed"
         );
     }
 

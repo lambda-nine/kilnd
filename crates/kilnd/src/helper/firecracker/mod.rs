@@ -14,6 +14,7 @@ mod lifecycle;
 pub mod manifest;
 pub mod monitor;
 pub mod peer;
+pub mod proven;
 pub mod storage;
 pub mod supervisor;
 pub mod workers;
@@ -1012,8 +1013,17 @@ impl Node {
     /// provably gone settles; a live one stays charged and is revisited by the tick.
     async fn recover_workers(self: &Arc<Self>, unsettled: &[journal::WorkerRecord]) {
         for worker in unsettled {
+            // An older row's missing or malformed boot ID is None: such a process can
+            // only be proven gone, never signaled, and stays charged until it is.
             let live_identity = match (worker.pid, worker.start_time) {
-                (Some(pid), Some(start_time)) => Some(ProcessId { pid, start_time }),
+                (Some(pid), Some(start_time)) => Some(ProcessId {
+                    pid,
+                    start_time,
+                    boot_id: worker
+                        .host_boot_id
+                        .as_deref()
+                        .and_then(proven::BootId::parse),
+                }),
                 _ => None,
             };
             match live_identity {
@@ -1023,7 +1033,7 @@ impl Node {
                         && self.is_current_infrastructure(target.pid) => {}
                 Some(target) => {
                     let gone = self
-                        .probe_process(StopTarget::process(target), worker.host_boot_id.clone())
+                        .probe_process(StopTarget::process(target))
                         .await
                         .unwrap_or(false);
                     if gone {
@@ -1047,14 +1057,12 @@ impl Node {
                             self.orphans.lock().unwrap().push(Orphan {
                                 worker_id: worker.worker_id,
                                 target,
-                                boot_id: worker.host_boot_id.clone(),
                             });
                         }
                     } else {
                         self.orphans.lock().unwrap().push(Orphan {
                             worker_id: worker.worker_id,
                             target,
-                            boot_id: worker.host_boot_id.clone(),
                         });
                     }
                 }
@@ -1200,7 +1208,7 @@ impl Node {
         None
     }
 
-    async fn probe_process(&self, target: StopTarget, boot_id: Option<String>) -> Option<bool> {
+    async fn probe_process(&self, target: StopTarget) -> Option<bool> {
         for slot in &self.recovery {
             let channel = {
                 let slot = slot.lock().unwrap();
@@ -1211,7 +1219,6 @@ impl Node {
             };
             let request = RecoveryRequest::Probe {
                 target: target.clone(),
-                boot_id: boot_id.clone(),
             };
             let call = channel.call::<RecoveryReply>(Lane::Normal, &request, u64::MAX);
             if let Ok(Ok(RecoveryReply::Probed { gone })) =
@@ -1439,7 +1446,7 @@ impl Node {
         tokio::spawn(async move {
             for orphan in orphans {
                 let gone = node
-                    .probe_process(StopTarget::process(orphan.target), orphan.boot_id.clone())
+                    .probe_process(StopTarget::process(orphan.target))
                     .await
                     .unwrap_or(false);
                 if gone {
@@ -3325,7 +3332,7 @@ impl Node {
             })
         };
         if let Some((target, known_gone, worker)) = vm {
-            let gone = known_gone || self.probe_process(target, None).await.unwrap_or(false);
+            let gone = known_gone || self.probe_process(target).await.unwrap_or(false);
             if !gone {
                 return Err(ambiguous_fence(
                     AmbiguousClass::PermitsUnsettled,
@@ -3555,7 +3562,6 @@ impl Node {
 struct Orphan {
     worker_id: i64,
     target: ProcessId,
-    boot_id: Option<String>,
 }
 
 struct PrepLease {

@@ -75,11 +75,13 @@ impl Node {
             SupervisorRecord::Resource(resource) => {
                 if let ResourceRecord::Cgroup(identity) = &resource {
                     // M must hold the subtree before J could clone anything into it.
+                    // The whole journaled tree identity: K proves the parent, `vm`,
+                    // `vm/vmm` and `vm/console` and the boot before any cgroup.kill.
                     let target = StopTarget {
                         process: None,
-                        cgroup: Some(super::cgroup::CgroupTarget {
-                            path: format!("{}/vm", allocation_cgroup(key)),
-                            st_ino: identity.vm_ino,
+                        cgroup: Some(super::cgroup::CgroupStopTarget {
+                            relative: allocation_cgroup(key),
+                            identity: Some(identity.clone()),
                         }),
                     };
                     if !self.register_target(key, target).await {
@@ -274,21 +276,18 @@ impl Node {
         for record in &state.resources {
             recorded.absorb(record);
         }
+        // The journaled identities as they are: K proves each against the kernel and
+        // the current boot (section 7.1). A tree recorded in another boot, a replaced
+        // node or child, an unreadable boot ID or a tree with only an intent journaled
+        // is never signaled; a process without its boot ID never is either.
         let mut target = StopTarget {
             process: recorded.vmm,
-            // A tree recorded in another boot is gone; its inode numbers can name a
-            // replacement now, which is never signaled. An unreadable boot ID keeps it.
-            cgroup: recorded
-                .cgroup
-                .as_ref()
-                .filter(|identity| {
-                    let host = workers::host_boot_id();
-                    host == "unknown" || identity.boot_id == host
-                })
-                .map(|identity| super::cgroup::CgroupTarget {
-                    path: format!("{}/vm", allocation_cgroup(key)),
-                    st_ino: identity.vm_ino,
-                }),
+            cgroup: (recorded.cgroup.is_some() || recorded.cgroup_intent).then(|| {
+                super::cgroup::CgroupStopTarget {
+                    relative: allocation_cgroup(key),
+                    identity: recorded.cgroup.clone(),
+                }
+            }),
         };
         if let Some(known) = self
             .supervisors
@@ -365,6 +364,20 @@ impl Node {
                 .is_none_or(|entry| entry.exit.is_some());
             if gone && supervisor_done {
                 break;
+            }
+            // A tree at the path with only an intent journaled is never ours: no retry
+            // can prove it stopped, so the honest answer comes now (section 7.1).
+            if !gone
+                && target
+                    .cgroup
+                    .as_ref()
+                    .is_some_and(|cgroup| cgroup.identity.is_none())
+            {
+                return StopReply::Unknown {
+                    reason: "a cgroup tree is at the allocation's path but no generation was \
+                             journaled: it is Unknown and stays charged"
+                        .into(),
+                };
             }
             if deadline.expired() {
                 return StopReply::Unknown {
@@ -490,7 +503,7 @@ impl Node {
             .unwrap_or_default();
         for (worker_id, process) in children {
             let gone = self
-                .probe_process(StopTarget::process(process), None)
+                .probe_process(StopTarget::process(process))
                 .await
                 .unwrap_or(false);
             if !gone {
@@ -545,6 +558,8 @@ impl Node {
             }
             Err(reason) => return ambiguous_fence(AmbiguousClass::LedgerUnavailable, reason),
         };
+        #[cfg(test)]
+        workers::faults::hold("H.remove.after_state").await;
         if state.phase == "quarantined" {
             return ambiguous_fence(
                 AmbiguousClass::Conflict,
@@ -581,6 +596,19 @@ impl Node {
         if !matches!(cleaning, Ok(LedgerReply::Generation(_))) {
             return ambiguous_fence(AmbiguousClass::LedgerUnavailable, "CLEANING is not durable");
         }
+        // The snapshot read before the fence is stale: S could journal a resource until
+        // the fence stopped it. Cleanup acts on the complete journal as it is now, after
+        // the stop fence, so a record committed in between is honoured (B4 recheck 3).
+        let state = match self.allocation_state(key, token.deadline).await {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                return ambiguous_fence(
+                    AmbiguousClass::Conflict,
+                    "the journal record vanished after the stop fence",
+                );
+            }
+            Err(reason) => return ambiguous_fence(AmbiguousClass::LedgerUnavailable, reason),
+        };
         let mut recorded = RecordedResources::default();
         for record in &state.resources {
             recorded.absorb(record);
@@ -882,7 +910,7 @@ impl Node {
         if target.process.is_none() && target.cgroup.is_none() {
             return supervisor_live;
         }
-        !self.probe_process(target, None).await.unwrap_or(false)
+        !self.probe_process(target).await.unwrap_or(false)
     }
 
     /// Test-only: the dispatch-time check a later Exec must pass. It reads only memory:

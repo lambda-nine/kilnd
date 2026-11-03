@@ -623,12 +623,29 @@ async fn read_frame(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> io::Res
 
 // Process identity, used only inside workers, never on H.
 
-/// A process and when it began. A PID alone is never used to signal anything.
+/// A process, when it began and the boot it ran in. A PID alone is never used to
+/// signal anything, and PID plus start time only within the journaled boot: every
+/// identity written since B4 recheck 3 carries the boot ID. A record without one (an
+/// older row) deserializes with `None`, which proves nothing (`proven::prove_process`):
+/// it is never signaled and stays charged until it is provably gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessId {
     pub pid: i32,
     pub start_time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<super::proven::BootId>,
+}
+
+impl ProcessId {
+    /// A live process of this boot, identified now.
+    pub fn of_this_boot(pid: i32, start_time: u64) -> io::Result<Self> {
+        Ok(Self {
+            pid,
+            start_time,
+            boot_id: Some(super::proven::BootId::current()?),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -703,35 +720,10 @@ fn test_process_image(pid: i32) -> std::path::PathBuf {
     std::ffi::OsStr::from_bytes(&path).into()
 }
 
-/// Host boot identity: a changed value invalidates every recorded PID.
-#[cfg(target_os = "linux")]
-pub fn host_boot_id() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map(|id| id.trim().to_string())
-        .unwrap_or_else(|_| "unknown".into())
-}
-
-#[cfg(target_os = "macos")]
-pub fn host_boot_id() -> String {
-    let mut boot: libc::timeval = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of::<libc::timeval>();
-    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
-    // SAFETY: mib and output pointers are live and exactly sized.
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            2,
-            (&mut boot as *mut libc::timeval).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc == 0 {
-        format!("boot-{}", boot.tv_sec)
-    } else {
-        "unknown".into()
-    }
+/// Host boot identity: a changed value invalidates every recorded PID. Unreadable is
+/// an error, never a placeholder.
+pub fn host_boot_id() -> io::Result<super::proven::BootId> {
+    super::proven::BootId::current()
 }
 
 /// Starts one fork-only worker: it keeps only `keep`, never returns to the caller's
@@ -1153,7 +1145,14 @@ fn handle_ledger(
                     reason: "worker exited before its identity was recorded".into(),
                 });
             };
-            let host_boot_id = host_boot_id();
+            let host_boot_id = match host_boot_id() {
+                Ok(id) => id.to_string(),
+                Err(error) => {
+                    return Ok(LedgerReply::Failed {
+                        reason: format!("the host boot ID is unreadable: {error}"),
+                    });
+                }
+            };
             ledger.record_worker_identity(worker_id, pid, start_time, &host_boot_id)?;
             LedgerReply::Identity {
                 start_time,
@@ -1171,8 +1170,16 @@ fn handle_ledger(
                     reason: "worker exited before its identity was recorded".into(),
                 });
             };
+            let host_boot_id = match host_boot_id() {
+                Ok(id) => id.to_string(),
+                Err(error) => {
+                    return Ok(LedgerReply::Failed {
+                        reason: format!("the host boot ID is unreadable: {error}"),
+                    });
+                }
+            };
             let worker_id =
-                ledger.record_infrastructure_worker(&spec, pid, start_time, &host_boot_id())?;
+                ledger.record_infrastructure_worker(&spec, pid, start_time, &host_boot_id)?;
             LedgerReply::Worker { worker_id }
         }
         LedgerRequest::InfrastructureIntent { spec } => LedgerReply::Worker {
@@ -1184,13 +1191,19 @@ fn handle_ledger(
             spec,
             target,
         } => {
+            // S identified the child in this boot; an identity without one is refused.
+            let Some(boot_id) = target.boot_id else {
+                return Ok(LedgerReply::Failed {
+                    reason: "a child identity carries no boot ID".into(),
+                });
+            };
             let id = ledger.record_child_worker(
                 instance,
                 allocation,
                 &spec,
                 target.pid,
                 target.start_time,
-                &host_boot_id(),
+                &boot_id.to_string(),
             )?;
             LedgerReply::Generation(id as u64)
         }
@@ -2105,29 +2118,8 @@ fn report_setup_expired(context: &mut SupervisorContext) {
 
 fn stop_vm(vm: &Option<ProcessId>) {
     if let Some(target) = vm {
-        kill_target(*target);
+        super::proven::stop_process(target);
     }
-}
-
-/// Signals a process group only if the recorded start time still matches, and never
-/// a bare PID on mismatch. Returns whether the target is now provably gone.
-pub fn kill_target(target: ProcessId) -> bool {
-    match process_state(target.pid) {
-        ProcessState::Gone | ProcessState::Zombie => return true,
-        ProcessState::Running { start_time } if start_time != target.start_time => return true,
-        ProcessState::Running { .. } => {}
-    }
-    // SAFETY: the identity was just verified; the fake VM leads its own group.
-    unsafe { libc::kill(-target.pid, libc::SIGKILL) };
-    let end = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < end {
-        match process_state(target.pid) {
-            ProcessState::Gone | ProcessState::Zombie => return true,
-            ProcessState::Running { start_time } if start_time != target.start_time => return true,
-            ProcessState::Running { .. } => std::thread::sleep(Duration::from_millis(2)),
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -2164,8 +2156,9 @@ fn run_effect(
             .unwrap();
             // SAFETY: also from the parent, closing the race before K could signal.
             unsafe { libc::setpgid(pid, pid) };
-            if let ProcessState::Running { start_time } = process_state(pid) {
-                let target = ProcessId { pid, start_time };
+            if let ProcessState::Running { start_time } = process_state(pid)
+                && let Ok(target) = ProcessId::of_this_boot(pid, start_time)
+            {
                 *vm = Some(target);
                 let _ = context.control.send(
                     0,
@@ -2668,9 +2661,9 @@ pub enum RecoveryRequest {
     Kill {
         target: super::monitor::StopTarget,
     },
+    /// Whether a target is provably gone. Its process carries its own boot ID.
     Probe {
         target: super::monitor::StopTarget,
-        boot_id: Option<String>,
     },
     /// Removes an allocation's empty cgroup tree after S exited (section 6.4).
     RemoveCgroup {
@@ -2694,19 +2687,13 @@ pub enum RecoveryReply {
 }
 
 #[cfg(target_os = "linux")]
-fn cgroup_empty(target: Option<&super::cgroup::CgroupTarget>) -> bool {
+fn cgroup_empty(target: Option<&super::cgroup::CgroupStopTarget>) -> bool {
     let Some(target) = target else { return true };
-    match super::cgroup::open_node(&target.path) {
-        Err(error) => error.kind() == io::ErrorKind::NotFound,
-        Ok(node) => {
-            super::cgroup::inode(&node).is_ok_and(|ino| ino != target.st_ino)
-                || super::cgroup::populated(&node).is_ok_and(|p| !p)
-        }
-    }
+    super::cgroup::vm_empty(&target.relative, target.identity.as_ref())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn cgroup_empty(target: Option<&super::cgroup::CgroupTarget>) -> bool {
+fn cgroup_empty(target: Option<&super::cgroup::CgroupStopTarget>) -> bool {
     target.is_none()
 }
 
@@ -2745,7 +2732,9 @@ pub fn recovery_main(mut endpoint: Endpoint, monitor: UnixDatagram, mut heartbea
         if poll_many(&mut entries, Duration::from_millis(50)).is_err() {
             return;
         }
-        let mut bytes = [0u8; 1024];
+        // A stop target carries the whole journaled tree identity and the VMM's boot ID:
+        // a truncated datagram would fail to parse and stop nothing.
+        let mut bytes = [0u8; 8192];
         while let Ok(n) = monitor.recv(&mut bytes) {
             if n == 0 {
                 last_dispatch = std::time::Instant::now();
@@ -2780,17 +2769,12 @@ pub fn recovery_main(mut endpoint: Endpoint, monitor: UnixDatagram, mut heartbea
                             gone: super::monitor::execute(&target),
                         }
                     }
-                    RecoveryRequest::Probe { target, boot_id } => {
-                        let rebooted = boot_id.is_some_and(|boot| boot != host_boot_id());
-                        let process_gone = target.process.is_none_or(|process| {
-                            rebooted
-                                || match process_state(process.pid) {
-                                    ProcessState::Gone | ProcessState::Zombie => true,
-                                    ProcessState::Running { start_time } => {
-                                        start_time != process.start_time
-                                    }
-                                }
-                        });
+                    RecoveryRequest::Probe { target } => {
+                        // Gone only when proven: a missing boot ID with a matching PID
+                        // and start time is Unknown, not gone.
+                        let process_gone = target
+                            .process
+                            .is_none_or(|process| super::proven::process_gone(&process));
                         RecoveryReply::Probed {
                             gone: process_gone && cgroup_empty(target.cgroup.as_ref()),
                         }
@@ -2954,6 +2938,7 @@ pub(super) mod tests {
                 super::super::monitor::StopTarget::process(ProcessId {
                     pid: 1000 + index as i32,
                     start_time: 1,
+                    boot_id: None,
                 }),
             );
         }
@@ -3063,11 +3048,12 @@ pub(super) mod tests {
         assert!(start_time > 0);
         assert_eq!(process_state(i32::MAX - 7), ProcessState::Gone);
         // A wrong start time counts as gone, and must not signal this process.
-        assert!(kill_target(ProcessId {
+        assert!(super::super::proven::stop_process(&ProcessId {
             pid: me,
-            start_time: start_time + 1
+            start_time: start_time + 1,
+            boot_id: Some(host_boot_id().unwrap()),
         }));
         assert_eq!(process_state(me), ProcessState::Running { start_time });
-        assert_ne!(host_boot_id(), "unknown");
+        assert!(host_boot_id().is_ok());
     }
 }

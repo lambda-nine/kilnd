@@ -185,8 +185,8 @@ CREATE TABLE resource_events (
     instance_id TEXT NOT NULL,
     allocation_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN
-        ('cgroup','work_file','private_files','loop_intent','loop','loop_released',
-         'jail_intent','jail_mount','jail_binds','vmm')),
+        ('intent','cgroup','work_dir','work_file','private_files','loop_intent','loop',
+         'loop_released','jail_intent','jail_dir','jail_mount','jail_binds','vmm')),
     detail TEXT NOT NULL,
     generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
     FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)

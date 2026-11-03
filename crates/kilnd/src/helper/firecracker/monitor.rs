@@ -1,11 +1,14 @@
 //! Section 4.4's stop targets. M holds one per allocation from the moment its cgroup
 //! exists, before J could clone V, so containment never waits for a PID to be
-//! published. K executes a target: `cgroup.kill` on the pinned `vm` node (compared by
-//! inode first) and a pidfd signal to the recorded VMM (compared by start time first).
-//! A replaced directory or a reused PID is refused, never signaled.
-use super::cgroup::{CgroupTarget, NodeState};
+//! published. K executes a target only through section 7.1's proofs
+//! (`super::proven`): `cgroup.kill` on the `vm` node once the boot ID and the
+//! journaled inodes of the parent, `vm`, `vm/vmm` and `vm/console` are proven, and a
+//! pidfd signal to the recorded VMM once its start time and boot ID are. A replaced
+//! node or child, a reused PID or a missing boot ID is refused, never signaled.
+use super::cgroup::{CgroupStopTarget, NodeState};
 use super::workers::ProcessId;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 /// What M dispatches to K for one allocation.
@@ -14,8 +17,8 @@ use std::time::Duration;
 pub struct StopTarget {
     /// The VMM, once S has validated and published it.
     pub process: Option<ProcessId>,
-    /// The allocation's `vm` subtree, once it exists.
-    pub cgroup: Option<CgroupTarget>,
+    /// The allocation's tree and its journaled generation, once its intent exists.
+    pub cgroup: Option<CgroupStopTarget>,
 }
 
 impl StopTarget {
@@ -31,8 +34,11 @@ impl StopTarget {
         if other.process.is_some() {
             self.process = other.process;
         }
-        if other.cgroup.is_some() {
-            self.cgroup = other.cgroup.clone();
+        // A journaled generation is never replaced by a target that has only an intent.
+        match (&self.cgroup, &other.cgroup) {
+            (_, None) => {}
+            (Some(known), Some(later)) if known.identity.is_some() && later.identity.is_none() => {}
+            (_, Some(later)) => self.cgroup = Some(later.clone()),
         }
     }
 }
@@ -50,50 +56,30 @@ pub fn execute(target: &StopTarget) -> bool {
     gone
 }
 
+/// True only when the `vm` subtree is proven empty or absent. A replaced or unrecorded
+/// tree is not signaled and is not gone: the allocation stays charged.
 #[cfg(target_os = "linux")]
-fn kill_cgroup(target: &CgroupTarget) -> bool {
+fn kill_cgroup(target: &CgroupStopTarget) -> bool {
     super::workers::fault_point("K.cgroup_kill");
-    match super::cgroup::kill_node(target, Duration::from_secs(2)) {
-        Ok(NodeState::Absent | NodeState::Empty) => true,
-        // A replaced directory was not touched: whatever it holds is not this target.
-        Ok(NodeState::Replaced) => true,
-        Ok(NodeState::Populated) | Err(_) => false,
-    }
+    matches!(
+        super::cgroup::kill_recorded(
+            &target.relative,
+            target.identity.as_ref(),
+            Duration::from_secs(2)
+        ),
+        Ok(NodeState::Absent | NodeState::Empty)
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn kill_cgroup(_: &CgroupTarget) -> bool {
-    let _ = (Duration::ZERO, NodeState::Absent);
+fn kill_cgroup(_: &CgroupStopTarget) -> bool {
+    let _ = NodeState::Absent;
     false
 }
 
-/// A pidfd is opened first and the start time compared after, so the signal can
-/// reach only the recorded process. The fake fixtures' VM leads its own group.
-fn kill_process(target: ProcessId) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        use super::workers::{ProcessState, process_state};
-        let Ok(pidfd) = super::supervisor::pidfd_open(target.pid) else {
-            return true;
-        };
-        match process_state(target.pid) {
-            ProcessState::Running { start_time } if start_time == target.start_time => {}
-            _ => return true,
-        }
-        let _ = super::supervisor::pidfd_signal(&pidfd, libc::SIGKILL);
-        let end = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < end {
-            if super::supervisor::pidfd_exited(&pidfd) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        false
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        super::workers::kill_target(target)
-    }
+/// The recorded VMM, proven by pidfd, start time and boot ID before any signal.
+pub fn kill_process(target: ProcessId) -> bool {
+    super::proven::stop_process(&target)
 }
 
 #[cfg(test)]
@@ -104,14 +90,15 @@ mod tests {
     fn merging_keeps_both_halves_of_a_target() {
         let mut target = StopTarget {
             process: None,
-            cgroup: Some(CgroupTarget {
-                path: "kilnd-firecracker/a/fc-b/vm".into(),
-                st_ino: 7,
+            cgroup: Some(CgroupStopTarget {
+                relative: "kilnd-firecracker/a/fc-b".into(),
+                identity: None,
             }),
         };
         target.merge(&StopTarget::process(ProcessId {
             pid: 3,
             start_time: 9,
+            boot_id: None,
         }));
         assert!(target.process.is_some() && target.cgroup.is_some());
     }

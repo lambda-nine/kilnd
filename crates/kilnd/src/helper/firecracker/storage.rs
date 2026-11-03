@@ -189,11 +189,11 @@ pub enum LoopOutcome {
     Unknown,
 }
 
-/// Test-only gate between the full tuple comparison and the final generation check
-/// before `LOOP_CLR_FD`, so a privileged test can replace the binding in that window.
+/// Test-only gate between the loop proof and the final generation check before
+/// `LOOP_CLR_FD` (in `proven::clear_loop`), so a privileged test can replace the
+/// binding in that window.
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) static TEST_DETACH_GATE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+pub(crate) use super::proven::TEST_DETACH_GATE;
 
 /// Derived paths for one allocation, from the plan's launch object.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -517,7 +517,6 @@ mod linux {
     use std::os::unix::fs::MetadataExt;
     use std::time::Duration;
 
-    const LOOP_CLR_FD: libc::c_ulong = 0x4C01;
     const LOOP_SET_STATUS64: libc::c_ulong = 0x4C04;
     const LOOP_GET_STATUS64: libc::c_ulong = 0x4C05;
     const LOOP_CONFIGURE: libc::c_ulong = 0x4C0A;
@@ -633,6 +632,16 @@ mod linux {
         Ok(())
     }
 
+    /// A private directory: root-owned 0700-or-stricter, for a directory proof.
+    pub(crate) fn check_private_dir(file: &File) -> io::Result<()> {
+        check_trusted_dir(file, true)
+    }
+
+    /// `fstatat` without following, for a file proof's ownership checks.
+    pub(crate) fn stat_at(parent: &File, name: &str) -> io::Result<libc::stat> {
+        fstatat(parent, name)
+    }
+
     /// Opens an absolute path by descriptor from `/`, refusing links and any ancestor
     /// writable by a non-root principal.
     pub fn open_trusted(path: &Path) -> io::Result<File> {
@@ -703,8 +712,9 @@ mod linux {
         Ok(())
     }
 
-    /// The allocation's private work directory, created new.
-    pub fn create_work_dir(paths: &AllocationPaths) -> io::Result<File> {
+    /// The allocation's private work directory, created new, and its generation, which
+    /// S journals before anything is created in it.
+    pub fn create_work_dir(paths: &AllocationPaths) -> io::Result<(File, FileIdentity)> {
         let base = open_trusted(Path::new(WORK_BASE))?;
         let instance = paths
             .work_dir
@@ -718,7 +728,23 @@ mod linux {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| invalid("work name"))?;
-        private_dir(&instance_dir, name, false)
+        let dir = private_dir(&instance_dir, name, false)?;
+        let identity = file_identity(&dir)?;
+        Ok((dir, identity))
+    }
+
+    /// The allocation's private jail directory, created new, and its generation, which
+    /// S journals before the jail tmpfs is attached to it.
+    pub fn create_jail_dir(paths: &AllocationPaths) -> io::Result<(File, FileIdentity)> {
+        let firecracker = open_trusted(&Path::new(JAIL_BASE).join("firecracker"))?;
+        let name = paths
+            .jail_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid("jail name"))?;
+        let dir = private_dir(&firecracker, name, false)?;
+        let identity = file_identity(&dir)?;
+        Ok((dir, identity))
     }
 
     pub fn open_work_dir(paths: &AllocationPaths) -> io::Result<Option<File>> {
@@ -765,15 +791,64 @@ mod linux {
         })
     }
 
-    /// `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` of the backing file, root 0600.
-    pub fn create_work_file(dir: &File) -> io::Result<(File, FileIdentity)> {
-        let file = openat_raw(
-            dir.as_raw_fd(),
-            WORK_FILE,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-            0o600,
-        )?;
+    /// The generation of an open file or directory, birth time included.
+    pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
+        statx_identity(file.as_raw_fd(), "")
+    }
+
+    /// A new root-owned file in `dir` with no name (`O_TMPFILE`), and its generation.
+    /// It gets a name only through [`publish`], after its generation is journaled, so
+    /// no crash leaves a named file whose generation was never recorded: an unlinked
+    /// inode dies with its last descriptor.
+    pub fn new_unlinked(dir: &File, mode: u32) -> io::Result<(File, FileIdentity)> {
+        let file = openat_raw(dir.as_raw_fd(), ".", libc::O_RDWR | libc::O_TMPFILE, mode)?;
         let identity = statx_identity(file.as_raw_fd(), "")?;
+        Ok((file, identity))
+    }
+
+    /// One new private read-only file (identity block, config), written and synced
+    /// while unlinked.
+    pub fn write_unlinked(dir: &File, bytes: &[u8]) -> io::Result<(File, FileIdentity)> {
+        use std::io::Write;
+        let (mut file, _) = new_unlinked(dir, 0o444)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let identity = statx_identity(file.as_raw_fd(), "")?;
+        Ok((file, identity))
+    }
+
+    /// Links an unlinked file at `name`, never replacing anything, and proves the name
+    /// now shows exactly its journaled generation. `linkat` through `/proc/self/fd` with
+    /// `AT_SYMLINK_FOLLOW` needs no `CAP_DAC_READ_SEARCH`.
+    pub fn publish(
+        dir: &File,
+        file: &File,
+        name: &str,
+        identity: &FileIdentity,
+    ) -> io::Result<()> {
+        let from = cstr(&format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        let to = cstr(name)?;
+        // SAFETY: both names are NUL-terminated; the directory descriptor is live.
+        cvt(unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                dir.as_raw_fd(),
+                to.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        })?;
+        match identity_at(dir, name)? {
+            Some(seen) if seen.generation() == identity.generation() => {}
+            _ => return Err(io::Error::other(format!("{name} is not the journaled file"))),
+        }
+        dir.sync_all()
+    }
+
+    /// Test fixture: a work file created unlinked and published at once.
+    pub fn create_work_file(dir: &File) -> io::Result<(File, FileIdentity)> {
+        let (file, identity) = new_unlinked(dir, 0o600)?;
+        publish(dir, &file, WORK_FILE, &identity)?;
         Ok((file, identity))
     }
 
@@ -814,22 +889,6 @@ mod linux {
         }
     }
 
-    /// Writes one new private read-only file (identity block, config).
-    pub fn write_private(dir: &File, name: &str, bytes: &[u8]) -> io::Result<FileIdentity> {
-        use std::io::Write;
-        let mut file = openat_raw(
-            dir.as_raw_fd(),
-            name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-            0o444,
-        )?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        let identity = statx_identity(file.as_raw_fd(), "")?;
-        dir.sync_all()?;
-        Ok(identity)
-    }
-
     pub fn open_private(dir: &File, name: &str) -> io::Result<File> {
         openat_raw(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)
     }
@@ -859,7 +918,7 @@ mod linux {
         decode_dev(encoded) == (libc::major(st_dev), libc::minor(st_dev))
     }
 
-    fn open_loop(minor: u32, write: bool) -> io::Result<File> {
+    pub(crate) fn open_loop(minor: u32, write: bool) -> io::Result<File> {
         let path = format!("/dev/loop{minor}");
         let flags = if write { libc::O_RDWR } else { libc::O_RDONLY };
         let file = openat_raw(libc::AT_FDCWD, &path, flags | libc::O_NOFOLLOW, 0)?;
@@ -887,7 +946,7 @@ mod linux {
     }
 
     /// The device's disk sequence number, on this one opened descriptor.
-    fn diskseq(device: &File) -> io::Result<u64> {
+    pub(crate) fn diskseq(device: &File) -> io::Result<u64> {
         let mut seq: u64 = 0;
         // SAFETY: seq is writable for BLKGETDISKSEQ.
         cvt(unsafe { libc::ioctl(device.as_raw_fd(), BLKGETDISKSEQ, &mut seq) })?;
@@ -983,7 +1042,7 @@ mod linux {
 
     /// What one opened slot holds, compared with every recorded field.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum SlotMatch {
+    pub(crate) enum SlotMatch {
         Free,
         /// Exactly the recorded binding.
         Exact,
@@ -996,7 +1055,7 @@ mod linux {
     /// The full recorded tuple on this one opened descriptor: the device's major/minor
     /// (checked when it was opened), backing device/inode, offset, size limit, the
     /// device's real size and its logical block size.
-    fn match_slot(device: &File, binding: &LoopBinding) -> io::Result<SlotMatch> {
+    pub(crate) fn match_slot(device: &File, binding: &LoopBinding) -> io::Result<SlotMatch> {
         let stat = fstat(device)?;
         if stat.st_mode & libc::S_IFMT != libc::S_IFBLK
             || binding.major != LOOP_MAJOR
@@ -1082,42 +1141,28 @@ mod linux {
         {
             return Ok(LoopOutcome::Free);
         }
-        let device = match open_loop(binding.minor, false) {
-            Ok(device) => device,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(LoopOutcome::Free),
-            Err(error) => return Err(error),
-        };
         let Some(generation) = generation else {
+            let device = match open_loop(binding.minor, false) {
+                Ok(device) => device,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(LoopOutcome::Free);
+                }
+                Err(error) => return Err(error),
+            };
             return settle_unrecorded(device, binding);
         };
-        let before = diskseq(&device)?;
-        match match_slot(&device, binding)? {
-            SlotMatch::Free => return Ok(LoopOutcome::Free),
-            // A generation was journaled for this slot, so whatever else is bound there
-            // replaced it after a detach, with any backing file or tuple: Unknown, never
-            // another allocation's to ignore (section 7.1).
-            SlotMatch::OtherBacking | SlotMatch::Differs => return Ok(LoopOutcome::Unknown),
-            SlotMatch::Exact => {}
-        }
-        #[cfg(test)]
-        {
-            use std::sync::atomic::Ordering;
-            if TEST_DETACH_GATE
-                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                while TEST_DETACH_GATE.load(Ordering::SeqCst) == 2 {
-                    std::thread::yield_now();
-                }
-            }
-        }
-        // Immediately before the clear: still the journaled generation.
-        if before != generation.diskseq || diskseq(&device)? != generation.diskseq {
+        // A generation was journaled for this slot, so whatever else is bound there
+        // replaced it after a detach, with any backing file or tuple: Unknown, never
+        // another allocation's to ignore (section 7.1). The proof and the clear share
+        // the slot descriptor.
+        let proof = match super::super::proven::prove_loop(binding, generation) {
+            Ok(proof) => proof,
+            Err(super::super::proven::Unprovable::Gone) => return Ok(LoopOutcome::Free),
+            Err(_) => return Ok(LoopOutcome::Unknown),
+        };
+        if !super::super::proven::clear_loop(proof)? {
             return Ok(LoopOutcome::Unknown);
         }
-        // SAFETY: LOOP_CLR_FD takes no argument.
-        cvt(unsafe { libc::ioctl(device.as_raw_fd(), LOOP_CLR_FD, 0) })?;
-        drop(device);
         let end = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let device = match open_loop(binding.minor, false) {
@@ -1460,21 +1505,15 @@ mod linux {
         pub record: JailMount,
     }
 
-    /// Creates the allocation's private jail directory and its mandatory bounded tmpfs,
-    /// detached: the marker and jail root exist before the jailer could write anything,
-    /// and the record carries the tmpfs's unique mount ID and this boot's ID.
-    pub fn prepare_jail(paths: &AllocationPaths, identity: &JailIdentity) -> io::Result<DetachedJail> {
+    /// The mandatory bounded tmpfs for the allocation's journaled jail directory
+    /// (from [`create_jail_dir`]), detached: the marker and jail root exist before the
+    /// jailer could write anything, and the record carries the tmpfs's unique mount ID
+    /// and this boot's ID.
+    pub fn prepare_jail(jail_dir: File, identity: &JailIdentity) -> io::Result<DetachedJail> {
         if !identity.valid() {
             return Err(invalid("jail identity"));
         }
         let boot_id = boot_id()?;
-        let firecracker = open_trusted(&Path::new(JAIL_BASE).join("firecracker"))?;
-        let name = paths
-            .jail_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| invalid("jail name"))?;
-        let jail_dir = private_dir(&firecracker, name, false)?;
         let mount = detached_jail_tmpfs(identity)?;
         {
             use std::io::Write;
@@ -1997,22 +2036,27 @@ mod linux {
         parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo")?)
     }
 
-    fn umount_exact(path: &Path) -> io::Result<()> {
-        let target = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("path"))?;
-        // SAFETY: NUL-terminated; UMOUNT_NOFOLLOW refuses a link at the target.
-        cvt(unsafe { libc::umount2(target.as_ptr(), libc::UMOUNT_NOFOLLOW) })?;
-        Ok(())
+    fn jail_name(paths: &AllocationPaths) -> io::Result<&str> {
+        paths
+            .jail_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid("jail name"))
     }
 
     /// Unmounts the allocation's jail mounts, deepest first, never lazily. Every mount
-    /// is unmounted only if the unique mount ID at its path, read immediately before its
-    /// own unmount, is the journaled one from this boot; the reusable tuple, source and
-    /// marker must also match. Nothing mounted is nothing to do. A mount whose unique ID
-    /// was never journaled, a record from another boot, a changed ID, or any other mount
-    /// under the jail directory is refused and left exactly as it is, before anything is
-    /// unmounted: ownership is never inferred from the deterministic path or a copyable
-    /// marker, so the allocation stays charged (Unknown) for the operator.
+    /// is unmounted only through a [`ProvenMount`]: the unique mount ID at its name,
+    /// read immediately before its own unmount, is the journaled one from this boot; the
+    /// reusable tuple, source and marker must also match. Nothing mounted is nothing to
+    /// do. A mount whose unique ID was never journaled, a record from another boot, a
+    /// changed ID, or any other mount under the jail directory is refused and left
+    /// exactly as it is, before anything is unmounted: ownership is never inferred from
+    /// the deterministic path or a copyable marker, so the allocation stays charged
+    /// (Unknown) for the operator.
+    ///
+    /// [`ProvenMount`]: super::super::proven::ProvenMount
     pub fn unmount_jail(paths: &AllocationPaths, recorded: JailRecords<'_>) -> io::Result<()> {
+        use super::super::proven;
         let entries = read_mounts()?;
         let found = mounts_under(&entries, &paths.jail_dir);
         if found.is_empty() {
@@ -2052,8 +2096,10 @@ mod linux {
                     entry.mount_point.display()
                 )));
             }
-            verify_bind(paths, &root, entry, tmpfs_id, recorded.binds)?;
-            umount_exact(&entry.mount_point)?;
+            let record = verify_bind(paths, &root, entry, tmpfs_id, recorded.binds)?;
+            let proof = proven::prove_mount(&root, &record.name, record.unique_id, &record.boot_id)
+                .map_err(|e| e.refusal(&record.name))?;
+            proven::unmount(proof)?;
         }
         drop(root);
         // The tmpfs last: re-verified by its unique ID, its descriptor closed, unmounted.
@@ -2064,28 +2110,30 @@ mod linux {
             return Err(io::Error::other("jail mounts changed during unmount"));
         }
         drop(jail);
-        umount_exact(&paths.jail_dir)?;
+        let firecracker = open_trusted(&Path::new(JAIL_BASE).join("firecracker"))?;
+        let proof =
+            proven::prove_mount(&firecracker, jail_name(paths)?, mount.unique_id, &mount.boot_id)
+                .map_err(|e| e.refusal("the jail tmpfs"))?;
+        proven::unmount(proof)?;
         if !mounts_under(&read_mounts()?, &paths.jail_dir).is_empty() {
             return Err(io::Error::other("a jail mount remains"));
         }
         Ok(())
     }
 
-    /// Removes the unmounted, empty jail directory. Its marker and root lived on the
-    /// tmpfs, so anything left in it is unknown and refused: nothing is deleted
-    /// recursively.
-    pub fn remove_jail_dirs(paths: &AllocationPaths) -> io::Result<()> {
+    /// Removes the unmounted, empty jail directory, only through a [`ProvenDir`] of its
+    /// journaled generation. Absent is fine. Present with no journaled generation (an
+    /// intent alone, or no record) is Unknown and stays, as does a replacement. Its
+    /// marker and root lived on the tmpfs, so anything left in it is unknown and
+    /// refused: nothing is deleted recursively.
+    ///
+    /// [`ProvenDir`]: super::super::proven::ProvenDir
+    pub fn remove_jail_dirs(
+        paths: &AllocationPaths,
+        recorded: Option<&FileIdentity>,
+    ) -> io::Result<()> {
+        use super::super::proven::{self, Unprovable};
         let firecracker = match open_trusted(&Path::new(JAIL_BASE).join("firecracker")) {
-            Ok(dir) => dir,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let name = paths
-            .jail_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| invalid("jail name"))?;
-        let jail = match open_dir_at(&firecracker, name) {
             Ok(dir) => dir,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
@@ -2093,75 +2141,61 @@ mod linux {
         if !mounts_under(&read_mounts()?, &paths.jail_dir).is_empty() {
             return Err(io::Error::other("the jail directory is still mounted"));
         }
-        if let Some(entry) = list(&jail)?.first() {
+        let proof = match proven::prove_dir(&firecracker, jail_name(paths)?, recorded) {
+            Ok(proof) => proof,
+            Err(Unprovable::Gone) => return Ok(()),
+            Err(refusal) => return Err(refusal.refusal("the jail directory")),
+        };
+        if let Some(entry) = list(proof.dir())?.first() {
             return Err(io::Error::other(format!("unknown jail entry {entry}")));
         }
-        drop(jail);
-        unlink_dir(&firecracker, name)?;
-        firecracker.sync_all()?;
-        Ok(())
+        proven::remove_directory(proof)
     }
 
-    fn unlink_dir(parent: &File, name: &str) -> io::Result<()> {
-        let c = cstr(name)?;
-        // SAFETY: c is NUL-terminated; AT_REMOVEDIR removes only an empty directory.
-        cvt(unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) })?;
-        Ok(())
-    }
-
-    fn unlink_file(parent: &File, name: &str) -> io::Result<()> {
-        let c = cstr(name)?;
-        // SAFETY: c is NUL-terminated.
-        cvt(unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), 0) })?;
-        Ok(())
-    }
-
-    /// Removes the private work directory's three owned files and then the directory.
-    /// A recorded identity must match, birth time included, so a replacement that
-    /// reuses the inode number is refused too; an unrecorded file is ours only by its
-    /// fixed name inside this root-only directory. Anything else is refused.
+    /// Removes the private work directory's owned files and then the directory, each
+    /// only through a proof of its journaled generation (device, inode, birth time), so
+    /// a replacement that reuses the inode number is refused too. A file or directory
+    /// present with no journaled generation is Unknown and nothing is deleted: never
+    /// ours by its fixed name. Anything else is refused.
     pub fn remove_work(
         paths: &AllocationPaths,
+        dir_record: Option<&FileIdentity>,
         recorded: &std::collections::BTreeMap<String, FileIdentity>,
     ) -> io::Result<()> {
-        let Some(dir) = open_work_dir(paths)? else {
-            return Ok(());
+        use super::super::proven::{self, Unprovable};
+        let parent = paths.work_dir.parent().ok_or_else(|| invalid("work"))?;
+        let instance = match open_trusted(parent) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
         };
-        for name in list(&dir)? {
-            if ![WORK_FILE, IDENTITY_FILE, CONFIG_FILE].contains(&name.as_str()) {
-                return Err(io::Error::other(format!("unknown work entry {name}")));
-            }
-            let stat = fstatat(&dir, &name)?;
-            if stat.st_mode & libc::S_IFMT != libc::S_IFREG
-                || stat.st_nlink != 1
-                || stat.st_uid != 0
-            {
-                return Err(io::Error::other(format!("{name} is not an owned file")));
-            }
-            if let Some(identity) = recorded.get(&name) {
-                let seen = identity_at(&dir, &name)?
-                    .ok_or_else(|| io::Error::other(format!("{name} vanished")))?;
-                #[allow(clippy::unnecessary_cast)]
-                if (stat.st_dev as u64, stat.st_ino as u64) != (seen.st_dev, seen.st_ino)
-                    || seen.generation() != identity.generation()
-                {
-                    return Err(io::Error::other(format!("{name} was replaced")));
-                }
-            }
-        }
-        for name in list(&dir)? {
-            unlink_file(&dir, &name)?;
-        }
-        dir.sync_all()?;
-        let instance = open_trusted(paths.work_dir.parent().ok_or_else(|| invalid("work"))?)?;
         let name = paths
             .work_dir
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| invalid("work name"))?;
-        unlink_dir(&instance, name)?;
-        instance.sync_all()?;
-        Ok(())
+        let dir = match proven::prove_dir(&instance, name, dir_record) {
+            Ok(proof) => proof,
+            Err(Unprovable::Gone) => return Ok(()),
+            Err(refusal) => return Err(refusal.refusal("the work directory")),
+        };
+        // Every entry proven before anything is removed.
+        let mut files = Vec::new();
+        for entry in list(dir.dir())? {
+            if ![WORK_FILE, IDENTITY_FILE, CONFIG_FILE].contains(&entry.as_str()) {
+                return Err(io::Error::other(format!("unknown work entry {entry}")));
+            }
+            match proven::prove_file(dir.dir(), &entry, recorded.get(&entry)) {
+                Ok(proof) => files.push(proof),
+                Err(Unprovable::Gone) => {}
+                Err(refusal) => return Err(refusal.refusal(&entry)),
+            }
+        }
+        for proof in files {
+            proven::unlink_file(proof)?;
+        }
+        dir.dir().sync_all()?;
+        proven::remove_directory(dir)
     }
 
     /// Every owned name still present for one allocation: cgroup, mounts, jail and
@@ -2306,10 +2340,18 @@ mod tests {
     /// record here), then attached.
     #[cfg(target_os = "linux")]
     fn create_jail(paths: &AllocationPaths, identity: &JailIdentity) -> (File, File, JailMount) {
-        let detached = prepare_jail(paths, identity).unwrap();
+        let (jail_dir, _) = create_jail_dir(paths).unwrap();
+        let detached = prepare_jail(jail_dir, identity).unwrap();
         let record = detached.record.clone();
         let (jail, root) = attach_jail(paths, identity, detached).unwrap();
         (jail, root, record)
+    }
+
+    /// The generation of a directory as it is now: test cleanup of a directory the test
+    /// made itself, standing in for the journaled record.
+    #[cfg(target_os = "linux")]
+    fn dir_now(path: &Path) -> FileIdentity {
+        file_identity(&File::open(path).unwrap()).unwrap()
     }
 
     /// The product's bind: cloned detached, identified, then attached.
@@ -2421,7 +2463,7 @@ mod tests {
         );
         assert_eq!(mounted_at(&paths.jail_dir).len(), 1);
         raw_umount(&paths.jail_dir);
-        remove_jail_dirs(&paths).unwrap();
+        remove_jail_dirs(&paths, Some(&dir_now(&paths.jail_dir))).unwrap();
 
         // The genuine tree: a foreign nested mount and a journaled bind whose unique ID
         // differs are refused; nothing is unmounted until the whole tree checks out.
@@ -2464,7 +2506,7 @@ mod tests {
         unmount_jail(&paths, records).unwrap();
         assert!(mounted_at(&paths.jail_root.join("kernel")).is_empty());
         assert!(mounted_at(&paths.jail_dir).is_empty());
-        remove_jail_dirs(&paths).unwrap();
+        remove_jail_dirs(&paths, Some(&dir_now(&paths.jail_dir))).unwrap();
         assert!(!paths.jail_dir.exists());
         std::fs::remove_file(&scratch).unwrap();
     }
@@ -2508,7 +2550,7 @@ mod tests {
         if survived {
             raw_umount(&paths.jail_dir);
         }
-        remove_jail_dirs(&paths).unwrap();
+        remove_jail_dirs(&paths, Some(&dir_now(&paths.jail_dir))).unwrap();
         assert_ne!(replacement.unique_id, recorded.unique_id);
         let error = result.expect_err("cleanup accepted the copied marker");
         assert!(survived, "the replacement was unmounted");
@@ -2574,7 +2616,7 @@ mod tests {
         drop(root);
         raw_umount(&kernel);
         raw_umount(&paths.jail_dir);
-        remove_jail_dirs(&paths).unwrap();
+        remove_jail_dirs(&paths, Some(&dir_now(&paths.jail_dir))).unwrap();
         std::fs::remove_file(first).unwrap();
         std::fs::remove_file(other).unwrap();
     }
@@ -2712,7 +2754,7 @@ mod tests {
                 reused_tuple += 1;
             }
         }
-        remove_jail_dirs(&paths).unwrap();
+        remove_jail_dirs(&paths, Some(&dir_now(&paths.jail_dir))).unwrap();
         std::fs::remove_file(&scratch).unwrap();
         eprintln!(
             "B4 kernel: 100 replacement tmpfs mounts: reusable tuple reused {reused_tuple} \
@@ -2976,7 +3018,7 @@ mod tests {
     fn b4_linux_root_cleanup_refuses_a_work_file_reusing_the_inode() {
         prepare_jail_base().unwrap();
         let paths = scratch_paths();
-        let dir = create_work_dir(&paths).unwrap();
+        let (dir, dir_identity) = create_work_dir(&paths).unwrap();
         let (file, journaled) = create_work_file(&dir).unwrap();
         drop(file);
         std::fs::remove_file(&paths.work_file).unwrap();
@@ -3003,14 +3045,14 @@ mod tests {
             }
         };
         let recorded = std::collections::BTreeMap::from([(WORK_FILE.to_string(), recorded_identity)]);
-        let refused = remove_work(&paths, &recorded);
+        let refused = remove_work(&paths, Some(&dir_identity), &recorded);
         let survived = identity_at(&dir, WORK_FILE).unwrap();
         let own = std::collections::BTreeMap::from([(WORK_FILE.to_string(), replacement)]);
-        let removed = remove_work(&paths, &own);
+        let removed = remove_work(&paths, Some(&dir_identity), &own);
         let _ = std::fs::remove_dir(paths.work_dir.parent().unwrap());
 
         let error = refused.expect_err("a replacement that reuses the inode was removed");
-        assert!(error.to_string().contains("was replaced"), "{error}");
+        assert!(error.to_string().contains("replaced"), "{error}");
         assert_eq!(survived, Some(replacement), "the replacement survived");
         assert_ne!(replacement.generation(), recorded_identity.generation());
         removed.unwrap();
@@ -3023,6 +3065,58 @@ mod tests {
             replacement.btime_nsec,
             recorded_identity.btime_sec,
             recorded_identity.btime_nsec
+        );
+    }
+
+    /// B4 recheck 3 finding 2, the work-file PoC as a regression: a work file or work
+    /// directory present with no journaled generation is never ours by its fixed name.
+    /// The crash after creating it but before its record, or root's replacement there,
+    /// is Unknown: nothing is deleted and the allocation stays charged. An unlinked file
+    /// that died before its record left no name at all, and an intent-only directory
+    /// that is not there is fine.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: run scripts/b4-vm-tests.sh"]
+    fn b4_linux_root_unrecorded_work_files_and_directories_are_unknown() {
+        prepare_jail_base().unwrap();
+        let paths = scratch_paths();
+        let empty = std::collections::BTreeMap::new();
+        // Nothing there, with or without an intent: fine.
+        remove_work(&paths, None, &empty).unwrap();
+        let (dir, dir_identity) = create_work_dir(&paths).unwrap();
+        // An unlinked file that is never published leaves no name.
+        let (unpublished, _) = new_unlinked(&dir, 0o600).unwrap();
+        drop(unpublished);
+        assert!(identity_at(&dir, WORK_FILE).unwrap().is_none());
+        // The PoC: the original deleted and recreated, nothing journaled for it.
+        let (original, original_identity) = create_work_file(&dir).unwrap();
+        drop(original);
+        std::fs::remove_file(&paths.work_file).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let (replacement, replacement_identity) = create_work_file(&dir).unwrap();
+        drop(replacement);
+        assert_ne!(replacement_identity.generation(), original_identity.generation());
+        let unrecorded_file = remove_work(&paths, Some(&dir_identity), &empty);
+        let file_survived = identity_at(&dir, WORK_FILE).unwrap();
+        // The directory itself with no journaled generation, now empty.
+        std::fs::remove_file(&paths.work_file).unwrap();
+        let unrecorded_dir = remove_work(&paths, None, &empty);
+        let dir_survived = paths.work_dir.exists();
+        let removed = remove_work(&paths, Some(&dir_identity), &empty);
+        let _ = std::fs::remove_dir(paths.work_dir.parent().unwrap());
+
+        let error = unrecorded_file.expect_err("an unrecorded work file was removed");
+        assert!(error.to_string().contains("no generation was journaled"), "{error}");
+        assert_eq!(file_survived, Some(replacement_identity), "the replacement survived");
+        let error = unrecorded_dir.expect_err("an unrecorded work directory was removed");
+        assert!(error.to_string().contains("no generation was journaled"), "{error}");
+        assert!(dir_survived);
+        removed.unwrap();
+        assert!(!paths.work_dir.exists());
+        eprintln!(
+            "B4 evidence: an unrecorded work file (generation {:?}) and an unrecorded work \
+             directory were Unknown and left in place; the journaled directory was removed",
+            replacement_identity.generation()
         );
     }
 

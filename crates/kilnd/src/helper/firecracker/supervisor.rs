@@ -6,7 +6,7 @@
 //! descriptors or the kernel. Readiness is not reported: B4 has no broker, so the
 //! furthest a boot gets is BOOTING.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-use super::cgroup::{self, CgroupIdentity, CgroupTarget};
+use super::cgroup::{self, CgroupIdentity};
 use super::executable::ExecutableIdentity;
 #[cfg(target_os = "linux")]
 use super::executable::{self, Role};
@@ -54,11 +54,36 @@ pub enum ChildRole {
     Vm,
 }
 
+/// What S is about to create at a deterministic name, journaled before it exists.
+/// Evidence only: an object with an intent and no journaled generation is never ours
+/// by its name (section 7.1). Present, it is Unknown and stays charged; absent, it is
+/// fine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentKind {
+    Cgroup,
+    WorkDir,
+    WorkFile,
+    PrivateFiles,
+    JailDir,
+}
+
 /// One owned resource and its typed identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceRecord {
+    /// Before the cgroup tree, the work directory, a work file or the jail directory
+    /// is created.
+    Intent(IntentKind),
     Cgroup(CgroupIdentity),
+    /// The private work directory's generation (device, inode, birth time), journaled
+    /// right after its `mkdir` and before anything is created in it.
+    WorkDir(FileIdentity),
+    /// The jail directory's generation, journaled right after its `mkdir` and before
+    /// the jail tmpfs is attached to it.
+    JailDir(FileIdentity),
+    /// Created unlinked (`O_TMPFILE`) and journaled before it is linked at its name,
+    /// so no crash leaves a named work file without a journaled generation.
     WorkFile(FileIdentity),
     PrivateFiles {
         identity: FileIdentity,
@@ -96,7 +121,10 @@ pub enum ResourceRecord {
 impl ResourceRecord {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::Intent(_) => "intent",
             Self::Cgroup(_) => "cgroup",
+            Self::WorkDir(_) => "work_dir",
+            Self::JailDir(_) => "jail_dir",
             Self::WorkFile(_) => "work_file",
             Self::PrivateFiles { .. } => "private_files",
             Self::LoopIntent(_) => "loop_intent",
@@ -114,7 +142,17 @@ impl ResourceRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedResources {
+    /// Every intent journaled, in order: evidence that an object may exist.
+    #[serde(default)]
+    pub intents: Vec<IntentKind>,
+    /// A cgroup intent was journaled: the tree may exist even with no generation.
+    #[serde(default)]
+    pub cgroup_intent: bool,
     pub cgroup: Option<CgroupIdentity>,
+    #[serde(default)]
+    pub work_dir: Option<FileIdentity>,
+    #[serde(default)]
+    pub jail_dir: Option<FileIdentity>,
     pub work_file: Option<FileIdentity>,
     pub identity_file: Option<FileIdentity>,
     pub config_file: Option<FileIdentity>,
@@ -130,7 +168,15 @@ pub struct RecordedResources {
 impl RecordedResources {
     pub fn absorb(&mut self, record: &ResourceRecord) {
         match record {
+            ResourceRecord::Intent(kind) => {
+                if *kind == IntentKind::Cgroup {
+                    self.cgroup_intent = true;
+                }
+                self.intents.push(*kind);
+            }
             ResourceRecord::Cgroup(identity) => self.cgroup = Some(identity.clone()),
+            ResourceRecord::WorkDir(identity) => self.work_dir = Some(*identity),
+            ResourceRecord::JailDir(identity) => self.jail_dir = Some(*identity),
             ResourceRecord::WorkFile(identity) => self.work_file = Some(*identity),
             ResourceRecord::PrivateFiles { identity, config } => {
                 self.identity_file = Some(*identity);
@@ -237,13 +283,6 @@ impl LaunchPlan {
             uid,
             gid,
         })
-    }
-
-    pub fn vm_target(&self, identity: &CgroupIdentity) -> CgroupTarget {
-        CgroupTarget {
-            path: format!("{}/vm", self.cgroup),
-            st_ino: identity.vm_ino,
-        }
     }
 
     fn argv(&self, key: &str) -> io::Result<Vec<String>> {
@@ -459,6 +498,7 @@ pub use linux::*;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::super::proven;
     use super::*;
     use std::ffi::CString;
     use std::fs::File;
@@ -481,23 +521,6 @@ mod linux {
         }
         // SAFETY: a new owned descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
-    }
-
-    pub fn pidfd_signal(pidfd: &OwnedFd, signal: i32) -> io::Result<()> {
-        // SAFETY: the pidfd pins one process; no siginfo.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                pidfd.as_raw_fd(),
-                signal,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
     }
 
     /// Whether the pinned process has exited (its pidfd is readable).
@@ -529,7 +552,7 @@ mod linux {
     fn identify(pid: i32) -> io::Result<ProcessId> {
         match super::super::workers::process_state(pid) {
             super::super::workers::ProcessState::Running { start_time } => {
-                Ok(ProcessId { pid, start_time })
+                ProcessId::of_this_boot(pid, start_time)
             }
             _ => Err(io::Error::other("process is gone")),
         }
@@ -780,13 +803,11 @@ mod linux {
         };
         let report_raw = report_write.as_raw_fd();
         // SAFETY: S is single-threaded; the child only arranges descriptors and execs.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        if pid == 0 {
+        let forked = unsafe { proven::fork_child() }?;
+        let mut child = match forked {
+            proven::Forked::Parent(child) => child,
             // SAFETY: the child execs or exits without unwinding.
-            unsafe {
+            proven::Forked::Child => unsafe {
                 let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
                 libc::dup2(null, 0);
                 libc::dup2(null, 1);
@@ -805,14 +826,13 @@ mod linux {
                 let errno = error.raw_os_error().unwrap_or(libc::EIO).to_be_bytes();
                 libc::write(report_raw, errno.as_ptr().cast(), errno.len());
                 libc::_exit(127);
-            }
-        }
+            },
+        };
+        let pid = child.pid();
         drop(report_write);
         if observe {
             // The first stop is the exec trap.
-            let mut status = 0;
-            // SAFETY: waiting on our own child.
-            unsafe { libc::waitpid(pid, &mut status, 0) };
+            child.wait()?;
             let actual =
                 executable::observe_process_image(pid, Role::MkfsXfs, mkfs.installation_generation);
             // SAFETY: release the traced child.
@@ -820,8 +840,7 @@ mod linux {
             let actual = actual?;
             link.record(SupervisorRecord::Observed(actual))?;
             if actual != mkfs {
-                // SAFETY: our own child.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+                child.kill_unreaped();
                 return Err(Abort::Refused("formatter actual image differs".into()));
             }
         }
@@ -850,8 +869,7 @@ mod linux {
         });
         drop(report_read);
         if let Err(abort) = exec {
-            // SAFETY: our own child.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            child.kill_unreaped();
             return Err(abort);
         }
         if !failed.is_empty() {
@@ -860,7 +878,13 @@ mod linux {
                 failed.len()
             )));
         }
-        let status = link.wait_for(Duration::from_secs(60), || waitpid_nohang(pid))?;
+        let status = match link.wait_for(Duration::from_secs(60), || child.try_reap()) {
+            Ok(status) => status,
+            Err(abort) => {
+                child.kill_unreaped();
+                return Err(abort);
+            }
+        };
         if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
             // Pre-exec death and failed formatting alike: no executable evidence.
             return Err(Abort::Refused(format!("formatter failed: status {status}")));
@@ -893,23 +917,45 @@ mod linux {
         // SAFETY: a process-wide flag on S itself.
         cvt(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) })?;
         link.step("cgroup")?;
+        link.record(SupervisorRecord::Resource(ResourceRecord::Intent(
+            IntentKind::Cgroup,
+        )))?;
+        link.after("cgroup_intent");
         let identity = cgroup::create_tree(&plan.cgroup, &recipe["cgroups"])?;
-        *created = Some(identity.clone());
+        // A crash here leaves a tree with only its intent journaled: Unknown and
+        // charged, never removed by its name (section 7.1).
         link.after("cgroup");
         link.record(SupervisorRecord::Resource(ResourceRecord::Cgroup(
             identity.clone(),
         )))?;
+        // Only a journaled generation authorizes S's own containment.
+        *created = Some(identity.clone());
         link.step("join")?;
         cgroup::join(&format!("{}/control", plan.cgroup), identity.control_ino)?;
         link.step("artifacts")?;
         let profile_name = link.context().profile.clone();
         let (kernel, rootfs) = open_artifacts(link, &profile_name)?;
         link.step("work_dir")?;
-        let dir = storage::create_work_dir(&plan.paths)?;
+        link.record(SupervisorRecord::Resource(ResourceRecord::Intent(
+            IntentKind::WorkDir,
+        )))?;
+        let (dir, dir_identity) = storage::create_work_dir(&plan.paths)?;
+        // A crash here leaves an unjournaled directory: Unknown and charged.
+        link.after("work_dir");
+        link.record(SupervisorRecord::Resource(ResourceRecord::WorkDir(
+            dir_identity,
+        )))?;
         link.step("work_file")?;
-        let (work, first) = storage::create_work_file(&dir)?;
+        link.record(SupervisorRecord::Resource(ResourceRecord::Intent(
+            IntentKind::WorkFile,
+        )))?;
+        // Unlinked until its generation is durable: a crash before the link leaves no
+        // name at all.
+        let (work, first) = storage::new_unlinked(&dir, 0o600)?;
         link.after("work_file");
         link.record(SupervisorRecord::Resource(ResourceRecord::WorkFile(first)))?;
+        storage::publish(&dir, &work, storage::WORK_FILE, &first)?;
+        link.after("work_link");
         link.step("fallocate")?;
         let work_identity = storage::preallocate(&work, plan.work_bytes)?;
         if work_identity.generation() != first.generation() {
@@ -918,17 +964,21 @@ mod linux {
         link.step("mkfs")?;
         format_work(link, plan, &dir, &work, work_identity, expected)?;
         link.step("private_files")?;
+        link.record(SupervisorRecord::Resource(ResourceRecord::Intent(
+            IntentKind::PrivateFiles,
+        )))?;
         let block = storage::identity_block(&plan.plan)?;
-        let identity_file = storage::write_private(&dir, storage::IDENTITY_FILE, &block)?;
-        let config_file = storage::write_private(
-            &dir,
-            storage::CONFIG_FILE,
-            &storage::config_bytes(&plan.launch)?,
-        )?;
+        let (identity_open, identity_file) = storage::write_unlinked(&dir, &block)?;
+        let (config_open, config_file) =
+            storage::write_unlinked(&dir, &storage::config_bytes(&plan.launch)?)?;
         link.record(SupervisorRecord::Resource(ResourceRecord::PrivateFiles {
             identity: identity_file,
             config: config_file,
         }))?;
+        storage::publish(&dir, &identity_open, storage::IDENTITY_FILE, &identity_file)?;
+        storage::publish(&dir, &config_open, storage::CONFIG_FILE, &config_file)?;
+        drop((identity_open, config_open));
+        link.after("private_link");
         link.event(&SupervisorEvent::PreparationDone);
         link.step("loop")?;
         let mut attempts = 0;
@@ -973,8 +1023,17 @@ mod linux {
         link.record(SupervisorRecord::Resource(ResourceRecord::JailIntent(
             jail_identity.clone(),
         )))?;
+        link.record(SupervisorRecord::Resource(ResourceRecord::Intent(
+            IntentKind::JailDir,
+        )))?;
+        let (jail_dir, jail_dir_identity) = storage::create_jail_dir(&plan.paths)?;
+        // A crash here leaves an unjournaled directory: Unknown and charged.
+        link.after("jail_dir");
+        link.record(SupervisorRecord::Resource(ResourceRecord::JailDir(
+            jail_dir_identity,
+        )))?;
         link.step("jail_mount")?;
-        let detached = storage::prepare_jail(&plan.paths, &jail_identity)?;
+        let detached = storage::prepare_jail(jail_dir, &jail_identity)?;
         let mount = detached.record.clone();
         link.record(SupervisorRecord::Resource(ResourceRecord::JailMount(
             mount.clone(),
@@ -1000,6 +1059,13 @@ mod linux {
             unsafe { File::from_raw_fd(cvt(libc::fcntl(vmm_fd, libc::F_DUPFD_CLOEXEC, 3))?) };
         let config_open = storage::open_private(&dir, storage::CONFIG_FILE)?;
         let identity_open = storage::open_private(&dir, storage::IDENTITY_FILE)?;
+        if storage::file_identity(&config_open)?.generation() != config_file.generation()
+            || storage::file_identity(&identity_open)?.generation() != identity_file.generation()
+        {
+            return Err(Abort::Refused(
+                "a private file is not its journaled generation".into(),
+            ));
+        }
         let mut binds = Vec::new();
         for (name, source) in [
             ("kernel", &kernel),
@@ -1242,7 +1308,9 @@ mod linux {
             }
         }
         link.step("harden")?;
-        pidfd_signal(&v_pidfd, libc::SIGSTOP)?;
+        // V's journaled identity (this boot, PID, start time), proven on a pidfd.
+        let v_proof = proven::prove_process(&v).map_err(|e| e.refusal("the VMM"))?;
+        proven::signal(&v_proof, libc::SIGSTOP)?;
         link.wait_for(Duration::from_secs(5), || {
             let stat = std::fs::read_to_string(format!("/proc/{}/stat", v.pid))?;
             let state = stat
@@ -1258,7 +1326,8 @@ mod linux {
             plan.uid,
             plan.gid,
         )?;
-        pidfd_signal(&v_pidfd, libc::SIGCONT)?;
+        proven::signal(&v_proof, libc::SIGCONT)?;
+        drop(v_proof);
         link.after("harden");
         link.record(SupervisorRecord::Phase {
             from: vec!["spawn_intent".into()],
@@ -1435,27 +1504,15 @@ mod linux {
         HelperGone,
     }
 
-    /// Kills the allocation's `vm` subtree through its pinned inode and waits for it to
-    /// empty. Used by S on any abort, Revoke or V exit, and by cleanup.
+    /// Kills the allocation's `vm` subtree only through its proven journaled identity
+    /// and waits for it to empty. Used by S on any abort, Revoke or V exit, and by
+    /// cleanup. With no journaled generation, a tree at the path is Unknown and nothing
+    /// is signaled: the deterministic name is never authority.
     pub fn contain(
         plan: &LaunchPlan,
         identity: Option<&CgroupIdentity>,
     ) -> io::Result<cgroup::NodeState> {
-        let path = format!("{}/vm", plan.cgroup);
-        let st_ino = match identity {
-            Some(identity) => {
-                return cgroup::kill_recorded(&plan.cgroup, identity, Duration::from_secs(2));
-            }
-            // Unrecorded: the deterministic name under C2 is ours, so use what is there.
-            None => match cgroup::open_node(&path) {
-                Ok(node) => cgroup::inode(&node)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(cgroup::NodeState::Absent);
-                }
-                Err(error) => return Err(error),
-            },
-        };
-        cgroup::kill_node(&CgroupTarget { path, st_ino }, Duration::from_secs(2))
+        cgroup::kill_recorded(&plan.cgroup, identity, Duration::from_secs(2))
     }
 
     /// Cleanup: stop everything still in the VM subtree, then remove exactly the owned
@@ -1472,11 +1529,11 @@ mod linux {
             state => return Err(Abort::Refused(format!("the VM subtree is {state:?}"))),
         }
         if let Some(vmm) = recorded.vmm
-            && let super::super::workers::ProcessState::Running { start_time } =
-                super::super::workers::process_state(vmm.pid)
-            && start_time == vmm.start_time
+            && !proven::process_gone(&vmm)
         {
-            return Err(Abort::Refused("the recorded VMM is still running".into()));
+            return Err(Abort::Refused(
+                "the recorded VMM is not proven gone".into(),
+            ));
         }
         link.step("cleanup_unmount")?;
         storage::unmount_jail(
@@ -1538,7 +1595,7 @@ mod linux {
             )));
         }
         link.step("cleanup_files")?;
-        storage::remove_jail_dirs(&plan.paths)?;
+        storage::remove_jail_dirs(&plan.paths, recorded.jail_dir.as_ref())?;
         let mut files = BTreeMap::new();
         if let Some(identity) = recorded.work_file {
             files.insert(storage::WORK_FILE.to_string(), identity);
@@ -1549,7 +1606,7 @@ mod linux {
         if let Some(identity) = recorded.config_file {
             files.insert(storage::CONFIG_FILE.to_string(), identity);
         }
-        storage::remove_work(&plan.paths, &files)?;
+        storage::remove_work(&plan.paths, recorded.work_dir.as_ref(), &files)?;
         Ok(())
     }
 }

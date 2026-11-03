@@ -583,6 +583,7 @@ fn worker_pid(real: &Real, allocation: Id128, mode: &str) -> Option<ProcessId> {
                 Ok(ProcessId {
                     pid: r.get(0)?,
                     start_time: r.get::<_, i64>(1)? as u64,
+                    boot_id: None,
                 })
             },
         )
@@ -682,8 +683,13 @@ async fn b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left() {
     .collect();
     boundaries.extend(
         [
-            "cgroup",
+            // B4 recheck 3: after each new intent and record. An intent with nothing
+            // created yet, and an unlinked work or private file that dies with S,
+            // leave nothing behind.
+            "cgroup_intent",
             "work_file",
+            "work_link",
+            "private_link",
             "loop_configure",
             "loop_record",
             "jail_record",
@@ -715,6 +721,49 @@ async fn b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left() {
         assert_ne!(real.phase(context.allocation_id), "booting", "{boundary}");
         wait_until("contained", || vm_subtree_empty(&context)).await;
         remove_to_absent(&real, &runtime, &context, boundary).await;
+    }
+    // B4 recheck 3: a crash between creating a directory or the cgroup tree at its
+    // deterministic name and journaling its generation leaves an object that is never
+    // ours by its name. Remove refuses, nothing is deleted and the charge stays, until
+    // the operator removes the object; then Remove reaches ABSENT.
+    let (paths, cgroup_path) = (
+        |context: &CreateContext| {
+            super::super::inventory::real_paths(context.instance_id, context.allocation_id).0
+        },
+        |context: &CreateContext| {
+            Path::new(super::super::cgroup::CGROUP_ROOT).join(
+                super::super::inventory::real_paths(context.instance_id, context.allocation_id).1,
+            )
+        },
+    );
+    for point in ["cgroup", "work_dir", "jail_dir"] {
+        let boundary = format!("S.after.{point}.panic");
+        real.fixture.fault(&boundary);
+        let (runtime, context, _plan) = create(&real).await;
+        wait_until(&boundary, || {
+            worker_pid(&real, context.allocation_id, "supervisor").is_some_and(|s| !running(s))
+        })
+        .await;
+        real.fixture.clear(&boundary);
+        let object = match point {
+            "cgroup" => cgroup_path(&context),
+            "work_dir" => paths(&context).work_dir,
+            _ => paths(&context).jail_dir,
+        };
+        assert!(object.exists(), "{boundary}: the unjournaled object exists");
+        let reply = remove(&real, &runtime, &context).await;
+        assert!(!is_absent(&reply), "{boundary}: {reply:?}");
+        assert!(object.exists(), "{boundary}: refused, never removed by its name");
+        assert!(claim_held(&real, context.allocation_id), "{boundary}: still charged");
+        eprintln!("B4 evidence: {boundary} left {} Unknown: {reply:?}", object.display());
+        // The operator's repair.
+        if point == "cgroup" {
+            for name in super::super::cgroup::NODES.iter().rev() {
+                std::fs::remove_dir(object.join(name)).unwrap();
+            }
+        }
+        std::fs::remove_dir(&object).unwrap();
+        remove_to_absent(&real, &runtime, &context, &boundary).await;
     }
     // After BOOTING: S killed outright.
     let (runtime, context, _plan) = create(&real).await;
@@ -754,6 +803,52 @@ async fn b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left() {
         "helper killed during preparation",
     )
     .await;
+}
+
+/// B4 recheck 3 finding 2, the stale snapshot: Remove reads the journal before its stop
+/// fence, and S can still journal a resource until that fence stops it. Here S has
+/// created its work directory and is about to journal it when Remove reads the journal
+/// (held there). The record commits before the fence; cleanup must act on the journal
+/// as it is after the fence, prove the directory by that record and reach ABSENT. With
+/// the stale snapshot it would have seen an unjournaled directory.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs root, KVM and the B4 artifacts: run scripts/b4-vm-tests.sh"]
+async fn b4_linux_root_remove_honours_a_record_committed_before_the_fence() {
+    use super::super::supervisor::ResourceRecord;
+    let real = Real::new(NodeOptions::default()).await;
+    real.fixture.fault("S.after.work_dir.stall");
+    real.fixture.fault("S.step.work_file.panic");
+    let (runtime, context, _plan) = create(&real).await;
+    real.fixture.wait_reached("S.after.work_dir").await;
+    let journaled = |real: &Real| {
+        real.resources(context.allocation_id)
+            .iter()
+            .any(|r| matches!(r, ResourceRecord::WorkDir(_)))
+    };
+    assert!(!journaled(&real), "the directory is not journaled yet");
+    real.fixture.fault("H.remove.after_state.hold");
+    let removal = remove(&real, &runtime, &context);
+    let driver = async {
+        real.fixture.wait_reached("H.remove.after_state").await;
+        // Remove holds its pre-fence snapshot; S now journals the directory and dies.
+        real.fixture.clear("S.after.work_dir.stall");
+        wait_until("the work directory journaled", || journaled(&real)).await;
+        wait_until("S exited", || {
+            worker_pid(&real, context.allocation_id, "supervisor").is_some_and(|s| !running(s))
+        })
+        .await;
+        real.fixture.clear("S.step.work_file.panic");
+        real.fixture.clear("H.remove.after_state.hold");
+    };
+    let (reply, ()) = tokio::join!(removal, driver);
+    assert!(is_absent(&reply), "{reply:?}\n{}", real.fixture.log());
+    assert_eq!(host_leftovers(&real, &context, None), Vec::<String>::new());
+    assert!(!claim_held(&real, context.allocation_id));
+    assert_eq!(real.phase(context.allocation_id), "absent");
+    eprintln!(
+        "B4 evidence: a work_dir record committed after Remove's first read and before \
+         its fence was honoured: ABSENT with nothing left"
+    );
 }
 
 /// Exit 2: with H healthy, SIGKILL of S before J exits and after it, each fences at
@@ -1493,13 +1588,14 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
     let stale = super::super::monitor::StopTarget::process(ProcessId {
         pid,
         start_time: start_time + 1,
+        boot_id: Some(super::super::proven::BootId::current().unwrap()),
     });
     assert!(
         super::super::monitor::execute(&stale),
         "a different process is not ours"
     );
     assert!(
-        running(ProcessId { pid, start_time }),
+        running(ProcessId { pid, start_time, boot_id: None }),
         "the unrelated process survived"
     );
     // A replaced cgroup: same path, another inode, a live task inside.
@@ -1507,17 +1603,21 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
     let base = Path::new("/sys/fs/cgroup").join(&scratch);
     std::fs::create_dir_all(base.join("vm")).unwrap();
     std::fs::write(base.join("vm/cgroup.procs"), pid.to_string()).unwrap();
-    let state = super::super::cgroup::kill_node(
-        &super::super::cgroup::CgroupTarget {
-            path: format!("{scratch}/vm"),
-            st_ino: 1,
-        },
-        Duration::from_millis(200),
-    )
-    .unwrap();
+    let elsewhere = super::super::cgroup::CgroupIdentity {
+        boot_id: storage::boot_id().unwrap(),
+        parent_ino: 1,
+        control_ino: 2,
+        relay_ino: 3,
+        vm_ino: 4,
+        vmm_ino: 5,
+        console_ino: 6,
+    };
+    let state =
+        super::super::cgroup::kill_recorded(&scratch, Some(&elsewhere), Duration::from_millis(200))
+            .unwrap();
     assert_eq!(state, super::super::cgroup::NodeState::Replaced);
     assert!(
-        running(ProcessId { pid, start_time }),
+        running(ProcessId { pid, start_time, boot_id: None }),
         "a replaced cgroup is not signaled"
     );
     unrelated.kill().unwrap();
