@@ -1011,6 +1011,13 @@ mod tests {
         );
         assert!(path.exists(), "the live replacement was unlinked");
         assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+        let now = std::fs::symlink_metadata(&path).unwrap();
+        eprintln!(
+            "B4 evidence: stale socket inode {} reused by a live replacement; birth time equal: \
+             {}; cleanup refused it",
+            now.ino(),
+            now.created().ok() == original.created().ok()
+        );
 
         // The owned-socket guard has the same identity: a replacement that reused the
         // bound inode number is left in place at shutdown.
@@ -1022,6 +1029,13 @@ mod tests {
         let bound = bind(&lock_dir.join("kilnd.sock"), None).await.unwrap();
         let guarded = lock_dir.join("kilnd.sock");
         let before = std::fs::symlink_metadata(&guarded).unwrap();
+        // A bound listener pins its inode. BoundSocket drops the listener before the
+        // guard, so the replacement window is after the listener has closed.
+        let BoundSocket {
+            listener,
+            path_guard,
+        } = bound;
+        drop(listener);
         let mut reused = None;
         std::fs::remove_file(&guarded).unwrap();
         for _ in 0..100_000 {
@@ -1038,10 +1052,19 @@ mod tests {
             reused.is_some(),
             "filesystem did not reuse the bound socket inode"
         );
-        drop(bound);
+        drop(path_guard);
         assert!(
             guarded.exists(),
             "the guard unlinked an inode-reused replacement"
         );
+        assert!(std::os::unix::net::UnixStream::connect(&guarded).is_ok());
+        let now = std::fs::symlink_metadata(&guarded).unwrap();
+        eprintln!(
+            "B4 evidence: bound socket inode {} reused after the listener closed; birth time \
+             equal: {}; the guard left it",
+            now.ino(),
+            now.created().ok() == before.created().ok()
+        );
+        drop(reused);
     }
 }

@@ -1000,8 +1000,12 @@ mod linux {
 ///
 /// `(device, inode)` is not a generation: once a socket is unlinked, the filesystem can
 /// hand its inode number straight to a replacement. A [`SocketGeneration`] adds the
-/// birth time, which no system call sets, and is read without following a link through
-/// the retained socket directory's descriptor. [`remove_socket_generation`] reads it
+/// birth time, which no system call sets, and on Linux the inode's file handle
+/// (`name_to_handle_at`), which carries the inode generation number that ext4, XFS and
+/// tmpfs draw afresh for every allocation. The birth time alone is not enough: inode
+/// timestamps come from the coarse clock, so a replacement created within one clock tick
+/// of the original has the same one (measured on ext4, B4 fixes 6). Everything is read
+/// without following a link through the retained socket directory's descriptor. [`remove_socket_generation`] reads it
 /// again that way immediately before `unlinkat(dir, name)`; the remaining interval
 /// between that read and the unlink is the decided narrow window (design 7.1).
 pub mod socket {
@@ -1011,13 +1015,74 @@ pub mod socket {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
 
-    /// A socket's device, inode and birth time. Only [`socket_generation_at`] makes one.
+    /// A socket's device, inode, birth time and (Linux) file handle. Only
+    /// [`socket_generation_at`] makes one.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct SocketGeneration {
         device: u64,
         inode: u64,
         birth_sec: i64,
         birth_nsec: u32,
+        handle: Handle,
+    }
+
+    /// `name_to_handle_at`'s answer: type, length and bytes. All zero where the
+    /// filesystem cannot export handles, which leaves the birth time as the only
+    /// generation field (none of kilnd's supported socket filesystems).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Handle {
+        kind: i32,
+        len: u32,
+        bytes: [u8; 128],
+    }
+
+    const NO_HANDLE: Handle = Handle {
+        kind: 0,
+        len: 0,
+        bytes: [0; 128],
+    };
+
+    #[cfg(target_os = "linux")]
+    fn handle_at(dir: &File, name: &CString) -> io::Result<Option<Handle>> {
+        #[repr(C)]
+        struct FileHandle {
+            handle_bytes: libc::c_uint,
+            handle_type: libc::c_int,
+            f_handle: [u8; 128],
+        }
+        let mut raw = FileHandle {
+            handle_bytes: 128,
+            handle_type: 0,
+            f_handle: [0; 128],
+        };
+        let mut mount_id: libc::c_int = 0;
+        // SAFETY: the handle buffer holds `handle_bytes` bytes after its header; the name
+        // is NUL-terminated; flags 0 do not follow a final link.
+        let rc = unsafe {
+            libc::name_to_handle_at(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                (&mut raw as *mut FileHandle).cast::<libc::file_handle>(),
+                &mut mount_id,
+                0,
+            )
+        };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(None),
+                Some(libc::EOPNOTSUPP) => Ok(Some(NO_HANDLE)),
+                _ => Err(error),
+            };
+        }
+        let len = raw.handle_bytes.min(128);
+        let mut bytes = [0u8; 128];
+        bytes[..len as usize].copy_from_slice(&raw.f_handle[..len as usize]);
+        Ok(Some(Handle {
+            kind: raw.handle_type,
+            len,
+            bytes,
+        }))
     }
 
     /// What is at a name below a directory descriptor, never followed.
@@ -1064,6 +1129,9 @@ pub mod socket {
             ));
         }
         let socket = u32::from(stx.stx_mode) & libc::S_IFMT == libc::S_IFSOCK;
+        let Some(handle) = handle_at(dir, name)? else {
+            return Ok(None);
+        };
         Ok(Some((
             socket,
             SocketGeneration {
@@ -1071,6 +1139,7 @@ pub mod socket {
                 inode: stx.stx_ino,
                 birth_sec: stx.stx_btime.tv_sec,
                 birth_nsec: stx.stx_btime.tv_nsec,
+                handle,
             },
         )))
     }
@@ -1101,6 +1170,7 @@ pub mod socket {
                 inode: stat.st_ino,
                 birth_sec: stat.st_birthtime,
                 birth_nsec: stat.st_birthtime_nsec as u32,
+                handle: NO_HANDLE,
             },
         )))
     }
