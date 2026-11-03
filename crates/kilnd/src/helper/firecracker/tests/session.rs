@@ -494,7 +494,7 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
         sandbox_id: id.clone(),
     };
     let vmm = real.vmm(allocation);
-    let before_rm = host_leftovers(&real, &context, vmm.clone());
+    let before_rm = host_leftovers(&real, &context, vmm);
     evidence("owned before Delete", format!("{before_rm:?}"));
     assert!(
         !before_rm.is_empty(),
