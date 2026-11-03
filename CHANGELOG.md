@@ -6,6 +6,19 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B4 recheck 5 corrections. The cgroup proof enumerates children from the retained
+  descriptor (`getdents64` on a duplicate), and a proven unmount resolves its name from the
+  held parent descriptor (a thread's own working directory), so a mount over the helper's
+  `/proc/self/fd` can no longer hide a replacement or redirect an unmount. Process,
+  boot-ID and mount-table reads go beneath a private, never-attached procfs instance. The
+  API socket is identified by device, inode, birth time and file handle (inode generation)
+  through its directory descriptor, so an inode-reused replacement is never unlinked. `LoopInfo64` is opaque and
+  only a slot this process configured can have autoclear cleared; `process::run` starts
+  only the verified kiln CLI with typed arguments. `clippy.toml` also disallows truncation,
+  whole-file overwrite, `fallocate`, `prctl`, `ptrace` and `process_vm_*`; new CI tests
+  reject unapproved build scripts, generated `include!`s and `/proc/` or `cgroup.` paths
+  outside the approved modules.
+
 - Phase 1b B4 recheck 4 corrections. `executable::publish_object` copies into an unnamed
   `O_TMPFILE` inode, checks it through its descriptor and links that descriptor, then
   re-reads the name; there is no temporary name to replace or unlink. The destructive-action

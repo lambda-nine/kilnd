@@ -373,17 +373,24 @@ Startup establishes two independent ownership domains before reconciliation:
 5. Socket binding takes a nonblocking advisory lock on the persistent
    `.kilnd.socket.lock` in the socket directory. An existing socket is probed
    with a bounded connection attempt: a successful connection is a live
-   owner. On Linux, `ECONNREFUSED` plus unchanged device/inode identifies a
-   stale endpoint. Platforms such as macOS, where refusal can also report a
-   full live backlog, preserve the path and fail closed. Every other
-   ambiguous result is also preserved and rejected.
-6. The new listener is bound and its pathname identity recorded. Only then
-   may reconciliation invoke kiln or update SQLite.
+   owner. On Linux, `ECONNREFUSED` plus an unchanged generation (device,
+   inode, `statx` birth time and the `name_to_handle_at` file handle, which
+   carries the inode generation number, all read without following through the
+   pinned socket-directory descriptor) identifies a stale endpoint, which is removed
+   with `unlinkat` on that descriptor after one more generation read
+   (`crate::sys::socket`). An inode number reused by a replacement is
+   refused. Platforms such as macOS, where refusal can also report a full
+   live backlog, preserve the path and fail closed. Every other ambiguous
+   result is also preserved and rejected.
+6. The new listener is bound and its generation recorded through the
+   directory descriptor. Only then may reconciliation
+   invoke kiln or update SQLite.
 
 The lock files are never unlinked. Their open descriptors are close-on-exec,
 so kiln children cannot retain ownership after kilnd exits. The bound socket
-is an RAII resource: graceful exit removes it only if the pathname still has
-the device and inode recorded at bind time. A replacement is left untouched.
+is an RAII resource: graceful exit removes it only if the name still has the
+generation recorded at bind time. A replacement is left
+untouched.
 The socket-directory lock remains held while Chapter 7 supervisors drain,
 even if the transport listener has already closed.
 
@@ -607,7 +614,7 @@ accepted create, compensation, and execution supervisors before removing the
 socket and exiting. Thus the reply deadline does not bound owned cleanup.
 Sandboxes keep running. Forced termination can still interrupt an operation;
 startup reconciliation handles the state it can identify. After all accepted
-operations drain, kilnd conditionally removes only its own socket inode and
+operations drain, kilnd conditionally removes only its own socket generation and
 then releases the socket- and state-directory locks. A crash releases the
 kernel locks but can leave a stale socket for the next instance to probe.
 
