@@ -1028,16 +1028,18 @@ pub mod supervise {
                         }
                         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
                     }
-                    super::super::executable::close_all_except(keep);
                     // SAFETY: getppid has no preconditions.
                     if crate::sys::prctl::set_parent_death_kill() != 0
                         || unsafe { libc::getppid() } != parent
                     {
                         return 120;
                     }
+                    // Joined before the descriptor sweep: the join's proof reads the
+                    // helper's private procfs through its retained descriptor.
                     if crate::helper::firecracker::cgroup::join(leaf, leaf_ino).is_err() {
                         return 121;
                     }
+                    super::super::executable::close_all_except(keep);
                     if drop_to(uid, gid).is_err() {
                         return 122;
                     }
@@ -1336,11 +1338,13 @@ pub mod supervise {
             Ok(1) => return Some("the console drainer reported a counter overflow".into()),
             _ => {}
         }
-        if !matches!(workers.drainer.child.try_reap(), Ok(None)) {
-            return Some("the console drainer died".into());
+        match workers.drainer.child.try_reap() {
+            Ok(None) => {}
+            status => return Some(format!("the console drainer died: {status:?}")),
         }
-        if !matches!(workers.relay.child.try_reap(), Ok(None)) {
-            return Some("the broker relay died".into());
+        match workers.relay.child.try_reap() {
+            Ok(None) => {}
+            status => return Some(format!("the broker relay died: {status:?}")),
         }
         None
     }
