@@ -114,6 +114,28 @@ fn refused(kind: Kind, message: impl Into<String>) -> ExecReply {
     }
 }
 
+/// Refused before anything was journaled or sent, because this session can never run
+/// another command: fenced, stopped, unsupervised (a restarted helper never supervised
+/// it), booted again or its supervisor gone. Nothing reached the guest, but unlike
+/// `refused` this is not reusable (B6), so the daemon stops sending commands and the
+/// session waits, charged, for Delete.
+fn unusable(kind: Kind, message: impl Into<String>) -> ExecReply {
+    ExecReply {
+        reusable: false,
+        ..refused(kind, message)
+    }
+}
+
+/// `ready()`'s refusal: another execution in flight is transient and keeps the session;
+/// anything else means it can't run a command again.
+fn not_ready<H: Host + ?Sized>(host: &H, reason: String) -> ExecReply {
+    if host.busy().is_some() {
+        refused(Kind::Busy, reason)
+    } else {
+        unusable(Kind::Unavailable, reason)
+    }
+}
+
 /// How the interruption is reported once the VM is retired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Interrupted {
@@ -558,7 +580,7 @@ pub(super) async fn exec<H: Host>(
         };
     }
     if let Err(reason) = host.ready() {
-        return refused(Kind::Unavailable, reason);
+        return not_ready(&*host, reason);
     }
     let Some(token_wire) = kilnd_broker_protocol::Id128::parse(&request.token.to_string()) else {
         return refused(Kind::InvalidRequest, "token");
@@ -569,7 +591,7 @@ pub(super) async fn exec<H: Host>(
         return refused(Kind::InvalidRequest, "execution ID");
     };
     let Some(slot) = host.control() else {
-        return refused(Kind::Unavailable, "the supervisor is gone");
+        return unusable(Kind::Unavailable, "the supervisor is gone");
     };
     // B5-05: admission waits for any probe in flight, so a probe can never observe
     // our own execution starting.
@@ -585,14 +607,14 @@ pub(super) async fn exec<H: Host>(
         permit = slot.acquire_owned() => permit,
     };
     let Ok(permit) = permit else {
-        return refused(Kind::Unavailable, "the supervisor is gone");
+        return unusable(Kind::Unavailable, "the supervisor is gone");
     };
     let (boot, inner) = match host.ready() {
         Ok(session) => session,
-        Err(reason) => return refused(Kind::Unavailable, reason),
+        Err(reason) => return not_ready(&*host, reason),
     };
     if boot != request.expected_boot_id {
-        return refused(Kind::Incompatible, "the allocation booted again");
+        return unusable(Kind::Incompatible, "the allocation booted again");
     }
     // Busy before the journal, so no second Exec or Validate slips between.
     if !host.set_busy(request.token) {

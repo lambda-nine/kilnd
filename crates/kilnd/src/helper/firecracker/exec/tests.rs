@@ -618,3 +618,28 @@ async fn b5_09_a_late_probe_failure_is_still_recorded() {
     tokio::time::sleep(LATE_PROBE + Duration::from_secs(1)).await;
     assert!(host.contained());
 }
+
+/// B6: a session the helper can't run a command in again (fenced, stopped, or never
+/// supervised by this helper after a restart) is refused before anything is journaled
+/// or sent, and is not reusable, so the daemon stops treating it as READY. Another
+/// execution in flight is transient and keeps the session.
+#[tokio::test(start_paused = true)]
+async fn b6_an_unsupervised_session_is_refused_and_not_reusable() {
+    let (host, mut commands) = Scripted::new();
+    host.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+    let reply = spawn_exec(&host, soon(60), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(!reply.reusable && !reply.dispatched, "{reply:?}");
+    assert_eq!(reply.cleanup, ExecCleanup::NoChildStarted);
+    assert!(host.journal().is_empty(), "nothing was journaled");
+    assert!(commands.try_recv().is_err(), "nothing was sent");
+
+    let (host, mut commands) = Scripted::new();
+    *host.busy.lock().unwrap() = Some(Id128::random());
+    let reply = spawn_exec(&host, soon(60), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(reply.reusable && !reply.dispatched, "{reply:?}");
+    assert!(commands.try_recv().is_err());
+}
