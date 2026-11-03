@@ -71,10 +71,13 @@ async fn wait_ready(
 
 fn stop_reasons(real: &Real, context: &CreateContext) -> Vec<String> {
     real.fixture.read(|view| {
-        let mut statement =
-            view.prepare("SELECT reason FROM stop_events WHERE allocation_id = ?1 ORDER BY generation")?;
+        let mut statement = view.prepare(
+            "SELECT reason FROM stop_events WHERE allocation_id = ?1 ORDER BY generation",
+        )?;
         let rows = statement
-            .query_map([context.allocation_id.to_string()], |r| r.get::<_, String>(0))?
+            .query_map([context.allocation_id.to_string()], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })

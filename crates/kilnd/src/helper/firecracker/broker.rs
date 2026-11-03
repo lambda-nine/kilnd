@@ -429,7 +429,15 @@ pub async fn cancel<S: AsyncRead + AsyncWrite + Unpin>(
     match shared {
         Some(budget) => cancel_with(stream, job, expected, cancel, deadline, budget).await,
         None => {
-            cancel_with(stream, job, expected, cancel, deadline, ExchangeBudget::default()).await
+            cancel_with(
+                stream,
+                job,
+                expected,
+                cancel,
+                deadline,
+                ExchangeBudget::default(),
+            )
+            .await
         }
     }
 }
@@ -942,9 +950,8 @@ pub mod relay {
 
     /// Each in-flight execution's guest-to-host budget, by token, which its Cancel
     /// exchange also charges.
-    type Budgets = std::rc::Rc<
-        std::cell::RefCell<std::collections::HashMap<Id128, SharedBudget<ExecBudget>>>,
-    >;
+    type Budgets =
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Id128, SharedBudget<ExecBudget>>>>;
 
     async fn run_job(
         job: RelayJob,
@@ -981,7 +988,15 @@ pub mod relay {
                 ..
             } => {
                 let shared = budgets.borrow().get(&request.token).cloned();
-                cancel(vsock, id, &expected, request, instant_of(deadline_ns), shared).await
+                cancel(
+                    vsock,
+                    id,
+                    &expected,
+                    request,
+                    instant_of(deadline_ns),
+                    shared,
+                )
+                .await
             }
             RelayJob::Exec {
                 expected,
@@ -1006,10 +1021,8 @@ pub mod relay {
                     };
                 };
                 let token = request.token;
-                let budget = SharedBudget::new(ExecBudget::new(
-                    request.max_output,
-                    request.max_output,
-                ));
+                let budget =
+                    SharedBudget::new(ExecBudget::new(request.max_output, request.max_output));
                 budgets.borrow_mut().insert(token, budget.clone());
                 let report = exec(
                     vsock,

@@ -143,6 +143,17 @@ impl Node {
         .await
     }
 
+    /// The boot can no longer answer: fenced, S gone or V gone.
+    fn session_ended(&self, key: AllocationKey) -> bool {
+        self.supervisors
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_none_or(|entry| {
+                entry.stop_fenced || entry.exit.is_some() || entry.vm_gone || entry.revoked
+            })
+    }
+
     /// The journaled boot and inner sandbox, if this allocation is READY and its
     /// supervision healthy enough to admit a reusable dispatch.
     fn ready_session(&self, key: AllocationKey) -> Result<(String, String), String> {
@@ -358,6 +369,13 @@ impl Node {
                 },
                 _ = waiter.cancelled() => break None,
                 _ = tokio::time::sleep_until(deadline.instant) => break None,
+                // A stop, S's exit or V's death ends the execution: its relay is gone
+                // with it, so no report may ever come.
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if self.session_ended(key) {
+                        break None;
+                    }
+                }
             }
         };
         let reply = match outcome {
