@@ -838,6 +838,11 @@ async fn b6_linux_root_attack_disk_and_vcpu_exhaustion_never_oversubscribe() {
         let (id, allocation) = ready_session(daemon, &mut transcript);
         let second = daemon.kilndctl(&mut transcript, &["create", "--net", "none"], None);
         assert_ne!(second.code, 0, "{dimension} would be oversubscribed");
+        assert!(
+            second.stderr.contains("resourceexhausted"),
+            "design 9.2: {}",
+            second.stderr
+        );
         let refused = refusal(daemon, std::slice::from_ref(&id));
         assert_eq!(deployment.claims(), 1);
         daemon.kilndctl(&mut transcript, &["health"], None);

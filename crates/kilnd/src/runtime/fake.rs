@@ -430,7 +430,14 @@ impl FakeRuntime {
                 None => None,
             };
             if let Some(reason) = rejected {
-                return Err(RuntimeError::Backend(reason.into()).into());
+                let error = RuntimeError::Backend(reason.into());
+                return Err(
+                    if state.fenced.rejection == Some(FakeRejection::CapacityExhausted) {
+                        CreateFailure::exhausted(error)
+                    } else {
+                        error.into()
+                    },
+                );
             }
             state.fenced.claims_made += 1;
             let generation = Self::next_generation(&mut state.fenced);

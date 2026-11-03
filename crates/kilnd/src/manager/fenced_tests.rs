@@ -342,7 +342,16 @@ async fn pre_intent_rejection_queued_replays_return_the_same_fence() {
 
         // The fence commits, publishes and only then can the duplicates proceed.
         fence_sync.release();
-        assert!(creating.await.unwrap().is_err(), "{rejection:?}");
+        let refused = creating.await.unwrap();
+        // Design 9.2: a node refusal for capacity is RESOURCE_EXHAUSTED (B6).
+        if rejection == FakeRejection::CapacityExhausted {
+            assert!(
+                matches!(refused, Err(Error::ResourceExhausted(_))),
+                "{refused:?}"
+            );
+        } else {
+            assert!(matches!(refused, Err(Error::Backend(_))), "{refused:?}");
+        }
         assert_eq!(charged(&m), 0, "{rejection:?}");
         let released = row(&m);
         assert_released_by_its_fence(&fake, &released);

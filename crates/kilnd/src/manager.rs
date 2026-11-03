@@ -1591,6 +1591,18 @@ impl<R: Runtime> Manager<R> {
     ) -> Result<Sandbox> {
         let id = sandbox.id.clone();
         let binding = fenced_binding(&sandbox)?.clone();
+        // Design 9.2: a node that refused for capacity is RESOURCE_EXHAUSTED, once the
+        // row has done what any post-C1 refusal must.
+        let exhausted = matches!(&joined, Ok(Err(failure)) if failure.is_exhausted());
+        let refused = |reason: String| {
+            if exhausted {
+                self.node_resource_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                Error::ResourceExhausted(format!("create sandbox {id}: {reason}"))
+            } else {
+                Error::Backend(format!("create sandbox {id}: {reason}"))
+            }
+        };
         let reason = match joined {
             Ok(Ok(created)) => match ready_receipt_mismatch(&binding, &created) {
                 None => {
@@ -1624,7 +1636,7 @@ impl<R: Runtime> Manager<R> {
                     ) {
                         Ok(()) => {
                             warn!(sandbox = %id, error = %reason, "create rejected with durable absence proof");
-                            return Err(Error::Backend(format!("create sandbox {id}: {reason}")));
+                            return Err(refused(reason));
                         }
                         // An unusable receipt is no proof: charged like any failure.
                         Err(error) => {
@@ -1650,7 +1662,7 @@ impl<R: Runtime> Manager<R> {
         if let Err(error) = self.settle_fenced(&row, SandboxState::Failed, None).await {
             warn!(sandbox = %id, error = %error, "allocation stays charged; retry through Delete or reconciliation");
         }
-        Err(Error::Backend(format!("create sandbox {id}: {reason}")))
+        Err(refused(reason))
     }
 
     /// C8: READY could not be persisted. Publish cleanup intent if possible, then

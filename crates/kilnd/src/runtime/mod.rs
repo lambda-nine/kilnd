@@ -44,6 +44,9 @@ pub struct CreateFailure {
     certainty: CreateCertainty,
     error: RuntimeError,
     absence: Option<Box<FencedAbsence>>,
+    /// The node authority refused for capacity (design 9.2: RESOURCE_EXHAUSTED). Still
+    /// ambiguous: the row is released only by its fence, like any post-C1 refusal.
+    exhausted: bool,
 }
 
 impl CreateFailure {
@@ -55,7 +58,21 @@ impl CreateFailure {
             certainty: CreateCertainty::DefinitelyNotCreated,
             error,
             absence: None,
+            exhausted: false,
         }
+    }
+
+    /// The node refused this token for capacity. Ambiguous like any other post-C1
+    /// refusal; only the caller's status code differs.
+    pub fn exhausted(error: RuntimeError) -> Self {
+        Self {
+            exhausted: true,
+            ..Self::from(error)
+        }
+    }
+
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// A rejected token that already holds a durable ABSENT fence.
@@ -64,6 +81,7 @@ impl CreateFailure {
             certainty: CreateCertainty::DefinitelyNotCreated,
             error,
             absence: Some(Box::new(absence)),
+            exhausted: false,
         }
     }
 
@@ -86,6 +104,7 @@ impl From<RuntimeError> for CreateFailure {
             certainty: CreateCertainty::AllocationAmbiguous,
             error,
             absence: None,
+            exhausted: false,
         }
     }
 }

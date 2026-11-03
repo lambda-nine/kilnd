@@ -19,9 +19,10 @@ use super::{
 use crate::firecracker::{canonical, offline_768_v1_reservation, strict_json};
 use crate::helper::firecracker::journal::AccountingSnapshot;
 use crate::helper::protocol::{
-    AccountingReply, CreateReply, FIRECRACKER_GROUP_VERSION, FenceReply, FirecrackerOperation,
-    FirecrackerRequest, FirecrackerResponse, GcOutcome, GroupError, GroupErrorKind, InspectReply,
-    ListStatus, MAX_FIRECRACKER_GC_IDS, PreparedReply, ValidateReply, WireBytes,
+    AccountingReply, AmbiguousClass, CreateReply, FIRECRACKER_GROUP_VERSION, FenceReply,
+    FirecrackerOperation, FirecrackerRequest, FirecrackerResponse, GcOutcome, GroupError,
+    GroupErrorKind, InspectReply, ListStatus, MAX_FIRECRACKER_GC_IDS, PreparedReply, ValidateReply,
+    WireBytes,
 };
 use crate::helper::{AttachedConnection, Client};
 use crate::model::{Digest, Id128, Network, SandboxSpec};
@@ -672,7 +673,13 @@ impl Runtime for FirecrackerRuntime {
                 self.wait_ready(context, prepared, deadline, cancel).await
             }
             FirecrackerResponse::Create(CreateReply::Ambiguous { class, message }) => {
-                Err(RuntimeError::Backend(format!("create rejected ({class:?}): {message}")).into())
+                let error =
+                    RuntimeError::Backend(format!("create rejected ({class:?}): {message}"));
+                Err(if class == AmbiguousClass::Capacity {
+                    CreateFailure::exhausted(error)
+                } else {
+                    error.into()
+                })
             }
             FirecrackerResponse::Error(error) => Err(group_failure(error).into()),
             _ => Err(unexpected().into()),
