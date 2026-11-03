@@ -673,3 +673,292 @@ time.sleep(30)
     stop.cancel();
     server.await.unwrap().unwrap();
 }
+
+/// B6: a helper that answers one Firecracker Exec. It takes the frame, hands the three
+/// stdio endpoints over, reads stdin, writes both outputs and replies `reply`.
+async fn serve_one_firecracker_exec(
+    listener: tokio::net::UnixListener,
+    stdout: &'static [u8],
+    stderr: &'static [u8],
+    reply: ExecReply,
+) -> (FirecrackerRequest, Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let (stream, _) = listener.accept().await.unwrap();
+    assert!(fds::receive(&stream).await.unwrap().is_empty());
+    let mut control = socket::Socket(stream);
+    let request: Request = read_frame(&mut control.0).await.unwrap();
+    request.validate(0).unwrap();
+    let Operation::Firecracker(request) = request.operation else {
+        panic!("not a Firecracker request");
+    };
+    let [mut input, mut output, mut error] = server::handoff_stdio(&mut control).await.unwrap();
+    let mut stdin = Vec::new();
+    input.read_to_end(&mut stdin).await.unwrap();
+    output.write_all(stdout).await.unwrap();
+    output.shutdown().await.unwrap();
+    error.write_all(stderr).await.unwrap();
+    error.shutdown().await.unwrap();
+    write_frame(
+        &mut control.0,
+        &Response::Firecracker(FirecrackerResponse::Exec(Box::new(reply))),
+    )
+    .await
+    .unwrap();
+    control.0.shutdown().await.unwrap();
+    (request, stdin)
+}
+
+fn fc_exec_request() -> FirecrackerRequest {
+    FirecrackerRequest {
+        group_version: FIRECRACKER_GROUP_VERSION,
+        instance_id: crate::model::Id128::random(),
+        connection_epoch: Some(crate::model::Id128::random()),
+        operation: FirecrackerOperation::Exec {
+            allocation_id: crate::model::Id128::random(),
+            expected_boot_id: "00000000-0000-4000-8000-000000000001".into(),
+            execution_token: crate::model::Id128::random(),
+            execution_id: "ex-0123456789abcdef".into(),
+            argv: vec!["cat".into()],
+            stdin_bytes: 5,
+            max_output: 1024,
+        },
+    }
+}
+
+fn capture(bytes: &[u8]) -> CaptureInfo {
+    CaptureInfo {
+        kept: bytes.len(),
+        total: bytes.len() as u64,
+        known: true,
+        truncated: false,
+    }
+}
+
+#[tokio::test]
+async fn b6_firecracker_exec_carries_stdio_and_keeps_a_completed_session_reusable() {
+    use crate::model::{CleanupEvidence, CommandStatus, SandboxDisposition};
+    use crate::runtime::{ExecFinish, ExecSpec};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("helper.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let server = tokio::spawn(serve_one_firecracker_exec(
+        listener,
+        b"hello",
+        b"warn",
+        ExecReply {
+            finish: WireFinishFc::Completed,
+            status: Some(CommandStatus::Exited(0)),
+            stdout: capture(b"hello"),
+            stderr: capture(b"warn"),
+            cleanup: ExecCleanup::GuestCgroupDrained,
+            reusable: true,
+            dispatched: true,
+        },
+    ));
+    let client = Client {
+        path,
+        expected_uid: unsafe { libc::geteuid() },
+    };
+    let argv = vec!["cat".to_owned()];
+    let spec = ExecSpec {
+        argv: &argv,
+        stdin: b"input",
+        deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+        max_output: 1024,
+    };
+    let request = fc_exec_request();
+    let outcome = client
+        .firecracker_exec(
+            request.clone(),
+            &spec,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    let (received, stdin) = server.await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&received).unwrap(),
+        serde_json::to_value(&request).unwrap()
+    );
+    assert_eq!(stdin, b"input");
+    assert_eq!(outcome.finish, Ok(ExecFinish::Completed));
+    assert_eq!(outcome.command_status, Some(CommandStatus::Exited(0)));
+    assert_eq!(outcome.stdout.data, b"hello");
+    assert_eq!(outcome.stderr.data, b"warn");
+    assert_eq!(outcome.disposition, SandboxDisposition::Reusable);
+    assert_eq!(outcome.cleanup, CleanupEvidence::RuntimeDrained);
+}
+
+#[tokio::test]
+async fn b6_a_timed_out_firecracker_exec_retires_the_session_with_host_proof() {
+    use crate::model::{CleanupEvidence, SandboxDisposition};
+    use crate::runtime::{ExecFinish, ExecSpec};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("helper.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let server = tokio::spawn(serve_one_firecracker_exec(
+        listener,
+        b"",
+        b"",
+        ExecReply {
+            finish: WireFinishFc::TimedOut,
+            status: None,
+            stdout: CaptureInfo {
+                kept: 0,
+                total: 0,
+                known: false,
+                truncated: false,
+            },
+            stderr: CaptureInfo {
+                kept: 0,
+                total: 0,
+                known: false,
+                truncated: false,
+            },
+            cleanup: ExecCleanup::VmStopped,
+            reusable: false,
+            dispatched: true,
+        },
+    ));
+    let client = Client {
+        path,
+        expected_uid: unsafe { libc::geteuid() },
+    };
+    let argv = vec!["sleep".to_owned(), "60".to_owned()];
+    let spec = ExecSpec {
+        argv: &argv,
+        stdin: b"input",
+        deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+        max_output: 1024,
+    };
+    let outcome = client
+        .firecracker_exec(
+            fc_exec_request(),
+            &spec,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    server.await.unwrap();
+    assert_eq!(outcome.finish, Ok(ExecFinish::TimedOut));
+    assert_eq!(outcome.disposition, SandboxDisposition::Stopped);
+    assert_eq!(outcome.cleanup, CleanupEvidence::SandboxStopped);
+    assert!(!outcome.stdout.total_bytes_known);
+}
+
+#[test]
+fn b6_firecracker_replies_are_reusable_only_with_their_own_evidence() {
+    use crate::model::{CleanupEvidence, SandboxDisposition};
+    use crate::runtime::ExecSpec;
+    let argv = vec!["true".to_owned()];
+    let spec = ExecSpec {
+        argv: &argv,
+        stdin: b"",
+        deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+        max_output: 8,
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let reply = |reusable, cleanup| ExecReply {
+        finish: WireFinishFc::Completed,
+        status: Some(crate::model::CommandStatus::Exited(0)),
+        stdout: capture(b""),
+        stderr: capture(b""),
+        cleanup,
+        reusable,
+        dispatched: true,
+    };
+    for (reusable, cleanup, disposition, evidence) in [
+        (
+            true,
+            ExecCleanup::GuestCgroupDrained,
+            SandboxDisposition::Reusable,
+            CleanupEvidence::RuntimeDrained,
+        ),
+        (
+            true,
+            ExecCleanup::NoChildStarted,
+            SandboxDisposition::Reusable,
+            CleanupEvidence::NoChildStarted,
+        ),
+        // A reusable claim without guest drain evidence, or a retirement without the
+        // host's stop barrier, proves nothing: quarantined.
+        (
+            true,
+            ExecCleanup::VmStopped,
+            SandboxDisposition::Quarantined,
+            CleanupEvidence::SandboxStopped,
+        ),
+        (
+            true,
+            ExecCleanup::Unknown,
+            SandboxDisposition::Quarantined,
+            CleanupEvidence::Unknown,
+        ),
+        (
+            false,
+            ExecCleanup::GuestCgroupDrained,
+            SandboxDisposition::Quarantined,
+            CleanupEvidence::RuntimeDrained,
+        ),
+        (
+            false,
+            ExecCleanup::Unknown,
+            SandboxDisposition::Quarantined,
+            CleanupEvidence::Unknown,
+        ),
+        (
+            false,
+            ExecCleanup::VmStopped,
+            SandboxDisposition::Stopped,
+            CleanupEvidence::SandboxStopped,
+        ),
+    ] {
+        let outcome = client::firecracker_outcome(
+            reply(reusable, cleanup),
+            Vec::new(),
+            Vec::new(),
+            &spec,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            (outcome.disposition, outcome.cleanup),
+            (disposition, evidence),
+            "{reusable} {cleanup:?}"
+        );
+    }
+    // Capture evidence must describe exactly the bytes delivered.
+    let mut lying = reply(true, ExecCleanup::GuestCgroupDrained);
+    lying.stdout = capture(b"four");
+    assert!(
+        client::firecracker_outcome(lying, b"two".to_vec(), Vec::new(), &spec, &cancel).is_err()
+    );
+}
+
+#[tokio::test]
+async fn b6_an_unconfirmed_firecracker_exec_quarantines_the_sandbox() {
+    use crate::model::{CleanupEvidence, RuntimeErrorKind, SandboxDisposition};
+    use crate::runtime::ExecSpec;
+    let client = Client {
+        path: "/nonexistent/kilnd-helper.sock".into(),
+        expected_uid: 0,
+    };
+    let argv = vec!["true".to_owned()];
+    let spec = ExecSpec {
+        argv: &argv,
+        stdin: b"",
+        deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+        max_output: 1024,
+    };
+    let outcome = client
+        .firecracker_exec(
+            fc_exec_request(),
+            &spec,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        outcome.finish.unwrap_err().kind,
+        RuntimeErrorKind::CleanupFailed
+    );
+    assert_eq!(outcome.disposition, SandboxDisposition::Quarantined);
+    assert_eq!(outcome.cleanup, CleanupEvidence::Unknown);
+}

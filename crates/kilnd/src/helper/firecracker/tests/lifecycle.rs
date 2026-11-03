@@ -19,10 +19,17 @@ fn artifacts() -> PathBuf {
     PathBuf::from(std::env::var(ARTIFACTS_ENV).expect("KILND_B4_ARTIFACTS names the artifacts"))
 }
 
-fn root_dir(path: &Path, mode: u32) {
+pub(super) fn root_dir(path: &Path, mode: u32) {
     std::fs::create_dir_all(path).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     std::os::unix::fs::chown(path, Some(0), Some(0)).unwrap();
+}
+
+/// A root-owned single-link copy of `source` at `target`, with `mode`.
+pub(super) fn install_root_file(source: &Path, target: &Path, mode: u32) {
+    std::fs::copy(source, target).unwrap_or_else(|e| panic!("{}: {e}", source.display()));
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode)).unwrap();
+    std::os::unix::fs::chown(target, Some(0), Some(0)).unwrap();
 }
 
 fn digest_file(path: &Path) -> (u64, Digest) {
@@ -104,11 +111,20 @@ fn real_manifest(pins: &BTreeMap<Role, ExecutablePin>, bundle: &Path) -> Vec<u8>
 fn real_tree_with(
     options: NodeOptions,
     guest: Option<&Path>,
+    at: Option<&Path>,
 ) -> (tempfile::TempDir, PathBuf, ChildConfig) {
-    let temp = tempfile::Builder::new()
-        .prefix("b4")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let temp = match at {
+        // No random suffix: exactly this name, and creation fails if it exists.
+        Some(at) => tempfile::Builder::new()
+            .prefix(at.file_name().unwrap())
+            .rand_bytes(0)
+            .tempdir_in(at.parent().unwrap())
+            .unwrap_or_else(|e| panic!("{} must not exist yet: {e}", at.display())),
+        None => tempfile::Builder::new()
+            .prefix("b4")
+            .tempdir_in("/tmp")
+            .unwrap(),
+    };
     let root = temp.path().canonicalize().unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     for name in ["ledger", "faults", "peers", "fake"] {
@@ -188,11 +204,20 @@ impl Real {
     }
 
     pub async fn with_guest(options: NodeOptions, guest: Option<&Path>) -> Self {
+        let real = Self::unstarted(options, guest, None);
+        real.start().await;
+        real
+    }
+
+    /// The real tree and ledger with no helper running yet, so root can enroll first.
+    /// `at` names an exact root (`/run/<name>`) instead of a fresh one in `/tmp`; it is
+    /// created new and refused if it exists.
+    pub fn unstarted(options: NodeOptions, guest: Option<&Path>, at: Option<&Path>) -> Self {
         assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
         // scripts/b4-vm-tests.sh starts this process with only the helper unit's bounding
         // set, so every thread, client and child holds no more than the unit grants.
         limit_to_unit_capabilities();
-        let (temp, root, config) = real_tree_with(options, guest);
+        let (temp, root, config) = real_tree_with(options, guest, at);
         std::fs::write(root.join("faults/L.keep_launch_capabilities"), b"").unwrap();
         Ledger::provision(&ledger_config(&config)).unwrap();
         let fixture = Fixture {
@@ -201,14 +226,23 @@ impl Real {
             child: Mutex::new(None),
             seen: Mutex::default(),
         };
-        fixture.start().await;
-        if let Ok(error) = std::fs::read_to_string(fixture.root.join("start-error")) {
-            panic!("the real helper did not start: {error}");
-        }
         Self {
             fixture,
             bundle: config.catalog.bundle_directory,
         }
+    }
+
+    pub async fn start(&self) {
+        self.fixture.start().await;
+        if let Ok(error) = std::fs::read_to_string(self.fixture.root.join("start-error")) {
+            panic!("the real helper did not start: {error}");
+        }
+    }
+
+    /// The fixture's parsed configuration, as its helper reads it.
+    pub(super) fn config(&self) -> ChildConfig {
+        serde_json::from_slice(&std::fs::read(self.fixture.root.join("config.json")).unwrap())
+            .unwrap()
     }
 
     pub(super) fn phase(&self, allocation: Id128) -> String {

@@ -1,26 +1,34 @@
 //! The unprivileged typed Firecracker client. It holds no privilege, opens no ledger
-//! and has no direct Linux fallback. Nothing in `main.rs` selects this backend: B7
-//! alone may enable it. B3's helper cannot publish READY, so `create` here can only
-//! end in a matching absence fence or a charged ambiguous failure.
+//! and has no direct Linux fallback. `main.rs` selects it only for the isolated test
+//! deployment (B6, `deploy/firecracker-test/`); B7 alone may enable it in production,
+//! and until then the production helper serves no profile, so every Preflight there
+//! is a C0 refusal.
+//!
+//! B6 wires the whole public path. `create` sends Create, which the helper answers
+//! once C2 is durable, then follows Inspect until the journaled READY (C6); `exec`,
+//! `validate_sandbox`, `remove` and `gc` are the helper's typed operations by exact
+//! allocation token. The boot and inner sandbox a READY row was published with are
+//! remembered per allocation and always re-read from the helper's journal when
+//! missing, so a stale guess is never sent: the helper compares them with its own.
 use super::{
     AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendInventory, BackendRecord,
-    BackendStatus, CreateContext, CreateFailure, CreatedSandbox, ExecOutcome, ExecSpec,
-    ExecutionContext, FencedAbsence, PreparedCreate, Runtime, RuntimeCapabilities, RuntimeError,
+    BackendStatus, CreateContext, CreateFailure, CreatedSandbox, EvidenceRegime, ExecOutcome,
+    ExecSpec, ExecutionContext, FencedAbsence, PreparedCreate, ReadyReceipt, Runtime,
+    RuntimeCapabilities, RuntimeError, RuntimeReceipt,
 };
 use crate::firecracker::{canonical, offline_768_v1_reservation, strict_json};
 use crate::helper::firecracker::journal::AccountingSnapshot;
 use crate::helper::protocol::{
     AccountingReply, CreateReply, FIRECRACKER_GROUP_VERSION, FenceReply, FirecrackerOperation,
-    FirecrackerRequest, FirecrackerResponse, GroupError, GroupErrorKind, InspectReply, ListStatus,
-    PreparedReply, WireBytes,
+    FirecrackerRequest, FirecrackerResponse, GcOutcome, GroupError, GroupErrorKind, InspectReply,
+    ListStatus, MAX_FIRECRACKER_GC_IDS, PreparedReply, ValidateReply, WireBytes,
 };
 use crate::helper::{AttachedConnection, Client};
-use crate::model::{
-    CleanupEvidence, Digest, Id128, Network, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage,
-    SandboxDisposition, SandboxSpec,
-};
+use crate::model::{Digest, Id128, Network, SandboxSpec};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -30,12 +38,27 @@ struct Attachment {
     _connection: AttachedConnection,
 }
 
+/// The boot and persistent inner sandbox a READY allocation is bound to, as the
+/// helper journaled them. Validate and Exec must name both; the helper refuses
+/// anything else, so this is a binding, not an authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Session {
+    boot_id: String,
+    inner_id: String,
+}
+
+/// How often `create` reads READY back from the helper while the guest boots.
+const READY_POLL: Duration = Duration::from_millis(100);
+/// One Inspect inside a create's or an execution's own deadline.
+const INSPECT_BUDGET: Duration = Duration::from_secs(5);
+
 pub struct FirecrackerRuntime {
     client: Client,
     instance_id: Id128,
     database_uuid: Id128,
     attachment: tokio::sync::Mutex<Option<Attachment>>,
     node_id: Mutex<Option<Id128>>,
+    sessions: Mutex<HashMap<Id128, Session>>,
 }
 
 fn group_failure(error: GroupError) -> RuntimeError {
@@ -137,6 +160,40 @@ fn decode_fence(
     Ok(receipt)
 }
 
+/// The allocation a backend ID names: `fc-` and 32 lowercase hexadecimal digits. Nothing
+/// here is ever NotFound: only a receipt says an allocation is gone.
+fn allocation_of(id: &str) -> Result<Id128, RuntimeError> {
+    id.strip_prefix("fc-")
+        .and_then(|hex| Id128::parse(hex).ok())
+        .ok_or_else(|| {
+            RuntimeError::Incompatible(format!("{id:?} is not a Firecracker backend ID"))
+        })
+}
+
+/// A removal or collection receipt for an allocation known only by its backend ID.
+/// The plan digest is the manager's to compare with its row (`commit_absence`).
+fn decode_removal(
+    bytes: &[u8],
+    instance: Id128,
+    allocation: Id128,
+) -> Result<FencedAbsence, RuntimeError> {
+    let receipt = FencedAbsence::decode(bytes)?;
+    if receipt.instance_id() != instance || receipt.allocation_id() != allocation {
+        return Err(RuntimeError::Backend(
+            "absence receipt does not match this allocation".into(),
+        ));
+    }
+    Ok(receipt)
+}
+
+/// Phases in which a created allocation is still on its way to READY.
+fn booting(phase: &str) -> bool {
+    matches!(
+        phase,
+        "intent" | "preparing" | "spawn_intent" | "booting" | "ready"
+    )
+}
+
 impl FirecrackerRuntime {
     pub fn new(helper_socket: PathBuf, instance_id: Id128, database_uuid: Id128) -> Self {
         Self {
@@ -148,6 +205,7 @@ impl FirecrackerRuntime {
             database_uuid,
             attachment: tokio::sync::Mutex::new(None),
             node_id: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -283,10 +341,203 @@ impl FirecrackerRuntime {
         }
     }
 
-    fn unsupported(&self, what: &str) -> RuntimeError {
-        RuntimeError::Unsupported(format!(
-            "{what} needs the VM lifecycle, which this build of the backend does not have"
-        ))
+    fn attached_node(&self) -> Result<Id128, RuntimeError> {
+        self.node_id
+            .lock()
+            .unwrap()
+            .ok_or_else(|| RuntimeError::Backend("not attached to a node".into()))
+    }
+
+    async fn inspect_raw(
+        &self,
+        allocation: Id128,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<InspectReply, RuntimeError> {
+        let deadline = deadline.min(Instant::now() + INSPECT_BUDGET);
+        match self
+            .call(
+                FirecrackerOperation::Inspect {
+                    allocation_id: allocation,
+                },
+                deadline,
+                cancel,
+            )
+            .await?
+        {
+            FirecrackerResponse::Inspect(reply) => {
+                if let InspectReply::PresentReady {
+                    boot_id, inner_id, ..
+                } = &reply
+                {
+                    self.remember(allocation, boot_id, inner_id);
+                }
+                Ok(reply)
+            }
+            FirecrackerResponse::Error(error) => Err(group_failure(error)),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn remember(&self, allocation: Id128, boot_id: &str, inner_id: &str) {
+        self.sessions.lock().unwrap().insert(
+            allocation,
+            Session {
+                boot_id: boot_id.into(),
+                inner_id: inner_id.into(),
+            },
+        );
+    }
+
+    fn forget(&self, allocation: Id128) {
+        self.sessions.lock().unwrap().remove(&allocation);
+    }
+
+    /// The boot and inner sandbox to name. Missing after a daemon restart, it is read
+    /// from the helper's journal; only a READY allocation has one.
+    async fn session(
+        &self,
+        allocation: Id128,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Session, RuntimeError> {
+        if let Some(session) = self.sessions.lock().unwrap().get(&allocation).cloned() {
+            return Ok(session);
+        }
+        match self.inspect_raw(allocation, deadline, cancel).await? {
+            InspectReply::PresentReady {
+                boot_id, inner_id, ..
+            } => Ok(Session { boot_id, inner_id }),
+            InspectReply::PresentBusy { phase, .. } => Err(RuntimeError::Backend(format!(
+                "allocation {allocation} is at {phase}, not READY"
+            ))),
+            InspectReply::StoppedWithResources { .. } | InspectReply::AbsentFenced { .. } => Err(
+                RuntimeError::Backend(format!("allocation {allocation} has no running VM")),
+            ),
+            InspectReply::Incompatible { message } => Err(RuntimeError::Incompatible(message)),
+            InspectReply::Unknown { reason } => Err(RuntimeError::Backend(format!(
+                "allocation {allocation} is unknown: {reason}"
+            ))),
+        }
+    }
+
+    /// C6: the helper answers Create once C2 is durable; READY is journaled later, by S,
+    /// after the broker's handshake. Follow it by Inspect within the create deadline.
+    /// Anything but READY is a charged failure the manager settles by exact token.
+    async fn wait_ready(
+        &self,
+        context: &CreateContext,
+        prepared: &PreparedCreate,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<CreatedSandbox, CreateFailure> {
+        let node_id = match prepared.regime() {
+            EvidenceRegime::AbsenceFenced { node_id } => node_id,
+            EvidenceRegime::LegacyLocal => {
+                return Err(RuntimeError::Backend("a legacy plan cannot boot a VM".into()).into());
+            }
+        };
+        let plan_digest = prepared.plan_digest();
+        let mut last = String::from("no answer yet");
+        loop {
+            if cancel.is_cancelled() || Instant::now() >= deadline {
+                return Err(RuntimeError::Backend(format!(
+                    "allocation {} did not reach READY before its deadline ({last}); it stays charged",
+                    context.allocation_id
+                ))
+                .into());
+            }
+            match self
+                .inspect_raw(context.allocation_id, deadline, cancel)
+                .await
+            {
+                Ok(InspectReply::PresentReady {
+                    generation,
+                    boot_id,
+                    ..
+                }) => {
+                    let receipt = ReadyReceipt {
+                        node_id,
+                        instance_id: context.instance_id,
+                        allocation_id: context.allocation_id,
+                        plan_digest,
+                        helper_generation: generation,
+                        boot_id,
+                    };
+                    receipt.validate()?;
+                    return Ok(CreatedSandbox {
+                        backend_id: format!("fc-{}", context.allocation_id),
+                        receipt: RuntimeReceipt::Ready(receipt),
+                    });
+                }
+                Ok(InspectReply::PresentBusy { phase, .. }) if booting(&phase) => {
+                    last = format!("at {phase}");
+                }
+                Ok(InspectReply::PresentBusy { phase, .. }) => {
+                    return Err(RuntimeError::Backend(format!(
+                        "allocation reached {phase} before READY was published"
+                    ))
+                    .into());
+                }
+                Ok(InspectReply::StoppedWithResources { .. }) => {
+                    return Err(RuntimeError::Backend(
+                        "the VM stopped before READY; its resources stay charged".into(),
+                    )
+                    .into());
+                }
+                Ok(InspectReply::AbsentFenced { receipt }) => {
+                    let receipt = decode_fence(&receipt.0, context, &plan_digest)?;
+                    return Err(CreateFailure::absent_fenced(
+                        receipt,
+                        RuntimeError::Backend("the allocation was fenced before READY".into()),
+                    ));
+                }
+                Ok(InspectReply::Incompatible { message }) => {
+                    return Err(RuntimeError::Incompatible(message).into());
+                }
+                // A stop in progress, a stale supervisor observation or a missing ledger
+                // answer: no proof either way yet, and the deadline still bounds it.
+                Ok(InspectReply::Unknown { reason }) => last = reason,
+                Err(error) => last = error.to_string(),
+            }
+            tokio::select! {
+                () = tokio::time::sleep(READY_POLL) => {}
+                () = cancel.cancelled() => {}
+            }
+        }
+    }
+
+    /// The helper's Remove by exact token: stop, remove every owned resource, persist
+    /// ABSENT. A retired token answers with its fence; a token the helper never
+    /// journaled is refused, untouched.
+    async fn remove_allocation(
+        &self,
+        allocation: Id128,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<FencedAbsence, RuntimeError> {
+        match self
+            .call(
+                FirecrackerOperation::Remove {
+                    allocation_id: allocation,
+                },
+                deadline,
+                cancel,
+            )
+            .await?
+        {
+            FirecrackerResponse::Remove(FenceReply::Absent { receipt }) => {
+                self.forget(allocation);
+                decode_removal(&receipt.0, self.instance_id, allocation)
+            }
+            FirecrackerResponse::Remove(FenceReply::Ambiguous { class, message }) => {
+                Err(RuntimeError::Backend(format!(
+                    "allocation {allocation} stays charged ({class:?}): {message}"
+                )))
+            }
+            FirecrackerResponse::Error(error) => Err(group_failure(error)),
+            _ => Err(unexpected()),
+        }
     }
 }
 
@@ -380,12 +631,9 @@ impl Runtime for FirecrackerRuntime {
                     RuntimeError::Backend("this allocation token is permanently fenced".into()),
                 ))
             }
-            // Accepted is a durable charge, never readiness: B3 has no READY.
-            FirecrackerResponse::Create(CreateReply::Accepted { phase, .. }) => {
-                Err(RuntimeError::Backend(format!(
-                    "allocation accepted at {phase}; no VM launch exists in this build"
-                ))
-                .into())
+            // Accepted is a durable charge, not readiness: READY is S's to journal.
+            FirecrackerResponse::Create(CreateReply::Accepted { .. }) => {
+                self.wait_ready(context, prepared, deadline, cancel).await
             }
             FirecrackerResponse::Create(CreateReply::Ambiguous { class, message }) => {
                 Err(RuntimeError::Backend(format!("create rejected ({class:?}): {message}")).into())
@@ -403,42 +651,41 @@ impl Runtime for FirecrackerRuntime {
         cancel: &CancellationToken,
     ) -> Result<AllocationObservation, RuntimeError> {
         match self
-            .call(
-                FirecrackerOperation::Inspect {
-                    allocation_id: context.allocation_id,
-                },
-                deadline,
-                cancel,
-            )
+            .inspect_raw(context.allocation_id, deadline, cancel)
             .await?
         {
-            FirecrackerResponse::Inspect(InspectReply::AbsentFenced { receipt }) => {
-                Ok(AllocationObservation::AbsentFenced(decode_fence(
-                    &receipt.0,
-                    context,
-                    prepared_digest,
-                )?))
-            }
-            FirecrackerResponse::Inspect(InspectReply::StoppedWithResources { generation }) => {
+            // The helper's READY: idle on the journaled boot, no execution in flight.
+            InspectReply::PresentReady {
+                generation,
+                boot_id,
+                ..
+            } => Ok(AllocationObservation::Present {
+                receipt: ReadyReceipt {
+                    node_id: self.attached_node()?,
+                    instance_id: context.instance_id,
+                    allocation_id: context.allocation_id,
+                    plan_digest: *prepared_digest,
+                    helper_generation: generation,
+                    boot_id,
+                },
+                healthy_idle: true,
+                uncertain_execution: false,
+            }),
+            InspectReply::AbsentFenced { receipt } => Ok(AllocationObservation::AbsentFenced(
+                decode_fence(&receipt.0, context, prepared_digest)?,
+            )),
+            InspectReply::StoppedWithResources { generation } => {
                 Ok(AllocationObservation::StoppedWithResources {
                     helper_generation: generation,
                 })
             }
-            // Without READY, a busy preparation is as unknown as a stale answer: the
-            // manager then fences, which refuses until proof really exists.
-            FirecrackerResponse::Inspect(InspectReply::PresentBusy { phase, .. }) => {
-                Ok(AllocationObservation::Unknown {
-                    reason: format!("allocation is at {phase}"),
-                })
-            }
-            FirecrackerResponse::Inspect(InspectReply::Unknown { reason }) => {
-                Ok(AllocationObservation::Unknown { reason })
-            }
-            FirecrackerResponse::Inspect(InspectReply::Incompatible { message }) => {
-                Err(RuntimeError::Incompatible(message))
-            }
-            FirecrackerResponse::Error(error) => Err(group_failure(error)),
-            _ => Err(unexpected()),
+            // Booting or busy carries no ready receipt to compare: unknown, so the
+            // manager settles by exact token, which stops it before any release.
+            InspectReply::PresentBusy { phase, .. } => Ok(AllocationObservation::Unknown {
+                reason: format!("allocation is at {phase}"),
+            }),
+            InspectReply::Unknown { reason } => Ok(AllocationObservation::Unknown { reason }),
+            InspectReply::Incompatible { message } => Err(RuntimeError::Incompatible(message)),
         }
     }
 
@@ -449,6 +696,29 @@ impl Runtime for FirecrackerRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<AbsenceReceipt, RuntimeError> {
+        // A token the helper journaled is removed by exact token: stop, remove, ABSENT.
+        // Its FenceAbsent would close the token's gate and still refuse while resources
+        // exist. A retired token answers with its fence either way. Only a token with no
+        // journal record falls through to FenceAbsent, which fences it never-admitted.
+        match self
+            .remove_allocation(context.allocation_id, deadline, cancel)
+            .await
+        {
+            Ok(receipt) if &receipt.plan_digest() == prepared_digest => {
+                return Ok(AbsenceReceipt::Fenced(receipt));
+            }
+            Ok(_) => {
+                return Err(RuntimeError::Backend(
+                    "absence receipt does not match this token".into(),
+                ));
+            }
+            Err(_) if cancel.is_cancelled() || Instant::now() >= deadline => {
+                return Err(RuntimeError::Backend(
+                    "the fence deadline expired; the allocation stays charged".into(),
+                ));
+            }
+            Err(_) => {}
+        }
         match self
             .call(
                 FirecrackerOperation::FenceAbsent {
@@ -474,43 +744,127 @@ impl Runtime for FirecrackerRuntime {
 
     async fn validate_sandbox(
         &self,
-        _id: &str,
-        _deadline: Instant,
-        _cancel: &CancellationToken,
+        id: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
     ) -> Result<(), RuntimeError> {
-        Err(self.unsupported("sandbox validation"))
+        let allocation = allocation_of(id)?;
+        let session = self.session(allocation, deadline, cancel).await?;
+        // Never NotFound from here: a socket failure or an unanswered probe is not
+        // absence, only Inspect's own evidence is.
+        match self
+            .call(
+                FirecrackerOperation::Validate {
+                    allocation_id: allocation,
+                    expected_boot_id: session.boot_id,
+                    expected_inner_id: session.inner_id,
+                },
+                deadline,
+                cancel,
+            )
+            .await?
+        {
+            FirecrackerResponse::Validate(ValidateReply::Ready { .. }) => Ok(()),
+            FirecrackerResponse::Validate(ValidateReply::Busy { .. }) => Err(
+                RuntimeError::Backend(format!("allocation {allocation} is executing")),
+            ),
+            FirecrackerResponse::Validate(ValidateReply::ControlBusy) => Err(
+                RuntimeError::Backend(format!("allocation {allocation}'s control slot is busy")),
+            ),
+            FirecrackerResponse::Validate(ValidateReply::Incompatible { message }) => {
+                self.forget(allocation);
+                Err(RuntimeError::Incompatible(message))
+            }
+            FirecrackerResponse::Validate(ValidateReply::Unknown { reason }) => {
+                Err(RuntimeError::Backend(reason))
+            }
+            FirecrackerResponse::Error(error) => Err(group_failure(error)),
+            _ => Err(unexpected()),
+        }
     }
 
     async fn exec(
         &self,
-        _id: &str,
-        _execution: &ExecutionContext,
-        _spec: &ExecSpec<'_>,
-        _cancel: &CancellationToken,
+        id: &str,
+        execution: &ExecutionContext,
+        spec: &ExecSpec<'_>,
+        cancel: &CancellationToken,
     ) -> ExecOutcome {
-        // No Exec was sent, so no command can have started. READY cannot exist in this
-        // build; a caller reaching here has an impossible row and it stays quarantined.
-        ExecOutcome {
-            finish: Err(RuntimeDiagnostic::new(
-                RuntimeErrorKind::Unavailable,
-                RuntimeStage::Validate,
-                "this build of the Firecracker backend has no execution path",
+        // Before any Exec frame nothing can have reached the guest: a refusal here
+        // keeps the session as it is, and only a failure to learn its boot stops use.
+        let not_sent = |kind, message: String, disposition| ExecOutcome {
+            finish: Err(crate::model::RuntimeDiagnostic::new(
+                kind,
+                crate::model::RuntimeStage::Validate,
+                message,
             )),
             command_status: None,
             stdout: crate::model::Captured::known_empty(),
             stderr: crate::model::Captured::known_empty(),
-            disposition: SandboxDisposition::Quarantined,
-            cleanup: CleanupEvidence::NoChildStarted,
+            disposition,
+            cleanup: crate::model::CleanupEvidence::NoChildStarted,
+        };
+        let allocation = match allocation_of(id) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                return not_sent(
+                    crate::model::RuntimeErrorKind::NotFound,
+                    error.to_string(),
+                    crate::model::SandboxDisposition::Quarantined,
+                );
+            }
+        };
+        let session = match self.session(allocation, spec.deadline, cancel).await {
+            Ok(session) => session,
+            Err(error) => {
+                return not_sent(
+                    crate::model::RuntimeErrorKind::Unavailable,
+                    format!("the session's boot could not be established: {error}"),
+                    crate::model::SandboxDisposition::Quarantined,
+                );
+            }
+        };
+        let epoch = match self.epoch(spec.deadline).await {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return not_sent(
+                    crate::model::RuntimeErrorKind::Unavailable,
+                    format!("not attached to the helper: {error}"),
+                    crate::model::SandboxDisposition::Reusable,
+                );
+            }
+        };
+        let request = FirecrackerRequest {
+            group_version: FIRECRACKER_GROUP_VERSION,
+            instance_id: self.instance_id,
+            connection_epoch: Some(epoch),
+            operation: FirecrackerOperation::Exec {
+                allocation_id: allocation,
+                expected_boot_id: session.boot_id,
+                execution_token: execution.execution_token,
+                execution_id: execution.execution_id.clone(),
+                argv: spec.argv.to_vec(),
+                stdin_bytes: spec.stdin.len(),
+                max_output: spec.max_output,
+            },
+        };
+        let outcome = self.client.firecracker_exec(request, spec, cancel).await;
+        if outcome.disposition != crate::model::SandboxDisposition::Reusable {
+            self.forget(allocation);
         }
+        outcome
     }
 
     async fn remove(
         &self,
-        _id: &str,
-        _deadline: Instant,
-        _cancel: &CancellationToken,
+        id: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
     ) -> Result<AbsenceReceipt, RuntimeError> {
-        Err(self.unsupported("removal"))
+        let allocation = allocation_of(id)?;
+        self.remove_allocation(allocation, deadline, cancel)
+            .await
+            .map(AbsenceReceipt::Fenced)
     }
 
     async fn list(
@@ -552,12 +906,76 @@ impl Runtime for FirecrackerRuntime {
     async fn gc(
         &self,
         ids: &[String],
-        _deadline: Instant,
-        _cancel: &CancellationToken,
+        deadline: Instant,
+        cancel: &CancellationToken,
     ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        Err(self.unsupported("scoped collection"))
+        if ids.len() > MAX_FIRECRACKER_GC_IDS {
+            return Err(RuntimeError::Backend(format!(
+                "at most {MAX_FIRECRACKER_GC_IDS} allocations per collection"
+            )));
+        }
+        let mut allocations = Vec::with_capacity(ids.len());
+        for id in ids {
+            let allocation = allocation_of(id)?;
+            if allocations.contains(&allocation) {
+                return Err(RuntimeError::Backend(format!("{id} is named twice")));
+            }
+            allocations.push(allocation);
+        }
+        let results = match self
+            .call(
+                FirecrackerOperation::Gc {
+                    allocation_ids: allocations.clone(),
+                },
+                deadline,
+                cancel,
+            )
+            .await?
+        {
+            FirecrackerResponse::Gc(results) => results,
+            FirecrackerResponse::Error(error) => return Err(group_failure(error)),
+            _ => return Err(unexpected()),
+        };
+        // Every receipt is individually proven; a skip or failure leaves that one
+        // charged and discoverable, and is reported after the receipts are kept.
+        let mut receipts = Vec::new();
+        let mut refused = Vec::new();
+        for result in results {
+            if !allocations.contains(&result.allocation_id) {
+                return Err(RuntimeError::Backend(format!(
+                    "collection reported allocation {} outside its scope",
+                    result.allocation_id
+                )));
+            }
+            match result.outcome {
+                GcOutcome::Removed { receipt } => {
+                    self.forget(result.allocation_id);
+                    receipts.push(AbsenceReceipt::Fenced(decode_removal(
+                        &receipt.0,
+                        self.instance_id,
+                        result.allocation_id,
+                    )?));
+                }
+                GcOutcome::Skipped { reason } => {
+                    refused.push(format!("{}: skipped: {reason}", result.allocation_id));
+                }
+                GcOutcome::Failed { class, message } => {
+                    refused.push(format!(
+                        "{}: failed ({class:?}): {message}",
+                        result.allocation_id
+                    ));
+                }
+            }
+        }
+        if refused.is_empty() || !receipts.is_empty() {
+            return Ok(receipts);
+        }
+        Err(RuntimeError::Backend(format!(
+            "nothing was collected: {}",
+            refused.join("; ")
+        )))
     }
 }

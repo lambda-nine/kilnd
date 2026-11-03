@@ -14,6 +14,9 @@ pub mod store;
 /// Typed system-call and ioctl wrappers: the only non-gate users of `libc::syscall`
 /// and `libc::ioctl` (design section 7.1).
 pub mod sys;
+/// B6: the isolated Firecracker test deployment, the only way to select that backend
+/// before B7.
+pub mod test_deployment;
 mod validation;
 
 mod lock;

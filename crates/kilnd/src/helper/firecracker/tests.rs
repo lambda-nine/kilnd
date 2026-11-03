@@ -70,6 +70,10 @@ struct NodeOptions {
     uid: Option<(u32, u32)>,
     #[serde(default)]
     gid: Option<(u32, u32)>,
+    /// B6: hash a real peer's image instead of assuming the fixture digest, for a real
+    /// kilnd binary enrolled by root.
+    #[serde(default)]
+    hash_peers: bool,
 }
 
 /// Where a fixture helper reads an attaching peer's cgroup and account. The start time,
@@ -100,6 +104,7 @@ impl Default for NodeOptions {
             real: false,
             uid: None,
             gid: None,
+            hash_peers: false,
         }
     }
 }
@@ -231,7 +236,7 @@ fn node_fixture_child() {
                         directory: None,
                         any_cgroup: false,
                         any_account: false,
-                        assumed_digest: Some(fixture_digest()),
+                        assumed_digest: (!config.options.hash_peers).then(fixture_digest),
                     },
                 },
             },
@@ -4651,14 +4656,18 @@ async fn exit1_preflight_or_listing_needs_no_session_side_effect_and_no_ready_ex
     let runtime = fixture.runtime(instance, Id128::random());
     let context = token(instance);
     let plan = prepared(&runtime, &context).await;
-    // Every Create outcome here is ambiguous from the caller's side: B3 has no READY.
+    // Fake effects never reach READY, so from the caller's side this Create can only end
+    // ambiguous and charged at its deadline (B6: create follows Inspect to READY).
     let failure = runtime
         .create(&context, &plan, deadline(10), &no_cancel())
         .await
         .unwrap_err();
     assert_eq!(failure.certainty(), CreateCertainty::AllocationAmbiguous);
     assert!(failure.absence().is_none());
-    assert!(failure.to_string().contains("no VM launch"), "{failure}");
+    assert!(
+        failure.to_string().contains("did not reach READY"),
+        "{failure}"
+    );
     let capabilities = timed_capabilities(&runtime, &fixture).await;
     assert!(!capabilities.launch_enabled);
     assert_eq!(capabilities.profiles, [PROFILE]);
@@ -4729,16 +4738,24 @@ async fn exit1_preflight_or_listing_needs_no_session_side_effect_and_no_ready_ex
             .unwrap(),
         AllocationObservation::Unknown { .. }
     ));
-    // Unsupported until B4/B5, never a fake success.
+    // B6: an allocation that is not READY never validates, a malformed ID is refused
+    // before any request, and none of it is ever NotFound, only a receipt is absence.
+    let backend_id = format!("fc-{}", context.allocation_id);
+    assert!(matches!(
+        runtime
+            .validate_sandbox(&backend_id, deadline(5), &no_cancel())
+            .await,
+        Err(RuntimeError::Backend(_))
+    ));
     assert!(matches!(
         runtime
             .validate_sandbox("fc-x", deadline(1), &no_cancel())
             .await,
-        Err(RuntimeError::Unsupported(_))
+        Err(RuntimeError::Incompatible(_))
     ));
     assert!(matches!(
         runtime.remove("fc-x", deadline(1), &no_cancel()).await,
-        Err(RuntimeError::Unsupported(_))
+        Err(RuntimeError::Incompatible(_))
     ));
     assert!(
         runtime
@@ -4792,9 +4809,14 @@ fn exit1_production_gate_leaves_every_catalog_profile_refused() {
         .unwrap();
     assert!(!production.contains("TestApproved"));
     assert!(production.contains("ManifestGate::ProductionDisabled"));
-    // The daemon's entry point still has no way to select this backend.
-    let main = include_str!("../../main.rs").to_lowercase();
-    assert!(!main.contains("firecracker"));
+    // B6: the daemon selects this backend only from the isolated test deployment, read
+    // and checked against its own paths first; the helper above still serves no profile.
+    let main = include_str!("../../main.rs");
+    assert_eq!(main.matches("FirecrackerRuntime::new(").count(), 1);
+    let (before, selected) = main.split_once("TestDeployment::read(").unwrap();
+    assert!(!before.contains("FirecrackerRuntime::new("));
+    let checked = selected.split_once("FirecrackerRuntime::new(").unwrap().0;
+    assert!(checked.contains("check_daemon("), "{checked}");
 }
 
 #[tokio::test]
@@ -4896,3 +4918,5 @@ mod broker;
 mod control_plane;
 #[cfg(target_os = "linux")]
 mod lifecycle;
+#[cfg(target_os = "linux")]
+mod session;

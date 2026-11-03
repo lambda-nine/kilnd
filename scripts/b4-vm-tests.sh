@@ -11,6 +11,10 @@
 #   B4_GUEST   a kiln-guest bundle directory with Image, rootfs.squashfs and
 #              kilnd-guest-broker (the B5 production bundle; earlier: the schema-1
 #              guest, which listens for no command, so a boot ends at BOOTING
+#   B6_EVIDENCE  where b6_linux_root writes its transcript and SQLite/journal evidence
+#              (default: none). B6's session test also runs the kilnd and kilndctl
+#              binaries, built here as ordinary dynamic executables in their own
+#              target directory ($HOME/.cache/kilnd-target-b6)
 # The test binary is built static (crt-static) because it is installed as the helper
 # image and the contract approves static ELFs only. Everything the tests create under
 # /opt/kilnd, /var/lib/kilnd-helper/{jails,work} and /sys/fs/cgroup/kilnd-firecracker is
@@ -21,9 +25,15 @@ filter=${1:-b4_linux_root}
 tools=${B4_TOOLS:-$HOME/b4-build/out}
 vmm=${B4_VMM:-$HOME/fc-spike/release-v1.17.0-aarch64/firecracker-v1.17.0-aarch64}
 guest=${B4_GUEST:-$HOME/kiln-guest-build/bundle-a}
+target=aarch64-unknown-linux-gnu
+
+# B6: the daemon and client the session test runs as an ordinary installed kilnd would
+# be, before the static flags below apply to anything.
+bins=${B6_TARGET_DIR:-$HOME/.cache/kilnd-target-b6}
+CARGO_TARGET_DIR=$bins cargo build --locked --release -p kilnd -p kilndctl --bin kilnd --bin kilndctl
+
 export CARGO_TARGET_DIR=${B4_TARGET_DIR:-$HOME/.cache/kilnd-target-static}
 export RUSTFLAGS="-C target-feature=+crt-static"
-target=aarch64-unknown-linux-gnu
 
 # kilnd's library tests, and since Phase 1b B5 the direct-kiln core's, which hold the
 # moved capability-drop regression (process::tests).
@@ -59,6 +69,10 @@ sudo install -m 0444 -o root -g root "$guest/rootfs.squashfs" "$work/artifacts/r
 # Since B5-10 the host checks the broker's digest against the manifest's pin: the
 # bundle's own broker artifact, which its root runs.
 sudo install -m 0444 -o root -g root "$guest/kilnd-guest-broker" "$work/artifacts/kilnd-guest-broker"
+# B6's daemon and client: root-owned copies the test installs and enrolls from.
+sudo install -d -m 0755 -o root -g root "$work/bin"
+sudo install -m 0755 -o root -g root "$bins/release/kilnd" "$work/bin/kilnd"
+sudo install -m 0755 -o root -g root "$bins/release/kilndctl" "$work/bin/kilndctl"
 # A stripped static copy is the helper image: it is hashed at every helper start.
 sudo install -m 0755 -o root -g root "$lib" "$work/kilnd-lib-tests"
 sudo strip --strip-debug "$work/kilnd-lib-tests"
@@ -72,6 +86,7 @@ sudo setpriv --bounding-set="$caps" --inh-caps=-all \
     env KILND_B4_ARTIFACTS="$work/artifacts" RUST_BACKTRACE=${RUST_BACKTRACE:-1} \
     KILND_B5_KILL_INNER_GUEST="${KILND_B5_KILL_INNER_GUEST:-}" \
     KILND_B5_CONSOLE_FLOOD_GUEST="${KILND_B5_CONSOLE_FLOOD_GUEST:-}" \
+    KILND_B6_BIN="$work/bin" KILND_B6_EVIDENCE="${B6_EVIDENCE:-}" \
     "$work/kilnd-lib-tests" --ignored --test-threads=1 --nocapture "$filter"
 sudo setpriv --bounding-set="$caps" --inh-caps=-all \
     env RUST_BACKTRACE=${RUST_BACKTRACE:-1} \

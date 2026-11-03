@@ -138,6 +138,10 @@ impl Client {
             Operation::Firecracker(request) => match request.operation {
                 FirecrackerOperation::Create { .. } => Duration::from_secs(5),
                 FirecrackerOperation::Capabilities => Duration::from_secs(1),
+                // After its deadline the helper still sends Cancel, waits up to two
+                // seconds for the guest, then proves the VM subtree empty: the same
+                // allowance as kiln's cleanup.
+                FirecrackerOperation::Exec { .. } => Duration::from_secs(70),
                 _ => Duration::from_secs(2),
             },
             _ => Duration::from_secs(2),
@@ -229,82 +233,20 @@ impl Client {
         spec: &ExecSpec<'_>,
         cancel: &CancellationToken,
     ) -> ExecOutcome {
-        if cancel.is_cancelled() || Instant::now() >= spec.deadline {
-            return ExecOutcome {
-                finish: Ok(if cancel.is_cancelled() {
-                    ExecFinish::Canceled
-                } else {
-                    ExecFinish::TimedOut
-                }),
-                command_status: None,
-                stdout: Captured::known_empty(),
-                stderr: Captured::known_empty(),
-                disposition: SandboxDisposition::Reusable,
-                cleanup: CleanupEvidence::NoChildStarted,
-            };
+        if let Some(outcome) = undispatched(spec, cancel) {
+            return outcome;
         }
-        let observed_out = Arc::new(Mutex::new(Captured::default()));
-        let observed_err = Arc::new(Mutex::new(Captured::default()));
-        let failed = |error: io::Error| ExecOutcome {
-            finish: Err(RuntimeDiagnostic::new(
-                RuntimeErrorKind::CleanupFailed,
-                RuntimeStage::Cleanup,
-                format!("helper execution/cleanup could not be confirmed: {error}"),
-            )),
-            command_status: None,
-            stdout: observed_out.lock().unwrap().clone(),
-            stderr: observed_err.lock().unwrap().clone(),
-            disposition: SandboxDisposition::Quarantined,
-            cleanup: CleanupEvidence::Unknown,
+        let request = KilnRequest::Exec {
+            id: id.into(),
+            argv: spec.argv.to_vec(),
+            stdin_bytes: spec.stdin.len(),
+            max_output: spec.max_output,
         };
+        let observed = Observed::default();
         let operation = async {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let request = KilnRequest::Exec {
-                id: id.into(),
-                argv: spec.argv.to_vec(),
-                stdin_bytes: spec.stdin.len(),
-                max_output: spec.max_output,
-            };
-            let exchange = self.exchange(Operation::Kiln(request), spec.deadline, cancel, Some(tx));
-            let io_work = async {
-                let descriptors = rx.await.map_err(io::Error::other)?;
-                let mut streams = descriptors.into_iter();
-                let mut next = || {
-                    fds::socket(
-                        streams
-                            .next()
-                            .ok_or_else(|| io::Error::other("missing helper stdio"))?,
-                        self.expected_uid,
-                    )
-                };
-                let mut input = next()?;
-                let mut output = next()?;
-                let mut error = next()?;
-                input
-                    .write_all(spec.stdin)
-                    .await
-                    .map_err(|e| super::io_stage("stdin write", e))?;
-                input
-                    .shutdown()
-                    .await
-                    .map_err(|e| super::io_stage("stdin shutdown", e))?;
-                tokio::try_join!(
-                    async {
-                        read_output(&mut output, spec.max_output, &observed_out)
-                            .await
-                            .map_err(|e| super::io_stage("stdout drain", e))
-                    },
-                    async {
-                        read_output(&mut error, spec.max_output, &observed_err)
-                            .await
-                            .map_err(|e| super::io_stage("stderr drain", e))
-                    }
-                )?;
-                Ok::<_, io::Error>(())
-            };
-            let (response, ()) = tokio::try_join!(exchange, io_work)?;
-            let out = observed_out.lock().unwrap().data.clone();
-            let err = observed_err.lock().unwrap().data.clone();
+            let (response, out, err) = self
+                .stdio_exchange(Operation::Kiln(request), spec, cancel, &observed)
+                .await?;
             match response {
                 Response::Executed {
                     finish,
@@ -340,8 +282,182 @@ impl Client {
             }
         }
         .await;
-        operation.unwrap_or_else(failed)
+        operation.unwrap_or_else(|error| observed.unconfirmed(error))
     }
+
+    /// B6: one Firecracker execution, the same stdio exchange as kiln's. The helper owns
+    /// cancellation through its stop barrier, so the reply's own reuse and cleanup
+    /// evidence decide the disposition; an exchange that fails before a reply proves
+    /// nothing about the guest and is quarantined.
+    pub async fn firecracker_exec(
+        &self,
+        request: FirecrackerRequest,
+        spec: &ExecSpec<'_>,
+        cancel: &CancellationToken,
+    ) -> ExecOutcome {
+        if let Some(outcome) = undispatched(spec, cancel) {
+            return outcome;
+        }
+        let observed = Observed::default();
+        let operation = async {
+            let (response, out, err) = self
+                .stdio_exchange(Operation::Firecracker(request), spec, cancel, &observed)
+                .await?;
+            match response {
+                Response::Firecracker(FirecrackerResponse::Exec(reply)) => {
+                    firecracker_outcome(*reply, out, err, spec, cancel)
+                }
+                Response::Firecracker(FirecrackerResponse::Error(error)) => {
+                    Err(io::Error::other(format!(
+                        "Firecracker helper refused the execution: {}",
+                        error.message
+                    )))
+                }
+                _ => Err(io::Error::other("unexpected helper exec reply")),
+            }
+        }
+        .await;
+        operation.unwrap_or_else(|error| observed.unconfirmed(error))
+    }
+
+    /// Sends one execution request, takes the three stdio endpoints, writes stdin and
+    /// drains both outputs beside the reply. Shared by kiln and Firecracker.
+    async fn stdio_exchange(
+        &self,
+        operation: Operation,
+        spec: &ExecSpec<'_>,
+        cancel: &CancellationToken,
+        observed: &Observed,
+    ) -> io::Result<(Response, Vec<u8>, Vec<u8>)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let exchange = self.exchange(operation, spec.deadline, cancel, Some(tx));
+        let io_work = async {
+            let descriptors = rx.await.map_err(io::Error::other)?;
+            let mut streams = descriptors.into_iter();
+            let mut next = || {
+                fds::socket(
+                    streams
+                        .next()
+                        .ok_or_else(|| io::Error::other("missing helper stdio"))?,
+                    self.expected_uid,
+                )
+            };
+            let mut input = next()?;
+            let mut output = next()?;
+            let mut error = next()?;
+            input
+                .write_all(spec.stdin)
+                .await
+                .map_err(|e| super::io_stage("stdin write", e))?;
+            input
+                .shutdown()
+                .await
+                .map_err(|e| super::io_stage("stdin shutdown", e))?;
+            tokio::try_join!(
+                async {
+                    read_output(&mut output, spec.max_output, &observed.out)
+                        .await
+                        .map_err(|e| super::io_stage("stdout drain", e))
+                },
+                async {
+                    read_output(&mut error, spec.max_output, &observed.err)
+                        .await
+                        .map_err(|e| super::io_stage("stderr drain", e))
+                }
+            )?;
+            Ok::<_, io::Error>(())
+        };
+        let (response, ()) = tokio::try_join!(exchange, io_work)?;
+        let out = observed.out.lock().unwrap().data.clone();
+        let err = observed.err.lock().unwrap().data.clone();
+        Ok((response, out, err))
+    }
+}
+
+/// A pre-canceled or expired execution sends nothing: no command can have started.
+fn undispatched(spec: &ExecSpec<'_>, cancel: &CancellationToken) -> Option<ExecOutcome> {
+    if !(cancel.is_cancelled() || Instant::now() >= spec.deadline) {
+        return None;
+    }
+    Some(ExecOutcome {
+        finish: Ok(if cancel.is_cancelled() {
+            ExecFinish::Canceled
+        } else {
+            ExecFinish::TimedOut
+        }),
+        command_status: None,
+        stdout: Captured::known_empty(),
+        stderr: Captured::known_empty(),
+        disposition: SandboxDisposition::Reusable,
+        cleanup: CleanupEvidence::NoChildStarted,
+    })
+}
+
+/// Output the caller actually read, kept even when the exchange then fails.
+#[derive(Default)]
+struct Observed {
+    out: Arc<Mutex<Captured>>,
+    err: Arc<Mutex<Captured>>,
+}
+
+impl Observed {
+    fn unconfirmed(&self, error: io::Error) -> ExecOutcome {
+        ExecOutcome {
+            finish: Err(RuntimeDiagnostic::new(
+                RuntimeErrorKind::CleanupFailed,
+                RuntimeStage::Cleanup,
+                format!("helper execution/cleanup could not be confirmed: {error}"),
+            )),
+            command_status: None,
+            stdout: self.out.lock().unwrap().clone(),
+            stderr: self.err.lock().unwrap().clone(),
+            disposition: SandboxDisposition::Quarantined,
+            cleanup: CleanupEvidence::Unknown,
+        }
+    }
+}
+
+/// Maps a validated Firecracker reply. Reuse needs the reply's own word and trusted
+/// guest cleanup evidence; a retired VM needs the host's stop barrier. Anything else
+/// is quarantined: the guest's state is unknown.
+pub(crate) fn firecracker_outcome(
+    reply: ExecReply,
+    out: Vec<u8>,
+    err: Vec<u8>,
+    spec: &ExecSpec<'_>,
+    cancel: &CancellationToken,
+) -> io::Result<ExecOutcome> {
+    let finish = match reply.finish {
+        WireFinishFc::Completed => Ok(ExecFinish::Completed),
+        WireFinishFc::TimedOut => Ok(ExecFinish::TimedOut),
+        // The helper cancels at the deadline too; the caller's own token says which.
+        WireFinishFc::Canceled if Instant::now() >= spec.deadline && !cancel.is_cancelled() => {
+            Ok(ExecFinish::TimedOut)
+        }
+        WireFinishFc::Canceled => Ok(ExecFinish::Canceled),
+        WireFinishFc::Failed(diagnostic) => Err(diagnostic),
+    };
+    let cleanup = match reply.cleanup {
+        ExecCleanup::NoChildStarted => CleanupEvidence::NoChildStarted,
+        ExecCleanup::GuestCgroupDrained => CleanupEvidence::RuntimeDrained,
+        ExecCleanup::VmStopped => CleanupEvidence::SandboxStopped,
+        ExecCleanup::Unknown => CleanupEvidence::Unknown,
+    };
+    let disposition = match (reply.reusable, cleanup) {
+        (true, CleanupEvidence::NoChildStarted | CleanupEvidence::RuntimeDrained) => {
+            SandboxDisposition::Reusable
+        }
+        (false, CleanupEvidence::SandboxStopped) => SandboxDisposition::Stopped,
+        _ => SandboxDisposition::Quarantined,
+    };
+    Ok(ExecOutcome {
+        finish,
+        command_status: reply.status,
+        stdout: reply.stdout.capture(out, spec.max_output)?,
+        stderr: reply.stderr.capture(err, spec.max_output)?,
+        disposition,
+        cleanup,
+    })
 }
 
 async fn read_output(

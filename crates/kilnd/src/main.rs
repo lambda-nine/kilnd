@@ -9,10 +9,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use kilnd::manager::{Limits, Manager};
 use kilnd::model::Id128;
+use kilnd::runtime::Runtime;
+use kilnd::runtime::firecracker::FirecrackerRuntime;
 use kilnd::runtime::kiln::KilnRuntime;
 use kilnd::store::Store;
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Control daemon for kiln sandboxes: gRPC over a Unix socket, state in SQLite.
@@ -122,6 +124,14 @@ struct Args {
     shutdown_grace_secs: u64,
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
+    /// The execution backend. Until B7, `firecracker` runs only as the isolated test
+    /// deployment named by --firecracker-test-deployment, never in production.
+    #[arg(long, value_enum, default_value_t = Backend::Kiln)]
+    backend: Backend,
+    /// deploy/firecracker-test/deployment.json: the isolated test deployment's paths,
+    /// which must match this daemon's flags. Required with --backend firecracker.
+    #[arg(long)]
+    firecracker_test_deployment: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -151,6 +161,12 @@ enum Command {
         #[arg(long)]
         hold: bool,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    Kiln,
+    Firecracker,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -228,6 +244,23 @@ async fn run(args: Args) -> Result<()> {
         );
     }
 
+    // The backend is settled before anything is opened: a refused test deployment
+    // touches no state.
+    let deployment = match (args.backend, &args.firecracker_test_deployment) {
+        (Backend::Kiln, None) => None,
+        (Backend::Kiln, Some(_)) => {
+            bail!("--firecracker-test-deployment needs --backend firecracker")
+        }
+        (Backend::Firecracker, None) => bail!(
+            "--backend firecracker runs only as the isolated test deployment until B7: pass --firecracker-test-deployment"
+        ),
+        (Backend::Firecracker, Some(path)) => {
+            let deployment = kilnd::test_deployment::TestDeployment::read(path)?;
+            deployment.check_daemon(&args.socket, &args.state_dir, &args.helper_socket)?;
+            Some(deployment)
+        }
+    };
+
     // Store::open takes the state-directory lock before opening SQLite. Bind
     // then takes the socket-directory lock and reserves the endpoint. Both
     // ownership domains must be established before reconciliation mutates
@@ -237,16 +270,43 @@ async fn run(args: Args) -> Result<()> {
         .state_directory_identity()?
         .context("on-disk store has no state-directory identity")?;
     let socket = kilnd::server::bind_away_from(&args.socket, gid, Some(state_directory)).await?;
-    let manager = Arc::new(Manager::new(
-        KilnRuntime::new(args.helper_socket.clone()),
-        store,
-        limits,
-    ));
+    match deployment {
+        None => {
+            let runtime = KilnRuntime::new(args.helper_socket.clone());
+            serve_with(args, store, socket, runtime, limits).await
+        }
+        Some(deployment) => {
+            warn!(
+                deployment = %deployment.deployment,
+                profile = %deployment.profile,
+                "serving the isolated Firecracker test deployment; this is not a production configuration"
+            );
+            let identity = store.identity()?;
+            let runtime = FirecrackerRuntime::new(
+                args.helper_socket.clone(),
+                identity.instance_id,
+                identity.database_uuid,
+            );
+            serve_with(args, store, socket, runtime, limits).await
+        }
+    }
+}
+
+/// The one daemon composition, for whichever backend `run` selected (design 9.1).
+async fn serve_with<R: Runtime>(
+    args: Args,
+    store: Store,
+    socket: kilnd::server::BoundSocket,
+    runtime: R,
+    limits: Limits,
+) -> Result<()> {
+    let manager = Arc::new(Manager::new(runtime, store, limits));
     let r = manager
         .reconcile()
         .await
         .context("startup reconciliation")?;
     info!(
+        backend = manager.runtime().name(),
         gc_removed = r.gc_removed.len(),
         recovered = r.recovered.len(),
         lost = r.lost.len(),
@@ -255,7 +315,10 @@ async fn run(args: Args) -> Result<()> {
         still_deleting = r.still_deleting.len(),
         interrupted_executions = r.interrupted_executions,
         unmanaged = r.unmanaged.len(),
-        "reconciled with kiln"
+        released = r.released.len(),
+        quarantined = r.quarantined.len(),
+        admission_blocked = r.admission_blocked,
+        "reconciled with the backend"
     );
 
     manager.prune().context("startup history prune")?;
