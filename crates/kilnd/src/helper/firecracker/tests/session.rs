@@ -110,6 +110,21 @@ impl Transcript {
     }
 }
 
+/// Health after its one-second cache, and the node's reserved sandbox slots from it.
+async fn node_sandboxes(transcript: &mut Transcript, bin: &Path, socket: &Path) -> u64 {
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let health = transcript.kilndctl(bin, socket, &["health"], None);
+    assert!(health.stdout.contains("authoritative"), "{}", health.stdout);
+    health
+        .stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("node reservations:"))
+        .and_then(|l| l.trim().strip_prefix("sandboxes "))
+        .and_then(|l| l.split('/').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{}", health.stdout))
+}
+
 /// `kilnd@.service`'s `[Service]` settings for instance `name`, minus the lines a
 /// transient unit can't take or that `ExecStart` replaces. The daemon runs under exactly
 /// the hardening an installed further instance has.
@@ -333,6 +348,8 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
     .arg("--helper-socket")
     .arg(&deployment.helper.socket)
     .args(["--log-format", "json", "--backend", "firecracker"])
+    // A one-second Health cache, so the transcript's Health calls show each step's charge.
+    .args(["--health-success-cache-secs", "1"])
     .arg("--firecracker-test-deployment")
     .arg(&deployment_file);
     checked(&mut run);
@@ -386,6 +403,7 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
     assert!(id.starts_with("sb-"), "{id}");
     let got = transcript.kilndctl(&bin, &socket, &["get", &id], None);
     assert!(got.stdout.contains("ready"), "{}", got.stdout);
+    assert_eq!(node_sandboxes(&mut transcript, &bin, &socket).await, 1);
     let wrote = transcript.kilndctl(
         &bin,
         &socket,
@@ -453,6 +471,11 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
         refused.code, 0,
         "a retired session refuses its next command"
     );
+    assert_eq!(
+        node_sandboxes(&mut transcript, &bin, &socket).await,
+        1,
+        "a retired VM stays charged until Delete proves its resources absent"
+    );
 
     // The VM is gone before Delete; its disk, jail and charge are not.
     let view = kilnd_view(&state_dir);
@@ -494,7 +517,7 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
     let deleted = transcript.kilndctl(&bin, &socket, &["get", &id], None);
     assert!(deleted.stdout.contains("deleted"), "{}", deleted.stdout);
     transcript.kilndctl(&bin, &socket, &["ls", "--all"], None);
-    transcript.kilndctl(&bin, &socket, &["health"], None);
+    assert_eq!(node_sandboxes(&mut transcript, &bin, &socket).await, 0);
 
     // Nothing is left: no VMM, loop, mount, cgroup or file, no node claim, and the
     // daemon's row released by its matching ABSENT receipt.
