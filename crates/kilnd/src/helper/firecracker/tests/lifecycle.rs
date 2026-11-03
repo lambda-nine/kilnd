@@ -125,12 +125,15 @@ fn real_tree_with(
     for name in ["Image", "rootfs.squashfs"] {
         std::fs::copy(guest_dir.join(name), bundle.join(name)).unwrap();
     }
-    for name in ["kernel.config", "kiln", "kilnd-guest-broker"] {
-        let source = match guest {
-            Some(dir) if name == "kilnd-guest-broker" => dir.join(name),
-            _ => bundle_source(name),
-        };
-        std::fs::copy(source, bundle.join(name)).unwrap();
+    // The broker artifact is the one this root runs: HelloReply's digest must match
+    // the manifest's pin (B5-10), so it never comes from the synthetic fixtures.
+    std::fs::copy(
+        guest_dir.join("kilnd-guest-broker"),
+        bundle.join("kilnd-guest-broker"),
+    )
+    .unwrap();
+    for name in ["kernel.config", "kiln"] {
+        std::fs::copy(bundle_source(name), bundle.join(name)).unwrap();
     }
     let manifest = real_manifest(&pins, &bundle);
     std::fs::write(bundle.join("manifest.json"), &manifest).unwrap();

@@ -8,7 +8,8 @@
 #   B4_VMM     the release Firecracker v1.17.0 aarch64 binary
 #   KILND_B5_KILL_INNER_GUEST, KILND_B5_CONSOLE_FLOOD_GUEST  B5's test guests from
 #              scripts/b5-test-guest.sh, for the two b5_linux_root tests that need them
-#   B4_GUEST   a kiln-guest bundle directory with Image and rootfs.squashfs: the schema-1
+#   B4_GUEST   a kiln-guest bundle directory with Image, rootfs.squashfs and
+#              kilnd-guest-broker (the B5 production bundle; earlier: the schema-1
 #              guest, which listens for no command, so a boot ends at BOOTING
 # The test binary is built static (crt-static) because it is installed as the helper
 # image and the contract approves static ELFs only. Everything the tests create under
@@ -55,6 +56,9 @@ sudo install -m 0555 -o root -g root "$tools/mkfs.xfs" "$work/artifacts/mkfs.xfs
 sudo install -m 0555 -o root -g root "$vmm" "$work/artifacts/firecracker"
 sudo install -m 0444 -o root -g root "$guest/Image" "$work/artifacts/Image"
 sudo install -m 0444 -o root -g root "$guest/rootfs.squashfs" "$work/artifacts/rootfs.squashfs"
+# Since B5-10 the host checks the broker's digest against the manifest's pin: the
+# bundle's own broker artifact, which its root runs.
+sudo install -m 0444 -o root -g root "$guest/kilnd-guest-broker" "$work/artifacts/kilnd-guest-broker"
 # A stripped static copy is the helper image: it is hashed at every helper start.
 sudo install -m 0755 -o root -g root "$lib" "$work/kilnd-lib-tests"
 sudo strip --strip-debug "$work/kilnd-lib-tests"
