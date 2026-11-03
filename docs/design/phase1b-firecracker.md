@@ -571,7 +571,7 @@ After the node-global C2 claim and real free-space check, P uses `openat(O_CREAT
 
 `-K` prevents discard undoing preallocation. Format only the new inode before exposure; verify identity before/after and sync file/parent. Never mkfs/repair a disk after a guest has written it. The backing file stays root-owned 0600 and inaccessible to jail UID/GID.
 
-Expose the work volume as a **helper-owned loop block device**, size limit exactly W, rather than a writable regular backing file inside the jail. Persist LOOP_INTENT with the chosen slot's major/minor, backing device/inode, offset=0, size limit and logical block size (512) **before** LOOP_CONFIGURE/binding. LOOP_CONFIGURE sets `LO_FLAGS_AUTOCLEAR`; on the configuring descriptor S then reads the attachment's generation, its disk sequence number (`BLKGETDISKSEQ`), and journals it with the boot ID as the `loop` record. Only then does it clear autoclear on that descriptor (`LOOP_SET_STATUS64` writing back exactly what `LOOP_GET_STATUS64` returned, less the flag) and re-verify the tuple and generation, so a crash before the record leaves no attachment once S's descriptor closes. An unexpectedly busy slot is a conflict, never permission to replace its backing. Binding, cleanup and crash recovery validate all of those identities: before LOOP_CLR_FD, on the same opened slot descriptor that then detaches it, cleanup requires the journaled boot ID, the full recorded tuple (including the kernel's `BLKGETSIZE64` and `BLKSSZGET`) and the journaled disk sequence number, read again immediately before the ioctl. The recorded backing inode bound with any other offset, size limit or block size, or with another disk sequence number (detached and rebound, even with the exact tuple), is Unknown: left bound and charged, never detached. A slot with only an intent is never detached: its autoclear attachment is waited out briefly and otherwise Unknown. A generation from another boot is gone by definition and the slot is not touched. Bind only the device node as `/work`, owned U:G and mode 0600; no loop-control device, host `/dev` directory or backing-file path enters the jail. The unprivileged VMM cannot grow/truncate the root-owned backing file or resize the block device. Disable discard/unmap paths that could punch holes in the allocation guarantee. B4 must prove the pinned Firecracker synchronous block backend accepts this fixed-size block device and cannot enlarge/rebind it under the VMM credentials/seccomp; an unsupported backend fails closed, without a regular-file fallback. Loop attachment is privileged typed storage work, never a caller-selected device.
+Expose the work volume as a **helper-owned loop block device**, size limit exactly W, rather than a writable regular backing file inside the jail. Persist LOOP_INTENT with the chosen slot's major/minor, backing device/inode, offset=0, size limit and logical block size (512) **before** LOOP_CONFIGURE/binding. LOOP_CONFIGURE sets `LO_FLAGS_AUTOCLEAR`; on the configuring descriptor S then reads the attachment's generation, its disk sequence number (`BLKGETDISKSEQ`), and journals it with the boot ID as the `loop` record. Only then does it clear autoclear on that descriptor (`LOOP_SET_STATUS64` writing back exactly what `LOOP_GET_STATUS64` returned, less the flag) and re-verify the tuple and generation, so a crash before the record leaves no attachment once S's descriptor closes. An unexpectedly busy slot is a conflict, never permission to replace its backing. Binding, cleanup and crash recovery validate all of those identities: before LOOP_CLR_FD, on the same opened slot descriptor that then detaches it, cleanup requires the journaled boot ID, the full recorded tuple (including the kernel's `BLKGETSIZE64` and `BLKSSZGET`) and the journaled disk sequence number, read again immediately before the ioctl. Once a generation is journaled, its slot bound to anything other than that generation is Unknown: left bound and charged, never detached. That covers another backing file, the recorded backing inode with any other offset, size limit or block size, and another disk sequence number (detached and rebound, even with the exact tuple). A slot with only an intent is never detached: its autoclear attachment is waited out briefly and otherwise Unknown; only there is another backing file NotOurs, because a busy candidate slot can be another allocation's. A generation from another boot is gone by definition and the slot is not touched. After cleanup detaches a generation, or finds its slot free, it journals `loop_released` for it; from then on that slot is not the allocation's, so a retry or the absence observation never takes a later binding there for a replacement. Cleanup's leftover check and the absence observation read every journaled, unreleased slot itself by major and minor, not only slots backed inside the work directory, and a bound one blocks ABSENT. Bind only the device node as `/work`, owned U:G and mode 0600; no loop-control device, host `/dev` directory or backing-file path enters the jail. The unprivileged VMM cannot grow/truncate the root-owned backing file or resize the block device. Disable discard/unmap paths that could punch holes in the allocation guarantee. B4 must prove the pinned Firecracker synchronous block backend accepts this fixed-size block device and cannot enlarge/rebind it under the VMM credentials/seccomp; an unsupported backend fails closed, without a regular-file fallback. Loop attachment is privileged typed storage work, never a caller-selected device.
 
 Guest init mounts vdb at `/var/lib/kiln/runs` with `nosuid,nodev,noexec,prjquota`. Kiln's persistent sandbox project quota bounds blocks and inodes, probed before Ready. Test direct work-path execution denied and normal overlay execution allowed. Guest root can bypass its inner quota but cannot exceed W; this is a physical outer bound, not trust in guest enforcement.
 
@@ -585,9 +585,9 @@ Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no laz
 
 **Teardown fault model (B4 recheck, November 2, 2026).** Copyable markers and check-then-ioctl sequences cannot beat a concurrent host-root actor, so B4's exact-identity guarantee is defined by kernel IDs that are never reused within a boot, plus the boot ID (`/proc/sys/kernel/random/boot_id`), journaled with every identity: a different boot ID means every recorded mount and loop attachment is gone by definition.
 
-- *In scope:* root replacing a resource before cleanup, at any crash point — a fresh tmpfs or bind at the path, or a loop slot detached and rebound, with any tuple. That is refused: the unique ID or disk sequence number differs, the allocation is Unknown and stays charged, and the replacement is left exactly as it is.
+- *In scope:* root replacing a resource before cleanup, at any crash point, a reboot included — a fresh tmpfs or bind at the path, a loop slot detached and rebound with any backing file or tuple, a cgroup node removed and recreated, or a work-directory file deleted and recreated. That is refused: the unique mount ID, the disk sequence number, the cgroup inode with its boot ID, or the file's birth time differs, the allocation is Unknown and stays charged, and the replacement is left exactly as it is. cgroupfs inode numbers are never reused within a boot but start again at each boot, so `CgroupIdentity` carries the boot ID and records every node; a tree recorded in another boot is gone and anything at its path is Replaced. Files outlive a reboot and their inode numbers are reused once deleted, so a `FileIdentity` adds the `statx` birth time (`STATX_BTIME`), which no system call sets; a filesystem that does not report it refuses the launch.
 - *Out of scope:* host root mutating one of our own resources in place, during teardown — for example `LOOP_SET_STATUS64` on our attachment between cleanup's comparison and `LOOP_CLR_FD`, which leaves the disk sequence number unchanged. Host root is trusted and the kernel has no compare-and-clear; detaching an attachment whose generation (disk sequence number and backing inode) matches is correct, because it is ours.
-- *Kernel facts relied on,* verified on the VM's 6.8.0-147 by `b4_linux_root_kernel_generation_ids_are_never_reused`: a replacement tmpfs gets a new unique mount ID although the reusable tuple is reused; a detached mount keeps its unique ID when attached; detach plus reattach of the same slot, inode and tuple changes the disk sequence number; `LOOP_SET_STATUS64` does not. Also observed: while cleanup's descriptor on a slot is open, another opener's `LOOP_CLR_FD` only marks it autoclear and a rebinding `LOOP_CONFIGURE` fails `EBUSY`, so a replacement cannot land inside cleanup's own comparison-to-clear window. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
+- *Kernel facts relied on,* verified on the VM's 6.8.0-147 by `b4_linux_root_kernel_generation_ids_are_never_reused`: a replacement tmpfs gets a new unique mount ID although the reusable tuple is reused; a detached mount keeps its unique ID when attached; detach plus reattach of the same slot, inode and tuple changes the disk sequence number; `LOOP_SET_STATUS64` does not. B4 recheck 2 added, on the same kernel: ext4 gave a recreated work file the deleted file's inode number at once, with a later birth time (`b4_linux_root_cleanup_refuses_a_work_file_reusing_the_inode`). Also observed: while cleanup's descriptor on a slot is open, another opener's `LOOP_CLR_FD` only marks it autoclear and a rebinding `LOOP_CONFIGURE` fails `EBUSY`, so a replacement cannot land inside cleanup's own comparison-to-clear window. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
 
 ## 7.2 Durable reservation vector
 
@@ -1466,7 +1466,9 @@ VM by `scripts/b4-vm-tests.sh` under exactly the helper unit's bounding set; raw
 *Amended by the B4 recheck corrections below:* the marker and reusable tuple of item 1 are
 now secondary to the journaled unique mount ID, an unjournaled bind is no longer ours by its
 name, item 2's tuple is joined by the disk sequence number, item 3's fallback is root-strict,
-item 4's gate moved after publishing, and item 5's record waits for exit status 0.
+item 4's gate moved after publishing, and item 5's record waits for exit status 0. *Amended
+by the B4 recheck 2 corrections:* item 2's NotOurs for another backing file now applies only
+to a slot with no journaled generation.
 
 Daybreak Blue's B4 review (`reviews/2026-11-02-b4-breakit.md`, PoCs in `reviews/poc-b4/`)
 found destructive cleanup acting on replacements, a fail-open capability path, unpinned
@@ -1583,6 +1585,10 @@ to installed main `734e275` with its schema-7 database.
 
 ## B4 recheck corrections (November 2, 2026)
 
+*Amended by the B4 recheck 2 corrections below:* item 2's journaled generation now makes
+another backing file in its slot Unknown too, and the leftover check reads the journaled slot
+itself.
+
 Daybreak Blue's recheck of `38aee62` (`reviews/2026-11-02-b4-recheck.md`, PoCs in
 `reviews/poc-b4-recheck/`) broke all five corrections with adversarial variants: a copied
 marker and an unjournaled bind name authorized replacement mounts, a loop retuned between
@@ -1687,3 +1693,101 @@ database. A station restart interrupted the first
 suite run (on the uncommitted fix, after its first 12 tests, crash matrix included, had
 passed); the VM came back with no mount, loop or cgroup left, and the full rerun above is
 the evidence.
+
+## B4 recheck 2 corrections (November 2, 2026)
+
+Daybreak Blue's second recheck of `ee79331` (`reviews/2026-11-02-b4-recheck2.md`, PoC in
+`reviews/poc-b4-recheck2/`) confirmed the five earlier corrections and found one in-scope
+replacement that still reached ABSENT: root detaches the journaled loop and rebinds its slot
+to another backing inode. `match_slot` reported `OtherBacking` before the disk sequence
+number was compared, `detach_loop` mapped that to NotOurs, cleanup accepted NotOurs, and both
+the leftover check and the absence observation only scanned slots backed inside the work
+directory. The finding is accepted and fixed in `8afe9c5`; the sweep it asked for found two
+more journaled identities a replacement could satisfy, fixed in `4ede400`.
+
+**1. Loops: a journaled slot holding anything else is Unknown.** With a generation journaled,
+`detach_loop` returns Unknown for any occupied slot that is not exactly that generation and
+tuple, whatever its backing file. NotOurs remains only for an intent-only candidate slot
+bound to another backing file. `storage::recorded_loop_present` reads a recorded slot by
+major and minor: free or another boot's generation is absent; with this boot's generation,
+any binding is present; with only an intent, only our backing inode is. Cleanup's leftover
+check and `observe_presence` use it for every journaled, unreleased slot, in addition to
+`loops_backed_in`; H now loads the allocation's journal in `fence_flow` and sends its loops
+with `ObserveAllocation`. Because LOOP_CTL_GET_FREE hands a freed slot to the next
+allocation, cleanup journals a new `loop_released` record (resource kind `loop_released`,
+accepted as evidence after the stop fence) once it detaches a generation or finds it gone; a
+released slot is skipped by retries and by the observation. A crash between the detach and
+that record leaves the slot Unknown if anything binds it before the retry: charged, not
+guessed. The crash point is `S.after.loop_detach`.
+
+**2. Sweep.** Every outcome that cleanup, the recovery worker K and Gc (which removes through
+the same Remove path) accept as success, checked for a journaled identity replaced before
+cleanup:
+
+| Resource | Accepted outcome | Replaced before cleanup | Verdict |
+|---|---|---|---|
+| Loop, journaled generation | Detached: exact tuple and disk sequence number | Other diskseq or tuple on our inode: Unknown | Correct (recheck 1) |
+| Loop, journaled generation | NotOurs: another backing file | Accepted, ABSENT with the replacement bound | **Fixed:** Unknown |
+| Loop, journaled generation | Free: slot free or `/dev/loopN` gone | Nothing bound: gone | Correct |
+| Loop, generation of another boot | Free, slot untouched | Gone by definition | Correct |
+| Loop, after our `LOOP_CLR_FD` | Detached when the slot is rebound with another diskseq | Ours went by this cleanup | Correct; now journaled as `loop_released` |
+| Loop, intent only | NotOurs: another backing file | May be another allocation's | Kept by design; our inode is Unknown |
+| Loop leftover check and observation | Only slots backed in the work directory | A foreign-backed replacement was invisible | **Fixed:** journaled slots by major/minor |
+| Jail tmpfs | Nothing mounted under the jail directory | Fresh tmpfs, copied marker, another boot's record: unique ID refused | Correct (recheck 1) |
+| Read-only binds | None mounted | Unjournaled or replaced bind: refused by unique ID | Correct (recheck 1) |
+| cgroup `vm` node (kill) | Absent, or Empty after `cgroup.kill` by inode | Other inode: Replaced, refused | Correct within a boot |
+| cgroup, record from another boot | Inode match after a reboot | Inode numbers restart: a recreated tree could match | **Fixed:** boot ID; present means Replaced |
+| cgroup children (`remove_tree`) | Parent inode only | Replaced `control`/`relay`/`vm`/`vmm`/`console` removed | **Fixed:** every recorded child |
+| cgroup in H's stop target | Kill by recorded `vm` inode | Another boot's inode could name a replacement | **Fixed:** left out |
+| VMM process | Not running with the recorded start time | PID reuse is another process; ours is gone | Correct |
+| J, S, cleanup S, formatter | Worker records probed by PID, start time and boot ID; formatter waited by S in the charged leaf | PID reuse is another process | Correct |
+| Work, identity and config files | Recorded `(st_dev, st_ino)` matches | ext4 reuses the inode number: replacement deleted as ours | **Fixed:** birth time |
+| Unrecorded work file, jail and work directories | Ours by fixed name in a root-only directory, empty or owned entries only | No generation was journaled | Unchanged (intent-only analogue) |
+| Absence observation | No cgroup, mount, jail or work directory, or loop | Any present name blocks ABSENT | Correct; loops fixed above |
+
+Still outside the fault model, as before: root mutating our own resource in place during
+teardown (here also moving our journaled tmpfs elsewhere with `mount --move`, or swapping a
+cgroup child between `remove_tree`'s inode check and its `rmdir`), and a replacement file
+created with the clock set back to our file's exact birth nanosecond.
+
+**3. cgroup and files.** `CgroupIdentity` gains `boot_id` and the `relay` and `vm/console`
+inodes. `cgroup::kill_recorded` (used by `contain`) and `cgroup::remove_tree` report a tree
+recorded in another boot as Replaced when anything is at its path, and `remove_tree` compares
+every recorded child before removing anything. `FileIdentity` gains `btime_sec` and
+`btime_nsec` from `statx`; creation, `identity_at` and `remove_work` use it, and the
+preallocation and formatting checks compare the whole generation.
+
+**Regressions.** `tests::lifecycle::b4_linux_root_cleanup_refuses_a_foreign_backing_loop_replacement`
+(the PoC on the real chain: Remove refuses, the allocation stays charged, the foreign binding
+survives and the observation lists the slot; after `loop_released` a later binding of the slot
+is left alone and Remove reaches ABSENT; with `S.after.loop_detach` the same later binding is
+refused and charged), `storage::tests::b4_linux_root_detach_refuses_a_foreign_backing_generation`
+(was `poc_b4_recheck2_foreign_loop_replacement_is_accepted`, plus the intent-only and
+other-boot cases), `storage::tests::b4_linux_root_cleanup_refuses_a_work_file_reusing_the_inode`
+and `cgroup::tests::b4_linux_root_cgroup_cleanup_refuses_replaced_nodes_and_other_boots`. The
+stale-resource test's foreign-rebinding case, which expected ABSENT, moved into the first.
+
+**Results (November 2, 2026, in `kiln` on Linux 6.8.0-147, raw output in
+`reviews/2026-11-02-b4-fixes3-vm/`).** `scripts/b4-vm-tests.sh` ran all 24 root tests at
+`4ede400` and all passed in 1167.8 s: the 20 earlier exit tests and regressions, the crash
+matrix included, and the four new ones. The journaled slot rebound to a foreign inode
+(disk sequence number 58, journaled 56) was refused, stayed charged and stayed bound, and the
+absence observation listed it; after `loop_released`, the same slot bound again was left alone
+and Remove reached ABSENT; with the crash before that record, the later binding was refused
+and charged. At storage level the foreign rebinding was Unknown and present, an intent-only
+slot kept NotOurs and another boot's generation was Free. ext4 gave the recreated work file
+the deleted file's inode number (607456) on the first try, and the differing birth time
+refused it; a replaced cgroup child and another boot's record were refused and left in place.
+The cleanup check found no owned VMM, loop, mount, cgroup or file. With `4ede400` installed,
+`integration-test.sh`, `daemon-singleton-regressions.sh`, `state-path-regressions.sh`,
+`phase0-regressions.py`, `smoke.sh` and `kilnd-maintenance-tests.py` passed, as did
+`deployment-regressions.py` between two builds and its `--reboot-arm graceful` and
+`--reboot-verify` around a real reboot of the VM. Installing `4ede400` migrated the VM's dev
+database from schema 7 to 10, and no schema-7 copy had been taken first. The schema-7 database
+was rebuilt from it with `734e275`'s own schema: its `sandboxes` and `executions` columns are
+a subset of schema 10's, and the 7-to-8 migration copies them unchanged. All 128 rows from
+before this run and their 375 executions were kept, the 10 sandboxes this run's suites created
+were left out, and `history_sequence` went back to 272. The schema-10 file is kept, root-only, at
+`/root/kilnd-db-backups/` in the VM. `734e275` was reinstalled (`kilnd` SHA-256 `c39c3f3b…`);
+`quick_check` passed, health as the `kilnd` account served, and the legacy ambiguous failure's
+64 MiB/128 PID/16 MiB charge was still held.

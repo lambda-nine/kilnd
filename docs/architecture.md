@@ -196,8 +196,9 @@ VMM, hardens the jail and journals BOOTING; every resource is journaled through 
 or as S owns it. Stop, Remove and scoped Gc contain through K's pinned-inode
 `cgroup.kill`, clean up through a journaled cleanup-only S, and release only through the
 existing ABSENT fence after a real namespace observation. Cleanup acts only on exact
-journaled identities (the jail tmpfs's source and marker nonce, its binds, the loop
-slot's full tuple) and refuses anything else, so it stays charged. Production still serves no
+journaled identities (the jail tmpfs's and binds' unique mount IDs, the loop slot's full
+tuple and disk sequence number, the cgroup inodes with the boot ID, and file birth times) and
+refuses anything else, so it stays charged. Production still serves no
 profile and nothing reports READY.
 
 ## State machine

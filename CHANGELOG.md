@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B4 recheck 2 corrections. A journaled loop slot rebound to another backing file
+  is Unknown and charged, not NotOurs; NotOurs remains only for an intent-only slot. Cleanup's
+  leftover check and the absence observation read each journaled slot by major and minor, and
+  cleanup journals `loop_released` once a generation is gone so a later binding of the slot
+  is not mistaken for a replacement. The cgroup identity records the boot ID and every node's
+  inode; a tree recorded in another boot, or a replaced child, is refused. Work-directory
+  files add their `statx` birth time, so a replacement reusing the inode number is refused;
+  a filesystem without `STATX_BTIME` refuses the launch. The ledger keeps schema 1: a B4
+  ledger must be provisioned again.
 - Phase 1b B4 recheck corrections. Teardown identity now comes from kernel IDs never reused
   within a boot, journaled with the boot ID: the jail tmpfs's and every bind's
   `STATX_MNT_ID_UNIQUE` (Linux 6.8+, no fallback), taken from the detached mount descriptor

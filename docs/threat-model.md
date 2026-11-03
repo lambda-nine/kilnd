@@ -184,8 +184,11 @@ sandbox compromises the host.
   drops them, verifies every capability set and exits rather than continue on any
   failure. Cleanup unmounts and detaches only by exact journaled identity, taken from kernel IDs
   never reused within a boot and journaled with the boot ID: each jail mount's and bind's
-  unique mount ID (`STATX_MNT_ID_UNIQUE`, journaled before it is attached), and a loop
-  attachment's disk sequence number with its full tuple. The reusable mount ID, inode,
+  unique mount ID (`STATX_MNT_ID_UNIQUE`, journaled before it is attached), a loop
+  attachment's disk sequence number with its full tuple, and the cgroup tree's inodes; a work
+  file adds its birth time, since its inode number is reused once deleted. A journaled loop
+  slot bound to anything else, another backing file included, is Unknown, and the absence
+  observation reads each journaled slot itself. The reusable mount ID, inode,
   source and marker are secondary checks only, and a bind that was never journaled is never
   inferred from its name. The fault model is explicit: host root replacing one of these
   resources before cleanup, at any crash point, is refused, left in place and the allocation
