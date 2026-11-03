@@ -112,6 +112,9 @@ impl ExclusiveFileLock {
         })
     }
 
+    // Approved (design 7.1): truncates this process's own just-locked lock file before
+    // writing its diagnostic PID; the inode was re-verified at the stable pathname above.
+    #[allow(clippy::disallowed_methods)]
     fn finish_acquire(
         mut file: File,
         path: &Path,

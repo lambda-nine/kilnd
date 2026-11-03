@@ -386,6 +386,9 @@ pub fn assemble(
 }
 
 #[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They create,
+// overwrite and remove their own scratch files directly.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::model::Digest;

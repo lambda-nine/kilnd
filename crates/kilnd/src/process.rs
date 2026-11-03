@@ -2,9 +2,10 @@
 //! and cancellation. Backends use it to drive their CLIs; nothing here goes
 //! through a shell.
 
+#[cfg(test)]
 use std::ffi::OsStr;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -81,16 +82,7 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
     let mut holds_launch_bits =
         (data[0].effective | data[0].permitted | data[0].inheritable) & mask != 0;
     for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
-        // SAFETY: prctl with constant integer arguments.
-        let ambient = unsafe {
-            libc::prctl(
-                libc::PR_CAP_AMBIENT,
-                libc::PR_CAP_AMBIENT_IS_SET as libc::c_ulong,
-                cap as libc::c_ulong,
-                0,
-                0,
-            )
-        };
+        let ambient = crate::sys::prctl::cap_ambient_is_set(cap);
         if ambient < 0 {
             return Err(last());
         }
@@ -100,16 +92,14 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
     // The bounding set, CAP_SETPCAP last: dropping a bounding bit needs it.
     let mut inert_bounding = false;
     for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
-        // SAFETY: prctl with constant integer arguments.
-        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) };
+        let present = crate::sys::prctl::capbset_read(cap);
         if present < 0 {
             return Err(last());
         }
         if present == 0 {
             continue;
         }
-        // SAFETY: as above.
-        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
+        if crate::sys::prctl::capbset_drop(cap) != 0 {
             let error = last();
             if error.raw_os_error() == Some(libc::EPERM) && may_fall_back {
                 inert_bounding = true;
@@ -120,17 +110,7 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
     }
     // Ambient bits, explicitly; clearing inheritable below would also clear them.
     for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
-        // SAFETY: as above.
-        let rc = unsafe {
-            libc::prctl(
-                libc::PR_CAP_AMBIENT,
-                libc::PR_CAP_AMBIENT_LOWER as libc::c_ulong,
-                cap as libc::c_ulong,
-                0,
-                0,
-            )
-        };
-        if rc != 0 {
+        if crate::sys::prctl::cap_ambient_lower(cap) != 0 {
             return Err(last());
         }
     }
@@ -142,11 +122,8 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
         pid: 0,
     };
     crate::sys::capset(&mut header, &data)?;
-    if inert_bounding {
-        // SAFETY: as above.
-        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-            return Err(last());
-        }
+    if inert_bounding && crate::sys::prctl::set_no_new_privs() != 0 {
+        return Err(last());
     }
     // Verify every set from the kernel, not from what was asked for.
     let mut after = [empty; 2];
@@ -155,16 +132,7 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(libc::EPERM));
     }
     for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
-        // SAFETY: as above.
-        let ambient = unsafe {
-            libc::prctl(
-                libc::PR_CAP_AMBIENT,
-                libc::PR_CAP_AMBIENT_IS_SET as libc::c_ulong,
-                cap as libc::c_ulong,
-                0,
-                0,
-            )
-        };
+        let ambient = crate::sys::prctl::cap_ambient_is_set(cap);
         if ambient != 0 {
             return Err(if ambient < 0 {
                 last()
@@ -172,8 +140,7 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
                 io::Error::from_raw_os_error(libc::EPERM)
             });
         }
-        // SAFETY: as above.
-        let bounding = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) };
+        let bounding = crate::sys::prctl::capbset_read(cap);
         if bounding < 0 {
             return Err(last());
         }
@@ -182,8 +149,7 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
         }
     }
     if inert_bounding {
-        // SAFETY: as above.
-        let nnp = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+        let nnp = crate::sys::prctl::get_no_new_privs();
         if nnp != 1 || after[0].permitted & (1 << SETPCAP) != 0 {
             return Err(if nnp < 0 {
                 last()
@@ -235,8 +201,7 @@ pub(crate) unsafe fn prepare_child(expected_parent: libc::pid_t) -> io::Result<(
         // A failed or unverified drop refuses the exec: the child exits without running
         // the backend.
         drop_firecracker_launch_capabilities()?;
-        // SAFETY: prctl is async-signal-safe and uses constant arguments.
-        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+        if crate::sys::prctl::set_parent_death_kill() != 0 {
             return Err(io::Error::last_os_error());
         }
         // PR_SET_PDEATHSIG is not retroactive. If the captured parent died
@@ -369,17 +334,158 @@ impl CaptureTask {
     }
 }
 
+/// The kiln CLI executable kilnd is configured with. It is checked at every launch
+/// ([`KilnBinary::verified`]), so the runners start only this one fixed tool.
+#[derive(Clone, Debug)]
+pub struct KilnBinary {
+    path: PathBuf,
+}
+
+impl KilnBinary {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn display(&self) -> std::path::Display<'_> {
+        self.path.display()
+    }
+
+    /// The configured path, if it is now an absolute path to a regular executable file
+    /// owned by root or by this process's user and writable by neither group nor others.
+    pub fn verified(&self) -> io::Result<&Path> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !self.path.is_absolute() {
+            return Err(io::Error::other(format!(
+                "kiln executable {} is not an absolute path",
+                self.path.display()
+            )));
+        }
+        let meta = std::fs::metadata(&self.path)?;
+        let mode = meta.permissions().mode();
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        if !meta.is_file() || mode & 0o111 == 0 || mode & 0o022 != 0 {
+            return Err(io::Error::other(format!(
+                "kiln executable {} is not a protected executable file (mode {:o})",
+                self.path.display(),
+                mode & 0o7777
+            )));
+        }
+        if meta.uid() != 0 && meta.uid() != euid {
+            return Err(io::Error::other(format!(
+                "kiln executable {} is owned by uid {}",
+                self.path.display(),
+                meta.uid()
+            )));
+        }
+        Ok(&self.path)
+    }
+}
+
+impl AsRef<Path> for KilnBinary {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// One kiln CLI invocation's arguments. Only the constructors below make one, each a
+/// fixed subcommand with typed operands, so no caller passes an arbitrary argv.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KilnArgs(Vec<String>);
+
+fn kiln_id(id: &str) -> io::Result<&str> {
+    if crate::runtime::kiln_direct::valid_kiln_id(id) {
+        Ok(id)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid kiln sandbox ID {id:?}"),
+        ))
+    }
+}
+
+impl KilnArgs {
+    /// `capabilities --protocol=1 [ID]`.
+    pub fn capabilities(id: Option<&str>) -> io::Result<Self> {
+        let mut args = vec!["capabilities".to_string(), "--protocol=1".to_string()];
+        if let Some(id) = id {
+            args.push(kiln_id(id)?.to_string());
+        }
+        Ok(Self(args))
+    }
+
+    /// `gc --help`.
+    pub fn gc_help() -> Self {
+        Self(vec!["gc".into(), "--help".into()])
+    }
+
+    /// `ls`.
+    pub fn ls() -> Self {
+        Self(vec!["ls".into()])
+    }
+
+    /// `rm ID`.
+    pub fn rm(id: &str) -> io::Result<Self> {
+        Ok(Self(vec!["rm".into(), kiln_id(id)?.to_string()]))
+    }
+
+    /// `gc ID...`: scoped collection of exactly these sandboxes, never a global one.
+    pub fn gc(ids: &[String]) -> io::Result<Self> {
+        if ids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scoped gc needs at least one ID",
+            ));
+        }
+        let mut args = vec!["gc".to_string()];
+        for id in ids {
+            args.push(kiln_id(id)?.to_string());
+        }
+        Ok(Self(args))
+    }
+
+    /// `create` with the spec's flags (every value in `--flag=value` form).
+    pub fn create(spec: &crate::model::SandboxSpec) -> Self {
+        Self(crate::runtime::kiln_direct::create_args(spec))
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// The programs [`run`] may start (design 7.1, B4 recheck 5). There is no arbitrary
+/// program variant, so the runner cannot broker `rm`, `umount` or another destructive
+/// utility around the clippy gate: a new tool needs a new variant here.
+pub enum Tool<'a> {
+    /// The verified kiln CLI with typed arguments.
+    Kiln {
+        bin: &'a KilnBinary,
+        args: &'a KilnArgs,
+    },
+    /// Test fixtures only: a shell or `sleep` driving the runner's own mechanics.
+    #[cfg(test)]
+    Fixture {
+        program: &'a Path,
+        args: &'a [&'a OsStr],
+    },
+}
+
 pub struct Request<'a> {
-    pub program: &'a Path,
-    pub args: &'a [&'a OsStr],
+    pub tool: Tool<'a>,
     pub stdin: &'a [u8],
     pub deadline: tokio::time::Instant,
     pub max_output: usize,
 }
 
-// Approved (design 7.1): kilnd's one generic subprocess runner (the kiln CLI and other
-// fixed tools, with a cleared environment), and SIGKILL of its own unreaped tokio child at
-// the deadline or on cancel: the PID cannot be reused before this runner reaps it.
+// Approved (design 7.1): kilnd's one subprocess runner, for the fixed `Tool` variants only
+// (the verified kiln CLI with typed arguments, with a cleared environment), and SIGKILL of
+// its own unreaped tokio child at the deadline or on cancel: the PID cannot be reused
+// before this runner reaps it.
 #[allow(clippy::disallowed_methods)]
 pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Outcome> {
     if cancel.is_cancelled() {
@@ -404,9 +510,20 @@ pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Ou
             ),
         });
     }
-    let mut cmd = Command::new(req.program);
-    cmd.args(req.args)
-        .env_clear()
+    let mut cmd = match &req.tool {
+        Tool::Kiln { bin, args } => {
+            let mut cmd = Command::new(bin.verified()?);
+            cmd.args(args.as_slice());
+            cmd
+        }
+        #[cfg(test)]
+        Tool::Fixture { program, args } => {
+            let mut cmd = Command::new(program);
+            cmd.args(args.iter());
+            cmd
+        }
+    };
+    cmd.env_clear()
         .env("PATH", SAFE_PATH)
         .stdin(if req.stdin.is_empty() {
             Stdio::null()
@@ -1001,8 +1118,10 @@ mod tests {
     async fn sh(script: &str, stdin: &[u8], timeout: Duration, max_output: usize) -> Outcome {
         let args = [OsStr::new("-c"), OsStr::new(script)];
         let req = Request {
-            program: Path::new("/bin/sh"),
-            args: &args,
+            tool: Tool::Fixture {
+                program: Path::new("/bin/sh"),
+                args: &args,
+            },
             stdin,
             deadline: tokio::time::Instant::now() + timeout,
             max_output,
@@ -1041,8 +1160,10 @@ mod tests {
         let script = format!("touch '{}'", marker.display());
         let args = [OsStr::new("-c"), OsStr::new(&script)];
         let req = Request {
-            program: Path::new("/bin/sh"),
-            args: &args,
+            tool: Tool::Fixture {
+                program: Path::new("/bin/sh"),
+                args: &args,
+            },
             stdin: b"",
             deadline: tokio::time::Instant::now() - Duration::from_secs(1),
             max_output: 10,
@@ -1325,8 +1446,10 @@ mod tests {
         let cancel = CancellationToken::new();
         let args = [OsStr::new("30")];
         let req = Request {
-            program: Path::new("/bin/sleep"),
-            args: &args,
+            tool: Tool::Fixture {
+                program: Path::new("/bin/sleep"),
+                args: &args,
+            },
             stdin: b"",
             deadline: tokio::time::Instant::now() + Duration::from_secs(60),
             max_output: 1024,
@@ -1404,8 +1527,10 @@ mod tests {
         let script = format!("touch '{}'", marker.display());
         let args = [OsStr::new("-c"), OsStr::new(&script)];
         let req = Request {
-            program: Path::new("/bin/sh"),
-            args: &args,
+            tool: Tool::Fixture {
+                program: Path::new("/bin/sh"),
+                args: &args,
+            },
             stdin: b"",
             deadline: tokio::time::Instant::now() + Duration::from_secs(1),
             max_output: 1024,

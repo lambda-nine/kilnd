@@ -4,9 +4,8 @@
 # a justified #[allow(clippy::disallowed_methods)]. CI runs clippy with -D warnings on
 # Linux, and proven::tests::disallowed_allows_only_in_approved_modules rejects an allow
 # anywhere else. `allow-invalid` marks paths that exist only on some targets (macOS
-# libc has no umount2; Linux libc has no unmount); every one resolves on Linux except
-# pidfd_send_signal, which libc does not wrap (it is reachable only through
-# libc::syscall, itself disallowed).
+# libc has no umount2; Linux libc has no unmount); see design 7.1 for which resolve where.
+# rustix and nix are not dependencies.
 disallowed-methods = [
   # Signals.
   { path = "libc::kill", reason = "a signal: only proven.rs may signal (design 7.1)" },
@@ -37,6 +36,26 @@ disallowed-methods = [
   { path = "tokio::fs::remove_dir", reason = "destructive: only proven.rs (design 7.1)" },
   { path = "tokio::fs::remove_dir_all", reason = "destructive: only proven.rs (design 7.1)" },
   { path = "tokio::fs::rename", reason = "replaces a name: destructive (design 7.1)" },
+  # Truncation, creation-by-truncation and whole-file overwrite (B4 recheck 5).
+  { path = "std::fs::File::set_len", reason = "truncates or extends a file: approved storage items only (design 7.1)" },
+  { path = "std::fs::File::create", reason = "truncates an existing file: approved items only (design 7.1)" },
+  { path = "std::fs::OpenOptions::truncate", reason = "truncates an existing file: approved items only (design 7.1)" },
+  { path = "std::fs::write", reason = "creates or truncates by name: approved items only (design 7.1)" },
+  { path = "tokio::fs::File::set_len", reason = "truncates or extends a file: approved storage items only (design 7.1)" },
+  { path = "tokio::fs::File::create", reason = "truncates an existing file: approved items only (design 7.1)" },
+  { path = "tokio::fs::OpenOptions::truncate", reason = "truncates an existing file: approved items only (design 7.1)" },
+  { path = "tokio::fs::write", reason = "creates or truncates by name: approved items only (design 7.1)" },
+  { path = "libc::truncate", reason = "truncates by name: never (design 7.1)" },
+  { path = "libc::ftruncate", reason = "truncates a file: never (design 7.1)" },
+  { path = "libc::fallocate", reason = "can punch holes: only sys::preallocate's mode 0 (design 7.1)", allow-invalid = true },
+  { path = "libc::fallocate64", reason = "can punch holes: only sys::preallocate's mode 0 (design 7.1)", allow-invalid = true },
+  { path = "libc::posix_fallocate", reason = "storage allocation: only sys::preallocate (design 7.1)", allow-invalid = true },
+  # Raw process and memory control (B4 recheck 5).
+  { path = "libc::prctl", reason = "process control: only sys's dumpable wrappers (design 7.1)", allow-invalid = true },
+  { path = "libc::ptrace", reason = "another process's memory and registers: never (design 7.1)", allow-invalid = true },
+  { path = "libc::process_vm_writev", reason = "writes another process's memory: never (design 7.1)", allow-invalid = true },
+  { path = "libc::process_vm_readv", reason = "reads another process's memory: never (design 7.1)", allow-invalid = true },
+  { path = "libc::pidfd_getfd", reason = "steals another process's descriptor: never (design 7.1)", allow-invalid = true },
   # ioctl: only the typed wrapper, which offers read requests and the proof-gated LOOP_CLR_FD.
   { path = "libc::ioctl", reason = "use the typed ioctl wrapper (design 7.1)" },
   # Subprocesses.

@@ -553,7 +553,7 @@ mod linux {
     }
 
     fn proc_status(pid: i32) -> io::Result<String> {
-        std::fs::read_to_string(format!("/proc/{pid}/status"))
+        crate::sys::procfs::read_to_string(&format!("{pid}/status"))
     }
 
     fn ppid(pid: i32) -> io::Result<i32> {
@@ -573,7 +573,7 @@ mod linux {
         // SAFETY: setfsgid/setfsuid affect only this single-threaded process and are
         // restored before returning. Changing them also resets the dumpable flag, which
         // is put back exactly as it was.
-        let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        let dumpable = crate::sys::dumpable();
         unsafe {
             libc::setfsgid(gid);
             libc::setfsuid(uid);
@@ -582,9 +582,9 @@ mod linux {
         unsafe {
             libc::setfsuid(0);
             libc::setfsgid(0);
-            if dumpable >= 0 {
-                libc::prctl(libc::PR_SET_DUMPABLE, dumpable, 0, 0, 0);
-            }
+        }
+        if let Ok(dumpable) = dumpable {
+            let _ = crate::sys::set_dumpable(dumpable);
         }
         result
     }
@@ -592,15 +592,16 @@ mod linux {
     /// The descriptors a process holds, as link text: kept bounded and exact.
     pub fn open_descriptors(pid: i32) -> io::Result<BTreeMap<i32, String>> {
         let mut out = BTreeMap::new();
-        for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))? {
-            let entry = entry?;
-            let fd: i32 = entry
-                .file_name()
-                .to_str()
+        let dir = crate::sys::procfs::open_dir(&format!("{pid}/fd"))?;
+        for entry in crate::sys::read_dir_fd(&dir, 8192)? {
+            let fd: i32 = std::str::from_utf8(&entry.name)
+                .ok()
                 .and_then(|n| n.parse().ok())
                 .ok_or_else(|| io::Error::other("fd name"))?;
-            let target = std::fs::read_link(entry.path())
-                .map(|p| p.to_string_lossy().into_owned())
+            let name =
+                std::ffi::CString::new(entry.name).map_err(|_| io::Error::other("fd name"))?;
+            let target = crate::sys::read_link_at(&dir, &name)
+                .map(|p| String::from_utf8_lossy(&p).into_owned())
                 .unwrap_or_default();
             out.insert(fd, target);
             if out.len() > 4096 {
@@ -809,7 +810,7 @@ mod linux {
                 if observe {
                     // Test-only exec stop: the parent reads /proc/<pid>/exe at the
                     // post-exec trap and detaches. Production has no ptrace path.
-                    libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+                    crate::sys::ptrace_traceme();
                 }
                 let keep = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
                 executable::close_all_except(&[keep, report_raw]);
@@ -829,8 +830,7 @@ mod linux {
             child.wait()?;
             let actual =
                 executable::observe_process_image(pid, Role::MkfsXfs, mkfs.installation_generation);
-            // SAFETY: release the traced child.
-            unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) };
+            child.detach_trace();
             let actual = actual?;
             link.record(SupervisorRecord::Observed(actual))?;
             if actual != mkfs {
@@ -908,8 +908,8 @@ mod linux {
     ) -> Result<Booted, Abort> {
         let recipe = &plan.launch["resource_recipe"];
         // Orphans reparent here, so V becomes S's child when J exits.
-        // SAFETY: a process-wide flag on S itself.
-        cvt(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) })?;
+        // A process-wide flag on S itself.
+        cvt(crate::sys::prctl::set_child_subreaper())?;
         link.step("cgroup")?;
         link.record(SupervisorRecord::Resource(ResourceRecord::Intent(
             IntentKind::Cgroup,
@@ -1306,7 +1306,7 @@ mod linux {
         let v_proof = proven::prove_process(&v).map_err(|e| e.refusal("the VMM"))?;
         proven::signal(&v_proof, libc::SIGSTOP)?;
         link.wait_for(Duration::from_secs(5), || {
-            let stat = std::fs::read_to_string(format!("/proc/{}/stat", v.pid))?;
+            let stat = crate::sys::procfs::read_to_string(&format!("{}/stat", v.pid))?;
             let state = stat
                 .rfind(')')
                 .and_then(|at| stat[at + 1..].split_whitespace().next().map(str::to_owned));

@@ -2,7 +2,6 @@
 //! never links kiln's code or reads its state directories; the CLI's
 //! `create`, `exec`, `ls`, `rm` and `gc` are the whole interface.
 
-use std::ffi::OsStr;
 use std::io::ErrorKind;
 #[cfg(test)]
 use std::path::Path;
@@ -68,14 +67,14 @@ pub(crate) fn unsupported_token() -> RuntimeError {
 }
 
 pub struct DirectKilnRuntime {
-    bin: PathBuf,
+    bin: process::KilnBinary,
     cgroup_root: PathBuf,
 }
 
 impl DirectKilnRuntime {
     pub fn new(bin: PathBuf) -> Self {
         Self {
-            bin,
+            bin: process::KilnBinary::new(bin),
             cgroup_root: PathBuf::from("/sys/fs/cgroup/kiln"),
         }
     }
@@ -83,7 +82,7 @@ impl DirectKilnRuntime {
     async fn call_until(
         &self,
         op: &str,
-        args: &[String],
+        args: &process::KilnArgs,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<process::Outcome, RuntimeError> {
@@ -101,14 +100,15 @@ impl DirectKilnRuntime {
 
     async fn run_control(
         &self,
-        args: &[String],
+        args: &process::KilnArgs,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> std::io::Result<process::Outcome> {
-        let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
         let req = process::Request {
-            program: &self.bin,
-            args: &args,
+            tool: process::Tool::Kiln {
+                bin: &self.bin,
+                args,
+            },
             stdin: b"",
             deadline,
             max_output: CONTROL_OUTPUT,
@@ -122,12 +122,10 @@ impl DirectKilnRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<protocol::Capabilities, RuntimeError> {
-        let mut args = vec!["capabilities".into(), "--protocol=1".into()];
-        if let Some(id) = id {
-            args.push(id.into());
-        }
+        let args = process::KilnArgs::capabilities(id);
         let scope = id.map(|id| format!(" sandbox {id}")).unwrap_or_default();
         let result = async {
+            let args = args.map_err(|e| e.to_string())?;
             let out = kiln_process::probe(
                 &self.bin,
                 &args,
@@ -196,12 +194,7 @@ impl DirectKilnRuntime {
         cancel: &CancellationToken,
     ) -> Result<(), String> {
         let out = self
-            .call_until(
-                "gc --help",
-                &["gc".into(), "--help".into()],
-                deadline,
-                cancel,
-            )
+            .call_until("gc --help", &process::KilnArgs::gc_help(), deadline, cancel)
             .await
             .map_err(|e| format!("scoped gc capability check failed: {e}"))?;
         if out.stdout_completion != process::CaptureCompletion::Eof
@@ -232,7 +225,7 @@ impl DirectKilnRuntime {
     ) -> Result<Vec<BackendSandbox>, RuntimeError> {
         let deadline = deadline.min(Instant::now() + QUERY_TIMEOUT);
         let out = self
-            .call_until("ls", &["ls".into()], deadline, cancel)
+            .call_until("ls", &process::KilnArgs::ls(), deadline, cancel)
             .await?;
         if out.stdout_completion != process::CaptureCompletion::Eof
             || out.stderr_completion != process::CaptureCompletion::Eof
@@ -307,7 +300,7 @@ impl DirectKilnRuntime {
             .await
             .map_err(CreateFailure::definitely_not_created)?;
         let out = self
-            .run_control(&create_args(spec), deadline, cancel)
+            .run_control(&process::KilnArgs::create(spec), deadline, cancel)
             .await?;
         create_result(&out)
     }
@@ -321,7 +314,7 @@ impl DirectKilnRuntime {
         let deadline = deadline.min(Instant::now() + REMOVE_TIMEOUT);
         check_id(id)?;
         let removal = self
-            .call_until("rm", &["rm".into(), id.into()], deadline, cancel)
+            .call_until("rm", &process::KilnArgs::rm(id)?, deadline, cancel)
             .await;
         // A successful rm or a list omission alone does not prove that the
         // exact sandbox released its resources. Reuse startup's direct probe,
@@ -355,9 +348,7 @@ impl DirectKilnRuntime {
         for id in ids {
             check_id(id)?;
         }
-        let mut args = Vec::with_capacity(ids.len() + 1);
-        args.push("gc".to_string());
-        args.extend(ids.iter().cloned());
+        let args = process::KilnArgs::gc(ids)?;
         let out = self.call_until("gc", &args, deadline, cancel).await?;
         let requested: std::collections::HashSet<_> = ids.iter().map(String::as_str).collect();
         let mut removed = Vec::new();
@@ -600,7 +591,7 @@ impl DirectKilnRuntime {
     #[cfg(test)]
     fn with_cgroup_root(bin: PathBuf, cgroup_root: &Path) -> Self {
         Self {
-            bin,
+            bin: process::KilnBinary::new(bin),
             cgroup_root: cgroup_root.to_path_buf(),
         }
     }
@@ -1951,7 +1942,7 @@ mod tests {
                 (error.kind, error.stage),
                 (Kind::Incompatible, Stage::Handshake)
             );
-            assert!(error.message.contains(runtime.bin.to_str().unwrap()));
+            assert!(error.message.contains(runtime.bin.path().to_str().unwrap()));
             if mode == "old-pid1" {
                 assert!(error.message.contains("sandbox abcd"));
             }
@@ -2235,7 +2226,10 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let state = tmp.path().join("state");
-            let bin = create_fixture(tmp.path(), false, body).bin.clone();
+            let bin = create_fixture(tmp.path(), false, body)
+                .bin
+                .path()
+                .to_path_buf();
             let root = tmp.path().join("cgroup");
             let limits = Limits {
                 max_sandboxes: 1,
@@ -2382,7 +2376,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let marker = tmp.path().join("workload");
         let runtime = fixture_runtime(tmp.path(), &format!("open({marker:?},'w').close()"));
-        let source=fs::read_to_string(&runtime.bin).unwrap().replace("os.write(1,CAPS)",&format!("if len(sys.argv)>3:\n        open({:?},'w').write('#!/bin/sh\\necho old-binary-rejects-protocol >&2\\nexit 2\\n')\n    os.write(1,CAPS)",runtime.bin));
+        let source=fs::read_to_string(&runtime.bin).unwrap().replace("os.write(1,CAPS)",&format!("if len(sys.argv)>3:\n        open({:?},'w').write('#!/bin/sh\\necho old-binary-rejects-protocol >&2\\nexit 2\\n')\n    os.write(1,CAPS)",runtime.bin.path()));
         fs::write(&runtime.bin, source).unwrap();
         let out = execute(&runtime).await;
         assert_eq!(out.finish.unwrap_err().kind, Kind::Protocol);

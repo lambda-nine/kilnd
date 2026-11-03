@@ -1306,15 +1306,9 @@ pub fn observe_process_image(
     role: Role,
     generation: u64,
 ) -> io::Result<ExecutableIdentity> {
-    let path = CString::new(format!("/proc/{pid}/exe")).unwrap();
-    // SAFETY: path is NUL-terminated. This is the one permitted magic-link open: the
-    // resulting descriptor is the running image, not a name lookup of its path.
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: open returned a new owned descriptor.
-    let file = unsafe { File::from_raw_fd(fd) };
+    // The one permitted magic-link open, beneath the helper's private procfs instance:
+    // the resulting descriptor is the running image, not a name lookup of its path.
+    let file = crate::sys::procfs::open_image(pid)?;
     let meta = file.metadata()?;
     let sha256 = hash_descriptor(&file, meta.len()).map_err(io::Error::other)?;
     Ok(ExecutableIdentity {
@@ -1339,7 +1333,7 @@ pub fn verify_self_image(table: &ExecutableTable) -> Result<ExecutableIdentity, 
         Role::KilndHelper,
         expected.installation_generation,
     )
-    .map_err(|e| io_error("observe /proc/self/exe", e))?;
+    .map_err(|e| io_error("observe the running helper image", e))?;
     if actual != expected {
         return Err(ExecutableError::Mismatch(
             "running helper is not the protected installed image".into(),

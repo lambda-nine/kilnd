@@ -49,6 +49,8 @@ pub const RECOVERY_SLOTS: usize = 2;
 /// Test-only deterministic faults, by marker file. Compiled out of production: there
 /// is no public fixture mode, CLI switch or environment hook.
 #[cfg(test)]
+// Approved (design 7.1): test-only fault markers, compiled only under cfg(test).
+#[allow(clippy::disallowed_methods)]
 pub mod faults {
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -658,7 +660,9 @@ pub enum ProcessState {
 
 #[cfg(target_os = "linux")]
 pub fn process_state(pid: i32) -> ProcessState {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    // Beneath the helper's private procfs instance, never a /proc pathname a mount in
+    // its namespace could shadow (B4 recheck 5).
+    let Ok(stat) = crate::sys::procfs::read_to_string(&format!("{pid}/stat")) else {
         return ProcessState::Gone;
     };
     // The command name can hold spaces and parentheses: parse after the last ')'.
@@ -2122,6 +2126,8 @@ fn stop_vm(vm: &Option<ProcessId>) {
 }
 
 #[cfg(test)]
+// Approved (design 7.1): the fake runtime's marker files, compiled only under cfg(test).
+#[allow(clippy::disallowed_methods)]
 fn run_effect(
     context: &mut SupervisorContext,
     effect: FakeEffect,

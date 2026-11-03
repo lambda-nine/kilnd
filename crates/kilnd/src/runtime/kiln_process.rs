@@ -5,7 +5,6 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -21,7 +20,7 @@ use tokio_util::task::AbortOnDropHandle;
 use super::ExecSpec;
 use super::kiln_protocol::MAX_FRAME;
 use crate::model::Captured;
-use crate::process::{SAFE_PATH, prepare_child};
+use crate::process::{KilnArgs, KilnBinary, SAFE_PATH, prepare_child};
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -73,13 +72,13 @@ pub struct ProbeResult {
 // unreaped tokio child, whose PID cannot be reused before it is reaped.
 #[allow(clippy::disallowed_methods)]
 pub async fn probe(
-    bin: &Path,
-    args: &[String],
+    bin: &KilnBinary,
+    args: &KilnArgs,
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> io::Result<ProbeResult> {
-    let mut cmd = Command::new(bin);
-    cmd.args(args)
+    let mut cmd = Command::new(bin.verified()?);
+    cmd.args(args.as_slice())
         .env_clear()
         .env("PATH", SAFE_PATH)
         .stdin(Stdio::null())
@@ -253,7 +252,8 @@ fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
 impl OwnedExec {
     // Approved (design 7.1): launches `kiln exec` for one sandbox command.
     #[allow(clippy::disallowed_methods)]
-    pub fn spawn(bin: &Path, id: &str, spec: &ExecSpec<'_>) -> io::Result<Self> {
+    pub fn spawn(bin: &KilnBinary, id: &str, spec: &ExecSpec<'_>) -> io::Result<Self> {
+        let program = bin.verified()?;
         let spawning = crate::process::spawn_guard();
         let (status, status_child) = pair(Shutdown::Write, Shutdown::Read)?;
         let (mut stdin, stdin_child) = pair(Shutdown::Read, Shutdown::Write)?;
@@ -266,7 +266,7 @@ impl OwnedExec {
             stderr_child.as_raw_fd(),
         ];
         let expected_parent = unsafe { libc::getpid() };
-        let mut cmd = Command::new(bin);
+        let mut cmd = Command::new(program);
         cmd.arg("exec")
             .arg("--protocol=1")
             .arg(format!("--status-fd={}", fds[0]))
@@ -586,7 +586,7 @@ pub(super) mod tests {
         }
     }
 
-    pub fn fixture(path: &Path, body: &str) {
+    pub fn fixture(path: &std::path::Path, body: &str) {
         std::fs::write(path, format!(r#"#!/usr/bin/python3
 import os,sys,time,signal,socket
 CAPS=bytes.fromhex('4b494c4e45584f00010002001d0000001f000000010001000500080000000000302e312e306769742074657374')
@@ -619,7 +619,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             deadline: Instant::now() + Duration::from_secs(10),
             max_output: 3,
         };
-        let mut owner = OwnedExec::spawn(&bin, "abcd", &spec).unwrap();
+        let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         assert!(matches!(
             wait_for_cli(&mut owner, spec.deadline, &CancellationToken::new()).await,
             Stop::Exited
@@ -656,7 +656,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             deadline: Instant::now() + Duration::from_secs(10),
             max_output: 1024,
         };
-        let mut owner = OwnedExec::spawn(&bin, "abcd", &spec).unwrap();
+        let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         assert!(matches!(
             wait_for_cli(&mut owner, spec.deadline, &CancellationToken::new()).await,
             Stop::Exited
@@ -763,7 +763,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 100,
         };
-        let mut owner = OwnedExec::spawn(&bin, "abcd", &spec).unwrap();
+        let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         let pid = owner.child.id().unwrap();
         owner.panic_after_status = true;
         assert!(matches!(
@@ -796,7 +796,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                 deadline: Instant::now() + Duration::from_secs(5),
                 max_output: 1024,
             };
-            let mut owner = OwnedExec::spawn(&bin, "abcd", &spec).unwrap();
+            let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
                 while locked(&owner.stdout).captured.data.is_empty() {
                     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -841,7 +841,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 3,
         };
-        let mut owner = OwnedExec::spawn(&bin, "abcd", &spec).unwrap();
+        let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         assert!(matches!(
             wait_for_cli(&mut owner, spec.deadline, &CancellationToken::new()).await,
             Stop::Exited
@@ -885,10 +885,13 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                     let cancel = CancellationToken::new();
                     match path {
                         "run" => {
-                            let args = [std::ffi::OsStr::new("capabilities")];
+                            let bin = KilnBinary::new(bin.clone());
+                            let args = KilnArgs::capabilities(None).unwrap();
                             let request = crate::process::Request {
-                                program: &bin,
-                                args: &args,
+                                tool: crate::process::Tool::Kiln {
+                                    bin: &bin,
+                                    args: &args,
+                                },
                                 stdin: b"",
                                 deadline,
                                 max_output: 1024,
@@ -896,9 +899,14 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                             crate::process::run(&request, &cancel).await.unwrap();
                         }
                         "probe" => {
-                            probe(&bin, &["capabilities".to_string()], deadline, &cancel)
-                                .await
-                                .unwrap();
+                            probe(
+                                &KilnBinary::new(bin.clone()),
+                                &KilnArgs::capabilities(None).unwrap(),
+                                deadline,
+                                &cancel,
+                            )
+                            .await
+                            .unwrap();
                         }
                         _ => {
                             let argv = vec!["ignored".to_string()];
@@ -908,7 +916,9 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                                 deadline,
                                 max_output: 16,
                             };
-                            let mut owner = OwnedExec::spawn(&bin, "abcd", &spec).unwrap();
+                            let mut owner =
+                                OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec)
+                                    .unwrap();
                             owner.kill_reap().await.unwrap();
                             owner.settle().await;
                         }
@@ -972,7 +982,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                 deadline: Instant::now() + Duration::from_secs(5),
                 max_output: 3,
             };
-            let mut owner = OwnedExec::spawn(&bin, "abcd", &spec).unwrap();
+            let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
             let _ = wait_for_cli(&mut owner, spec.deadline, &CancellationToken::new()).await;
             owner.kill_reap().await.unwrap();
             let raw = owner.settle().await;

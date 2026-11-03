@@ -362,7 +362,7 @@ pub fn join(relative_leaf: &str, expected_ino: u64) -> io::Result<()> {
     }
     // "0" names the writer itself.
     write_control(&node, ControlFile::Procs, "0")?;
-    let own = std::fs::read_to_string("/proc/self/cgroup")?;
+    let own = crate::sys::procfs::read_to_string(&crate::sys::procfs::own("cgroup"))?;
     let expected = format!("0::/{relative_leaf}");
     if own.lines().next() != Some(expected.as_str()) {
         return Err(io::Error::other("the kernel placed this process elsewhere"));
@@ -486,12 +486,11 @@ pub fn allocation_names(instance_relative: &str) -> io::Result<Vec<String>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
         Err(error) => return Err(error),
     };
-    let path = format!("/proc/self/fd/{}", node.as_raw_fd());
+    // Enumerated from the node descriptor itself, never a /proc/self/fd pathname.
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            names.push(entry.file_name().to_string_lossy().into_owned());
+    for entry in crate::sys::read_dir_fd(&node, 8192)? {
+        if matches!(entry.kind, libc::DT_DIR | libc::DT_UNKNOWN) {
+            names.push(String::from_utf8_lossy(&entry.name).into_owned());
         }
         if names.len() > 4096 {
             return Err(io::Error::other("too many cgroup entries"));
@@ -553,7 +552,7 @@ pub fn inode(file: &File) -> io::Result<u64> {
 // Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
 // unmount and remove their own scratch resources and replacements directly.
 #[allow(clippy::disallowed_methods)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -805,6 +804,93 @@ mod tests {
             "B4 evidence: vm/vmm inode {replacement_ino} replaced journaled {journaled_vmm} and an \
              unexpected vm/extra were Replaced with no cgroup.kill; their processes \
              survived; the journaled tree was killed and removed",
+        );
+    }
+
+    /// Bind-mounts a directory of empty per-descriptor subdirectories over this
+    /// process's `/proc/self/fd`, as root in the helper's mount namespace could, and
+    /// unmounts it on drop.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct ShadowedProcFd {
+        _fake: tempfile::TempDir,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ShadowedProcFd {
+        /// `entry(fake_dir_for_fd)` fills each fake descriptor entry.
+        pub(crate) fn new(entry: impl Fn(&std::path::Path)) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            let fake = tempfile::tempdir_in("/var/tmp").unwrap();
+            for fd in 0..2048 {
+                entry(&fake.path().join(fd.to_string()));
+            }
+            let source = std::ffi::CString::new(fake.path().as_os_str().as_bytes()).unwrap();
+            let rc = unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    c"/proc/self/fd".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(rc, 0, "bind mount: {}", io::Error::last_os_error());
+            Self { _fake: fake }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ShadowedProcFd {
+        fn drop(&mut self) {
+            let rc = unsafe { libc::umount2(c"/proc/self/fd".as_ptr(), 0) };
+            assert_eq!(rc, 0, "unmount the fake /proc/self/fd");
+        }
+    }
+
+    /// B4 recheck 5 finding 1, the PoC as a regression: root bind-mounts a view of empty
+    /// directories over the helper's `/proc/self/fd`, after replacing `vm/vmm` and
+    /// putting an unrelated process in it. The proof enumerates the retained `vm`
+    /// descriptor itself (`getdents64`), so it still sees the replacement: the kill and
+    /// the removal are Replaced, and the process survives.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root, cgroup2 and CAP_SYS_ADMIN: run scripts/b4-vm-tests.sh"]
+    fn b4_linux_root_a_shadowed_proc_fd_view_cannot_hide_a_replaced_child() {
+        let instance = format!("{FIRECRACKER_TREE}/b4-recheck5-{}", std::process::id());
+        let relative = format!("{instance}/fc-procfd");
+        let base = std::path::Path::new(CGROUP_ROOT).join(&relative);
+        let identity = scratch_tree(&relative);
+        std::fs::remove_dir(base.join("vm/vmm")).unwrap();
+        std::fs::create_dir(base.join("vm/vmm")).unwrap();
+        let mut foreign = sleeper_in(&base.join("vm/vmm"));
+        let (killed, removed, empty) = {
+            let _shadow = ShadowedProcFd::new(|entry| std::fs::create_dir(entry).unwrap());
+            assert_eq!(
+                std::fs::read_dir("/proc/self/fd").unwrap().count(),
+                2048,
+                "the fake view is in place"
+            );
+            (
+                kill_recorded(&relative, Some(&identity), Duration::from_secs(2)),
+                remove_tree(&relative, Some(&identity)),
+                vm_empty(&relative, Some(&identity)),
+            )
+        };
+        let survived = foreign.try_wait().unwrap().is_none() && base.join("vm/vmm").exists();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        scrub_tree(&relative, &[]);
+
+        assert_eq!(killed.unwrap(), NodeState::Replaced);
+        assert_eq!(removed.unwrap(), NodeState::Replaced);
+        assert!(!empty, "a replaced subtree is not proven empty");
+        assert!(
+            survived,
+            "the replacement process was killed through a shadowed proof"
+        );
+        eprintln!(
+            "B4 evidence: with /proc/self/fd shadowed by empty directories, the replaced \
+             vm/vmm was still seen through the retained descriptor: Replaced, no cgroup.kill"
         );
     }
 

@@ -9,11 +9,11 @@
 //! | Action | Proof | Bound to |
 //! |---|---|---|
 //! | `pidfd_send_signal` | [`ProvenProcess`] | the pidfd opened before the start time and boot ID were compared |
-//! | `cgroup.kill` | [`ProvenCgroupVm`] | the `vm` node's descriptor, its children re-listed immediately before |
+//! | `cgroup.kill` | [`ProvenCgroupVm`] | the `vm` node's descriptor, its children re-listed from that descriptor (`getdents64`) immediately before |
 //! | cgroup `rmdir` | [`ProvenCgroupTree`] | each parent's descriptor, the child's inode re-read immediately before |
 //! | `unlinkat` | [`ProvenFile`] | the verified directory's descriptor, the birth time re-read immediately before |
 //! | directory `rmdir` | [`ProvenDir`] | the parent's descriptor, the birth time re-read immediately before |
-//! | `umount2` | [`ProvenMount`] | `/proc/self/fd/<parent>/<name>`, the unique mount ID re-read immediately before |
+//! | `umount2` | [`ProvenMount`] | `<name>` from a thread whose working directory is the parent's descriptor, the unique mount ID re-read immediately before |
 //! | `LOOP_CLR_FD` | [`ProvenLoop`] | the slot descriptor the generation was compared on |
 //! | `kill` of S's own unreaped child | [`UnreapedChild`] | the PID the kernel cannot reuse before this process reaps it |
 //!
@@ -74,7 +74,7 @@ fn unknown(why: impl fmt::Display) -> Unprovable {
     Unprovable::Unknown(why.to_string())
 }
 
-/// The kernel's boot ID, `/proc/sys/kernel/random/boot_id` (on macOS, where only the
+/// The kernel's boot ID, procfs `sys/kernel/random/boot_id` (on macOS, where only the
 /// fake fixtures run, `kern.bootsessionuuid`). Process start times and every
 /// kernel-generation ID the gate compares are meaningful only within one boot.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,10 +95,12 @@ impl BootId {
         Some(Self(bytes))
     }
 
-    /// This boot's ID. Unreadable or malformed is an error, never a placeholder.
+    /// This boot's ID, read beneath the helper's private procfs instance
+    /// (`crate::sys::procfs`), never a `/proc` pathname. Unreadable or malformed is an
+    /// error, never a placeholder.
     #[cfg(target_os = "linux")]
     pub fn current() -> io::Result<Self> {
-        let text = std::fs::read_to_string(super::storage::BOOT_ID_PATH)?;
+        let text = crate::sys::procfs::boot_id()?;
         Self::parse(text.trim_end_matches('\n'))
             .ok_or_else(|| io::Error::other("malformed boot ID"))
     }
@@ -369,6 +371,16 @@ impl UnreapedChild {
         Ok(None)
     }
 
+    /// `PTRACE_DETACH` of this traced, unreaped child (the formatter's test-only
+    /// exec-stop observation): its PID cannot name another process.
+    #[cfg(target_os = "linux")]
+    pub fn detach_trace(&self) {
+        if !self.reaped {
+            // SAFETY: an unreaped child's PID cannot name another process.
+            unsafe { libc::ptrace(libc::PTRACE_DETACH, self.pid, 0, 0) };
+        }
+    }
+
     /// SIGKILL, only while the PID is still provably this child's.
     pub fn kill_unreaped(&self) {
         if !self.reaped {
@@ -410,13 +422,16 @@ mod linux {
 
     // Cgroups.
 
-    /// Subdirectory names of a cgroup node: its child cgroups.
+    /// Subdirectory names of a cgroup node, its child cgroups, enumerated from the
+    /// retained node descriptor itself (`getdents64` on a rewound duplicate, B4 recheck
+    /// 5): never by reopening a `/proc/self/fd/N` pathname, which a mount in the
+    /// helper's namespace could replace with another view. An entry whose type the
+    /// filesystem does not report counts as a child.
     fn child_cgroups(node: &File) -> io::Result<Vec<String>> {
         let mut names = Vec::new();
-        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", node.as_raw_fd()))? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                names.push(entry.file_name().to_string_lossy().into_owned());
+        for entry in crate::sys::read_dir_fd(node, 4096)? {
+            if matches!(entry.kind, libc::DT_DIR | libc::DT_UNKNOWN) {
+                names.push(String::from_utf8_lossy(&entry.name).into_owned());
             }
             if names.len() > 64 {
                 return Err(io::Error::other("too many child cgroups"));
@@ -887,27 +902,54 @@ mod linux {
         })
     }
 
-    /// Unmounts the proven mount, never lazily. Its unique ID is read again on a fresh
-    /// descriptor immediately before; that descriptor is closed first, because a held
-    /// one makes a non-lazy unmount busy. The target is resolved through the held
-    /// parent descriptor, not a path from the root.
+    /// Unmounts the proven mount, never lazily, resolving the target from the held
+    /// parent descriptor and nothing else (B4 recheck 5).
+    ///
+    /// Linux 6.8 has no unmount-by-descriptor: `umount2` takes a pathname, `open_tree`
+    /// without `OPEN_TREE_CLONE` only returns another descriptor of the attached mount,
+    /// and `move_mount` cannot detach. So the unmount runs on a short-lived thread that
+    /// gives itself a private filesystem context (`unshare(CLONE_FS)`, which changes no
+    /// other thread), makes the parent descriptor its working directory (`fchdir`),
+    /// reads the unique mount ID at the single-component `name` again, and calls
+    /// `umount2(name, UMOUNT_NOFOLLOW)`. Both resolve one component from exactly the
+    /// parent's dentry and mount; no `/proc/self/fd` pathname, which a mount in the
+    /// helper's namespace could redirect, is involved. The descriptor of that last read
+    /// is closed first, because a held one makes a non-lazy unmount busy.
     pub fn unmount(proof: ProvenMount) -> io::Result<()> {
         let name = proof.name.to_str().map_err(io::Error::other)?;
-        let seen = storage::mount_identity_at(&proof.parent, name)?;
-        if seen.unique_id != proof.unique_id {
-            return Err(io::Error::other(format!(
-                "{name} changed before its unmount"
-            )));
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(io::Error::other("a mount name is one path component"));
         }
-        let target = cstr(&format!(
-            "/proc/self/fd/{}/{name}",
-            proof.parent.as_raw_fd()
-        ))?;
-        // SAFETY: NUL-terminated; UMOUNT_NOFOLLOW refuses a link at the last component.
-        if unsafe { libc::umount2(target.as_ptr(), libc::UMOUNT_NOFOLLOW) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| -> io::Result<()> {
+                    // SAFETY: unshare(CLONE_FS) copies this thread's filesystem context
+                    // (root, working directory, umask) for it alone.
+                    if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // SAFETY: a live directory descriptor; only this thread's working
+                    // directory changes, and the thread ends with this closure.
+                    if unsafe { libc::fchdir(proof.parent.as_raw_fd()) } != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let seen = storage::mount_identity_at(&proof.parent, name)?;
+                    if seen.unique_id != proof.unique_id {
+                        return Err(io::Error::other(format!(
+                            "{name} changed before its unmount"
+                        )));
+                    }
+                    // SAFETY: a NUL-terminated single component, resolved from this
+                    // thread's working directory, the parent; UMOUNT_NOFOLLOW refuses a
+                    // link there.
+                    if unsafe { libc::umount2(proof.name.as_ptr(), libc::UMOUNT_NOFOLLOW) } != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .join()
+                .map_err(|_| io::Error::other("the unmount thread panicked"))?
+        })
     }
 
     // Loops.
@@ -1119,13 +1161,15 @@ mod tests {
 
     /// Section 7.1's inventory, as defense in depth behind the clippy gate: no helper
     /// source other than this module and `crate::sys` names a destructive capability,
-    /// and `crate::sys` names only its two signal-0 probes. Matching is over whole
+    /// and `crate::sys` names only its two signal-0 probes and its one generation-checked
+    /// socket unlink (raw `syscall`, `ioctl`, `prctl`, `ptrace` and mode-0 `fallocate`
+    /// are its typed wrappers' business, policed by clippy). Matching is over whole
     /// expressions with comments and whitespace removed, so an allowed expression never
     /// hides another one next to it, and a function taken as a value (an alias) matches
     /// as well as a call. Test fixtures (the `tests` modules and files) are excluded.
     #[test]
     fn no_destructive_call_outside_the_gate() {
-        const DESTRUCTIVE: [&str; 29] = [
+        const DESTRUCTIVE: [&str; 36] = [
             "libc::kill",
             "libc::killpg",
             "libc::tgkill",
@@ -1155,10 +1199,23 @@ mod tests {
             "extern\"",
             "asm!",
             "dlsym",
+            "set_len",
+            ".truncate(true)",
+            "File::create(",
+            "libc::truncate",
+            "libc::ftruncate",
+            "process_vm_writev",
+            "pidfd_getfd",
         ];
-        const RAW: [&str; 2] = ["libc::syscall", "libc::ioctl"];
+        const RAW: [&str; 5] = [
+            "libc::syscall",
+            "libc::ioctl",
+            "libc::prctl",
+            "libc::ptrace",
+            "libc::fallocate",
+        ];
         // (file, whole expression, justification). Each must occur exactly once.
-        const ALLOWED: [(&str, &str, &str); 2] = [
+        const ALLOWED: [(&str, &str, &str); 3] = [
             (
                 "sys.rs",
                 "libc::syscall(
@@ -1174,6 +1231,12 @@ mod tests {
                 "sys.rs",
                 "libc::kill(pid, 0)",
                 "signal 0 on macOS: an existence probe, not a signal",
+            ),
+            (
+                "sys.rs",
+                "libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0)",
+                "kilnd's own API socket, only while its device, inode and birth time are \
+                 the generation it was bound or found as (sys::socket)",
             ),
         ];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1244,7 +1307,7 @@ mod tests {
     fn disallowed_allows_only_in_approved_modules() {
         const INNER: &str = "<the whole module>";
         // (file under crates/kilnd, item the allow is on, why).
-        const APPROVED: [(&str, &str, &str); 8] = [
+        const APPROVED: [(&str, &str, &str); 7] = [
             (
                 "src/helper/firecracker/proven.rs",
                 INNER,
@@ -1254,7 +1317,7 @@ mod tests {
             (
                 "src/process.rs",
                 "pub async fn run(",
-                "the generic subprocess runner",
+                "the fixed-tool subprocess runner",
             ),
             (
                 "src/runtime/kiln_process.rs",
@@ -1268,14 +1331,9 @@ mod tests {
                 "its own child",
             ),
             (
-                "src/server.rs",
-                "fn cleanup(&mut self)",
-                "the owned API socket",
-            ),
-            (
-                "src/server.rs",
-                "async fn remove_stale_socket_after_probe(",
-                "a stale API socket",
+                "src/lock.rs",
+                "fn finish_acquire(",
+                "truncating this process's own verified lock file",
             ),
         ];
         const SILENCERS: [&str; 5] = [
@@ -1353,10 +1411,9 @@ mod tests {
                         .map(|l| l.trim())
                         .take_while(|l| l.starts_with("//") || l.starts_with("#["))
                         .collect();
-                    let test_module = !inner
-                        && before.contains(&"#[cfg(test)]")
-                        && (item.starts_with("mod tests ")
-                            || item.starts_with("pub(super) mod tests "));
+                    // Any item compiled only under cfg(test): a test module, a test-only
+                    // fixture module or function.
+                    let test_module = !inner && before.contains(&"#[cfg(test)]");
                     let test_file = inner
                         && (relative.starts_with("tests/")
                             || (relative.ends_with("/tests.rs")
@@ -1435,6 +1492,18 @@ mod tests {
             "tokio::process::Command::new",
             "std::process::Child::kill",
             "tokio::process::Child::start_kill",
+            "std::fs::File::set_len",
+            "std::fs::File::create",
+            "std::fs::OpenOptions::truncate",
+            "std::fs::write",
+            "tokio::fs::File::set_len",
+            "tokio::fs::write",
+            "libc::truncate",
+            "libc::ftruncate",
+            "libc::fallocate",
+            "libc::prctl",
+            "libc::ptrace",
+            "libc::process_vm_writev",
         ] {
             assert!(
                 clippy.contains(&format!("path = \"{path}\"")),
@@ -1478,6 +1547,268 @@ mod tests {
             "foreign declarations:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// B4 recheck 5 finding 3: generated code is invisible to the source gates, so no
+    /// crate may grow a build script beyond the approved list, and no source may
+    /// `include!` anything (generated `OUT_DIR` code in particular) other than
+    /// `kilnd-api`'s protobuf stubs. A deliberately obfuscated bypass is out of scope
+    /// (code review covers malicious source changes); this catches an honest one.
+    #[test]
+    fn no_unapproved_build_scripts_or_generated_includes() {
+        // (crate-relative path, why).
+        const BUILD_SCRIPTS: [(&str, &str); 1] = [(
+            "kilnd-api/build.rs",
+            "tonic-prost-build compiles proto/kilnd/v1 into its out directory",
+        )];
+        // (crate-relative file, squashed expression, why). Each exactly once.
+        const INCLUDES: [(&str, &str, &str); 1] = [(
+            "kilnd-api/src/lib.rs",
+            "tonic::include_proto|!(\"kilnd.v1\")",
+            "the generated gRPC stubs, an API crate with no system calls",
+        )];
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut offenders = Vec::new();
+        let mut hits = [0; INCLUDES.len()];
+        let mut scripts = 0;
+        for krate in std::fs::read_dir(&crates).unwrap() {
+            let krate = krate.unwrap().path();
+            let name = krate.file_name().unwrap().to_string_lossy().into_owned();
+            let manifest = std::fs::read_to_string(krate.join("Cargo.toml")).unwrap_or_default();
+            if manifest
+                .lines()
+                .any(|l| l.trim_start().starts_with("build"))
+            {
+                offenders.push(format!("{name}/Cargo.toml names a build script"));
+            }
+            for path in rust_files(&krate, false) {
+                let relative = format!(
+                    "{name}/{}",
+                    path.strip_prefix(&krate).unwrap().to_string_lossy()
+                );
+                if path.file_name().is_some_and(|f| f == "build.rs") {
+                    scripts += 1;
+                    if !BUILD_SCRIPTS
+                        .iter()
+                        .any(|(approved, _)| *approved == relative)
+                    {
+                        offenders.push(format!("{relative}: build script not approved"));
+                    }
+                    continue;
+                }
+                let mut code = squash(&std::fs::read_to_string(&path).unwrap());
+                for (index, (file, expression, _)) in INCLUDES.iter().enumerate() {
+                    let expression = expression.replace('|', "");
+                    if *file == relative {
+                        hits[index] += code.matches(&expression).count();
+                        code = code.replace(&expression, " ");
+                    }
+                }
+                // The `|` keeps these needles from matching this test itself.
+                for needle in ["include|!(", "include_proto|!(", "OUT|_DIR"] {
+                    let needle = needle.replace('|', "");
+                    if code.contains(&needle) {
+                        offenders.push(format!("{relative}: `{needle}`"));
+                    }
+                }
+            }
+        }
+        assert!(scripts >= 1, "the approved build script was not found");
+        assert!(
+            offenders.is_empty(),
+            "unapproved build scripts or generated includes:\n{}",
+            offenders.join("\n")
+        );
+        for (index, (file, expression, _)) in INCLUDES.iter().enumerate() {
+            assert_eq!(
+                hits[index], 1,
+                "{file} `{expression}` must occur exactly once"
+            );
+        }
+    }
+
+    /// The string literals of Rust source, comments excluded: plain, byte, C and raw
+    /// strings, with escapes left as written.
+    fn string_literals(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '/' if chars.get(i + 1) == Some(&'/') => {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                }
+                '/' if chars.get(i + 1) == Some(&'*') => {
+                    i += 2;
+                    while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                '\'' => {
+                    if chars.get(i + 1) == Some(&'\\') {
+                        i += 2;
+                        while i < chars.len() && chars[i] != '\'' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else if chars.get(i + 2) == Some(&'\'') {
+                        i += 3;
+                    } else {
+                        i += 1;
+                    }
+                }
+                'r' if !chars
+                    .get(i.wrapping_sub(1))
+                    .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                    && matches!(chars.get(i + 1), Some('"') | Some('#')) =>
+                {
+                    let mut j = i + 1;
+                    let mut hashes = 0;
+                    while chars.get(j) == Some(&'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if chars.get(j) != Some(&'"') {
+                        i += 1;
+                        continue;
+                    }
+                    let start = j + 1;
+                    let mut k = start;
+                    loop {
+                        if k >= chars.len() {
+                            break;
+                        }
+                        if chars[k] == '"'
+                            && (0..hashes).all(|h| chars.get(k + 1 + h) == Some(&'#'))
+                        {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    out.push(chars[start..k.min(chars.len())].iter().collect());
+                    i = k + 1 + hashes;
+                }
+                '"' => {
+                    let start = i + 1;
+                    let mut k = start;
+                    while k < chars.len() && chars[k] != '"' {
+                        if chars[k] == '\\' {
+                            k += 1;
+                        }
+                        k += 1;
+                    }
+                    out.push(chars[start..k.min(chars.len())].iter().collect());
+                    i = k + 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// B4 recheck 5: proc and control files are reached only through the approved
+    /// modules: `/proc` through `crate::sys::procfs` (a private procfs instance), and
+    /// cgroup control files through `cgroup::write_control`'s enum (with
+    /// `cgroup.kill` only in this module). Defense in depth: no production string
+    /// literal elsewhere in the workspace contains `/proc/` or `cgroup.`, except the
+    /// exact justified ones below. Test modules and test files are excluded.
+    #[test]
+    fn proc_and_control_paths_only_in_approved_modules() {
+        const MODULES: [(&str, &str); 3] = [
+            (
+                "kilnd/src/sys.rs",
+                "the private procfs instance and fixed sysfs writes",
+            ),
+            (
+                "kilnd/src/helper/firecracker/cgroup.rs",
+                "the ControlFile enum's names and read-only cgroup files",
+            ),
+            (
+                "kilnd/src/helper/firecracker/proven.rs",
+                "cgroup.kill behind ProvenCgroupVm",
+            ),
+        ];
+        // (file, literal, why). Each must still occur.
+        const LITERALS: [(&str, &str, &str); 4] = [
+            (
+                "kilnd/src/helper/firecracker/storage.rs",
+                "/proc/self/fd/{}",
+                "linkat of an unnamed O_TMPFILE inode; the post-link generation recheck \
+                 rejects a redirected link (design 7.1)",
+            ),
+            (
+                "kilnd/src/helper/firecracker/executable.rs",
+                "/proc/self/fd/{}",
+                "linkat of the unnamed executable inode; the post-link device/inode/birth \
+                 time recheck rejects a redirected link (design 7.1)",
+            ),
+            (
+                "kilnd/src/runtime/kiln_direct.rs",
+                "exec/cgroup.events",
+                "reads kiln's own exec scope events; never written",
+            ),
+            (
+                "kilnd/src/helper/firecracker/workers.rs",
+                "/proc/{pid}/exe",
+                "a cfg(test) fixture's image path",
+            ),
+        ];
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut offenders = Vec::new();
+        let mut hits = [0; LITERALS.len()];
+        let mut checked = 0;
+        for krate in std::fs::read_dir(&crates).unwrap() {
+            let krate = krate.unwrap().path();
+            let name = krate.file_name().unwrap().to_string_lossy().into_owned();
+            let src = krate.join("src");
+            if !src.is_dir() {
+                continue;
+            }
+            for path in rust_files(&src, true) {
+                let relative = format!(
+                    "{name}/src/{}",
+                    path.strip_prefix(&src).unwrap().to_string_lossy()
+                );
+                checked += 1;
+                if MODULES.iter().any(|(module, _)| *module == relative) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for literal in string_literals(production_part(&text)) {
+                    if !(literal.contains("/proc/") || literal.contains("cgroup.")) {
+                        continue;
+                    }
+                    match LITERALS
+                        .iter()
+                        .position(|(file, allowed, _)| *file == relative && *allowed == literal)
+                    {
+                        Some(at) => hits[at] += 1,
+                        None => offenders.push(format!("{relative}: {literal:?}")),
+                    }
+                }
+            }
+        }
+        assert!(checked > 40, "the workspace sources were not found");
+        assert!(
+            offenders.is_empty(),
+            "proc or control-file paths outside the approved modules:\n{}",
+            offenders.join("\n")
+        );
+        for (index, (file, literal, _)) in LITERALS.iter().enumerate() {
+            assert!(
+                hits[index] >= 1,
+                "{file} no longer has {literal:?}: drop it here"
+            );
+        }
+    }
+
+    #[test]
+    fn the_literal_scanner_sees_strings_not_comments() {
+        let text = "// \"/proc/a\"\nlet a = \"/proc/b\"; let c = '\"'; let d = r#\"x\"y\"#;\n/* \"cgroup.z\" */ let e = c\"cgroup.w\"; fn f<'a>(_: &'a str) {}";
+        assert_eq!(string_literals(text), ["/proc/b", "x\"y", "cgroup.w"]);
     }
 
     /// Whether `relative` (a `.../tests.rs`) is declared `#[cfg(test)] mod tests;` by its

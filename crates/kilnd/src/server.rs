@@ -1,10 +1,11 @@
 //! The Unix socket and the server's lifecycle: bind with tight permissions,
 //! serve, and shut down gracefully.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::future::Future;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, chown};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,6 +28,9 @@ use crate::manager::Manager;
 use crate::runtime::Runtime;
 use crate::service::Service;
 use crate::store::prepare_socket_directory;
+use crate::sys::socket::{
+    Removal, Seen, SocketGeneration, remove_socket_generation, socket_generation_at,
+};
 
 /// How long to wait for in-flight requests after running executions were
 /// canceled, before exiting regardless.
@@ -86,25 +90,6 @@ impl AsyncWrite for AdmittedUnixStream {
     }
 }
 
-#[derive(Clone, Copy)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-impl FileIdentity {
-    fn of(meta: &std::fs::Metadata) -> Self {
-        Self {
-            device: meta.dev(),
-            inode: meta.ino(),
-        }
-    }
-
-    fn matches(self, meta: &std::fs::Metadata) -> bool {
-        self.device == meta.dev() && self.inode == meta.ino()
-    }
-}
-
 /// A listener plus exclusive ownership of its directory and pathname.
 /// Cleanup is conditional on the pathname still identifying this instance's
 /// socket, so a replacement is never unlinked on shutdown.
@@ -115,32 +100,27 @@ pub struct BoundSocket {
 
 struct SocketPathGuard {
     path: PathBuf,
-    identity: FileIdentity,
+    name: OsString,
+    generation: SocketGeneration,
     active: bool,
     _directory_lock: ExclusiveFileLock,
-    _directory: File,
+    directory: File,
 }
 
 impl SocketPathGuard {
-    // Approved (design 7.1): removes kilnd's own API socket at shutdown, only while it is still
-    // the socket inode this guard bound (compared under the socket-directory lock).
-    #[allow(clippy::disallowed_methods)]
+    /// Removes kilnd's own API socket at shutdown, only while it is still the
+    /// generation (device, inode and birth time) this guard bound, read through the
+    /// socket directory's descriptor immediately before the unlink (design 7.1).
     fn cleanup(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
-        match std::fs::symlink_metadata(&self.path) {
-            Ok(meta) if meta.file_type().is_socket() && self.identity.matches(&meta) => {
-                std::fs::remove_file(&self.path)
-                    .with_context(|| format!("remove owned socket {}", self.path.display()))?;
-            }
-            Ok(_) => {
+        match remove_socket_generation(&self.directory, &self.name, &self.generation)
+            .with_context(|| format!("remove owned socket {}", self.path.display()))?
+        {
+            Removal::Removed | Removal::Gone => {}
+            Removal::Replaced => {
                 warn!(socket = %self.path.display(), "socket path was replaced; leaving replacement untouched");
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("inspect owned socket {}", self.path.display()));
             }
         }
         self.active = false;
@@ -230,7 +210,7 @@ async fn bind_away_from_after_directory_check(
         &lock_path,
         "socket directory",
     )?;
-    remove_stale_socket(&socket_path).await?;
+    remove_stale_socket(&directory.file, name, &socket_path).await?;
 
     // A losing invocation must not alter an incumbent directory's access.
     // Permission changes occur only after this process owns the directory
@@ -241,17 +221,19 @@ async fn bind_away_from_after_directory_check(
 
     let listener = std::os::unix::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("bind {}", socket_path.display()))?;
-    let socket_meta = std::fs::symlink_metadata(&socket_path)
-        .with_context(|| format!("inspect bound socket {}", socket_path.display()))?;
-    if !socket_meta.file_type().is_socket() {
-        bail!("{} did not become a socket after bind", path.display());
-    }
+    let generation = match socket_generation_at(&directory.file, name)
+        .with_context(|| format!("inspect bound socket {}", socket_path.display()))?
+    {
+        Seen::Socket(generation) => generation,
+        _ => bail!("{} did not become a socket after bind", path.display()),
+    };
     let path_guard = SocketPathGuard {
         path: socket_path.clone(),
-        identity: FileIdentity::of(&socket_meta),
+        name: name.to_os_string(),
+        generation,
         active: true,
         _directory_lock: directory_lock,
-        _directory: directory.file,
+        directory: directory.file,
     };
     chown(&socket_path, None, gid).with_context(|| format!("chown {}", socket_path.display()))?;
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(sock_mode))?;
@@ -296,43 +278,46 @@ fn set_directory_access(file: &File, gid: Option<u32>, mode: u32, path: &Path) -
     Ok(())
 }
 
-async fn remove_stale_socket(path: &Path) -> Result<()> {
-    remove_stale_socket_after_probe(path, || {}).await
+async fn remove_stale_socket(directory: &File, name: &OsStr, path: &Path) -> Result<()> {
+    remove_stale_socket_after_probe(directory, name, path, || {}).await
 }
 
-// Approved (design 7.1): removes a stale API socket only after a refused connection and an
-// identity recheck under the socket-directory lock; a changed path is left alone.
-#[allow(clippy::disallowed_methods)]
+/// Removes a stale API socket only after a refused connection, and only while the name
+/// still shows the generation (device, inode and birth time) read before the probe,
+/// through the socket directory's descriptor (design 7.1). A changed path is left
+/// alone.
 async fn remove_stale_socket_after_probe(
+    directory: &File,
+    name: &OsStr,
     path: &Path,
     after_refused_probe: impl FnOnce(),
 ) -> Result<()> {
-    let first = match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => meta,
-        Ok(_) => bail!("{} exists and is not a socket", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+    let generation = match socket_generation_at(directory, name)
+        .with_context(|| format!("stat {}", path.display()))?
+    {
+        Seen::Socket(generation) => generation,
+        Seen::NotASocket => bail!("{} exists and is not a socket", path.display()),
+        Seen::Nothing => return Ok(()),
     };
-    let identity = FileIdentity::of(&first);
     let probe =
         tokio::time::timeout(SOCKET_PROBE_TIMEOUT, tokio::net::UnixStream::connect(path)).await;
     match probe {
         Ok(Ok(_)) => bail!("{} already has a live listener", path.display()),
         Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) && cfg!(target_os = "linux") => {
             after_refused_probe();
-            let current = std::fs::symlink_metadata(path)
-                .with_context(|| format!("recheck stale socket {}", path.display()))?;
-            if !current.file_type().is_socket() || !identity.matches(&current) {
-                bail!(
+            // The socket-directory lock makes this compare-and-delete stable between
+            // cooperating kilnd processes; the birth time makes it refuse an inode-reused
+            // replacement. POSIX has no atomic compare-and-unlink primitive, so the
+            // interval between the final read and the unlink remains.
+            match remove_socket_generation(directory, name, &generation)
+                .with_context(|| format!("remove stale socket {}", path.display()))?
+            {
+                Removal::Removed => {}
+                Removal::Replaced | Removal::Gone => bail!(
                     "{} changed while checking whether it was stale",
                     path.display()
-                );
+                ),
             }
-            // The socket-directory lock makes this compare-and-delete stable
-            // between cooperating kilnd processes. POSIX has no atomic
-            // compare-and-unlink primitive, so hostile root remains trusted.
-            std::fs::remove_file(path)
-                .with_context(|| format!("remove stale socket {}", path.display()))?;
             Ok(())
         }
         Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) => Err(e).with_context(|| {
@@ -342,8 +327,8 @@ async fn remove_stale_socket_after_probe(
             )
         }),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::symlink_metadata(path) {
-                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            match socket_generation_at(directory, name) {
+                Ok(Seen::Nothing) => Ok(()),
                 _ => bail!(
                     "{} changed while checking whether it was stale",
                     path.display()
@@ -969,12 +954,14 @@ mod tests {
             }
         });
 
-        let error = remove_stale_socket_after_probe(&path, || {
-            probed.wait();
-            replaced.wait();
-        })
-        .await
-        .expect_err("a replacement socket was deleted as stale");
+        let directory = File::open(&dir).unwrap();
+        let error =
+            remove_stale_socket_after_probe(&directory, OsStr::new("kilnd.sock"), &path, || {
+                probed.wait();
+                replaced.wait();
+            })
+            .await
+            .expect_err("a replacement socket was deleted as stale");
         assert!(error.to_string().contains("changed"), "{error:#}");
         let replacement = rx.recv().unwrap();
         let replacement_inode = std::fs::symlink_metadata(&path).unwrap().ino();
@@ -982,5 +969,79 @@ mod tests {
         assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
         drop(replacement);
         replacer.join().unwrap();
+    }
+
+    /// B4 recheck 5 finding 2, the PoC as a regression: once root unlinks the stale
+    /// socket, ext4 hands its inode number straight to a live replacement. The birth
+    /// time differs, so cleanup refuses and the replacement keeps its name.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "needs an ext4 /var/tmp that reuses inodes; run by scripts/b4-vm-tests.sh"]
+    async fn b4_linux_root_stale_socket_inode_reuse_is_refused() {
+        let tmp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let dir = tmp.path().join("run");
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let path = dir.join("kilnd.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let original = std::fs::symlink_metadata(&path).unwrap();
+        let replacement = std::sync::Mutex::new(None);
+        let directory = File::open(&dir).unwrap();
+
+        let error =
+            remove_stale_socket_after_probe(&directory, OsStr::new("kilnd.sock"), &path, || {
+                std::fs::remove_file(&path).unwrap();
+                for _ in 0..100_000 {
+                    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                    let seen = std::fs::symlink_metadata(&path).unwrap();
+                    if seen.dev() == original.dev() && seen.ino() == original.ino() {
+                        *replacement.lock().unwrap() = Some(listener);
+                        return;
+                    }
+                    drop(listener);
+                    std::fs::remove_file(&path).unwrap();
+                }
+                panic!("filesystem did not reuse the stale socket inode");
+            })
+            .await
+            .expect_err("the reused-inode replacement was deleted as stale");
+        assert!(error.to_string().contains("changed"), "{error:#}");
+        assert!(
+            replacement.lock().unwrap().is_some(),
+            "the inode was reused"
+        );
+        assert!(path.exists(), "the live replacement was unlinked");
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+
+        // The owned-socket guard has the same identity: a replacement that reused the
+        // bound inode number is left in place at shutdown.
+        let lock_dir = tmp.path().join("guard");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&lock_dir)
+            .unwrap();
+        let bound = bind(&lock_dir.join("kilnd.sock"), None).await.unwrap();
+        let guarded = lock_dir.join("kilnd.sock");
+        let before = std::fs::symlink_metadata(&guarded).unwrap();
+        let mut reused = None;
+        std::fs::remove_file(&guarded).unwrap();
+        for _ in 0..100_000 {
+            let listener = std::os::unix::net::UnixListener::bind(&guarded).unwrap();
+            let seen = std::fs::symlink_metadata(&guarded).unwrap();
+            if seen.dev() == before.dev() && seen.ino() == before.ino() {
+                reused = Some(listener);
+                break;
+            }
+            drop(listener);
+            std::fs::remove_file(&guarded).unwrap();
+        }
+        assert!(
+            reused.is_some(),
+            "filesystem did not reuse the bound socket inode"
+        );
+        drop(bound);
+        assert!(
+            guarded.exists(),
+            "the guard unlinked an inode-reused replacement"
+        );
     }
 }

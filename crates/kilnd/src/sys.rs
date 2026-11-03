@@ -1,25 +1,38 @@
-//! Typed system-call and ioctl wrappers (design section 7.1, B4 recheck 4).
+//! Typed system-call and ioctl wrappers (design section 7.1, B4 recheck 4 and 5).
 //!
 //! `libc::syscall` and `libc::ioctl` take any request, so clippy's
 //! `disallowed-methods` (see `clippy.toml`) rejects them everywhere except here and
 //! `helper::firecracker::proven`. Each function below issues exactly one fixed request,
-//! and none of them signals, removes, unmounts, renames or detaches anything:
+//! and none of them signals, unmounts, renames or detaches anything:
 //!
 //! - descriptors and processes: `close_range` of this process's own descriptors,
 //!   `pidfd_open`, a pidfd liveness probe whose signal is the constant 0, `capget` and
-//!   `capset` on the calling thread, and `execveat` of a retained descriptor (the only
-//!   way the helper starts the jailer, Firecracker or mkfs.xfs);
+//!   `capset` on the calling thread, the calling process's dumpable flag (`prctl`), and
+//!   `execveat` of a retained descriptor (the only way the helper starts the jailer,
+//!   Firecracker or mkfs.xfs);
+//! - fd-native reads: [`read_dir_fd`] lists a held directory descriptor with
+//!   `getdents64` on a duplicate (never a `/proc/self/fd` pathname), and [`procfs`]
+//!   reads process and kernel state beneath a private, never-attached procfs instance
+//!   that no mount in any namespace can shadow;
 //! - the new mount API, creation only: [`DetachedMount`] can be built only by
 //!   [`fsmount`] or [`open_tree_clone`], and `move_mount` and `mount_setattr` take one,
 //!   so they can only act on a mount this process created;
-//! - the [`ioctl`] module: read requests, plus `LOOP_CONFIGURE` on a free slot (the
-//!   kernel refuses a bound one) and clearing `LO_FLAGS_AUTOCLEAR`. `LOOP_CLR_FD`
-//!   is not here: it exists only in `proven::clear_loop`, which takes a `ProvenLoop`.
+//! - the [`ioctl`] module: read requests, `LOOP_CONFIGURE` on a free slot (the kernel
+//!   refuses a bound one), and clearing `LO_FLAGS_AUTOCLEAR` on a [`ioctl::ConfiguredLoop`]
+//!   only, a slot this process configured itself, after re-reading its status and
+//!   generation on that descriptor. `LoopInfo64` is opaque: no caller can build or
+//!   change one. `LOOP_CLR_FD` is not here: it exists only in `proven::clear_loop`,
+//!   which takes a `ProvenLoop`;
+//! - fixed storage writes: [`preallocate`] (mode-0 `fallocate`, never a punch-hole) and
+//!   [`write_sysfs`], which writes only the [`SysfsControl`] enum's files;
+//! - [`socket`]: the one unlink here, of kilnd's own API socket, only while its
+//!   device, inode and birth time, read through the socket directory's descriptor
+//!   immediately before, are the generation it was bound or found as.
 //!
-//! Signals, `cgroup.kill`, unlinks, `rmdir`, unmounts and `LOOP_CLR_FD` live only in
-//! `helper::firecracker::proven`, behind its proof types.
+//! Signals, `cgroup.kill`, every other unlink, `rmdir`, unmounts and `LOOP_CLR_FD` live
+//! only in `helper::firecracker::proven`, behind its proof types.
 // Approved (design 7.1): the typed wrapper module for libc::syscall and libc::ioctl.
-// Every request is a fixed, non-destructive one; see the module documentation.
+// Every request is a fixed one; see the module documentation.
 #![allow(clippy::disallowed_methods)]
 
 #[cfg(target_os = "linux")]
@@ -131,6 +144,443 @@ mod linux {
         io::Error::last_os_error()
     }
 
+    /// Fixed `prctl` requests on the calling thread or process. Each returns the raw
+    /// `prctl` result; all are async-signal-safe and allocation-free, for use between
+    /// fork and exec.
+    pub mod prctl {
+        /// `PR_CAP_AMBIENT_IS_SET` of one capability.
+        pub fn cap_ambient_is_set(cap: u32) -> libc::c_int {
+            // SAFETY: integer arguments only.
+            unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_IS_SET as libc::c_ulong,
+                    cap as libc::c_ulong,
+                    0,
+                    0,
+                )
+            }
+        }
+
+        /// `PR_CAP_AMBIENT_LOWER` of one capability.
+        pub fn cap_ambient_lower(cap: u32) -> libc::c_int {
+            // SAFETY: integer arguments only.
+            unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_LOWER as libc::c_ulong,
+                    cap as libc::c_ulong,
+                    0,
+                    0,
+                )
+            }
+        }
+
+        /// `PR_CAPBSET_READ` of one capability.
+        pub fn capbset_read(cap: u32) -> libc::c_int {
+            // SAFETY: integer arguments only.
+            unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap as libc::c_ulong, 0, 0, 0) }
+        }
+
+        /// `PR_CAPBSET_DROP` of one capability from the calling thread's bounding set.
+        pub fn capbset_drop(cap: u32) -> libc::c_int {
+            // SAFETY: integer arguments only.
+            unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) }
+        }
+
+        /// `PR_SET_NO_NEW_PRIVS` to 1 (it cannot be cleared).
+        pub fn set_no_new_privs() -> libc::c_int {
+            // SAFETY: integer arguments only.
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }
+        }
+
+        /// `PR_GET_NO_NEW_PRIVS`.
+        pub fn get_no_new_privs() -> libc::c_int {
+            // SAFETY: integer arguments only.
+            unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) }
+        }
+
+        /// `PR_SET_PDEATHSIG` to `SIGKILL`: the calling child dies with its parent.
+        pub fn set_parent_death_kill() -> libc::c_int {
+            // SAFETY: integer arguments only.
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) }
+        }
+
+        /// `PR_SET_CHILD_SUBREAPER` to 1 on the calling process.
+        pub fn set_child_subreaper() -> libc::c_int {
+            // SAFETY: integer arguments only.
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }
+        }
+    }
+
+    /// `ptrace(PTRACE_TRACEME)` in a freshly forked child, so its exec stops for the
+    /// parent's image observation (a test-only path of the formatter launch).
+    /// Async-signal-safe.
+    pub fn ptrace_traceme() -> libc::c_long {
+        // SAFETY: PTRACE_TRACEME takes no other arguments.
+        unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) }
+    }
+
+    /// The calling process's dumpable flag (`PR_GET_DUMPABLE`).
+    pub fn dumpable() -> io::Result<libc::c_int> {
+        // SAFETY: PR_GET_DUMPABLE takes no pointer arguments.
+        let rc = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(rc)
+    }
+
+    /// Restores the calling process's dumpable flag (`PR_SET_DUMPABLE`), which a
+    /// filesystem-ID change resets. Only 0 and 1 are accepted.
+    pub fn set_dumpable(value: libc::c_int) -> io::Result<()> {
+        if !matches!(value, 0 | 1) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        // SAFETY: PR_SET_DUMPABLE takes one integer argument.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, value, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// One entry of a directory descriptor: its name and `d_type` (`DT_UNKNOWN` when
+    /// the filesystem does not say).
+    pub struct DirEntry {
+        pub name: Vec<u8>,
+        pub kind: u8,
+    }
+
+    /// Every entry of the directory `dir` holds, except `.` and `..`: `getdents64` on a
+    /// `F_DUPFD_CLOEXEC` duplicate rewound to the start, so the listing is of exactly
+    /// that inode, never of a `/proc/self/fd/N` pathname a mount could shadow. More
+    /// than `limit` entries is an error.
+    pub fn read_dir_fd(dir: &File, limit: usize) -> io::Result<Vec<DirEntry>> {
+        // SAFETY: duplicating a live descriptor this process owns.
+        let fd = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fcntl returned a new descriptor nothing else owns.
+        let dup = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: rewinding the shared directory offset to its start.
+        if unsafe { libc::lseek(dup.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // u64 storage keeps the records 8-byte aligned, as the kernel writes them.
+        let mut buffer = vec![0u64; 4096];
+        let bytes = buffer.len() * 8;
+        let mut entries = Vec::new();
+        loop {
+            // SAFETY: the buffer is writable for `bytes`; the descriptor is live.
+            let n = sys_ret(unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    dup.as_raw_fd(),
+                    buffer.as_mut_ptr().cast::<u8>(),
+                    bytes,
+                )
+            })? as usize;
+            if n == 0 {
+                return Ok(entries);
+            }
+            // SAFETY: the kernel wrote `n <= bytes` bytes of the u64 buffer.
+            let raw = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), n) };
+            let mut at = 0;
+            while at < n {
+                // struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type;
+                // char d_name[]; }
+                if at + 19 > n {
+                    return Err(io::Error::other("truncated directory record"));
+                }
+                let reclen = u16::from_ne_bytes([raw[at + 16], raw[at + 17]]) as usize;
+                if reclen < 20 || at + reclen > n {
+                    return Err(io::Error::other("malformed directory record"));
+                }
+                let kind = raw[at + 18];
+                let name = &raw[at + 19..at + reclen];
+                let name = &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())];
+                if name != b"." && name != b".." {
+                    entries.push(DirEntry {
+                        name: name.to_vec(),
+                        kind,
+                    });
+                    if entries.len() > limit {
+                        return Err(io::Error::other("directory exceeds its entry bound"));
+                    }
+                }
+                at += reclen;
+            }
+        }
+    }
+
+    /// The `readlinkat` text of one entry below a directory descriptor (a `/proc`
+    /// descriptor link, say), never followed.
+    pub fn read_link_at(dir: &File, name: &CStr) -> io::Result<Vec<u8>> {
+        let mut buffer = vec![0u8; 4096];
+        // SAFETY: the buffer is writable for its length; the name is NUL-terminated.
+        let n = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buffer.truncate(n as usize);
+        Ok(buffer)
+    }
+
+    /// Process and kernel state read beneath a private procfs instance (B4 recheck 5).
+    ///
+    /// The helper's own `/proc` pathnames are in its mount namespace, where root can
+    /// mount over them; a proof must not read such a view. The helper therefore makes
+    /// its own procfs superblock (`fsopen("proc")`, `fsmount`) and never attaches it:
+    /// no other process can reach a mount there, so nothing can shadow a path below
+    /// it. Every lookup is `openat2` beneath that root with `RESOLVE_BENEATH`,
+    /// `RESOLVE_NO_SYMLINKS`, `RESOLVE_NO_MAGICLINKS` and `RESOLVE_NO_XDEV`, except
+    /// [`open_image`]'s one magic link. Without `CAP_SYS_ADMIN` (only an unprivileged
+    /// test process, never the root helper) it falls back to `/proc`; as root, failure
+    /// to make the instance is an error.
+    ///
+    /// The descriptor is cached with the instance's unique mount ID (never reused
+    /// within a boot) and re-verified on every use, so a forked worker that closed
+    /// every descriptor, or a reused descriptor number, makes a fresh instance rather
+    /// than reading another file.
+    pub mod procfs {
+        use super::{DetachedMount, fsconfig_create, fsmount, fsopen, sys_ret};
+        use std::fs::File;
+        use std::io::{self, Read};
+        use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+        use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
+        const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+        const RESOLVE_NO_XDEV: u64 = 0x01;
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        const RESOLVE_BENEATH: u64 = 0x08;
+
+        static ROOT_FD: AtomicI32 = AtomicI32::new(-1);
+        static ROOT_ID: AtomicU64 = AtomicU64::new(0);
+
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+
+        fn unique_mount_id(fd: RawFd) -> io::Result<u64> {
+            // SAFETY: statx writes into the zeroed buffer; the empty name is
+            // NUL-terminated.
+            let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::statx(
+                    fd,
+                    c"".as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                    STATX_MNT_ID_UNIQUE,
+                    &mut stx,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if stx.stx_mask & STATX_MNT_ID_UNIQUE == 0 {
+                return Err(io::Error::other(
+                    "kernel reports no unique mount ID (STATX_MNT_ID_UNIQUE needs Linux 6.8)",
+                ));
+            }
+            Ok(stx.stx_mnt_id)
+        }
+
+        fn new_root() -> io::Result<File> {
+            let made = (|| -> io::Result<DetachedMount> {
+                let context = fsopen(c"proc")?;
+                fsconfig_create(&context)?;
+                fsmount(&context, 0)
+            })();
+            match made {
+                Ok(mount) => Ok(mount.into_file()),
+                // SAFETY: geteuid has no preconditions.
+                Err(error)
+                    if error.raw_os_error() == Some(libc::EPERM)
+                        && unsafe { libc::geteuid() } != 0 =>
+                {
+                    let fd = unsafe {
+                        libc::open(
+                            c"/proc".as_ptr(),
+                            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                        )
+                    };
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // SAFETY: open returned a new owned descriptor.
+                    Ok(unsafe { File::from_raw_fd(fd) })
+                }
+                Err(error) => Err(io::Error::new(
+                    error.kind(),
+                    format!("private procfs instance: {error}"),
+                )),
+            }
+        }
+
+        /// The cached root, re-verified by its unique mount ID; a fresh one otherwise.
+        fn root() -> io::Result<RawFd> {
+            let fd = ROOT_FD.load(Ordering::Acquire);
+            if fd >= 0 && unique_mount_id(fd).ok() == Some(ROOT_ID.load(Ordering::Acquire)) {
+                return Ok(fd);
+            }
+            let file = new_root()?;
+            let id = unique_mount_id(file.as_raw_fd())?;
+            // The descriptor stays open for the process's life: a cached number is
+            // never closed, so a stale one can only fail its identity check above.
+            let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
+            ROOT_ID.store(id, Ordering::Release);
+            ROOT_FD.store(fd, Ordering::Release);
+            Ok(fd)
+        }
+
+        fn check(relative: &str) -> io::Result<()> {
+            let valid = !relative.is_empty()
+                && relative.split('/').all(|part| {
+                    !part.is_empty()
+                        && part != "."
+                        && part != ".."
+                        && part
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+                });
+            if valid {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("not a procfs-relative path: {relative:?}"),
+                ))
+            }
+        }
+
+        /// Opens `relative` (for example `"123/stat"`) beneath the private instance,
+        /// following no link of any kind and crossing no mount.
+        pub fn open(relative: &str, flags: libc::c_int) -> io::Result<File> {
+            check(relative)?;
+            let path = std::ffi::CString::new(relative)?;
+            let root = root()?;
+            let how = OpenHow {
+                flags: (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+                mode: 0,
+                resolve: RESOLVE_BENEATH
+                    | RESOLVE_NO_SYMLINKS
+                    | RESOLVE_NO_MAGICLINKS
+                    | RESOLVE_NO_XDEV,
+            };
+            // SAFETY: a live root descriptor, a NUL-terminated path and a complete
+            // version-0 open_how.
+            let fd = sys_ret(unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    root,
+                    path.as_ptr(),
+                    &how,
+                    std::mem::size_of::<OpenHow>(),
+                )
+            })?;
+            // SAFETY: a new owned descriptor.
+            Ok(unsafe { File::from_raw_fd(fd as RawFd) })
+        }
+
+        /// A directory beneath the private instance, as [`open`].
+        pub fn open_dir(relative: &str) -> io::Result<File> {
+            open(relative, libc::O_RDONLY | libc::O_DIRECTORY)
+        }
+
+        /// A whole file beneath the private instance, as [`open`].
+        pub fn read_to_string(relative: &str) -> io::Result<String> {
+            let mut text = String::new();
+            open(relative, libc::O_RDONLY)?.read_to_string(&mut text)?;
+            Ok(text)
+        }
+
+        /// `relative` below this process's own directory (`<pid>/relative`), since
+        /// `self` is a link and links are not followed.
+        pub fn own(relative: &str) -> String {
+            // SAFETY: getpid has no preconditions.
+            format!("{}/{relative}", unsafe { libc::getpid() })
+        }
+
+        /// This boot's ID text, `sys/kernel/random/boot_id`.
+        pub fn boot_id() -> io::Result<String> {
+            read_to_string("sys/kernel/random/boot_id")
+        }
+
+        /// A process's running image through its `exe` magic link, the one magic link
+        /// followed here: `<pid>` is a directory of the private instance, so only the
+        /// final link is resolved, and the descriptor is the image itself.
+        pub fn open_image(pid: i32) -> io::Result<File> {
+            if pid <= 0 {
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            }
+            let path = std::ffi::CString::new(format!("{pid}/exe"))?;
+            let root = root()?;
+            // SAFETY: a live root descriptor and a NUL-terminated relative path.
+            let fd = unsafe { libc::openat(root, path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: a new owned descriptor.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    }
+
+    /// Full preallocation of a work file: mode-0 `fallocate` (allocate and extend; never
+    /// `FALLOC_FL_PUNCH_HOLE` or any other mode), then `fsync`.
+    pub fn preallocate(file: &File, bytes: u64) -> io::Result<()> {
+        let length = libc::off_t::try_from(bytes)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: a live descriptor; mode 0 allocates and extends.
+        if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        file.sync_all()
+    }
+
+    /// The only sysfs files the helper writes.
+    #[derive(Clone, Copy, Debug)]
+    pub enum SysfsControl {
+        /// `/sys/block/loop<minor>/queue/discard_max_bytes`, written `0` only.
+        LoopDiscardOff { minor: u32 },
+    }
+
+    /// Writes one fixed value to one [`SysfsControl`] file, opened without following a
+    /// link, never created or truncated.
+    pub fn write_sysfs(control: SysfsControl) -> io::Result<()> {
+        use std::io::Write;
+        let (path, value) = match control {
+            SysfsControl::LoopDiscardOff { minor } => (
+                format!("/sys/block/loop{minor}/queue/discard_max_bytes"),
+                b"0" as &[u8],
+            ),
+        };
+        let path = std::ffi::CString::new(path)?;
+        // SAFETY: a NUL-terminated path; no O_CREAT or O_TRUNC.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a new owned descriptor.
+        unsafe { File::from_raw_fd(fd) }.write_all(value)
+    }
+
     // The new mount API, creation only.
 
     /// A filesystem context from `fsopen`.
@@ -145,6 +595,10 @@ mod linux {
         /// The mount's root, for relative creation and identity reads.
         pub fn file(&self) -> &File {
             &self.0
+        }
+
+        fn into_file(self) -> File {
+            self.0
         }
     }
 
@@ -288,12 +742,14 @@ mod linux {
         .map(drop)
     }
 
-    /// Loop and block-device ioctls: read requests, plus attaching a free slot and
-    /// clearing autoclear. Nothing here detaches or reconfigures a bound slot.
+    /// Loop and block-device ioctls: read requests, attaching a free slot, and clearing
+    /// autoclear on a slot this process configured. Nothing here detaches a slot or
+    /// changes any other binding field (B4 recheck 5 finding 3).
     pub mod ioctl {
         use std::fs::File;
         use std::io;
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
 
         const LOOP_SET_STATUS64: libc::c_ulong = 0x4C04;
         const LOOP_GET_STATUS64: libc::c_ulong = 0x4C05;
@@ -303,24 +759,65 @@ mod linux {
         const BLKSSZGET: libc::c_ulong = 0x1268;
         /// `_IOR(0x12, 128, __u64)`.
         const BLKGETDISKSEQ: libc::c_ulong = 0x8008_1280;
-        pub const LO_FLAGS_AUTOCLEAR: u32 = 4;
+        const LO_FLAGS_AUTOCLEAR: u32 = 4;
+        const LOOP_MAJOR: u32 = 7;
 
+        /// A slot's `LOOP_GET_STATUS64` answer. Opaque: only [`loop_status`] makes one,
+        /// from the kernel, and nothing outside this module can change or submit one.
+        ///
+        /// ```compile_fail
+        /// // B4 recheck 5 PoC (typed-ioctl-occupied-loop): a forged status cannot be
+        /// // built or edited, so it cannot retune an occupied slot.
+        /// fn forge(device: &std::fs::File) {
+        ///     let mut forged = kilnd::sys::ioctl::loop_status(device).unwrap().unwrap();
+        ///     forged.lo_sizelimit = 1 << 20;
+        /// }
+        /// ```
         #[repr(C)]
-        #[derive(Clone, Copy)]
         pub struct LoopInfo64 {
-            pub lo_device: u64,
-            pub lo_inode: u64,
-            pub lo_rdevice: u64,
-            pub lo_offset: u64,
-            pub lo_sizelimit: u64,
-            pub lo_number: u32,
-            pub lo_encrypt_type: u32,
-            pub lo_encrypt_key_size: u32,
-            pub lo_flags: u32,
-            pub lo_file_name: [u8; 64],
-            pub lo_crypt_name: [u8; 64],
-            pub lo_encrypt_key: [u8; 32],
-            pub lo_init: [u64; 2],
+            lo_device: u64,
+            lo_inode: u64,
+            lo_rdevice: u64,
+            lo_offset: u64,
+            lo_sizelimit: u64,
+            lo_number: u32,
+            lo_encrypt_type: u32,
+            lo_encrypt_key_size: u32,
+            lo_flags: u32,
+            lo_file_name: [u8; 64],
+            lo_crypt_name: [u8; 64],
+            lo_encrypt_key: [u8; 32],
+            lo_init: [u64; 2],
+        }
+
+        impl LoopInfo64 {
+            /// The backing file's device, as the kernel encodes it (`huge_encode_dev`).
+            pub fn backing_device(&self) -> u64 {
+                self.lo_device
+            }
+
+            pub fn backing_inode(&self) -> u64 {
+                self.lo_inode
+            }
+
+            pub fn offset(&self) -> u64 {
+                self.lo_offset
+            }
+
+            pub fn size_limit(&self) -> u64 {
+                self.lo_sizelimit
+            }
+
+            pub fn autoclear(&self) -> bool {
+                self.lo_flags & LO_FLAGS_AUTOCLEAR != 0
+            }
+        }
+
+        /// Whether a `lo_device` (`huge_encode_dev`) names the device `st_dev`.
+        pub fn same_device(encoded: u64, st_dev: u64) -> bool {
+            let major = ((encoded & 0xfff00) >> 8) as u32;
+            let minor = ((encoded & 0xff) | ((encoded >> 12) & 0xfff00)) as u32;
+            (major, minor) == (libc::major(st_dev), libc::minor(st_dev))
         }
 
         #[repr(C)]
@@ -386,14 +883,39 @@ mod linux {
             Ok(block)
         }
 
+        /// A slot this process bound with [`loop_configure_autoclear`]: the configuring
+        /// descriptor, what it was bound to, and the attachment's disk sequence number
+        /// read on that descriptor right after. Only that function makes one, so the
+        /// autoclear clear can only reach this process's own attachment.
+        pub struct ConfiguredLoop {
+            device: File,
+            backing_dev: u64,
+            backing_ino: u64,
+            size_limit: u64,
+            diskseq: u64,
+        }
+
+        impl ConfiguredLoop {
+            /// The configuring descriptor, for read-only checks.
+            pub fn device(&self) -> &File {
+                &self.device
+            }
+
+            /// The attachment's disk sequence number, read right after `LOOP_CONFIGURE`.
+            pub fn diskseq(&self) -> u64 {
+                self.diskseq
+            }
+        }
+
         /// `LOOP_CONFIGURE` of a slot onto `backing`, offset 0, with `LO_FLAGS_AUTOCLEAR`.
         /// The kernel refuses a bound slot with `EBUSY`, so this never replaces a binding.
         pub fn loop_configure_autoclear(
-            device: &File,
+            device: File,
             backing: &File,
             size_limit: u64,
             block_size: u32,
-        ) -> io::Result<()> {
+        ) -> io::Result<ConfiguredLoop> {
+            let meta = backing.metadata()?;
             // SAFETY: zero is valid for every field; the kernel copies the structure.
             let mut config: LoopConfig = unsafe { std::mem::zeroed() };
             config.fd = backing.as_raw_fd() as u32;
@@ -402,17 +924,227 @@ mod linux {
             config.info.lo_flags = LO_FLAGS_AUTOCLEAR;
             config.block_size = block_size;
             // SAFETY: config is a complete loop_config for this live descriptor.
-            cvt(unsafe { libc::ioctl(device.as_raw_fd(), LOOP_CONFIGURE, &config) }).map(drop)
+            cvt(unsafe { libc::ioctl(device.as_raw_fd(), LOOP_CONFIGURE, &config) })?;
+            let diskseq = disk_sequence(&device)?;
+            Ok(ConfiguredLoop {
+                device,
+                backing_dev: meta.dev(),
+                backing_ino: meta.ino(),
+                size_limit,
+                diskseq,
+            })
         }
 
-        /// `LOOP_SET_STATUS64` of exactly `current` (what `LOOP_GET_STATUS64` returned)
-        /// less `LO_FLAGS_AUTOCLEAR`. It can only make a binding outlive its descriptor,
-        /// never end or alter one.
-        pub fn loop_clear_autoclear(device: &File, current: &LoopInfo64) -> io::Result<()> {
-            let mut info = *current;
+        /// Clears `LO_FLAGS_AUTOCLEAR` on this process's own attachment, so it outlives
+        /// the configuring descriptor. On that descriptor it reads the status itself
+        /// (`LOOP_GET_STATUS64`), requires the configured backing device and inode,
+        /// offset 0, size limit, autoclear still set, and the configured disk sequence
+        /// number before and after that read, then writes back exactly that status less
+        /// the one flag. It cannot end or retune a binding.
+        ///
+        /// ```compile_fail
+        /// // B4 recheck 5 PoC (unchecked-wrappers): a status read from any slot is not a
+        /// // ConfiguredLoop, so it cannot be submitted for that slot.
+        /// fn retune(device: &std::fs::File) {
+        ///     let forged = kilnd::sys::ioctl::loop_status(device).unwrap().unwrap();
+        ///     kilnd::sys::ioctl::loop_clear_autoclear(device, &forged).unwrap();
+        /// }
+        /// ```
+        ///
+        /// The read-only accessors do compile, so the two refusals above are the
+        /// privacy and the signature, not a wrong path:
+        ///
+        /// ```no_run
+        /// fn limit(device: &std::fs::File) -> u64 {
+        ///     let status = kilnd::sys::ioctl::loop_status(device).unwrap();
+        ///     status.map_or(0, |s| s.size_limit())
+        /// }
+        /// ```
+        pub fn loop_clear_autoclear(configured: &ConfiguredLoop) -> io::Result<()> {
+            let device = &configured.device;
+            let stat = device.metadata()?;
+            use std::os::unix::fs::FileTypeExt;
+            if !stat.file_type().is_block_device() || libc::major(stat.rdev()) != LOOP_MAJOR {
+                return Err(io::Error::other("not a loop device"));
+            }
+            let generation = |what: &str| -> io::Result<()> {
+                if disk_sequence(device)? != configured.diskseq {
+                    return Err(io::Error::other(format!(
+                        "loop attachment changed {what} clearing autoclear"
+                    )));
+                }
+                Ok(())
+            };
+            generation("before")?;
+            let mut info = loop_status(device)?
+                .ok_or_else(|| io::Error::other("loop detached before clearing autoclear"))?;
+            generation("while")?;
+            if !same_device(info.lo_device, configured.backing_dev)
+                || info.lo_inode != configured.backing_ino
+                || info.lo_offset != 0
+                || info.lo_sizelimit != configured.size_limit
+                || !info.autoclear()
+            {
+                return Err(io::Error::other(
+                    "loop status is not this process's attachment",
+                ));
+            }
             info.lo_flags &= !LO_FLAGS_AUTOCLEAR;
-            // SAFETY: info is the kernel's own status structure for this slot.
+            // SAFETY: info is the kernel's own status for this slot, less one flag.
             cvt(unsafe { libc::ioctl(device.as_raw_fd(), LOOP_SET_STATUS64, &info) }).map(drop)
         }
+    }
+}
+
+/// kilnd's API socket generation and its one removal (B4 recheck 5 finding 2).
+///
+/// `(device, inode)` is not a generation: once a socket is unlinked, the filesystem can
+/// hand its inode number straight to a replacement. A [`SocketGeneration`] adds the
+/// birth time, which no system call sets, and is read without following a link through
+/// the retained socket directory's descriptor. [`remove_socket_generation`] reads it
+/// again that way immediately before `unlinkat(dir, name)`; the remaining interval
+/// between that read and the unlink is the decided narrow window (design 7.1).
+pub mod socket {
+    use std::ffi::{CString, OsStr};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// A socket's device, inode and birth time. Only [`socket_generation_at`] makes one.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SocketGeneration {
+        device: u64,
+        inode: u64,
+        birth_sec: i64,
+        birth_nsec: u32,
+    }
+
+    /// What is at a name below a directory descriptor, never followed.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Seen {
+        Nothing,
+        NotASocket,
+        Socket(SocketGeneration),
+    }
+
+    fn name_c(name: &OsStr) -> io::Result<CString> {
+        if name.is_empty() || name.as_bytes().contains(&b'/') || name == "." || name == ".." {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a socket name is one path component",
+            ));
+        }
+        CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read(dir: &File, name: &CString) -> io::Result<Option<(bool, SocketGeneration)>> {
+        // SAFETY: statx writes into the zeroed buffer; the name is NUL-terminated.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::statx(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_TYPE | libc::STATX_INO | libc::STATX_BTIME,
+                &mut stx,
+            )
+        };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        if stx.stx_mask & libc::STATX_BTIME == 0 {
+            return Err(io::Error::other(
+                "the socket directory's filesystem reports no birth time (STATX_BTIME)",
+            ));
+        }
+        let socket = u32::from(stx.stx_mode) & libc::S_IFMT == libc::S_IFSOCK;
+        Ok(Some((
+            socket,
+            SocketGeneration {
+                device: libc::makedev(stx.stx_dev_major, stx.stx_dev_minor),
+                inode: stx.stx_ino,
+                birth_sec: stx.stx_btime.tv_sec,
+                birth_nsec: stx.stx_btime.tv_nsec,
+            },
+        )))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read(dir: &File, name: &CString) -> io::Result<Option<(bool, SocketGeneration)>> {
+        // SAFETY: stat is writable; the name is NUL-terminated.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        Ok(Some((
+            stat.st_mode & libc::S_IFMT == libc::S_IFSOCK,
+            SocketGeneration {
+                device: stat.st_dev as u64,
+                inode: stat.st_ino,
+                birth_sec: stat.st_birthtime,
+                birth_nsec: stat.st_birthtime_nsec as u32,
+            },
+        )))
+    }
+
+    /// What is at `name` below `dir` now, without following it.
+    pub fn socket_generation_at(dir: &File, name: &OsStr) -> io::Result<Seen> {
+        Ok(match read(dir, &name_c(name)?)? {
+            None => Seen::Nothing,
+            Some((false, _)) => Seen::NotASocket,
+            Some((true, generation)) => Seen::Socket(generation),
+        })
+    }
+
+    /// The outcome of [`remove_socket_generation`].
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Removal {
+        Removed,
+        /// Something else is at the name now; it was left exactly as it is.
+        Replaced,
+        /// Nothing is at the name.
+        Gone,
+    }
+
+    /// Unlinks `name` below `dir` only if it is still exactly `expected`, read again
+    /// through `dir` immediately before `unlinkat(dir, name, 0)`.
+    pub fn remove_socket_generation(
+        dir: &File,
+        name: &OsStr,
+        expected: &SocketGeneration,
+    ) -> io::Result<Removal> {
+        let c = name_c(name)?;
+        match read(dir, &c)? {
+            None => return Ok(Removal::Gone),
+            Some((true, seen)) if seen == *expected => {}
+            Some(_) => return Ok(Removal::Replaced),
+        }
+        // SAFETY: a NUL-terminated single component below a live directory descriptor.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(Removal::Gone);
+            }
+            return Err(error);
+        }
+        Ok(Removal::Removed)
     }
 }

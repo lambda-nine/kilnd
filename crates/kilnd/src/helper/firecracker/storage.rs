@@ -68,11 +68,6 @@ pub struct LoopBinding {
 /// The work device's logical block size: the formatter's 512-byte sectors.
 pub const LOOP_BLOCK_SIZE: u32 = 512;
 
-/// This boot's identity. Mount unique IDs and disk sequence numbers are never reused
-/// within one boot, so every journaled generation carries the boot it belongs to: a
-/// record from another boot names a mount or loop attachment that is gone by definition.
-pub const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
-
 /// A boot ID as the kernel prints it: a lowercase 8-4-4-4-12 UUID.
 pub fn valid_boot_id(text: &str) -> bool {
     text.len() == 36
@@ -518,14 +513,18 @@ mod linux {
     use std::os::unix::fs::MetadataExt;
     use std::time::Duration;
 
-    use crate::sys::ioctl::{self, LO_FLAGS_AUTOCLEAR};
+    use crate::sys::ioctl;
     const STATX_MNT_ID: u32 = 0x1000;
     /// Linux 6.8: the 64-bit mount ID that is never reused within a boot.
     const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
 
-    /// This boot's ID. Unreadable or malformed is an error, never a default.
+    /// This boot's identity, read beneath the private procfs instance
+    /// (`sys::procfs`). Mount unique IDs and disk sequence numbers are never reused
+    /// within one boot, so every journaled generation carries the boot it belongs to: a
+    /// record from another boot names a mount or loop attachment that is gone by
+    /// definition. Unreadable or malformed is an error, never a default.
     pub fn boot_id() -> io::Result<String> {
-        let text = std::fs::read_to_string(BOOT_ID_PATH)?;
+        let text = sys::procfs::boot_id()?;
         let text = text.trim_end_matches('\n');
         if !valid_boot_id(text) {
             return Err(io::Error::other("malformed boot ID"));
@@ -651,7 +650,9 @@ mod linux {
         private_dir(&jails, "firecracker", true)?;
         private_dir(&state, "work", true)?;
         let base = Path::new(JAIL_BASE);
-        let mounts = parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo")?)?;
+        let mounts = parse_mountinfo(&sys::procfs::read_to_string(&sys::procfs::own(
+            "mountinfo",
+        ))?)?;
         if !mounts.iter().any(|m| m.mount_point == base) {
             let path = CString::new(base.as_os_str().as_bytes()).unwrap();
             // SAFETY: both paths are NUL-terminated; a bind of the directory onto itself.
@@ -821,13 +822,7 @@ mod linux {
     /// Full preallocation: mode-0 fallocate, then a block count check. Unsupported
     /// preallocation fails; there is no sparse fallback.
     pub fn preallocate(file: &File, bytes: u64) -> io::Result<FileIdentity> {
-        let length = libc::off_t::try_from(bytes).map_err(|_| invalid("work size"))?;
-        // SAFETY: a live descriptor; mode 0 allocates and extends.
-        let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        file.sync_all()?;
+        sys::preallocate(file, bytes)?;
         let stat = fstat(file)?;
         #[allow(clippy::unnecessary_cast)]
         let allocated = stat.st_blocks as u64 * 512;
@@ -863,15 +858,8 @@ mod linux {
         ioctl::loop_status(device)
     }
 
-    fn decode_dev(encoded: u64) -> (u32, u32) {
-        // The kernel reports lo_device as huge_encode_dev: the "new" encoding.
-        let major = ((encoded & 0xfff00) >> 8) as u32;
-        let minor = ((encoded & 0xff) | ((encoded >> 12) & 0xfff00)) as u32;
-        (major, minor)
-    }
-
     fn same_device(encoded: u64, st_dev: u64) -> bool {
-        decode_dev(encoded) == (libc::major(st_dev), libc::minor(st_dev))
+        ioctl::same_device(encoded, st_dev)
     }
 
     pub(crate) fn open_loop(minor: u32, write: bool) -> io::Result<File> {
@@ -909,7 +897,7 @@ mod linux {
     /// so if its owner dies before the generation is journaled, the kernel detaches it
     /// when this descriptor closes and no unrecorded attachment outlives the crash.
     pub struct AttachedLoop {
-        device: File,
+        configured: ioctl::ConfiguredLoop,
         pub generation: LoopGeneration,
     }
 
@@ -932,55 +920,66 @@ mod linux {
         }
         let boot_id = boot_id()?;
         let device = open_loop(binding.minor, true)?;
-        if let Err(error) = ioctl::loop_configure_autoclear(
-            &device,
+        let configured = match ioctl::loop_configure_autoclear(
+            device,
             backing,
             binding.size_limit,
             binding.block_size,
         ) {
-            if error.raw_os_error() == Some(libc::EBUSY) {
+            Ok(configured) => configured,
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "loop slot is busy",
                 ));
             }
-            return Err(error);
-        }
+            Err(error) => return Err(error),
+        };
         let generation = LoopGeneration {
             boot_id,
-            diskseq: diskseq(&device)?,
+            diskseq: configured.diskseq(),
         };
-        if match_slot(&device, binding)? != SlotMatch::Exact
-            || diskseq(&device)? != generation.diskseq
+        let device = configured.device();
+        if match_slot(device, binding)? != SlotMatch::Exact
+            || diskseq(device)? != generation.diskseq
         {
             return Err(io::Error::other("loop binding differs from the intent"));
         }
         disable_discard(binding.minor)?;
-        Ok(AttachedLoop { device, generation })
+        Ok(AttachedLoop {
+            configured,
+            generation,
+        })
     }
 
     /// After the generation is journaled: clears autoclear on the configuring
     /// descriptor, so the binding outlives it, and proves that changed nothing else.
-    /// `LOOP_SET_STATUS64` writes back exactly what `LOOP_GET_STATUS64` returned, less
-    /// the one flag; it does not change the disk sequence number.
+    /// `ioctl::loop_clear_autoclear` takes only this process's own `ConfiguredLoop`,
+    /// reads the status itself and writes back exactly that, less the one flag; it does
+    /// not change the disk sequence number.
     pub fn persist_loop(binding: &LoopBinding, attached: AttachedLoop) -> io::Result<()> {
-        let AttachedLoop { device, generation } = attached;
-        let info = loop_status(&device)?
+        let AttachedLoop {
+            configured,
+            generation,
+        } = attached;
+        let device = configured.device();
+        let info = loop_status(device)?
             .ok_or_else(|| io::Error::other("loop detached before it was persisted"))?;
-        if match_slot(&device, binding)? != SlotMatch::Exact
-            || diskseq(&device)? != generation.diskseq
-            || info.lo_flags & LO_FLAGS_AUTOCLEAR == 0
+        if match_slot(device, binding)? != SlotMatch::Exact
+            || diskseq(device)? != generation.diskseq
+            || configured.diskseq() != generation.diskseq
+            || !info.autoclear()
         {
             return Err(io::Error::other(
                 "loop binding is not the journaled generation",
             ));
         }
-        ioctl::loop_clear_autoclear(&device, &info)?;
-        let after = loop_status(&device)?
+        ioctl::loop_clear_autoclear(&configured)?;
+        let after = loop_status(device)?
             .ok_or_else(|| io::Error::other("loop detached while it was persisted"))?;
-        if after.lo_flags & LO_FLAGS_AUTOCLEAR != 0
-            || match_slot(&device, binding)? != SlotMatch::Exact
-            || diskseq(&device)? != generation.diskseq
+        if after.autoclear()
+            || match_slot(device, binding)? != SlotMatch::Exact
+            || diskseq(device)? != generation.diskseq
         {
             return Err(io::Error::other(
                 "loop binding changed while it was persisted",
@@ -1016,11 +1015,12 @@ mod linux {
         let Some(info) = loop_status(device)? else {
             return Ok(SlotMatch::Free);
         };
-        if !same_device(info.lo_device, binding.backing_dev) || info.lo_inode != binding.backing_ino
+        if !same_device(info.backing_device(), binding.backing_dev)
+            || info.backing_inode() != binding.backing_ino
         {
             return Ok(SlotMatch::OtherBacking);
         }
-        if info.lo_offset != binding.offset || info.lo_sizelimit != binding.size_limit {
+        if info.offset() != binding.offset || info.size_limit() != binding.size_limit {
             return Ok(SlotMatch::Differs);
         }
         let size = ioctl::block_device_bytes(device)?;
@@ -1046,10 +1046,8 @@ mod linux {
     /// Section 7.1: discard and write-zeroes unmapping could punch holes in W. Loop
     /// refuses both while its discard limit is zero.
     fn disable_discard(minor: u32) -> io::Result<()> {
-        let path = format!("/sys/block/loop{minor}/queue/discard_max_bytes");
-        std::fs::write(&path, b"0")?;
-        let value = std::fs::read_to_string(&path)?;
-        if value.trim() != "0" {
+        sys::write_sysfs(sys::SysfsControl::LoopDiscardOff { minor })?;
+        if discard_max_bytes(minor)? != 0 {
             return Err(io::Error::other("loop discard could not be disabled"));
         }
         Ok(())
@@ -1156,8 +1154,7 @@ mod linux {
                 SlotMatch::OtherBacking => return Ok(LoopOutcome::NotOurs),
                 SlotMatch::Exact | SlotMatch::Differs => {}
             }
-            let autoclear =
-                loop_status(&device)?.is_some_and(|info| info.lo_flags & LO_FLAGS_AUTOCLEAR != 0);
+            let autoclear = loop_status(&device)?.is_some_and(|info| info.autoclear());
             if !autoclear || std::time::Instant::now() >= end {
                 return Ok(LoopOutcome::Unknown);
             }
@@ -1365,31 +1362,6 @@ mod linux {
         sys::fsmount(&fs, MOUNT_ATTR_NOSUID)
     }
 
-    fn mount_raw(
-        source: Option<&str>,
-        target: &Path,
-        fstype: Option<&str>,
-        flags: libc::c_ulong,
-        data: Option<&str>,
-    ) -> io::Result<()> {
-        let source = source.map(cstr).transpose()?;
-        let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| invalid("path"))?;
-        let fstype = fstype.map(cstr).transpose()?;
-        let data = data.map(cstr).transpose()?;
-        // SAFETY: every pointer is NUL-terminated or null.
-        cvt(unsafe {
-            libc::mount(
-                source.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-                target.as_ptr(),
-                fstype.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-                flags,
-                data.as_ref()
-                    .map_or(std::ptr::null(), |s| s.as_ptr().cast()),
-            )
-        })?;
-        Ok(())
-    }
-
     /// The jail tmpfs, created detached with its marker and jail root, and identified
     /// before it is attached anywhere. Its owner journals [`DetachedJail::record`], then
     /// calls [`attach_jail`]. If the owner dies first, the detached mount dies with its
@@ -1457,9 +1429,17 @@ mod linux {
             record,
         } = detached;
         sys::move_mount_onto(&mount, &jail_dir)?;
-        // Private propagation of exactly this mount, through its own descriptor.
-        let own = PathBuf::from(format!("/proc/self/fd/{}", mount.file().as_raw_fd()));
-        mount_raw(None, &own, None, libc::MS_PRIVATE, None)?;
+        // Private propagation of exactly this mount, through its own descriptor
+        // (`mount_setattr` with an empty path), never a `/proc/self/fd` pathname.
+        sys::mount_setattr(
+            &mount,
+            &sys::MountAttr {
+                attr_set: 0,
+                attr_clr: 0,
+                propagation: libc::MS_PRIVATE,
+                userns_fd: 0,
+            },
+        )?;
         drop((mount, jail_dir));
         let jail = open_trusted(&paths.jail_dir)?;
         let seen = mount_identity(&jail)?;
@@ -1611,20 +1591,17 @@ mod linux {
         Ok(())
     }
 
+    /// The entries of a held jail directory, read fd-natively (`getdents64` on a
+    /// duplicate), never through a `/proc/self/fd` pathname a mount could shadow.
     fn list(dir: &File) -> io::Result<Vec<String>> {
-        let path = format!("/proc/self/fd/{}", dir.as_raw_fd());
         let mut names = Vec::new();
-        for entry in std::fs::read_dir(path)? {
+        for entry in sys::read_dir_fd(dir, 1024)
+            .map_err(|e| io::Error::other(format!("jail directory: {e}")))?
+        {
             names.push(
-                entry?
-                    .file_name()
-                    .to_str()
-                    .ok_or_else(|| io::Error::other("non-UTF-8 jail entry"))?
-                    .to_string(),
+                String::from_utf8(entry.name)
+                    .map_err(|_| io::Error::other("non-UTF-8 jail entry"))?,
             );
-            if names.len() > 1024 {
-                return Err(io::Error::other("jail directory exceeds its inode bound"));
-            }
         }
         names.sort();
         Ok(names)
@@ -1670,7 +1647,9 @@ mod linux {
         }
         // Exactly the contract's mounts remain: the tmpfs at the jail directory and the
         // five read-only binds directly on it.
-        let mounts = parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo")?)?;
+        let mounts = parse_mountinfo(&sys::procfs::read_to_string(&sys::procfs::own(
+            "mountinfo",
+        ))?)?;
         let under = mounts_under(&mounts, &paths.jail_dir);
         let tmpfs: Vec<&MountEntry> = under
             .iter()
@@ -1893,7 +1872,9 @@ mod linux {
     }
 
     fn read_mounts() -> io::Result<Vec<MountEntry>> {
-        parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo")?)
+        parse_mountinfo(&sys::procfs::read_to_string(&sys::procfs::own(
+            "mountinfo",
+        ))?)
     }
 
     fn jail_name(paths: &AllocationPaths) -> io::Result<&str> {
@@ -2077,7 +2058,9 @@ mod linux {
         if super::super::cgroup::exists(cgroup)? {
             names.push("cgroup".into());
         }
-        let entries = parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo")?)?;
+        let entries = parse_mountinfo(&sys::procfs::read_to_string(&sys::procfs::own(
+            "mountinfo",
+        ))?)?;
         for entry in mounts_under(&entries, &paths.jail_dir) {
             names.push(format!("mount:{}", entry.mount_point.display()));
         }
@@ -2216,6 +2199,68 @@ mod tests {
             "umount {}: {}",
             target.display(),
             io::Error::last_os_error()
+        );
+    }
+
+    /// B4 recheck 5 finding 1, the unmount half: `unmount` used to call `umount2` on
+    /// `/proc/self/fd/<parent>/<name>` after checking the real parent descriptor, so a
+    /// shadowed `/proc/self/fd` could redirect a proven unmount onto another mount.
+    /// Here every fake descriptor entry links to a victim directory with its own tmpfs
+    /// at the same name. The unmount resolves `name` from the held parent descriptor
+    /// only: the proven mount goes and the victim stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and CAP_SYS_ADMIN: run scripts/b4-vm-tests.sh"]
+    fn b4_linux_root_a_shadowed_proc_fd_view_cannot_redirect_an_unmount() {
+        use super::super::cgroup::tests::ShadowedProcFd;
+        use super::super::proven;
+        use std::os::fd::AsRawFd;
+        let scratch = tempfile::tempdir_in("/var/tmp").unwrap();
+        let ours = scratch.path().join("ours");
+        let victim = scratch.path().join("victim");
+        for dir in [&ours, &victim] {
+            std::fs::create_dir_all(dir.join("target")).unwrap();
+        }
+        raw_mount("b4-ours", &ours.join("target"), "tmpfs", "size=1M");
+        raw_mount("b4-victim", &victim.join("target"), "tmpfs", "size=1M");
+        let parent = File::open(&ours).unwrap();
+        let unique = mount_identity_at(&parent, "target").unwrap().unique_id;
+        let victim_unique = mount_identity(&File::open(victim.join("target")).unwrap())
+            .unwrap()
+            .unique_id;
+        assert_ne!(unique, victim_unique);
+        let proof = proven::prove_mount(&parent, "target", unique, &boot_id().unwrap())
+            .unwrap_or_else(|e| panic!("our tmpfs is not proven: {e}"));
+        let unmounted = {
+            let victim = victim.clone();
+            let _shadow = ShadowedProcFd::new(move |entry| {
+                std::os::unix::fs::symlink(&victim, entry).unwrap();
+            });
+            assert!(
+                std::fs::symlink_metadata(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+                    && Path::new(&format!("/proc/self/fd/{}/target", parent.as_raw_fd())).exists(),
+                "the fake view redirects the parent's descriptor link"
+            );
+            proven::unmount(proof)
+        };
+        let ours_left = mounted_at(&ours.join("target"));
+        let victim_left = mounted_at(&victim.join("target"));
+        if !victim_left.is_empty() {
+            raw_umount(&victim.join("target"));
+        }
+        if !ours_left.is_empty() {
+            raw_umount(&ours.join("target"));
+        }
+
+        unmounted.unwrap();
+        assert!(ours_left.is_empty(), "the proven mount is still mounted");
+        assert_eq!(victim_left.len(), 1, "the victim mount was unmounted");
+        eprintln!(
+            "B4 evidence: with /proc/self/fd linking to a victim directory, unmount removed \
+             only the proven tmpfs (unique ID {unique}); the victim {victim_unique} stayed"
         );
     }
 

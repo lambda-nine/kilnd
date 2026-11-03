@@ -280,21 +280,10 @@ mod platform {
     impl ProcessView {
         pub(super) fn open(pid: i32) -> io::Result<Self> {
             let pidfd = open_pidfd(pid)?;
-            let path = CString::new(format!("/proc/{pid}")).unwrap();
-            // SAFETY: the path is NUL-terminated and the flags are valid for open.
-            let fd = unsafe {
-                libc::open(
-                    path.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            // Beneath the helper's private procfs instance, never a /proc pathname.
             Ok(Self {
                 pidfd,
-                // SAFETY: open returned a new descriptor that nothing else owns.
-                directory: unsafe { File::from_raw_fd(fd) },
+                directory: crate::sys::procfs::open_dir(&pid.to_string())?,
             })
         }
 
