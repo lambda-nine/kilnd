@@ -133,6 +133,12 @@ pub enum RelayReport {
         reason: String,
         dispatched: bool,
     },
+    /// The VMM gave no `OK` for port 5252: nothing in the guest is listening yet (or
+    /// any more). Only readiness retries this, within its Create deadline.
+    Unreachable {
+        job: u64,
+        reason: String,
+    },
 }
 
 impl RelayReport {
@@ -144,7 +150,8 @@ impl RelayReport {
             | Self::Accepted { job, .. }
             | Self::Executed { job, .. }
             | Self::Refused { job, .. }
-            | Self::Failed { job, .. } => *job,
+            | Self::Failed { job, .. }
+            | Self::Unreachable { job, .. } => *job,
         }
     }
 
@@ -159,6 +166,8 @@ impl RelayReport {
 enum Fail {
     Refused(ErrorReply),
     Broken(String),
+    /// No `OK` from the VMM: no listener behind port 5252.
+    Unreachable(String),
 }
 
 impl From<kilnd_broker_protocol::ProtocolError> for Fail {
@@ -318,6 +327,11 @@ async fn open<S: AsyncRead + AsyncWrite + Unpin, B: Budget>(
 
 fn failed(job: u64, fail: Fail, dispatched: bool) -> RelayReport {
     match fail {
+        Fail::Unreachable(reason) => RelayReport::Failed {
+            job,
+            reason: format!("unreachable: {reason}"),
+            dispatched,
+        },
         Fail::Refused(error) => RelayReport::Refused {
             job,
             error,
@@ -370,7 +384,10 @@ pub async fn initialize<S: AsyncRead + AsyncWrite + Unpin>(
             other => Err(Fail::Broken(format!("unexpected {other:?}"))),
         }
     };
-    run.await.unwrap_or_else(|fail| failed(job, fail, false))
+    run.await.unwrap_or_else(|fail| match fail {
+        Fail::Unreachable(reason) => RelayReport::Unreachable { job, reason },
+        fail => failed(job, fail, false),
+    })
 }
 
 /// `Probe`: the boot and inner sandbox, idle or busy. No create, restart or mutation.
@@ -1498,7 +1515,11 @@ pub mod supervise {
             },
             deadline_ns: link.deadline_ns(),
         };
-        submit(link, plan, booted, workers, request, Vec::new())?;
+        submit(link, plan, booted, workers, request.clone(), Vec::new())?;
+        // The guest is still booting when BOOTING is journaled: until its broker
+        // listens, the VMM answers CONNECT without OK. Only that is retried, every
+        // 50 ms, within the original Create deadline; nothing was sent to a broker.
+        let mut retry_at: Option<std::time::Instant> = None;
         let report = loop {
             link.beat();
             if let Some(command) = link.poll(Duration::from_millis(5))? {
@@ -1507,7 +1528,14 @@ pub mod supervise {
             if let Some(reason) = breach(workers) {
                 return Err(Abort::Refused(reason));
             }
+            if retry_at.is_some_and(|at| std::time::Instant::now() >= at) {
+                retry_at = None;
+                submit(link, plan, booted, workers, request.clone(), Vec::new())?;
+            }
             match next_report(workers).map_err(Abort::Refused)? {
+                Some(RelayReport::Unreachable { job: answered, .. }) if answered == job => {
+                    retry_at = Some(std::time::Instant::now() + Duration::from_millis(50));
+                }
                 Some(report) if report.job() == job => break report,
                 Some(_) => return Err(Abort::Refused("a report for another job".into())),
                 None => {}
