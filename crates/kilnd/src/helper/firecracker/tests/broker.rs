@@ -566,6 +566,17 @@ async fn b5_linux_root_boot_timings() {
     for run in 0..22 {
         let started = std::time::Instant::now();
         let (runtime, context, _) = create(&real).await;
+        // BOOTING (the VMM validated, hardened and running) apart from READY.
+        let mut booting = None;
+        while booting.is_none() {
+            let phase = real.phase(context.allocation_id);
+            if phase == "booting" || phase == "ready" {
+                booting = Some(started.elapsed());
+            }
+            assert!(started.elapsed() < Duration::from_secs(120), "never booted: {phase}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let booting = booting.unwrap();
         let (boot, _) = wait_ready(&real, &runtime, &context).await;
         let ready = started.elapsed();
         let ran = exec(&real, &runtime, &context, &boot, &["true"], Vec::new()).await;
@@ -573,7 +584,8 @@ async fn b5_linux_root_boot_timings() {
         assert_eq!(ran.reply.unwrap().finish, WireFinishFc::Completed);
         let kind = if run < 2 { "warmup" } else { "measured" };
         eprintln!(
-            "B5 boot: {{\"run\":{run},\"kind\":\"{kind}\",\"create_ready_ms\":{},\"first_tool_result_ms\":{}}}",
+            "B5 boot: {{\"run\":{run},\"kind\":\"{kind}\",\"create_booting_ms\":{},\"create_ready_ms\":{},\"first_tool_result_ms\":{}}}",
+            booting.as_millis(),
             ready.as_millis(),
             first.as_millis()
         );
