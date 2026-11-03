@@ -6,8 +6,8 @@
 # Inputs (override by environment):
 #   B4_TOOLS   jailer + mkfs.xfs from build-phase1b-tools.sh   ($HOME/b4-build/out)
 #   B4_VMM     the release Firecracker v1.17.0 aarch64 binary
-#   KILND_B5_KILL_INNER_GUEST  B5-04's test guest from scripts/b5-test-guest.sh, which
-#              b5_linux_root_a_killed_inner_sandbox_is_never_ready needs
+#   KILND_B5_KILL_INNER_GUEST, KILND_B5_CONSOLE_FLOOD_GUEST  B5's test guests from
+#              scripts/b5-test-guest.sh, for the two b5_linux_root tests that need them
 #   B4_GUEST   a kiln-guest bundle directory with Image and rootfs.squashfs: the schema-1
 #              guest, which listens for no command, so a boot ends at BOOTING
 # The test binary is built static (crt-static) because it is installed as the helper
@@ -67,6 +67,7 @@ caps=-all,+chown,+dac_override,+fowner,+kill,+setgid,+setuid,+setpcap,+net_admin
 sudo setpriv --bounding-set="$caps" --inh-caps=-all \
     env KILND_B4_ARTIFACTS="$work/artifacts" RUST_BACKTRACE=${RUST_BACKTRACE:-1} \
     KILND_B5_KILL_INNER_GUEST="${KILND_B5_KILL_INNER_GUEST:-}" \
+    KILND_B5_CONSOLE_FLOOD_GUEST="${KILND_B5_CONSOLE_FLOOD_GUEST:-}" \
     "$work/kilnd-lib-tests" --ignored --test-threads=1 --nocapture "$filter"
 sudo setpriv --bounding-set="$caps" --inh-caps=-all \
     env RUST_BACKTRACE=${RUST_BACKTRACE:-1} \

@@ -1,10 +1,14 @@
 /*
- * B5-04's test-guest broker wrapper (from Daybreak's B5 break-it PoC). The parent
+ * B5's test-guest broker wrapper (from Daybreak's B5 break-it PoC). The parent
  * immediately becomes the approved broker, renamed kilnd-guest-broker.real; a guest-root
- * child finds the persistent kiln sandbox's recorded init.pid, waits five seconds for
- * READY to settle, and kills it from the guest's outer PID namespace, leaving the broker
- * itself Idle. Test guests only: scripts/b5-test-guest.sh builds it into a copy of a
- * production bundle, never into the product image.
+ * child attacks:
+ *   B5_KILL_INNER     finds the persistent kiln sandbox's recorded init.pid, waits five
+ *                     seconds for READY to settle, and kills it from the guest's outer
+ *                     PID namespace, leaving the broker itself Idle (B5-04).
+ *   B5_CONSOLE_FLOOD  writes about 128 KiB/s to the serial console for the VM's life:
+ *                     past D's 64 KiB prefix, under its 1 MiB/s retirement rate.
+ * Test guests only: scripts/b5-test-guest.sh builds it into a copy of a production
+ * bundle, never into the product image.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -26,6 +30,22 @@ static void sleep_ms(long milliseconds) {
     while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {}
 }
 
+#if defined(B5_CONSOLE_FLOOD)
+static void attack(void) {
+    static unsigned char block[4 * 1024];
+    memset(block, 'F', sizeof(block));
+    for (;;) {
+        size_t done = 0;
+        while (done < sizeof(block)) {
+            ssize_t n = write(STDERR_FILENO, block + done, sizeof(block) - done);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) _exit(20);
+            done += (size_t)n;
+        }
+        sleep_ms(31);
+    }
+}
+#elif defined(B5_KILL_INNER)
 static pid_t find_inner_init(void) {
     const char *root = "/var/lib/kiln/runs";
     DIR *runs = opendir(root);
@@ -66,6 +86,9 @@ static void attack(void) {
     dprintf(STDERR_FILENO, "B5_TEST_KILLED_INNER pid=%ld\n", (long)inner);
     _exit(0);
 }
+#else
+#error "select B5_KILL_INNER or B5_CONSOLE_FLOOD"
+#endif
 
 int main(void) {
     pid_t child = fork();

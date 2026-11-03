@@ -512,6 +512,70 @@ async fn b5_linux_root_a_killed_inner_sandbox_is_never_ready() {
     removed_cleanly(&real, &runtime, &context).await;
 }
 
+/// The real guest console flood Daybreak ran beside the healthy path: a guest-root
+/// writer at about 128 KiB/s, past D's 64 KiB prefix and under its 1 MiB/s rate. D keeps
+/// draining with flat memory and RSS, executions stay reusable, and nothing retires.
+#[tokio::test]
+#[ignore = "needs root with the B4 launch capabilities: run scripts/b4-vm-tests.sh"]
+async fn b5_linux_root_a_real_guest_console_flood_keeps_the_drainer_flat() {
+    let guest = std::env::var("KILND_B5_CONSOLE_FLOOD_GUEST")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .expect("KILND_B5_CONSOLE_FLOOD_GUEST names the test guest (scripts/b5-test-guest.sh)");
+    let real = Real::with_guest(NodeOptions::default(), Some(&guest)).await;
+    let (runtime, context, _) = create(&real).await;
+    let (boot, inner) = wait_ready(&real, &runtime, &context).await;
+    let drainer = worker_pid(&real, context.allocation_id, "console")
+        .expect("D runs")
+        .pid;
+    let rss_kib = || -> u64 {
+        std::fs::read_to_string(format!("/proc/{drainer}/status"))
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix("VmRSS:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            })
+            .unwrap_or(0)
+    };
+    let mut samples = Vec::new();
+    for round in 0..30 {
+        let ran = exec(&real, &runtime, &context, &boot, &["true"], Vec::new()).await;
+        let reply = ran.reply.unwrap();
+        assert!(reply.reusable, "round {round}: {reply:?}");
+        let memory: u64 = cgroup_file(&context, "vm/console", "memory.current")
+            .trim()
+            .parse()
+            .unwrap();
+        let cpu = usage_usec(&cgroup_file(&context, "vm/console", "cpu.stat"));
+        samples.push((memory, cpu, rss_kib()));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    evidence(
+        "console flood (memory bytes, cpu usec, rss KiB) per second",
+        format!("{samples:?}"),
+    );
+    let settled = &samples[10..];
+    let memory_max = settled.iter().map(|s| s.0).max().unwrap();
+    let memory_min = settled.iter().map(|s| s.0).min().unwrap();
+    let rss_max = settled.iter().map(|s| s.2).max().unwrap();
+    let rss_min = settled.iter().map(|s| s.2).min().unwrap();
+    assert!(memory_max < MIB as u64, "{samples:?}");
+    assert!(memory_max - memory_min <= 256 * 1024, "{samples:?}");
+    assert!(rss_max - rss_min <= 512, "{samples:?}");
+    assert!(
+        settled.last().unwrap().1 > settled[0].1,
+        "D kept reading: {samples:?}"
+    );
+    assert!(matches!(
+        validate(&real, &runtime, &context, &boot, &inner).await,
+        ValidateReply::Ready { .. }
+    ));
+    removed_cleanly(&real, &runtime, &context).await;
+}
+
 /// B5 exit: timeout, the caller's disconnect and a Stop during execution each retire
 /// the VM (design 5.5): reusable = false, VM stopped, no second dispatch.
 #[tokio::test]
