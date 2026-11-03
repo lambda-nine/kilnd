@@ -1924,6 +1924,7 @@ pub(crate) struct PreparedDirectory {
 
 /// One directory entry's metadata, read with `fstatat` and never by opening it.
 struct EntryStat {
+    regular: bool,
     mode: u32,
     uid: u32,
     nlink: u64,
@@ -2282,6 +2283,7 @@ fn stat_entry_no_follow(directory: &File, name: &OsStr, path: &Path) -> Result<O
     // SAFETY: fstatat succeeded and initialized the whole structure.
     let stat = unsafe { stat.assume_init() };
     Ok(Some(EntryStat {
+        regular: stat.st_mode & libc::S_IFMT == libc::S_IFREG,
         mode: stat.st_mode as u32,
         uid: stat.st_uid,
         nlink: stat.st_nlink as u64,
@@ -2317,7 +2319,7 @@ fn create_database_entry(directory: &File, path: &Path, expected_uid: u32) -> Re
 }
 
 fn validate_database_entry(entry: &EntryStat, path: &Path, expected_uid: u32) -> Result<()> {
-    if entry.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+    if !entry.regular {
         bail!("{} must be a regular file", path.display());
     }
     if entry.uid != expected_uid {
