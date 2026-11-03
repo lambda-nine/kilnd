@@ -1925,6 +1925,7 @@ pub(crate) struct PreparedDirectory {
 /// One directory entry's metadata, read with `fstatat` and never by opening it.
 struct EntryStat {
     regular: bool,
+    symlink: bool,
     mode: u32,
     uid: u32,
     nlink: u64,
@@ -2284,6 +2285,7 @@ fn stat_entry_no_follow(directory: &File, name: &OsStr, path: &Path) -> Result<O
     let stat = unsafe { stat.assume_init() };
     Ok(Some(EntryStat {
         regular: stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+        symlink: stat.st_mode & libc::S_IFMT == libc::S_IFLNK,
         mode: stat.st_mode as u32,
         uid: stat.st_uid,
         nlink: stat.st_nlink as u64,
@@ -2319,6 +2321,12 @@ fn create_database_entry(directory: &File, path: &Path, expected_uid: u32) -> Re
 }
 
 fn validate_database_entry(entry: &EntryStat, path: &Path, expected_uid: u32) -> Result<()> {
+    if entry.symlink {
+        bail!(
+            "{} is a symbolic link: refused without following symlinks",
+            path.display()
+        );
+    }
     if !entry.regular {
         bail!("{} must be a regular file", path.display());
     }
@@ -7113,6 +7121,11 @@ mod tests {
             .err()
             .expect("database symlink was followed");
         assert!(error.to_string().contains("kilnd.db"), "{error:#}");
+        // scripts/state-path-regressions.sh matches this diagnostic.
+        assert!(
+            error.to_string().contains("without following symlinks"),
+            "{error:#}"
+        );
         assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
     }
 
@@ -7134,6 +7147,11 @@ mod tests {
             .err()
             .expect("database sidecar symlink was followed");
         assert!(error.to_string().contains("kilnd.db-wal"), "{error:#}");
+        // scripts/state-path-regressions.sh matches this diagnostic.
+        assert!(
+            error.to_string().contains("without following symlinks"),
+            "{error:#}"
+        );
         assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
     }
 
