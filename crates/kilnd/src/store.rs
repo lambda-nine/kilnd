@@ -883,6 +883,12 @@ impl Store {
         )?;
         let database_path = directory.path.join("kilnd.db");
         let expected_uid = unsafe { libc::geteuid() };
+        // Nothing below opens a descriptor to the database or a sidecar, before SQLite
+        // or after: closing any descriptor to a file drops every POSIX lock this process
+        // holds on it, SQLite's included. A dropped lock lets another connection (an
+        // operator's sqlite3, a backup) believe it is the last one, checkpoint and unlink
+        // the live WAL, and everything the daemon commits afterwards would then go to an
+        // unlinked file and be lost at its next crash (B6). Entries are only stat'ed.
         let existing = inspect_database_entry(
             &directory.file,
             OsStr::new("kilnd.db"),
@@ -890,25 +896,25 @@ impl Store {
             expected_uid,
         )?;
         inspect_sqlite_sidecars(&directory, expected_uid)?;
+        // A new database is created here, exclusively and 0600 whatever the umask, and
+        // closed before SQLite opens it; SQLite gives its sidecars the same mode.
+        let existing = match existing {
+            Some(existing) => existing,
+            None => create_database_entry(&directory.file, &database_path, expected_uid)?,
+        };
         let conn = Connection::open_with_flags(
             &database_path,
             OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .context("open database without following symlinks")?;
-        let mut opened =
-            open_entry_no_follow(&directory.file, OsStr::new("kilnd.db"), &database_path)?
-                .context("SQLite did not create kilnd.db")?;
-        if existing.is_none() {
-            opened
-                .file
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("set {} to 0600", database_path.display()))?;
-            opened.refresh()?;
-        }
-        validate_database_entry(&opened, &database_path, expected_uid)?;
-        if let Some(existing) = existing
-            && existing.identity() != opened.identity()
-        {
+        let opened = inspect_database_entry(
+            &directory.file,
+            OsStr::new("kilnd.db"),
+            &database_path,
+            expected_uid,
+        )?
+        .context("kilnd.db vanished while opening")?;
+        if existing.identity() != opened.identity() {
             bail!("{} changed while opening", database_path.display());
         }
         let store = Self::init_with_directory(
@@ -923,12 +929,16 @@ impl Store {
             true,
             "state",
         )?;
-        inspect_database_entry(
+        let reopened = inspect_database_entry(
             &directory.file,
             OsStr::new("kilnd.db"),
             &database_path,
             expected_uid,
-        )?;
+        )?
+        .context("kilnd.db vanished after opening")?;
+        if reopened.identity() != opened.identity() {
+            bail!("{} changed while opening", database_path.display());
+        }
         inspect_sqlite_sidecars(&directory, expected_uid)?;
         Ok(store)
     }
@@ -1912,19 +1922,18 @@ pub(crate) struct PreparedDirectory {
     pub(crate) file: File,
 }
 
-struct OpenedEntry {
-    file: File,
-    metadata: std::fs::Metadata,
+/// One directory entry's metadata, read with `fstatat` and never by opening it.
+struct EntryStat {
+    mode: u32,
+    uid: u32,
+    nlink: u64,
+    dev: u64,
+    ino: u64,
 }
 
-impl OpenedEntry {
-    fn refresh(&mut self) -> Result<()> {
-        self.metadata = self.file.metadata().context("inspect opened database")?;
-        Ok(())
-    }
-
+impl EntryStat {
     fn identity(&self) -> (u64, u64) {
-        (self.metadata.dev(), self.metadata.ino())
+        (self.dev, self.ino)
     }
 }
 
@@ -2244,24 +2253,25 @@ fn create_directory_at(directory: &File, name: &OsStr, path: &Path) -> Result<()
     Ok(())
 }
 
-fn open_entry_no_follow(
-    directory: &File,
-    name: &OsStr,
-    path: &Path,
-) -> Result<Option<OpenedEntry>> {
+/// Stats one entry beneath the held directory without following a link and without
+/// opening it, so a FIFO cannot block and no descriptor is ever closed on a file SQLite
+/// holds locks on (see `Store::open`).
+// libc's stat field widths differ between Linux and macOS, so these casts widen on one
+// and are identities on the other.
+#[allow(clippy::unnecessary_cast)]
+fn stat_entry_no_follow(directory: &File, name: &OsStr, path: &Path) -> Result<Option<EntryStat>> {
     let name = CString::new(name.as_bytes()).context("database filename contains NUL")?;
-    // O_NONBLOCK makes inspecting a pre-created FIFO fail safely rather than
-    // hanging startup. O_NOFOLLOW rejects a symbolic link before SQLite sees
-    // the path.
-    // SAFETY: directory and name are live and flags are valid for openat.
-    let fd = unsafe {
-        libc::openat(
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory and name are live, and stat is writable for one libc::stat.
+    let status = unsafe {
+        libc::fstatat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
         )
     };
-    if fd < 0 {
+    if status != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::NotFound {
             return Ok(None);
@@ -2269,30 +2279,59 @@ fn open_entry_no_follow(
         return Err(error)
             .with_context(|| format!("inspect {} without following symlinks", path.display()));
     }
-    // SAFETY: openat returned a new owned descriptor.
-    let file = unsafe { File::from_raw_fd(fd) };
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspect {}", path.display()))?;
-    Ok(Some(OpenedEntry { file, metadata }))
+    // SAFETY: fstatat succeeded and initialized the whole structure.
+    let stat = unsafe { stat.assume_init() };
+    Ok(Some(EntryStat {
+        mode: stat.st_mode as u32,
+        uid: stat.st_uid,
+        nlink: stat.st_nlink as u64,
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+    }))
 }
 
-fn validate_database_entry(entry: &OpenedEntry, path: &Path, expected_uid: u32) -> Result<()> {
-    if !entry.metadata.is_file() {
+/// Creates a new, empty database entry, exclusively, mode 0600, not following a link,
+/// and closes it before any SQLite connection exists.
+fn create_database_entry(directory: &File, path: &Path, expected_uid: u32) -> Result<EntryStat> {
+    let name = CString::new("kilnd.db").unwrap();
+    // SAFETY: directory and name are live and the flags are valid for openat.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("create {}", path.display()));
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("set {} to 0600", path.display()))?;
+    drop(file);
+    inspect_database_entry(directory, OsStr::new("kilnd.db"), path, expected_uid)?
+        .with_context(|| format!("{} vanished after creation", path.display()))
+}
+
+fn validate_database_entry(entry: &EntryStat, path: &Path, expected_uid: u32) -> Result<()> {
+    if entry.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
         bail!("{} must be a regular file", path.display());
     }
-    if entry.metadata.uid() != expected_uid {
+    if entry.uid != expected_uid {
         bail!(
             "{} must be owned by uid {expected_uid}, found uid {}",
             path.display(),
-            entry.metadata.uid()
+            entry.uid
         );
     }
-    let mode = entry.metadata.permissions().mode() & 0o7777;
+    let mode = entry.mode & 0o7777;
     if mode != 0o600 {
         bail!("{} must have mode 0600, found {mode:04o}", path.display());
     }
-    if entry.metadata.nlink() != 1 {
+    if entry.nlink != 1 {
         bail!("{} must have exactly one link", path.display());
     }
     Ok(())
@@ -2303,8 +2342,8 @@ fn inspect_database_entry(
     name: &OsStr,
     path: &Path,
     expected_uid: u32,
-) -> Result<Option<OpenedEntry>> {
-    let entry = open_entry_no_follow(directory, name, path)?;
+) -> Result<Option<EntryStat>> {
+    let entry = stat_entry_no_follow(directory, name, path)?;
     if let Some(entry) = entry.as_ref() {
         validate_database_entry(entry, path, expected_uid)?;
     }
@@ -6957,18 +6996,89 @@ mod tests {
         let database = tmp.path().join("kilnd.db");
         std::fs::File::create(&database).unwrap();
         std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let file = std::fs::File::open(&database).unwrap();
-        let entry = OpenedEntry {
-            metadata: file.metadata().unwrap(),
-            file,
-        };
-        let foreign_uid = if entry.metadata.uid() == 0 { 1 } else { 0 };
+        let directory = std::fs::File::open(tmp.path()).unwrap();
+        let entry = stat_entry_no_follow(&directory, OsStr::new("kilnd.db"), &database)
+            .unwrap()
+            .unwrap();
+        let foreign_uid = if entry.uid == 0 { 1 } else { 0 };
         let database_error = validate_database_entry(&entry, &database, foreign_uid)
             .expect_err("foreign-owned database was accepted");
         assert!(
             database_error.to_string().contains("owned"),
             "{database_error:#}"
         );
+    }
+
+    /// B6: once SQLite has opened the database, nothing in kilnd may open and close its
+    /// own descriptor to it or a sidecar. Closing one drops every POSIX lock the process
+    /// holds on that file, SQLite's included, and another process's connection (an
+    /// operator's sqlite3, a backup) then believes it is the last one: it checkpoints and
+    /// unlinks the live WAL, every later commit goes to an unlinked file, and a crash
+    /// loses them. The VM crash matrix found this when a SIGKILLed daemon came back
+    /// without rows it had committed. POSIX locks belong to a process, so the reader here
+    /// is a separate one: this test binary, re-executed as `wal_reader_child`.
+    #[test]
+    fn another_process_never_unlinks_the_live_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let database = tmp.path().join("kilnd.db");
+        let read = || -> i64 {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "store::tests::wal_reader_child",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(WAL_READER_ENV, &database)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines()
+                .find_map(|l| l.split("wal reader: ").nth(1))
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_else(|| {
+                    panic!("no reading: {text}{}", String::from_utf8_lossy(&out.stderr))
+                })
+                .parse()
+                .unwrap()
+        };
+        let before = read();
+        assert!(
+            tmp.path().join("kilnd.db-wal").exists(),
+            "another process's close unlinked the live WAL: kilnd had lost its locks"
+        );
+        // A commit after that reader must reach the real WAL, so another process sees it.
+        store
+            .conn()
+            .execute("UPDATE history_sequence SET value = value + 1", [])
+            .unwrap();
+        assert_eq!(
+            read(),
+            before + 1,
+            "another process must see a committed write"
+        );
+        drop(store);
+    }
+
+    const WAL_READER_ENV: &str = "KILND_TEST_WAL_READER";
+
+    /// The separate reader process for `another_process_never_unlinks_the_live_wal`.
+    #[test]
+    #[ignore = "re-exec target for another_process_never_unlinks_the_live_wal"]
+    fn wal_reader_child() {
+        let Ok(path) = std::env::var(WAL_READER_ENV) else {
+            return;
+        };
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        reader.pragma_update(None, "query_only", "ON").unwrap();
+        let value: i64 = reader
+            .query_row("SELECT value FROM history_sequence", [], |r| r.get(0))
+            .unwrap();
+        drop(reader);
+        println!("wal reader: {value}");
     }
 
     #[test]
