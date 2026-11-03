@@ -80,8 +80,10 @@ def run(title, prefix, scenarios, argv=None):
     summary = {
         'title': title,
         'prefix': prefix,
-        'commit': subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT,
-                                 capture_output=True, text=True).stdout.strip(),
+        # The VM mounts the Mac's checkout under another owner, so git needs this to
+        # read it at all.
+        'commit': subprocess.run(['git', '-c', f'safe.directory={ROOT}', 'rev-parse', 'HEAD'],
+                                 cwd=ROOT, capture_output=True, text=True).stdout.strip(),
         'started_unix': int(started),
         'seconds': round(time.time() - started, 1),
         'scenarios': results,

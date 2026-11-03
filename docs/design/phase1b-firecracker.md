@@ -2888,3 +2888,125 @@ v1.17.0. Logs, the transcript and the SQLite and journal evidence are in
 | Nothing regressed | B5's real-chain suite 8/8 in 668 s (at `9c88e9a`; the later commits change only `main.rs`'s backend selection, docs and lexical tests); B4's 31/31 in 1,416 s plus the core's capability-drop test, and the session again, at `b0ef982`; Mac tests and clippy on Rust 1.88 and 1.99, the gate tests, the maintenance tests and CI green |
 
 The station restart at 19:26 UTC stopped the managed VM during the first B4 run (14 minutes of uptime, not the two-hour death below). The B5 suite had already passed; nothing non-main had been installed, `/var/lib/kilnd/kilnd.db` kept its digest, no build file was truncated, and B4 and the session were rerun. Separately, at 18:44 UTC the idle VM died at 2 h 02 m of uptime, as twice before: launchd reports the Virtualization service "exited due to exit(0), ran for 7339719ms", and the guest kernel logged nothing. That points to a host-side limit near two hours rather than nested-Firecracker load; VM phases are now kept under two hours from a fresh restart.
+
+### Milestone 2: recovery and section 10 on the real chain
+
+Milestone 2 runs every remaining B6 exit criterion through real daemons and `kilndctl`.
+The harness in `tests/session.rs` (`Deployment`, `Daemon`) builds the isolated test
+deployment for any number of daemons. Each has its own `kilnd-<name>` account, transient
+unit with `kilnd@.service`'s hardening, state directory and root enrollment, all against
+one real helper. `tests/recovery.rs` holds the scenarios. `scripts/firecracker-crash-matrix.py`
+and `scripts/firecracker-regressions.py` run each one alone through `scripts/b4-vm-tests.sh`,
+which cleans the host before and after, and collect a `B6 matrix:` line per scenario into
+`matrix.json` and `matrix.md`. A scenario that is missing, fails or reports nothing fails
+the script, and `b6_scenario_names_match_the_scripts` keeps the scripts' lists and the
+tests in step. The scripts refuse to start past 90 minutes of VM uptime.
+
+*Two defects the real chain found.*
+
+- **A dropped POSIX lock let another reader unlink the daemon's live WAL.** `Store::open`
+  (since B2, never on main or installed) checked the database's and its sidecars' owner,
+  mode and link count by opening and closing its own descriptors, some after SQLite had
+  opened them. Closing any descriptor to a file drops every POSIX lock the process holds
+  on it, SQLite's included. Another process's connection, such as an operator's `sqlite3`,
+  a backup or this harness's root reader, could then take the database's exclusive lock,
+  believe itself the last connection, checkpoint and unlink the WAL and shared memory
+  under the live daemon. Everything the daemon committed afterwards went to an unlinked
+  file: it saw its own writes, nobody else did, and a crash lost them. The crash matrix
+  saw a SIGKILLed daemon return without an execution row it had committed, and a
+  root reader still see a row as `ready` after Delete had committed `deleting`. Fix:
+  entries are only `fstatat`ed beneath the held directory with `AT_SYMLINK_NOFOLLOW`, never
+  opened, and a new database is created by kilnd itself (`O_CREAT|O_EXCL|O_NOFOLLOW`,
+  0600) and closed before SQLite opens it, so SQLite's sidecars inherit 0600. Test:
+  `store::tests::another_process_never_unlinks_the_live_wal` reads from a separate
+  process (POSIX locks belong to a process), and fails on the old code.
+- **A session no supervisor owns was refused as reusable.** After a helper restart, the
+  new helper adopts the old supervisor only as an orphan to watch, and Exec on that
+  allocation is refused before anything is journaled or sent. B5 answered every such
+  refusal `reusable: true`, so the daemon kept the row READY and kept sending commands.
+  Now a refusal because the session can never run a command again (fenced, stopped,
+  unsupervised, booted again, supervisor gone) is `reusable: false` with
+  `no_child_started`, and the daemon quarantines the row, still charged, for Delete.
+  Another execution in flight stays a transient, reusable refusal. Test:
+  `exec::tests::b6_an_unsupervised_session_is_refused_and_not_reusable`.
+
+*The B5 recheck follow-ups.*
+
+- **B5-R1:** `fence_flow`'s Lookup, never-admitted quota check, `SettleUnstarted`,
+  pending-record flush and Fence all stop waiting at the request's own deadline
+  (`ledger_until`), so a stalled L ends the attempt charged and ambiguous. The detached
+  task then gives its slot and any removing claim back, and a later attempt can make
+  progress. The flush is cancel-safe: a record in flight when the flush is dropped goes
+  back to the front of the queue, and L may then see it twice, as after any unanswered
+  call. The Fence commit after a dropped wait may still land; the next attempt answers
+  with that fence. Tests: `b5_r1_a_stalled_ledger_fence_gives_back_its_detached_slot`
+  (the recheck's PoC as a fixture test, which fails without the bound) and, through the
+  daemon, `b6_linux_root_attack_a_stalled_ledger_fence_never_holds_remove`.
+- **B5-R2:** settlement compacts too, so exactly eight settled cleanup-worker rows remain,
+  as section 7.4 says, even when rows settle out of order. Unsettled and node-level rows
+  are never removed (`b5_01_stop_reasons_and_cleanup_workers_are_bounded`).
+
+*Decisions made here.*
+
+- **A capacity refusal is RESOURCE_EXHAUSTED.** A C2 refusal for capacity now carries
+  that in `CreateFailure` (`exhausted`), still ambiguous and released only by its fence,
+  and Create answers RESOURCE_EXHAUSTED after the fence settles (section 9.2). A Delete
+  whose proof is blocked still answers INTERNAL with a "stays charged" message: the row
+  and the node stay charged and the text says so, but kilnd's API has no UNAVAILABLE
+  code for it yet. That mapping is left for B7.
+- **A C0 refusal is an honest answer to a full node.** When the node is full, or both of
+  P's node-wide slots are busy (section 6.4), Preflight refuses with no row and no
+  reservation. Only a refusal after C1 needs its fence. The scenarios accept either, and
+  the matrix records which one happened.
+- **A helper restart never resumes a session.** The restarted helper replays every claim
+  and watches the old supervisor as an orphan, but never adopts it as a supervisor. The
+  daemon learns that at its next Exec (quarantine), and Delete stops and removes by exact
+  token as for any allocation.
+- **Recovery by allocation stays in the runtime.** Section 9.1's split holds. The manager
+  inspects, removes or fences exact tokens, and `FirecrackerRuntime` decides how. Its
+  `fence_absent` removes a journaled token first, because the manager reaches it for any
+  Unknown observation (a stop still in progress, a boot).
+
+*How each section 4.5 row is covered on the real chain.*
+
+| Section 4.5 row | Scenario | Result |
+|---|---|---|
+| Post-C1 failure before INTENT; a queued duplicate | `crash_daemon_death_before_c2_…`: kilnd dies with its Create held before C2 | The restarted daemon fences the never-admitted token and releases the row with that fence; the held Create then finds the fence and allocates nothing |
+| Capacity commits, reply lost | `crash_capacity_commit_reply_lost_…`: L dies right after the C2 commit | One claim survives L's death and a helper restart, never a second; the row stays charged until Delete's ABSENT |
+| H dies (READY session) | `crash_helper_restart_keeps_every_claim` | S killed the VM when H died (the old VMM is gone); the new helper replays the one claim, its journal phase still `ready`; the next Exec is refused as not reusable and the row quarantined, never READY again; Delete reaches ABSENT |
+| H or the daemon dies during BUSY | `crash_daemon_death_mid_execution_…` | The disconnect retires the VM; the helper's phase is `stop_intent` and its Inspect stays Unknown until STOPPED, so the restarted daemon publishes the execution `failed` with unknown cleanup and the row quarantined (section 8.3's "or cleanup failure/QUARANTINED"), never READY; no command replays; Delete releases |
+| Daemon dies while booting | `crash_daemon_death_while_booting_…` | The restarted daemon adopts exactly that READY boot (C6); one allocation, no second VM |
+| Cleanup finishes but ABSENT's sync fails | `crash_absent_sync_failure_…` | Delete errors; both ledgers stay charged; a retry commits ABSENT |
+| ABSENT commits, the daemon's terminal commit is lost | `crash_absent_committed_but_publication_lost_…` | The helper's claim is released; the row stays DELETING and charged until the restarted daemon replays the receipt |
+| Daemon database restored or stale; the node ledger survives | `crash_restored_stale_db_…` (two daemons) | The stale daemon blocks its own admission; the node keeps the charge; the other daemon's Health shows the node's count, and its second Create is refused |
+| Daemon database lost | `crash_lost_db_…` (two daemons) | The new database is another instance, which the helper refuses; the lost daemon's claim and VM stay; the other daemon gets no slot; restoring the database restores control |
+
+Section 10.2's other items: item 15's two-daemon race and the disk and vCPU
+exhaustion (`attack_two_daemons_race_…`, `attack_disk_and_vcpu_exhaustion_…`);
+section 4.1's one live holder against a byte copy of the daemon's files from the enrolled
+unit's own cgroup (`attack_duplicate_instance_attachment_…`); item 13's simultaneous
+hostile I/O beside real Create, Health, Get, Exec and Delete (`attack_hostile_io_…`); and
+quarantine with blocked proof (`attack_quarantine_stays_deletable_…`: both K slots
+stalled, a timed-out execution can't prove the VM gone, the sandbox is quarantined and
+charged, Delete errors until K recovers, then reaches ABSENT).
+
+### Milestone 2 exit evidence
+
+All in the `kiln` Lima VM under the managed `kiln-vm` process, restarted at 21:04 UTC
+for a fresh window, with the inputs of milestone 1 (the approved jailer and `mkfs.xfs`,
+release Firecracker v1.17.0, kiln-guest `86fbf26`'s bundle with broker `35fad74f…`).
+Matrices, transcripts and daemon and helper logs are in `reviews/2026-11-03-b6-vm/m2-final/`.
+
+| B6 exit criterion | Evidence |
+|---|---|
+| Section 10 attacks on the actual chain | `firecracker-regressions.py`: 7/7 (the session, the race, exhaustion, duplicate attachment, hostile I/O, the stalled fence, quarantine) |
+| Two-daemon race | Two sessions first, then the last two Creates together: exactly three allocations reach INTENT; the loser is FAILED and released by its own fence (`refused_after_c1`, receipt in `retired_tokens`); claims return to 0 after cleanup. Four simultaneous Creates instead mostly end at C0 for P's two slots, with no row |
+| Full global-ledger crash matrix | `firecracker-crash-matrix.py`: 9/9 (the table above) |
+| Disk and vCPU exhaustion never oversubscribe | One session per dimension's ceiling; the second is refused at C2 (`node capacity exhausted: Disk` and `VirtualCpu`), released by its fence; claims never exceed 1 |
+| Duplicate attachments | A byte copy of the serving daemon's files, the enrolled account and image, from inside the enrolled unit's own cgroup and from outside it: both `another live holder has this instance`; the daemon kept serving |
+| A surviving node ledger never discounts a lost daemon | Stale and lost databases: the node keeps the claim and the lost daemon's VM; the other daemon's Health shows the node's count and its next Create is refused (released by its fence) |
+| B5's hostile I/O with real lifecycle requests | Two hostile relays and a console flood beside a real daemon: worst Create 14.38 s (120 s budget), Health 8.8 ms, Get 3.8 ms, Exec 76.9 ms (60 s), Delete 127 ms (60 s); hostile cgroups' memory [659,456, 487,424, 147,456] → [397,312, 258,048, 147,456] bytes; helper RSS 20,292 → 21,476 KiB; 806 endless-frame and 10 silent-peer jobs each ended at its bound; 2.9 GB of console drained with one rate report |
+| No reservation freed while a VM, disk or worker may exist | Every scenario's release is checked the same way: helper phase `absent`, claim released, the retired token's receipt equal to the row's `release_evidence_id`, no host leftover; before Delete, a retired VM's disk, jail and cgroup and its claim remain |
+| Quarantine controllable through Delete; honest Unknown | Both K slots stalled: a timed-out execution can't prove the VM gone, so it is `failed` with unknown cleanup and the row quarantined; Delete then errors ("the fence deadline expired; the allocation stays charged"), the row DELETING and charged; once K recovers, Delete reaches ABSENT |
+| B5-R1 and B5-R2 | The stalled-fence Delete answered in 60.0 s with the detached slot and removing claim already free while L was still stalled; the next Delete reached ABSENT. The fixture test fails without the bound. Exactly eight settled worker rows |
+| The gate | No new destructive call: `Store::open` now only `fstatat`s and creates; clippy with `-D clippy::disallowed_methods` on Rust 1.88 and 1.99 (macOS and Linux) and the gate tests pass |

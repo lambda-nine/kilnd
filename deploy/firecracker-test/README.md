@@ -83,6 +83,27 @@ output and exit code), `kilnd-db.json` (the sandbox row, its executions and its 
 evidence), `helper-journal.json` (the node ledger's allocation, claim, leases, stop and
 resource events and retired token), `kilnd.log` and `helper.log` there.
 
+## The crash matrix and the attacks (B6 milestone 2)
+
+The same deployment, with a second daemon `fctest2` (account `kilnd-fctest2`, unit
+`kilnd-fctest2.service`, socket `/run/kilnd-fctest2/kilnd.sock`, state
+`/var/lib/kilnd-fctest2`, the same helper) where a scenario needs two, runs the
+global-ledger crash matrix and section 10's attacks:
+
+```sh
+python3 -I scripts/firecracker-crash-matrix.py --evidence $HOME/b6/crash
+python3 -I scripts/firecracker-regressions.py --evidence $HOME/b6/attacks
+```
+
+Each scenario is one privileged test in
+`crates/kilnd/src/helper/firecracker/tests/recovery.rs`, run alone through
+`scripts/b4-vm-tests.sh` with a clean host before and after. Each script writes the
+transcripts, daemon and helper logs, `tests.log`, `matrix.json` and `matrix.md`, and
+fails if any scenario is missing or failed. Byte copies of daemon state for the database
+scenarios live under `/var/lib/kilnd-b6-copies`, which the cleanup script removes too.
+Both scripts refuse to start past 90 minutes of VM uptime, because the kiln VM freezes
+at about two hours.
+
 ## What the session proves
 
 - `kilndctl create --net none` reaches READY through C0 to C7: Preflight, the C1 row, the

@@ -6,6 +6,17 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B6 milestone 2. `Store::open` no longer opens and closes descriptors to the
+  database or its sidecars (it `fstatat`s them and creates a new database itself, 0600,
+  before SQLite opens it): a close dropped SQLite's own POSIX locks, so another process's
+  connection could unlink the live WAL and a crash then lost committed state. Exec on a
+  session that can never run a command again (fenced, stopped, unsupervised after a helper
+  restart) is refused as not reusable, so the daemon quarantines it. B5-R1: every ledger
+  wait in the fence is bounded by the request's deadline and the pending flush is
+  cancel-safe. B5-R2: exactly eight settled cleanup-worker rows are kept. New
+  `scripts/firecracker-crash-matrix.py` and `scripts/firecracker-regressions.py` run the
+  global-ledger crash matrix and section 10's attacks through real daemons and kilndctl.
+
 - Phase 1b B6 milestone 1: the first whole Firecracker session through the public API.
   `FirecrackerRuntime` now follows Create to the helper's journaled READY and sends
   Validate, Exec, Remove and Gc by exact allocation token with the journaled boot and
