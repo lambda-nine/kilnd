@@ -749,14 +749,25 @@ pub mod relay {
     /// pipe was created by H's runtime and closed by the workers' descriptor sweeps, but
     /// every new I/O driver duplicates its stale descriptor number. R never handles a
     /// signal, so while it builds its runtime it points every free descriptor below 1024
-    /// at one end of a fresh, inert socket pair, then closes them all: the driver keeps
+    /// (and 16 under its soft limit) at one end of a fresh, inert socket pair, then
+    /// closes them all: the driver keeps
     /// its own duplicate of an inert socket that never becomes readable. Nothing of S's
     /// is exposed, since only free numbers are filled.
     #[cfg(unix)]
     fn runtime() -> io::Result<tokio::runtime::Runtime> {
         let (inert, _peer) = StdUnixStream::pair()?;
+        // Leave room under the soft limit for the driver's own epoll, eventfd and dup.
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: limit is writable.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let top = (limit.rlim_cur.min(1024) as libc::c_int).saturating_sub(16);
         let mut fillers = Vec::new();
-        for fd in 3..1024 {
+        for fd in 3..top {
             // SAFETY: F_GETFD only reads the descriptor table.
             if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
                 // SAFETY: fills a free number with a duplicate this function owns.
@@ -801,7 +812,6 @@ pub mod relay {
         control: StdUnixStream,
         descriptors: UnixDatagram,
     ) {
-
         let local = tokio::task::LocalSet::new();
         local.block_on(&runtime, async move {
             let _ = control.set_nonblocking(true);
