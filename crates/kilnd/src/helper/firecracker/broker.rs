@@ -754,8 +754,8 @@ pub mod relay {
     /// its own duplicate of an inert socket that never becomes readable. Nothing of S's
     /// is exposed, since only free numbers are filled.
     #[cfg(unix)]
-    fn runtime() -> io::Result<tokio::runtime::Runtime> {
-        let (inert, _peer) = StdUnixStream::pair()?;
+    fn runtime() -> io::Result<(tokio::runtime::Runtime, StdUnixStream)> {
+        let (inert, peer) = StdUnixStream::pair()?;
         // Leave room under the soft limit for the driver's own epoll, eventfd and dup.
         let mut limit = libc::rlimit {
             rlim_cur: 0,
@@ -782,7 +782,9 @@ pub mod relay {
             .enable_time()
             .build();
         drop(fillers);
-        built
+        // The peer stays open for R's life: an EOF on the driver's copy would read as
+        // a broken signal pipe.
+        Ok((built?, peer))
     }
 
     /// R's whole life as S's fork-only, single-threaded child: jobs until S closes the
@@ -792,8 +794,8 @@ pub mod relay {
     /// thread, so the runtime runs on one fresh thread of R's own (two tasks of the
     /// relay leaf's four).
     pub fn relay_worker_main(control: StdUnixStream, descriptors: UnixDatagram) {
-        let runtime = match runtime() {
-            Ok(runtime) => runtime,
+        let (runtime, _inert_peer) = match runtime() {
+            Ok(built) => built,
             Err(error) => {
                 eprintln!("kilnd relay: runtime: {error}");
                 return;
