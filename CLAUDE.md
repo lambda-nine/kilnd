@@ -17,6 +17,10 @@ through its CLI. Read [README.md](README.md),
   `cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`,
   `python3 -I scripts/kilnd-maintenance-tests.py`.
   CI runs them with Rust 1.88 (the MSRV), and clippy again with 1.99.
+- **Crates:** `kilnd` (daemon, helper, store), `kilnd-api` (generated gRPC), `kilndctl`,
+  `kilnd-exec-core` (the direct-kiln process/status/capture/validation core, shared with the
+  guest broker; kilnd re-exports it from the old paths) and `kilnd-broker-protocol` (the
+  strict broker protocol v1 codec, design section 5.2).
 - **The destructive-action gate is clippy.** `clippy.toml` disallows raw signals,
   removals, renames, unmounts, `libc::syscall`, `libc::ioctl` and subprocesses. Use the
   proof-taking functions in `helper/firecracker/proven.rs` or the typed wrappers in

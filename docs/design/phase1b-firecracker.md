@@ -637,12 +637,13 @@ The other `/proc` pathname reads moved beneath `sys::procfs`, a private procfs s
 
 *The clippy gate (B4 recheck 4).* `clippy.toml` at the workspace root lists as `disallowed-methods` every raw destructive, raw-syscall and subprocess capability: `libc::kill`, `killpg`, `tgkill`, `pidfd_send_signal`, `syscall`, `unlink`, `unlinkat`, `rmdir`, `remove`, `umount`, `umount2`, `unmount`, `rename`, `renameat`, `renameat2`, `renameatx_np`, `ioctl`, `execve`, `execv`, `execvp`, `execvpe`, `execveat`, `fexecve`, `posix_spawn`, `posix_spawnp` and `system`; `std::fs::remove_file`, `remove_dir`, `remove_dir_all` and `rename` and their `tokio::fs` equivalents; `std::process::Command::new` and `tokio::process::Command::new`; and `std::process::Child::kill`, `tokio::process::Child::kill` and `start_kill`. Since B4 recheck 5 it also lists truncation and overwrite (`std::fs::File::set_len`, `File::create`, `OpenOptions::truncate` and `std::fs::write`, the `tokio::fs` equivalents, `libc::truncate`, `ftruncate`, `fallocate`, `fallocate64` and `posix_fallocate`) and raw process and memory control (`libc::prctl`, `ptrace`, `process_vm_writev`, `process_vm_readv` and `pidfd_getfd`). Neither `nix` nor `rustix` is a direct dependency. The lint resolves paths, so it fires on a function taken as a value, a `use ... as` alias or a function-pointer constant exactly as on a call; the recheck-4 PoC (`let raw_kill = libc::kill;`) fails clippy on Rust 1.88 and 1.99. Entries marked `allow-invalid` exist only on some targets; on Linux every one resolves except `pidfd_send_signal`, which libc does not wrap (it is reachable only through `libc::syscall`, itself disallowed), and the macOS-only `unmount` and `renameatx_np`. CI runs clippy over all targets with `-D warnings -D clippy::disallowed_methods` on 1.88 and 1.99. There is no `disallowed-types` entry: every listed capability is a function, and `Command` has no other constructor.
 
-| Approved module or item (`crates/kilnd/src/`) | Allows | Why |
+| Approved module or item (`crates/kilnd/src/`, or `crates/kilnd-exec-core/src/` where marked *core*) | Allows | Why |
 |---|---|---|
 | `helper/firecracker/proven.rs` (whole module) | every raw destructive call | The gate: each one sits behind a proof type |
-| `sys.rs` (whole module) | `libc::syscall`, `libc::ioctl`, `libc::prctl`, `libc::ptrace`, `libc::fallocate`, one `unlinkat`, and `kill(pid, 0)` on macOS | The typed wrappers: `close_range`, `pidfd_open`, `pidfd_alive` (signal fixed at 0), `capget`, `capset`, `execveat_empty` (the only way the helper starts the jailer, Firecracker or mkfs.xfs, from a retained descriptor), `read_dir_fd` (`getdents64`), `procfs` (`openat2` beneath the private instance), one function per fixed `prctl` request (`sys::prctl`: ambient, bounding-set, no-new-privs, parent-death and subreaper requests, plus the dumpable flag), `ptrace_traceme`, `preallocate` (mode-0 `fallocate` only), `write_sysfs` (the `SysfsControl` enum's files only), the creation-only mount API (`DetachedMount` is made only by `fsmount` or `open_tree_clone`, so `move_mount` and `mount_setattr` act only on a mount this process created), `sys::ioctl` (`LOOP_GET_STATUS64` into an opaque `LoopInfo64`, `LOOP_CTL_GET_FREE`, `BLKGETDISKSEQ`, `BLKGETSIZE64`, `BLKSSZGET`, `LOOP_CONFIGURE`, which the kernel refuses on a bound slot and which returns the `ConfiguredLoop`, and clearing `LO_FLAGS_AUTOCLEAR` on that `ConfiguredLoop` only), and `sys::socket`'s generation-checked unlink of kilnd's API socket. `LOOP_CLR_FD` is not there: it is only in `proven::clear_loop`, which takes a `ProvenLoop` |
-| `process.rs`, `run` | `tokio::process::Command::new`, `Child::start_kill` | kilnd's one subprocess runner, for the fixed `process::Tool` variants only: `Tool::Kiln`, a `KilnBinary` verified at every launch (an absolute path to a regular executable owned by root or this user and writable by neither group nor others) with `KilnArgs` from typed constructors (`capabilities`, `ls`, `rm`, scoped `gc`, `gc --help`, `create`), and SIGKILL of its own unreaped child, whose PID cannot be reused before it is reaped. There is no arbitrary-program variant |
-| `runtime/kiln_process.rs`, `probe`, `OwnedExec::spawn`, `OwnedExec::kill_reap` | `tokio::process::Command::new`, `Child::start_kill` | The kiln CLI probe and `kiln exec`, both taking the verified `KilnBinary` (and the probe typed `KilnArgs`), and SIGKILL of their own unreaped children |
+| `sys.rs` (whole module) | `libc::syscall`, `libc::ioctl`, `libc::prctl`, `libc::ptrace`, `libc::fallocate`, one `unlinkat`, and `kill(pid, 0)` on macOS | The typed wrappers: `close_range`, `pidfd_open`, `pidfd_alive` (signal fixed at 0), `capget` and `capset` (re-exported from the core since B5), `execveat_empty` (the only way the helper starts the jailer, Firecracker or mkfs.xfs, from a retained descriptor), `read_dir_fd` (`getdents64`), `procfs` (`openat2` beneath the private instance), one function per fixed `prctl` request (`sys::prctl`: ambient, bounding-set, no-new-privs, parent-death and subreaper requests, plus the dumpable flag), `ptrace_traceme`, `preallocate` (mode-0 `fallocate` only), `write_sysfs` (the `SysfsControl` enum's files only), the creation-only mount API (`DetachedMount` is made only by `fsmount` or `open_tree_clone`, so `move_mount` and `mount_setattr` act only on a mount this process created), `sys::ioctl` (`LOOP_GET_STATUS64` into an opaque `LoopInfo64`, `LOOP_CTL_GET_FREE`, `BLKGETDISKSEQ`, `BLKGETSIZE64`, `BLKSSZGET`, `LOOP_CONFIGURE`, which the kernel refuses on a bound slot and which returns the `ConfiguredLoop`, and clearing `LO_FLAGS_AUTOCLEAR` on that `ConfiguredLoop` only), and `sys::socket`'s generation-checked unlink of kilnd's API socket. `LOOP_CLR_FD` is not there: it is only in `proven::clear_loop`, which takes a `ProvenLoop` |
+| *core* `sys.rs` (whole module, B5) | `libc::syscall`, `libc::prctl` | The child setup's subset of the typed wrappers, moved unchanged from kilnd's `sys.rs` with `process::prepare_child`, which issues them between fork and exec: `capget`, `capset`, and the fixed `prctl` capability-ambient, bounding-set, no-new-privs and parent-death requests. kilnd's `sys` re-exports them. `no_destructive_call_outside_the_gate` scans it like kilnd's `sys.rs` |
+| *core* `process.rs`, `run` | `tokio::process::Command::new`, `Child::start_kill` | kilnd's one subprocess runner, for the fixed `process::Tool` variants only: `Tool::Kiln`, a `KilnBinary` verified at every launch (an absolute path to a regular executable owned by root or this user and writable by neither group nor others) with `KilnArgs` from typed constructors (`capabilities`, `ls`, `rm`, scoped `gc`, `gc --help`, `create`), and SIGKILL of its own unreaped child, whose PID cannot be reused before it is reaped. There is no arbitrary-program variant |
+| *core* `runtime/kiln_process.rs`, `probe`, `OwnedExec::spawn`, `OwnedExec::kill_reap` | `tokio::process::Command::new`, `Child::start_kill` | The kiln CLI probe and `kiln exec`, both taking the verified `KilnBinary` (and the probe typed `KilnArgs`), and SIGKILL of their own unreaped children |
 | `lock.rs`, `ExclusiveFileLock::finish_acquire` | `std::fs::File::set_len` | Truncating this process's own just-locked lock file before writing its diagnostic PID, after the inode was re-verified at the stable pathname |
 | `cfg(test)` items, test modules and files | anything | Fixtures compiled only under `cfg(test)` (test modules, and test-only fault and fake-effect items), or integration-test crates |
 
@@ -2227,3 +2228,186 @@ identical. Schema 7, `quick_check` ok, and health as `kilnd` reports serving wit
 sandboxes. The empty B4 ledger directory the reboot run left under `/var/lib/kilnd-helper`
 was removed. No test account, loop beyond kiln's own, mount, cgroup, process or build output
 remains; the mounted checkout is back on main `b58d94a` and the VM is stopped.
+
+## B5 implementation notes (November 3, 2026)
+
+B5 is built in two milestones on `phase1b/b5-broker`. This section records milestone 1, the
+direct-kiln core extraction and the broker protocol codec; milestone 2 (the broker, the host
+modules and the image) follows it.
+
+### The `kilnd-exec-core` move
+
+`crates/kilnd-exec-core` holds kilnd's reviewed direct-kiln process, status, capture and
+validation code, moved unchanged so the guest broker can reuse it instead of reimplementing
+kiln's machine protocol (section 5.1). It has no gRPC, SQLite, helper server or receipt
+types; its dependencies are `libc`, `serde`, `thiserror`, `tokio` and `tokio-util`.
+
+*How it stays a move.* The new crate mirrors kilnd's module paths (`process`, `validation`,
+`model`, `sys`, `runtime::{kiln_direct, kiln_process, kiln_protocol}`), so every moved item
+keeps its `crate::` and `super::` references and every moved test keeps its name: the
+workspace lists the same 541 tests (and the same 11 ignored ones) before and after, by full
+path. kilnd re-exports each moved item from its old path (`kilnd::process`, `kilnd::model`,
+`kilnd::runtime`, `kilnd::sys`, `crate::validation`), so the B2 and B4 interfaces, the
+`Runtime` trait's signatures and every kilnd caller are unchanged. `DirectKilnRuntime` stays
+in kilnd with its fields, constructors and `Runtime` impl; its moved inherent methods
+delegate to the core through a borrowed view, `DirectKiln::new(&bin, &cgroup_root)`. The
+methods that return kilnd-only types stay in kilnd: `create_until` and `create_result`
+(`CreateFailure`, whose absence receipts are helper types), `remove_until` and `gc_until`.
+kilnd's adapter tests are byte-for-byte unchanged; two `cfg(test)` fixture helpers they
+import from the moved modules (`kiln_process::tests::fixture`, `kiln_protocol::tests::exit125`
+and `hex`) are copied into kilnd's shim modules, because one crate's tests cannot reach
+another's `cfg(test)` items.
+
+`scripts/b5-move-audit.py` proves it mechanically against the B4 base `415d850`: it finds
+each moved item in its new file and compares the two token by token, allowing only the named
+rewrites below; it fails if any line deleted from a partly moved kilnd file is not part of a
+moved item, an import or the delegating body; and it fails if a listed rewrite is unused.
+
+| Old path (`crates/`) | New path (`crates/`) | Moved items |
+|---|---|---|
+| `kilnd/src/model.rs` | `kilnd-exec-core/src/model.rs` | `SandboxSpec`, `Network`, `SandboxDisposition`, `SandboxDisposition` impl, `CleanupEvidence`, `CleanupEvidence` impl, `Captured`, `Captured` impl, `CommandStatus`, `CommandStatus` impl, `RuntimeErrorKind`, `RuntimeStage`, `RuntimeDiagnostic`, `RuntimeDiagnostic` impl |
+| `kilnd/src/sys.rs` | `kilnd-exec-core/src/sys.rs` | `sys_ret`, `CapHeader`, `CapData`, `capget`, `capset`, `cap_ambient_is_set`, `cap_ambient_lower`, `capbset_read`, `capbset_drop`, `set_no_new_privs`, `get_no_new_privs`, `set_parent_death_kill` |
+| `kilnd/src/runtime/mod.rs` | `kilnd-exec-core/src/runtime/mod.rs` | `RuntimeError`, `ExecSpec`, `ExecFinish`, `ExecOutcome`, `legacy_exec_evidence`, `BackendStatus`, `BackendSandbox` |
+| `kilnd/src/runtime/kiln_direct.rs` | `kilnd-exec-core/src/runtime/kiln_direct.rs` | `CLI_REQUIREMENT`, `SANDBOX_REQUIREMENT`, `CONTROL_OUTPUT`, `QUERY_TIMEOUT`, `CLEANUP_TIMEOUT`, `CLEANUP_POLL`, `call_until`, `run_control`, `capabilities`, `require_scoped_gc`, `list_until`, `wait_exec_cleanup`, `exec_direct`, `validate_sandbox`, `create_args`, `parse_ls`, `valid_kiln_id`, `check_id`, `exec_populated`, `decode_status`, `summarize` |
+| `kilnd/src/process.rs` | `kilnd-exec-core/src/process.rs` | whole file: `SAFE_PATH`, `FIRECRACKER_LAUNCH_CAPABILITIES`, `drop_firecracker_launch_capabilities`, `require_firecracker_launch_capabilities_dropped`, `LAUNCH_CAPABILITY_EXIT`, `prepare_child`, `DRAIN_GRACE`, `SpawnGuard`, `spawn_guard`, `Finish`, `Outcome`, `CaptureCompletion`, `CaptureState`, `CaptureTask`, `KilnBinary`, `KilnArgs`, `kiln_id`, `Tool`, `Request`, `run`, `drain_captures`, `spawn_capture`, `capture` and its tests |
+| `kilnd/src/validation.rs` | `kilnd-exec-core/src/validation.rs` | whole file: the `MAX_*` bounds, `validate_image_name`, `validate_allowlist_entry`, `validate_writable_path`, `validate_argv` and its tests |
+| `kilnd/src/runtime/kiln_process.rs` | `kilnd-exec-core/src/runtime/kiln_process.rs` | whole file: `FRAME_TIMEOUT`, `SETTLEMENT_TIMEOUT`, `CLI_LIMIT`, `StreamState`, `StatusState`, `Stop`, `RawResult`, `ProbeResult`, `probe`, `OwnedExec`, `locked`, `catch_poll`, `pair`, `above_stdio`, `spawn_capture`, `capture`, `read_status` and its tests |
+| `kilnd/src/runtime/kiln_protocol.rs` | `kilnd-exec-core/src/runtime/kiln_protocol.rs` | whole file: `MAX_FRAME`, `HEADER`, `FEATURE_CREATE_CERTAINTY`, `Cleanup`, `Outcome`, `Capabilities`, `u16_at`, `u32_at`, `i32_at`, `payload`, `outcome`, `capabilities` and its tests |
+
+*The rewrites.* Crossing a crate boundary needs visibility, and nothing else changed:
+`pub(crate)` became `pub` on `legacy_exec_evidence`, `valid_kiln_id`, `list_until`,
+`exec_direct`, `require_firecracker_launch_capabilities_dropped`, `CaptureCompletion` and
+`Outcome`'s two completion fields; `pub` was added to `check_id`, `exec_populated`,
+`decode_status`, `summarize`, `CONTROL_OUTPUT`, `QUERY_TIMEOUT`, `call_until`, `run_control`,
+`capabilities`, `wait_exec_cleanup` and `validate_sandbox` (the last was the `Runtime` impl's
+body and is now the core's inherent method, which the impl calls); `&self.bin` became
+`self.bin` three times, because the view already holds a reference; and `catch_poll` narrowed
+from `pub` to `pub(crate)`, because in a now-public module clippy's `result_unit_err` would
+reject exporting its `Result<_, ()>`. `sys_ret`, a five-line private helper, is in both
+`sys` modules. One test-name string, `runtime::kiln_process::tests::owned_exec_recovers_descriptors_in_a_dedicated_child`,
+is unchanged because the module path is.
+
+*The gate.* The moved subprocess runner (`process::run`), kiln probe and exec owner
+(`kiln_process::probe`, `OwnedExec::spawn`, `OwnedExec::kill_reap`) carry their approved allows
+with them; `disallowed_allows_only_in_approved_modules` now names each approved item by crate
+and file. The child setup's capability and `prctl` wrappers moved with `prepare_child`, which
+issues them between fork and exec, into the core's own typed `sys` module. That is the one new
+allow-list entry: a relocation of part of kilnd's approved `sys.rs`, not a new capability (the
+section 7.1 table names it). `no_destructive_call_outside_the_gate` scans it with kilnd's
+`sys.rs` rule (raw wrappers allowed, no destructive call), and the approved `exec/cgroup.events`
+literal moved with `wait_exec_cleanup`. `scripts/b4-vm-tests.sh` now also runs the core's
+library tests under the same root bounding set, since the moved
+`process::tests::b4_linux_root_worker_capability_drop_fails_closed` lives there.
+
+### Broker protocol version 1: `kilnd-broker-protocol`
+
+`crates/kilnd-broker-protocol` is the strict codec of sections 5.2 and 5.3, with no `unsafe`
+code (`#![forbid(unsafe_code)]`) and no I/O below its `stream` module. It depends on the core
+crate for argv and writable-path validation, kiln's ID grammar and the typed runtime kinds and
+stages. It is not `no_std`: tokio streams and serde JSON are the point of using it.
+
+*Public API.* `header` (`Header::parse`/`encode`, `Kind`, `Direction`, the 36-byte `KGB1`
+layout), `json` (`check`, `from_slice`, `to_vec`), `types` (`Id128`, `Hex32`, `SandboxId`,
+`ExecutionId`, `BootId`, `WorkUuid`, `InnerId`, `WireText`), `message` (the sixteen messages,
+`Message::decode`/`encode_payload`/`validate`, `GuestExecSpec::canonical_json`/`sha256`),
+`frame` (`Frame`, `Sequence`, `encode_frame`, `FrameDecoder`), `budget` (`Budget`,
+`ExecBudget`, `ExchangeBudget`, `HostBudget`), `exchange` (`HostConnection`,
+`GuestConnection`) and `stream` (`FrameReader`, `FrameWriter`, `Due`). Every failure is a
+`ProtocolError` variant: bad magic, unsupported version, unknown flags or kind, wrong
+direction, payload over its kind's bound, premature EOF in the header or payload, sequence
+mismatch or overflow, foreign request ID, unexpected kind, EOF before the terminal frame,
+trailing bytes, duplicate terminal, empty data where bytes were due, non-UTF-8, JSON syntax,
+depth, float and duplicate key, schema, field bound, invalid field, each cumulative budget,
+stdin length, capture mismatch, a stage timeout (first byte, frame, EOF, write) and transport
+I/O.
+
+*Decisions made here, within section 5:*
+
+- **One operation per connection.** `Hello` names its channel (`exec` or `control`); a control
+  connection then carries exactly one `Initialize`, `Probe` or `Cancel` and its reply, and an
+  exec connection one execution, ending with the guest's `Result` and write EOF. Each
+  connection has a fresh challenge, its own sequence numbers from zero in each direction and
+  its own non-exec 64 KiB/16-frame budget; the at-most-two-connections rule bounds them.
+- **Order on an exec connection:** `Exec` (request ID = token), `Accepted`, the declared stdin
+  in non-empty `Stdin` frames, one `StdinEnd {token, total}`; after the command settles,
+  contiguous `Stdout` frames, then contiguous `Stderr` frames, then `Result`, then EOF. No
+  output may precede `StdinEnd`. An `Error` is terminal anywhere; it is never success or
+  absence. The host checks the `Result`'s kept lengths against the bytes actually received and
+  the negotiated `max_output`.
+- **Bounds checked from the header, before the body:** per frame, host-to-guest control
+  384 KiB (the encoded bound, so argv within 256 KiB that escapes past it is refused at
+  encode), guest-to-host control 64 KiB, data 64 KiB. Per execution, guest to host across both
+  channels: 128 frames, retained stdout and stderr up to their negotiated limits (at most
+  1 MiB each), other control payload 64 KiB combined, and
+  `stdout + stderr + 64 KiB + 128 × 36` wire bytes. Per non-exec exchange: 16 frames and
+  64 KiB. Host to guest on one connection: 1027 frames (`Hello`, `Exec`, 1024 `Stdin`,
+  `StdinEnd`) and 1 MiB of stdin. A refused frame charges nothing and its body is never read.
+- **Memory.** The decoder reads only the bytes the current header or payload still needs, so
+  it never reads into the next frame, and grows its payload buffer only as bytes arrive. It
+  holds at most a header plus the part of one checked payload received so far.
+- **Strict JSON** is a full grammar pass before serde: UTF-8, integers only (`-0` refused too),
+  objects and arrays nested at most 8 deep (the top-level object is depth 1), duplicate keys
+  refused at every level after unescaping, lone surrogates and raw control characters refused,
+  nothing after the value. Serde then maps it onto `deny_unknown_fields` types. kilnd's lenient
+  `CommandStatus` shape is not used on the wire: `Termination` is its strict twin, with exit
+  codes 0 to 255 and signals 1 to 64.
+- **Field shapes.** IDs, challenges, nonces and digests are exact lowercase hex; sandbox and
+  execution IDs are kilnd's `sb-`/`ex-` shapes; the boot ID a canonical lowercase UUID; the
+  work UUID a canonical UUIDv4 (as B1 derives it); the inner ID kiln's grammar; wire
+  diagnostics at most 2048 bytes. `Exec` reuses kilnd's `validate_argv` with a 256 KiB bound
+  and adds stdin at most 1 MiB, `max_output` at most 1 MiB and `remaining_ms` in
+  1..=3,600,000. `Initialize` carries the label-free `GuestExecSpec`, validated as B1's
+  `validate_guest_exec_spec`; its canonical JSON digest matches B1's fixture
+  (`24efdf3f…`, from `identity.bin`).
+- **`HelloReply`** reports the vdc identity (all eight fields), the guest boot ID, the broker's
+  build digest, kiln's protocol and feature bits, `/init`'s seven runtime-hardening results
+  as named booleans (`cmdline`, `kernel_log_bounded`, `kaslr`, `memory_initialization`,
+  `kstack_offset`, `lockdown_confidentiality`, `kexec_absent`), the work mount's UUID and
+  `nosuid`/`nodev`/`noexec`/`prjquota` flags, the broker state and the inner ID if
+  initialized. `Error` carries a code (`protocol`, `admission`, `incompatible`, `internal`)
+  and the broker state.
+- **Deadlines** are absolute instants. `Due::By` requires a whole frame by an instant;
+  `Due::FirstByte` waits for the first byte until the execution deadline and then requires the
+  frame within two seconds of that byte, and the caller holds every later frame and the EOF to
+  the same instant, so a result transfer settles within two seconds of its start. Trickled
+  bytes never move a deadline. Every write has a deadline too.
+
+*Tests (milestone 1).* 62 in the protocol crate, all unprivileged:
+
+- `tests/codec.rs` (41): one test per rejection: golden header bytes, bad magic (checked
+  first), every unsupported version, unknown flags and kinds, every kind travelling the wrong
+  way, each kind's payload bound at the limit and one past it, JSON depth (arrays, objects and
+  a 100,000-deep input refused before serde), floats and `-0`, duplicate keys at every level and
+  after unescaping, syntax, UTF-8, unknown, missing and mistyped fields (including inside a
+  struct variant), bounded schema messages, every `Exec` bound on decode and encode, argv that
+  passes 256 KiB but escapes past 384 KiB, ID shapes, wire-text narrowing, capture facts and
+  termination bounds, protocol version, B1 spec validation and digest, a frame round trip of
+  every message, sequence gaps, duplicates and overflow, oversized lengths allocating nothing,
+  the budget charged before any payload byte, premature EOF in header and payload, each
+  budget's limits, and every exchange rule on both sides (unsolicited and misaddressed
+  replies, stale challenges, wrong reply kinds, cancel tokens, host send order, output order,
+  totals, output after `Result`, a second `Result`, foreign tokens, stdin under- and overshoot,
+  empty stdin frames, EOF before the terminal frame).
+- `tests/property.rs` (8), from fixed seeds with an xorshift generator: random messages of
+  every kind round-trip through random chunkings; truncation at every header byte and at
+  random payload points is `PrematureEof` with the right part and counts; 10,000 oversized
+  lengths are refused from the header with nothing allocated; duplicated frames break the
+  sequence; 20,000 mutated headers fail typed; arbitrary bytes never panic and the decoder's
+  memory stays bounded; mutated JSON never panics, and whatever still decodes is valid and
+  re-encodes to itself; maximal nesting and string payloads stay bounded.
+- `tests/adversary.rs` (13), over tokio duplex pipes on a paused clock, so every deadline is
+  exact: no first byte (`Timeout(FirstByte)` at 2 s); a first byte only and a 100 ms trickle
+  (`Timeout(Frame)` at 2 s, holding only a header); a 10 s wait then a trickle (2 s after the
+  first byte); never-reading peers on both sides (`Timeout(Write)` at 2 s); endless empty
+  valid frames (refused at frame 129, having read only headers); endless full 64 KiB frames
+  (refused at the 1 MiB stdout limit with the refused frame's body unread); one execution
+  budget spanning the exec and control channels; cumulative wire and control bytes; endless
+  unsolicited replies (refused at the first); trailing bytes, a missing EOF and EOF mid-frame;
+  a blocked output writer not delaying the control channel's `CancelAck`; and a healthy
+  exec exchange (Hello, Exec, stdin, a 5 s command, output, Result, EOF) finishing exactly on
+  time while three hostile connections beside it fail at their own bounds.
+
+*Checks.* `cargo test --locked --workspace`, clippy with `-D warnings -D
+clippy::disallowed_methods` on 1.88 and 1.99 for macOS and checked for
+`aarch64-unknown-linux-gnu`, `git diff --check`, `kilnd-maintenance-tests.py` and
+`scripts/b5-move-audit.py`.

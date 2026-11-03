@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B5 milestone 1. kilnd's direct-kiln process, status, capture and validation code
+  moved unchanged into the new `kilnd-exec-core` crate, which kilnd re-exports from the old
+  paths (`scripts/b5-move-audit.py` proves the move token by token). New
+  `kilnd-broker-protocol` crate: the strict `KGB1` broker protocol version 1 codec (36-byte
+  header, sixteen kinds, per-direction sequences, strict JSON, field bounds, cumulative frame,
+  wire and payload budgets charged before any payload byte, per-connection order and
+  deadline-bounded stream I/O) with unit, property and stream-adversary tests. No broker,
+  host module or image change yet; production Firecracker stays disabled.
+
 - Phase 1b B4 recheck 5 corrections. The cgroup proof enumerates children from the retained
   descriptor (`getdents64` on a duplicate), and a proven unmount resolves its name from the
   held parent descriptor (a thread's own working directory), so a mount over the helper's
