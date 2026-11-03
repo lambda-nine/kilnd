@@ -745,21 +745,63 @@ pub mod relay {
         Ok(fds)
     }
 
-    /// R's whole life: jobs until S closes the control stream.
-    pub fn relay_main(control: StdUnixStream, descriptors: UnixDatagram) {
-        // I/O and time only. R is fork-only, and the signal driver's process-global
-        // pipe belongs to the parent's runtime, closed by the descriptor sweep.
-        let runtime = match tokio::runtime::Builder::new_current_thread()
+    /// Builds R's current-thread runtime. R is fork-only: tokio's process-global signal
+    /// pipe was created by H's runtime and closed by the workers' descriptor sweeps, but
+    /// every new I/O driver duplicates its stale descriptor number. R never handles a
+    /// signal, so while it builds its runtime it points every free descriptor below 1024
+    /// at one end of a fresh, inert socket pair, then closes them all: the driver keeps
+    /// its own duplicate of an inert socket that never becomes readable. Nothing of S's
+    /// is exposed, since only free numbers are filled.
+    #[cfg(unix)]
+    fn runtime() -> io::Result<tokio::runtime::Runtime> {
+        let (inert, _peer) = StdUnixStream::pair()?;
+        let mut fillers = Vec::new();
+        for fd in 3..1024 {
+            // SAFETY: F_GETFD only reads the descriptor table.
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                // SAFETY: fills a free number with a duplicate this function owns.
+                if unsafe { libc::dup2(inert.as_raw_fd(), fd) } == fd {
+                    // SAFETY: the duplicate is ours.
+                    fillers.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
+            }
+        }
+        let built = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                eprintln!("kilnd relay: runtime: {error}");
-                return;
-            }
-        };
+            .build();
+        drop(fillers);
+        built
+    }
+
+    /// R's whole life as S's fork-only, single-threaded child: jobs until S closes the
+    /// control stream.
+    pub fn relay_worker_main(control: StdUnixStream, descriptors: UnixDatagram) {
+        match runtime() {
+            Ok(runtime) => relay_on(runtime, control, descriptors),
+            Err(error) => eprintln!("kilnd relay: runtime: {error}"),
+        }
+    }
+
+    /// The same job loop in a freshly started process or a test thread, whose tokio
+    /// globals are its own.
+    pub fn relay_main(control: StdUnixStream, descriptors: UnixDatagram) {
+        let built = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build();
+        match built {
+            Ok(runtime) => relay_on(runtime, control, descriptors),
+            Err(error) => eprintln!("kilnd relay: runtime: {error}"),
+        }
+    }
+
+    fn relay_on(
+        runtime: tokio::runtime::Runtime,
+        control: StdUnixStream,
+        descriptors: UnixDatagram,
+    ) {
+
         let local = tokio::task::LocalSet::new();
         local.block_on(&runtime, async move {
             let _ = control.set_nonblocking(true);
@@ -1327,7 +1369,7 @@ pub mod supervise {
                         UnixDatagram::from_raw_fd(fds_raw),
                     )
                 };
-                super::relay::relay_main(control, fds);
+                super::relay::relay_worker_main(control, fds);
             },
         )?;
         drop(control_r);
