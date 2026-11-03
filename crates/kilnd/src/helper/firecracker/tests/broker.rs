@@ -471,18 +471,25 @@ async fn b5_linux_root_three_thousand_executions_keep_the_ledger_bounded() {
 #[tokio::test]
 #[ignore = "needs root with the B4 launch capabilities: run scripts/b4-vm-tests.sh"]
 async fn b5_linux_root_a_killed_inner_sandbox_is_never_ready() {
-    let guest = PathBuf::from(
-        std::env::var("KILND_B5_KILL_INNER_GUEST")
-            .expect("KILND_B5_KILL_INNER_GUEST names the test guest (scripts/b5-test-guest.sh)"),
-    );
+    let guest = std::env::var("KILND_B5_KILL_INNER_GUEST")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .expect("KILND_B5_KILL_INNER_GUEST names the test guest (scripts/b5-test-guest.sh)");
     let real = Real::with_guest(NodeOptions::default(), Some(&guest)).await;
     let (runtime, context, _) = create(&real).await;
     let (boot, inner) = wait_ready(&real, &runtime, &context).await;
-    evidence("kill-inner guest", format!("READY boot {boot} inner {inner}"));
+    evidence(
+        "kill-inner guest",
+        format!("READY boot {boot} inner {inner}"),
+    );
     // The wrapper kills init five seconds after it appears; eight is past that.
     tokio::time::sleep(Duration::from_secs(8)).await;
     let reply = validate(&real, &runtime, &context, &boot, &inner).await;
-    evidence("validate after the inner sandbox died", format!("{reply:?}"));
+    evidence(
+        "validate after the inner sandbox died",
+        format!("{reply:?}"),
+    );
     assert!(
         !matches!(reply, ValidateReply::Ready { .. }),
         "a dead inner sandbox was reported Ready"
@@ -492,9 +499,11 @@ async fn b5_linux_root_a_killed_inner_sandbox_is_never_ready() {
         assert!(std::time::Instant::now() < end, "the VM was not retired");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(stop_reasons(&real, &context)
-        .iter()
-        .any(|reason| reason.contains("not idle")));
+    assert!(
+        stop_reasons(&real, &context)
+            .iter()
+            .any(|reason| reason.contains("not idle"))
+    );
     let ran = exec(&real, &runtime, &context, &boot, &["true"], Vec::new()).await;
     assert!(
         !ran.reply.unwrap().dispatched,

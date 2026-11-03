@@ -557,13 +557,12 @@ impl Node {
             Ok(None) => {
                 // A retired token answers with its fence; anything else is unknown here.
                 let lookup = self
-                    .ledger_call(
-                        Lane::Reserved,
+                    .bounded_ledger(
                         &LedgerRequest::Inspect {
                             instance: key.instance,
                             allocation: key.allocation,
                         },
-                        token.deadline.ns,
+                        token.deadline,
                     )
                     .await;
                 return match lookup {
@@ -604,15 +603,14 @@ impl Node {
             return ambiguous_fence(AmbiguousClass::PermitsUnsettled, reason);
         }
         let cleaning = self
-            .ledger_call(
-                Lane::Reserved,
+            .bounded_ledger(
                 &LedgerRequest::SetPhase {
                     instance: key.instance,
                     allocation: key.allocation,
                     from: STOPPABLE.iter().map(|s| s.to_string()).collect(),
                     to: "cleaning".into(),
                 },
-                token.deadline.ns,
+                token.deadline,
             )
             .await;
         if !matches!(cleaning, Ok(LedgerReply::Generation(_))) {
@@ -715,8 +713,7 @@ impl Node {
             .to_string();
         let host = identity::host_name(key.instance, key.allocation);
         let intent = self
-            .ledger_call(
-                Lane::Reserved,
+            .bounded_ledger(
                 &LedgerRequest::AllocationWorkerIntent {
                     instance: key.instance,
                     allocation: key.allocation,
@@ -730,7 +727,7 @@ impl Node {
                         image,
                     }),
                 },
-                deadline.ns,
+                deadline,
             )
             .await;
         let Ok(LedgerReply::WorkerIntent { worker_id, .. }) = intent else {
