@@ -264,8 +264,90 @@ pub fn check_hello(reply: &HelloReply, expected: &Expected) -> Result<(), String
     Ok(())
 }
 
+/// Section 5.6's read pacing: R takes guest bytes at most 4 MiB/s after a 256 KiB
+/// burst, and at most 64 KiB per read, so a guest that streams at line rate costs R
+/// bounded CPU per second within the same absolute deadlines. Each connection has its
+/// own bucket, so an execution's output can never delay its Cancel's reply; with at
+/// most one exec and one control connection, R reads at most 8 MiB/s in all.
+pub const READ_RATE: u64 = 4 * 1024 * 1024;
+pub const READ_BURST: u64 = 256 * 1024;
+pub const READ_QUANTUM: usize = 64 * 1024;
+
+pub struct Paced<R> {
+    inner: R,
+    tokens: u64,
+    last: Instant,
+    wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<R> Paced<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            tokens: READ_BURST,
+            last: Instant::now(),
+            wait: None,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last).as_nanos();
+        let earned = elapsed.saturating_mul(u128::from(READ_RATE)) / 1_000_000_000;
+        if earned > 0 {
+            let earned = u64::try_from(earned).unwrap_or(u64::MAX);
+            self.tokens = self.tokens.saturating_add(earned).min(READ_BURST);
+            self.last = now;
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Paced<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        let this = &mut *self;
+        loop {
+            if let Some(wait) = this.wait.as_mut() {
+                if wait.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                this.wait = None;
+            }
+            this.refill(Instant::now());
+            if this.tokens > 0 {
+                break;
+            }
+            // Sleep until one quantum's worth (or the whole burst) has been earned.
+            let need = READ_BURST.min(READ_QUANTUM as u64);
+            let nanos = need.saturating_mul(1_000_000_000) / READ_RATE;
+            this.wait = Some(Box::pin(tokio::time::sleep(Duration::from_nanos(nanos))));
+        }
+        let allowed = usize::try_from(this.tokens)
+            .unwrap_or(usize::MAX)
+            .min(READ_QUANTUM)
+            .min(buf.remaining());
+        let mut limited = buf.take(allowed);
+        let start = limited.filled().as_ptr();
+        match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut limited) {
+            Poll::Ready(Ok(())) => {}
+            other => return other,
+        }
+        debug_assert_eq!(start, limited.filled().as_ptr());
+        let n = limited.filled().len();
+        // SAFETY: the inner reader initialized and filled `n` bytes of `buf`'s unfilled
+        // part, through `limited`, which borrows exactly that region.
+        unsafe { buf.assume_init(n) };
+        buf.advance(n);
+        this.tokens = this.tokens.saturating_sub(n as u64);
+        Poll::Ready(Ok(()))
+    }
+}
+
 struct Link<S> {
-    reader: FrameReader<ReadHalf<S>>,
+    reader: FrameReader<Paced<ReadHalf<S>>>,
     writer: FrameWriter<WriteHalf<S>>,
     conn: HostConnection,
 }
@@ -308,7 +390,7 @@ async fn open<S: AsyncRead + AsyncWrite + Unpin, B: Budget>(
         expected: expected.binding.clone(),
     };
     let mut link = Link {
-        reader: FrameReader::new(read, Direction::GuestToHost),
+        reader: FrameReader::new(Paced::new(read), Direction::GuestToHost),
         writer: FrameWriter::new(write, Direction::HostToGuest),
         conn: HostConnection::new(hello_id, &hello),
     };

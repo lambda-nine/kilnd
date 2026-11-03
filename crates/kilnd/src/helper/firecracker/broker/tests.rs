@@ -665,3 +665,50 @@ fn the_relay_loop_runs_a_probe_job_and_reports_it() {
     relay.join().unwrap();
     let _ = guest_thread.join();
 }
+
+/// An endless guest: every read is filled completely, at once.
+struct Endless;
+
+impl AsyncRead for Endless {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let n = buf.remaining();
+        buf.put_slice(&vec![b'x'; n]);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Section 5.6: R reads a line-rate guest at most 4 MiB/s after its 256 KiB burst, in
+/// reads of at most 64 KiB, on the paused clock.
+#[tokio::test(start_paused = true)]
+async fn guest_reads_are_paced_to_four_mib_per_second_after_the_burst() {
+    let mut paced = Paced::new(Endless);
+    let mut chunk = vec![0u8; 1024 * 1024];
+    let began = Instant::now();
+    let mut total = 0usize;
+    let mut largest = 0usize;
+    while total < 4 * 1024 * 1024 + READ_BURST as usize {
+        let n = paced.read(&mut chunk).await.unwrap();
+        assert!(n > 0);
+        largest = largest.max(n);
+        total += n;
+    }
+    assert_eq!(largest, READ_QUANTUM);
+    let took = began.elapsed();
+    // 4 MiB beyond the burst takes one second; never sooner, and the sleeps round
+    // only to whole quanta.
+    assert!(took >= Duration::from_secs(1), "{took:?}");
+    assert!(took <= Duration::from_millis(1020), "{took:?}");
+    // An idle second refills only the burst, never more.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let began = Instant::now();
+    let mut burst = 0usize;
+    while burst < READ_BURST as usize {
+        burst += paced.read(&mut chunk).await.unwrap();
+    }
+    assert_eq!(burst, READ_BURST as usize);
+    assert_eq!(began.elapsed(), Duration::ZERO);
+}
