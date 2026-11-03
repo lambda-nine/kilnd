@@ -1763,7 +1763,19 @@ mod tests {
             ),
         ];
         // (file, literal, why). Each must still occur.
-        const LITERALS: [(&str, &str, &str); 4] = [
+        const LITERALS: [(&str, &str, &str); 6] = [
+            (
+                "kilnd-guest-broker/src/main.rs",
+                "/proc/sys/kernel/random/boot_id",
+                "the guest broker reads its own kernel's boot ID for HelloReply; guest-only, \
+                 read-only",
+            ),
+            (
+                "kilnd-guest-broker/src/main.rs",
+                "/proc/self/mountinfo",
+                "the guest broker reads the work disk's mount flags for HelloReply; \
+                 guest-only, read-only",
+            ),
             (
                 "kilnd/src/helper/firecracker/storage.rs",
                 "/proc/self/fd/{}",

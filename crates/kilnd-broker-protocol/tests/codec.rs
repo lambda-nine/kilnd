@@ -1347,3 +1347,45 @@ fn guest_stdin_exactly_as_declared() {
         Err(ProtocolError::TrailingBytes)
     );
 }
+
+#[test]
+fn the_shared_identity_block_parses_and_re_encodes_byte_for_byte() {
+    use kilnd_broker_protocol::identity::*;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../kilnd/tests/fixtures/firecracker");
+    let block = std::fs::read(root.join("identity.bin")).unwrap();
+    let identity = parse_block(&block).unwrap();
+    assert_eq!(identity.block(), block);
+    // Every mutation is refused: magic, length, padding, a non-canonical record.
+    let mut bad = block.clone();
+    bad[0] = b'X';
+    assert!(parse_block(&bad).is_err());
+    let mut bad = block.clone();
+    bad[7] ^= 1;
+    assert!(parse_block(&bad).is_err());
+    let mut bad = block.clone();
+    bad[4095] = 1;
+    assert!(parse_block(&bad).is_err());
+    assert!(parse_block(&block[..4095]).is_err());
+    let len = u32::from_be_bytes(block[4..8].try_into().unwrap()) as usize;
+    let mut spaced = block[8..8 + len].to_vec();
+    spaced.insert(1, b' ');
+    let mut bad = b"KID1".to_vec();
+    bad.extend_from_slice(&(spaced.len() as u32).to_be_bytes());
+    bad.extend_from_slice(&spaced);
+    bad.resize(4096, 0);
+    assert_eq!(
+        parse_block(&bad),
+        Err(ProtocolError::InvalidField("identity is not canonical"))
+    );
+    // The bootstrap record appends KGH1 and the seven-bit mask.
+    let mut boot = block.clone();
+    boot.extend_from_slice(b"KGH1");
+    boot.extend_from_slice(&0x7fu32.to_be_bytes());
+    let (parsed, mask) = parse_bootstrap(&boot).unwrap();
+    assert_eq!(parsed, identity);
+    assert!(hardening_from_mask(mask).all());
+    assert!(!hardening_from_mask(0x3f).all());
+    boot[4096 + 7] = 0xff;
+    assert!(parse_bootstrap(&boot).is_err());
+}

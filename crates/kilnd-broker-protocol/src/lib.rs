@@ -21,6 +21,7 @@ pub mod error;
 pub mod exchange;
 pub mod frame;
 pub mod header;
+pub mod identity;
 pub mod json;
 pub mod message;
 pub mod stream;

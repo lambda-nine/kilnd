@@ -625,6 +625,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kilnd-guest-broker"
+version = "0.1.0"
+dependencies = [
+ "kilnd-broker-protocol",
+ "kilnd-exec-core",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "kilndctl"
 version = "0.1.0"
 dependencies = [

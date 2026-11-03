@@ -4,6 +4,7 @@ members = [
     "crates/kilnd-api",
     "crates/kilnd-broker-protocol",
     "crates/kilnd-exec-core",
+    "crates/kilnd-guest-broker",
     "crates/kilnd",
     "crates/kilndctl",
 ]
