@@ -2422,14 +2422,25 @@ clippy::disallowed_methods` on 1.88 and 1.99 for macOS and checked for
 
 ### Milestone 1 break-it findings folded in
 
-Daybreak's break-it pass over milestone 1 found three protocol-crate weaknesses, now fixed
-with tests: a `FrameReader` or `FrameWriter` that failed once could be called again and
-read past the failure (both now keep the first error and return it forever); an execution's
-budget could not be shared across the exec and control connections without each owning a
-copy (`SharedBudget<B>`, an `Rc<RefCell<B>>` borrowed only inside `admit`, so a stalled
-exec read cannot hold it); and duplicate-key detection was quadratic in an object's width
-(a `BTreeSet` per object, with a property test that a 64 KiB object of distinct keys checks
-in under 200 ms).
+Daybreak accepted milestone 1 at `bd3f228` with no HIGH findings
+(`reviews/2026-11-03-b5m1-breakit.md`) and three non-blockers, fixed in `4cd1ce6`, before every
+milestone 2 exit run, each with a regression test:
+
+- *MEDIUM, the execution budget across channels.* `SharedBudget<B>` is an `Rc<RefCell<B>>`
+  borrowed only inside the synchronous `admit`, never across a read or any other await, and
+  R keys it by execution token so a Cancel charges its execution. No async lock guards any
+  budget. Test (`adversary.rs`): with the exec peer stalled mid-frame on the shared budget,
+  the control channel's `CancelAck` is admitted at once, and both count against one budget.
+- *LOW, duplicate-key checking.* An ordered set per object (the sorted-keys approach, n log n)
+  replaces the quadratic scan. Test (`property.rs`): about 30,000 distinct shortest keys in
+  384 KiB check in under 200 ms. Daybreak's own benchmark at the branch head: 3 ms at
+  384 KiB, from 704 ms.
+- *LOW, retry after timeout.* Any timeout, codec or I/O error poisons a `FrameReader` or
+  `FrameWriter`: every later call returns the stored error, and every caller closes the
+  connection. Test (`adversary.rs`): a read retried after a timeout, with the rest of the
+  frame now available, still fails, as do a later EOF read and a write after a write
+  timeout. Daybreak's retry harness now fails where it expected success, and its
+  2,000,000-case decoder harness still finds no panic.
 
 ### The guest broker: kilnd-guest-broker
 
