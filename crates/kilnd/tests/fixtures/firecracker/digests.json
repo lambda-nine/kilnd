@@ -1,5 +1,5 @@
 {
-  "approved_manifest_sha256": "67f3760e2aa2941b2d9cfb0034c05b0110f106deba9eb412e69b8daa2608e463",
+  "approved_manifest_sha256": "533c3414c63ebb2a1503a77c737ace6af2b044b4baec6b4e813f5a0dcc87e607",
   "files": {
     "README.md": "86469877e6b648386a8967d4e92f4aa99b73fa4de65183ef30d38a4718229912",
     "bootstrap.json": "410286f286e7e7b20da78528807b6581662e17e3cd9eed32a2d38cb3cc194a59",
@@ -7,20 +7,20 @@
     "bundle/kernel.config": "f4c45a08aaa43fe5f6c939c31e746dd9db697487f946e9803d6503c28b1c0665",
     "bundle/kiln": "ed521b90649fd763d504c85c0b93e8f96a224e3f6817b170771a8e672eb121dc",
     "bundle/kilnd-guest-broker": "c4c151348c6b4202058d421d06071480cde69a687d4f445c1a9608b4d2bb3409",
-    "bundle/manifest.json": "67f3760e2aa2941b2d9cfb0034c05b0110f106deba9eb412e69b8daa2608e463",
+    "bundle/manifest.json": "533c3414c63ebb2a1503a77c737ace6af2b044b4baec6b4e813f5a0dcc87e607",
     "bundle/rootfs.squashfs": "88e009fa8880530c0ffc9ea497589d932a95079d328e5b37a3a8ecd6ea1a29b8",
-    "conformance.json": "400551e41b759c7af718df6f7fee26b440700d7207e7870e3d03a8d8e1e9581f",
+    "conformance.json": "3eb0c1b2572d683631442cc9a44a0cd8901038051b8e2565d41385ca8c602e81",
     "contract.json": "ae4b5c5eda30dc2798ca5c2e8958aa1023429023a2bc8d41f5530b68ae5f45ed",
     "executables/firecracker": "80984d2f0064925cb0a9c0e4de902c90148316a6ac488ef5cf3a2ad521d6f1d4",
     "executables/jailer": "608d22c44f3790de7320a3f2cf36d85c80abf7b3757d205c4b541d7e0c49a157",
     "executables/kilnd-helper": "513f2aebe515777e7f875121e4742cf732bb16b0195618b52cce06eb1e978c94",
     "executables/mkfs.xfs": "efb71d7dca9a6d38e1ab5c625ea754cd5318b3968d8b52b926b1ceb7db6fea9e",
-    "identity.bin": "39a8c3b6ecf60e62f040428357f04bc6be4a58d04a31566fc9bd470c80fff25c",
+    "identity.bin": "c4d203b8d8915d0af04bd162022b685c99d3d9a4f628dff9c78464439e93f726",
     "jailer-patch.fixture": "db58cb814db9da2af0ff7fa93520f8ce6e26d425e407c44df308ca01094644b6",
     "legacy-no-vsock-manifest.json": "d498adc916bdd67622121351eb6296b7dd6c1d6bee654ea5fccee6cf3552fd64",
     "negative-cases.json": "9d3d0d5b1084e2d49ad311fe04c2c3e8d690705d29ac90bd73964eea99af3dc4",
-    "plan-equal-ids.json": "201876cd689277b324120dc5850b66e4796c29665008395d070c9fc538262e9d",
-    "plan.json": "ead6df1a068ff429313eb67eb278e5029fc77f736a781c1a8a8445278c082971",
+    "plan-equal-ids.json": "3283a1d28a2dee313c47079ee18db3f78fff8e3cd64c430a00248aa5bcc0888e",
+    "plan.json": "3e19baf5dc5e2e9b16e3dd4b0f5f4951331b1d0482d6529ab77d3bd1ef77b717",
     "replacement-cases.json": "a3935cf5cc2d8bc5968f1f0ee90b25b58fa15f9f37bdcdac9d68f842ea3492c0",
     "substitutions-equal-ids.json": "f157003cfd904431231316615edef8f19a55a64164872c7002f5afd5cddae968",
     "substitutions.json": "4674100ce51f1e867a2e28493393c2b2f30139bf84baf9d975377874ba4c31cc",
@@ -28,5 +28,5 @@
     "vmm-status.txt": "1d07737b200f4087c2af50a04443803e03db37834f2a45e19cb5d368c665cbdb"
   },
   "launch_sha256": "d0a0c134435381004e700ae2d99092d4486fda6198d4d2458d6b36ccd0f7e1a2",
-  "plan_sha256": "accf420bf49c5880f7c5c2e52104591b6e0d93061485d4ebda321b28b97c38ad"
+  "plan_sha256": "8d358820349fa7885ce92d605e521e9dd5612d10a533645665416a14fdc888aa"
 }
