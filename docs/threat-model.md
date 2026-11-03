@@ -172,8 +172,11 @@ sandbox compromises the host.
   device with discard disabled, a bounded private tmpfs jail with read-only artifact binds,
   the patched jailer (`deploy/firecracker/`) executed by retained descriptor with a
   verified zero capability set, Stop, Remove, scoped Gc and the real absence observation.
-  Production still serves no profile: the manifest gate refuses every catalog until B7, no
-  READY exists without B5's broker, and `main.rs` selects kiln only. The B4 root tests
+  Production still serves no profile: the manifest gate refuses every catalog until B7, the
+  manager does not consume the helper's READY until B6, and `main.rs` selects kiln only.
+  B5's broker relay and console drainer run outside H, in their own cgroup leaves, without
+  capabilities, under the relay or VMM credentials; every guest byte is parsed there, under
+  cumulative frame, byte and time budgets, and a breach of either retires the VM. The B4 root tests
   approve a catalog through a `cfg(test)` gate only. Firecracker's own isolation and its
   seccomp filter are trusted, not re-proven: a VMM-credential process without that filter
   still meets the jail's 16 MiB and 1024-inode caps, cannot write outside `/run`, cannot

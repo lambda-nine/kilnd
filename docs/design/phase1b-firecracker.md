@@ -601,7 +601,7 @@ Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no laz
 |---|---|---|
 | `pidfd_send_signal` (SIGKILL, SIGSTOP, SIGCONT) | `proven::signal`, used by `proven::kill_and_wait` / `stop_process` (K, S's `stop_vm`) and S's hardening of V | `ProvenProcess` |
 | `kill` (macOS fixtures only, no pidfd) | `proven::signal` | `ProvenProcess` (start time and boot ID compared just before) |
-| `kill(SIGKILL)` of S's formatter | `proven::UnreapedChild::kill_unreaped` | `UnreapedChild`, made only by `proven::fork_child`; never after it is reaped |
+| `kill(SIGKILL)` of S's formatter, and (B5) of S's relay R and console drainer D if either outlives a one-second wait after S closes its sockets | `proven::UnreapedChild::kill_unreaped` | `UnreapedChild`, made only by `proven::fork_child`; never after it is reaped |
 | write to `cgroup.kill` | `proven::write_cgroup_kill` (private), reached only from `proven::kill_cgroup_vm`, via `cgroup::kill_recorded` (H, M, K, S's `contain`, cleanup). The generic `cgroup::write_control` is private and takes a `ControlFile` enum with no `cgroup.kill` variant | `ProvenCgroupVm` |
 | cgroup `rmdir` (`unlinkat(AT_REMOVEDIR)`) | `proven::remove_cgroup_tree`, via `cgroup::remove_tree` (K) | `ProvenCgroupTree` |
 | directory `rmdir` | `proven::remove_directory`, via `storage::remove_jail_dirs` and `storage::remove_work` | `ProvenDir` |
@@ -922,6 +922,13 @@ kiln-guest embeds the broker at a pinned kilnd commit/binary digest, adds the vd
 
 **Exit:** node-global stress across at least two daemon namespaces supports the chosen profile, accounting for all per-allocation S/P/R/D and VMM/KVM costs plus shared H/L/M/K, the full tmpfs allowance, journal/WAL/fence and bundle-store headroom. Measure peak CPU/PIDs/memory/storage and workload density; reapprove limits if 128 MiB per-session or shared allowances fail. Legacy privileged suites pass; Daybreak recheck closes the findings (or Stephen explicitly accepts any residual risk); Stephen's section 12 choices are reflected in fixtures. These tests alone do not establish hostile multi-tenant production readiness.
 
+**B4 recheck 6 hardening follow-ups** (`reviews/2026-11-03-b4-recheck6.md`, ranked; none blocks B5):
+
+1. *Fail closed when a socket filesystem cannot export a file handle* (MEDIUM). `name_to_handle_at` returning `EOPNOTSUPP` becomes the all-zero handle, so the API socket's generation silently falls back to device, inode and birth time; ramfs accepts Unix sockets and returns `EOPNOTSUPP`. Reject `EOPNOTSUPP`, or validate an explicit allowlist of socket filesystems that export handles (`sys.rs` socket generation).
+2. *Make the destructive-method gate dependency-aware* (LOW). Clippy's list names libc/std/tokio paths; a future system-call crate could expose an equivalent the lexical backstop misses. Reject new syscall-wrapper dependencies by manifest allowlist, or require their destructive methods to join `clippy.toml` in the same change.
+3. *Serialize initialization of the private procfs cache* (LOW). The cache publishes its mount ID and descriptor through two atomics; concurrent first callers can each create a procfs root, and the losers' descriptors leak for the process's life. Use `OnceLock` or a mutex.
+4. *Give `read_dir_fd` an independent file description* (LOW). `F_DUPFD_CLOEXEC` shares the directory offset, so its rewind also rewinds the original description. Reopen `.` beneath the held descriptor instead, preserving the fd-native property.
+
 # 12. Decisions confirmed by Stephen — October 31, 2026
 
 Stephen confirmed the first five decisions below on **October 31, 2026**, matching the proposed recommendations. The remaining defaults stand as design decisions. None is awaiting approval; the provisional overhead estimates and implementation/review gates remain to be validated.
@@ -967,7 +974,7 @@ pandoc docs/design/phase1b-firecracker.md \
   -o ../research/phase1b-firecracker-design.pdf
 ```
 
-The PDF is a local review artifact; the source and style are versioned with this design. Rendering grants no production approval. B1 contract tests run on macOS and Linux/root; B4/B5 still owe the live production-chain evidence.
+The PDF is a local review artifact; the source and style are versioned with this design. Rendering grants no production approval. B1 contract tests run on macOS and Linux/root. B4 and B5 ran the live chain (pinned bundle, patched jailer, Firecracker, broker READY and persistent exec) under test approval only; B6 wires it into the manager and B7 alone may enable production.
 
 # 15. Review response
 
@@ -2231,11 +2238,12 @@ remains; the mounted checkout is back on main `b58d94a` and the VM is stopped.
 
 ## B5 implementation notes (November 3, 2026)
 
-B5 is built in two milestones on `phase1b/b5-broker`. This section records milestone 1, the
-direct-kiln core extraction and the broker protocol codec; milestone 2 (the broker, the host
-modules and the image) follows it.
+B5 is built in two milestones on `phase1b/b5-broker`. Milestone 1 is the direct-kiln core
+extraction and the broker protocol codec; milestone 2 is the guest broker, the host relay,
+console drainer, Validate and Exec, and the kiln-guest image. Milestone 2's notes, decisions
+and exit evidence follow milestone 1's.
 
-### The `kilnd-exec-core` move
+### The kilnd-exec-core move
 
 `crates/kilnd-exec-core` holds kilnd's reviewed direct-kiln process, status, capture and
 validation code, moved unchanged so the guest broker can reuse it instead of reimplementing
@@ -2299,7 +2307,7 @@ literal moved with `wait_exec_cleanup`. `scripts/b4-vm-tests.sh` now also runs t
 library tests under the same root bounding set, since the moved
 `process::tests::b4_linux_root_worker_capability_drop_fails_closed` lives there.
 
-### Broker protocol version 1: `kilnd-broker-protocol`
+### Broker protocol version 1: kilnd-broker-protocol
 
 `crates/kilnd-broker-protocol` is the strict codec of sections 5.2 and 5.3, with no `unsafe`
 code (`#![forbid(unsafe_code)]`) and no I/O below its `stream` module. It depends on the core
@@ -2411,3 +2419,212 @@ I/O.
 clippy::disallowed_methods` on 1.88 and 1.99 for macOS and checked for
 `aarch64-unknown-linux-gnu`, `git diff --check`, `kilnd-maintenance-tests.py` and
 `scripts/b5-move-audit.py`.
+
+### Milestone 1 break-it findings folded in
+
+Daybreak's break-it pass over milestone 1 found three protocol-crate weaknesses, now fixed
+with tests: a `FrameReader` or `FrameWriter` that failed once could be called again and
+read past the failure (both now keep the first error and return it forever); an execution's
+budget could not be shared across the exec and control connections without each owning a
+copy (`SharedBudget<B>`, an `Rc<RefCell<B>>` borrowed only inside `admit`, so a stalled
+exec read cannot hold it); and duplicate-key detection was quadratic in an object's width
+(a `BTreeSet` per object, with a property test that a 64 KiB object of distinct keys checks
+in under 200 ms).
+
+### The guest broker: kilnd-guest-broker
+
+One binary, `/usr/local/bin/kilnd-guest-broker`, statically linked for the guest, with four
+modules:
+
+- `main.rs` (Linux only) reads `/init`'s bootstrap record from fd 3 to EOF: the 4096-byte
+  `KID1` identity block, `KGH1` and the seven-bit runtime-hardening mask
+  (`identity::parse_bootstrap`; the identity record must be canonical JSON, byte for byte).
+  It reads the boot ID, hashes its own executable, reads the work disk's XFS superblock UUID
+  from `/dev/vdb` and the work mount's flags and `prjquota` from `/proc/self/mountinfo`,
+  probes kiln, then listens on AF_VSOCK port 5252 with a backlog of 4. The accept loop drops
+  any peer whose CID is not 2 and any connection beyond two open ones, before reading a
+  byte. Everything runs on one current-thread runtime in a `LocalSet`.
+- `session.rs` is the state machine, Uninitialized → Initializing → Idle → Executing →
+  Draining → Idle, with Faulted terminal; every transition is a method, so the transport
+  cannot skip one. The session starts Faulted if any hardening bit is missing or the kiln
+  probe failed. `Initialize` runs once: an identical repeat after success replays the same
+  `Ready`; anything else, and any failure or uncertainty during initialization, faults the
+  session, so a second inner sandbox is never created. `Cancel` names the active token and
+  only cancels; it is acknowledged at once.
+- `kiln.rs` drives only `/usr/local/bin/kiln`, through `kilnd-exec-core`'s reviewed
+  `DirectKiln` (section 5.1): capabilities, `run_control(KilnArgs::create)` for the one
+  persistent sandbox (no network, no labels), `valid_kiln_id`, `validate_sandbox`, then a
+  smoke `true` that must finish Completed, exit 0 and leave `RuntimeDrained` evidence.
+  Each execution is the core's `exec_direct`, so argv is the core's typed array with the
+  caller's argv only after `--`. `result_of` turns only the core's own evidence into the
+  wire `Result`.
+- `server.rs` serves one operation per connection: `Hello` within two seconds of accept,
+  then a control `Initialize`, `Probe` or `Cancel`, or one execution. At most one exec and
+  one control connection are open at once, and they never share a writer, so `Cancel` never
+  waits on the output writer. Stdin must arrive within `min(2 s, remaining)`; output goes in
+  64 KiB chunks, then `Result` and EOF within two seconds. Any failure on an exec
+  connection after `Accepted` faults the session.
+
+The vdc reader is the only new codec shared with `/init`: `identity.rs` in the protocol
+crate parses the block strictly (magic, length, canonical JSON, zero padding) and is tested
+against B1's `identity.bin` fixture.
+
+### Host side: the relay R, the console drainer D, Validate and Exec
+
+S forks two more fork-only workers right after BOOTING, through the same
+`proven::fork_child` as its formatter, and journals each as a `Child` record immediately:
+
+- **R, the broker relay** (`helper/firecracker/broker.rs`), in the allocation's `relay`
+  cgroup leaf, under the allocation's journaled relay UID/GID with no groups, no
+  capabilities and `no_new_privs`, all three verified by `capget` after the drop. It keeps
+  only a control stream and a descriptor socket to S. Per job, S connects to the exact
+  recorded jail's `run/vsock.sock` as root: it walks `root` then `run` by descriptor,
+  requires a socket owned by the VMM UID, connects from a scoped thread that unshared its
+  filesystem context and `fchdir`ed into the held `run` directory, requires `SO_PEERCRED`
+  to be the journaled VMM PID and UID, and then rechecks the socket's identity. S hands
+  that connection (and for an execution the three helper-side stdio sockets) to R over
+  `SCM_RIGHTS`. R does every guest-facing byte: `CONNECT 5252\n`, the `OK <port>\n` reply
+  (at most 32 bytes within two seconds), Hello, the request and its budgets, stdin and
+  output. It reads each connection through a token bucket (4 MiB/s after a 256 KiB burst,
+  at most 64 KiB per read) within the same absolute deadlines. Its reports to S are
+  bounded typed values.
+- **D, the console drainer** (`helper/firecracker/console.rs`), in `vm/console` under the
+  VMM's UID/GID, reads the console pipe to EOF in 64 KiB quanta, keeps the first 64 KiB and
+  checked counters and discards the rest, so a full pipe never blocks the VMM. A token
+  bucket (1 MiB/s, 256 KiB burst) reports a breach once (`R`), as does a counter overflow
+  (`O`); S then retires the VM, and D keeps draining under its CPU cap.
+
+S's order after the fork is: signals and parent-death checks, join the leaf by its
+journaled cgroup inode, close every other descriptor, then drop credentials. (Joining
+needs S's procfs descriptor, so it comes before the sweep.) Either worker's death, a
+malformed or unexpected report, or a console breach ends S's steady loop and retires the
+VM through the existing containment. When S ends, it closes both workers' sockets, waits
+one second, then kills any still unreaped with `UnreapedChild::kill_unreaped` (section 7.1).
+
+*Readiness.* S checks that the plan's label-free inner spec matches the journaled binding
+digest, then has R send Hello and `Initialize` within the original Create deadline. Hello
+must match the journaled identity, work UUID and mount flags, report every hardening bit
+and not be Faulted. While the guest is still booting, the VMM answers `CONNECT` without
+`OK`; only that (`Unreachable`, before any broker byte) is retried, every 50 ms. On
+`Ready`, S journals a `broker` resource record (boot ID and inner ID), then `booting →
+ready`, and tells H. Inspect then answers `present_ready {generation, boot_id, inner_id}`,
+and List reports `ready`.
+
+*Validate* answers `busy {token}` from the recorded state during an execution, without
+touching the guest. Otherwise it requires the journaled boot and inner IDs, sends `Probe`
+on a fresh control connection, and answers `ready` only for an idle broker on that boot
+and inner sandbox with no active token. Any other answer, or a refusal or failure, retires
+the VM; a missing answer within the deadline is `unknown`, never absence.
+
+*Exec* (`helper/firecracker/exec.rs`) marks the allocation busy in memory, then journals an
+`exec` resource record (`intent`, with the token, execution ID and boot ID) and `ready →
+exec_intent` before any byte can reach the guest. It hands the three stdio sockets to S,
+which passes them to R with the vsock connection. R reads the declared stdin from kilnd
+first (a failure there is `dispatched: false`, journaled `undispatched`, and the VM goes
+back to `ready`), then sends `Exec`; on `Accepted` H journals `busy` and `exec_intent →
+busy`. R holds the output until the `Result` is validated against it, then writes it to
+kilnd within two seconds. Only a validated, delivered result with the guest's drain
+evidence journals `idle` and returns to `ready` with `reusable: true`. Every other ending
+after dispatch (the deadline, the caller's disconnect, a Stop, S's exit, V's death, a
+protocol, transport or cleanup failure, a guest timeout or cancel) is an interruption: a
+`Cancel` on a fresh control connection, two seconds to settle, then the existing stop fence
+and K's kill of the `vm` subtree. The reply is `reusable: false`, and `vm_stopped` once K
+has proved the subtree gone (H waits at most five seconds for that proof). The work runs on
+its own task, so the caller's disconnect cannot drop it, and H polls every 50 ms for the
+session ending under it.
+
+*Journal.* The phase CHECK gains `ready`, `exec_intent` and `busy`, all three stoppable;
+`resource_events` gains the `broker` and `exec` kinds, which recovery's `absorb` ignores
+(the VM itself is the resource). The ledger keeps schema 1, as the B4 notes allow.
+
+### Decisions made in milestone 2
+
+- **One fresh vsock connection per operation**, matching milestone 1's one operation per
+  connection: Initialize, each Probe, each Cancel and each Exec. The guest's
+  two-connection cap is exactly one exec plus one control.
+- **Read pacing is per connection.** Section 5.6's 4 MiB/s with a 256 KiB burst applies to
+  each guest connection's read half separately, so exec output can never delay its
+  Cancel's reply; with at most one exec and one control connection, R reads at most 8 MiB/s.
+  A full execution's largest legal output (2 MiB of retained output plus control and
+  headers) takes under half a second at that rate, inside the two-second result
+  settlement. Each read takes at most 64 KiB, and the frame reader checks the deadline and
+  cumulative budgets on every frame.
+- **R is per allocation, not per job.** It is forked once after BOOTING and lives until S
+  ends, so a job costs a connection, not a fork. Its budgets are keyed by execution token,
+  so the exec connection and a Cancel share one `SharedBudget<ExecBudget>`.
+- **R runs tokio after a fork.** tokio keeps a process-global signal pipe, created by H's
+  runtime; the fork and descriptor sweep close it, but each new I/O driver duplicates its
+  stale number and drains whatever that number names. R never handles a signal, so it moves
+  its two sockets to the top 16 numbers under `min(soft limit, 1024)`, fills every free
+  number below with one end of an inert socket pair while it builds a current-thread
+  runtime, then closes the fill and keeps the inert peer open (an EOF would read as a
+  broken signal pipe). The fork also copies H's thread-local "inside a runtime" marker, so
+  the runtime runs on a fresh thread of R's own. The plain `relay_main` (no fill) serves
+  tests running in a multithreaded test process.
+- **`/init` supervises the broker and never restarts it.** It starts the broker as guest
+  root after mounting the work disk, in a new session, with a cleared environment
+  (`PATH=/usr/local/bin:/usr/bin:/usr/sbin`), `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 256,
+  `no_new_privs`, not dumpable, its working directory a fresh 0700 `/run/kilnd-broker`, and
+  only the bootstrap pipe on fd 3. Its exit powers the VM off.
+- **The pinned image.** kiln-guest's `config/pins.json` names the kilnd commit, the SHA-256
+  of that commit's `git archive` (`kilnd_source_sha256`, carried into `build-lock.json`)
+  and the expected broker digest and size. The build refuses an archive, lock or broker that
+  does not match, unless `--allow-unpinned-broker`, which marks the bundle
+  `diagnostic_only`. The manifest's provenance records the archive digest, `Cargo.lock`,
+  the workspace manifest, every source file of the three crates the broker builds from
+  (`kilnd-guest-broker`, `kilnd-broker-protocol`, `kilnd-exec-core`), and the exact cargo and
+  compiler. The broker is built offline from vendored crates in the same verified
+  toolchain as kiln, and installed at `/usr/local/bin/kilnd-guest-broker` beside
+  `/usr/local/bin/kiln`.
+
+### Exit evidence
+
+All root evidence is from the `kiln` Lima VM (Ubuntu, kernel 6.8.0-147, 4 vCPUs, 4 GiB),
+Firecracker 1.17.0 through the patched jailer, with the pinned production bundle (kiln-guest
+`74f3a89`, the broker built from kilnd `fb9034d`). The B5 root suite's final run is at
+`7d117af` (R's read pacing; an earlier run at `c2fc1f6`, before pacing, also passed). The
+B4 and installed suites ran at `95ab9bf`; the only later host change is that pacing, which
+the B5 suite covers. Logs are in `reviews/2026-11-03-b5-vm/`.
+
+| B5 exit criterion | Evidence |
+|---|---|
+| Framing, cumulative wire-byte, frame-count, first-byte and never-read adversaries, including endless valid frames and trickle timing | The protocol crate's 66 tests (codec 42, property 9, adversary 15) on macOS and Linux. In the VM, under the hostile run below: a relay fed endless valid frames had 96 jobs each refused at its bound, and a silent never-reading peer had 3 jobs each ended at its two-second deadline |
+| Three concurrent hostile transport and console sources leave memory flat; a healthy fourth meets its deadlines | `b5_linux_root_hostile_sources_…`: two hostile relays (endless frames, silent peer) and a 64 KiB-write console flood, each in its own capped cgroup under its own UID, beside a READY allocation doing five rounds of Inspect, Validate and Exec, then Remove. Worst cases: Inspect 3.19 ms (5 s budget), Validate 13.92 ms (5 s), Exec 55.31 ms (60 s), Remove (its stop barrier included) 118.5 ms (60 s). Hostile cgroup memory before/after: [401,408, 258,048, 151,552] → [397,312, 258,048, 151,552] bytes; helper RSS 19,656 → 20,292 KiB |
+| Each offender retires | Every hostile relay job ended `Failed` at its bound; the flood was reported once (`R`), which `breach()` maps to retirement. In real VMs, killing R or D retires the VM (`b5_linux_root_a_dead_relay_or_drainer_retires_the_vm`). A real guest console flood is not exercised: the production guest has no console writer a test can drive |
+| The console drains after its retained prefix | 307,625,984 bytes drained during the healthy run, after the first 64 KiB, with the flooder never blocked; one `R` report |
+| Relay and console CPU charged outside H | Hostile CPU (µs) in their own cgroups: [105,445, 2,678, 104,929] → [372,802, 4,704, 378,113]. Real allocation: relay leaf 60,211 µs, `vm/console` 5,105 µs over the whole persistent-exec test (12,933 µs in the run before pacing; the increase is not yet profiled) |
+| Actual persistent exec | `b5_linux_root_ready_and_persistent_execution`: READY with the journaled boot and inner IDs; Validate refuses another boot; a file one execution writes, the next reads; 1 MiB of every byte value round-trips; 3,000,000 bytes of output keep 1 MiB, total 3,000,000, truncated; exits 0, 1, 124–127 and 143 are `Exited(n)` and reusable; `kill -TERM $$` is `Signaled(15)`; a missing executable is `LaunchFailed` and reusable; stderr is separate |
+| Actual cancel and kill | `b5_linux_root_timeout_cancel_and_kill_retire_the_vm`: a deadline is `TimedOut` after 3.04 s, `VmStopped`, `reusable: false`; the caller's disconnect empties the VM subtree; a Stop during an execution is `Failed(Unavailable)`, interrupted, `VmStopped` |
+| Two clean-worktree builds match | kiln-guest `verify.py`: `reproducible: true`; every bundle file byte-identical (below) |
+| Full guest integration | kiln-guest `tests/firecracker.py` through the jailer on the pinned bundle: the fixed test-mode suite offline and with test-only networking, every security and runtime assertion present, egress passed, installed binaries unchanged. The production boot's integration is the B5 root suite itself: the real identity drive, vsock device, broker Hello and Initialize, persistent exec, cancel and kill. A scan of the unpacked rootfs (103 files) finds no key, token or user path; Alpine's stock `/etc/shadow` has every account locked. Nothing in the image carries a credential |
+| Two warmups and twenty cold boots | `b5_linux_root_boot_timings`, below |
+| Legacy privileged suites | `scripts/b4-vm-tests.sh b4_linux_root` at `95ab9bf`: 31 passed (and the core's 1). Its first run at `c2fc1f6` failed one test only because a healthy neighbour now reaches READY (`PresentReady`) where it asserted `PresentBusy`; `95ab9bf` accepts both. Installed at `95ab9bf`: `install.sh`, `integration-test.sh` (with the dedicated-child admission FD/RSS, slow-client, queue and concurrent-Health stress regression), the singleton, state-path and Phase 0 regressions, `smoke.sh` and the maintenance tests all pass. `deployment-regressions.py` was not needed: B5 changes no install, upgrade or maintenance script or unit |
+
+*Reproducible bundle* (kiln-guest `74f3a89`, both builds):
+
+| Artifact | Bytes | SHA-256 |
+|---|---|---|
+| `Image` | 17,807,872 | `0015f87e136b314a164b30f5255a1589144a3937db0dce00d5eef6c0fdbf2e6a` |
+| `kernel.config` | 95,549 | `f07a7ffd291f4ad821e3f4f0f2e0ab1928d3024103f3c74d71e541765cc2d4e9` |
+| `kiln` | 2,376,016 | `54442ccc0ce12b9a9236c927b9073019d7d4774c2e2d82f4d55d0db491925c64` |
+| `kilnd-guest-broker` | 2,245,008 | `d4eb4cacc428ce8887a396456456bcb00e2ad5c912eb3fce5393c907962a4f2d` |
+| `rootfs.squashfs` | 8,396,800 | `9e1f4f750d2de73e0fc1645e735e5debaeff54207b4b4038ff18ab3a24ded1c4` |
+| `manifest.json` | | `91e9291605cc5e0f895882e4b600ac48b7ca549c2e7b7b5ab6c9d976076995bf` |
+
+*Boot timings* (2 warmups, then 20 measured cold boots, each a fresh Create of a new
+allocation; milliseconds from the Create call):
+
+| | min | p50 | p95 | max |
+|---|---|---|---|---|
+| BOOTING journaled | 12,751 | 12,804 | 12,849 | 12,866 |
+| READY journaled | 13,221 | 13,265 | 13,288 | 13,297 |
+| BOOTING → READY | 429 | 455 | 480 | 497 |
+| First tool result (`true`, after READY) | 13 | 23 | 37 | 37 |
+
+(The `c2fc1f6` run, before pacing: READY p50 13,778 ms, p95 14,512 ms; BOOTING → READY p50
+456 ms.)
+
+The guest and broker take under half a second from BOOTING to a smoke-tested inner
+sandbox. The roughly 13 s before BOOTING is B4's host path in this nested VM (the work
+disk, jail, jailer and VMM launch and adoption), which B5 does not change and these runs
+do not break down; B7 owns that profile.

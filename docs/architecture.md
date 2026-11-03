@@ -150,9 +150,9 @@ An allocation-token backend also needs preflight, recovery by exact token and
 receipts bound to its identity. `FakeRuntime`'s `Fenced` mode exercises that contract
 for the manager. `FirecrackerRuntime` is the unprivileged typed client for the helper's
 Firecracker group: it reconstructs and verifies each prepared plan, and its create can
-end only in a matching fence or a charged ambiguous failure, because this build has no
-VM launch and no READY reply. `main.rs` still selects kiln only, and B7 alone may change
-that. The helper's side is the [root node ledger](#firecracker-node-authority).
+end only in a matching fence or a charged ambiguous failure: the helper's READY (B5) is not
+yet wired into the manager, which is B6's work. `main.rs` still selects kiln only, and B7
+alone may change that. The helper's side is the [root node ledger](#firecracker-node-authority).
 
 ### Firecracker node authority
 
@@ -200,6 +200,21 @@ journaled identities (the jail tmpfs's and binds' unique mount IDs, the loop slo
 tuple and disk sequence number, the cgroup inodes with the boot ID, and file birth times) and
 refuses anything else, so it stays charged. Production still serves no
 profile and nothing reports READY.
+
+B5 adds the guest broker and the host half of its protocol
+([design](design/phase1b-firecracker.md#b5-implementation-notes-november-3-2026)). The
+`kilnd-guest-broker` crate is baked into the kiln-guest image at a pinned kilnd commit and
+binary digest; `/init` starts it as guest root and powers the VM off if it dies. It listens
+on vsock port 5252 for the host only, keeps one persistent kiln sandbox per VM and runs each
+execution through the shared `kilnd-exec-core`. On the host, S forks two fork-only workers
+after BOOTING: the relay R, in the allocation's `relay` cgroup leaf under the allocation's
+relay UID/GID with no capabilities, does every byte of guest-facing parsing over vsock
+connections S opens and checks against the journaled VMM; the console drainer D, in
+`vm/console` under the VMM's credentials, drains and meters the serial console. S journals
+READY only after the broker's Hello matches the journaled identity and Initialize created and
+smoke-tested the inner sandbox. The helper's `validate` and `exec` operations then run on
+that sandbox; EXEC_INTENT is durable before any byte is sent, and any interruption after
+dispatch stops the VM through the existing barrier. Production still serves no profile.
 
 ## State machine
 

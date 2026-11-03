@@ -262,8 +262,8 @@ async fn read_request(stream: &mut Socket) -> io::Result<Request> {
     Ok(request)
 }
 
-/// One Firecracker request: no descriptors cross, in either direction, and the reply
-/// is the separate `Response::Firecracker` branch. AttachInstance alone keeps its
+/// One Firecracker request: no descriptors cross in either direction except B5 Exec's
+/// three stdio sockets, and the reply is the separate `Response::Firecracker` branch. AttachInstance alone keeps its
 /// connection: that connection's EOF is the detach.
 async fn firecracker_request(
     stream: Socket,

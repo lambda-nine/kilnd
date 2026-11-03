@@ -121,7 +121,8 @@ closes the connection on the unknown variant, which is how a client detects it.
 The whole group frame must also be strict JSON: duplicate keys anywhere, including
 inside labels, close the connection without a reply, as do floats, depth above 32,
 unknown fields, a wrong group version and a misplaced epoch. No descriptor crosses
-in either direction. Nothing in the group can carry a path, UID, CID, PID, flag,
+in either direction, except that B5's `exec` hands the caller three stdio sockets first,
+exactly as kiln's Exec does. Nothing in the group can carry a path, UID, CID, PID, flag,
 command or environment. Identities are typed 128-bit IDs and digests, profiles are
 `[a-z0-9-]{1,64}`, and plan and receipt bytes are bounded lowercase hex.
 
@@ -132,12 +133,14 @@ command or environment. Identities are typed 128-bit IDs and digests, profiles a
 | `accounting` | 5 s | Node totals with generation and once-only shared reserve, or `unknown`. No other namespace's identity |
 | `preflight {allocation_id, sandbox_id, profile, spec}` | 30 s | `prepared` plan bytes, digests and reservation, or a refusal with no session effects |
 | `create {allocation_id, sandbox_id, plan, plan_digest}` | 120 s | `accepted`, the token's `absent` fence, or `ambiguous {class}`. There is no READY variant |
-| `inspect {allocation_id}` | 5 s | `present_busy`, `stopped_with_resources`, `absent_fenced`, `incompatible` or `unknown`. A missing record is `unknown` |
+| `inspect {allocation_id}` | 5 s | `present_ready {generation, boot_id, inner_id}` (B5: the phase is READY and no execution is in flight), `present_busy`, `stopped_with_resources`, `absent_fenced`, `incompatible` or `unknown`. A missing record is `unknown` |
 | `list` | 30 s | This namespace's records with `complete`; anything stale or unexplained makes it incomplete |
 | `fence_absent {allocation_id, sandbox_id, plan_digest}` | 30 s | The permanent receipt, byte for byte, or `ambiguous {class}` |
 | `stop {allocation_id, expected_generation, reason}` | 60 s | `stopped {generation, observations}` once STOP_INTENT is durable, the `vm` subtree is proven empty and S has exited, or `unknown {reason}`. Never a release. `expected_generation` is the C2 generation; `reason` is `delete`, `interrupted`, `unhealthy` or `operator` |
 | `remove {allocation_id}` | 60 s | Stop, exact cleanup and the ABSENT fence: the permanent receipt, or `ambiguous {class}` with the charge held. Idempotent; an unknown token is `ambiguous {conflict}` (only `fence_absent` fences those) |
 | `gc {allocation_ids}` | 30 s | At most 1024 unique IDs. Per ID: `removed {receipt}`, `skipped {reason}` (live, quarantined, unknown or another instance's) or `failed {class}`. Empty is a no-op |
+| `validate {allocation_id, expected_boot_id, expected_inner_id}` | 5 s | B5. `ready {boot_id, inner_id}` after a broker Probe on the reserved control channel finds it idle on the journaled boot and inner sandbox; `busy {execution_token}` from the recorded state during an execution, with no guest polling; `incompatible` for another boot or inner sandbox; `unknown {reason}` otherwise. Never absence; a probe that fails or finds the broker in any other state retires the VM |
+| `exec {allocation_id, expected_boot_id, execution_token, execution_id, argv, stdin_bytes, max_output}` | 3,600 s | B5. One execution in the persistent sandbox: `{finish, status, stdout, stderr, cleanup, reusable, dispatched}`, with `finish` `completed`, `timed_out`, `canceled` or `failed {diagnostic}` and `cleanup` `no_child_started`, `guest_cgroup_drained`, `vm_stopped` or `unknown`. argv at most 256 KiB, stdin at most 1 MiB, `max_output` 1 byte to 1 MiB. EXEC_INTENT is journaled before any byte is sent; only a validated, delivered result with the guest's drain evidence leaves the VM `reusable`. Any interruption after dispatch (deadline, the caller's disconnect, Stop, a protocol, transport or cleanup failure) sends Cancel, allows two seconds, then stops the VM through the barrier: `reusable: false`, and `vm_stopped` once K proved the `vm` subtree gone |
 
 An instance must be enrolled by root first (`kilnd-helper enroll`, which takes the node
 lock and uses no socket), under a Unix account no other instance holds. Attachment succeeds

@@ -6,6 +6,19 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B5 milestone 2. New `kilnd-guest-broker` crate: the guest broker baked into
+  kiln-guest (pinned there at kilnd `fb9034d`, broker `d4eb4cac`), started by `/init` as
+  guest root and never restarted, listening on vsock 5252 for the host only, with one
+  persistent kiln sandbox per VM driven through `kilnd-exec-core`. The protocol crate gains
+  the `KID1` identity and `/init` bootstrap codec and `SharedBudget`, and folds in milestone
+  1's break-it findings (poisoned readers and writers, linear duplicate-key checks). The
+  helper's S forks a broker relay R (relay cgroup leaf and UID/GID, no capabilities), which
+  parses every guest byte, read at most 4 MiB/s per connection, and a console drainer D
+  (rate-metered, drains to EOF); READY is journaled only after a matching Hello and
+  Initialize. New `validate` and `exec` Firecracker operations, `present_ready` Inspect and
+  `ready` List: EXEC_INTENT is durable before any byte is sent, and any interruption after
+  dispatch stops the VM. Ledger phases `ready`, `exec_intent` and `busy`, resource kinds
+  `broker` and `exec` (schema 1 unchanged). Production Firecracker stays disabled.
 - Phase 1b B5 milestone 1. kilnd's direct-kiln process, status, capture and validation code
   moved unchanged into the new `kilnd-exec-core` crate, which kilnd re-exports from the old
   paths (`scripts/b5-move-audit.py` proves the move token by token). New
