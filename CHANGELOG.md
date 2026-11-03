@@ -6,6 +6,17 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B4 recheck 4 corrections. `executable::publish_object` copies into an unnamed
+  `O_TMPFILE` inode, checks it through its descriptor and links that descriptor, then
+  re-reads the name; there is no temporary name to replace or unlink. The destructive-action
+  gate is now semantic: `clippy.toml` disallows the raw signal, removal, rename, unmount,
+  `ioctl`, `syscall` and subprocess functions (calls and function values alike), and only
+  `proven.rs`, the new typed wrapper module `crate::sys` and six named subprocess and socket
+  functions may allow them; a CI test rejects any other allow, lint-group silencer, foreign
+  declaration or inline assembly. `cgroup.kill` is written only inside `proven.rs`, and the
+  generic cgroup writer takes a `ControlFile` that cannot name it. CI runs clippy on 1.88
+  and 1.99.
+
 - Phase 1b B4 recheck 3 corrections. Every destructive helper action (signals,
   `cgroup.kill`, cgroup and directory `rmdir`, file `unlink`, `umount2`, `LOOP_CLR_FD`) now
   requires a proof type from the new `helper/firecracker/proven.rs` that the resource is a

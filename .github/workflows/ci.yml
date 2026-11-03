@@ -37,8 +37,16 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
-      - name: cargo clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+      # -D warnings makes clippy.toml's disallowed-methods (design section 7.1's
+      # destructive-action gate) an error; the explicit flag keeps that true if the
+      # warnings level ever changes. Both the MSRV and the current toolchain.
+      - name: cargo clippy (1.88)
+        run: cargo clippy --locked --all-targets -- -D warnings -D clippy::disallowed_methods
+
+      - name: cargo clippy (1.99)
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component clippy
+          cargo +1.99.0 clippy --locked --all-targets -- -D warnings -D clippy::disallowed_methods
 
       - name: Shell syntax
         run: |

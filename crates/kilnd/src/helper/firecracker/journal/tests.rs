@@ -1,5 +1,8 @@
 //! Ledger authority tests, with real SQLite files and no fakes of its behavior.
 #![allow(clippy::type_complexity)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#![allow(clippy::disallowed_methods)]
 use super::*;
 use crate::helper::firecracker::config::tests::{sample_leases, sample_vector};
 use crate::helper::firecracker::config::{DEFAULT_MAX_ENROLLED, MAX_ENROLLED_HARD};
@@ -1348,7 +1351,10 @@ fn inferred_executables_are_recorded_as_retained_fd_not_observed() {
             .collect::<rusqlite::Result<_>>()
             .unwrap()
     };
-    assert!(kinds.contains(&(vector[1].role.as_str().to_string(), Some("retained_fd".into()))));
+    assert!(kinds.contains(&(
+        vector[1].role.as_str().to_string(),
+        Some("retained_fd".into())
+    )));
     assert!(kinds.contains(&(vector[0].role.as_str().to_string(), Some("proc_exe".into()))));
     assert!(
         ledger

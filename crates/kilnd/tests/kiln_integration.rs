@@ -4,6 +4,9 @@
 //!
 //! It uses its own temporary database, never /var/lib/kilnd, and removes
 //! every sandbox it creates.
+// Approved (design 7.1): test fixtures, an integration-test crate. They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#![allow(clippy::disallowed_methods)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;

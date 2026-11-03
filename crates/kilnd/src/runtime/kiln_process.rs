@@ -69,6 +69,9 @@ pub struct ProbeResult {
 }
 
 /// Capability exchanges require actual EOF, not the generic runner's drain grace.
+// Approved (design 7.1): launches the kiln CLI capability probe, and SIGKILLs only its own
+// unreaped tokio child, whose PID cannot be reused before it is reaped.
+#[allow(clippy::disallowed_methods)]
 pub async fn probe(
     bin: &Path,
     args: &[String],
@@ -248,6 +251,8 @@ fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
 }
 
 impl OwnedExec {
+    // Approved (design 7.1): launches `kiln exec` for one sandbox command.
+    #[allow(clippy::disallowed_methods)]
     pub fn spawn(bin: &Path, id: &str, spec: &ExecSpec<'_>) -> io::Result<Self> {
         let spawning = crate::process::spawn_guard();
         let (status, status_child) = pair(Shutdown::Write, Shutdown::Read)?;
@@ -379,6 +384,9 @@ impl OwnedExec {
         }
     }
 
+    // Approved (design 7.1): SIGKILL of this exec's own unreaped tokio child, whose PID cannot
+    // be reused before the following wait reaps it.
+    #[allow(clippy::disallowed_methods)]
     pub async fn kill_reap(&mut self) -> io::Result<()> {
         if self.child_status.is_none() {
             let _ = self.child.start_kill();
@@ -555,6 +563,9 @@ async fn read_status<R: AsyncRead + Unpin>(mut pipe: R, state: &Mutex<StatusStat
 }
 
 #[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#[allow(clippy::disallowed_methods)]
 pub(super) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

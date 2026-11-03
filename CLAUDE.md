@@ -16,7 +16,12 @@ through its CLI. Read [README.md](README.md),
 - **Checks before every commit:** `cargo test --locked`,
   `cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`,
   `python3 -I scripts/kilnd-maintenance-tests.py`.
-  CI runs them with Rust 1.88 (the MSRV).
+  CI runs them with Rust 1.88 (the MSRV), and clippy again with 1.99.
+- **The destructive-action gate is clippy.** `clippy.toml` disallows raw signals,
+  removals, renames, unmounts, `libc::syscall`, `libc::ioctl` and subprocesses. Use the
+  proof-taking functions in `helper/firecracker/proven.rs` or the typed wrappers in
+  `src/sys.rs`; never add `#[allow(clippy::disallowed_methods)]` outside the approved list
+  in `proven::tests::disallowed_allows_only_in_approved_modules` (design section 7.1).
 - **Privileged checks** for anything touching the runtime adapter, process
   handling, reconciliation, the socket or shutdown, in the VM after
   `scripts/install.sh`: `scripts/integration-test.sh`,

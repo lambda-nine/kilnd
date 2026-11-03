@@ -46,18 +46,7 @@ pub(crate) const FIRECRACKER_LAUNCH_CAPABILITIES: [u32; 3] = [27, 18, 8]; // MKN
 /// Allocation-free and async-signal-safe: it runs between fork and exec.
 #[cfg(target_os = "linux")]
 pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
-    #[repr(C)]
-    struct Header {
-        version: u32,
-        pid: i32,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Data {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
+    use crate::sys::{CapData as Data, CapHeader as Header};
     const VERSION_3: u32 = 0x2008_0522;
     const SETPCAP: u32 = 8;
     let mask: u32 = FIRECRACKER_LAUNCH_CAPABILITIES
@@ -69,10 +58,7 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
             version: VERSION_3,
             pid: 0,
         };
-        // SAFETY: header and two data words are live, correctly sized storage.
-        if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
-            return Err(last());
-        }
+        crate::sys::capget(&mut header, data)?;
         if header.version != VERSION_3 {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
@@ -110,8 +96,7 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
         }
         holds_launch_bits |= ambient != 0;
     }
-    let may_fall_back =
-        !can_setpcap && ruid != 0 && euid != 0 && suid != 0 && !holds_launch_bits;
+    let may_fall_back = !can_setpcap && ruid != 0 && euid != 0 && suid != 0 && !holds_launch_bits;
     // The bounding set, CAP_SETPCAP last: dropping a bounding bit needs it.
     let mut inert_bounding = false;
     for cap in FIRECRACKER_LAUNCH_CAPABILITIES {
@@ -156,10 +141,7 @@ pub(crate) fn drop_firecracker_launch_capabilities() -> io::Result<()> {
         version: VERSION_3,
         pid: 0,
     };
-    // SAFETY: header and data are live, correctly sized storage.
-    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) } != 0 {
-        return Err(last());
-    }
+    crate::sys::capset(&mut header, &data)?;
     if inert_bounding {
         // SAFETY: as above.
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
@@ -395,6 +377,10 @@ pub struct Request<'a> {
     pub max_output: usize,
 }
 
+// Approved (design 7.1): kilnd's one generic subprocess runner (the kiln CLI and other
+// fixed tools, with a cleared environment), and SIGKILL of its own unreaped tokio child at
+// the deadline or on cancel: the PID cannot be reused before this runner reaps it.
+#[allow(clippy::disallowed_methods)]
 pub async fn run(req: &Request<'_>, cancel: &CancellationToken) -> io::Result<Outcome> {
     if cancel.is_cancelled() {
         return Ok(Outcome {
@@ -561,6 +547,9 @@ async fn capture<R: AsyncRead + Unpin>(pipe: Option<R>, max: usize, state: &Mute
 }
 
 #[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::pin::Pin;
@@ -788,7 +777,11 @@ mod tests {
     fn b4_linux_root_worker_capability_drop_fails_closed() {
         let mask = launch_mask();
         let effective = capability_masks()[2].1;
-        assert_eq!(effective & mask, mask, "the fixture lacks the B4 launch capabilities");
+        assert_eq!(
+            effective & mask,
+            mask,
+            "the fixture lacks the B4 launch capabilities"
+        );
         // The last case is B4 recheck finding 5 (was
         // `poc_b4_recheck_root_reaches_no_new_privs_fallback`): UID 0 without permitted
         // CAP_SETPCAP cannot drop its bounding bits and is not the verified unprivileged
@@ -817,7 +810,10 @@ mod tests {
             .lines()
             .find_map(|l| l.strip_prefix("CAPDROP returned "))
             .unwrap();
-        assert!(line.ends_with("nnp=0"), "root drops bounding bits itself: {line}");
+        assert!(
+            line.ends_with("nnp=0"),
+            "root drops bounding bits itself: {line}"
+        );
         for name in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
             let value: u64 = line
                 .split(&format!("(\"{name}\", "))

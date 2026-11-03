@@ -1,0 +1,54 @@
+# Design section 7.1, the destructive-action invariant: these are the raw destructive,
+# raw-syscall and subprocess capabilities. Clippy rejects every use (a call, or a path
+# taken as a function value or alias) outside the approved modules, each of which carries
+# a justified #[allow(clippy::disallowed_methods)]. CI runs clippy with -D warnings on
+# Linux, and proven::tests::disallowed_allows_only_in_approved_modules rejects an allow
+# anywhere else. `allow-invalid` marks paths that exist only on some targets (macOS
+# libc has no umount2; Linux libc has no unmount); every one resolves on Linux except
+# pidfd_send_signal, which libc does not wrap (it is reachable only through
+# libc::syscall, itself disallowed).
+disallowed-methods = [
+  # Signals.
+  { path = "libc::kill", reason = "a signal: only proven.rs may signal (design 7.1)" },
+  { path = "libc::killpg", reason = "a signal: only proven.rs may signal (design 7.1)" },
+  { path = "libc::tgkill", reason = "a signal: only proven.rs may signal (design 7.1)", allow-invalid = true },
+  { path = "libc::pidfd_send_signal", reason = "a signal: only proven.rs may signal (design 7.1)", allow-invalid = true },
+  { path = "libc::syscall", reason = "a raw syscall bypasses every typed gate (design 7.1)" },
+  { path = "std::process::Child::kill", reason = "a signal: only proven.rs may signal (design 7.1)" },
+  { path = "tokio::process::Child::kill", reason = "a signal: only proven.rs may signal (design 7.1)" },
+  { path = "tokio::process::Child::start_kill", reason = "a signal: only proven.rs may signal (design 7.1)" },
+  # Removal, unmount and rename.
+  { path = "libc::unlink", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "libc::unlinkat", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "libc::rmdir", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "libc::remove", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "libc::umount", reason = "destructive: only proven.rs (design 7.1)", allow-invalid = true },
+  { path = "libc::umount2", reason = "destructive: only proven.rs (design 7.1)", allow-invalid = true },
+  { path = "libc::unmount", reason = "destructive: only proven.rs (design 7.1)", allow-invalid = true },
+  { path = "libc::rename", reason = "replaces a name: destructive (design 7.1)" },
+  { path = "libc::renameat", reason = "replaces a name: destructive (design 7.1)" },
+  { path = "libc::renameat2", reason = "replaces a name: destructive (design 7.1)", allow-invalid = true },
+  { path = "libc::renameatx_np", reason = "replaces a name: destructive (design 7.1)", allow-invalid = true },
+  { path = "std::fs::remove_file", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "std::fs::remove_dir", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "std::fs::remove_dir_all", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "std::fs::rename", reason = "replaces a name: destructive (design 7.1)" },
+  { path = "tokio::fs::remove_file", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "tokio::fs::remove_dir", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "tokio::fs::remove_dir_all", reason = "destructive: only proven.rs (design 7.1)" },
+  { path = "tokio::fs::rename", reason = "replaces a name: destructive (design 7.1)" },
+  # ioctl: only the typed wrapper, which offers read requests and the proof-gated LOOP_CLR_FD.
+  { path = "libc::ioctl", reason = "use the typed ioctl wrapper (design 7.1)" },
+  # Subprocesses.
+  { path = "std::process::Command::new", reason = "a subprocess: approved launch modules only (design 7.1)" },
+  { path = "tokio::process::Command::new", reason = "a subprocess: approved launch modules only (design 7.1)" },
+  { path = "libc::execve", reason = "a subprocess image: approved launch modules only (design 7.1)" },
+  { path = "libc::execv", reason = "a subprocess image: approved launch modules only (design 7.1)" },
+  { path = "libc::execvp", reason = "a subprocess image: approved launch modules only (design 7.1)" },
+  { path = "libc::execvpe", reason = "a subprocess image: approved launch modules only (design 7.1)", allow-invalid = true },
+  { path = "libc::execveat", reason = "a subprocess image: approved launch modules only (design 7.1)", allow-invalid = true },
+  { path = "libc::fexecve", reason = "a subprocess image: approved launch modules only (design 7.1)", allow-invalid = true },
+  { path = "libc::posix_spawn", reason = "a subprocess: approved launch modules only (design 7.1)" },
+  { path = "libc::posix_spawnp", reason = "a subprocess: approved launch modules only (design 7.1)" },
+  { path = "libc::system", reason = "a shell: never (design 7.1)" },
+]

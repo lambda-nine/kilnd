@@ -848,12 +848,154 @@ impl ExecutableTable {
 /// Publishes an object from an already authenticated source descriptor. Never
 /// replaces or repairs: an existing object must match, and a mismatch is an error.
 /// The installer alone calls this, outside Create. Parent and file are fsynced.
+///
+/// B4 recheck 4: nothing is published or cleaned up through a pathname. The copy is
+/// created with `O_TMPFILE` in the root-only digest directory, so it has no name while
+/// it is copied, hashed, made 0555 and fsynced through its one descriptor, and that
+/// exact descriptor is what `linkat` names: `linkat(AT_FDCWD, "/proc/self/fd/N",
+/// directory, name, AT_SYMLINK_FOLLOW)`, which needs no `CAP_DAC_READ_SEARCH` (the
+/// helper's bounding set has none, so `linkat(fd, "", ..., AT_EMPTY_PATH)` is refused
+/// on kernels before 6.10). `linkat` never replaces, so a collision on the approved
+/// name fails closed. The name is then re-read without following and must be the held
+/// inode (device, inode, birth time); a mismatch is an error and everything is left
+/// as it is. There is no temporary name, so no error path unlinks anything: an
+/// unpublished copy dies with its descriptor.
+#[cfg(target_os = "linux")]
 pub fn publish_object(
     policy: &WalkPolicy,
     store_root: &Path,
     source: &File,
     pin: &ExecutablePin,
 ) -> Result<(), ExecutableError> {
+    use super::storage::{file_identity, identity_at};
+    let Some((root, directory, name)) = publish_target(policy, store_root, pin)? else {
+        return Ok(());
+    };
+    let dot = component_name(OsStr::new("."))?;
+    // SAFETY: the directory and "." are live; O_TMPFILE takes a mode. No O_EXCL, so
+    // the unnamed inode may be linked once.
+    let fd = unsafe {
+        libc::openat(
+            directory.file().as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDWR | libc::O_TMPFILE | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io_error("create unnamed copy", io::Error::last_os_error()));
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let copied = copy_source(source, &mut file)?;
+    let digest_of_copy = hash_descriptor(&file, copied)?;
+    if copied != pin.bytes || digest_of_copy != pin.sha256 {
+        return Err(ExecutableError::Mismatch(
+            "source does not match its pin".into(),
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o555))
+        .map_err(|e| io_error("chmod", e))?;
+    file.sync_all().map_err(|e| io_error("fsync", e))?;
+    let held = file_identity(&file).map_err(|e| io_error("identify copy", e))?;
+    #[cfg(test)]
+    tests::publish_gate(tests::PublishStage::Copied);
+    let from = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|_| ExecutableError::Io("descriptor path".into()))?;
+    // SAFETY: both names are NUL-terminated and the directory descriptor is live. The
+    // magic link resolves to the open file itself, never to a name; linkat never
+    // replaces an existing entry.
+    if unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            directory.file().as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    } != 0
+    {
+        return Err(io_error("publish", io::Error::last_os_error()));
+    }
+    #[cfg(test)]
+    tests::publish_gate(tests::PublishStage::Linked);
+    let role = pin.role.as_str();
+    match identity_at(directory.file(), role) {
+        Ok(Some(seen)) if seen.generation() == held.generation() => {}
+        Ok(_) => {
+            return Err(ExecutableError::Mismatch(format!(
+                "published {role} is not the held copy; left in place"
+            )));
+        }
+        Err(error) => return Err(io_error("re-read published name", error)),
+    }
+    let (_, published) = verify_object(policy, &directory, pin)?;
+    if (published.st_dev, published.st_ino) != (held.st_dev, held.st_ino) {
+        return Err(ExecutableError::Mismatch(format!(
+            "published {role} is not the held copy; left in place"
+        )));
+    }
+    sync_published(&root, &directory)
+}
+
+/// Development platforms only (production is Linux): there is no `O_TMPFILE`, so the
+/// copy is read and checked in memory first, then written to the approved name
+/// created with `O_EXCL`, which never replaces anything. Nothing is ever unlinked.
+#[cfg(all(test, not(target_os = "linux")))]
+pub fn publish_object(
+    policy: &WalkPolicy,
+    store_root: &Path,
+    source: &File,
+    pin: &ExecutablePin,
+) -> Result<(), ExecutableError> {
+    use std::io::Write as _;
+    let Some((root, directory, name)) = publish_target(policy, store_root, pin)? else {
+        return Ok(());
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(
+            source.try_clone().map_err(|e| io_error("source", e))?,
+            MAX_EXECUTABLE_BYTES + 1,
+        ),
+        &mut bytes,
+    )
+    .map_err(|e| io_error("copy", e))?;
+    if bytes.len() as u64 != pin.bytes || Digest::of(&bytes) != pin.sha256 {
+        return Err(ExecutableError::Mismatch(
+            "source does not match its pin".into(),
+        ));
+    }
+    let mut file = open_at(
+        directory.file().as_raw_fd(),
+        &name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+    )
+    .map_err(|e| io_error("publish", e))?;
+    file.write_all(&bytes).map_err(|e| io_error("copy", e))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o555))
+        .map_err(|e| io_error("chmod", e))?;
+    file.sync_all().map_err(|e| io_error("fsync", e))?;
+    let held = file.metadata().map_err(|e| io_error("identify copy", e))?;
+    let (_, published) = verify_object(policy, &directory, pin)?;
+    if (published.st_dev, published.st_ino) != (held.dev(), held.ino()) {
+        return Err(ExecutableError::Mismatch(format!(
+            "published {} is not the held copy; left in place",
+            pin.role.as_str()
+        )));
+    }
+    sync_published(&root, &directory)
+}
+
+/// The digest directory for `pin`, created if missing, and the role's name in it.
+/// `None` when the object already exists and verifies: republishing is idempotent and
+/// never replaces.
+#[cfg(any(test, target_os = "linux"))]
+fn publish_target(
+    policy: &WalkPolicy,
+    store_root: &Path,
+    pin: &ExecutablePin,
+) -> Result<Option<(ProtectedDir, ProtectedDir, CString)>, ExecutableError> {
     let digest = pin.sha256.to_string();
     let root = walk_directory(policy, store_root)?;
     let digest_name = component_name(OsStr::new(&digest))?;
@@ -874,57 +1016,30 @@ pub fn publish_object(
     .is_ok()
     {
         verify_object(policy, &directory, pin)?;
-        return Ok(());
+        return Ok(None);
     }
-    let temporary = component_name(OsStr::new(&format!(".{}.tmp", pin.role.as_str())))?;
-    let mut file = open_at(
-        directory.file().as_raw_fd(),
-        &temporary,
-        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-    )
-    .map_err(|e| io_error("create private copy", e))?;
+    Ok(Some((root, directory, name)))
+}
+
+#[cfg(target_os = "linux")]
+fn copy_source(source: &File, file: &mut File) -> Result<u64, ExecutableError> {
     let mut input = source.try_clone().map_err(|e| io_error("source", e))?;
-    let copied = std::io::copy(
+    std::io::copy(
         &mut std::io::Read::take(&mut input, MAX_EXECUTABLE_BYTES + 1),
-        &mut file,
+        file,
     )
-    .map_err(|e| io_error("copy", e))?;
-    let digest_of_copy = hash_descriptor(&file, copied)?;
-    let result = (|| {
-        if copied != pin.bytes || digest_of_copy != pin.sha256 {
-            return Err(ExecutableError::Mismatch(
-                "source does not match its pin".into(),
-            ));
-        }
-        file.set_permissions(std::fs::Permissions::from_mode(0o555))
-            .map_err(|e| io_error("chmod", e))?;
-        file.sync_all().map_err(|e| io_error("fsync", e))?;
-        // SAFETY: both directory handles and names are live; linkat never replaces.
-        if unsafe {
-            libc::linkat(
-                directory.file().as_raw_fd(),
-                temporary.as_ptr(),
-                directory.file().as_raw_fd(),
-                name.as_ptr(),
-                0,
-            )
-        } != 0
-        {
-            return Err(io_error("publish", io::Error::last_os_error()));
-        }
-        Ok(())
-    })();
-    // SAFETY: directory and temporary name are live.
-    unsafe { libc::unlinkat(directory.file().as_raw_fd(), temporary.as_ptr(), 0) };
-    result?;
+    .map_err(|e| io_error("copy", e))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sync_published(root: &ProtectedDir, directory: &ProtectedDir) -> Result<(), ExecutableError> {
     directory
         .file()
         .sync_all()
         .map_err(|e| io_error("fsync parent", e))?;
     root.file()
         .sync_all()
-        .map_err(|e| io_error("fsync store", e))?;
-    Ok(())
+        .map_err(|e| io_error("fsync store", e))
 }
 
 /// The record S sends J on control FD 4. Bound by version, plan generation, exact VMM
@@ -1020,13 +1135,11 @@ pub fn close_all_except(keep: &[RawFd]) {
         for fd in &sorted {
             let fd = *fd as libc::c_uint;
             if fd > next {
-                // SAFETY: closing a descriptor range this process owns.
-                unsafe { libc::syscall(libc::SYS_close_range, next, fd - 1, 0) };
+                let _ = crate::sys::close_range(next, fd - 1);
             }
             next = fd + 1;
         }
-        // SAFETY: closing a descriptor range this process owns.
-        unsafe { libc::syscall(libc::SYS_close_range, next, libc::c_uint::MAX, 0) };
+        let _ = crate::sys::close_range(next, libc::c_uint::MAX);
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1181,19 +1294,8 @@ pub fn exec_retained(fd: RawFd, argv: &[CString], env: &[CString]) -> io::Error 
     argv_ptrs.push(std::ptr::null());
     let mut env_ptrs: Vec<*const libc::c_char> = env.iter().map(|arg| arg.as_ptr()).collect();
     env_ptrs.push(std::ptr::null());
-    // SAFETY: fd is live, the empty path and both NULL-terminated vectors outlive the
-    // call, and AT_EMPTY_PATH selects the descriptor itself.
-    unsafe {
-        libc::syscall(
-            libc::SYS_execveat,
-            fd,
-            c"".as_ptr(),
-            argv_ptrs.as_ptr(),
-            env_ptrs.as_ptr(),
-            libc::AT_EMPTY_PATH,
-        );
-    }
-    io::Error::last_os_error()
+    // SAFETY: both NULL-terminated vectors of NUL-terminated strings outlive the call.
+    unsafe { crate::sys::execveat_empty(fd, argv_ptrs.as_ptr(), env_ptrs.as_ptr()) }
 }
 
 /// A process's actual executable through its `/proc` magic link: device and inode

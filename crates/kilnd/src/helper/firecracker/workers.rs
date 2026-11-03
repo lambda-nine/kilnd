@@ -689,8 +689,7 @@ pub fn process_state(pid: i32) -> ProcessState {
     };
     if n != size {
         // A zombie has no BSD info on macOS, but still answers kill(pid, 0).
-        // SAFETY: signal 0 only checks for existence.
-        if unsafe { libc::kill(pid, 0) } == 0 {
+        if crate::sys::process_exists(pid) {
             return ProcessState::Zombie;
         }
         return ProcessState::Gone;

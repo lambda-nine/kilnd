@@ -511,21 +511,14 @@ pub use linux::*;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use crate::sys;
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::time::Duration;
 
-    const LOOP_SET_STATUS64: libc::c_ulong = 0x4C04;
-    const LOOP_GET_STATUS64: libc::c_ulong = 0x4C05;
-    const LOOP_CONFIGURE: libc::c_ulong = 0x4C0A;
-    const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4C82;
-    const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
-    const BLKSSZGET: libc::c_ulong = 0x1268;
-    /// `_IOR(0x12, 128, __u64)`.
-    const BLKGETDISKSEQ: libc::c_ulong = 0x8008_1280;
-    const LO_FLAGS_AUTOCLEAR: u32 = 4;
+    use crate::sys::ioctl::{self, LO_FLAGS_AUTOCLEAR};
     const STATX_MNT_ID: u32 = 0x1000;
     /// Linux 6.8: the 64-bit mount ID that is never reused within a boot.
     const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
@@ -538,32 +531,6 @@ mod linux {
             return Err(io::Error::other("malformed boot ID"));
         }
         Ok(text.to_string())
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct LoopInfo64 {
-        lo_device: u64,
-        lo_inode: u64,
-        lo_rdevice: u64,
-        lo_offset: u64,
-        lo_sizelimit: u64,
-        lo_number: u32,
-        lo_encrypt_type: u32,
-        lo_encrypt_key_size: u32,
-        lo_flags: u32,
-        lo_file_name: [u8; 64],
-        lo_crypt_name: [u8; 64],
-        lo_encrypt_key: [u8; 32],
-        lo_init: [u64; 2],
-    }
-
-    #[repr(C)]
-    struct LoopConfig {
-        fd: u32,
-        block_size: u32,
-        info: LoopInfo64,
-        reserved: [u64; 8],
     }
 
     fn cstr(name: &str) -> io::Result<CString> {
@@ -820,12 +787,7 @@ mod linux {
     /// Links an unlinked file at `name`, never replacing anything, and proves the name
     /// now shows exactly its journaled generation. `linkat` through `/proc/self/fd` with
     /// `AT_SYMLINK_FOLLOW` needs no `CAP_DAC_READ_SEARCH`.
-    pub fn publish(
-        dir: &File,
-        file: &File,
-        name: &str,
-        identity: &FileIdentity,
-    ) -> io::Result<()> {
+    pub fn publish(dir: &File, file: &File, name: &str, identity: &FileIdentity) -> io::Result<()> {
         let from = cstr(&format!("/proc/self/fd/{}", file.as_raw_fd()))?;
         let to = cstr(name)?;
         // SAFETY: both names are NUL-terminated; the directory descriptor is live.
@@ -840,7 +802,11 @@ mod linux {
         })?;
         match identity_at(dir, name)? {
             Some(seen) if seen.generation() == identity.generation() => {}
-            _ => return Err(io::Error::other(format!("{name} is not the journaled file"))),
+            _ => {
+                return Err(io::Error::other(format!(
+                    "{name} is not the journaled file"
+                )));
+            }
         }
         dir.sync_all()
     }
@@ -893,18 +859,8 @@ mod linux {
         openat_raw(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)
     }
 
-    fn loop_status(device: &File) -> io::Result<Option<LoopInfo64>> {
-        // SAFETY: info is writable and sized for LOOP_GET_STATUS64.
-        let mut info: LoopInfo64 = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::ioctl(device.as_raw_fd(), LOOP_GET_STATUS64, &mut info) };
-        if rc == 0 {
-            return Ok(Some(info));
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENXIO) {
-            return Ok(None);
-        }
-        Err(error)
+    fn loop_status(device: &File) -> io::Result<Option<ioctl::LoopInfo64>> {
+        ioctl::loop_status(device)
     }
 
     fn decode_dev(encoded: u64) -> (u32, u32) {
@@ -940,17 +896,12 @@ mod linux {
             libc::O_RDWR | libc::O_NOFOLLOW,
             0,
         )?;
-        // SAFETY: LOOP_CTL_GET_FREE takes no argument.
-        let minor = cvt(unsafe { libc::ioctl(control.as_raw_fd(), LOOP_CTL_GET_FREE) })?;
-        Ok(minor as u32)
+        ioctl::loop_free_slot(&control)
     }
 
     /// The device's disk sequence number, on this one opened descriptor.
     pub(crate) fn diskseq(device: &File) -> io::Result<u64> {
-        let mut seq: u64 = 0;
-        // SAFETY: seq is writable for BLKGETDISKSEQ.
-        cvt(unsafe { libc::ioctl(device.as_raw_fd(), BLKGETDISKSEQ, &mut seq) })?;
-        Ok(seq)
+        ioctl::disk_sequence(device)
     }
 
     /// A loop attachment made by [`attach_loop`]: the configuring descriptor, still open,
@@ -981,16 +932,12 @@ mod linux {
         }
         let boot_id = boot_id()?;
         let device = open_loop(binding.minor, true)?;
-        // SAFETY: zero is valid for every field; the kernel copies the structure.
-        let mut config: LoopConfig = unsafe { std::mem::zeroed() };
-        config.fd = backing.as_raw_fd() as u32;
-        config.info.lo_offset = 0;
-        config.info.lo_sizelimit = binding.size_limit;
-        config.info.lo_flags = LO_FLAGS_AUTOCLEAR;
-        config.block_size = binding.block_size;
-        let rc = unsafe { libc::ioctl(device.as_raw_fd(), LOOP_CONFIGURE, &config) };
-        if rc != 0 {
-            let error = io::Error::last_os_error();
+        if let Err(error) = ioctl::loop_configure_autoclear(
+            &device,
+            backing,
+            binding.size_limit,
+            binding.block_size,
+        ) {
             if error.raw_os_error() == Some(libc::EBUSY) {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -1018,24 +965,26 @@ mod linux {
     /// the one flag; it does not change the disk sequence number.
     pub fn persist_loop(binding: &LoopBinding, attached: AttachedLoop) -> io::Result<()> {
         let AttachedLoop { device, generation } = attached;
-        let mut info = loop_status(&device)?
+        let info = loop_status(&device)?
             .ok_or_else(|| io::Error::other("loop detached before it was persisted"))?;
         if match_slot(&device, binding)? != SlotMatch::Exact
             || diskseq(&device)? != generation.diskseq
             || info.lo_flags & LO_FLAGS_AUTOCLEAR == 0
         {
-            return Err(io::Error::other("loop binding is not the journaled generation"));
+            return Err(io::Error::other(
+                "loop binding is not the journaled generation",
+            ));
         }
-        info.lo_flags &= !LO_FLAGS_AUTOCLEAR;
-        // SAFETY: info is the kernel's own status structure for this slot.
-        cvt(unsafe { libc::ioctl(device.as_raw_fd(), LOOP_SET_STATUS64, &info) })?;
+        ioctl::loop_clear_autoclear(&device, &info)?;
         let after = loop_status(&device)?
             .ok_or_else(|| io::Error::other("loop detached while it was persisted"))?;
         if after.lo_flags & LO_FLAGS_AUTOCLEAR != 0
             || match_slot(&device, binding)? != SlotMatch::Exact
             || diskseq(&device)? != generation.diskseq
         {
-            return Err(io::Error::other("loop binding changed while it was persisted"));
+            return Err(io::Error::other(
+                "loop binding changed while it was persisted",
+            ));
         }
         Ok(())
     }
@@ -1074,12 +1023,8 @@ mod linux {
         if info.lo_offset != binding.offset || info.lo_sizelimit != binding.size_limit {
             return Ok(SlotMatch::Differs);
         }
-        let mut size: u64 = 0;
-        // SAFETY: size is writable for BLKGETSIZE64.
-        cvt(unsafe { libc::ioctl(device.as_raw_fd(), BLKGETSIZE64, &mut size) })?;
-        let mut block: libc::c_int = 0;
-        // SAFETY: block is writable for BLKSSZGET.
-        cvt(unsafe { libc::ioctl(device.as_raw_fd(), BLKSSZGET, &mut block) })?;
+        let size = ioctl::block_device_bytes(device)?;
+        let block = ioctl::logical_block_size(device)?;
         if size != binding.size_limit || u32::try_from(block).ok() != Some(binding.block_size) {
             return Ok(SlotMatch::Differs);
         }
@@ -1211,8 +1156,8 @@ mod linux {
                 SlotMatch::OtherBacking => return Ok(LoopOutcome::NotOurs),
                 SlotMatch::Exact | SlotMatch::Differs => {}
             }
-            let autoclear = loop_status(&device)?
-                .is_some_and(|info| info.lo_flags & LO_FLAGS_AUTOCLEAR != 0);
+            let autoclear =
+                loop_status(&device)?.is_some_and(|info| info.lo_flags & LO_FLAGS_AUTOCLEAR != 0);
             if !autoclear || std::time::Instant::now() >= end {
                 return Ok(LoopOutcome::Unknown);
             }
@@ -1353,12 +1298,7 @@ mod linux {
     /// The identity of what is mounted at one name in a directory: an `O_PATH`
     /// descriptor opened without following, then statx on that descriptor.
     pub fn mount_identity_at(dir: &File, name: &str) -> io::Result<MountedIdentity> {
-        let at = openat_raw(
-            dir.as_raw_fd(),
-            name,
-            libc::O_PATH | libc::O_NOFOLLOW,
-            0,
-        )?;
+        let at = openat_raw(dir.as_raw_fd(), name, libc::O_PATH | libc::O_NOFOLLOW, 0)?;
         mount_identity(&at)
     }
 
@@ -1391,7 +1331,9 @@ mod linux {
             || stat.st_nlink != 1
             || stat.st_size as u64 != expected.len() as u64
         {
-            return Err(io::Error::other("jail marker is not the owned root-only file"));
+            return Err(io::Error::other(
+                "jail marker is not the owned root-only file",
+            ));
         }
         let mut bytes = Vec::with_capacity(expected.len() + 1);
         (&mut marker)
@@ -1403,67 +1345,24 @@ mod linux {
         Ok(())
     }
 
-    fn sys_ret(rc: libc::c_long) -> io::Result<libc::c_long> {
-        if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(rc)
-        }
-    }
-
     /// A detached tmpfs from the new mount API: configured, created and mounted with no
     /// path, so its marker and jail root exist before it is attached anywhere.
-    fn detached_jail_tmpfs(identity: &JailIdentity) -> io::Result<File> {
-        const FSOPEN_CLOEXEC: libc::c_uint = 1;
-        const FSCONFIG_SET_STRING: libc::c_uint = 1;
-        const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
-        const FSMOUNT_CLOEXEC: libc::c_uint = 1;
+    fn detached_jail_tmpfs(identity: &JailIdentity) -> io::Result<sys::DetachedMount> {
         const MOUNT_ATTR_NOSUID: libc::c_uint = 0x2;
-        // SAFETY: a NUL-terminated name and constant flags.
-        let fs = sys_ret(unsafe { libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), FSOPEN_CLOEXEC) })?;
-        // SAFETY: a new owned descriptor.
-        let fs = unsafe { File::from_raw_fd(fs as RawFd) };
+        let fs = sys::fsopen(c"tmpfs")?;
         let source = cstr(&identity.source())?;
         let mut options = vec![(c"source".to_owned(), source)];
         for option in JAIL_TMPFS_DATA.split(',') {
-            let (key, value) = option.split_once('=').ok_or_else(|| invalid("tmpfs option"))?;
+            let (key, value) = option
+                .split_once('=')
+                .ok_or_else(|| invalid("tmpfs option"))?;
             options.push((cstr(key)?, cstr(value)?));
         }
         for (key, value) in &options {
-            // SAFETY: both strings are NUL-terminated; the context descriptor is live.
-            sys_ret(unsafe {
-                libc::syscall(
-                    libc::SYS_fsconfig,
-                    fs.as_raw_fd(),
-                    FSCONFIG_SET_STRING,
-                    key.as_ptr(),
-                    value.as_ptr(),
-                    0,
-                )
-            })?;
+            sys::fsconfig_set_string(&fs, key, value)?;
         }
-        // SAFETY: as above, with no key or value.
-        sys_ret(unsafe {
-            libc::syscall(
-                libc::SYS_fsconfig,
-                fs.as_raw_fd(),
-                FSCONFIG_CMD_CREATE,
-                std::ptr::null::<libc::c_char>(),
-                std::ptr::null::<libc::c_void>(),
-                0,
-            )
-        })?;
-        // SAFETY: a live context descriptor and constant flags.
-        let mount = sys_ret(unsafe {
-            libc::syscall(
-                libc::SYS_fsmount,
-                fs.as_raw_fd(),
-                FSMOUNT_CLOEXEC,
-                MOUNT_ATTR_NOSUID,
-            )
-        })?;
-        // SAFETY: a new owned descriptor on the detached mount's root.
-        Ok(unsafe { File::from_raw_fd(mount as RawFd) })
+        sys::fsconfig_create(&fs)?;
+        sys::fsmount(&fs, MOUNT_ATTR_NOSUID)
     }
 
     fn mount_raw(
@@ -1491,16 +1390,13 @@ mod linux {
         Ok(())
     }
 
-    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
-    const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x40;
-
     /// The jail tmpfs, created detached with its marker and jail root, and identified
     /// before it is attached anywhere. Its owner journals [`DetachedJail::record`], then
     /// calls [`attach_jail`]. If the owner dies first, the detached mount dies with its
     /// descriptor, so a jail tmpfs at the path whose unique ID was never journaled can
     /// only be a replacement.
     pub struct DetachedJail {
-        mount: File,
+        mount: sys::DetachedMount,
         jail_dir: File,
         pub record: JailMount,
     }
@@ -1518,7 +1414,7 @@ mod linux {
         {
             use std::io::Write;
             let mut marker = openat_raw(
-                mount.as_raw_fd(),
+                mount.file().as_raw_fd(),
                 JAIL_MARKER,
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
                 0o400,
@@ -1527,9 +1423,9 @@ mod linux {
         }
         let root_name = cstr("root")?;
         // SAFETY: a NUL-terminated name under a live mount descriptor.
-        cvt(unsafe { libc::mkdirat(mount.as_raw_fd(), root_name.as_ptr(), 0o700) })?;
-        let ids = mount_identity(&mount)?;
-        let root = mount_identity_at(&mount, "root")?;
+        cvt(unsafe { libc::mkdirat(mount.file().as_raw_fd(), root_name.as_ptr(), 0o700) })?;
+        let ids = mount_identity(mount.file())?;
+        let root = mount_identity_at(mount.file(), "root")?;
         if (root.unique_id, root.st_dev) != (ids.unique_id, ids.st_dev) {
             return Err(io::Error::other("jail root is not on the jail tmpfs"));
         }
@@ -1560,27 +1456,24 @@ mod linux {
             jail_dir,
             record,
         } = detached;
-        // SAFETY: both descriptors are live; empty paths name them exactly.
-        sys_ret(unsafe {
-            libc::syscall(
-                libc::SYS_move_mount,
-                mount.as_raw_fd(),
-                c"".as_ptr(),
-                jail_dir.as_raw_fd(),
-                c"".as_ptr(),
-                MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
-            )
-        })?;
+        sys::move_mount_onto(&mount, &jail_dir)?;
         // Private propagation of exactly this mount, through its own descriptor.
-        let own = PathBuf::from(format!("/proc/self/fd/{}", mount.as_raw_fd()));
+        let own = PathBuf::from(format!("/proc/self/fd/{}", mount.file().as_raw_fd()));
         mount_raw(None, &own, None, libc::MS_PRIVATE, None)?;
         drop((mount, jail_dir));
         let jail = open_trusted(&paths.jail_dir)?;
         let seen = mount_identity(&jail)?;
         if (seen.unique_id, seen.mount_id, seen.st_dev, seen.st_ino)
-            != (record.unique_id, record.mount_id, record.st_dev, record.st_ino)
+            != (
+                record.unique_id,
+                record.mount_id,
+                record.st_dev,
+                record.st_ino,
+            )
         {
-            return Err(io::Error::other("the attached jail mount is not the journaled one"));
+            return Err(io::Error::other(
+                "the attached jail mount is not the journaled one",
+            ));
         }
         check_marker(&jail, identity)?;
         let root = open_dir_at(&jail, "root")?;
@@ -1596,7 +1489,7 @@ mod linux {
     /// record, then calls [`attach_bind`]; if the owner dies first, the clone dies with
     /// its descriptor.
     pub struct DetachedBind {
-        tree: File,
+        tree: sys::DetachedMount,
         pub record: BindMount,
     }
 
@@ -1604,17 +1497,9 @@ mod linux {
     /// the original), made read-only, nosuid, nodev and private with `mount_setattr`
     /// while detached, plus the empty file it will be attached over.
     pub fn prepare_bind(root: &File, name: &str, source: &File) -> io::Result<DetachedBind> {
-        const OPEN_TREE_CLONE: libc::c_uint = 1;
         const MOUNT_ATTR_RDONLY: u64 = 0x1;
         const MOUNT_ATTR_NOSUID: u64 = 0x2;
         const MOUNT_ATTR_NODEV: u64 = 0x4;
-        #[repr(C)]
-        struct MountAttr {
-            attr_set: u64,
-            attr_clr: u64,
-            propagation: u64,
-            userns_fd: u64,
-        }
         let name = BINDS
             .iter()
             .copied()
@@ -1628,35 +1513,15 @@ mod linux {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
             0o400,
         )?);
-        // SAFETY: a live descriptor and an empty NUL-terminated path.
-        let tree = sys_ret(unsafe {
-            libc::syscall(
-                libc::SYS_open_tree,
-                source.as_raw_fd(),
-                c"".as_ptr(),
-                libc::AT_EMPTY_PATH as libc::c_uint | OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint,
-            )
-        })?;
-        // SAFETY: a new owned descriptor on the detached clone.
-        let tree = unsafe { File::from_raw_fd(tree as RawFd) };
-        let attr = MountAttr {
+        let tree = sys::open_tree_clone(source)?;
+        let attr = sys::MountAttr {
             attr_set: MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
             attr_clr: 0,
             propagation: libc::MS_PRIVATE,
             userns_fd: 0,
         };
-        // SAFETY: attr is a complete version-0 mount_attr; the path is empty.
-        sys_ret(unsafe {
-            libc::syscall(
-                libc::SYS_mount_setattr,
-                tree.as_raw_fd(),
-                c"".as_ptr(),
-                libc::AT_EMPTY_PATH,
-                &attr,
-                std::mem::size_of::<MountAttr>(),
-            )
-        })?;
-        let ids = mount_identity(&tree)?;
+        sys::mount_setattr(&tree, &attr)?;
+        let ids = mount_identity(tree.file())?;
         let original = source.metadata()?;
         if (ids.st_dev, ids.st_ino) != (original.dev(), original.ino()) {
             return Err(io::Error::other(format!(
@@ -1681,22 +1546,16 @@ mod linux {
     pub fn attach_bind(root: &File, detached: DetachedBind) -> io::Result<()> {
         let DetachedBind { tree, record } = detached;
         let name = cstr(&record.name)?;
-        // SAFETY: both descriptors are live; the target name is NUL-terminated and is
-        // resolved under the jail root without following a final link.
-        sys_ret(unsafe {
-            libc::syscall(
-                libc::SYS_move_mount,
-                tree.as_raw_fd(),
-                c"".as_ptr(),
-                root.as_raw_fd(),
-                name.as_ptr(),
-                MOVE_MOUNT_F_EMPTY_PATH,
-            )
-        })?;
+        sys::move_mount_at(&tree, root, &name)?;
         drop(tree);
         let seen = mount_identity_at(root, &record.name)?;
         if (seen.unique_id, seen.mount_id, seen.st_dev, seen.st_ino)
-            != (record.unique_id, record.mount_id, record.st_dev, record.st_ino)
+            != (
+                record.unique_id,
+                record.mount_id,
+                record.st_dev,
+                record.st_ino,
+            )
             || seen.unique_id == mount_identity(root)?.unique_id
         {
             return Err(io::Error::other(format!(
@@ -1830,8 +1689,7 @@ mod linux {
             || names != expected
             || under.len() != BINDS.len() + 1
             || under.iter().any(|m| {
-                m.mount_point != paths.jail_dir
-                    && (!m.read_only || m.parent_id != mount.mount_id)
+                m.mount_point != paths.jail_dir && (!m.read_only || m.parent_id != mount.mount_id)
             })
         {
             return Err(io::Error::other(
@@ -2012,7 +1870,9 @@ mod linux {
             )));
         }
         let record = binds
-            .ok_or_else(|| io::Error::other(format!("{name} is mounted but no bind was journaled")))?
+            .ok_or_else(|| {
+                io::Error::other(format!("{name} is mounted but no bind was journaled"))
+            })?
             .iter()
             .find(|b| b.name == name)
             .ok_or_else(|| io::Error::other(format!("{name} has no bind record")))?;
@@ -2062,15 +1922,17 @@ mod linux {
         if found.is_empty() {
             return Ok(());
         }
-        let identity = recorded.identity.ok_or_else(|| {
-            io::Error::other("a jail mount exists but no identity was journaled")
-        })?;
+        let identity = recorded
+            .identity
+            .ok_or_else(|| io::Error::other("a jail mount exists but no identity was journaled"))?;
         let mount = recorded.mount.ok_or_else(|| {
             io::Error::other("a jail mount exists but no unique mount ID was journaled")
         })?;
         let boot = boot_id()?;
         if mount.boot_id != boot
-            || recorded.binds.is_some_and(|binds| binds.iter().any(|b| b.boot_id != boot))
+            || recorded
+                .binds
+                .is_some_and(|binds| binds.iter().any(|b| b.boot_id != boot))
         {
             return Err(io::Error::other(
                 "the journaled jail mounts belong to another boot: this mount is not ours",
@@ -2111,9 +1973,13 @@ mod linux {
         }
         drop(jail);
         let firecracker = open_trusted(&Path::new(JAIL_BASE).join("firecracker"))?;
-        let proof =
-            proven::prove_mount(&firecracker, jail_name(paths)?, mount.unique_id, &mount.boot_id)
-                .map_err(|e| e.refusal("the jail tmpfs"))?;
+        let proof = proven::prove_mount(
+            &firecracker,
+            jail_name(paths)?,
+            mount.unique_id,
+            &mount.boot_id,
+        )
+        .map_err(|e| e.refusal("the jail tmpfs"))?;
         proven::unmount(proof)?;
         if !mounts_under(&read_mounts()?, &paths.jail_dir).is_empty() {
             return Err(io::Error::other("a jail mount remains"));
@@ -2271,6 +2137,9 @@ mod linux {
 }
 
 #[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -2285,7 +2154,9 @@ mod tests {
             .read_exact(&mut bytes)
             .unwrap();
         let h: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let jail_dir = Path::new(JAIL_BASE).join("firecracker").join(format!("fc-{h}"));
+        let jail_dir = Path::new(JAIL_BASE)
+            .join("firecracker")
+            .join(format!("fc-{h}"));
         let work_dir = Path::new(WORK_BASE).join(&h).join(format!("fc-{h}"));
         AllocationPaths {
             jail_root: jail_dir.join("root"),
@@ -2297,8 +2168,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn mounted_at(path: &Path) -> Vec<MountEntry> {
-        let entries = parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo").unwrap())
-            .unwrap();
+        let entries =
+            parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo").unwrap()).unwrap();
         entries
             .into_iter()
             .filter(|e| e.mount_point == path)
@@ -2323,7 +2194,13 @@ mod tests {
                 data.as_ptr().cast(),
             )
         };
-        assert_eq!(rc, 0, "mount {}: {}", target.display(), io::Error::last_os_error());
+        assert_eq!(
+            rc,
+            0,
+            "mount {}: {}",
+            target.display(),
+            io::Error::last_os_error()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2333,7 +2210,13 @@ mod tests {
         let target_c = CString::new(target.as_os_str().as_bytes()).unwrap();
         // SAFETY: NUL-terminated.
         let rc = unsafe { libc::umount2(target_c.as_ptr(), libc::UMOUNT_NOFOLLOW) };
-        assert_eq!(rc, 0, "umount {}: {}", target.display(), io::Error::last_os_error());
+        assert_eq!(
+            rc,
+            0,
+            "umount {}: {}",
+            target.display(),
+            io::Error::last_os_error()
+        );
     }
 
     /// The product's jail creation: detached, identified (the caller journals the
@@ -2387,7 +2270,11 @@ mod tests {
                 std::ptr::null(),
                 target.as_ptr(),
                 std::ptr::null(),
-                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+                libc::MS_BIND
+                    | libc::MS_REMOUNT
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV,
                 std::ptr::null(),
             )
         };
@@ -2416,12 +2303,21 @@ mod tests {
         // The root fault: ours unmounted, a fresh tmpfs with the same source and a jail
         // root put in its place.
         raw_umount(&paths.jail_dir);
-        raw_mount(&identity.source(), &paths.jail_dir, "tmpfs", JAIL_TMPFS_DATA);
+        raw_mount(
+            &identity.source(),
+            &paths.jail_dir,
+            "tmpfs",
+            JAIL_TMPFS_DATA,
+        );
         std::fs::create_dir(&paths.jail_root).unwrap();
         let replacement = mount_identity(&File::open(&paths.jail_dir).unwrap()).unwrap();
         let refused = unmount_jail(&paths, records);
         assert!(refused.is_err(), "cleanup accepted a replacement");
-        assert_eq!(mounted_at(&paths.jail_dir).len(), 1, "the replacement survived");
+        assert_eq!(
+            mounted_at(&paths.jail_dir).len(),
+            1,
+            "the replacement survived"
+        );
         eprintln!(
             "B4 evidence: recorded {recorded:?}, replacement {replacement:?}; refused: {}",
             refused.unwrap_err()
@@ -2483,7 +2379,10 @@ mod tests {
             mount: Some(&recorded),
             binds: Some(&journaled),
         };
-        assert!(unmount_jail(&paths, records).is_err(), "a foreign nested mount");
+        assert!(
+            unmount_jail(&paths, records).is_err(),
+            "a foreign nested mount"
+        );
         assert_eq!(mounted_at(&paths.jail_root.join("kernel")).len(), 1);
         assert_eq!(mounted_at(&paths.jail_dir).len(), 1);
         raw_umount(&paths.jail_root.join("x"));
@@ -2527,7 +2426,12 @@ mod tests {
         let (jail, root, recorded) = create_jail(&paths, &identity);
         drop((jail, root));
         raw_umount(&paths.jail_dir);
-        raw_mount(&identity.source(), &paths.jail_dir, "tmpfs", JAIL_TMPFS_DATA);
+        raw_mount(
+            &identity.source(),
+            &paths.jail_dir,
+            "tmpfs",
+            JAIL_TMPFS_DATA,
+        );
         std::fs::write(paths.jail_dir.join(JAIL_MARKER), identity.marker()).unwrap();
         std::fs::set_permissions(
             paths.jail_dir.join(JAIL_MARKER),
@@ -2704,7 +2608,10 @@ mod tests {
             .unwrap();
         // SAFETY: zeroed is a valid loop_info64; the ioctls fill and read it.
         let mut info: TestLoopInfo = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::ioctl(device.as_raw_fd(), 0x4C05, &mut info) }, 0);
+        assert_eq!(
+            unsafe { libc::ioctl(device.as_raw_fd(), 0x4C05, &mut info) },
+            0
+        );
         info.lo_offset = offset;
         info.lo_sizelimit = size_limit;
         let rc = unsafe { libc::ioctl(device.as_raw_fd(), 0x4C04, &info) };
@@ -2744,10 +2651,19 @@ mod tests {
         let mut seen = std::collections::BTreeSet::from([recorded.unique_id]);
         let mut reused_tuple = 0;
         for _ in 0..100 {
-            raw_mount(&identity.source(), &paths.jail_dir, "tmpfs", JAIL_TMPFS_DATA);
+            raw_mount(
+                &identity.source(),
+                &paths.jail_dir,
+                "tmpfs",
+                JAIL_TMPFS_DATA,
+            );
             let fresh = mount_identity(&File::open(&paths.jail_dir).unwrap()).unwrap();
             raw_umount(&paths.jail_dir);
-            assert!(seen.insert(fresh.unique_id), "unique mount ID {} reused", fresh.unique_id);
+            assert!(
+                seen.insert(fresh.unique_id),
+                "unique mount ID {} reused",
+                fresh.unique_id
+            );
             if (fresh.mount_id, fresh.st_dev, fresh.st_ino)
                 == (recorded.mount_id, recorded.st_dev, recorded.st_ino)
             {
@@ -2772,10 +2688,16 @@ mod tests {
         let attached = attach_loop(&binding, &file).unwrap();
         let second = attached.generation.clone();
         persist_loop(&binding, attached).unwrap();
-        assert_ne!(second.diskseq, first.diskseq, "reattach kept the disk sequence");
+        assert_ne!(
+            second.diskseq, first.diskseq,
+            "reattach kept the disk sequence"
+        );
         retune_loop(binding.minor, 4096, W - 4096);
         let retuned = current_generation(binding.minor).unwrap();
-        assert_eq!(retuned, second, "LOOP_SET_STATUS64 changed the disk sequence");
+        assert_eq!(
+            retuned, second,
+            "LOOP_SET_STATUS64 changed the disk sequence"
+        );
         unbind_loop(binding.minor);
         drop(file);
         std::fs::remove_file(&backing).unwrap();
@@ -2796,7 +2718,8 @@ mod tests {
     fn b4_linux_root_detach_refuses_the_same_inode_with_another_loop_tuple() {
         use std::os::unix::fs::MetadataExt;
         const W: u64 = 16 * 1024 * 1024;
-        let backing = std::env::temp_dir().join(format!("b4-loop-tuple-{}.img", std::process::id()));
+        let backing =
+            std::env::temp_dir().join(format!("b4-loop-tuple-{}.img", std::process::id()));
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2822,10 +2745,19 @@ mod tests {
             assert!(losetup(&all), "losetup {all:?}");
         };
         for (label, args) in [
-            ("offset", vec!["--offset", "4096", "--sizelimit", "16773120"]),
+            (
+                "offset",
+                vec!["--offset", "4096", "--sizelimit", "16773120"],
+            ),
             ("size limit", vec!["--sizelimit", "8388608"]),
-            ("offset and size limit", vec!["--offset", "4096", "--sizelimit", "8388608"]),
-            ("block size", vec!["--sizelimit", "16777216", "--sector-size", "4096"]),
+            (
+                "offset and size limit",
+                vec!["--offset", "4096", "--sizelimit", "8388608"],
+            ),
+            (
+                "block size",
+                vec!["--sizelimit", "16777216", "--sector-size", "4096"],
+            ),
         ] {
             bind(&args);
             let generation = current_generation(minor).unwrap();
@@ -3044,7 +2976,8 @@ mod tests {
                 ..replacement
             }
         };
-        let recorded = std::collections::BTreeMap::from([(WORK_FILE.to_string(), recorded_identity)]);
+        let recorded =
+            std::collections::BTreeMap::from([(WORK_FILE.to_string(), recorded_identity)]);
         let refused = remove_work(&paths, Some(&dir_identity), &recorded);
         let survived = identity_at(&dir, WORK_FILE).unwrap();
         let own = std::collections::BTreeMap::from([(WORK_FILE.to_string(), replacement)]);
@@ -3059,7 +2992,11 @@ mod tests {
         eprintln!(
             "B4 evidence: work file replaced {} the inode number {}: birth time {}.{:09} != \
              journaled {}.{:09}; refused, left in place",
-            if reused { "reusing" } else { "(simulated reuse of)" },
+            if reused {
+                "reusing"
+            } else {
+                "(simulated reuse of)"
+            },
             replacement.st_ino,
             replacement.btime_sec,
             replacement.btime_nsec,
@@ -3095,7 +3032,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let (replacement, replacement_identity) = create_work_file(&dir).unwrap();
         drop(replacement);
-        assert_ne!(replacement_identity.generation(), original_identity.generation());
+        assert_ne!(
+            replacement_identity.generation(),
+            original_identity.generation()
+        );
         let unrecorded_file = remove_work(&paths, Some(&dir_identity), &empty);
         let file_survived = identity_at(&dir, WORK_FILE).unwrap();
         // The directory itself with no journaled generation, now empty.
@@ -3106,10 +3046,20 @@ mod tests {
         let _ = std::fs::remove_dir(paths.work_dir.parent().unwrap());
 
         let error = unrecorded_file.expect_err("an unrecorded work file was removed");
-        assert!(error.to_string().contains("no generation was journaled"), "{error}");
-        assert_eq!(file_survived, Some(replacement_identity), "the replacement survived");
+        assert!(
+            error.to_string().contains("no generation was journaled"),
+            "{error}"
+        );
+        assert_eq!(
+            file_survived,
+            Some(replacement_identity),
+            "the replacement survived"
+        );
         let error = unrecorded_dir.expect_err("an unrecorded work directory was removed");
-        assert!(error.to_string().contains("no generation was journaled"), "{error}");
+        assert!(
+            error.to_string().contains("no generation was journaled"),
+            "{error}"
+        );
         assert!(dir_survived);
         removed.unwrap();
         assert!(!paths.work_dir.exists());
@@ -3151,7 +3101,10 @@ mod tests {
         }
         drop(file);
         std::fs::remove_file(&backing).unwrap();
-        assert_eq!(retuned, journaled, "LOOP_SET_STATUS64 changed the generation");
+        assert_eq!(
+            retuned, journaled,
+            "LOOP_SET_STATUS64 changed the generation"
+        );
         assert_eq!(outcome, LoopOutcome::Detached);
         assert!(!left);
         eprintln!(

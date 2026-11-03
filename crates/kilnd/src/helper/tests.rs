@@ -1,3 +1,6 @@
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#![allow(clippy::disallowed_methods)]
 use super::protocol::*;
 use super::*;
 use std::os::fd::{AsRawFd, OwnedFd};

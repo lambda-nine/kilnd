@@ -122,6 +122,9 @@ struct SocketPathGuard {
 }
 
 impl SocketPathGuard {
+    // Approved (design 7.1): removes kilnd's own API socket at shutdown, only while it is still
+    // the socket inode this guard bound (compared under the socket-directory lock).
+    #[allow(clippy::disallowed_methods)]
     fn cleanup(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
@@ -297,6 +300,9 @@ async fn remove_stale_socket(path: &Path) -> Result<()> {
     remove_stale_socket_after_probe(path, || {}).await
 }
 
+// Approved (design 7.1): removes a stale API socket only after a refused connection and an
+// identity recheck under the socket-directory lock; a changed path is left alone.
+#[allow(clippy::disallowed_methods)]
 async fn remove_stale_socket_after_probe(
     path: &Path,
     after_refused_probe: impl FnOnce(),
@@ -516,6 +522,9 @@ async fn serve_with_final_wait<R: Runtime>(
 }
 
 #[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::manager::{CreateRequest, ExecRequest, Limits};

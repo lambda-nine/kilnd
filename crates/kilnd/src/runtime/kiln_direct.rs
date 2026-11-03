@@ -968,6 +968,9 @@ fn summarize(stderr: &[u8]) -> String {
 }
 
 #[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::super::kiln_process::tests::fixture;
     use super::*;

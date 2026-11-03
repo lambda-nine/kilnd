@@ -19,14 +19,6 @@ pub const FIRECRACKER_TREE: &str = "kilnd-firecracker";
 const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 /// Leaves and internal nodes below an allocation parent, parents before children.
 pub const NODES: [&str; 5] = ["control", "relay", "vm", "vm/vmm", "vm/console"];
-/// Control files a recipe may set, in the order they are written.
-const LIMIT_FILES: [&str; 5] = [
-    "memory.max",
-    "memory.swap.max",
-    "memory.oom.group",
-    "pids.max",
-    "cpu.max",
-];
 
 /// The inode numbers of a created tree and the boot it was created in. Kill and
 /// removal compare against these before acting, so a replaced directory is refused
@@ -106,15 +98,21 @@ fn open_root() -> io::Result<File> {
     Ok(root)
 }
 
+/// Opens a cgroup directory below `parent` without following links. Only directories:
+/// a control file is opened for writing only by [`write_control`], whose
+/// [`ControlFile`] cannot name `cgroup.kill`.
 #[cfg(target_os = "linux")]
-pub(super) fn open_at(parent: &File, name: &str, directory: bool) -> io::Result<File> {
+pub(super) fn open_dir(parent: &File, name: &str) -> io::Result<File> {
+    open_raw(
+        parent,
+        name,
+        libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn open_raw(parent: &File, name: &str, flags: libc::c_int) -> io::Result<File> {
     let name = std::ffi::CString::new(name).map_err(|_| invalid("cgroup name"))?;
-    let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
-    flags |= if directory {
-        libc::O_DIRECTORY | libc::O_RDONLY
-    } else {
-        libc::O_RDWR
-    };
     // SAFETY: name is NUL-terminated and the parent is a live directory.
     let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
     if fd < 0 {
@@ -132,7 +130,7 @@ pub fn open_node(relative: &str) -> io::Result<File> {
     }
     let mut current = open_root()?;
     for component in relative.split('/') {
-        current = open_at(&current, component, true)?;
+        current = open_dir(&current, component)?;
     }
     Ok(current)
 }
@@ -151,10 +149,50 @@ fn mkdir_at(parent: &File, name: &str) -> io::Result<bool> {
     Err(error)
 }
 
+/// The control files the helper writes. `cgroup.kill` is deliberately not one: its only
+/// writer is `proven::kill_cgroup_vm`, which takes a `ProvenCgroupVm` (design 7.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ControlFile {
+    SubtreeControl,
+    Procs,
+    MemoryMax,
+    MemorySwapMax,
+    MemoryOomGroup,
+    PidsMax,
+    CpuMax,
+}
+
+impl ControlFile {
+    /// The recipe's limit files, in the order they are written.
+    const LIMITS: [Self; 5] = [
+        Self::MemoryMax,
+        Self::MemorySwapMax,
+        Self::MemoryOomGroup,
+        Self::PidsMax,
+        Self::CpuMax,
+    ];
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::SubtreeControl => "cgroup.subtree_control",
+            Self::Procs => "cgroup.procs",
+            Self::MemoryMax => "memory.max",
+            Self::MemorySwapMax => "memory.swap.max",
+            Self::MemoryOomGroup => "memory.oom.group",
+            Self::PidsMax => "pids.max",
+            Self::CpuMax => "cpu.max",
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
-pub(super) fn write_control(node: &File, name: &str, value: &str) -> io::Result<()> {
+fn write_control(node: &File, control: ControlFile, value: &str) -> io::Result<()> {
     use std::io::Write;
-    let mut file = open_at(node, name, false)?;
+    let mut file = open_raw(
+        node,
+        control.name(),
+        libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    )?;
     file.write_all(value.as_bytes())
 }
 
@@ -194,7 +232,7 @@ fn delegate_controllers(node: &File, controllers: &[String]) -> io::Result<()> {
             .map(|c| format!("+{c}"))
             .collect::<Vec<_>>()
             .join(" ");
-        write_control(node, "cgroup.subtree_control", &value)?;
+        write_control(node, ControlFile::SubtreeControl, &value)?;
     }
     let enabled = read_control(node, "cgroup.subtree_control")?;
     for controller in controllers {
@@ -228,18 +266,18 @@ fn controllers(recipe: &Value) -> io::Result<Vec<String>> {
 }
 
 /// The fixed (file, value) pairs one recipe node sets, refusing any other key.
-fn limits(node: &Value) -> io::Result<Vec<(&'static str, String)>> {
+fn limits(node: &Value) -> io::Result<Vec<(ControlFile, String)>> {
     let object = node.as_object().ok_or_else(|| invalid("recipe node"))?;
     for key in object.keys() {
-        if !LIMIT_FILES.contains(&key.as_str())
+        if !ControlFile::LIMITS.iter().any(|file| file.name() == key)
             && !["inherit", "direct_tasks"].contains(&key.as_str())
         {
             return Err(invalid(format!("cgroup key {key} is outside the contract")));
         }
     }
     let mut out = Vec::new();
-    for file in LIMIT_FILES {
-        if let Some(value) = object.get(file) {
+    for file in ControlFile::LIMITS {
+        if let Some(value) = object.get(file.name()) {
             let text = match value {
                 Value::Number(n) => n.to_string(),
                 Value::String(s)
@@ -249,7 +287,7 @@ fn limits(node: &Value) -> io::Result<Vec<(&'static str, String)>> {
                 {
                     s.clone()
                 }
-                _ => return Err(invalid(format!("cgroup value for {file}"))),
+                _ => return Err(invalid(format!("cgroup value for {}", file.name()))),
             };
             out.push((file, text));
         }
@@ -277,7 +315,7 @@ pub fn create_tree(relative: &str, recipe: &Value) -> io::Result<CgroupIdentity>
                 "allocation cgroup already exists",
             ));
         }
-        node = open_at(&node, component, true)?;
+        node = open_dir(&node, component)?;
         delegate_controllers(&node, &wanted)?;
     }
     let parent = node;
@@ -287,13 +325,13 @@ pub fn create_tree(relative: &str, recipe: &Value) -> io::Result<CgroupIdentity>
     let mut inodes = std::collections::HashMap::new();
     for name in NODES {
         let (base, leaf) = match name.rsplit_once('/') {
-            Some((base, leaf)) => (open_at(&parent, base, true)?, leaf),
+            Some((base, leaf)) => (open_dir(&parent, base)?, leaf),
             None => (parent.try_clone()?, name),
         };
         if !mkdir_at(&base, leaf)? {
             return Err(io::Error::other(format!("cgroup {name} already exists")));
         }
-        let child = open_at(&base, leaf, true)?;
+        let child = open_dir(&base, leaf)?;
         if name == "vm" {
             delegate_controllers(&child, &wanted)?;
         }
@@ -323,7 +361,7 @@ pub fn join(relative_leaf: &str, expected_ino: u64) -> io::Result<()> {
         return Err(io::Error::other("cgroup leaf was replaced"));
     }
     // "0" names the writer itself.
-    write_control(&node, "cgroup.procs", "0")?;
+    write_control(&node, ControlFile::Procs, "0")?;
     let own = std::fs::read_to_string("/proc/self/cgroup")?;
     let expected = format!("0::/{relative_leaf}");
     if own.lines().next() != Some(expected.as_str()) {
@@ -512,6 +550,9 @@ pub fn inode(file: &File) -> io::Result<u64> {
 }
 
 #[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -532,18 +573,54 @@ mod tests {
         }
     }
 
+    fn named(limits: Vec<(ControlFile, String)>) -> Vec<(&'static str, String)> {
+        limits
+            .into_iter()
+            .map(|(file, value)| (file.name(), value))
+            .collect()
+    }
+
+    /// B4 recheck 4 finding 2: the generic writer cannot name `cgroup.kill`. Its
+    /// argument is a [`ControlFile`], and no variant is `cgroup.kill`.
+    #[test]
+    fn the_control_writer_cannot_name_cgroup_kill() {
+        for file in [
+            ControlFile::SubtreeControl,
+            ControlFile::Procs,
+            ControlFile::MemoryMax,
+            ControlFile::MemorySwapMax,
+            ControlFile::MemoryOomGroup,
+            ControlFile::PidsMax,
+            ControlFile::CpuMax,
+        ] {
+            // Exhaustive: a new variant fails to compile here until it is listed.
+            match file {
+                ControlFile::SubtreeControl
+                | ControlFile::Procs
+                | ControlFile::MemoryMax
+                | ControlFile::MemorySwapMax
+                | ControlFile::MemoryOomGroup
+                | ControlFile::PidsMax
+                | ControlFile::CpuMax => {}
+            }
+            assert_ne!(file.name(), "cgroup.kill");
+            assert!(!file.name().contains('/'));
+        }
+    }
+
     #[test]
     fn recipe_limits_accept_only_the_fixed_control_files() {
         let node =
             json!({"memory.max": 939524096, "cpu.max": "100000 100000", "direct_tasks": false});
         assert_eq!(
-            limits(&node).unwrap(),
+            named(limits(&node).unwrap()),
             vec![
                 ("memory.max", "939524096".to_string()),
                 ("cpu.max", "100000 100000".to_string())
             ]
         );
         assert!(limits(&json!({"cgroup.procs": "1"})).is_err());
+        assert!(limits(&json!({"cgroup.kill": "1"})).is_err());
         assert!(limits(&json!({"cpu.max": "1;rm"})).is_err());
         assert!(controllers(&json!({"controllers": ["memory", "pids", "cpu"]})).is_ok());
         assert!(controllers(&json!({"controllers": ["memory", "pids", "io"]})).is_err());
@@ -650,7 +727,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn sleeper_in(node: &std::path::Path) -> std::process::Child {
-        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         std::fs::write(node.join("cgroup.procs"), child.id().to_string()).unwrap();
         child
     }
@@ -675,7 +755,8 @@ mod tests {
         let mut foreign = sleeper_in(&base.join("vm/vmm"));
         let replaced_kill = kill_recorded(&relative, Some(&identity), Duration::from_secs(1));
         let replaced_remove = remove_tree(&relative, Some(&identity));
-        let replaced_survived = foreign.try_wait().unwrap().is_none() && base.join("vm/vmm").exists();
+        let replaced_survived =
+            foreign.try_wait().unwrap().is_none() && base.join("vm/vmm").exists();
         let _ = foreign.kill();
         let _ = foreign.wait();
         // An extra child below the journaled vm node, with our own vmm intact.
@@ -703,10 +784,19 @@ mod tests {
 
         assert_eq!(replaced_kill.unwrap(), NodeState::Replaced);
         assert_eq!(replaced_remove.unwrap(), NodeState::Replaced);
-        assert!(replaced_survived, "the replaced child or its process was touched");
+        assert!(
+            replaced_survived,
+            "the replaced child or its process was touched"
+        );
         assert_eq!(extra_kill.unwrap(), NodeState::Replaced);
-        assert!(!extra_empty, "a subtree with a foreign child is not proven empty");
-        assert!(extra_survived, "a process in an unexpected child was killed");
+        assert!(
+            !extra_empty,
+            "a subtree with a foreign child is not proven empty"
+        );
+        assert!(
+            extra_survived,
+            "a process in an unexpected child was killed"
+        );
         assert_eq!(own_kill.unwrap(), NodeState::Empty);
         assert!(!own_status.success());
         assert_eq!(own_remove.unwrap(), NodeState::Absent);
@@ -749,9 +839,7 @@ mod tests {
         assert!(process_survived, "an unrecorded tree was signaled");
         assert_eq!(remove.unwrap(), NodeState::Unknown);
         assert!(tree_survived, "an unrecorded tree was removed by its name");
-        eprintln!(
-            "B4 evidence: an unrecorded cgroup tree was Unknown: not signaled, not removed"
-        );
+        eprintln!("B4 evidence: an unrecorded cgroup tree was Unknown: not signaled, not removed");
     }
 
     #[test]
@@ -769,7 +857,7 @@ mod tests {
             limits(&recipe[node]).unwrap();
         }
         assert_eq!(
-            limits(&recipe["allocation"]).unwrap(),
+            named(limits(&recipe["allocation"]).unwrap()),
             vec![
                 ("memory.max", "939524096".to_string()),
                 ("memory.swap.max", "0".to_string()),

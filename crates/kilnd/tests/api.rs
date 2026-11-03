@@ -1,4 +1,7 @@
 //! The whole gRPC API over a real Unix socket, with the fake backend.
+// Approved (design 7.1): test fixtures, an integration-test crate. They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#![allow(clippy::disallowed_methods)]
 
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};

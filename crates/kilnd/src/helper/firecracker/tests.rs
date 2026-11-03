@@ -3,6 +3,9 @@
 //! parts are only the resources S creates and the catalog this file injects; stalls
 //! are real blocked or stopped processes. Nothing here launches a VM.
 #![allow(clippy::type_complexity)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#![allow(clippy::disallowed_methods)]
 use super::config::{DEFAULT_MAX_ENROLLED, NodeCeilings, ProfileCatalog, SharedReserve};
 use super::executable::tests::{all_pins, fixture_bytes, pin_of};
 use super::executable::{self, Role, WalkPolicy};

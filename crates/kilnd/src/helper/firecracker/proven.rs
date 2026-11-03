@@ -28,6 +28,9 @@
 //! `no_destructive_call_outside_the_gate` fails if any other helper source makes one of
 //! these calls outside its allow-list.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Approved (design 7.1): the destructive-action gate itself. Every raw signal,
+// cgroup.kill, unlink, rmdir, unmount and LOOP_CLR_FD sits behind a proof type here.
+#![allow(clippy::disallowed_methods)]
 use super::workers::ProcessId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -399,8 +402,7 @@ mod linux {
     fn rmdir_at(parent: &File, name: &CString) -> io::Result<()> {
         // SAFETY: a NUL-terminated name below a live directory descriptor;
         // AT_REMOVEDIR removes only an empty directory or cgroup.
-        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0
-        {
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -449,7 +451,7 @@ mod linux {
                     "unexpected cgroup {path} in the recorded tree"
                 )));
             }
-            let child = match cgroup::open_at(node, &name, true) {
+            let child = match cgroup::open_dir(node, &name) {
                 Ok(child) => child,
                 Err(error) if not_found(&error) => continue,
                 Err(error) => return Err(unknown(format!("open cgroup {path}: {error}"))),
@@ -498,7 +500,7 @@ mod linux {
             Err(error) if not_found(&error) => return Err(Unprovable::Gone),
             Err(error) => return Err(unknown(format!("open cgroup {base}: {error}"))),
         };
-        let parent = match cgroup::open_at(&instance, leaf, true) {
+        let parent = match cgroup::open_dir(&instance, leaf) {
             Ok(node) => node,
             Err(error) if not_found(&error) => return Err(Unprovable::Gone),
             Err(error) => return Err(unknown(format!("open cgroup {relative}: {error}"))),
@@ -518,7 +520,12 @@ mod linux {
                 identity.parent_ino
             )));
         }
-        Ok((instance, cstr(leaf).map_err(io_unknown("name"))?, parent, identity))
+        Ok((
+            instance,
+            cstr(leaf).map_err(io_unknown("name"))?,
+            parent,
+            identity,
+        ))
     }
 
     /// The journaled `vm` subtree, proven: this boot, the allocation parent and `vm`
@@ -534,7 +541,7 @@ mod linux {
         identity: Option<&CgroupIdentity>,
     ) -> Result<ProvenCgroupVm, Unprovable> {
         let (_, _, parent, identity) = open_recorded_parent(relative, identity)?;
-        let vm = match cgroup::open_at(&parent, "vm", true) {
+        let vm = match cgroup::open_dir(&parent, "vm") {
             Ok(vm) => vm,
             Err(error) if not_found(&error) => return Err(Unprovable::Gone),
             Err(error) => return Err(unknown(format!("open cgroup vm: {error}"))),
@@ -558,6 +565,27 @@ mod linux {
         cgroup::populated(&proof.vm)
     }
 
+    /// The one `cgroup.kill` write in the helper, on the `vm` descriptor a
+    /// [`ProvenCgroupVm`] holds. Private: only [`kill_cgroup_vm`] reaches it.
+    fn write_cgroup_kill(vm: &File) -> io::Result<()> {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        // SAFETY: a NUL-terminated name relative to the live `vm` directory descriptor.
+        let fd = unsafe {
+            libc::openat(
+                vm.as_raw_fd(),
+                c"cgroup.kill".as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(b"1")
+    }
+
     /// `cgroup.kill` through the proven `vm` descriptor, after re-listing its children
     /// immediately before, then a bounded wait for populated=0. A replacement child
     /// found by that last check is Replaced and nothing is signaled.
@@ -570,7 +598,7 @@ mod linux {
             Err(Unprovable::Replaced(_)) => return Ok(NodeState::Replaced),
             Err(other) => return Err(other.refusal("the vm subtree")),
         }
-        cgroup::write_control(&proof.vm, "cgroup.kill", "1")?;
+        write_cgroup_kill(&proof.vm)?;
         let end = std::time::Instant::now() + wait;
         loop {
             if !cgroup::populated(&proof.vm)? {
@@ -629,7 +657,7 @@ mod linux {
             return Ok(NodeState::Populated);
         }
         let check_and_remove = |base: &File, name: &str, path: &str| -> io::Result<bool> {
-            let node = match cgroup::open_at(base, name, true) {
+            let node = match cgroup::open_dir(base, name) {
                 Ok(node) => node,
                 Err(error) if not_found(&error) => return Ok(true),
                 Err(error) => return Err(error),
@@ -665,7 +693,7 @@ mod linux {
         } = proof;
         drop((parent, vm));
         let leaf_name = leaf.to_str().map_err(io::Error::other)?;
-        match cgroup::open_at(&instance, leaf_name, true) {
+        match cgroup::open_dir(&instance, leaf_name) {
             Ok(node) => {
                 if node.metadata()?.ino() != identity.parent_ino {
                     return Ok(NodeState::Replaced);
@@ -707,8 +735,7 @@ mod linux {
             ))
         })?;
         let stat = storage::stat_at(dir, name).map_err(io_unknown(name))?;
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 || stat.st_uid != 0
-        {
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 || stat.st_uid != 0 {
             return Err(Unprovable::Replaced(format!("{name} is not an owned file")));
         }
         if seen.generation() != recorded.generation() {
@@ -774,7 +801,10 @@ mod linux {
             Ok(dir) => dir,
             Err(error) if not_found(&error) => return Err(Unprovable::Gone),
             Err(error)
-                if matches!(error.raw_os_error(), Some(libc::ENOTDIR) | Some(libc::ELOOP)) =>
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOTDIR) | Some(libc::ELOOP)
+                ) =>
             {
                 return Err(Unprovable::Replaced(format!("{name} is not a directory")));
             }
@@ -913,8 +943,7 @@ mod linux {
             storage::SlotMatch::Exact => {}
         }
         if before != generation.diskseq
-            || storage::diskseq(&device).map_err(io_unknown("BLKGETDISKSEQ"))?
-                != generation.diskseq
+            || storage::diskseq(&device).map_err(io_unknown("BLKGETDISKSEQ"))? != generation.diskseq
         {
             return Err(Unprovable::Replaced(format!(
                 "loop{} is another attachment of the same tuple",
@@ -1037,109 +1066,436 @@ mod tests {
         }));
     }
 
-    /// Section 7.1's inventory, enforced: no helper source other than this module makes
-    /// a destructive system call, apart from the justified allow-list below. Test
-    /// fixtures (the `tests` modules and files) are excluded.
+    /// Removes `//` comments and every whitespace character, so an expression matches
+    /// however rustfmt wraps it. Needles and allowed expressions go through it too.
+    fn squash(text: &str) -> String {
+        text.lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// A file's production text: everything before its `#[cfg(test)]` test module.
+    fn production_part(text: &str) -> &str {
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let mut offset = 0;
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() == "#[cfg(test)]" {
+                let next = lines[index + 1..]
+                    .iter()
+                    .map(|l| l.trim())
+                    .find(|l| !l.starts_with("//") && !l.starts_with("#["));
+                if next.is_some_and(|l| {
+                    l.starts_with("mod tests") || l.starts_with("pub(super) mod tests")
+                }) {
+                    return &text[..offset];
+                }
+            }
+            offset += line.len();
+        }
+        text
+    }
+
+    fn rust_files(root: &std::path::Path, skip_test_files: bool) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if !(skip_test_files && name == "tests") && name != "fixtures" {
+                        stack.push(path);
+                    }
+                } else if name.ends_with(".rs") && !(skip_test_files && name == "tests.rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Section 7.1's inventory, as defense in depth behind the clippy gate: no helper
+    /// source other than this module and `crate::sys` names a destructive capability,
+    /// and `crate::sys` names only its two signal-0 probes. Matching is over whole
+    /// expressions with comments and whitespace removed, so an allowed expression never
+    /// hides another one next to it, and a function taken as a value (an alias) matches
+    /// as well as a call. Test fixtures (the `tests` modules and files) are excluded.
     #[test]
     fn no_destructive_call_outside_the_gate() {
-        const NEEDLES: [&str; 18] = [
-            "libc::kill(",
-            "libc::killpg(",
-            "libc::tgkill(",
+        const DESTRUCTIVE: [&str; 29] = [
+            "libc::kill",
+            "libc::killpg",
+            "libc::tgkill",
             "SYS_pidfd_send_signal",
             "SYS_kill",
             "SYS_tgkill",
             "cgroup.kill",
             "AT_REMOVEDIR",
-            "libc::rmdir(",
-            "libc::unlink(",
-            "unlinkat(",
-            "remove_dir(",
-            "remove_dir_all(",
-            "remove_file(",
+            "libc::rmdir",
+            "libc::unlink",
+            "unlinkat",
+            "fs::remove_dir",
+            "fs::remove_file",
+            "fs::rename",
+            "libc::rename",
+            "renameat",
             "umount",
+            "libc::unmount",
             "LOOP_CLR_FD",
-            ".kill()",
             "MNT_DETACH",
+            ".kill(",
+            "start_kill",
+            "Command::new",
+            "libc::exec",
+            "posix_spawn",
+            "libc::system",
+            "extern\"",
+            "asm!",
+            "dlsym",
         ];
-        // (file, line fragment, justification). Each must match exactly one line.
-        const ALLOWED: [(&str, &str, &str); 3] = [
+        const RAW: [&str; 2] = ["libc::syscall", "libc::ioctl"];
+        // (file, whole expression, justification). Each must occur exactly once.
+        const ALLOWED: [(&str, &str, &str); 2] = [
             (
-                "firecracker/executable.rs",
-                "libc::unlinkat(directory.file().as_raw_fd(), temporary.as_ptr(), 0)",
-                "the helper's own temporary copy name in the root-only executable store, \
-                 created O_EXCL by the same function: never tenant-reachable or replaced",
-            ),
-            (
-                "firecracker/peer.rs",
-                "libc::SYS_pidfd_send_signal,",
+                "sys.rs",
+                "libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    0,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )",
                 "signal 0 through a pidfd: a liveness probe, not a signal",
             ),
             (
-                "firecracker/workers.rs",
+                "sys.rs",
                 "libc::kill(pid, 0)",
                 "signal 0 on macOS: an existence probe, not a signal",
             ),
         ];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/helper");
-        let mut files = Vec::new();
-        let mut stack = vec![root.clone()];
-        while let Some(directory) = stack.pop() {
-            for entry in std::fs::read_dir(&directory).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    if path.file_name().is_some_and(|n| n != "tests") {
-                        stack.push(path);
-                    }
-                } else if path.extension().is_some_and(|e| e == "rs")
-                    && path.file_name().is_some_and(|n| n != "tests.rs")
-                {
-                    files.push(path);
-                }
-            }
-        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<_> = rust_files(&src.join("helper"), true);
+        files.push(src.join("sys.rs"));
         assert!(files.len() > 15, "the helper sources were not found");
         let mut offenders = Vec::new();
-        let mut allowed_hits = vec![0; ALLOWED.len()];
+        let mut allowed_hits = [0; ALLOWED.len()];
         for path in files {
             let relative = path
-                .strip_prefix(&root)
+                .strip_prefix(&src)
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            if relative == "firecracker/proven.rs" {
+            if relative == "helper/firecracker/proven.rs" {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            // A file's unit tests are fixtures: everything from its test module on.
-            let production = match text.find("#[cfg(test)]\nmod tests") {
-                Some(at) => &text[..at],
-                None => &text[..],
-            };
-            for (number, line) in production.lines().enumerate() {
-                let code = line.split("//").next().unwrap_or("");
-                if !NEEDLES.iter().any(|needle| code.contains(needle)) {
-                    continue;
+            let mut code = squash(production_part(&text));
+            for (index, (file, expression, _)) in ALLOWED.iter().enumerate() {
+                if relative == *file {
+                    let expression = squash(expression);
+                    allowed_hits[index] += code.matches(&expression).count();
+                    code = code.replace(&expression, " ");
                 }
-                match ALLOWED
-                    .iter()
-                    .position(|(file, fragment, _)| relative == *file && code.contains(fragment))
-                {
-                    Some(index) => allowed_hits[index] += 1,
-                    None => offenders.push(format!("{relative}:{}: {}", number + 1, line.trim())),
+            }
+            let raw_allowed = relative == "sys.rs";
+            for needle in DESTRUCTIVE
+                .iter()
+                .chain(RAW.iter().filter(|_| !raw_allowed))
+            {
+                let needle = squash(needle);
+                for (at, _) in code.match_indices(&needle) {
+                    let start = code[..at]
+                        .char_indices()
+                        .rev()
+                        .nth(40)
+                        .map_or(0, |(i, _)| i);
+                    let end = code[at..]
+                        .char_indices()
+                        .nth(60)
+                        .map_or(code.len(), |(i, _)| at + i);
+                    offenders.push(format!("{relative}: `{needle}` in …{}…", &code[start..end]));
                 }
             }
         }
         assert!(
             offenders.is_empty(),
-            "destructive calls outside proven.rs:\n{}",
+            "destructive or raw calls outside proven.rs:\n{}",
             offenders.join("\n")
         );
-        for (index, (file, fragment, _)) in ALLOWED.iter().enumerate() {
+        for (index, (file, expression, _)) in ALLOWED.iter().enumerate() {
             assert_eq!(
                 allowed_hits[index], 1,
-                "the allow-listed {file} `{fragment}` must match exactly one line"
+                "the allow-listed {file} `{expression}` must occur exactly once"
             );
         }
+    }
+
+    /// B4 recheck 4 finding 2: `clippy::disallowed_methods` is the semantic gate (CI runs
+    /// clippy with `-D warnings`). This polices its exceptions: an `allow` or `expect` of
+    /// that lint, of `disallowed_types`, or of a group or level that would silence it
+    /// (`clippy::style`, `clippy::all`, `warnings`) may appear only on the approved items
+    /// below or on a `#[cfg(test)]` test module or test-only file, and each one needs an
+    /// `// Approved (design 7.1):` justification immediately above it. No manifest or
+    /// cargo config may lower the lint, and `clippy.toml` must still list every capability.
+    #[test]
+    fn disallowed_allows_only_in_approved_modules() {
+        const INNER: &str = "<the whole module>";
+        // (file under crates/kilnd, item the allow is on, why).
+        const APPROVED: [(&str, &str, &str); 8] = [
+            (
+                "src/helper/firecracker/proven.rs",
+                INNER,
+                "the destructive-action gate",
+            ),
+            ("src/sys.rs", INNER, "the typed syscall and ioctl wrappers"),
+            (
+                "src/process.rs",
+                "pub async fn run(",
+                "the generic subprocess runner",
+            ),
+            (
+                "src/runtime/kiln_process.rs",
+                "pub async fn probe(",
+                "the kiln probe",
+            ),
+            ("src/runtime/kiln_process.rs", "pub fn spawn(", "kiln exec"),
+            (
+                "src/runtime/kiln_process.rs",
+                "pub async fn kill_reap(",
+                "its own child",
+            ),
+            (
+                "src/server.rs",
+                "fn cleanup(&mut self)",
+                "the owned API socket",
+            ),
+            (
+                "src/server.rs",
+                "async fn remove_stale_socket_after_probe(",
+                "a stale API socket",
+            ),
+        ];
+        const SILENCERS: [&str; 5] = [
+            "clippy::disallowed_methods",
+            "clippy::disallowed_types",
+            "clippy::style",
+            "clippy::all",
+            "warnings",
+        ];
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let workspace = crates.join("..");
+        let mut hits = [0; APPROVED.len()];
+        let mut offenders = Vec::new();
+        let mut checked = 0;
+        for krate in std::fs::read_dir(&crates).unwrap() {
+            let krate = krate.unwrap().path();
+            for path in rust_files(&krate, false) {
+                let relative = path
+                    .strip_prefix(&krate)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let crate_name = krate.file_name().unwrap().to_string_lossy().into_owned();
+                let text = std::fs::read_to_string(&path).unwrap();
+                let lines: Vec<&str> = text.lines().collect();
+                checked += 1;
+                let mut index = 0;
+                while index < lines.len() {
+                    let line = lines[index].trim_start();
+                    if !(line.starts_with("#[") || line.starts_with("#![")) {
+                        index += 1;
+                        continue;
+                    }
+                    // The whole attribute, across lines, to its matching bracket.
+                    let first = index;
+                    let mut attribute = String::new();
+                    let mut depth = 0i32;
+                    loop {
+                        for c in lines[index].chars() {
+                            attribute.push(c);
+                            match c {
+                                '[' | '(' => depth += 1,
+                                ']' | ')' => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        index += 1;
+                        if depth <= 0 || index >= lines.len() {
+                            break;
+                        }
+                    }
+                    let squashed = squash(&attribute);
+                    let lowers = squashed.contains("allow(") || squashed.contains("expect(");
+                    if !lowers || !SILENCERS.iter().any(|s| squashed.contains(s)) {
+                        continue;
+                    }
+                    let place = format!("{crate_name}/{relative}:{}", first + 1);
+                    let justified = lines[..first]
+                        .iter()
+                        .rev()
+                        .take_while(|l| l.trim_start().starts_with("//"))
+                        .any(|l| l.trim_start().starts_with("// Approved (design 7.1):"));
+                    if !justified {
+                        offenders.push(format!("{place}: no `// Approved (design 7.1):` comment"));
+                    }
+                    let inner = line.starts_with("#![");
+                    let item = lines[index..]
+                        .iter()
+                        .map(|l| l.trim())
+                        .find(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#["))
+                        .unwrap_or("");
+                    let before: Vec<&str> = lines[..first]
+                        .iter()
+                        .rev()
+                        .map(|l| l.trim())
+                        .take_while(|l| l.starts_with("//") || l.starts_with("#["))
+                        .collect();
+                    let test_module = !inner
+                        && before.contains(&"#[cfg(test)]")
+                        && (item.starts_with("mod tests ")
+                            || item.starts_with("pub(super) mod tests "));
+                    let test_file = inner
+                        && (relative.starts_with("tests/")
+                            || (relative.ends_with("/tests.rs")
+                                && declared_for_tests(&krate, &relative)));
+                    if crate_name == "kilnd"
+                        && let Some(at) = APPROVED.iter().position(|(file, approved, _)| {
+                            *file == relative
+                                && if inner {
+                                    *approved == INNER
+                                } else {
+                                    item.starts_with(approved)
+                                }
+                        })
+                    {
+                        hits[at] += 1;
+                    } else if !(test_module || test_file) {
+                        offenders.push(format!(
+                            "{place}: `{}` on `{item}` is not approved",
+                            attribute.trim()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(checked > 40, "the workspace sources were not found");
+        assert!(
+            offenders.is_empty(),
+            "unapproved lint exceptions:\n{}",
+            offenders.join("\n")
+        );
+        for (index, (file, item, _)) in APPROVED.iter().enumerate() {
+            assert_eq!(
+                hits[index], 1,
+                "the approved allow on {file} `{item}` must occur exactly once"
+            );
+        }
+        // Nothing outside the sources may lower the lint.
+        let mut manifests = vec![workspace.join("Cargo.toml")];
+        for krate in std::fs::read_dir(&crates).unwrap() {
+            manifests.push(krate.unwrap().path().join("Cargo.toml"));
+        }
+        for manifest in manifests {
+            let text = std::fs::read_to_string(&manifest).unwrap_or_default();
+            assert!(
+                !text.contains("[lints"),
+                "{} has a [lints] table",
+                manifest.display()
+            );
+        }
+        for config in [".cargo/config", ".cargo/config.toml"] {
+            assert!(
+                !workspace.join(config).exists(),
+                "{config} could pass lint flags"
+            );
+        }
+        let clippy = std::fs::read_to_string(workspace.join("clippy.toml")).unwrap();
+        for path in [
+            "libc::kill",
+            "libc::killpg",
+            "libc::tgkill",
+            "libc::pidfd_send_signal",
+            "libc::syscall",
+            "libc::unlink",
+            "libc::unlinkat",
+            "libc::rmdir",
+            "libc::umount2",
+            "libc::rename",
+            "libc::renameat",
+            "libc::renameat2",
+            "libc::ioctl",
+            "std::fs::remove_file",
+            "std::fs::remove_dir",
+            "std::fs::remove_dir_all",
+            "std::fs::rename",
+            "std::process::Command::new",
+            "tokio::process::Command::new",
+            "std::process::Child::kill",
+            "tokio::process::Child::start_kill",
+        ] {
+            assert!(
+                clippy.contains(&format!("path = \"{path}\"")),
+                "clippy.toml no longer disallows {path}"
+            );
+        }
+    }
+
+    /// Clippy's gate sees only paths it can resolve. A local `extern` block, inline
+    /// assembly or a dynamic symbol lookup would reach a destructive call under another
+    /// name, so none may appear anywhere in the workspace, tests included.
+    #[test]
+    fn no_foreign_declarations_or_inline_assembly() {
+        // Squashed forms; the `|` keeps this list from matching itself and is removed.
+        const FORBIDDEN: [&str; 9] = [
+            "extern|\"C\"{",
+            "extern|\"system\"{",
+            "extern|{",
+            "asm|!(",
+            "global_asm|!(",
+            "naked_asm|!(",
+            "#[link|(",
+            "link|_name",
+            "dlsym|(",
+        ];
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut offenders = Vec::new();
+        for krate in std::fs::read_dir(&crates).unwrap() {
+            for path in rust_files(&krate.unwrap().path(), false) {
+                let code = squash(&std::fs::read_to_string(&path).unwrap());
+                for needle in FORBIDDEN {
+                    let needle = needle.replace('|', "");
+                    if code.contains(&needle) {
+                        offenders.push(format!("{}: {needle}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "foreign declarations:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Whether `relative` (a `.../tests.rs`) is declared `#[cfg(test)] mod tests;` by its
+    /// parent module, so it compiles only for tests.
+    fn declared_for_tests(krate: &std::path::Path, relative: &str) -> bool {
+        let directory = std::path::Path::new(relative).parent().unwrap();
+        let candidates = [
+            krate.join(directory).join("mod.rs"),
+            krate.join(directory.with_extension("rs")),
+        ];
+        candidates.iter().any(|parent| {
+            std::fs::read_to_string(parent).is_ok_and(|text| {
+                let lines: Vec<&str> = text.lines().map(str::trim).collect();
+                lines.windows(2).any(|pair| {
+                    pair[0] == "#[cfg(test)]"
+                        && (pair[1] == "mod tests;" || pair[1].ends_with(" mod tests;"))
+                })
+            })
+        })
     }
 }

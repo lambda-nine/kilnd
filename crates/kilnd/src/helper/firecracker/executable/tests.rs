@@ -1,6 +1,9 @@
 //! Exit 5: the KR-05 matrix over real files and descriptors. Every case compares the
 //! tuple a descriptor actually names with the plan's tuple, never argv or a past hash.
 //! Linux root tests below run the real `execveat` chain and read `/proc/<pid>/exe`.
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#![allow(clippy::disallowed_methods)]
 use super::*;
 use crate::model::Digest;
 use std::io::Read as _;
@@ -598,6 +601,236 @@ fn exit5_publishing_never_replaces_and_a_lease_holder_keeps_its_exact_object() {
     );
     assert_eq!(std::fs::metadata(&object).unwrap().ino(), before);
     assert_eq!(std::fs::metadata(&object).unwrap().mode() & 0o7777, 0o555);
+}
+
+/// Where `publish_object` is between its checks and its link, for the regression below.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PublishStage {
+    /// Copied, hashed, made 0555 and fsynced; not yet linked.
+    Copied,
+    /// Linked at the approved name; not yet re-read.
+    Linked,
+}
+
+#[cfg(target_os = "linux")]
+type PublishHook = Box<dyn FnMut(PublishStage)>;
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// Per thread, so a test's hook never fires in another test's publish.
+    static PUBLISH_HOOK: std::cell::RefCell<Option<PublishHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn publish_gate(stage: PublishStage) {
+    PUBLISH_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(stage);
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn with_publish_hook<T>(hook: PublishHook, body: impl FnOnce() -> T) -> T {
+    PUBLISH_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+    let result = body();
+    PUBLISH_HOOK.with(|slot| *slot.borrow_mut() = None);
+    result
+}
+
+/// A static-ELF pin no other test or install uses: the jailer fixture plus 16 random
+/// bytes, so its digest directory is new.
+#[cfg(target_os = "linux")]
+fn unique_pin() -> (Vec<u8>, ExecutablePin) {
+    let mut bytes = fixture_bytes(Role::Jailer);
+    let mut random = [0u8; 16];
+    File::open("/dev/urandom")
+        .unwrap()
+        .read_exact(&mut random)
+        .unwrap();
+    bytes.extend_from_slice(&random);
+    let pin = ExecutablePin {
+        role: Role::Jailer,
+        bytes: bytes.len() as u64,
+        sha256: Digest::of(&bytes),
+        installation_generation: 1,
+    };
+    (bytes, pin)
+}
+
+/// A source that blocks until `actor` has run: the copy is in progress, holding the
+/// unnamed descriptor, while the actor acts as the root replacement actor would.
+#[cfg(target_os = "linux")]
+fn publish_while(
+    policy: &WalkPolicy,
+    store: &Path,
+    bytes: Vec<u8>,
+    pin: &ExecutablePin,
+    actor: impl FnOnce(&Path) + Send + 'static,
+) -> Result<(), ExecutableError> {
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd;
+    let digest_dir = store.join(pin.sha256.to_string());
+    let mut pipe = [-1; 2];
+    // SAFETY: pipe points to two writable descriptor slots.
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    // SAFETY: pipe2 returned two new descriptors, each transferred exactly once.
+    let source = unsafe { File::from_raw_fd(pipe[0]) };
+    let mut writer = unsafe { File::from_raw_fd(pipe[1]) };
+    let thread = std::thread::spawn(move || {
+        // Wait for the unnamed copy: an open `O_TMPFILE` descriptor in the directory.
+        let prefix = format!("{}/#", digest_dir.display());
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let unnamed = std::fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
+                std::fs::read_link(entry.unwrap().path()).is_ok_and(|target| {
+                    let target = target.to_string_lossy();
+                    target.starts_with(&prefix) && target.ends_with(" (deleted)")
+                })
+            });
+            if unnamed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "the unnamed copy never appeared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        actor(&digest_dir);
+        writer.write_all(&bytes).unwrap();
+    });
+    let result = publish_object(policy, store, &source, pin);
+    thread.join().unwrap();
+    result
+}
+
+/// B4 recheck 4 finding 1, the PoC as a regression. The copy has no name while it is
+/// checked, so the replacement actor has nothing to replace: names planted next to it
+/// during the copy (the old `.jailer.tmp` among them) are neither published nor
+/// deleted, and the approved name gets exactly the original bytes. A collision on the
+/// approved name fails closed and leaves its occupant, and a name replaced after the
+/// link fails the re-read and is left as it is.
+#[cfg(target_os = "linux")]
+fn no_temporary_name_is_published_or_deleted(policy: &WalkPolicy, store: &Path) {
+    let replacement = b"root replacement".to_vec();
+    const PLANTED: [&str; 4] = [".jailer.tmp", ".jailer.tmp.0", "jailer.tmp", "#0"];
+
+    // 1. Planted temporary names: published with the original bytes, planted names kept.
+    let (approved, pin) = unique_pin();
+    let digest_dir = store.join(pin.sha256.to_string());
+    let planted = replacement.clone();
+    publish_while(policy, store, approved.clone(), &pin, move |dir| {
+        for name in PLANTED {
+            std::fs::write(dir.join(name), &planted).unwrap();
+        }
+    })
+    .unwrap();
+    assert_eq!(std::fs::read(digest_dir.join("jailer")).unwrap(), approved);
+    for name in PLANTED {
+        assert_eq!(
+            std::fs::read(digest_dir.join(name)).unwrap(),
+            replacement,
+            "{name} was touched"
+        );
+    }
+    let meta = std::fs::symlink_metadata(digest_dir.join("jailer")).unwrap();
+    assert_eq!((meta.nlink(), meta.mode() & 0o7777), (1, 0o555));
+    ExecutableTable::open(policy.clone(), store, &[pin]).unwrap();
+
+    // 2. The approved name taken during the copy: refused, occupant untouched.
+    let (approved, pin) = unique_pin();
+    let digest_dir = store.join(pin.sha256.to_string());
+    let occupant = replacement.clone();
+    let error = publish_while(policy, store, approved, &pin, move |dir| {
+        std::fs::write(dir.join("jailer"), &occupant).unwrap();
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("publish"), "{error}");
+    assert_eq!(
+        std::fs::read(digest_dir.join("jailer")).unwrap(),
+        replacement
+    );
+
+    // 3. The approved name replaced between the link and its re-read: refused, and the
+    // replacement is left in place, not unlinked.
+    let (approved, pin) = unique_pin();
+    let digest_dir = store.join(pin.sha256.to_string());
+    let swap = replacement.clone();
+    let hook_dir = digest_dir.clone();
+    let error = with_publish_hook(
+        Box::new(move |stage| {
+            if stage == PublishStage::Linked {
+                std::fs::write(hook_dir.join("swap"), &swap).unwrap();
+                std::fs::rename(hook_dir.join("swap"), hook_dir.join("jailer")).unwrap();
+            }
+        }),
+        || publish_while(policy, store, approved, &pin, |_| {}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("not the held copy"), "{error}");
+    assert_eq!(
+        std::fs::read(digest_dir.join("jailer")).unwrap(),
+        replacement
+    );
+    eprintln!(
+        "PASS: no temporary name exists to replace; planted names were neither published \
+         nor deleted, a taken approved name was refused, and a post-link swap failed closed"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn executable_publish_has_no_temporary_name_to_replace() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let policy = WalkPolicy::test_rooted(&root);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = root.join("exec/sha256");
+    std::fs::create_dir_all(&store).unwrap();
+    for directory in [root.join("exec"), store.clone()] {
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    no_temporary_name_is_published_or_deleted(&policy, &store);
+}
+
+/// The same regression as root, from `/` with the production policy and the helper's
+/// bounding set (no `CAP_DAC_READ_SEARCH`), in the real store.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs root: run scripts/b4-vm-tests.sh"]
+fn b4_linux_root_executable_publish_has_no_temporary_name_to_replace() {
+    let store = Path::new("/opt/kilnd/exec/sha256");
+    for (directory, mode) in [
+        ("/opt/kilnd", 0o755),
+        ("/opt/kilnd/exec", 0o700),
+        ("/opt/kilnd/exec/sha256", 0o700),
+    ] {
+        match std::fs::create_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("{directory}: {error}"),
+        }
+        std::os::unix::fs::chown(directory, Some(0), Some(0)).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let before: Vec<_> = std::fs::read_dir(store)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    no_temporary_name_is_published_or_deleted(&WalkPolicy::production(), store);
+    // This test's digest directories only; the B4 cleanup removes the store itself.
+    for entry in std::fs::read_dir(store).unwrap() {
+        let entry = entry.unwrap();
+        if !before.contains(&entry.file_name()) {
+            std::fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
 }
 
 fn golden_record() -> serde_json::Value {

@@ -514,13 +514,7 @@ mod linux {
     }
 
     pub fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
-        // SAFETY: pidfd_open takes a PID and flags.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a new owned descriptor.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+        crate::sys::pidfd_open(pid)
     }
 
     /// Whether the pinned process has exited (its pidfd is readable).
@@ -1531,9 +1525,7 @@ mod linux {
         if let Some(vmm) = recorded.vmm
             && !proven::process_gone(&vmm)
         {
-            return Err(Abort::Refused(
-                "the recorded VMM is not proven gone".into(),
-            ));
+            return Err(Abort::Refused("the recorded VMM is not proven gone".into()));
         }
         link.step("cleanup_unmount")?;
         storage::unmount_jail(

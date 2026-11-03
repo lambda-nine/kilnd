@@ -11,6 +11,9 @@ pub mod runtime;
 pub mod server;
 pub mod service;
 pub mod store;
+/// Typed system-call and ioctl wrappers: the only non-gate users of `libc::syscall`
+/// and `libc::ioctl` (design section 7.1).
+pub mod sys;
 mod validation;
 
 mod lock;

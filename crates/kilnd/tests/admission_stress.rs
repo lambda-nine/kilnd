@@ -1,6 +1,8 @@
 //! Opt-in Linux resource regressions for Chapters 9 and 12. Parent tests drive
 //! dedicated child harnesses so `/proc` measurements stay isolated.
-
+// Approved (design 7.1): test fixtures, an integration-test crate. They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt;

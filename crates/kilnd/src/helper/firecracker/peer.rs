@@ -270,26 +270,11 @@ mod platform {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     fn open_pidfd(pid: i32) -> io::Result<OwnedFd> {
-        // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the kernel returned a new descriptor that nothing else owns.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+        crate::sys::pidfd_open(pid)
     }
 
     pub(super) fn pidfd_alive(fd: RawFd) -> bool {
-        // SAFETY: signal 0 only checks existence, and the null info pointer is allowed.
-        unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                fd,
-                0,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            ) == 0
-        }
+        crate::sys::pidfd_alive(fd)
     }
 
     impl ProcessView {
@@ -643,6 +628,9 @@ impl PeerPin {
 }
 
 #[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build, signal,
+// unmount and remove their own scratch resources and replacements directly.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
