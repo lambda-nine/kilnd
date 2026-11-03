@@ -246,20 +246,7 @@ async fn run(args: Args) -> Result<()> {
 
     // The backend is settled before anything is opened: a refused test deployment
     // touches no state.
-    let deployment = match (args.backend, &args.firecracker_test_deployment) {
-        (Backend::Kiln, None) => None,
-        (Backend::Kiln, Some(_)) => {
-            bail!("--firecracker-test-deployment needs --backend firecracker")
-        }
-        (Backend::Firecracker, None) => bail!(
-            "--backend firecracker runs only as the isolated test deployment until B7: pass --firecracker-test-deployment"
-        ),
-        (Backend::Firecracker, Some(path)) => {
-            let deployment = kilnd::test_deployment::TestDeployment::read(path)?;
-            deployment.check_daemon(&args.socket, &args.state_dir, &args.helper_socket)?;
-            Some(deployment)
-        }
-    };
+    let deployment = selected_deployment(&args)?;
 
     // Store::open takes the state-directory lock before opening SQLite. Bind
     // then takes the socket-directory lock and reserves the endpoint. Both
@@ -288,6 +275,24 @@ async fn run(args: Args) -> Result<()> {
                 identity.database_uuid,
             );
             serve_with(args, store, socket, runtime, limits).await
+        }
+    }
+}
+
+/// Kiln, or until B7 the isolated Firecracker test deployment and nothing else.
+fn selected_deployment(args: &Args) -> Result<Option<kilnd::test_deployment::TestDeployment>> {
+    match (args.backend, &args.firecracker_test_deployment) {
+        (Backend::Kiln, None) => Ok(None),
+        (Backend::Kiln, Some(_)) => {
+            bail!("--firecracker-test-deployment needs --backend firecracker")
+        }
+        (Backend::Firecracker, None) => bail!(
+            "--backend firecracker runs only as the isolated test deployment until B7: pass --firecracker-test-deployment"
+        ),
+        (Backend::Firecracker, Some(path)) => {
+            let deployment = kilnd::test_deployment::TestDeployment::read(path)?;
+            deployment.check_daemon(&args.socket, &args.state_dir, &args.helper_socket)?;
+            Ok(Some(deployment))
         }
     }
 }
@@ -681,6 +686,46 @@ fn group_id(name: &str) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firecracker_runs_only_as_the_isolated_test_deployment() {
+        let deployment = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/firecracker-test/deployment.json");
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["kilnd"];
+            argv.extend_from_slice(extra);
+            selected_deployment(&Args::try_parse_from(argv).unwrap())
+        };
+        assert!(parse(&[]).unwrap().is_none());
+        assert!(parse(&["--backend", "firecracker"]).is_err());
+        let file = deployment.to_str().unwrap();
+        assert!(parse(&["--firecracker-test-deployment", file]).is_err());
+        // The production paths are the defaults, so the file alone is refused there.
+        assert!(
+            parse(&[
+                "--backend",
+                "firecracker",
+                "--firecracker-test-deployment",
+                file
+            ])
+            .is_err()
+        );
+        let selected = parse(&[
+            "--backend",
+            "firecracker",
+            "--firecracker-test-deployment",
+            file,
+            "--socket",
+            "/run/kilnd-fctest/kilnd.sock",
+            "--state-dir",
+            "/var/lib/kilnd-fctest",
+            "--helper-socket",
+            "/run/kilnd-fctest-helper/helper.sock",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.deployment, "isolated-test");
+    }
 
     #[test]
     fn default_limits_and_zero_queue_are_valid() {

@@ -4813,10 +4813,16 @@ fn exit1_production_gate_leaves_every_catalog_profile_refused() {
     // and checked against its own paths first; the helper above still serves no profile.
     let main = include_str!("../../main.rs");
     assert_eq!(main.matches("FirecrackerRuntime::new(").count(), 1);
-    let (before, selected) = main.split_once("TestDeployment::read(").unwrap();
-    assert!(!before.contains("FirecrackerRuntime::new("));
-    let checked = selected.split_once("FirecrackerRuntime::new(").unwrap().0;
-    assert!(checked.contains("check_daemon("), "{checked}");
+    let (_, run) = main
+        .split_once("let deployment = selected_deployment(&args)?;")
+        .unwrap();
+    let (arm, _) = run.split_once("FirecrackerRuntime::new(").unwrap();
+    assert!(arm.contains("Some(deployment) =>"), "{arm}");
+    let (_, selection) = main.split_once("fn selected_deployment(").unwrap();
+    let (read, checked) = selection.split_once("TestDeployment::read(").unwrap();
+    assert!(read.contains("(Backend::Firecracker, Some(path)) =>"));
+    let (checked, _) = checked.split_once("Ok(Some(deployment))").unwrap();
+    assert!(checked.contains("check_daemon("));
 }
 
 #[tokio::test]

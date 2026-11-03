@@ -2766,3 +2766,122 @@ evidence is from the `kiln` Lima VM (kernel 6.8, 4 vCPUs, 4 GiB) under the manag
 
 The real-chain fixture now pins the bundle's own broker artifact (`c0b303f`): with B5-10
 the synthetic fixture broker is refused at Hello, which the first suite run showed.
+
+## B6 implementation notes (November 3, 2026)
+
+B6 is built in two milestones on `phase1b/b6-lifecycle`, from B5's accepted `034136a`.
+Milestone 1 wires the public `Runtime` path into B4's and B5's helper operations and runs
+the first whole session through the real daemon and `kilndctl`; milestone 2 is recovery
+and section 10's attacks. Stephen's decisions stand: one VM and one persistent kiln sandbox
+per session, 768 MiB guests, no warm pool, the VM terminated on any post-dispatch timeout,
+cancel or uncertainty, no API socket, and production Firecracker disabled behind the
+manifest gate until B7.
+
+### Milestone 1: the public runtime path
+
+*Create follows READY.* The helper answers Create once C2 is durable (`accepted`), and S
+journals READY later, after the broker's Hello and Initialize (B5). `FirecrackerRuntime`'s
+`create` therefore reads the allocation back with Inspect every 100 ms within the create
+deadline. `present_ready` becomes the C6 receipt: the plan's node, the instance,
+allocation and plan digest, the helper generation and the boot ID, which the manager
+publishes at C7 exactly as B2 built it. A booting phase keeps waiting. A stopped
+allocation, a phase past READY, an incompatible answer or the deadline is a charged
+ambiguous failure, which the manager settles by exact token; an absence fence is the
+token's own receipt. The B3 fixtures' fake effects never reach READY, so their Create now
+ends at its deadline, still ambiguous and charged.
+
+*The boot binding.* Validate and Exec must name the journaled boot and inner sandbox. The
+runtime remembers both per allocation from the READY Inspect, reads them again from the
+helper's `present_ready` when it has none (after a daemon restart, for example), and
+forgets them when a session retires or is removed. This is a binding, not an authority:
+the helper compares both with its own journal and refuses anything else, and startup
+reconciliation compares the row's durable boot ID with the helper's before a READY row
+stays READY (section 8.3).
+
+*Inspect.* `present_ready` is `Present` with a ready receipt, healthy and idle, with no
+uncertain execution. `present_busy` (still booting, or executing) stays `Unknown`, so the
+manager never reads it as reusable.
+
+*Exec.* `Client::firecracker_exec` shares kiln's stdio exchange: the three opposite
+endpoints, the receipt byte, stdin, then both outputs drained beside the reply. Its reply
+allowance after the wire deadline is 70 s, as for kiln, because after the deadline the
+helper still sends Cancel, waits two seconds for the guest and proves the `vm` subtree
+empty. The reply's own evidence sets the disposition:
+
+| Reply | Disposition | Cleanup evidence |
+|---|---|---|
+| `reusable: true` with `no_child_started` or `guest_cgroup_drained` | Reusable | NoChildStarted or RuntimeDrained |
+| `reusable: false` with `vm_stopped` | Stopped (the row becomes LOST, `sandbox_reusable=false`) | SandboxStopped |
+| anything else | Quarantined | as reported |
+| no reply, or capture facts that do not match the delivered bytes | Quarantined | Unknown |
+
+A failure to learn the session's boot before sending anything is NoChildStarted and
+Quarantined; nothing reached the guest, but the session can't be named.
+
+*Remove, the fence and Gc.* `remove` is the helper's Remove by exact token. Its receipt must
+name this instance and allocation; the manager compares the plan digest with its row
+before committing it. `fence_absent` now tries Remove first: for a token the helper
+journaled, Remove stops the VM, removes every owned resource and persists ABSENT; for a
+retired token it answers with the fence; only for a token with no journal record (Remove
+refuses it and touches nothing) does `fence_absent` call FenceAbsent, which fences a
+never-admitted token. The manager settles an `Unknown` observation, such as a stop still in
+progress or a VM still booting, through `fence_absent`, and FenceAbsent on an admitted
+token would close the token's gate and still refuse while its resources exist. `gc` maps
+backend IDs to allocations, returns only individually proven receipts and reports the
+skipped and failed ones.
+
+*Never NotFound.* A malformed backend ID is `Incompatible`, and no Firecracker answer is
+`NotFound`: only a receipt is absence (section 8.1).
+
+*Health reads the node ledger.* The new `Runtime::node_totals` (no totals by default) is
+read in the same shared, cached Health probe as the version. For Firecracker it is the
+helper's Accounting snapshot: the node's ceilings as limits, and its committed claims,
+including the once-only shared reserve, as reservations, for all seven dimensions. Health
+reports them as `AUTHORITATIVE`, with the snapshot's generation and when it was read. An
+unreadable authority stays `UNAVAILABLE`, degraded, with every total zero; commitments over
+a lowered ceiling degrade Health. The daemon's own sum is never shown as the node's.
+`kilndctl health` prints the generation.
+
+### The isolated test deployment
+
+`deploy/firecracker-test/` holds `deployment.json` and its README. kilnd selects the
+Firecracker backend only with `--backend firecracker --firecracker-test-deployment FILE`,
+and only when the file is strict JSON with exact fields, its kind is `isolated-test`, the
+daemon's `--socket`, `--state-dir` and `--helper-socket` are exactly the file's, no path
+in it is, contains or lies under a production path (`/run/kilnd`, `/var/lib/kilnd`,
+`/run/kilnd-helper`, `/var/lib/kilnd-helper`, `/etc/kilnd`), and its account, group and
+unit are its own. Either flag alone is refused. The other half of the gate is unchanged:
+the installed helper loads every profile through `ManifestGate::ProductionDisabled`, and
+`TestApproved` has no constructor outside test builds, so a daemon started this way against
+the production helper gets a C0 refusal for every Create.
+`exit1_production_gate_leaves_every_catalog_profile_refused` now checks that `main.rs`
+constructs `FirecrackerRuntime` exactly once, after reading the test deployment and
+checking its paths.
+
+The privileged `b6_linux_root_a_whole_session_through_kilnd_and_kilndctl` is that
+deployment. It creates the `kilnd-fctest` system account, installs the daemon image
+root-owned at `/opt/kilnd/b6-session/kilnd`, runs `kilnd init-state` for the instance ID,
+builds the real helper at the deployment's root and, with it stopped, enrolls that account,
+unit, cgroup and image digest as `add-instance.sh` does. It starts kilnd with `systemd-run`
+as the transient `kilnd-fctest.service` with every `[Service]` setting of
+`deploy/kilnd@.service`, so the helper attests the real daemon by its account, its exact
+unit cgroup and its image's device, inode and SHA-256, then drives the session with
+`kilndctl`. `scripts/b4-vm-tests.sh` builds kilnd and kilndctl for it, and
+`scripts/b4-vm-cleanup.py` removes the deployment's unit, account and directories (never
+production's) and fails if any remain.
+
+### Milestone 1 exit evidence
+
+All in the `kiln` Lima VM (kernel 6.8.0-147, 4 vCPUs, 4 GiB) under the managed `kiln-vm`
+process, with the re-pinned production bundle (kiln-guest `86fbf26`, broker `35fad74f…`),
+the approved jailer `42e9dea3…`, `mkfs.xfs` `9571cecc…` and the release Firecracker
+v1.17.0. Logs, the transcript and the SQLite and journal evidence are in
+`reviews/2026-11-03-b6-vm/`.
+
+| Milestone 1 criterion | Evidence |
+|---|---|
+| The public path is wired | `kilndctl create` reached READY in 13.8 s through Preflight, C1, the helper's C2, boot, the broker and C7; Validate ran in startup reconciliation; Exec, Remove and Health went through the helper |
+| Persistent sandbox | A file one `exec` wrote, the next read; stdin appended to it; a nonzero exit and stderr kept the session reusable (`runtime_drained`, `sandbox_reusable=1`) |
+| A timeout retires the VM | `exec --timeout 3s … sleep 60` exited 124 after 3.08 s; the execution is `timed_out`, `sandbox_reusable=0`, `sandbox_stopped`; the row is `lost` ("its host stop barrier passed") and refuses the next command; the journal's stop reason is "execution interrupted after dispatch"; the node still charges one slot until Delete |
+| `rm` reaches ABSENT and releases | The journal's phase is `absent`, the claim's `released_generation` is set, a retired token holds the receipt, and the row is `deleted` with that receipt's `release_evidence`; Health went 0/3, 1/3 while ready, 1/3 while lost, 0/3 after `rm`; no VMM, loop, mount, cgroup or file remains |
+| Real attestation | The daemon ran as `kilnd-fctest` in `/system.slice/kilnd-fctest.service` with kilnd@.service's hardening; the helper attached it by enrollment, cgroup and image digest |
