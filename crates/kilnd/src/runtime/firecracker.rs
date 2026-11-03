@@ -575,6 +575,42 @@ impl Runtime for FirecrackerRuntime {
         }
     }
 
+    async fn node_totals(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Option<super::NodeTotals>, RuntimeError> {
+        let snapshot = self.node_accounting(deadline, cancel).await?;
+        if snapshot.node_id != self.attached_node()? {
+            return Err(RuntimeError::Backend(
+                "node accounting is for another node".into(),
+            ));
+        }
+        let (ceilings, committed) = (snapshot.ceilings, snapshot.committed);
+        Ok(Some(super::NodeTotals {
+            generation: snapshot.generation,
+            limits: crate::store::SandboxBudgets {
+                sandboxes: ceilings.slots,
+                memory_bytes: ceilings.memory_bytes,
+                pids: ceilings.pids,
+                disk_bytes: ceilings.disk_bytes,
+                host_cpu_millis: ceilings.host_cpu_millis,
+                virtual_cpu_slots: ceilings.virtual_cpu_slots,
+                host_pids: ceilings.host_pids,
+            },
+            reserved: crate::store::SandboxResources {
+                sandboxes: committed.slots,
+                memory_bytes: committed.memory_bytes,
+                pids: committed.pids,
+                disk_bytes: committed.disk_bytes,
+                host_cpu_millis: committed.host_cpu_millis,
+                virtual_cpu_slots: committed.virtual_cpu_slots,
+                host_pids: committed.host_pids,
+            },
+            over_committed: snapshot.over_committed,
+        }))
+    }
+
     async fn prepare(
         &self,
         context: &CreateContext,

@@ -190,8 +190,13 @@ async fn run(cli: Cli) -> Result<u8> {
                     resources.max_host_pids
                 );
                 println!(
-                    "accounting:          {}",
-                    accounting_status(resources.accounting_status)
+                    "accounting:          {}{}",
+                    accounting_status(resources.accounting_status),
+                    if resources.accounting_generation == 0 {
+                        String::new()
+                    } else {
+                        format!(" (generation {})", resources.accounting_generation)
+                    }
                 );
                 println!("rejected creates:   {}", resources.rejected_creates);
             }

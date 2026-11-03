@@ -192,6 +192,8 @@ pub struct FakeFenced {
 pub struct FakeState {
     pub mode: FakeEvidenceMode,
     pub fenced: FakeFenced,
+    /// B6: what `node_totals` answers; `None` models an unreadable authority.
+    pub node_totals: Option<super::NodeTotals>,
     pub sandboxes: BTreeMap<String, BackendStatus>,
     /// Specs passed to `create`, in order.
     pub created: Vec<SandboxSpec>,
@@ -715,6 +717,17 @@ impl Runtime for FakeRuntime {
             } else {
                 AccountingAuthority::LocalLegacy
             },
+        }
+    }
+
+    async fn node_totals(
+        &self,
+        _deadline: tokio::time::Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<Option<super::NodeTotals>, RuntimeError> {
+        match self.state().node_totals {
+            Some(totals) => Ok(Some(totals)),
+            None => Err(RuntimeError::Backend("node authority unavailable".into())),
         }
     }
 

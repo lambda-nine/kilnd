@@ -345,7 +345,8 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
                 .arg(&socket)
                 .arg("health"),
         );
-        if probe.status.success() {
+        // Any answer ends the wait; the transcript's first Health must say serving.
+        if String::from_utf8_lossy(&probe.stdout).contains("status:") {
             break;
         }
         let active = output(Command::new("systemctl").args(["is-active", &unit]));
@@ -371,7 +372,14 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
 
     // The session.
     let health = transcript.kilndctl(&bin, &socket, &["health"], None);
+    assert_eq!(health.code, 0, "{}", health.stdout);
+    assert!(
+        health.stdout.contains("status:             serving"),
+        "{}",
+        health.stdout
+    );
     assert!(health.stdout.contains("firecracker"), "{}", health.stdout);
+    assert!(health.stdout.contains("authoritative"), "{}", health.stdout);
     let created = transcript.kilndctl(&bin, &socket, &["create", "--net", "none"], None);
     assert_eq!(created.code, 0, "{}{}", created.stderr, real.fixture.log());
     let id = created.stdout.trim().to_string();

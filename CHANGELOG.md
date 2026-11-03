@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B6 milestone 1: the first whole Firecracker session through the public API.
+  `FirecrackerRuntime` now follows Create to the helper's journaled READY and sends
+  Validate, Exec, Remove and Gc by exact allocation token with the journaled boot and
+  inner sandbox; a token's absence fence removes an admitted allocation first. kilnd
+  gains `--backend firecracker`, accepted only with `--firecracker-test-deployment`
+  naming `deploy/firecracker-test/deployment.json` at its exact non-production paths;
+  the production helper still serves no profile. The privileged
+  `b6_linux_root_a_whole_session_through_kilnd_and_kilndctl` runs the real daemon in its
+  own enrolled unit and drives it with `kilndctl`.
+
 - Phase 1b B5 break-it corrections (Daybreak, November 3). The ledger compacts settled
   execution rows into one `exec_history` summary in the settling transaction, caps stop
   reasons and settled cleanup workers per allocation, and answers an oversized reply with

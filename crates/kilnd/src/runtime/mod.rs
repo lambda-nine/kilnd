@@ -530,6 +530,17 @@ pub struct RuntimeCapabilities {
     pub accounting: AccountingAuthority,
 }
 
+/// Node-global totals read from a backend's own accounting authority (design 7.3).
+/// Limits are the node's ceilings; reservations include its once-only shared reserve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeTotals {
+    pub generation: u64,
+    pub limits: crate::store::SandboxBudgets,
+    pub reserved: crate::store::SandboxResources,
+    /// A lowered ceiling never discounts commitments; it only stops admission.
+    pub over_committed: bool,
+}
+
 /// Futures are `Send` because tonic requires it of service handlers.
 pub trait Runtime: Send + Sync + 'static {
     /// Short backend name stored with each sandbox, like "kiln".
@@ -544,6 +555,17 @@ pub trait Runtime: Send + Sync + 'static {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> impl Future<Output = Result<String, RuntimeError>> + Send;
+
+    /// Node-global totals from this backend's own authority, for Health. A backend whose
+    /// promise is this daemon's own durable sum (`AccountingAuthority::LocalLegacy`) has
+    /// none. An error is Unavailable, never zero.
+    fn node_totals(
+        &self,
+        _deadline: Instant,
+        _cancel: &CancellationToken,
+    ) -> impl Future<Output = Result<Option<NodeTotals>, RuntimeError>> + Send {
+        async { Ok(None) }
+    }
 
     /// Read-only preflight before any reservation: must allocate nothing.
     /// Returning an error leaves no row and no charge.

@@ -23,8 +23,8 @@ use crate::model::{
 use crate::runtime::{
     AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendRecord, BackendStatus,
     CreateContext, CreateFailure, CreatedSandbox, EvidenceRegime, ExecFinish, ExecOutcome,
-    ExecSpec, ExecutionContext, FencedAbsence, MAX_BACKEND_PLAN_BYTES, PreparedCreate, Runtime,
-    RuntimeCapabilities, RuntimeError, RuntimeReceipt,
+    ExecSpec, ExecutionContext, FencedAbsence, MAX_BACKEND_PLAN_BYTES, NodeTotals, PreparedCreate,
+    Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt,
 };
 use crate::store::{ExecutionResult, ReserveSandbox, SandboxBudgets, SandboxResources, Store};
 use crate::validation::{
@@ -189,8 +189,16 @@ struct ExecTicket {
 
 #[derive(Default)]
 struct HealthProbeState {
-    cached: Option<(Instant, std::result::Result<String, String>)>,
+    cached: Option<(Instant, std::result::Result<Probed, String>)>,
     in_flight: bool,
+}
+
+/// One shared Health probe: the backend version and, for a backend with a node
+/// authority, that authority's totals or why they could not be read.
+#[derive(Clone, Debug)]
+struct Probed {
+    version: String,
+    node: Option<std::result::Result<(NodeTotals, i64), String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,6 +291,12 @@ pub enum NodeAccountingStatus {
     /// A node authority owns totals and it cannot be read. `reserved` is then
     /// this daemon's local sum only and must not be presented as node totals.
     Unavailable,
+    /// `limits` and `reserved` are the node authority's own totals, at its snapshot
+    /// generation, read during the shared Health probe at `observed_at_ms`.
+    Authoritative {
+        generation: u64,
+        observed_at_ms: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1160,10 +1174,23 @@ impl<R: Runtime> Manager<R> {
                         let runtime_manager = manager.clone();
                         let probe_cancel = cancel.clone();
                         let mut task = tokio::spawn(async move {
-                            runtime_manager
-                                .runtime
-                                .version(deadline, &probe_cancel)
-                                .await
+                            let runtime = &runtime_manager.runtime;
+                            let version = runtime.version(deadline, &probe_cancel).await?;
+                            // A node authority's totals are read in the same bounded probe,
+                            // so Health never presents this daemon's local sum as the node's.
+                            let node = match runtime.capabilities().accounting {
+                                AccountingAuthority::LocalLegacy => None,
+                                AccountingAuthority::Node => Some(
+                                    match runtime.node_totals(deadline, &probe_cancel).await {
+                                        Ok(Some(totals)) => Ok((totals, now_ms())),
+                                        Ok(None) => {
+                                            Err("the backend reports no node totals".to_string())
+                                        }
+                                        Err(error) => Err(error.to_string()),
+                                    },
+                                ),
+                            };
+                            Ok::<_, RuntimeError>(Probed { version, node })
                         });
                         let result = tokio::select! {
                             biased;
@@ -1198,9 +1225,9 @@ impl<R: Runtime> Manager<R> {
                 () = self.shutting_down.cancelled() => {},
             }
         };
-        let (mut serving, backend_version, mut detail) = match probe {
-            Ok(v) => (true, v, String::new()),
-            Err(e) => (false, String::new(), format!("backend: {e}")),
+        let (mut serving, backend_version, node, mut detail) = match probe {
+            Ok(probed) => (true, probed.version, probed.node, String::new()),
+            Err(e) => (false, String::new(), None, format!("backend: {e}")),
         };
         let finalization_failures = self.finalization_failures.load(Ordering::Relaxed);
         if finalization_failures != 0 {
@@ -1253,14 +1280,37 @@ impl<R: Runtime> Manager<R> {
             ));
         }
         let capabilities = self.runtime.capabilities();
-        let accounting = match capabilities.accounting {
-            AccountingAuthority::LocalLegacy => NodeAccountingStatus::LocalLegacy,
-            AccountingAuthority::Node => {
+        let (mut limits, mut reserved) = (limits, reserved);
+        let accounting = match (capabilities.accounting, node) {
+            (AccountingAuthority::LocalLegacy, _) => NodeAccountingStatus::LocalLegacy,
+            (AccountingAuthority::Node, Some(Ok((totals, observed_at_ms)))) => {
+                if totals.over_committed {
+                    serving = false;
+                    if !detail.is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str(
+                        "node commitments exceed its ceilings (lowered?); the node admits nothing new",
+                    );
+                }
+                limits = totals.limits;
+                reserved = totals.reserved;
+                NodeAccountingStatus::Authoritative {
+                    generation: totals.generation,
+                    observed_at_ms,
+                }
+            }
+            (AccountingAuthority::Node, unavailable) => {
                 serving = false;
                 if !detail.is_empty() {
                     detail.push_str("; ");
                 }
-                detail.push_str("node accounting authority is unavailable");
+                match unavailable {
+                    Some(Err(why)) => {
+                        detail.push_str(&format!("node accounting authority is unavailable: {why}"))
+                    }
+                    _ => detail.push_str("node accounting authority is unavailable"),
+                }
                 NodeAccountingStatus::Unavailable
             }
         };

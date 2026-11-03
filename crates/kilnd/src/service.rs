@@ -284,10 +284,29 @@ fn runtime_capabilities_pb(c: crate::runtime::RuntimeCapabilities) -> pb::Runtim
 fn node_resources_pb(s: crate::manager::NodeResourceSnapshot) -> pb::NodeResourceStats {
     use crate::manager::NodeAccountingStatus as Accounting;
     // A daemon's local sum is the node total only for a backend with no node
-    // authority, which reserves no CPU, vCPU or host PIDs. Otherwise an unreadable
-    // authority reports nothing rather than a number that looks authoritative.
-    let local = s.accounting == Accounting::LocalLegacy;
-    let total = |value: u64| if local { value } else { 0 };
+    // authority, which reserves no CPU, vCPU or host PIDs. A node authority's own
+    // totals are reported whole. Otherwise an unreadable authority reports nothing
+    // rather than a number that looks authoritative.
+    let (status, generation, observed_at_ms) = match s.accounting {
+        Accounting::LocalLegacy => (pb::NodeAccountingStatus::LocalLegacy, 0, 0),
+        Accounting::Unavailable => (pb::NodeAccountingStatus::Unavailable, 0, 0),
+        Accounting::Authoritative {
+            generation,
+            observed_at_ms,
+        } => (
+            pb::NodeAccountingStatus::Authoritative,
+            generation,
+            observed_at_ms,
+        ),
+    };
+    let total = |value: u64| match s.accounting {
+        Accounting::LocalLegacy | Accounting::Authoritative { .. } => value,
+        Accounting::Unavailable => 0,
+    };
+    let host = |value: u64| match s.accounting {
+        Accounting::Authoritative { .. } => value,
+        Accounting::LocalLegacy | Accounting::Unavailable => 0,
+    };
     pb::NodeResourceStats {
         max_sandboxes: total(s.limits.sandboxes),
         reserved_sandboxes: total(s.reserved.sandboxes),
@@ -298,19 +317,15 @@ fn node_resources_pb(s: crate::manager::NodeResourceSnapshot) -> pb::NodeResourc
         max_disk_bytes: total(s.limits.disk_bytes),
         reserved_disk_bytes: total(s.reserved.disk_bytes),
         rejected_creates: s.rejected_creates,
-        max_host_cpu_millis: 0,
-        reserved_host_cpu_millis: 0,
-        max_virtual_cpu_slots: 0,
-        reserved_virtual_cpu_slots: 0,
-        max_host_pids: 0,
-        reserved_host_pids: 0,
-        accounting_status: match s.accounting {
-            Accounting::LocalLegacy => pb::NodeAccountingStatus::LocalLegacy,
-            Accounting::Unavailable => pb::NodeAccountingStatus::Unavailable,
-        }
-        .into(),
-        accounting_generation: 0,
-        accounting_observed_at_unix_ms: 0,
+        max_host_cpu_millis: host(s.limits.host_cpu_millis),
+        reserved_host_cpu_millis: host(s.reserved.host_cpu_millis),
+        max_virtual_cpu_slots: host(s.limits.virtual_cpu_slots),
+        reserved_virtual_cpu_slots: host(s.reserved.virtual_cpu_slots),
+        max_host_pids: host(s.limits.host_pids),
+        reserved_host_pids: host(s.reserved.host_pids),
+        accounting_status: status.into(),
+        accounting_generation: generation,
+        accounting_observed_at_unix_ms: observed_at_ms,
     }
 }
 
@@ -1178,6 +1193,93 @@ mod tests {
             .sandbox
             .unwrap();
         assert_eq!(got.state, pb::SandboxState::Quarantined as i32);
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_node_authoritys_own_totals_and_generation() {
+        use crate::runtime::NodeTotals;
+        use crate::store::{SandboxBudgets, SandboxResources};
+        let fake = FakeRuntime::fenced();
+        let totals = NodeTotals {
+            generation: 41,
+            limits: SandboxBudgets {
+                sandboxes: 3,
+                memory_bytes: 3072 << 20,
+                pids: 2048,
+                disk_bytes: 16 << 30,
+                host_cpu_millis: 3500,
+                virtual_cpu_slots: 3,
+                host_pids: 128,
+            },
+            reserved: SandboxResources {
+                sandboxes: 1,
+                memory_bytes: (896 + 128) << 20,
+                pids: 192 + 32,
+                disk_bytes: (1408 << 20) + (512 << 20),
+                host_cpu_millis: 1500,
+                virtual_cpu_slots: 1,
+                host_pids: 64,
+            },
+            over_committed: false,
+        };
+        fake.state().node_totals = Some(totals);
+        let manager = Arc::new(Manager::new(
+            fake.clone(),
+            Store::open_in_memory().unwrap(),
+            Limits::default(),
+        ));
+        let service = Service::new(manager.clone());
+        let health = service
+            .health(as_root(pb::HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            health.status,
+            pb::health_response::Status::Serving as i32,
+            "{}",
+            health.detail
+        );
+        let stats = health.node_resources.unwrap();
+        assert_eq!(
+            stats.accounting_status,
+            pb::NodeAccountingStatus::Authoritative as i32
+        );
+        assert_eq!(stats.accounting_generation, 41);
+        assert!(stats.accounting_observed_at_unix_ms > 0);
+        assert_eq!(
+            (
+                stats.max_sandboxes,
+                stats.reserved_sandboxes,
+                stats.reserved_memory_bytes,
+                stats.reserved_host_cpu_millis,
+                stats.max_virtual_cpu_slots,
+                stats.reserved_host_pids,
+            ),
+            (3, 1, (896 + 128) << 20, 1500, 3, 64)
+        );
+        // Commitments over a lowered ceiling degrade Health; nothing is discounted.
+        let mut over = totals;
+        over.over_committed = true;
+        over.generation = 42;
+        fake.state().node_totals = Some(over);
+        let manager = Arc::new(Manager::new(
+            fake,
+            Store::open_in_memory().unwrap(),
+            Limits::default(),
+        ));
+        let health = Service::new(manager)
+            .health(as_root(pb::HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(health.status, pb::health_response::Status::Degraded as i32);
+        assert!(
+            health.detail.contains("exceed its ceilings"),
+            "{}",
+            health.detail
+        );
+        assert_eq!(health.node_resources.unwrap().reserved_sandboxes, 1);
     }
 
     #[tokio::test]
