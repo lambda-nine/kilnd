@@ -409,7 +409,7 @@
     "work_backing_path": "/var/lib/kilnd-helper/work/1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a/fc-2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b/work.xfs",
     "work_bytes": 1342177280
   },
-  "manifest_sha256": "533c3414c63ebb2a1503a77c737ace6af2b044b4baec6b4e813f5a0dcc87e607",
+  "manifest_sha256": "6dbaf0148ac3f1f57b75192c0fb2ea881e6d8386096081afb5fa9ea328f777fe",
   "profile": "test-only-b1",
   "schema": "kiln-test-plan-v1",
   "substitutions": {
