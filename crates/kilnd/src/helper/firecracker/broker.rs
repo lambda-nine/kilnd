@@ -772,16 +772,26 @@ pub mod relay {
 
     /// Builds R's current-thread runtime. R is fork-only: tokio's process-global signal
     /// pipe was created by H's runtime and closed by the workers' descriptor sweeps, but
-    /// every new I/O driver duplicates its stale descriptor number. R never handles a
-    /// signal, so while it builds its runtime it points every free descriptor below 1024
-    /// (and 16 under its soft limit) at one end of a fresh, inert socket pair, then
-    /// closes them all: the driver keeps
-    /// its own duplicate of an inert socket that never becomes readable. Nothing of S's
-    /// is exposed, since only free numbers are filled.
+    /// every new I/O driver duplicates its stale descriptor number and drains whatever
+    /// that number names. R never handles a signal, so first it moves its two sockets
+    /// to the top of its table (the 16 numbers under `min(soft limit, 1024)`), where
+    /// H's early signal pipe cannot have been; then, while it builds its runtime, it
+    /// points every free descriptor below them at one end of a fresh, inert socket
+    /// pair, and closes those afterwards. The driver keeps its own duplicate of an inert
+    /// socket that never becomes readable, and can name neither of R's sockets, nor
+    /// anything of S's. Returns the runtime, the inert peer (kept open for R's life:
+    /// an EOF on the driver's copy would read as a broken signal pipe) and the moved
+    /// sockets.
     #[cfg(unix)]
-    fn runtime() -> io::Result<(tokio::runtime::Runtime, StdUnixStream)> {
-        let (inert, peer) = StdUnixStream::pair()?;
-        // Leave room under the soft limit for the driver's own epoll, eventfd and dup.
+    fn runtime(
+        control: StdUnixStream,
+        descriptors: UnixDatagram,
+    ) -> io::Result<(
+        tokio::runtime::Runtime,
+        StdUnixStream,
+        StdUnixStream,
+        UnixDatagram,
+    )> {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -791,6 +801,27 @@ pub mod relay {
             return Err(io::Error::last_os_error());
         }
         let top = (limit.rlim_cur.min(1024) as libc::c_int).saturating_sub(16);
+        if top <= 3 {
+            return Err(io::Error::other("the descriptor limit is too low"));
+        }
+        let lift = |fd: RawFd| -> io::Result<OwnedFd> {
+            // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor this function owns.
+            let moved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, top) };
+            if moved < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the duplicate is ours.
+            Ok(unsafe { OwnedFd::from_raw_fd(moved) })
+        };
+        let moved_control = lift(control.as_raw_fd())?;
+        let moved_descriptors = lift(descriptors.as_raw_fd())?;
+        // Close the old numbers (the moved ones name the same descriptions), so the
+        // inert fill takes them too.
+        drop(control);
+        drop(descriptors);
+        let control = StdUnixStream::from(moved_control);
+        let descriptors = UnixDatagram::from(moved_descriptors);
+        let (inert, peer) = StdUnixStream::pair()?;
         let mut fillers = Vec::new();
         for fd in 3..top {
             // SAFETY: F_GETFD only reads the descriptor table.
@@ -807,9 +838,8 @@ pub mod relay {
             .enable_time()
             .build();
         drop(fillers);
-        // The peer stays open for R's life: an EOF on the driver's copy would read as
-        // a broken signal pipe.
-        Ok((built?, peer))
+        drop(inert);
+        Ok((built?, peer, control, descriptors))
     }
 
     /// R's whole life as S's fork-only, single-threaded child: jobs until S closes the
@@ -819,7 +849,7 @@ pub mod relay {
     /// thread, so the runtime runs on one fresh thread of R's own (two tasks of the
     /// relay leaf's four).
     pub fn relay_worker_main(control: StdUnixStream, descriptors: UnixDatagram) {
-        let (runtime, _inert_peer) = match runtime() {
+        let (runtime, _inert_peer, control, descriptors) = match runtime(control, descriptors) {
             Ok(built) => built,
             Err(error) => {
                 eprintln!("kilnd relay: runtime: {error}");
