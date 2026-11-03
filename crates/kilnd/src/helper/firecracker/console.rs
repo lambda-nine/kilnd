@@ -112,10 +112,6 @@ pub fn drainer_main(console: std::os::fd::OwnedFd, report: std::os::fd::OwnedFd)
             // SAFETY: one readable byte; the report pipe is owned and nonblocking.
             unsafe { libc::write(report.as_raw_fd(), [byte].as_ptr().cast(), 1) };
         }
-        #[cfg(test)]
-        if super::workers::fault_enabled("D.dump") {
-            super::workers::faults::write("console-prefix.log", &meter.prefix);
-        }
     }
 }
 

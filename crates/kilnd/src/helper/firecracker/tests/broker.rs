@@ -573,7 +573,10 @@ async fn b5_linux_root_boot_timings() {
             if phase == "booting" || phase == "ready" {
                 booting = Some(started.elapsed());
             }
-            assert!(started.elapsed() < Duration::from_secs(120), "never booted: {phase}");
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "never booted: {phase}"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let booting = booting.unwrap();
