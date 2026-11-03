@@ -747,24 +747,35 @@ pub mod relay {
 
     /// R's whole life: jobs until S closes the control stream.
     pub fn relay_main(control: StdUnixStream, descriptors: UnixDatagram) {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        else {
-            return;
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("kilnd relay: runtime: {error}");
+                return;
+            }
         };
         let local = tokio::task::LocalSet::new();
         local.block_on(&runtime, async move {
             let _ = control.set_nonblocking(true);
             let _ = descriptors.set_nonblocking(true);
-            let Ok(control) = tokio::net::UnixStream::from_std(control) else {
-                return;
+            let control = match tokio::net::UnixStream::from_std(control) {
+                Ok(control) => control,
+                Err(error) => {
+                    eprintln!("kilnd relay: control: {error}");
+                    return;
+                }
             };
             // SAFETY: an owned socket stays open and names the same description for
             // the AsyncFd's whole life.
-            let Ok(descriptors) = (unsafe { tokio::io::unix::AsyncFd::register(descriptors) })
-            else {
-                return;
+            let descriptors = match unsafe { tokio::io::unix::AsyncFd::register(descriptors) } {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    eprintln!("kilnd relay: descriptors: {error}");
+                    return;
+                }
             };
             let (mut reader, mut writer) = control.into_split();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RelayReport>();
@@ -786,17 +797,28 @@ pub mod relay {
             });
             let busy = std::rc::Rc::new(std::cell::Cell::new((false, false)));
             let budgets: Budgets = Default::default();
-            while let Ok(Some(job)) = read_job(&mut reader).await {
+            loop {
+                let job = match read_job(&mut reader).await {
+                    Ok(Some(job)) => job,
+                    Ok(None) => return,
+                    Err(error) => {
+                        eprintln!("kilnd relay: job frame: {error}");
+                        return;
+                    }
+                };
                 let id = job.job();
                 let fds = match job_fds(&descriptors, id, job.descriptors()).await {
                     Ok(fds) => fds,
                     Err(error) => {
+                        eprintln!("kilnd relay: job {id} descriptors: {error}");
                         let _ = tx.send(RelayReport::Failed {
                             job: id,
                             reason: error.to_string(),
                             dispatched: false,
                         });
-                        // A lost or mismatched descriptor desynchronizes S and R.
+                        // A lost or mismatched descriptor desynchronizes S and R; the
+                        // report goes first, then R ends and S retires the VM.
+                        tokio::task::yield_now().await;
                         return;
                     }
                 };
