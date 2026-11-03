@@ -747,8 +747,11 @@ pub mod relay {
 
     /// R's whole life: jobs until S closes the control stream.
     pub fn relay_main(control: StdUnixStream, descriptors: UnixDatagram) {
+        // I/O and time only. R is fork-only, and the signal driver's process-global
+        // pipe belongs to the parent's runtime, closed by the descriptor sweep.
         let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+            .enable_io()
+            .enable_time()
             .build()
         {
             Ok(runtime) => runtime,
