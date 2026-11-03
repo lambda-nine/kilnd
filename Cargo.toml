@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/kilnd-api",
+    "crates/kilnd-broker-protocol",
     "crates/kilnd-exec-core",
     "crates/kilnd",
     "crates/kilndctl",
@@ -38,4 +39,5 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 kilnd-api = { path = "crates/kilnd-api" }
+kilnd-broker-protocol = { path = "crates/kilnd-broker-protocol" }
 kilnd-exec-core = { path = "crates/kilnd-exec-core" }

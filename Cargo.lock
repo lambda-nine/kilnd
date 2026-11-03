@@ -600,6 +600,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kilnd-broker-protocol"
+version = "0.1.0"
+dependencies = [
+ "kilnd-exec-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "kilnd-exec-core"
 version = "0.1.0"
 dependencies = [
