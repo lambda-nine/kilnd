@@ -4825,6 +4825,99 @@ fn exit1_production_gate_leaves_every_catalog_profile_refused() {
     assert!(checked.contains("check_daemon("));
 }
 
+/// B5-R1 (the recheck's `remove_fence_stall` PoC, against the real helper): L stops
+/// answering inside the fence's own transaction. The fence's ledger waits end at the
+/// request's deadline, so the detached task gives its slot back and the token's
+/// serialization is free while L is still stalled; once L recovers, the next attempt
+/// finishes the fence. Before the fix the stuck task held both until L answered.
+#[tokio::test]
+async fn b5_r1_a_stalled_ledger_fence_gives_back_its_detached_slot() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let context = token(instance);
+    let plan = prepared(&runtime, &context).await;
+    let epoch = epoch_of(&runtime).await;
+    let fence = || FirecrackerOperation::FenceAbsent {
+        allocation_id: context.allocation_id,
+        sandbox_id: context.sandbox_id.clone(),
+        plan_digest: plan.plan_digest(),
+    };
+    let free = fixture.census().await["detached_available"]
+        .as_u64()
+        .unwrap();
+    assert!(free >= 2);
+    fixture.fault("L.fence.before_commit.stall");
+    let started = std::time::Instant::now();
+    let reply = raw_call(
+        &fixture,
+        instance,
+        Some(epoch),
+        fence(),
+        wire_deadline(2),
+        2_000,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            &reply,
+            FirecrackerResponse::Fence(FenceReply::Ambiguous { .. })
+        ),
+        "{reply:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    fixture.wait_reached("L.fence.before_commit").await;
+    // L is still stalled, yet the detached body has finished and given its slot back.
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let census = fixture.census().await;
+        if census["detached_available"].as_u64() == Some(free) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < end,
+            "the stalled fence kept its detached slot: {census}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        fixture
+            .root
+            .join("faults/L.fence.before_commit.stall")
+            .exists()
+    );
+    // L recovers: the abandoned transaction commits or not, and either way the next
+    // attempt answers with the token's one fence.
+    fixture.clear("L.fence.before_commit.stall");
+    let mut receipt = None;
+    for _ in 0..20 {
+        match raw_call(
+            &fixture,
+            instance,
+            Some(epoch),
+            fence(),
+            wire_deadline(5),
+            5_000,
+        )
+        .await
+        .unwrap()
+        {
+            FirecrackerResponse::Fence(FenceReply::Absent { receipt: bytes }) => {
+                receipt = Some(bytes);
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+    let receipt = FencedAbsence::decode(&receipt.expect("the fence completes").0).unwrap();
+    assert_eq!(receipt.allocation_id(), context.allocation_id);
+    assert_eq!(
+        fixture.census().await["detached_available"].as_u64(),
+        Some(free)
+    );
+}
+
 #[tokio::test]
 async fn exit6_tight_fence_allowance_stops_new_tokens_end_to_end() {
     let allowance =

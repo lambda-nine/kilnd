@@ -2293,7 +2293,28 @@ impl Ledger {
         }
         let operation = next_generation(&tx)?;
         let id = Self::insert_worker_intent(&tx, Some((instance, allocation)), spec, operation)?;
-        // Each cleanup attempt adds a row: keep the newest eight settled ones (B5-01).
+        // Each cleanup attempt adds a row; settlement compacts (B5-01, B5-R2).
+        Self::compact_settled_workers(
+            &tx,
+            &instance.to_string(),
+            &allocation.to_string(),
+            &spec.mode,
+        )?;
+        commit_tx(tx, &self.fail_next_commit)?;
+        Ok((id, operation))
+    }
+
+    /// Keeps exactly the newest eight settled rows of one allocation's worker mode
+    /// (section 7.4). It runs where a row becomes settled as well as on insert, so a
+    /// row settling after its successor was journaled can't leave a ninth (B5-R2).
+    /// `worker_intents_no_delete` permits exactly these deletions; unsettled and
+    /// node-level rows are never touched.
+    fn compact_settled_workers(
+        tx: &rusqlite::Transaction<'_>,
+        instance: &str,
+        allocation: &str,
+        mode: &str,
+    ) -> Result<(), LedgerError> {
         tx.prepare_cached(
             "DELETE FROM worker_intents WHERE instance_id = ?1 AND allocation_id = ?2
                AND mode = ?3 AND settled_generation IS NOT NULL
@@ -2301,14 +2322,8 @@ impl Ledger {
                    AND allocation_id = ?2 AND mode = ?3 AND settled_generation IS NOT NULL
                    ORDER BY id DESC LIMIT ?4)",
         )?
-        .execute(params![
-            instance.to_string(),
-            allocation.to_string(),
-            spec.mode,
-            SETTLED_WORKERS_KEPT,
-        ])?;
-        commit_tx(tx, &self.fail_next_commit)?;
-        Ok((id, operation))
+        .execute(params![instance, allocation, mode, SETTLED_WORKERS_KEPT])?;
+        Ok(())
     }
 
     /// The later durable record of a stop: an emergency already ran under C2's
@@ -2425,15 +2440,27 @@ impl Ledger {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let generation = next_generation(&tx)?;
-        tx.prepare_cached(
-            "UPDATE worker_intents SET settled_generation = ?2, settlement = ?3
-             WHERE id = ?1 AND settled_generation IS NULL",
-        )?
-        .execute(params![
-            worker_id,
-            signed(generation, "generation")?,
-            settlement
-        ])?;
+        let settled = tx
+            .prepare_cached(
+                "UPDATE worker_intents SET settled_generation = ?2, settlement = ?3
+                 WHERE id = ?1 AND settled_generation IS NULL",
+            )?
+            .execute(params![
+                worker_id,
+                signed(generation, "generation")?,
+                settlement
+            ])?;
+        if settled == 1 {
+            let owner: Option<(Option<String>, Option<String>, String)> = tx
+                .prepare_cached(
+                    "SELECT instance_id, allocation_id, mode FROM worker_intents WHERE id = ?1",
+                )?
+                .query_row([worker_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?;
+            if let Some((Some(instance), Some(allocation), mode)) = owner {
+                Self::compact_settled_workers(&tx, &instance, &allocation, &mode)?;
+            }
+        }
         commit_tx(tx, &self.fail_next_commit)
     }
 

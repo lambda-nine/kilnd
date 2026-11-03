@@ -2120,11 +2120,49 @@ fn b5_01_stop_reasons_and_cleanup_workers_are_bounded() {
         count(&ledger, "SELECT COUNT(*) FROM stop_events"),
         STOP_REASONS_KEPT
     );
-    assert!(
+    // Exactly eight, the design's number, not eight plus the newest (B5-R2).
+    assert_eq!(
         count(
             &ledger,
             "SELECT COUNT(*) FROM worker_intents WHERE settled_generation IS NOT NULL"
-        ) <= SETTLED_WORKERS_KEPT + 1
+        ),
+        SETTLED_WORKERS_KEPT
+    );
+    // Rows that settle out of order, after their successors were journaled, still
+    // leave exactly eight; unsettled rows are never removed.
+    let unsettled_before = count(
+        &ledger,
+        "SELECT COUNT(*) FROM worker_intents WHERE settled_generation IS NULL",
+    );
+    let mut open = Vec::new();
+    for _ in 0..12 {
+        let (worker, _) = ledger
+            .record_allocation_worker_intent(instance(), allocation, &request(1).supervisor)
+            .unwrap();
+        open.push(worker);
+    }
+    assert_eq!(
+        count(
+            &ledger,
+            "SELECT COUNT(*) FROM worker_intents WHERE settled_generation IS NULL"
+        ),
+        unsettled_before + 12
+    );
+    for worker in open.into_iter().rev() {
+        ledger.settle_worker(worker, "exited").unwrap();
+        assert!(
+            count(
+                &ledger,
+                "SELECT COUNT(*) FROM worker_intents WHERE settled_generation IS NOT NULL"
+            ) <= SETTLED_WORKERS_KEPT
+        );
+    }
+    assert_eq!(
+        count(
+            &ledger,
+            "SELECT COUNT(*) FROM worker_intents WHERE settled_generation IS NOT NULL"
+        ),
+        SETTLED_WORKERS_KEPT
     );
     assert_eq!(
         ledger

@@ -116,6 +116,24 @@ impl WireDeadline {
     }
 }
 
+/// A queued journal record taken for writing. Dropped while still holding it (the
+/// flush was cancelled mid-call), it goes back to the front of the queue.
+struct Requeue<'a> {
+    pending: &'a Mutex<VecDeque<LedgerRequest>>,
+    record: Option<LedgerRequest>,
+}
+
+impl Drop for Requeue<'_> {
+    fn drop(&mut self) {
+        if let Some(record) = self.record.take() {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_front(record);
+        }
+    }
+}
+
 /// 128 random bits from the kernel without a filesystem open on H's runtime.
 fn fresh_id() -> io::Result<Id128> {
     let mut bytes = [0u8; 16];
@@ -1269,12 +1287,25 @@ impl Node {
 
     /// Later records wait here. Dropping one could only leave a worker unsettled, which
     /// keeps its charge: a full queue fails toward more cost, never toward release.
-    async fn flush_pending(&self) {
+    /// Writes queued records in order. True once the queue is empty; false when L gave
+    /// no usable answer, with that record still first. Cancel-safe (B5-R1): a record in
+    /// flight when this future is dropped goes back to the front, so a caller may bound
+    /// the flush without losing a record. L may then see it twice, exactly as after
+    /// any unanswered call, which this queue has always retried.
+    async fn flush_pending(&self) -> bool {
         let _flushing = self.flushing.lock().await;
         loop {
-            let record = self.pending.lock().unwrap().pop_front();
-            let Some(record) = record else { return };
-            let reply = self.ledger_call(Lane::Reserved, &record, u64::MAX).await;
+            let Some(record) = self.pending.lock().unwrap().pop_front() else {
+                return true;
+            };
+            let mut requeue = Requeue {
+                pending: &self.pending,
+                record: Some(record),
+            };
+            let reply = self
+                .ledger_call(Lane::Reserved, requeue.record.as_ref().unwrap(), u64::MAX)
+                .await;
+            let record = requeue.record.take().unwrap();
             match reply {
                 Ok(LedgerReply::Done | LedgerReply::Generation(_)) => {
                     if let (
@@ -1300,10 +1331,28 @@ impl Node {
                 }
                 _ => {
                     self.pending.lock().unwrap().push_front(record);
-                    return;
+                    return false;
                 }
             }
         }
+    }
+
+    /// One reserved-lane ledger call that the caller stops waiting for at `until`
+    /// (B5-R1). The request carries its own deadline, but L checks that only once it
+    /// reads the frame; a stalled L never answers. Missing the bound reads as no answer,
+    /// which every caller turns into a charged, ambiguous reply.
+    async fn ledger_until(
+        &self,
+        request: &LedgerRequest,
+        deadline_ns: u64,
+        until: Instant,
+    ) -> Result<LedgerReply, CallError> {
+        tokio::time::timeout_at(
+            until,
+            self.ledger_call(Lane::Reserved, request, deadline_ns),
+        )
+        .await
+        .unwrap_or(Err(CallError::Full))
     }
 
     /// Irrevocable for this boot: the gate closes, S's permit is revoked and nothing can
@@ -3271,15 +3320,18 @@ impl Node {
         let serial = gate.serial.clone().lock_owned().await;
         gate.waiters.fetch_sub(1, Ordering::AcqRel);
         let _serial = serial;
+        // Every ledger wait below ends at the request's own deadline (B5-R1), so a
+        // stalled L leaves this attempt charged and ambiguous and gives back the detached
+        // slot and any removing claim, and a later attempt can make progress.
         let reply = self
-            .ledger_call(
-                Lane::Reserved,
+            .ledger_until(
                 &LedgerRequest::Lookup {
                     instance: token.instance,
                     allocation: token.allocation,
                     plan_digest: token.plan_digest,
                 },
                 token.deadline.with_grace(),
+                token.deadline.instant + LOOKUP_GRACE,
             )
             .await;
         let mut never_admitted = false;
@@ -3324,12 +3376,12 @@ impl Node {
         // commit below checks again in its own transaction, and that is the authority.
         if never_admitted {
             let allowed = self
-                .ledger_call(
-                    Lane::Reserved,
+                .ledger_until(
                     &LedgerRequest::NeverAdmittedFenceAllowed {
                         instance: token.instance,
                     },
                     token.deadline.ns,
+                    token.deadline.instant,
                 )
                 .await;
             match allowed {
@@ -3402,10 +3454,19 @@ impl Node {
             }
         }
         // Later records (S's exit and the like) must be durable before the commit.
-        self.flush_pending().await;
+        match tokio::time::timeout_at(token.deadline.instant, self.flush_pending()).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                return ambiguous_fence(
+                    AmbiguousClass::LedgerUnavailable,
+                    "earlier journal records are not durable yet",
+                );
+            }
+        }
+        #[cfg(test)]
+        workers::faults::hold("H.fence.before_commit").await;
         let outcome = self
-            .ledger_call(
-                Lane::Reserved,
+            .ledger_until(
                 &LedgerRequest::Fence(Box::new(FenceRequest {
                     instance_id: token.instance,
                     allocation_id: token.allocation,
@@ -3414,6 +3475,7 @@ impl Node {
                     observations: "permits=settled;namespace=absent".into(),
                 })),
                 token.deadline.ns,
+                token.deadline.instant,
             )
             .await;
         match outcome {
@@ -3499,13 +3561,13 @@ impl Node {
         }
         // Rows with no identity never had an open gate: S was never released.
         let settled = self
-            .ledger_call(
-                Lane::Reserved,
+            .ledger_until(
                 &LedgerRequest::SettleUnstarted {
                     instance: token.instance,
                     allocation: token.allocation,
                 },
                 token.deadline.ns,
+                token.deadline.instant,
             )
             .await;
         match settled {
@@ -3721,6 +3783,10 @@ impl Node {
             }).sum::<usize>(),
             "discarded": self.discarded.lock().unwrap().clone(),
             "attached": self.attachments.lock().unwrap().len(),
+            // Free detached-operation slots across instances, and removals in flight:
+            // a stalled ledger must not keep either (B5-R1).
+            "detached_available": self.shares.lock().unwrap().iter().flat_map(|shares| shares.by_instance.values()).map(|share| share.detached.available_permits()).sum::<usize>(),
+            "removing": self.removing.lock().unwrap().len(),
             "peer_starts": self.attachments.lock().unwrap().values().map(|a| a.peer_start).collect::<Vec<_>>(),
         })
     }
