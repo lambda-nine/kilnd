@@ -2730,3 +2730,39 @@ than queueing past its deadline. The ledger keeps schema 1 (no B5 ledger has shi
 The real guest console flood, previously a disposable review patch, is now the VM
 regression `b5_linux_root_a_real_guest_console_flood_keeps_the_drainer_flat` with its
 own test guest.
+
+### Evidence for the corrections
+
+On the Mac: `cargo test --locked --workspace` (472 kilnd library tests, the guest
+broker's 18, the protocol crate's), clippy with `-D warnings -D clippy::disallowed_methods`
+on Rust 1.88 and 1.99 (and on Linux in the VM), the destructive-action gate tests, the 26
+maintenance tests, the 58-move audit and `git diff --check` all pass; CI is green. All VM
+evidence is from the `kiln` Lima VM (kernel 6.8, 4 vCPUs, 4 GiB) under the managed
+`kiln-vm` process, with the re-pinned bundle below; logs are in
+`reviews/2026-11-03-b5-fixes-vm/`.
+
+| Run | Result |
+|---|---|
+| B5 real-chain suite (`b5_linux_root`, 8 tests) | All pass in 657 s. Twenty cold boots: READY p50 13.94 s, p95 13.96 s, max 13.99 s. Persistent execution, timeout, disconnect and Stop retirement, worker death as before; a timeout now reports `known: false` capture |
+| 3,000 executions (B5-01) | 3,000 `true` executions in 46.4 s, each reusable; afterwards the journal holds one `exec_history` row (`settled: 3000`) and Remove reaches ABSENT |
+| Killed inner sandbox (B5-04) | READY, then the guest-root wrapper kills init; Validate answers `unknown: the broker reported Faulted`, the VM subtree empties, the next Exec is not dispatched, Remove reaches ABSENT |
+| Real guest console flood | About 128 KiB/s from guest root over 30 s of executions: D's cgroup memory plateaus at 155,648 bytes, its RSS stays 8,628 KiB, its CPU keeps rising (1.75 s total), every execution reusable, Validate Ready |
+| Four-source fairness | Healthy worst cases under two hostile relays and a console flood: Inspect 3.42 ms, Validate 21.49 ms, Exec 50.27 ms, Remove 130.96 ms; hostile memory [659,456, 487,424, 151,552] → [393,216, 249,856, 151,552] bytes; 331,415,552 console bytes drained, one rate report |
+| B4 root suite | 31 passed in 1,368 s, and the core's capability-drop test. The first attempt was cut off when the VM itself failed (Virtualization.framework `VirtualMachineStateError` at 10:49, during the scoped-GC test); the VM was restarted through its managed process and the rerun passed |
+| Installed suites at `c0b303f` | `install.sh`, `integration-test.sh`, the singleton, state-path and Phase 0 regressions, `smoke.sh` and the maintenance tests all pass. `/var/lib/kilnd` was restored from its byte copy afterwards (`cmp` identical, schema 7) and kilnd `734e275` reinstalled |
+
+*Re-pinned bundle* (kiln-guest `86fbf26`, broker from kilnd `71fe6c4`, archive
+`5e23b69da19226473656c61cb4943cb17118e68e21ba529606e36d3533803b00`; two clean builds,
+`verify.py` `reproducible: true`, every file byte-identical):
+
+| Artifact | Bytes | SHA-256 |
+|---|---|---|
+| `Image` | 17,807,872 | `0015f87e136b314a164b30f5255a1589144a3937db0dce00d5eef6c0fdbf2e6a` |
+| `kernel.config` | 95,549 | `f07a7ffd291f4ad821e3f4f0f2e0ab1928d3024103f3c74d71e541765cc2d4e9` |
+| `kiln` | 2,376,016 | `54442ccc0ce12b9a9236c927b9073019d7d4774c2e2d82f4d55d0db491925c64` |
+| `kilnd-guest-broker` | 2,245,008 | `35fad74f7ce0babe5f531accbdee2b19926f632603b0a55de43775d117cc3528` |
+| `rootfs.squashfs` | 8,396,800 | `04ce1385409207967d71018e84dc3dc61b1dd71827b47d19b1a912b55c8a4ab8` |
+| `manifest.json` | 33,056,298 | `34f53dc5f2a8df61fdfefea738732a73e1818d3809ac4eff1d3aa53010c6a474` |
+
+The real-chain fixture now pins the bundle's own broker artifact (`c0b303f`): with B5-10
+the synthetic fixture broker is refused at Hello, which the first suite run showed.
