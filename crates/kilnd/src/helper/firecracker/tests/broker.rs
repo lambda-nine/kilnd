@@ -58,14 +58,26 @@ async fn wait_ready(
         {
             return (boot_id, inner_id);
         }
+        let phase = real.phase(context.allocation_id);
         assert!(
-            std::time::Instant::now() < end,
-            "never READY: phase {}\n{}",
-            real.phase(context.allocation_id),
+            std::time::Instant::now() < end && phase != "stop_intent",
+            "never READY: phase {phase}, stop reasons {:?}\n{}",
+            stop_reasons(real, context),
             real.fixture.log()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+fn stop_reasons(real: &Real, context: &CreateContext) -> Vec<String> {
+    real.fixture.read(|view| {
+        let mut statement =
+            view.prepare("SELECT reason FROM stop_events WHERE allocation_id = ?1 ORDER BY generation")?;
+        let rows = statement
+            .query_map([context.allocation_id.to_string()], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
 }
 
 async fn validate(
