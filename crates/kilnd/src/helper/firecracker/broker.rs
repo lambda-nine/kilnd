@@ -787,10 +787,26 @@ pub mod relay {
 
     /// R's whole life as S's fork-only, single-threaded child: jobs until S closes the
     /// control stream.
+    ///
+    /// The fork also copied H's thread-local "inside a runtime" marker into this
+    /// thread, so the runtime runs on one fresh thread of R's own (two tasks of the
+    /// relay leaf's four).
     pub fn relay_worker_main(control: StdUnixStream, descriptors: UnixDatagram) {
-        match runtime() {
-            Ok(runtime) => relay_on(runtime, control, descriptors),
-            Err(error) => eprintln!("kilnd relay: runtime: {error}"),
+        let runtime = match runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("kilnd relay: runtime: {error}");
+                return;
+            }
+        };
+        let worker = std::thread::Builder::new()
+            .name("relay".into())
+            .spawn(move || relay_on(runtime, control, descriptors));
+        match worker {
+            Ok(worker) => {
+                let _ = worker.join();
+            }
+            Err(error) => eprintln!("kilnd relay: thread: {error}"),
         }
     }
 
