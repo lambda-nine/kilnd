@@ -313,8 +313,11 @@ fn status_of(record: &InventoryRecord, freshness: &WorkerFreshness) -> ListStatu
         return ListStatus::Unknown;
     }
     match record.phase.as_str() {
-        // A booting VM is busy: B4 has no READY, and nothing is reusable yet.
-        "intent" | "preparing" | "spawn_intent" | "booting" => ListStatus::Busy,
+        // Only a READY VM with no execution in flight is reusable.
+        "ready" => ListStatus::Ready,
+        "intent" | "preparing" | "spawn_intent" | "booting" | "exec_intent" | "busy" => {
+            ListStatus::Busy
+        }
         "stop_intent" | "quarantined" => ListStatus::Quarantined,
         "stopped" | "cleaning" => ListStatus::StoppedWithResources,
         _ => ListStatus::Unknown,

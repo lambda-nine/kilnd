@@ -235,6 +235,25 @@ pub enum FirecrackerOperation {
     Gc {
         allocation_ids: Vec<Id128>,
     },
+    /// B5: the broker's process and idle validation. During an execution the recorded
+    /// busy state answers, with no guest polling. Never absence on a socket failure.
+    Validate {
+        allocation_id: Id128,
+        expected_boot_id: String,
+        expected_inner_id: String,
+    },
+    /// B5: one execution in the persistent sandbox. The helper hands the caller three
+    /// stdio sockets first, as for kiln's Exec. It owns cancellation through the stop
+    /// barrier: any interruption after dispatch retires the VM.
+    Exec {
+        allocation_id: Id128,
+        expected_boot_id: String,
+        execution_token: Id128,
+        execution_id: String,
+        argv: Vec<String>,
+        stdin_bytes: usize,
+        max_output: usize,
+    },
     /// Test-only: whether a reusable dispatch would be admitted at this instant. There
     /// is no Exec in B4; this exposes the fence that a later Exec must consult.
     #[cfg(test)]
@@ -278,6 +297,8 @@ impl FirecrackerOperation {
             }
             Self::Create { .. } => 120_000,
             Self::Stop { .. } | Self::Remove { .. } => 60_000,
+            Self::Validate { .. } => 5_000,
+            Self::Exec { .. } => 3_600_000,
             #[cfg(test)]
             Self::TestDispatchProbe { .. } => 2_000,
         }
@@ -351,6 +372,37 @@ impl FirecrackerRequest {
                 {
                     return Err("Gc takes at most 1024 unique allocation IDs".into());
                 }
+                Ok(())
+            }
+            FirecrackerOperation::Validate {
+                expected_boot_id,
+                expected_inner_id,
+                ..
+            } => {
+                if kilnd_broker_protocol::BootId::new(expected_boot_id.as_str()).is_none()
+                    || kilnd_broker_protocol::InnerId::new(expected_inner_id.as_str()).is_none()
+                {
+                    return Err("invalid boot or inner sandbox ID".into());
+                }
+                Ok(())
+            }
+            FirecrackerOperation::Exec {
+                expected_boot_id,
+                execution_id,
+                argv,
+                stdin_bytes,
+                max_output,
+                ..
+            } => {
+                if kilnd_broker_protocol::BootId::new(expected_boot_id.as_str()).is_none()
+                    || !crate::model::valid_id("ex", execution_id)
+                    || *stdin_bytes > MAX_STDIN
+                    || *max_output == 0
+                    || *max_output > MAX_OUTPUT
+                {
+                    return Err("invalid exec bounds".into());
+                }
+                validate_argv(argv, MAX_ARGV)?;
                 Ok(())
             }
             #[cfg(test)]
@@ -503,6 +555,12 @@ pub enum FenceReply {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum InspectReply {
+    /// B5: READY with no execution in flight, on the journaled boot and inner sandbox.
+    PresentReady {
+        generation: u64,
+        boot_id: String,
+        inner_id: String,
+    },
     PresentBusy {
         generation: u64,
         phase: String,
@@ -521,6 +579,55 @@ pub enum InspectReply {
     Unknown {
         reason: String,
     },
+}
+
+/// B5's Validate: never absence, never a restart.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ValidateReply {
+    /// The broker answered idle on the journaled boot and inner sandbox.
+    Ready { boot_id: String, inner_id: String },
+    /// An execution is in flight: the recorded state, without guest polling.
+    Busy { execution_token: Id128 },
+    /// Booted again, another inner sandbox, or not READY.
+    Incompatible { message: String },
+    /// No proof either way: stays charged and is not reusable.
+    Unknown { reason: String },
+}
+
+/// How an execution's cleanup was established (design 5.4). `VmStopped` is the host's
+/// own proof; the first two are the trusted guest core's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecCleanup {
+    NoChildStarted,
+    GuestCgroupDrained,
+    VmStopped,
+    Unknown,
+}
+
+/// B5's Exec answer: the typed outcome, both capture facts, and whether the next
+/// command may reuse this VM. Output bytes travel only on the stdio sockets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecReply {
+    pub finish: WireFinishFc,
+    pub status: Option<CommandStatus>,
+    pub stdout: CaptureInfo,
+    pub stderr: CaptureInfo,
+    pub cleanup: ExecCleanup,
+    pub reusable: bool,
+    /// False only with proof that no Exec byte reached the guest.
+    pub dispatched: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum WireFinishFc {
+    Completed,
+    TimedOut,
+    Canceled,
+    Failed(RuntimeDiagnostic),
 }
 
 /// A host stop receipt, or why there is none. Never a release.
@@ -562,6 +669,8 @@ pub struct GcResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListStatus {
+    /// B5: READY and idle.
+    Ready,
     Busy,
     StoppedWithResources,
     Stale,
@@ -607,6 +716,8 @@ pub enum FirecrackerResponse {
     /// Remove's answer has Fence's shape: ABSENT's receipt, or charged and ambiguous.
     Remove(FenceReply),
     Gc(Vec<GcResult>),
+    Validate(ValidateReply),
+    Exec(Box<ExecReply>),
     #[cfg(test)]
     TestDispatch {
         admitted: bool,
@@ -713,7 +824,7 @@ impl From<WireError> for RuntimeError {
         }
     }
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureInfo {
     pub kept: usize,

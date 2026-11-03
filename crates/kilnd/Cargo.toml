@@ -14,6 +14,7 @@ anyhow.workspace = true
 clap.workspace = true
 kilnd-api.workspace = true
 kilnd-exec-core.workspace = true
+kilnd-broker-protocol.workspace = true
 libc.workspace = true
 prost.workspace = true
 rusqlite.workspace = true

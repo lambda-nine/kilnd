@@ -52,6 +52,10 @@ pub enum SupervisorRecord {
 pub enum ChildRole {
     Jailer,
     Vm,
+    /// B5's broker relay R, fork-only in the allocation's `relay` leaf.
+    Relay,
+    /// B5's console drainer D, fork-only in `vm/console`.
+    Console,
 }
 
 /// What S is about to create at a deterministic name, journaled before it exists.
@@ -116,6 +120,19 @@ pub enum ResourceRecord {
         process: ProcessId,
         credentials: Credentials,
     },
+    /// The guest broker's validated boot and inner sandbox, journaled before READY.
+    Broker {
+        boot_id: String,
+        inner_id: String,
+    },
+    /// One execution: EXEC_INTENT before Exec is sent, BUSY on acceptance, then its
+    /// settlement (`idle`, `interrupted` or `undispatched`). Evidence, never a release.
+    Exec {
+        token: String,
+        execution_id: String,
+        boot_id: String,
+        state: String,
+    },
 }
 
 impl ResourceRecord {
@@ -134,6 +151,8 @@ impl ResourceRecord {
             Self::JailMount(_) => "jail_mount",
             Self::JailBinds(_) => "jail_binds",
             Self::Vmm { .. } => "vmm",
+            Self::Broker { .. } => "broker",
+            Self::Exec { .. } => "exec",
         }
     }
 }
@@ -222,6 +241,8 @@ impl RecordedResources {
             ResourceRecord::JailMount(mount) => self.jail_mount = Some(mount.clone()),
             ResourceRecord::JailBinds(binds) => self.jail_binds = Some(binds.clone()),
             ResourceRecord::Vmm { process, .. } => self.vmm = Some(*process),
+            // Session evidence: nothing for cleanup to remove.
+            ResourceRecord::Broker { .. } | ResourceRecord::Exec { .. } => {}
         }
     }
 }
@@ -334,6 +355,11 @@ pub struct Console {
 }
 
 impl Console {
+    /// The pipe, handed to D once the VM is booted.
+    pub fn into_fd(self) -> std::os::fd::OwnedFd {
+        self.fd
+    }
+
     pub fn drain(&mut self) {
         use std::os::fd::AsRawFd;
         let mut chunk = [0u8; 64 * 1024];
@@ -375,6 +401,11 @@ impl<'a> Link<'a> {
 
     pub fn context(&self) -> &SupervisorContext {
         self.context
+    }
+
+    /// The original Create deadline.
+    pub fn deadline_ns(&self) -> u64 {
+        self.deadline_ns
     }
 
     pub fn beat(&mut self) {
@@ -688,7 +719,7 @@ mod linux {
 
     /// Reaps any exited child that is not one we are tracking (V's own reparented
     /// descendants never exist, but a subreaper must not accumulate zombies).
-    fn reap_strays(keep: &[i32]) {
+    pub fn reap_strays(keep: &[i32]) {
         loop {
             let mut status = 0;
             // SAFETY: status is writable; WNOHANG returns at once.
@@ -1464,38 +1495,6 @@ mod linux {
             ));
         }
         Ok(identify(candidate)?)
-    }
-
-    /// The steady loop of a booted S: heartbeats, the console drain, V's pidfd and
-    /// H's commands. V's exit or H's loss ends it; Revoke stops V and ends it.
-    pub fn steady(link: &mut Link<'_>, booted: &mut Booted) -> SteadyEnd {
-        link.console = booted.console.take();
-        #[cfg(test)]
-        let mut dumped = Instant::now();
-        loop {
-            link.beat();
-            #[cfg(test)]
-            if dumped.elapsed() >= Duration::from_millis(500) {
-                dumped = Instant::now();
-                link.dump_console();
-            }
-            if pidfd_exited(&booted.vmm_pidfd) {
-                reap_strays(&[]);
-                return SteadyEnd::VmExited;
-            }
-            match link.poll(Duration::from_millis(20)) {
-                Ok(None) => {}
-                Ok(Some(_)) => {}
-                Err(Abort::Revoked) => return SteadyEnd::Revoked,
-                Err(_) => return SteadyEnd::HelperGone,
-            }
-        }
-    }
-
-    pub enum SteadyEnd {
-        VmExited,
-        Revoked,
-        HelperGone,
     }
 
     /// Kills the allocation's `vm` subtree only through its proven journaled identity

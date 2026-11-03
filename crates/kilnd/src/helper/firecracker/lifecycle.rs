@@ -9,11 +9,14 @@ use super::*;
 use crate::helper::protocol::{GcOutcome, GcResult, StopReason, StopReply};
 
 /// Phases from which a stop may be recorded as complete.
-const STOPPABLE: [&str; 7] = [
+const STOPPABLE: [&str; 10] = [
     "intent",
     "preparing",
     "spawn_intent",
     "booting",
+    "ready",
+    "exec_intent",
+    "busy",
     "stop_intent",
     "stopped",
     "cleaning",
@@ -123,14 +126,23 @@ impl Node {
                         return false;
                     };
                     let wanted = match role {
-                        ChildRole::Jailer => Role::Jailer,
-                        ChildRole::Vm => Role::Firecracker,
+                        ChildRole::Jailer => Some(Role::Jailer),
+                        ChildRole::Vm => Some(Role::Firecracker),
+                        // Fork-only from S: the verified helper image they inherit.
+                        ChildRole::Relay | ChildRole::Console => None,
                     };
                     (
-                        entry.expected.iter().find(|e| e.role == wanted).copied(),
+                        match wanted {
+                            Some(wanted) => {
+                                entry.expected.iter().find(|e| e.role == wanted).copied()
+                            }
+                            None => self.config.helper_image,
+                        },
                         match role {
                             ChildRole::Jailer => "jailer",
                             ChildRole::Vm => "vm",
+                            ChildRole::Relay => "relay",
+                            ChildRole::Console => "console",
                         },
                     )
                 };
@@ -146,8 +158,18 @@ impl Node {
                             allocation: key.allocation,
                             spec: Box::new(WorkerIntentSpec {
                                 mode: mode.into(),
-                                allowed_names: vec!["vm".into()],
-                                cgroup: format!("{host}/vm/vmm"),
+                                allowed_names: vec![
+                                    match role {
+                                        ChildRole::Relay => "relay",
+                                        _ => "vm",
+                                    }
+                                    .into(),
+                                ],
+                                cgroup: match role {
+                                    ChildRole::Relay => format!("{host}/relay"),
+                                    ChildRole::Console => format!("{host}/vm/console"),
+                                    _ => format!("{host}/vm/vmm"),
+                                },
                                 image,
                             }),
                             target: process,
@@ -730,6 +752,7 @@ impl Node {
                 profile: profile_name,
                 control: Endpoint::new(child),
                 watch: watch_child,
+                descriptors: None,
             });
         })
         .map_err(|e| e.to_string())?;
@@ -913,9 +936,9 @@ impl Node {
         !self.probe_process(target).await.unwrap_or(false)
     }
 
-    /// Test-only: the dispatch-time check a later Exec must pass. It reads only memory:
-    /// the stop fence, S's exit, V's known exit and both monitors' health.
-    #[cfg(test)]
+    /// The dispatch-time check every Exec passes (B5; B4 exposed it to tests only). It
+    /// reads only memory: the stop fence, S's exit, V's known exit and both monitors'
+    /// health.
     pub(super) fn reusable_dispatch(&self, key: AllocationKey) -> bool {
         let healthy = self.monitor_healthy();
         self.supervisors

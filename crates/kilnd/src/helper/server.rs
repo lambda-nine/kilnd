@@ -273,9 +273,23 @@ async fn firecracker_request(
     deadline: WireDeadline,
     cancel: CancellationToken,
 ) -> io::Result<()> {
-    timeout(Duration::from_secs(2), fds::send(&stream.0, &[]))
-        .await
-        .map_err(io::Error::other)??;
+    let mut stream = stream;
+    // Only B5's Exec hands out descriptors: the three opposite stdio endpoints, kept
+    // until the caller's receipt, exactly as for kiln's Exec.
+    let stdio = if matches!(request.operation, FirecrackerOperation::Exec { .. }) {
+        let [input, output, error] = timeout(Duration::from_secs(2), handoff_stdio(&mut stream))
+            .await
+            .map_err(io::Error::other)??;
+        let owned = |socket: Socket| -> io::Result<std::os::fd::OwnedFd> {
+            Ok(socket.0.into_std()?.into())
+        };
+        Some([owned(input)?, owned(output)?, owned(error)?])
+    } else {
+        timeout(Duration::from_secs(2), fds::send(&stream.0, &[]))
+            .await
+            .map_err(io::Error::other)??;
+        None
+    };
     // The connector's own pidfd, taken before any reply. A kernel that can't supply one
     // gets no authority at all. A live connector holds its number, so the PID below is
     // really this connection's, and a socket left behind by a process whose PID was
@@ -308,7 +322,7 @@ async fn firecracker_request(
             "only reserved recovery slots remain",
         )),
         Some(node) => {
-            let operation = node.handle(request, peer, pin, deadline, &waiter);
+            let operation = node.handle_with_stdio(request, peer, pin, deadline, &waiter, stdio);
             tokio::pin!(operation);
             tokio::select! {
                 response = &mut operation => response,

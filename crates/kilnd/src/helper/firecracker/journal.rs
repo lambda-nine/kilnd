@@ -70,8 +70,8 @@ CREATE TABLE allocations (
     work_uuid TEXT NOT NULL,
     stop_authority TEXT NOT NULL,
     phase TEXT NOT NULL CHECK (phase IN
-        ('intent','preparing','spawn_intent','booting','stop_intent','stopped','cleaning',
-         'quarantined','absent')),
+        ('intent','preparing','spawn_intent','booting','ready','exec_intent','busy',
+         'stop_intent','stopped','cleaning','quarantined','absent')),
     created_generation INTEGER NOT NULL CHECK (created_generation >= 1),
     updated_generation INTEGER NOT NULL CHECK (updated_generation >= created_generation),
     PRIMARY KEY (instance_id, allocation_id),
@@ -186,7 +186,8 @@ CREATE TABLE resource_events (
     allocation_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN
         ('intent','cgroup','work_dir','work_file','private_files','loop_intent','loop',
-         'loop_released','jail_intent','jail_dir','jail_mount','jail_binds','vmm')),
+         'loop_released','jail_intent','jail_dir','jail_mount','jail_binds','vmm','broker',
+         'exec')),
     detail TEXT NOT NULL,
     generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
     FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
@@ -2028,7 +2029,8 @@ impl Ledger {
             .prepare_cached(
                 "UPDATE allocations SET updated_generation = ?3
                  WHERE instance_id = ?1 AND allocation_id = ?2
-                   AND phase IN ('preparing','spawn_intent','booting','stop_intent','stopped','cleaning')",
+                   AND phase IN ('preparing','spawn_intent','booting','ready','exec_intent','busy',
+                                 'stop_intent','stopped','cleaning')",
             )?
             .execute(params![
                 instance.to_string(),

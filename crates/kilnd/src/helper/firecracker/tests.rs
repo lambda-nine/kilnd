@@ -4891,6 +4891,8 @@ fn fixture_child_does_nothing_without_its_environment() {
     node_fixture_child();
 }
 
+#[cfg(target_os = "linux")]
+mod broker;
 mod control_plane;
 #[cfg(target_os = "linux")]
 mod lifecycle;

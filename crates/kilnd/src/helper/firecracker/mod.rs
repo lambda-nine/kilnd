@@ -4,8 +4,11 @@
 //! everything here is in-memory checks and dispatch to worker processes. It performs
 //! no filesystem, SQLite, hashing or `/proc` work on the socket runtime. No reply can
 //! say READY: that needs B5's broker, and production profiles stay refused until B7.
+pub mod broker;
 pub mod cgroup;
 pub mod config;
+pub mod console;
+pub mod exec;
 pub mod executable;
 pub mod identity;
 pub mod inventory;
@@ -383,6 +386,14 @@ struct SupervisorEntry {
     kill_inflight: bool,
     /// The revoke actually reached S's bounded write queue.
     revoke_sent: bool,
+    /// B5: H's end of S's descriptor socket, for an execution's stdio.
+    descriptors: Option<Arc<std::os::unix::net::UnixDatagram>>,
+    /// B5: the broker's journaled boot and inner sandbox once READY.
+    ready: Option<(String, String)>,
+    /// B5: the execution token between EXEC_INTENT and its settlement.
+    busy: Option<Id128>,
+    /// B5: waiters for relay reports, by job.
+    jobs: HashMap<u64, mpsc::UnboundedSender<broker::RelayReport>>,
 }
 
 impl SupervisorEntry {
@@ -408,6 +419,10 @@ impl SupervisorEntry {
             contained: None,
             kill_inflight: false,
             revoke_sent: false,
+            descriptors: None,
+            ready: None,
+            busy: None,
+            jobs: HashMap::new(),
         }
     }
 }
@@ -1835,6 +1850,20 @@ impl Node {
         deadline: WireDeadline,
         cancel: &CancellationToken,
     ) -> FirecrackerResponse {
+        self.handle_with_stdio(request, peer, pin, deadline, cancel, None)
+            .await
+    }
+
+    /// As [`Self::handle`], with an Exec's helper-side stdio ends (B5).
+    pub async fn handle_with_stdio(
+        self: &Arc<Self>,
+        request: FirecrackerRequest,
+        peer: PeerCredentials,
+        pin: Option<PeerPin>,
+        deadline: WireDeadline,
+        cancel: &CancellationToken,
+        stdio: Option<[std::os::fd::OwnedFd; 3]>,
+    ) -> FirecrackerResponse {
         let instance = request.instance_id;
         let epoch = request.connection_epoch;
         if let FirecrackerOperation::AttachInstance { database_uuid } = request.operation {
@@ -2010,6 +2039,77 @@ impl Node {
                     })
                     .await;
                 FirecrackerResponse::Gc(reply)
+            }
+            FirecrackerOperation::Validate {
+                allocation_id,
+                expected_boot_id,
+                expected_inner_id,
+            } => {
+                if !self.is_holder(instance, peer) || !self.epoch_valid(instance, epoch, peer) {
+                    return group_error(
+                        GroupErrorKind::Unauthorized,
+                        "this process does not hold the instance",
+                    );
+                }
+                let key = AllocationKey {
+                    instance,
+                    allocation: allocation_id,
+                };
+                let node = self.clone();
+                let work = tokio::spawn(async move {
+                    node.validate_op(key, expected_boot_id, expected_inner_id, deadline)
+                        .await
+                });
+                match work.await {
+                    Ok(reply) => FirecrackerResponse::Validate(reply),
+                    Err(_) => group_error(GroupErrorKind::Unavailable, "validation panicked"),
+                }
+            }
+            FirecrackerOperation::Exec {
+                allocation_id,
+                expected_boot_id,
+                execution_token,
+                execution_id,
+                argv,
+                stdin_bytes,
+                max_output,
+            } => {
+                if !self.is_holder(instance, peer) || !self.epoch_valid(instance, epoch, peer) {
+                    return group_error(
+                        GroupErrorKind::Unauthorized,
+                        "this process does not hold the instance",
+                    );
+                }
+                let Some(stdio) = stdio else {
+                    return group_error(GroupErrorKind::Unavailable, "no execution stdio");
+                };
+                let key = AllocationKey {
+                    instance,
+                    allocation: allocation_id,
+                };
+                // Its own task: the caller's disconnect is an interruption the work
+                // itself carries through the stop barrier, never a dropped future.
+                let node = self.clone();
+                let waiter = cancel.clone();
+                let work = tokio::spawn(async move {
+                    node.exec_op(
+                        key,
+                        expected_boot_id,
+                        execution_token,
+                        execution_id,
+                        argv,
+                        stdin_bytes,
+                        max_output,
+                        stdio,
+                        deadline,
+                        waiter,
+                    )
+                    .await
+                });
+                match work.await {
+                    Ok(reply) => FirecrackerResponse::Exec(Box::new(reply)),
+                    Err(_) => group_error(GroupErrorKind::Unavailable, "execution panicked"),
+                }
             }
             #[cfg(test)]
             FirecrackerOperation::TestDispatchProbe { allocation_id } => {
@@ -2809,7 +2909,17 @@ impl Node {
         let (host, child) = StdUnixStream::pair().map_err(unavailable)?;
         let (watch_monitor, watch_child) = StdUnixStream::pair().map_err(unavailable)?;
         watch_child.set_nonblocking(true).map_err(unavailable)?;
-        let mut keep = vec![child.as_raw_fd(), watch_child.as_raw_fd()];
+        // B5: an execution's stdio crosses to S on its own socket, never the frames.
+        let (descriptors_host, descriptors_child) =
+            std::os::unix::net::UnixDatagram::pair().map_err(unavailable)?;
+        descriptors_host
+            .set_nonblocking(true)
+            .map_err(unavailable)?;
+        let mut keep = vec![
+            child.as_raw_fd(),
+            watch_child.as_raw_fd(),
+            descriptors_child.as_raw_fd(),
+        ];
         keep.extend(self.config.table_fds());
         let inherited = self.config.clone();
         let instance = token.instance;
@@ -2824,12 +2934,14 @@ impl Node {
                 profile: profile_name,
                 control: Endpoint::new(child),
                 watch: watch_child,
+                descriptors: Some(descriptors_child),
             });
         })
         .map_err(unavailable)?;
         let (channel, events) = Channel::spawn(host, CONTROL_QUEUE, 0).map_err(unavailable)?;
         let mut entry = SupervisorEntry::new(pid, channel.clone(), worker_id);
         entry.expected = expected.clone();
+        entry.descriptors = Some(Arc::new(descriptors_host));
         self.supervisors.lock().unwrap().insert(key, entry);
         tokio::spawn(Self::supervisor_events(self.clone(), key, events));
         // A failure before the gate means S exits on EOF with nothing done. It is not
@@ -3041,6 +3153,27 @@ impl Node {
                         entry.vm_gone = false;
                     }
                     self.contain_allocation(key, "the VMM exited");
+                }
+                SupervisorEvent::Ready { boot_id, inner_id } => {
+                    if let Some(entry) = self.supervisors.lock().unwrap().get_mut(&key) {
+                        entry.ready = Some((boot_id, inner_id));
+                    }
+                }
+                SupervisorEvent::Broker { report } => {
+                    let job = report.job();
+                    let mut supervisors = self.supervisors.lock().unwrap();
+                    if let Some(entry) = supervisors.get_mut(&key) {
+                        let finished = report.is_final();
+                        if let Some(waiter) = entry.jobs.get(&job) {
+                            let _ = waiter.send(report);
+                        }
+                        if finished {
+                            entry.jobs.remove(&job);
+                        }
+                    }
+                }
+                SupervisorEvent::Retire { reason } => {
+                    self.contain_allocation(key, &format!("retired: {reason}"));
                 }
                 SupervisorEvent::CleanedUp | SupervisorEvent::CleanupFailed { .. } => {
                     let result = match event {
@@ -3449,10 +3582,29 @@ impl Node {
                         reason: "the process monitor is not healthy".into(),
                     }
                 } else {
-                    InspectReply::PresentBusy {
-                        generation,
-                        phase,
-                        plan_digest: None,
+                    let ready = self
+                        .supervisors
+                        .lock()
+                        .unwrap()
+                        .get(&AllocationKey {
+                            instance,
+                            allocation,
+                        })
+                        .filter(|entry| entry.busy.is_none())
+                        .and_then(|entry| entry.ready.clone());
+                    match ready {
+                        Some((boot_id, inner_id)) if phase == "ready" => {
+                            InspectReply::PresentReady {
+                                generation,
+                                boot_id,
+                                inner_id,
+                            }
+                        }
+                        _ => InspectReply::PresentBusy {
+                            generation,
+                            phase,
+                            plan_digest: None,
+                        },
                     }
                 }
             }

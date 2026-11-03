@@ -194,7 +194,7 @@ impl Real {
         }
     }
 
-    fn phase(&self, allocation: Id128) -> String {
+    pub(super) fn phase(&self, allocation: Id128) -> String {
         self.fixture.read(|view| {
             view.query_row(
                 "SELECT phase FROM allocations WHERE allocation_id = ?1",
@@ -219,7 +219,7 @@ impl Real {
         })
     }
 
-    fn vmm(&self, allocation: Id128) -> Option<ProcessId> {
+    pub(super) fn vmm(&self, allocation: Id128) -> Option<ProcessId> {
         self.resources(allocation)
             .into_iter()
             .find_map(|record| match record {
@@ -267,11 +267,13 @@ impl Real {
         })
     }
 
-    async fn wait_phase(&self, allocation: Id128, phase: &str) {
+    pub(super) async fn wait_phase(&self, allocation: Id128, phase: &str) {
         let end = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             let now = self.phase(allocation);
-            if now == phase {
+            // Since B5 the guest has a broker, so a booted VM moves on to READY within
+            // seconds; a test that waits for a booted VM accepts either.
+            if now == phase || (phase == "booting" && now == "ready") {
                 return;
             }
             assert!(
@@ -442,8 +444,10 @@ async fn b4_linux_root_create_boots_and_remove_leaves_nothing() {
             ]),
             expected
         );
-        // Readiness does not exist without the broker.
-        assert_eq!(real.phase(context.allocation_id), "booting");
+        // Since B5 the booted VM is READY once the broker answered; B4's own claim is
+        // only that it booted.
+        let phase = real.phase(context.allocation_id);
+        assert!(phase == "booting" || phase == "ready", "{phase}");
         let reply = remove(&real, &runtime, &context).await;
         assert!(is_absent(&reply), "{reply:?}\n{}", real.fixture.log());
         assert_eq!(host_leftovers(&real, &context, Some(vmm)), Vec::<String>::new());
@@ -572,7 +576,7 @@ fn vm_subtree_empty(context: &CreateContext) -> bool {
     }
 }
 
-fn worker_pid(real: &Real, allocation: Id128, mode: &str) -> Option<ProcessId> {
+pub(super) fn worker_pid(real: &Real, allocation: Id128, mode: &str) -> Option<ProcessId> {
     real.fixture.read(|view| {
         use rusqlite::OptionalExtension;
         view.query_row(

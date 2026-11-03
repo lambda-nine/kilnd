@@ -571,6 +571,7 @@ dependencies = [
  "h2",
  "hyper-util",
  "kilnd-api",
+ "kilnd-broker-protocol",
  "kilnd-exec-core",
  "libc",
  "prost",

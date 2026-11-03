@@ -136,14 +136,14 @@ pub fn monotonic_ns() -> u64 {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Envelope<T> {
+pub(super) struct Envelope<T> {
     /// Zero marks an unsolicited event; a request's reply echoes its nonzero ID.
-    id: u64,
-    deadline_ns: u64,
-    body: T,
+    pub(super) id: u64,
+    pub(super) deadline_ns: u64,
+    pub(super) body: T,
 }
 
-fn encode_frame<T: Serialize>(envelope: &Envelope<T>) -> io::Result<Vec<u8>> {
+pub(super) fn encode_frame<T: Serialize>(envelope: &Envelope<T>) -> io::Result<Vec<u8>> {
     let body = serde_json::to_vec(envelope).map_err(io::Error::other)?;
     if body.is_empty() || body.len() > MAX_IPC_FRAME {
         return Err(io::Error::other("worker frame size exceeded"));
@@ -1736,6 +1736,8 @@ pub enum SupervisorCommand {
     /// A fence revoked every future permit: stop and exit.
     Revoke,
     Tick,
+    /// B5: one broker job for a READY S (Probe, Exec or Cancel).
+    Broker(super::broker::BrokerCommand),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1769,6 +1771,19 @@ pub enum SupervisorEvent {
     CleanupFailed {
         reason: String,
     },
+    /// B5: the broker handshake and Initialize succeeded; READY is journaled.
+    Ready {
+        boot_id: String,
+        inner_id: String,
+    },
+    /// B5: one relay report for a job H gave.
+    Broker {
+        report: super::broker::RelayReport,
+    },
+    /// B5: a console, relay or transport breach; S contained the VM subtree.
+    Retire {
+        reason: String,
+    },
 }
 
 /// What a supervisor owns besides itself. It reaches other processes only through
@@ -1781,6 +1796,9 @@ pub struct SupervisorContext {
     pub control: Endpoint,
     /// Heartbeats to M. Its EOF is how M learns S is gone.
     pub watch: std::os::unix::net::UnixStream,
+    /// B5: H's descriptor socket, which carries an execution's stdio. Absent for a
+    /// cleanup-only S.
+    pub descriptors: Option<UnixDatagram>,
 }
 
 pub(super) fn send_watch_byte(watch: &std::os::unix::net::UnixStream, byte: u8) {
@@ -1900,7 +1918,8 @@ pub fn supervisor_main(mut context: SupervisorContext) {
                             return;
                         }
                     }
-                    SupervisorCommand::Recorded { .. } => {}
+                    // Broker jobs reach only a READY S's steady loop.
+                    SupervisorCommand::Recorded { .. } | SupervisorCommand::Broker(_) => {}
                     SupervisorCommand::OpenGate {
                         allowed_names,
                         expected,
@@ -1984,7 +2003,7 @@ fn real_supervisor(
     deadline_ns: u64,
     plan_generation: u64,
 ) {
-    use super::supervisor::{Abort, LaunchPlan, Link, SteadyEnd};
+    use super::supervisor::{Abort, LaunchPlan, Link};
     let parsed = match LaunchPlan::parse(plan.as_bytes()) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -2000,29 +2019,20 @@ fn real_supervisor(
         }
     };
     let mut created = None;
+    let descriptors = context.descriptors.take();
     let mut link = Link::new(context, deadline_ns);
     let result =
         super::supervisor::launch(&mut link, &parsed, expected, plan_generation, &mut created);
     let end = match result {
         Ok(mut booted) => {
             link.event(&SupervisorEvent::Booting);
-            // After BOOTING, no forward deadline applies: the steady loop only watches.
-            match super::supervisor::steady(&mut link, &mut booted) {
-                SteadyEnd::VmExited => {
-                    link.event(&SupervisorEvent::VmExited);
-                    let _ = super::supervisor::contain(&parsed, created.as_ref());
-                    // Stay owned until H revokes: cleanup is Remove's, by its own S.
-                    loop {
-                        link.beat();
-                        match link.poll(Duration::from_millis(20)) {
-                            Ok(_) => {}
-                            Err(_) => break,
-                        }
-                    }
-                }
-                SteadyEnd::Revoked | SteadyEnd::HelperGone => {}
-            }
-            None
+            booted_supervisor(
+                &mut link,
+                &parsed,
+                &mut booted,
+                descriptors,
+                created.as_ref(),
+            )
         }
         Err(abort) => Some(abort),
     };
@@ -2034,6 +2044,54 @@ fn real_supervisor(
     }
     drop(link);
     send_watch_byte(&context.watch, b'E');
+}
+
+/// B5: after BOOTING, D and R, readiness through the broker, then the steady loop.
+/// Every way out stops both workers and contains the VM subtree; a VM exit or a breach
+/// stays owned until H revokes, since cleanup is Remove's, by its own S.
+#[cfg(target_os = "linux")]
+fn booted_supervisor(
+    link: &mut super::supervisor::Link<'_>,
+    parsed: &super::supervisor::LaunchPlan,
+    booted: &mut super::supervisor::Booted,
+    descriptors: Option<UnixDatagram>,
+    created: Option<&super::cgroup::CgroupIdentity>,
+) -> Option<super::supervisor::Abort> {
+    use super::broker::supervise::{self, SteadyEnd};
+    use super::supervisor::Abort;
+    let mut workers = match supervise::start(link, parsed, booted) {
+        Ok(workers) => workers,
+        Err(abort) => return Some(abort),
+    };
+    if let Err(abort) = supervise::ready(link, parsed, booted, &mut workers) {
+        workers.stop();
+        return Some(abort);
+    }
+    let Some(descriptors) = descriptors else {
+        workers.stop();
+        return Some(Abort::Refused("no descriptor socket".into()));
+    };
+    let end = supervise::steady(link, booted, &mut workers, &descriptors);
+    let reported = match end {
+        SteadyEnd::VmExited => Some(SupervisorEvent::VmExited),
+        SteadyEnd::Retire(reason) => Some(SupervisorEvent::Retire { reason }),
+        SteadyEnd::Revoked | SteadyEnd::HelperGone => None,
+    };
+    // Contain first: a breach retires the VM before anything is reported.
+    let _ = super::supervisor::contain(parsed, created);
+    workers.stop();
+    // A subreaper accumulates no zombies; R and D were reaped by their handles above.
+    super::supervisor::reap_strays(&[]);
+    if let Some(event) = reported {
+        link.event(&event);
+        loop {
+            link.beat();
+            if link.poll(Duration::from_millis(20)).is_err() {
+                break;
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(target_os = "linux"))]

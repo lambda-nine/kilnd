@@ -531,6 +531,7 @@ impl Runtime for FirecrackerRuntime {
                     .map(|record| BackendRecord {
                         id: format!("fc-{}", record.allocation_id),
                         status: match record.status {
+                            ListStatus::Ready => BackendStatus::Ready,
                             ListStatus::Busy => BackendStatus::Busy,
                             ListStatus::StoppedWithResources => BackendStatus::StoppedWithResources,
                             ListStatus::Stale => BackendStatus::Stale,
