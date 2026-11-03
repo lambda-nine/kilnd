@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/kilnd-api", "crates/kilnd", "crates/kilndctl"]
+members = [
+    "crates/kilnd-api",
+    "crates/kilnd-exec-core",
+    "crates/kilnd",
+    "crates/kilndctl",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -33,3 +38,4 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 kilnd-api = { path = "crates/kilnd-api" }
+kilnd-exec-core = { path = "crates/kilnd-exec-core" }

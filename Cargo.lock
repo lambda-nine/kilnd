@@ -571,6 +571,7 @@ dependencies = [
  "h2",
  "hyper-util",
  "kilnd-api",
+ "kilnd-exec-core",
  "libc",
  "prost",
  "rusqlite",
@@ -596,6 +597,19 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "kilnd-exec-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

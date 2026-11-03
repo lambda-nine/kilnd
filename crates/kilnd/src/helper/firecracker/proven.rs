@@ -1242,15 +1242,23 @@ mod tests {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files: Vec<_> = rust_files(&src.join("helper"), true);
         files.push(src.join("sys.rs"));
+        // Phase 1b B5 moved the child setup's capability and prctl wrappers to the
+        // direct-kiln core crate's own typed `sys` module; it is held to the same rule.
+        let core_sys =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kilnd-exec-core/src/sys.rs");
+        assert!(
+            core_sys.is_file(),
+            "the core crate's sys module was not found"
+        );
+        files.push(core_sys);
         assert!(files.len() > 15, "the helper sources were not found");
         let mut offenders = Vec::new();
         let mut allowed_hits = [0; ALLOWED.len()];
         for path in files {
-            let relative = path
-                .strip_prefix(&src)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
+            let relative = path.strip_prefix(&src).map_or_else(
+                |_| "kilnd-exec-core/src/sys.rs".to_string(),
+                |relative| relative.to_string_lossy().into_owned(),
+            );
             if relative == "helper/firecracker/proven.rs" {
                 continue;
             }
@@ -1263,7 +1271,7 @@ mod tests {
                     code = code.replace(&expression, " ");
                 }
             }
-            let raw_allowed = relative == "sys.rs";
+            let raw_allowed = relative == "sys.rs" || relative == "kilnd-exec-core/src/sys.rs";
             for needle in DESTRUCTIVE
                 .iter()
                 .chain(RAW.iter().filter(|_| !raw_allowed))
@@ -1306,31 +1314,55 @@ mod tests {
     #[test]
     fn disallowed_allows_only_in_approved_modules() {
         const INNER: &str = "<the whole module>";
-        // (file under crates/kilnd, item the allow is on, why).
-        const APPROVED: [(&str, &str, &str); 7] = [
+        // (crate, file under that crate, item the allow is on, why). Phase 1b B5 moved
+        // the subprocess runner, the kiln probe/exec owner and the child setup's
+        // capability and prctl wrappers to kilnd-exec-core unchanged, so their allows
+        // moved with them; the wrapper subset is that crate's own typed `sys` module.
+        const APPROVED: [(&str, &str, &str, &str); 8] = [
             (
+                "kilnd",
                 "src/helper/firecracker/proven.rs",
                 INNER,
                 "the destructive-action gate",
             ),
-            ("src/sys.rs", INNER, "the typed syscall and ioctl wrappers"),
             (
+                "kilnd",
+                "src/sys.rs",
+                INNER,
+                "the typed syscall and ioctl wrappers",
+            ),
+            (
+                "kilnd-exec-core",
+                "src/sys.rs",
+                INNER,
+                "the child setup's typed capget/capset and fixed prctl wrappers",
+            ),
+            (
+                "kilnd-exec-core",
                 "src/process.rs",
                 "pub async fn run(",
                 "the fixed-tool subprocess runner",
             ),
             (
+                "kilnd-exec-core",
                 "src/runtime/kiln_process.rs",
                 "pub async fn probe(",
                 "the kiln probe",
             ),
-            ("src/runtime/kiln_process.rs", "pub fn spawn(", "kiln exec"),
             (
+                "kilnd-exec-core",
+                "src/runtime/kiln_process.rs",
+                "pub fn spawn(",
+                "kiln exec",
+            ),
+            (
+                "kilnd-exec-core",
                 "src/runtime/kiln_process.rs",
                 "pub async fn kill_reap(",
                 "its own child",
             ),
             (
+                "kilnd",
                 "src/lock.rs",
                 "fn finish_acquire(",
                 "truncating this process's own verified lock file",
@@ -1418,16 +1450,15 @@ mod tests {
                         && (relative.starts_with("tests/")
                             || (relative.ends_with("/tests.rs")
                                 && declared_for_tests(&krate, &relative)));
-                    if crate_name == "kilnd"
-                        && let Some(at) = APPROVED.iter().position(|(file, approved, _)| {
-                            *file == relative
-                                && if inner {
-                                    *approved == INNER
-                                } else {
-                                    item.starts_with(approved)
-                                }
-                        })
-                    {
+                    if let Some(at) = APPROVED.iter().position(|(krate, file, approved, _)| {
+                        *krate == crate_name
+                            && *file == relative
+                            && if inner {
+                                *approved == INNER
+                            } else {
+                                item.starts_with(approved)
+                            }
+                    }) {
                         hits[at] += 1;
                     } else if !(test_module || test_file) {
                         offenders.push(format!(
@@ -1444,10 +1475,10 @@ mod tests {
             "unapproved lint exceptions:\n{}",
             offenders.join("\n")
         );
-        for (index, (file, item, _)) in APPROVED.iter().enumerate() {
+        for (index, (krate, file, item, _)) in APPROVED.iter().enumerate() {
             assert_eq!(
                 hits[index], 1,
-                "the approved allow on {file} `{item}` must occur exactly once"
+                "the approved allow on {krate}/{file} `{item}` must occur exactly once"
             );
         }
         // Nothing outside the sources may lower the lint.
@@ -1746,7 +1777,7 @@ mod tests {
                  time recheck rejects a redirected link (design 7.1)",
             ),
             (
-                "kilnd/src/runtime/kiln_direct.rs",
+                "kilnd-exec-core/src/runtime/kiln_direct.rs",
                 "exec/cgroup.events",
                 "reads kiln's own exec scope events; never written",
             ),

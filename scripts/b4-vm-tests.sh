@@ -22,15 +22,20 @@ export CARGO_TARGET_DIR=${B4_TARGET_DIR:-$HOME/.cache/kilnd-target-static}
 export RUSTFLAGS="-C target-feature=+crt-static"
 target=aarch64-unknown-linux-gnu
 
-lib=$(cargo test --locked -p kilnd --lib --no-run --target "$target" --message-format=json \
+# kilnd's library tests, and since Phase 1b B5 the direct-kiln core's, which hold the
+# moved capability-drop regression (process::tests).
+built=$(cargo test --locked -p kilnd -p kilnd-exec-core --lib --no-run --target "$target" \
+    --message-format=json \
     | python3 -I -c '
 import json, sys
 for line in sys.stdin:
     m = json.loads(line)
-    if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "kilnd" and m["profile"]["test"]:
-        print(m["executable"])
+    if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] in ("kilnd", "kilnd_exec_core") and m["profile"]["test"]:
+        print(m["target"]["name"], m["executable"])
 ')
-[ -n "$lib" ] || { echo "library test binary not found" >&2; exit 1; }
+lib=$(printf '%s\n' "$built" | awk '$1 == "kilnd" { print $2 }')
+core=$(printf '%s\n' "$built" | awk '$1 == "kilnd_exec_core" { print $2 }')
+[ -n "$lib" ] && [ -n "$core" ] || { echo "library test binaries not found" >&2; exit 1; }
 
 work=$(mktemp -d /tmp/b4-tests.XXXXXX)
 cleanup() {
@@ -51,6 +56,7 @@ sudo install -m 0444 -o root -g root "$guest/rootfs.squashfs" "$work/artifacts/r
 # A stripped static copy is the helper image: it is hashed at every helper start.
 sudo install -m 0755 -o root -g root "$lib" "$work/kilnd-lib-tests"
 sudo strip --strip-debug "$work/kilnd-lib-tests"
+sudo install -m 0755 -o root -g root "$core" "$work/kilnd-exec-core-tests"
 sudo chmod 0711 "$work"
 
 # Exactly deploy/kilnd-helper.service's bounding set, from exec, for every thread: the
@@ -59,3 +65,6 @@ caps=-all,+chown,+dac_override,+fowner,+kill,+setgid,+setuid,+setpcap,+net_admin
 sudo setpriv --bounding-set="$caps" --inh-caps=-all \
     env KILND_B4_ARTIFACTS="$work/artifacts" RUST_BACKTRACE=${RUST_BACKTRACE:-1} \
     "$work/kilnd-lib-tests" --ignored --test-threads=1 --nocapture "$filter"
+sudo setpriv --bounding-set="$caps" --inh-caps=-all \
+    env RUST_BACKTRACE=${RUST_BACKTRACE:-1} \
+    "$work/kilnd-exec-core-tests" --ignored --test-threads=1 --nocapture "$filter"

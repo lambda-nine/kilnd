@@ -67,6 +67,9 @@ mod linux {
         sys_ret(unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) }).map(drop)
     }
 
+    // Phase 1b B5 moved the thread capability calls to the direct-kiln core crate.
+    pub use kilnd_exec_core::sys::{CapData, CapHeader, capget, capset};
+
     /// A pidfd for `pid`, which pins that process object from now on.
     pub fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
         // SAFETY: pidfd_open takes a PID and flags and returns a new descriptor.
@@ -88,34 +91,6 @@ mod linux {
                 0,
             ) == 0
         }
-    }
-
-    /// `_LINUX_CAPABILITY_VERSION_3`'s header.
-    #[repr(C)]
-    pub struct CapHeader {
-        pub version: u32,
-        pub pid: i32,
-    }
-
-    /// One of the two `_LINUX_CAPABILITY_VERSION_3` data words.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct CapData {
-        pub effective: u32,
-        pub permitted: u32,
-        pub inheritable: u32,
-    }
-
-    /// The calling thread's capability sets. Async-signal-safe.
-    pub fn capget(header: &mut CapHeader, data: &mut [CapData; 2]) -> io::Result<()> {
-        // SAFETY: header and two data words are live, correctly sized storage.
-        sys_ret(unsafe { libc::syscall(libc::SYS_capget, header, data.as_mut_ptr()) }).map(drop)
-    }
-
-    /// Sets the calling thread's capability sets. Async-signal-safe.
-    pub fn capset(header: &mut CapHeader, data: &[CapData; 2]) -> io::Result<()> {
-        // SAFETY: header and data are live, correctly sized storage.
-        sys_ret(unsafe { libc::syscall(libc::SYS_capset, header, data.as_ptr()) }).map(drop)
     }
 
     /// `execveat(fd, "", argv, envp, AT_EMPTY_PATH)`: runs the image the descriptor
@@ -146,65 +121,13 @@ mod linux {
 
     /// Fixed `prctl` requests on the calling thread or process. Each returns the raw
     /// `prctl` result; all are async-signal-safe and allocation-free, for use between
-    /// fork and exec.
+    /// fork and exec. Phase 1b B5 moved the capability, no-new-privs and parent-death
+    /// requests to the direct-kiln core crate with the child setup that issues them.
     pub mod prctl {
-        /// `PR_CAP_AMBIENT_IS_SET` of one capability.
-        pub fn cap_ambient_is_set(cap: u32) -> libc::c_int {
-            // SAFETY: integer arguments only.
-            unsafe {
-                libc::prctl(
-                    libc::PR_CAP_AMBIENT,
-                    libc::PR_CAP_AMBIENT_IS_SET as libc::c_ulong,
-                    cap as libc::c_ulong,
-                    0,
-                    0,
-                )
-            }
-        }
-
-        /// `PR_CAP_AMBIENT_LOWER` of one capability.
-        pub fn cap_ambient_lower(cap: u32) -> libc::c_int {
-            // SAFETY: integer arguments only.
-            unsafe {
-                libc::prctl(
-                    libc::PR_CAP_AMBIENT,
-                    libc::PR_CAP_AMBIENT_LOWER as libc::c_ulong,
-                    cap as libc::c_ulong,
-                    0,
-                    0,
-                )
-            }
-        }
-
-        /// `PR_CAPBSET_READ` of one capability.
-        pub fn capbset_read(cap: u32) -> libc::c_int {
-            // SAFETY: integer arguments only.
-            unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap as libc::c_ulong, 0, 0, 0) }
-        }
-
-        /// `PR_CAPBSET_DROP` of one capability from the calling thread's bounding set.
-        pub fn capbset_drop(cap: u32) -> libc::c_int {
-            // SAFETY: integer arguments only.
-            unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) }
-        }
-
-        /// `PR_SET_NO_NEW_PRIVS` to 1 (it cannot be cleared).
-        pub fn set_no_new_privs() -> libc::c_int {
-            // SAFETY: integer arguments only.
-            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }
-        }
-
-        /// `PR_GET_NO_NEW_PRIVS`.
-        pub fn get_no_new_privs() -> libc::c_int {
-            // SAFETY: integer arguments only.
-            unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) }
-        }
-
-        /// `PR_SET_PDEATHSIG` to `SIGKILL`: the calling child dies with its parent.
-        pub fn set_parent_death_kill() -> libc::c_int {
-            // SAFETY: integer arguments only.
-            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) }
-        }
+        pub use kilnd_exec_core::sys::prctl::{
+            cap_ambient_is_set, cap_ambient_lower, capbset_drop, capbset_read, get_no_new_privs,
+            set_no_new_privs, set_parent_death_kill,
+        };
 
         /// `PR_SET_CHILD_SUBREAPER` to 1 on the calling process.
         pub fn set_child_subreaper() -> libc::c_int {
