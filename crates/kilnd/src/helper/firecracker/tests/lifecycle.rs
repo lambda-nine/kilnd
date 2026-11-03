@@ -1426,7 +1426,11 @@ async fn b4_linux_root_stalled_classes_and_full_pools_keep_capabilities_inspect_
             began.elapsed()
         );
         assert!(
-            matches!(healthy_view, InspectReply::PresentBusy { .. }),
+            // B5: a healthy boot is still booting or already READY.
+            matches!(
+                healthy_view,
+                InspectReply::PresentBusy { .. } | InspectReply::PresentReady { .. }
+            ),
             "{step}: {healthy_view:?}"
         );
         // The stalled allocation's own Stop is bounded and honest: its S cannot exit.
@@ -1491,7 +1495,7 @@ async fn b4_linux_root_stalled_classes_and_full_pools_keep_capabilities_inspect_
     timed_capabilities(&healthy_runtime, &real.fixture).await;
     assert!(matches!(
         inspect(&real, &healthy_runtime, &healthy, 5).await,
-        InspectReply::PresentBusy { .. }
+        InspectReply::PresentBusy { .. } | InspectReply::PresentReady { .. }
     ));
     assert!(matches!(
         stop_within(&real, &healthy_runtime, &healthy, 30).await,
