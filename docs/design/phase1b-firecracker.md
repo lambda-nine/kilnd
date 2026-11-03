@@ -589,7 +589,7 @@ Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no laz
 - *Out of scope:* host root mutating one of our own resources in place, during teardown — for example `LOOP_SET_STATUS64` on our attachment between cleanup's comparison and `LOOP_CLR_FD`, which leaves the disk sequence number unchanged. Host root is trusted and the kernel has no compare-and-clear; detaching an attachment whose generation (disk sequence number and backing inode) matches is correct, because it is ours.
 - *Kernel facts relied on,* verified on the VM's 6.8.0-147 by `b4_linux_root_kernel_generation_ids_are_never_reused`: a replacement tmpfs gets a new unique mount ID although the reusable tuple is reused; a detached mount keeps its unique ID when attached; detach plus reattach of the same slot, inode and tuple changes the disk sequence number; `LOOP_SET_STATUS64` does not. B4 recheck 2 added, on the same kernel: ext4 gave a recreated work file the deleted file's inode number at once, with a later birth time (`b4_linux_root_cleanup_refuses_a_work_file_reusing_the_inode`). Also observed: while cleanup's descriptor on a slot is open, another opener's `LOOP_CLR_FD` only marks it autoclear and a rebinding `LOOP_CONFIGURE` fails `EBUSY`, so a replacement cannot land inside cleanup's own comparison-to-clear window. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
 
-**The destructive-action invariant (B4 recheck 3, November 2, 2026).** No destructive action may run on a resource unless the caller holds proof that the resource's current generation equals a durable journaled generation from the current boot. A resource with no such proof is Unknown: it stays charged, nothing is done to it, and it never counts toward ABSENT. The destructive actions are signals (`pidfd_send_signal`, `kill`), writes to `cgroup.kill`, `rmdir` of a cgroup or directory, `unlink` of a file, `umount2` and `LOOP_CLR_FD`. The type system enforces it: `crates/kilnd/src/helper/firecracker/proven.rs` holds one proof type per resource kind (`ProvenProcess`, `ProvenCgroupVm` and `ProvenCgroupTree`, `ProvenFile`, `ProvenDir`, `ProvenMount`, `ProvenLoop`), none `Clone` and none constructible outside that module. Only its verification functions make them, each from the journaled identity, the current boot ID and the live kernel object, returning `Result<Proven*, Unprovable>` (`Gone`, `Replaced` or `Unknown`). Every destructive helper takes its proof, and the raw system calls appear nowhere else in the helper: the CI unit test `proven::tests::no_destructive_call_outside_the_gate` fails if one does, apart from the allow-list below. Each check stays as close to its action as the kernel allows, which is the decided residual window: a pidfd for processes, the `vm` node's descriptor for `cgroup.kill` with its children re-listed just before, the parent's descriptor with the child's inode or birth time re-read just before each `rmdir` and `unlinkat`, the loop descriptor the generation was compared on, and for mounts a fresh descriptor's unique mount ID read just before `umount2` on `/proc/self/fd/<parent>/<name>` (that descriptor must be closed first, or a non-lazy unmount is busy).
+**The destructive-action invariant (B4 recheck 3, November 2, 2026).** No destructive action may run on a resource unless the caller holds proof that the resource's current generation equals a durable journaled generation from the current boot. A resource with no such proof is Unknown: it stays charged, nothing is done to it, and it never counts toward ABSENT. The destructive actions are signals (`pidfd_send_signal`, `kill`), writes to `cgroup.kill`, `rmdir` of a cgroup or directory, `unlink` of a file, `umount2` and `LOOP_CLR_FD`. The type system enforces it: `crates/kilnd/src/helper/firecracker/proven.rs` holds one proof type per resource kind (`ProvenProcess`, `ProvenCgroupVm` and `ProvenCgroupTree`, `ProvenFile`, `ProvenDir`, `ProvenMount`, `ProvenLoop`), none `Clone` and none constructible outside that module. Only its verification functions make them, each from the journaled identity, the current boot ID and the live kernel object, returning `Result<Proven*, Unprovable>` (`Gone`, `Replaced` or `Unknown`). Every destructive helper takes its proof, and the raw capabilities appear nowhere else: since B4 recheck 4 clippy enforces it semantically for the whole workspace (*The clippy gate* below), with the lexical test `proven::tests::no_destructive_call_outside_the_gate` kept as defense in depth. Each check stays as close to its action as the kernel allows, which is the decided residual window: a pidfd for processes, the `vm` node's descriptor for `cgroup.kill` with its children re-listed just before, the parent's descriptor with the child's inode or birth time re-read just before each `rmdir` and `unlinkat`, the loop descriptor the generation was compared on, and for mounts a fresh descriptor's unique mount ID read just before `umount2` on `/proc/self/fd/<parent>/<name>` (that descriptor must be closed first, or a non-lazy unmount is busy).
 
 - *Boot ID everywhere.* Every durable process identity (`ProcessId`, so `ResourceRecord::Vmm`, `StopTarget`, M's and K's targets and the worker rows) carries a validated boot ID. A process whose PID and start time match is proven only when its journaled boot ID is this boot's. A different boot ID only shows that the journaled process is gone, and never leads to a signal. An absent or invalid one, from an older row, proves nothing: that process is never signaled and stays charged until it is provably gone. An unreadable host boot ID is an error, never `unknown`.
 - *The cgroup tree.* `cgroup.kill` needs `ProvenCgroupVm`: the boot ID and the journaled inodes of the parent, `vm`, `vm/vmm` and `vm/console`, and no other cgroup anywhere below `vm`. A replaced or unexpected child is Replaced, with no signal. Removal needs `ProvenCgroupTree`, which covers every node and admits no other cgroup below the parent. H's monitor target, K's emergency target, `kill_recorded`, `contain` and `remove_tree` all go through these.
@@ -600,17 +600,31 @@ Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no laz
 | `pidfd_send_signal` (SIGKILL, SIGSTOP, SIGCONT) | `proven::signal`, used by `proven::kill_and_wait` / `stop_process` (K, S's `stop_vm`) and S's hardening of V | `ProvenProcess` |
 | `kill` (macOS fixtures only, no pidfd) | `proven::signal` | `ProvenProcess` (start time and boot ID compared just before) |
 | `kill(SIGKILL)` of S's formatter | `proven::UnreapedChild::kill_unreaped` | `UnreapedChild`, made only by `proven::fork_child`; never after it is reaped |
-| write to `cgroup.kill` | `proven::kill_cgroup_vm`, via `cgroup::kill_recorded` (H, M, K, S's `contain`, cleanup) | `ProvenCgroupVm` |
+| write to `cgroup.kill` | `proven::write_cgroup_kill` (private), reached only from `proven::kill_cgroup_vm`, via `cgroup::kill_recorded` (H, M, K, S's `contain`, cleanup). The generic `cgroup::write_control` is private and takes a `ControlFile` enum with no `cgroup.kill` variant | `ProvenCgroupVm` |
 | cgroup `rmdir` (`unlinkat(AT_REMOVEDIR)`) | `proven::remove_cgroup_tree`, via `cgroup::remove_tree` (K) | `ProvenCgroupTree` |
 | directory `rmdir` | `proven::remove_directory`, via `storage::remove_jail_dirs` and `storage::remove_work` | `ProvenDir` |
 | `unlinkat` of a work, identity or config file | `proven::unlink_file`, via `storage::remove_work` | `ProvenFile` |
 | `umount2` of each bind and the jail tmpfs | `proven::unmount`, via `storage::unmount_jail` | `ProvenMount` |
 | `LOOP_CLR_FD` | `proven::clear_loop`, via `storage::detach_loop` | `ProvenLoop` |
-| `unlinkat` of a temporary name | `executable.rs`, the private executable copy | Allow-listed: the helper's own temporary name in the root-only store, created `O_EXCL` by the same function; never tenant-reachable or replaced by name |
-| `pidfd_send_signal` with signal 0 | `peer.rs`, `pidfd_alive` | Allow-listed: a liveness probe, not a signal |
-| `kill(pid, 0)` | `workers.rs`, macOS `process_state` | Allow-listed: an existence probe, not a signal |
+| `pidfd_send_signal` with the constant signal 0 | `sys::pidfd_alive`, used by `peer.rs` | Not destructive: a liveness probe through a pidfd; the signal number is not a parameter |
+| `kill(pid, 0)` | `sys::process_exists`, used by macOS `workers::process_state` | Not destructive: an existence probe on macOS fixtures only |
 
-Test fixtures (the `tests` modules and files) are excluded from the gate. Nothing else in `crates/kilnd/src/helper/` calls `kill`, `pidfd_send_signal`, `cgroup.kill`, `rmdir`, `unlink(at)`, `remove_file`, `remove_dir`, `umount` or `LOOP_CLR_FD`.
+The executable store has no destructive call at all since B4 recheck 4: `executable::publish_object` copies into an unnamed `O_TMPFILE` inode and links that descriptor, so it neither publishes nor cleans up through a name (*B4 recheck 4 corrections*). The other helper writers create without a temporary name: the ledger's `node.db` is created once with `O_EXCL` and never replaced (SQLite's own `-wal`/`-shm`/`-journal` maintenance in the root-only ledger directory is the one dependency-internal unlink, outside the B4 lifecycle); work, identity and config files are `O_TMPFILE` then `linkat` (`storage::publish`); and the plan, policy and journal records are SQLite rows. `scripts/build-phase1b-tools.sh` publishes into its output directory with a random `mktemp` name and a rename, as the trusted build UID and never as root; its post-publish digest comparison is the gate, and every installer compares the digest again. It is not a helper path.
+
+*The clippy gate (B4 recheck 4).* `clippy.toml` at the workspace root lists as `disallowed-methods` every raw destructive, raw-syscall and subprocess capability: `libc::kill`, `killpg`, `tgkill`, `pidfd_send_signal`, `syscall`, `unlink`, `unlinkat`, `rmdir`, `remove`, `umount`, `umount2`, `unmount`, `rename`, `renameat`, `renameat2`, `renameatx_np`, `ioctl`, `execve`, `execv`, `execvp`, `execvpe`, `execveat`, `fexecve`, `posix_spawn`, `posix_spawnp` and `system`; `std::fs::remove_file`, `remove_dir`, `remove_dir_all` and `rename` and their `tokio::fs` equivalents; `std::process::Command::new` and `tokio::process::Command::new`; and `std::process::Child::kill`, `tokio::process::Child::kill` and `start_kill`. `nix` is not a dependency. The lint resolves paths, so it fires on a function taken as a value, a `use ... as` alias or a function-pointer constant exactly as on a call; the recheck-4 PoC (`let raw_kill = libc::kill;`) fails clippy on Rust 1.88 and 1.99. Entries marked `allow-invalid` exist only on some targets; on Linux every one resolves except `pidfd_send_signal`, which libc does not wrap (it is reachable only through `libc::syscall`, itself disallowed), and the macOS-only `unmount` and `renameatx_np`. CI runs clippy over all targets with `-D warnings -D clippy::disallowed_methods` on 1.88 and 1.99. There is no `disallowed-types` entry: every listed capability is a function, and `Command` has no other constructor.
+
+| Approved module or item (`crates/kilnd/src/`) | Allows | Why |
+|---|---|---|
+| `helper/firecracker/proven.rs` (whole module) | every raw destructive call | The gate: each one sits behind a proof type |
+| `sys.rs` (whole module) | `libc::syscall`, `libc::ioctl`, and `kill(pid, 0)` on macOS | The typed wrappers: `close_range`, `pidfd_open`, `pidfd_alive` (signal fixed at 0), `capget`, `capset`, `execveat_empty` (the only way the helper starts the jailer, Firecracker or mkfs.xfs, from a retained descriptor), the creation-only mount API (`DetachedMount` is made only by `fsmount` or `open_tree_clone`, so `move_mount` and `mount_setattr` act only on a mount this process created), and `sys::ioctl`: `LOOP_GET_STATUS64`, `LOOP_CTL_GET_FREE`, `BLKGETDISKSEQ`, `BLKGETSIZE64`, `BLKSSZGET`, `LOOP_CONFIGURE` (the kernel refuses a bound slot) and clearing `LO_FLAGS_AUTOCLEAR`. `LOOP_CLR_FD` is not there: it is only in `proven::clear_loop`, which takes a `ProvenLoop` |
+| `process.rs`, `run` | `tokio::process::Command::new`, `Child::start_kill` | kilnd's one generic subprocess runner (the kiln CLI), and SIGKILL of its own unreaped child, whose PID cannot be reused before it is reaped |
+| `runtime/kiln_process.rs`, `probe`, `OwnedExec::spawn`, `OwnedExec::kill_reap` | `tokio::process::Command::new`, `Child::start_kill` | The kiln CLI probe and `kiln exec`, and SIGKILL of their own unreaped children |
+| `server.rs`, `SocketPathGuard::cleanup`, `remove_stale_socket_after_probe` | `std::fs::remove_file` | kilnd's own API socket, removed only while it is the inode this daemon bound, or after a refused connection and an identity recheck, under the socket-directory lock |
+| test modules and files | anything | Fixtures compiled only under `cfg(test)`, or integration-test crates |
+
+Each allow is `#[allow(clippy::disallowed_methods)]` (inner for a whole module) with an `// Approved (design 7.1):` justification immediately above it. The CI test `proven::tests::disallowed_allows_only_in_approved_modules` scans every Rust source in the workspace and fails on an `allow` or `expect` of `disallowed_methods`, `disallowed_types` or anything that would silence them (`clippy::style`, `clippy::all`, `warnings`, also inside `cfg_attr`) other than exactly these, on a `#[cfg(test)]` test module, or on a test-only file (a `tests.rs` its parent declares `#[cfg(test)] mod tests;`, or an integration test); on one without the justification; on any `[lints]` table or `.cargo/config`; and on a `clippy.toml` that drops a required path. (`kilnd-api`'s generated code no longer allows `clippy::all`.) `proven::tests::no_foreign_declarations_or_inline_assembly` rejects a local `extern` block, inline assembly, `#[link]`, `link_name` or `dlsym` anywhere, which clippy cannot see through. The lexical test now matches whole expressions with comments and whitespace removed, so an allowed expression cannot hide another on the same line, and its needles also catch aliases (`libc::kill` without a call), `rename`, subprocesses, `start_kill`, raw `syscall` and `ioctl`, foreign declarations and inline assembly; it scans the helper and `sys.rs`.
+
+Test fixtures are excluded from the gate. Outside the approved items above, nothing in the workspace calls or names any listed capability.
 
 ## 7.2 Durable reservation vector
 
@@ -1940,3 +1954,110 @@ the suites, that copy was restored and compared byte-for-byte (`cmp`), and main 
 was reinstalled (`kilnd` SHA-256 `c39c3f3b…`, `kilnd-helper` `ccb2946f…`, `kilndctl`
 `850f5392…`). Its database is schema 7 with `quick_check` ok, and health as the `kilnd`
 account reports serving.
+
+## B4 recheck 4 corrections (November 2, 2026)
+
+Daybreak Blue's fourth recheck of `d268d8d` (`reviews/2026-11-02-b4-recheck4.md`, PoCs in
+`reviews/poc-b4-recheck4/`) confirmed the three recheck-3 fixes and found two gaps in the
+gate itself. Both are accepted.
+
+**1. The executable store published and unlinked through a fixed temporary name (HIGH).**
+`publish_object` created `.<role>.tmp` with `O_EXCL` and checked the copy through its
+descriptor, but then called `linkat` and `unlinkat` by name, so a root replacement of that
+name was published under the approved role name and its temporary link deleted. Now the copy
+has no name until it is published: it is an `O_TMPFILE` inode in the root-only digest
+directory, copied, hashed, made 0555 and fsynced through its one descriptor, and that exact
+descriptor is linked with `linkat(AT_FDCWD, "/proc/self/fd/N", directory, role,
+AT_SYMLINK_FOLLOW)`. The magic link resolves to the open file, not to a name. The name is then
+re-read without following, and its device, inode and birth time must be the held
+descriptor's; `verify_object` must also pass for that inode. A mismatch is an error that
+leaves everything in place. `linkat` never replaces, so a collision on the approved name
+fails closed with its occupant untouched. There is no `unlinkat` on any path: an unpublished
+copy dies with its descriptor. The executable exception is gone from the section 7.1
+inventory. The `linkat` form was chosen by measurement. On the VM's 6.8.0-147,
+`linkat(fd, "", dir, name, AT_EMPTY_PATH)` fails `ENOENT` under the helper's bounding set
+(`deploy/kilnd-helper.service` has no `CAP_DAC_READ_SEARCH`) and as an unprivileged user,
+and succeeds only as full root; the `/proc/self/fd` form succeeds in all three
+(`reviews/2026-11-02-b4-fixes5/vm/linkat-probe.log`). It is the form `storage::publish`
+already used. macOS has no `O_TMPFILE`. There, a test-only `publish_object` checks the
+bytes in memory, then creates the approved name with `O_EXCL`; it is not compiled into
+production. Production is Linux. The other writers were audited (section 7.1): none
+publishes or cleans up through a fixed temporary name.
+
+**2. The gate was lexical (MEDIUM).** A destructive call through a local alias
+(`let raw_kill = libc::kill;`) passed the substring scan, and the real `cgroup.kill` write
+went through the generic `cgroup::write_control`. Now:
+
+- *Proof-typed `cgroup.kill`.* The only `cgroup.kill` write is the private
+  `proven::write_cgroup_kill`, reached only from `kill_cgroup_vm(&ProvenCgroupVm)`.
+  `cgroup::write_control` is private to `cgroup.rs` and takes a `ControlFile` enum
+  (`cgroup.subtree_control`, `cgroup.procs` and the five limit files) with no `cgroup.kill`
+  variant. `cgroup::open_at` is now `open_dir`, which opens only directories, so no sibling
+  can open a control file for writing. A recipe naming `cgroup.kill` is refused.
+- *Clippy is the enforcement.* `clippy.toml` disallows every raw signal, removal, rename,
+  unmount, `ioctl`, `syscall` and subprocess capability (section 7.1 lists them). Clippy
+  resolves paths, so it catches a function value, a `use ... as` alias or a function-pointer
+  constant as well as a call. The PoC fails clippy on 1.88 and 1.99, so no `syn` pass was
+  needed. CI runs clippy with `-D warnings -D clippy::disallowed_methods` on both toolchains.
+- *Typed wrappers.* The new `crate::sys` holds every remaining non-destructive use of
+  `libc::syscall` and `libc::ioctl`, one fixed request per function, moved from
+  `executable.rs`, `peer.rs`, `supervisor.rs`, `storage.rs`, `workers.rs` and `process.rs`.
+  `pidfd_alive` takes no signal number. `move_mount` and `mount_setattr` accept only a
+  `DetachedMount`, which only `fsmount` and `open_tree_clone` make. The loop wrappers cannot
+  detach or reconfigure a bound slot.
+- *Approved modules and their check.* Only `proven.rs`, `sys.rs`, `process::run`,
+  `kiln_process::{probe, OwnedExec::spawn, OwnedExec::kill_reap}`,
+  `SocketPathGuard::cleanup` and `remove_stale_socket_after_probe` carry an allow. Each has
+  an `// Approved (design 7.1):` justification. Test modules and test-only files also carry
+  one. `proven::tests::disallowed_allows_only_in_approved_modules` fails on any other
+  allow or expect of the lint, its group (`clippy::style`, `clippy::all`) or `warnings`, and
+  on a missing justification, a `[lints]` table, a `.cargo/config` or a weakened
+  `clippy.toml`. `proven::tests::no_foreign_declarations_or_inline_assembly` closes the routes
+  clippy cannot resolve: a local `extern` block, inline assembly, `#[link]` and `dlsym`.
+  `kilnd-api` dropped its blanket `allow(clippy::all)`.
+- *The lexical test* stays as defense in depth. It now squashes comments and whitespace
+  and removes each allowed whole expression before matching, so an allowed fragment cannot
+  hide another call on the same line. Its needles catch the alias form, `rename`,
+  subprocesses, `start_kill` and raw `syscall`/`ioctl`. It covers the helper and `sys.rs`.
+
+**Regressions.** `executable::tests::executable_publish_has_no_temporary_name_to_replace`
+(unprivileged, in CI) and `b4_linux_root_executable_publish_has_no_temporary_name_to_replace`
+(root, the production policy from `/`, the real store, the helper's bounding set) replace
+the PoC. While the copy is blocked on a pipe, with its unnamed descriptor open, they plant
+`.jailer.tmp`, `.jailer.tmp.0`, `jailer.tmp` and `#0`: `publish_object` succeeds, `jailer`
+has exactly the original bytes with one link and mode 0555, and every planted name keeps the
+replacement's bytes. Planting the approved name itself is refused, with the occupant
+untouched. Replacing the name between the link and its re-read fails `not the held copy` and
+leaves the replacement. `cgroup::tests::the_control_writer_cannot_name_cgroup_kill` covers the
+enum. The gate evidence is in `reviews/2026-11-02-b4-fixes5/gate/`. With
+`guard-bypass.patch` applied, clippy fails on 1.88 and 1.99, for macOS and for
+`aarch64-unknown-linux-gnu`, and so does the lexical test (`guard-bypass-poc.log`).
+`gate-variants.log` runs nine bypasses. Clippy stops the alias, the `use` rename, the
+function-pointer constant, the raw `syscall` and the subprocess. The compiler stops
+`cgroup.kill` through `write_control`, which is private and needs a `ControlFile`. The
+approval test stops an unapproved allow and a `clippy::style` silencer. The foreign-declaration
+test stops the local `extern` block.
+
+**Results (November 2, 2026, `1ddd0aa`, raw output in `reviews/2026-11-02-b4-fixes5/`).**
+On the Mac: `cargo test --locked --workspace` passed (1.88; the kilnd library 474 passed,
+2 ignored), and clippy with `-D warnings` was clean on 1.88 and 1.99, both for macOS and
+checked for `aarch64-unknown-linux-gnu`. CI passed (`41568827854`), including the new 1.99
+clippy step. In `kiln` on Linux 6.8.0-147, the approved jailer and mkfs.xfs digests matched.
+`scripts/b4-vm-tests.sh` ran all 29 root tests, the 28 earlier ones and
+`b4_linux_root_executable_publish_has_no_temporary_name_to_replace`, and all passed in
+1254.4 s, with nothing owned left. The unprivileged workspace suite passed on Linux (the
+kilnd library 482 passed, 45 ignored). The shell's umask was 002, and two `b3f_01`
+init-state tests correctly refuse a group-writable temporary ancestor, so the run used
+umask 022. Native Linux clippy passed on 1.88 and 1.99 and failed on both with the PoC
+applied (`gate/linux-native-clippy.log`). With `1ddd0aa` installed,
+`integration-test.sh`, `daemon-singleton-regressions.sh`, `state-path-regressions.sh`,
+`phase0-regressions.py`, `smoke.sh` and `kilnd-maintenance-tests.py` passed. So did
+`deployment-regressions.py` between two builds (69 checks), and its `--reboot-arm graceful`
+and `--reboot-verify` around a real reboot. Before any B4 build, `kilnd` was stopped and
+`/var/lib/kilnd/` was copied byte for byte (`kilnd.db` SHA-256 `aec74dc4…`). After the
+suites, main `734e275` was reinstalled (`kilnd` `c39c3f3b…`, `kilnd-helper` `ccb2946f…`,
+`kilndctl` `850f5392…`), and the copy was restored and compared with `cmp`: identical.
+Schema 7, `quick_check` ok, and health as `kilnd` reports serving, with the legacy
+reservation still held. The empty B4 ledger directory the reboot run left under
+`/var/lib/kilnd-helper` was removed. No test account, loop beyond kiln's own, mount,
+cgroup, process or build output remains.
