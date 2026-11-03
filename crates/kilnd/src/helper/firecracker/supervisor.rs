@@ -133,6 +133,14 @@ pub enum ResourceRecord {
         boot_id: String,
         state: String,
     },
+    /// B5-01: the fixed-size summary that replaces every settled `exec` row, in the
+    /// settling transaction: how many executions settled, and the last one.
+    ExecHistory {
+        settled: u64,
+        last_token: String,
+        last_execution_id: String,
+        last_state: String,
+    },
 }
 
 impl ResourceRecord {
@@ -153,6 +161,7 @@ impl ResourceRecord {
             Self::Vmm { .. } => "vmm",
             Self::Broker { .. } => "broker",
             Self::Exec { .. } => "exec",
+            Self::ExecHistory { .. } => "exec_history",
         }
     }
 }
@@ -242,7 +251,9 @@ impl RecordedResources {
             ResourceRecord::JailBinds(binds) => self.jail_binds = Some(binds.clone()),
             ResourceRecord::Vmm { process, .. } => self.vmm = Some(*process),
             // Session evidence: nothing for cleanup to remove.
-            ResourceRecord::Broker { .. } | ResourceRecord::Exec { .. } => {}
+            ResourceRecord::Broker { .. }
+            | ResourceRecord::Exec { .. }
+            | ResourceRecord::ExecHistory { .. } => {}
         }
     }
 }

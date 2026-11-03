@@ -99,7 +99,12 @@ fn real_manifest(pins: &BTreeMap<Role, ExecutablePin>, bundle: &Path) -> Vec<u8>
 
 /// The real tree: store objects, a bundle and a fixture root whose helper runs from
 /// the installed image. Each fixture gets its own bundle directory.
-fn real_tree(options: NodeOptions) -> (tempfile::TempDir, PathBuf, ChildConfig) {
+/// With `guest`, another guest's directory holding its `Image`, `rootfs.squashfs` and
+/// the `kilnd-guest-broker` its root runs (B5's test guests).
+fn real_tree_with(
+    options: NodeOptions,
+    guest: Option<&Path>,
+) -> (tempfile::TempDir, PathBuf, ChildConfig) {
     let temp = tempfile::Builder::new()
         .prefix("b4")
         .tempdir_in("/tmp")
@@ -116,11 +121,16 @@ fn real_tree(options: NodeOptions) -> (tempfile::TempDir, PathBuf, ChildConfig) 
     root_dir(Path::new(BUNDLES), 0o755);
     let bundle = Path::new(BUNDLES).join(Id128::random().to_string());
     root_dir(&bundle, 0o755);
+    let guest_dir = guest.map_or_else(artifacts, Path::to_path_buf);
     for name in ["Image", "rootfs.squashfs"] {
-        std::fs::copy(artifacts().join(name), bundle.join(name)).unwrap();
+        std::fs::copy(guest_dir.join(name), bundle.join(name)).unwrap();
     }
     for name in ["kernel.config", "kiln", "kilnd-guest-broker"] {
-        std::fs::copy(bundle_source(name), bundle.join(name)).unwrap();
+        let source = match guest {
+            Some(dir) if name == "kilnd-guest-broker" => dir.join(name),
+            _ => bundle_source(name),
+        };
+        std::fs::copy(source, bundle.join(name)).unwrap();
     }
     let manifest = real_manifest(&pins, &bundle);
     std::fs::write(bundle.join("manifest.json"), &manifest).unwrap();
@@ -171,11 +181,15 @@ impl Drop for Real {
 
 impl Real {
     pub async fn new(options: NodeOptions) -> Self {
+        Self::with_guest(options, None).await
+    }
+
+    pub async fn with_guest(options: NodeOptions, guest: Option<&Path>) -> Self {
         assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
         // scripts/b4-vm-tests.sh starts this process with only the helper unit's bounding
         // set, so every thread, client and child holds no more than the unit grants.
         limit_to_unit_capabilities();
-        let (temp, root, config) = real_tree(options);
+        let (temp, root, config) = real_tree_with(options, guest);
         std::fs::write(root.join("faults/L.keep_launch_capabilities"), b"").unwrap();
         Ledger::provision(&ledger_config(&config)).unwrap();
         let fixture = Fixture {
@@ -450,7 +464,10 @@ async fn b4_linux_root_create_boots_and_remove_leaves_nothing() {
         assert!(phase == "booting" || phase == "ready", "{phase}");
         let reply = remove(&real, &runtime, &context).await;
         assert!(is_absent(&reply), "{reply:?}\n{}", real.fixture.log());
-        assert_eq!(host_leftovers(&real, &context, Some(vmm)), Vec::<String>::new());
+        assert_eq!(
+            host_leftovers(&real, &context, Some(vmm)),
+            Vec::<String>::new()
+        );
         // Idempotent: the same receipt again.
         let again = remove(&real, &runtime, &context).await;
         assert_eq!(again, reply);
@@ -757,9 +774,18 @@ async fn b4_linux_root_every_crash_boundary_reaches_absent_with_nothing_left() {
         assert!(object.exists(), "{boundary}: the unjournaled object exists");
         let reply = remove(&real, &runtime, &context).await;
         assert!(!is_absent(&reply), "{boundary}: {reply:?}");
-        assert!(object.exists(), "{boundary}: refused, never removed by its name");
-        assert!(claim_held(&real, context.allocation_id), "{boundary}: still charged");
-        eprintln!("B4 evidence: {boundary} left {} Unknown: {reply:?}", object.display());
+        assert!(
+            object.exists(),
+            "{boundary}: refused, never removed by its name"
+        );
+        assert!(
+            claim_held(&real, context.allocation_id),
+            "{boundary}: still charged"
+        );
+        eprintln!(
+            "B4 evidence: {boundary} left {} Unknown: {reply:?}",
+            object.display()
+        );
         // The operator's repair.
         if point == "cgroup" {
             for name in super::super::cgroup::NODES.iter().rev() {
@@ -1603,7 +1629,11 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
         "a different process is not ours"
     );
     assert!(
-        running(ProcessId { pid, start_time, boot_id: None }),
+        running(ProcessId {
+            pid,
+            start_time,
+            boot_id: None
+        }),
         "the unrelated process survived"
     );
     // A replaced cgroup: same path, another inode, a live task inside.
@@ -1625,7 +1655,11 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
             .unwrap();
     assert_eq!(state, super::super::cgroup::NodeState::Replaced);
     assert!(
-        running(ProcessId { pid, start_time, boot_id: None }),
+        running(ProcessId {
+            pid,
+            start_time,
+            boot_id: None
+        }),
         "a replaced cgroup is not signaled"
     );
     unrelated.kill().unwrap();
@@ -1696,12 +1730,21 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
     let half = (binding.size_limit / 2).to_string();
     let shorter = (binding.size_limit - 4096).to_string();
     for (label, args) in [
-        ("offset", vec!["--offset", "4096", "--sizelimit", shorter.as_str()]),
+        (
+            "offset",
+            vec!["--offset", "4096", "--sizelimit", shorter.as_str()],
+        ),
         ("size limit", vec!["--sizelimit", half.as_str()]),
     ] {
         let mut all = args.clone();
         all.extend([device.as_str(), paths.work_file.to_str().unwrap()]);
-        assert!(Command::new("losetup").args(&all).status().unwrap().success());
+        assert!(
+            Command::new("losetup")
+                .args(&all)
+                .status()
+                .unwrap()
+                .success()
+        );
         let reply = remove(&real, &runtime, &context).await;
         assert!(!is_absent(&reply), "{label}: {reply:?}");
         assert_eq!(
@@ -1726,7 +1769,12 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
     let exact = binding.size_limit.to_string();
     assert!(
         Command::new("losetup")
-            .args(["--sizelimit", exact.as_str(), device.as_str(), paths.work_file.to_str().unwrap()])
+            .args([
+                "--sizelimit",
+                exact.as_str(),
+                device.as_str(),
+                paths.work_file.to_str().unwrap()
+            ])
             .status()
             .unwrap()
             .success()
@@ -1741,7 +1789,10 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
         paths.work_file.to_str().unwrap(),
         "the rebinding was detached"
     );
-    assert!(claim_held(&real, context.allocation_id), "a new generation: charged");
+    assert!(
+        claim_held(&real, context.allocation_id),
+        "a new generation: charged"
+    );
     eprintln!(
         "B4 evidence: same tuple rebound, diskseq {} != journaled {}: refused, left bound",
         rebound.diskseq, generation.diskseq
@@ -1799,7 +1850,10 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
             .any(|m| m.mount_point == paths.jail_dir && m.source == identity.source()),
         "the replacement survived"
     );
-    assert!(claim_held(&real, context.allocation_id), "refusal keeps the charge");
+    assert!(
+        claim_held(&real, context.allocation_id),
+        "refusal keeps the charge"
+    );
     eprintln!("B4 evidence: replacement jail tmpfs with the allocation's source: refused");
     run("umount", &[paths.jail_dir.to_str().unwrap()]);
     remove_to_absent(&real, &runtime, &context, "after the replaced jail mount").await;
@@ -1844,7 +1898,11 @@ async fn b4_linux_root_cleanup_refuses_a_foreign_backing_loop_replacement() {
     };
     let losetup = |args: &[&str]| {
         assert!(
-            Command::new("losetup").args(args).status().unwrap().success(),
+            Command::new("losetup")
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
             "losetup {args:?}"
         );
     };
@@ -1894,7 +1952,10 @@ async fn b4_linux_root_cleanup_refuses_a_foreign_backing_loop_replacement() {
         Some(foreign_text.as_str()),
         "the replacement survived"
     );
-    assert!(claim_held(&real, context.allocation_id), "refusal keeps the charge");
+    assert!(
+        claim_held(&real, context.allocation_id),
+        "refusal keeps the charge"
+    );
     assert!(!released(context.allocation_id), "nothing was released");
     let slot = format!("loop{}", binding.minor);
     assert!(
@@ -1926,7 +1987,13 @@ async fn b4_linux_root_cleanup_refuses_a_foreign_backing_loop_replacement() {
     assert!(released(context.allocation_id), "the release was journaled");
     assert_eq!(backing(binding.minor), None, "the generation was detached");
     losetup(&[device.as_str(), foreign_text.as_str()]);
-    remove_to_absent(&real, &runtime, &context, "after a released slot was reused").await;
+    remove_to_absent(
+        &real,
+        &runtime,
+        &context,
+        "after a released slot was reused",
+    )
+    .await;
     assert_eq!(
         backing(binding.minor).as_deref(),
         Some(foreign_text.as_str()),
@@ -2331,7 +2398,10 @@ async fn b4_linux_root_scoped_gc_removes_only_proven_dead_allocations() {
         outcome(other.allocation_id),
         GcOutcome::Skipped { .. }
     ));
-    assert_eq!(host_leftovers(&real, &dead, Some(dead_vmm)), Vec::<String>::new());
+    assert_eq!(
+        host_leftovers(&real, &dead, Some(dead_vmm)),
+        Vec::<String>::new()
+    );
     assert!(
         running(real.vmm(live.allocation_id).unwrap()),
         "the live boot is untouched"

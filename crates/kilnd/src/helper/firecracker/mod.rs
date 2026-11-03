@@ -394,6 +394,9 @@ struct SupervisorEntry {
     busy: Option<Id128>,
     /// B5: waiters for relay reports, by job.
     jobs: HashMap<u64, mpsc::UnboundedSender<broker::RelayReport>>,
+    /// B5-05: the allocation's one control operation at a time. A Probe holds it until
+    /// R's job ends; Exec admission takes it briefly, so the two are ordered.
+    control: Arc<tokio::sync::Semaphore>,
 }
 
 impl SupervisorEntry {
@@ -423,6 +426,7 @@ impl SupervisorEntry {
             ready: None,
             busy: None,
             jobs: HashMap::new(),
+            control: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 }
@@ -547,6 +551,8 @@ pub struct Node {
     flushing: tokio::sync::Mutex<()>,
     prep_waiters: AtomicUsize,
     ledger_fault: Mutex<Option<String>>,
+    /// B5-01: L refused an answer too large for one frame.
+    ledger_reply_fault: Mutex<Option<String>>,
     /// The last replacement L that had to be discarded, until one succeeds.
     ledger_replacement_fault: Mutex<Option<String>>,
     ledger_retry_at: Mutex<Option<std::time::Instant>>,
@@ -794,6 +800,7 @@ impl Node {
             flushing: tokio::sync::Mutex::new(()),
             prep_waiters: AtomicUsize::new(0),
             ledger_fault: Mutex::new(None),
+            ledger_reply_fault: Mutex::new(None),
             ledger_replacement_fault: Mutex::new(None),
             ledger_retry_at: Mutex::new(None),
             lease_fault: Mutex::new(None),
@@ -1196,7 +1203,15 @@ impl Node {
         deadline_ns: u64,
     ) -> Result<LedgerReply, CallError> {
         let channel = self.ledger_channel();
-        channel.call(lane, request, deadline_ns).await
+        let reply = channel.call(lane, request, deadline_ns).await;
+        if let Ok(LedgerReply::Oversized { bytes }) = &reply {
+            // L stayed up and refused the answer; whatever asked treats it as Unknown
+            // and stays charged (B5-01). Health says so until the helper restarts.
+            *self.ledger_reply_fault.lock().unwrap() = Some(format!(
+                "a ledger answer of {bytes} bytes exceeded the worker frame bound"
+            ));
+        }
+        reply
     }
 
     /// One reserved K slot, then the other. A stuck slot stays occupied by its original
@@ -2434,6 +2449,9 @@ impl Node {
         }
         if ledger_fault.is_none() {
             ledger_fault = self.lease_fault.lock().unwrap().clone();
+        }
+        if ledger_fault.is_none() {
+            ledger_fault = self.ledger_reply_fault.lock().unwrap().clone();
         }
         let health = WorkersHealth {
             ledger: self.worker_health(&self.ledger.lock().unwrap(), "ledger", &stale),

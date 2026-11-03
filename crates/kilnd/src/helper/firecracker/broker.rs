@@ -42,9 +42,16 @@ pub const MAX_CONNECT_REPLY: usize = 32;
 pub struct Expected {
     pub binding: SessionBinding,
     pub work_uuid: WorkUuid,
+    /// The broker artifact the approved manifest pins for this plan (B5-10).
+    pub broker_sha256: Hex32,
     pub boot_id: Option<BootId>,
     pub inner_id: Option<InnerId>,
 }
+
+/// The kiln CLI features the broker's direct-kiln core requires: the private v1
+/// protocol's four (0xf) and persistent-create certainty (0x10). Hello and Ready must
+/// both report them (B5-10).
+pub const REQUIRED_KILN_FEATURES: u32 = 0x1f;
 
 /// One job S gives R: one fresh connection, one operation. Deadlines are absolute
 /// host `CLOCK_MONOTONIC` nanoseconds, the wire's own clock.
@@ -96,7 +103,31 @@ impl RelayJob {
     }
 }
 
-/// What R reports. `dispatched` is false only with proof that no Exec byte was sent.
+/// How far a failed job got (design 5.5, B5-03 and B5-07). It alone decides whether
+/// the VM may be reused after a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    /// A host-side failure that no guest behavior caused, before any byte of this job
+    /// reached the guest or R: short or late stdin from kilnd, no remaining budget, an
+    /// occupied relay channel, a missing stdio descriptor. Only this may restore READY.
+    Local,
+    /// The guest was reached and broke the session protocol (malformed frames, a wrong
+    /// binding or boot, missing hardening, a Faulted or refusing broker, no `OK`) before
+    /// any Exec byte. Nothing ran, but the guest is not reusable: retire the VM.
+    Guest,
+    /// A byte of the job's frame or its descriptors was handed over, or an Exec byte
+    /// may have reached the guest: dispatch is uncertain. Retire the VM.
+    Dispatched,
+}
+
+impl Reach {
+    pub fn dispatched(self) -> bool {
+        self == Reach::Dispatched
+    }
+}
+
+/// What R reports. A failure's `reach` says how far its job got.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RelayReport {
@@ -122,16 +153,19 @@ pub enum RelayReport {
         result: Box<ExecResult>,
         /// Every retained byte reached kilnd's stdout and stderr sockets.
         delivered: bool,
+        /// The bytes that actually reached each socket (B5-08).
+        stdout_delivered: u64,
+        stderr_delivered: u64,
     },
     Refused {
         job: u64,
         error: ErrorReply,
-        dispatched: bool,
+        reach: Reach,
     },
     Failed {
         job: u64,
         reason: String,
-        dispatched: bool,
+        reach: Reach,
     },
     /// The VMM gave no `OK` for port 5252: nothing in the guest is listening yet (or
     /// any more). Only readiness retries this, within its Create deadline.
@@ -231,6 +265,15 @@ pub async fn connect_port<S: AsyncRead + AsyncWrite + Unpin>(
 pub fn check_hello(reply: &HelloReply, expected: &Expected) -> Result<(), String> {
     if reply.protocol != PROTOCOL_VERSION || reply.kiln.protocol != 1 {
         return Err("protocol or kiln protocol is not 1".into());
+    }
+    if reply.kiln.features & REQUIRED_KILN_FEATURES != REQUIRED_KILN_FEATURES {
+        return Err(format!(
+            "the guest's kiln lacks required features {REQUIRED_KILN_FEATURES:#x}: {:#x}",
+            reply.kiln.features
+        ));
+    }
+    if reply.broker_sha256 != expected.broker_sha256 {
+        return Err("the guest broker is not the pinned build".into());
     }
     if reply.identity.binding() != expected.binding {
         return Err("the guest's identity is not this allocation's".into());
@@ -407,23 +450,15 @@ async fn open<S: AsyncRead + AsyncWrite + Unpin, B: Budget>(
     }
 }
 
-fn failed(job: u64, fail: Fail, dispatched: bool) -> RelayReport {
+fn failed(job: u64, fail: Fail, reach: Reach) -> RelayReport {
     match fail {
         Fail::Unreachable(reason) => RelayReport::Failed {
             job,
             reason: format!("unreachable: {reason}"),
-            dispatched,
+            reach,
         },
-        Fail::Refused(error) => RelayReport::Refused {
-            job,
-            error,
-            dispatched,
-        },
-        Fail::Broken(reason) => RelayReport::Failed {
-            job,
-            reason,
-            dispatched,
-        },
+        Fail::Refused(error) => RelayReport::Refused { job, error, reach },
+        Fail::Broken(reason) => RelayReport::Failed { job, reason, reach },
     }
 }
 
@@ -450,6 +485,7 @@ pub async fn initialize<S: AsyncRead + AsyncWrite + Unpin>(
                     || !ready.idle
                     || !ready.work_quota_verified
                     || ready.kiln.protocol != 1
+                    || ready.kiln.features & REQUIRED_KILN_FEATURES != REQUIRED_KILN_FEATURES
                 {
                     return Err(Fail::Broken(
                         "Ready does not bind this session, its boot or an idle quota-checked sandbox"
@@ -468,7 +504,7 @@ pub async fn initialize<S: AsyncRead + AsyncWrite + Unpin>(
     };
     run.await.unwrap_or_else(|fail| match fail {
         Fail::Unreachable(reason) => RelayReport::Unreachable { job, reason },
-        fail => failed(job, fail, false),
+        fail => failed(job, fail, Reach::Guest),
     })
 }
 
@@ -494,7 +530,10 @@ pub async fn probe<S: AsyncRead + AsyncWrite + Unpin>(
             other => Err(Fail::Broken(format!("unexpected {other:?}"))),
         }
     };
-    run.await.unwrap_or_else(|fail| failed(job, fail, false))
+    // Every probe failure is the guest's: R reached it and it did not answer as
+    // protocol 1 requires (B5-07).
+    run.await
+        .unwrap_or_else(|fail| failed(job, fail, Reach::Guest))
 }
 
 /// `Cancel` on its own control connection, which never waits on the exec writer. With
@@ -544,7 +583,8 @@ async fn cancel_with<S: AsyncRead + AsyncWrite + Unpin, B: Budget>(
             other => Err(Fail::Broken(format!("unexpected {other:?}"))),
         }
     };
-    run.await.unwrap_or_else(|fail| failed(job, fail, true))
+    run.await
+        .unwrap_or_else(|fail| failed(job, fail, Reach::Dispatched))
 }
 
 /// The guest-relative budget at send time: rounded down, 1..=3,600,000 ms; zero
@@ -591,8 +631,10 @@ where
     )
     .await;
     if !matches!(read, Ok(Ok(_))) || input.len() as u64 != exec.stdin_bytes {
+        // kilnd's own stdin, checked by our own validation: guest-independent.
         return RelayReport::Failed {
             job,
+            reach: Reach::Local,
             reason: format!(
                 "stdin: expected {} bytes, observed {} ({})",
                 exec.stdin_bytes,
@@ -603,18 +645,19 @@ where
                     "short or failed"
                 }
             ),
-            dispatched: false,
         };
     }
     let (mut link, _) = match open(stream, expected, Channel::Exec, &mut budget).await {
         Ok(opened) => opened,
-        Err(fail) => return failed(job, fail, false),
+        // The guest broke the protocol before any Exec byte: nothing ran, but it is
+        // not reusable (B5-07).
+        Err(fail) => return failed(job, fail, Reach::Guest),
     };
     let Some(remaining) = remaining_ms(deadline) else {
         return RelayReport::Failed {
             job,
             reason: "no execution budget remained at dispatch".into(),
-            dispatched: false,
+            reach: Reach::Local,
         };
     };
     exec.remaining_ms = remaining;
@@ -673,13 +716,15 @@ where
     .await;
     let (result, out, err) = match dispatched {
         Ok(done) => done,
-        Err(fail) => return failed(job, fail, true),
+        Err(fail) => return failed(job, fail, Reach::Dispatched),
     };
+    // Count what actually reaches each socket, so an interrupted delivery reports the
+    // bytes delivered, not the guest's facts (B5-08).
+    let mut stdout_delivered = 0usize;
+    let mut stderr_delivered = 0usize;
     let delivered = timeout_at(stage(), async {
-        stdout.write_all(&out).await?;
-        stdout.shutdown().await?;
-        stderr.write_all(&err).await?;
-        stderr.shutdown().await?;
+        deliver(&mut stdout, &out, &mut stdout_delivered).await?;
+        deliver(&mut stderr, &err, &mut stderr_delivered).await?;
         Ok::<_, io::Error>(())
     })
     .await
@@ -688,7 +733,26 @@ where
         job,
         result,
         delivered,
+        stdout_delivered: stdout_delivered as u64,
+        stderr_delivered: stderr_delivered as u64,
     }
+}
+
+/// Writes `bytes` then a write EOF, counting every byte the socket took.
+async fn deliver<W: AsyncWrite + Unpin>(
+    sink: &mut W,
+    bytes: &[u8],
+    written: &mut usize,
+) -> io::Result<()> {
+    while *written < bytes.len() {
+        let n = sink.write(&bytes[*written..]).await?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        *written += n;
+    }
+    sink.flush().await?;
+    sink.shutdown().await
 }
 
 #[cfg(unix)]
@@ -989,6 +1053,9 @@ pub mod relay {
             };
             let (mut reader, mut writer) = control.into_split();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RelayReport>();
+            // A report that cannot be written whole ends R (B5-03): a given-up frame
+            // must never be finished by a later one, so the stream is never resumed.
+            let (dead_tx, mut dead) = tokio::sync::oneshot::channel::<()>();
             tokio::task::spawn_local(async move {
                 while let Some(report) = rx.recv().await {
                     let Ok(frame) =
@@ -998,17 +1065,28 @@ pub mod relay {
                             body: &report,
                         })
                     else {
-                        return;
+                        break;
                     };
-                    if timeout_at(stage(), writer.write_all(&frame)).await.is_err() {
-                        return;
+                    if !matches!(
+                        timeout_at(stage(), writer.write_all(&frame)).await,
+                        Ok(Ok(()))
+                    ) {
+                        break;
                     }
                 }
+                let _ = dead_tx.send(());
             });
             let busy = std::rc::Rc::new(std::cell::Cell::new((false, false)));
             let budgets: Budgets = Default::default();
             loop {
-                let job = match read_job(&mut reader).await {
+                let read = tokio::select! {
+                    read = read_job(&mut reader) => read,
+                    _ = &mut dead => {
+                        eprintln!("kilnd relay: a report could not be written whole");
+                        return;
+                    }
+                };
+                let job = match read {
                     Ok(Some(job)) => job,
                     Ok(None) => return,
                     Err(error) => {
@@ -1024,7 +1102,7 @@ pub mod relay {
                         let _ = tx.send(RelayReport::Failed {
                             job: id,
                             reason: error.to_string(),
-                            dispatched: false,
+                            reach: Reach::Dispatched,
                         });
                         // A lost or mismatched descriptor desynchronizes S and R; the
                         // report goes first, then R ends and S retires the VM.
@@ -1035,10 +1113,11 @@ pub mod relay {
                 let exec = matches!(job, RelayJob::Exec { .. });
                 let (exec_busy, control_busy) = busy.get();
                 if (exec && exec_busy) || (!exec && control_busy) {
+                    // A local scheduling refusal: nothing reached the guest (B5-05).
                     let _ = tx.send(RelayReport::Failed {
                         job: id,
                         reason: "that channel already has a job".into(),
-                        dispatched: false,
+                        reach: Reach::Local,
                     });
                     continue;
                 }
@@ -1077,7 +1156,7 @@ pub mod relay {
             return RelayReport::Failed {
                 job: id,
                 reason: "no usable vsock connection".into(),
-                dispatched: false,
+                reach: Reach::Local,
             };
         };
         match job {
@@ -1129,7 +1208,7 @@ pub mod relay {
                     return RelayReport::Failed {
                         job: id,
                         reason: "missing stdio descriptors".into(),
-                        dispatched: false,
+                        reach: Reach::Local,
                     };
                 };
                 let token = request.token;
@@ -1463,17 +1542,42 @@ pub mod supervise {
         Ok((uid, gid))
     }
 
-    /// The session binding and work UUID, from the very identity block S wrote.
-    pub fn expected_of(plan: &LaunchPlan) -> io::Result<Expected> {
+    /// The session binding and work UUID, from the very identity block S wrote, and
+    /// the broker digest the plan's approved manifest pins.
+    pub fn expected_of(plan: &LaunchPlan, broker_sha256: Hex32) -> io::Result<Expected> {
         let block = super::super::storage::identity_block(&plan.plan)?;
         let identity =
             kilnd_broker_protocol::identity::parse_block(&block).map_err(io::Error::other)?;
         Ok(Expected {
             binding: identity.binding(),
             work_uuid: identity.work_uuid,
+            broker_sha256,
             boot_id: None,
             inner_id: None,
         })
+    }
+
+    /// The `kilnd-guest-broker` artifact pinned by the manifest this plan names: S's
+    /// own profile must hold exactly that verified manifest (B5-10).
+    fn pinned_broker(link: &Link<'_>, plan: &LaunchPlan) -> io::Result<Hex32> {
+        let context = link.context();
+        let profile = context
+            .config
+            .profile(&context.profile)
+            .ok_or_else(|| io::Error::other("profile is not configured"))?;
+        if plan.plan["manifest_sha256"].as_str()
+            != Some(profile.manifest_sha256.to_string().as_str())
+        {
+            return Err(io::Error::other(
+                "the plan's manifest is not the profile's verified manifest",
+            ));
+        }
+        let pin = profile
+            .artifacts
+            .get("kilnd-guest-broker")
+            .ok_or_else(|| io::Error::other("no pinned broker artifact"))?;
+        Hex32::parse(&pin.sha256.to_string())
+            .ok_or_else(|| io::Error::other("broker pin is not a digest"))
     }
 
     /// Forks D into `vm/console` as the VMM's U:G with the console pipe, and R into
@@ -1559,7 +1663,7 @@ pub mod supervise {
                 child: drainer_child,
                 report: report_read,
             },
-            expected: expected_of(plan)?,
+            expected: expected_of(plan, pinned_broker(link, plan)?)?,
             next_job: 0,
         })
     }
@@ -1586,6 +1690,11 @@ pub mod supervise {
         None
     }
 
+    /// Connects the VM's vsock socket and hands R the job: its descriptors, then its
+    /// frame. A failure says how far it got (B5-03): a VMM that will not take the
+    /// connection is the guest side's; once the descriptors are queued for R, any
+    /// failure (even before the frame's first byte) is uncertain, since R may already
+    /// hold them; only a refused descriptor send leaves R untouched.
     fn submit(
         link: &Link<'_>,
         plan: &LaunchPlan,
@@ -1593,13 +1702,18 @@ pub mod supervise {
         workers: &mut Workers,
         job: RelayJob,
         stdio: Vec<OwnedFd>,
-    ) -> io::Result<()> {
+    ) -> Result<(), (Reach, io::Error)> {
         let _ = link;
-        let vsock = connect_vsock(&booted.jail, plan, &booted.vmm)?;
+        let vsock =
+            connect_vsock(&booted.jail, plan, &booted.vmm).map_err(|e| (Reach::Guest, e))?;
         let mut fds = vec![vsock.as_raw_fd()];
         fds.extend(stdio.iter().map(AsRawFd::as_raw_fd));
-        send_fds(&workers.relay.descriptors, job.job(), &fds)?;
-        workers.relay.control.send(0, &job, Duration::from_secs(1))
+        send_fds(&workers.relay.descriptors, job.job(), &fds).map_err(|e| (Reach::Local, e))?;
+        workers
+            .relay
+            .control
+            .send(0, &job, Duration::from_secs(1))
+            .map_err(|e| (Reach::Dispatched, e))
     }
 
     fn next_report(workers: &mut Workers) -> Result<Option<RelayReport>, String> {
@@ -1640,7 +1754,7 @@ pub mod supervise {
             },
             deadline_ns: link.deadline_ns(),
         };
-        submit(link, plan, booted, workers, request.clone(), Vec::new())?;
+        submit(link, plan, booted, workers, request.clone(), Vec::new()).map_err(|(_, e)| e)?;
         // The guest is still booting when BOOTING is journaled: until its broker
         // listens, the VMM answers CONNECT without OK. Only that is retried, every
         // 50 ms, within the original Create deadline; nothing was sent to a broker.
@@ -1655,7 +1769,8 @@ pub mod supervise {
             }
             if retry_at.is_some_and(|at| std::time::Instant::now() >= at) {
                 retry_at = None;
-                submit(link, plan, booted, workers, request.clone(), Vec::new())?;
+                submit(link, plan, booted, workers, request.clone(), Vec::new())
+                    .map_err(|(_, e)| e)?;
             }
             match next_report(workers).map_err(Abort::Refused)? {
                 Some(RelayReport::Unreachable { job: answered, .. }) if answered == job => {
@@ -1766,13 +1881,16 @@ pub mod supervise {
                 )
             }
         };
-        let submitted = stdio.and_then(|stdio| submit(link, plan, booted, workers, request, stdio));
-        if let Err(error) = submitted {
+        // Our own descriptor hand-off from H failing is local: R never saw this job.
+        let submitted = stdio
+            .map_err(|e| (Reach::Local, e))
+            .and_then(|stdio| submit(link, plan, booted, workers, request, stdio));
+        if let Err((reach, error)) = submitted {
             link.event(&SupervisorEvent::Broker {
                 report: RelayReport::Failed {
                     job,
                     reason: error.to_string(),
-                    dispatched: false,
+                    reach,
                 },
             });
         }
@@ -1822,6 +1940,13 @@ pub mod supervise {
             match link.poll(Duration::from_millis(10)) {
                 Ok(Some(SupervisorCommand::Broker(request))) => {
                     command(link, &plan, booted, workers, descriptors, request);
+                    // A torn job frame poisons R's stream for good: S and R can no
+                    // longer agree on a job, so the session ends (B5-03).
+                    if workers.relay.control.is_poisoned() {
+                        return SteadyEnd::Retire(
+                            "a job frame to the broker relay was torn".into(),
+                        );
+                    }
                 }
                 Ok(Some(_)) | Ok(None) => {}
                 Err(Abort::Revoked) => return SteadyEnd::Revoked,

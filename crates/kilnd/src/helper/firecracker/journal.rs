@@ -32,6 +32,11 @@ pub const PRE_INTENT_TOKEN_MARGIN: u64 = 1024;
 const NEVER_ADMITTED_SHARE: u64 = 4;
 /// A complete inventory is bounded to this many active allocations.
 pub const MAX_ACTIVE_LISTED: usize = 1024;
+/// B5-01's per-allocation retention: the stop reasons and settled worker rows kept.
+pub const STOP_REASONS_KEPT: i64 = 16;
+pub const SETTLED_WORKERS_KEPT: i64 = 8;
+/// An execution's settlement states: the last row of its token.
+pub const EXEC_TERMINAL: [&str; 3] = ["idle", "undispatched", "interrupted"];
 
 const SCHEMA: &str = "
 CREATE TABLE node_identity (
@@ -187,7 +192,7 @@ CREATE TABLE resource_events (
     kind TEXT NOT NULL CHECK (kind IN
         ('intent','cgroup','work_dir','work_file','private_files','loop_intent','loop',
          'loop_released','jail_intent','jail_dir','jail_mount','jail_binds','vmm','broker',
-         'exec')),
+         'exec','exec_history')),
     detail TEXT NOT NULL,
     generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
     FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
@@ -345,7 +350,13 @@ WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
         OR NEW.host_boot_id IS NOT OLD.host_boot_id))
     OR OLD.settled_generation IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'a worker record is immutable once identified or settled'); END;
+-- B5-01: an allocation's settled worker rows are compacted to its newest eight settled
+-- rows of the same mode; an unsettled or node-level row is permanent.
 CREATE TRIGGER worker_intents_no_delete BEFORE DELETE ON worker_intents
+WHEN NOT (OLD.allocation_id IS NOT NULL AND OLD.settled_generation IS NOT NULL
+    AND (SELECT COUNT(*) FROM worker_intents w WHERE w.instance_id = OLD.instance_id
+        AND w.allocation_id = OLD.allocation_id AND w.mode = OLD.mode
+        AND w.settled_generation IS NOT NULL AND w.id > OLD.id) >= 8)
 BEGIN SELECT RAISE(ABORT, 'a worker record is permanent'); END;
 
 CREATE TRIGGER retired_tokens_no_replace BEFORE INSERT ON retired_tokens
@@ -379,7 +390,12 @@ WHEN EXISTS (SELECT 1 FROM allocations WHERE instance_id = NEW.instance_id
 BEGIN SELECT RAISE(ABORT, 'an absent allocation owns nothing new'); END;
 CREATE TRIGGER resource_events_no_update BEFORE UPDATE ON resource_events
 BEGIN SELECT RAISE(ABORT, 'a resource event is immutable'); END;
+-- B5-01: execution evidence is compacted, nothing else. An `exec` or `exec_history` row
+-- may go only once a newer `exec_history` row of the same allocation holds its summary.
 CREATE TRIGGER resource_events_no_delete BEFORE DELETE ON resource_events
+WHEN NOT (OLD.kind IN ('exec','exec_history') AND EXISTS (SELECT 1 FROM resource_events r
+    WHERE r.instance_id = OLD.instance_id AND r.allocation_id = OLD.allocation_id
+      AND r.kind = 'exec_history' AND r.generation > OLD.generation))
 BEGIN SELECT RAISE(ABORT, 'a resource event is permanent'); END;
 ";
 
@@ -1207,6 +1223,13 @@ impl Ledger {
     #[cfg(test)]
     pub(super) fn fail_next_commit(&self) {
         self.fail_next_commit.set(true);
+    }
+
+    /// Long-history tests only: commits without fsync, so 100,000 executions run in
+    /// seconds. Nothing else changes; production always opens FULL-sync.
+    #[cfg(test)]
+    pub(super) fn test_unsynchronized(&self) {
+        self.conn.pragma_update(None, "synchronous", "OFF").unwrap();
     }
 
     /// The root enrollment command. `limit` comes from the root policy; lowering it
@@ -2051,8 +2074,101 @@ impl Ledger {
             detail,
             signed(generation, "generation")?
         ])?;
+        if let super::supervisor::ResourceRecord::Exec {
+            token,
+            execution_id,
+            state,
+            ..
+        } = record
+            && EXEC_TERMINAL.contains(&state.as_str())
+        {
+            Self::compact_exec(&tx, instance, allocation, token, execution_id, state)?;
+        }
         commit_tx(tx, &self.fail_next_commit)?;
         Ok(generation)
+    }
+
+    /// B5-01's retention rule, in the transaction that records an execution's
+    /// settlement: one `exec_history` summary (how many executions settled and the
+    /// last one's token, ID and state) replaces every `exec` row and the previous
+    /// summary. An allocation therefore holds at most the in-flight execution's
+    /// `intent` and `busy` rows plus one summary, whatever its history.
+    fn compact_exec(
+        tx: &Transaction<'_>,
+        instance: Id128,
+        allocation: Id128,
+        token: &str,
+        execution_id: &str,
+        state: &str,
+    ) -> Result<(), LedgerError> {
+        let key = [instance.to_string(), allocation.to_string()];
+        let previous: Option<String> = tx
+            .prepare_cached(
+                "SELECT detail FROM resource_events WHERE instance_id = ?1 AND allocation_id = ?2
+                   AND kind = 'exec_history' ORDER BY generation DESC LIMIT 1",
+            )?
+            .query_row(key.clone(), |r| r.get(0))
+            .optional()?;
+        let (settled, last_token) = match previous {
+            Some(detail) => match serde_json::from_str(&detail)
+                .map_err(|e| LedgerError::Corrupt(format!("exec history: {e}")))?
+            {
+                super::supervisor::ResourceRecord::ExecHistory {
+                    settled,
+                    last_token,
+                    ..
+                } => (settled, last_token),
+                _ => return Err(LedgerError::Corrupt("exec history kind".into())),
+            },
+            None => (0, String::new()),
+        };
+        // A second settlement of the same token (`idle`, then `interrupted` when READY
+        // could not be journaled) updates the state without counting it twice.
+        let settled = if last_token == token {
+            settled
+        } else {
+            settled
+                .checked_add(1)
+                .ok_or(LedgerError::Overflow("settled executions"))?
+        };
+        let summary = super::supervisor::ResourceRecord::ExecHistory {
+            settled,
+            last_token: token.into(),
+            last_execution_id: execution_id.into(),
+            last_state: state.into(),
+        };
+        let generation = next_generation(tx)?;
+        let detail =
+            serde_json::to_string(&summary).map_err(|e| LedgerError::Config(e.to_string()))?;
+        tx.prepare_cached(
+            "INSERT INTO resource_events (instance_id, allocation_id, kind, detail, generation)
+             VALUES (?1, ?2, 'exec_history', ?3, ?4)",
+        )?
+        .execute(params![
+            instance.to_string(),
+            allocation.to_string(),
+            detail,
+            signed(generation, "generation")?
+        ])?;
+        tx.prepare_cached(
+            "UPDATE allocations SET updated_generation = ?3
+             WHERE instance_id = ?1 AND allocation_id = ?2",
+        )?
+        .execute(params![
+            instance.to_string(),
+            allocation.to_string(),
+            signed(generation, "generation")?
+        ])?;
+        tx.prepare_cached(
+            "DELETE FROM resource_events WHERE instance_id = ?1 AND allocation_id = ?2
+               AND kind IN ('exec','exec_history') AND generation < ?3",
+        )?
+        .execute(params![
+            instance.to_string(),
+            allocation.to_string(),
+            signed(generation, "generation")?
+        ])?;
+        Ok(())
     }
 
     /// A conditional phase change: only from one of `from`, never out of `absent`.
@@ -2127,8 +2243,14 @@ impl Ledger {
         let Some((sandbox_id, digest, phase, created, plan)) = row else {
             return Ok(None);
         };
+        // Defense in depth for B5-01: only execution rows newer than the latest summary
+        // (the in-flight execution's), whatever compaction left behind.
         let mut statement = self.conn.prepare_cached(
             "SELECT detail FROM resource_events WHERE instance_id = ?1 AND allocation_id = ?2
+               AND (kind NOT IN ('exec','exec_history')
+                    OR generation >= COALESCE((SELECT MAX(generation) FROM resource_events
+                        WHERE instance_id = ?1 AND allocation_id = ?2
+                          AND kind = 'exec_history'), 0))
              ORDER BY generation",
         )?;
         let mut rows = statement.query(key)?;
@@ -2171,6 +2293,20 @@ impl Ledger {
         }
         let operation = next_generation(&tx)?;
         let id = Self::insert_worker_intent(&tx, Some((instance, allocation)), spec, operation)?;
+        // Each cleanup attempt adds a row: keep the newest eight settled ones (B5-01).
+        tx.prepare_cached(
+            "DELETE FROM worker_intents WHERE instance_id = ?1 AND allocation_id = ?2
+               AND mode = ?3 AND settled_generation IS NOT NULL
+               AND id NOT IN (SELECT id FROM worker_intents WHERE instance_id = ?1
+                   AND allocation_id = ?2 AND mode = ?3 AND settled_generation IS NOT NULL
+                   ORDER BY id DESC LIMIT ?4)",
+        )?
+        .execute(params![
+            instance.to_string(),
+            allocation.to_string(),
+            spec.mode,
+            SETTLED_WORKERS_KEPT,
+        ])?;
         commit_tx(tx, &self.fail_next_commit)?;
         Ok((id, operation))
     }
@@ -2200,16 +2336,25 @@ impl Ledger {
         if changed != 1 {
             return Err(LedgerError::NoSuchAllocation);
         }
-        tx.prepare_cached(
-            "INSERT INTO stop_events (instance_id, allocation_id, generation, reason)
-             VALUES (?1, ?2, ?3, ?4)",
-        )?
-        .execute(params![
-            instance.to_string(),
-            allocation.to_string(),
-            signed(generation, "generation")?,
-            reason
-        ])?;
+        // Each Stop or Remove attempt may record a reason; the first sixteen are kept
+        // and later stops only move the phase (B5-01).
+        let recorded: i64 = tx
+            .prepare_cached(
+                "SELECT COUNT(*) FROM stop_events WHERE instance_id = ?1 AND allocation_id = ?2",
+            )?
+            .query_row([instance.to_string(), allocation.to_string()], |r| r.get(0))?;
+        if recorded < STOP_REASONS_KEPT {
+            tx.prepare_cached(
+                "INSERT INTO stop_events (instance_id, allocation_id, generation, reason)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![
+                instance.to_string(),
+                allocation.to_string(),
+                signed(generation, "generation")?,
+                reason
+            ])?;
+        }
         commit_tx(tx, &self.fail_next_commit)?;
         Ok(generation)
     }

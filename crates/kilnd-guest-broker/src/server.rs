@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use kilnd_broker_protocol::budget::HostBudget;
 use kilnd_broker_protocol::exchange::{GuestConnection, GuestEvent};
-use kilnd_broker_protocol::message::{Accepted, Channel, ErrorCode, ErrorReply, Exec, Message};
+use kilnd_broker_protocol::message::{
+    Accepted, BrokerState, Channel, ErrorCode, ErrorReply, Exec, Message,
+};
 use kilnd_broker_protocol::stream::{Due, FrameReader, FrameWriter};
 use kilnd_broker_protocol::{
     Direction, Id128, MAX_DATA_PAYLOAD, ProtocolError, Result, STAGE_TIMEOUT,
@@ -160,10 +162,26 @@ where
                 InitStep::Refuse(refusal) => Message::Error(refusal),
             }
         }
-        Message::Probe(probe) => match shared.session.borrow().probe(&probe) {
-            Ok(reply) => Message::ProbeReply(reply),
-            Err(refusal) => Message::Error(refusal),
-        },
+        Message::Probe(probe) => {
+            let checked = shared.session.borrow().probe(&probe);
+            match checked {
+                // B5-04: idle is claimed only for a persistent sandbox that is alive.
+                // A dead one faults the session for good, and the reply says so.
+                Ok(reply) if reply.state == BrokerState::Idle => {
+                    if let Err(reason) = shared.kiln.alive(&reply.inner_id).await {
+                        eprintln!("kilnd-guest-broker: {reason}");
+                        shared.session.borrow_mut().fault();
+                    }
+                    let now = shared.session.borrow().probe(&probe);
+                    match now {
+                        Ok(reply) => Message::ProbeReply(reply),
+                        Err(refusal) => Message::Error(refusal),
+                    }
+                }
+                Ok(reply) => Message::ProbeReply(reply),
+                Err(refusal) => Message::Error(refusal),
+            }
+        }
         Message::Cancel(cancel) => {
             Message::CancelAck(shared.session.borrow_mut().cancel(cancel.token))
         }
@@ -286,7 +304,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     /// Echoes stdin to stdout; `sleep` argv waits for cancellation or the deadline.
-    struct FakeKiln;
+    /// `inner_dead` models guest root killing the persistent sandbox (B5-04).
+    #[derive(Default)]
+    struct FakeKiln {
+        inner_dead: std::cell::Cell<bool>,
+    }
 
     impl KilnOps for FakeKiln {
         fn initialize<'a>(
@@ -326,10 +348,27 @@ mod tests {
                 }
             })
         }
+
+        fn alive<'a>(
+            &'a self,
+            _inner: &'a InnerId,
+        ) -> BoxFuture<'a, std::result::Result<(), String>> {
+            Box::pin(async move { self.check() })
+        }
+    }
+
+    impl FakeKiln {
+        fn check(&self) -> std::result::Result<(), String> {
+            if self.inner_dead.get() {
+                Err("init is gone".into())
+            } else {
+                Ok(())
+            }
+        }
     }
 
     fn shared() -> Rc<Shared<FakeKiln>> {
-        Rc::new(Shared::new(Session::new(facts()), FakeKiln))
+        Rc::new(Shared::new(Session::new(facts()), FakeKiln::default()))
     }
 
     struct Host {
@@ -448,6 +487,40 @@ mod tests {
                 h.request(Id128([3; 16]), init()).await,
                 HostEvent::Reply(Message::Ready(_))
             ));
+        })
+        .await;
+    }
+
+    /// B5-04: once guest root kills the persistent sandbox, Probe answers Faulted, not
+    /// Idle, and the session never admits another Exec.
+    #[tokio::test(start_paused = true)]
+    async fn b5_04_probe_reports_a_dead_inner_sandbox_as_faulted() {
+        run_local(async {
+            let s = initialized().await;
+            s.kiln.inner_dead.set(true);
+            let probe = || {
+                Message::Probe(Probe {
+                    boot_id: facts().boot_id,
+                    inner_id: InnerId::new("abcd").unwrap(),
+                })
+            };
+            let mut h = connect(&s, Channel::Control).await;
+            match h.request(Id128([2; 16]), probe()).await {
+                HostEvent::Reply(Message::ProbeReply(reply)) => {
+                    assert_eq!(reply.state, BrokerState::Faulted)
+                }
+                other => panic!("{other:?}"),
+            }
+            // Faulted is terminal: even a healthy check later cannot make it Idle.
+            s.kiln.inner_dead.set(false);
+            let mut h = connect(&s, Channel::Control).await;
+            match h.request(Id128([3; 16]), probe()).await {
+                HostEvent::Reply(Message::ProbeReply(reply)) => {
+                    assert_eq!(reply.state, BrokerState::Faulted)
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(s.session.borrow().state(), BrokerState::Faulted);
         })
         .await;
     }

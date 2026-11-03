@@ -1959,3 +1959,220 @@ fn b3_02_never_admitted_fences_stop_at_the_quota_and_admitted_ones_never_do() {
     assert!(!reopened.never_admitted_fence_allowed(instance()).unwrap());
     assert!(reopened.never_admitted_fence_allowed(other).unwrap());
 }
+
+fn exec_record(token: u64, state: &str) -> super::super::supervisor::ResourceRecord {
+    super::super::supervisor::ResourceRecord::Exec {
+        token: format!("{token:032x}"),
+        execution_id: format!("ex-{token:016x}"),
+        boot_id: "0f8e2c1a-1b2c-3d4e-5f60-718293a4b5c6".into(),
+        state: state.into(),
+    }
+}
+
+fn state_frame_bytes(ledger: &Ledger, allocation: Id128) -> usize {
+    let state = ledger.allocation_state(instance(), allocation).unwrap();
+    super::super::workers::encode_frame(&super::super::workers::Envelope {
+        id: 1,
+        deadline_ns: 0,
+        body: &super::super::workers::LedgerReply::State(state.map(Box::new)),
+    })
+    .unwrap()
+    .len()
+}
+
+fn phase(ledger: &mut Ledger, allocation: Id128, from: &str, to: &str) {
+    ledger
+        .set_phase(instance(), allocation, &[from.to_string()], to)
+        .unwrap();
+}
+
+/// B5-01 (Daybreak's `ledger_growth`): 100,000 executions in one session leave an
+/// `AllocationState` whose size does not depend on the history, so its reply fits one
+/// worker frame and Stop and Remove still reach ABSENT.
+#[test]
+fn b5_01_execution_history_never_grows_the_allocation_state() {
+    let fixture = temp_ledger(unrestricted());
+    let mut ledger = attached(&fixture.config);
+    ledger.test_unsynchronized();
+    let allocation = request(1).allocation_id;
+    accepted(ledger.admit_intent(&request(1)).unwrap());
+    phase(&mut ledger, allocation, "intent", "ready");
+    let mut sizes = Vec::new();
+    const EXECUTIONS: u64 = 100_000;
+    for token in 1..=EXECUTIONS {
+        ledger
+            .record_resource(instance(), allocation, &exec_record(token, "intent"))
+            .unwrap();
+        phase(&mut ledger, allocation, "ready", "exec_intent");
+        ledger
+            .record_resource(instance(), allocation, &exec_record(token, "busy"))
+            .unwrap();
+        phase(&mut ledger, allocation, "exec_intent", "busy");
+        if token == 3 || token == EXECUTIONS {
+            // In flight: the current execution's two rows plus the summary.
+            let state = ledger
+                .allocation_state(instance(), allocation)
+                .unwrap()
+                .unwrap();
+            let execs: Vec<_> = state
+                .resources
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r,
+                        super::super::supervisor::ResourceRecord::Exec { .. }
+                            | super::super::supervisor::ResourceRecord::ExecHistory { .. }
+                    )
+                })
+                .collect();
+            assert_eq!(execs.len(), 3, "{execs:?}");
+        }
+        // Every fourth one is interrupted after reporting idle, as when READY is not
+        // durable: one settlement, counted once.
+        ledger
+            .record_resource(instance(), allocation, &exec_record(token, "idle"))
+            .unwrap();
+        if token % 4 == 0 {
+            ledger
+                .record_resource(instance(), allocation, &exec_record(token, "interrupted"))
+                .unwrap();
+        }
+        phase(&mut ledger, allocation, "busy", "ready");
+        if token == 3 || token == EXECUTIONS {
+            sizes.push(state_frame_bytes(&ledger, allocation));
+        }
+    }
+    let state = ledger
+        .allocation_state(instance(), allocation)
+        .unwrap()
+        .unwrap();
+    let history: Vec<_> = state
+        .resources
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                super::super::supervisor::ResourceRecord::Exec { .. }
+                    | super::super::supervisor::ResourceRecord::ExecHistory { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        history,
+        [&super::super::supervisor::ResourceRecord::ExecHistory {
+            settled: EXECUTIONS,
+            last_token: format!("{EXECUTIONS:032x}"),
+            last_execution_id: format!("ex-{EXECUTIONS:016x}"),
+            last_state: "interrupted".into(),
+        }]
+    );
+    // Only the summary's digits grew between 3 and 100,000 executions.
+    // ("3" to "100000", and "idle" to "interrupted").
+    assert!(sizes[1] - sizes[0] <= 12, "{sizes:?}");
+    assert!(sizes[1] < 64 * 1024, "{sizes:?}");
+    // The table itself holds no history either.
+    let rows: i64 = ledger
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM resource_events WHERE kind IN ('exec','exec_history')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+    // Stop and Remove: STOP_INTENT, the workers settled, the fence: ABSENT.
+    ledger
+        .record_stop(instance(), allocation, "remove")
+        .unwrap();
+    assert!(state_frame_bytes(&ledger, allocation) < 64 * 1024);
+    ledger.settle_unstarted(instance(), allocation).unwrap();
+    absent(ledger.commit_fence(&fence_request(1)).unwrap());
+    assert!(matches!(
+        ledger
+            .lookup_token(instance(), allocation, &request(1).plan_digest)
+            .unwrap(),
+        TokenLookup::Fenced { .. }
+    ));
+}
+
+/// B5-01's audit of the other per-allocation rows: repeated Stop and Remove attempts
+/// keep at most sixteen stop reasons and eight settled cleanup workers, and an
+/// execution row cannot be deleted without a newer summary.
+#[test]
+fn b5_01_stop_reasons_and_cleanup_workers_are_bounded() {
+    let fixture = temp_ledger(unrestricted());
+    let mut ledger = attached(&fixture.config);
+    let allocation = request(1).allocation_id;
+    accepted(ledger.admit_intent(&request(1)).unwrap());
+    for attempt in 0..40 {
+        ledger
+            .record_stop(instance(), allocation, &format!("attempt {attempt}"))
+            .unwrap();
+        let (worker, _) = ledger
+            .record_allocation_worker_intent(instance(), allocation, &request(1).supervisor)
+            .unwrap();
+        ledger.settle_worker(worker, "exited").unwrap();
+    }
+    fn count(ledger: &Ledger, sql: &str) -> i64 {
+        ledger.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+    assert_eq!(
+        count(&ledger, "SELECT COUNT(*) FROM stop_events"),
+        STOP_REASONS_KEPT
+    );
+    assert!(
+        count(
+            &ledger,
+            "SELECT COUNT(*) FROM worker_intents WHERE settled_generation IS NOT NULL"
+        ) <= SETTLED_WORKERS_KEPT + 1
+    );
+    assert_eq!(
+        ledger
+            .allocation_state(instance(), allocation)
+            .unwrap()
+            .unwrap()
+            .phase,
+        "stop_intent"
+    );
+    // The triggers allow only that compaction.
+    ledger
+        .record_resource(
+            instance(),
+            allocation,
+            &super::super::supervisor::ResourceRecord::Intent(
+                super::super::supervisor::IntentKind::WorkDir,
+            ),
+        )
+        .unwrap();
+    ledger
+        .record_resource(instance(), allocation, &exec_record(1, "intent"))
+        .unwrap();
+    assert!(
+        ledger
+            .conn
+            .execute("DELETE FROM resource_events WHERE kind = 'exec'", [])
+            .is_err(),
+        "no execution row goes without a newer summary"
+    );
+    assert!(
+        ledger
+            .conn
+            .execute("DELETE FROM resource_events WHERE kind = 'intent'", [])
+            .is_err()
+    );
+    assert!(
+        ledger
+            .conn
+            .execute(
+                "DELETE FROM worker_intents WHERE settled_generation IS NULL",
+                []
+            )
+            .is_err()
+            || count(
+                &ledger,
+                "SELECT COUNT(*) FROM worker_intents WHERE settled_generation IS NULL"
+            ) == 0
+    );
+    ledger.settle_unstarted(instance(), allocation).unwrap();
+    absent(ledger.commit_fence(&fence_request(1)).unwrap());
+}

@@ -39,6 +39,7 @@ fn expected() -> Expected {
     Expected {
         binding: binding(),
         work_uuid: work_uuid(),
+        broker_sha256: Hex32([7; 32]),
         boot_id: None,
         inner_id: None,
     }
@@ -98,6 +99,12 @@ enum Mode {
     Silent,
     /// The VMM answers CONNECT with garbage.
     BadConnect,
+    /// HelloReply with a broker digest other than the pinned one (B5-10).
+    WrongBroker,
+    /// HelloReply without the required kiln features (B5-10).
+    NoFeatures,
+    /// An honest Hello, then Ready without the required kiln features (B5-10).
+    ReadyNoFeatures,
 }
 
 /// Records what the guest saw, so tests can prove nothing was dispatched.
@@ -143,6 +150,8 @@ async fn guest(stream: DuplexStream, mode: Mode, seen: std::rc::Rc<std::cell::Re
     match mode {
         Mode::ForeignIdentity => r.identity.allocation_id = Id128([0xee; 16]),
         Mode::Unhardened => r.hardening.kaslr = false,
+        Mode::WrongBroker => r.broker_sha256 = Hex32([0xbb; 32]),
+        Mode::NoFeatures => r.kiln.features = 0,
         _ => {}
     }
     writer
@@ -160,7 +169,11 @@ async fn guest(stream: DuplexStream, mode: Mode, seen: std::rc::Rc<std::cell::Re
                 inner_id: inner(),
                 kiln: KilnFacts {
                     protocol: 1,
-                    features: 0x1f,
+                    features: if mode == Mode::ReadyNoFeatures {
+                        0
+                    } else {
+                        0x1f
+                    },
                 },
                 idle: true,
                 work_quota_verified: true,
@@ -328,13 +341,19 @@ async fn readiness_needs_the_journaled_identity_and_full_hardening() {
             }
             other => panic!("{other:?}"),
         }
-        for mode in [Mode::ForeignIdentity, Mode::Unhardened] {
+        for mode in [
+            Mode::ForeignIdentity,
+            Mode::Unhardened,
+            Mode::WrongBroker,
+            Mode::NoFeatures,
+            Mode::ReadyNoFeatures,
+        ] {
             let (host, _) = spawn_guest(mode);
             assert!(
                 matches!(
                     initialize(host, 1, &expected(), init(), soon(100)).await,
                     RelayReport::Failed {
-                        dispatched: false,
+                        reach: Reach::Guest,
                         ..
                     }
                 ),
@@ -409,9 +428,20 @@ async fn run_exec(
     declared: u64,
     deadline: Instant,
 ) -> (RelayReport, Vec<u8>, bool, bool) {
+    run_exec_into(mode, stdin, declared, deadline, 2 << 20).await
+}
+
+/// `run_exec` with kilnd's stdout socket holding at most `out_capacity` unread bytes.
+async fn run_exec_into(
+    mode: Mode,
+    stdin: &[u8],
+    declared: u64,
+    deadline: Instant,
+    out_capacity: usize,
+) -> (RelayReport, Vec<u8>, bool, bool) {
     let (host, seen) = spawn_guest(mode);
     let (mut kilnd_in, relay_in) = duplex(2 << 20);
-    let (relay_out, mut kilnd_out) = duplex(2 << 20);
+    let (relay_out, mut kilnd_out) = duplex(out_capacity);
     let (relay_err, _kilnd_err) = duplex(2 << 20);
     kilnd_in.write_all(stdin).await.unwrap();
     drop(kilnd_in);
@@ -456,6 +486,34 @@ async fn a_full_execution_delivers_its_output_after_a_validated_result() {
     .await;
 }
 
+/// B5-08: a caller's stdout that stops reading after a prefix gets that prefix, and
+/// R reports exactly the bytes delivered, so H never copies the guest's full facts.
+#[tokio::test(start_paused = true)]
+async fn b5_08_a_partial_delivery_reports_the_bytes_delivered() {
+    local(async {
+        let stdin: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let (report, out, _, _) =
+            run_exec_into(Mode::Honest, &stdin, stdin.len() as u64, soon(30), 4096).await;
+        match report {
+            RelayReport::Executed {
+                result,
+                delivered,
+                stdout_delivered,
+                stderr_delivered,
+                ..
+            } => {
+                assert!(!delivered);
+                assert_eq!(result.stdout.kept, 200_000);
+                assert_eq!(stdout_delivered, 4096);
+                assert_eq!(stderr_delivered, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(out, stdin[..4096]);
+    })
+    .await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn short_stdin_fails_before_any_exec_byte() {
     local(async {
@@ -463,7 +521,7 @@ async fn short_stdin_fails_before_any_exec_byte() {
         assert!(matches!(
             report,
             RelayReport::Failed {
-                dispatched: false,
+                reach: Reach::Local,
                 ..
             }
         ));
@@ -478,7 +536,7 @@ async fn a_silent_guest_holds_the_job_only_until_the_execution_deadline() {
         let start = Instant::now();
         let (report, _, accepted, _) = run_exec(Mode::Silent, b"", 0, soon(30)).await;
         assert!(accepted);
-        assert!(matches!(report, RelayReport::Failed { dispatched: true, ref reason, .. } if reason.contains("FirstByte")));
+        assert!(matches!(report, RelayReport::Failed { reach: Reach::Dispatched, ref reason, .. } if reason.contains("FirstByte")));
         assert_eq!(start.elapsed(), Duration::from_secs(30));
     })
     .await;
@@ -493,7 +551,7 @@ async fn endless_output_is_refused_at_the_negotiated_limit() {
             matches!(
                 report,
                 RelayReport::Failed {
-                    dispatched: true,
+                    reach: Reach::Dispatched,
                     ..
                 }
             ),
@@ -515,7 +573,7 @@ async fn a_trickled_result_must_settle_within_two_seconds_of_its_start() {
             matches!(
                 report,
                 RelayReport::Failed {
-                    dispatched: true,
+                    reach: Reach::Dispatched,
                     ..
                 }
             ),

@@ -43,7 +43,13 @@ pub trait KilnOps {
         spec: ExecSpec<'a>,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, ExecOutcome>;
+    /// B5-04: the persistent sandbox is still alive, cheaply: its init answers kiln's
+    /// fixed capability request on its control socket, and its cgroup exists.
+    fn alive<'a>(&'a self, inner: &'a InnerId) -> BoxFuture<'a, Result<(), String>>;
 }
+
+/// The liveness check's budget, inside the host's two-second Probe stage.
+pub const ALIVE_BUDGET: Duration = Duration::from_millis(1500);
 
 pub struct Kiln {
     bin: KilnBinary,
@@ -151,6 +157,24 @@ impl KilnOps for Kiln {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, ExecOutcome> {
         Box::pin(async move { self.core().exec_direct(inner.as_str(), &spec, cancel).await })
+    }
+
+    fn alive<'a>(&'a self, inner: &'a InnerId) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let deadline = Instant::now() + ALIVE_BUDGET;
+            // `kiln capabilities <id>`: the existing fixed argv mapping. It connects to
+            // the sandbox's control socket, which only its live init serves.
+            self.core()
+                .capabilities(Some(inner.as_str()), deadline, &CancellationToken::new())
+                .await
+                .map_err(|e| format!("the persistent sandbox does not answer: {e}"))?;
+            let cgroup = self.cgroup_root.join(inner.as_str());
+            match tokio::fs::metadata(&cgroup).await {
+                Ok(meta) if meta.is_dir() => Ok(()),
+                Ok(_) => Err(format!("{} is not a cgroup", cgroup.display())),
+                Err(e) => Err(format!("the persistent sandbox's cgroup is gone: {e}")),
+            }
+        })
     }
 }
 

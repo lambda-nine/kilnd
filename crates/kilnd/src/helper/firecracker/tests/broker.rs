@@ -417,6 +417,92 @@ async fn b5_linux_root_ready_and_persistent_execution() {
     removed_cleanly(&real, &runtime, &context).await;
 }
 
+/// B5-01 in the real chain: 3,000 short executions in one session leave one
+/// execution summary in the journal, and Remove still reaches ABSENT.
+#[tokio::test]
+#[ignore = "needs root with the B4 launch capabilities: run scripts/b4-vm-tests.sh"]
+async fn b5_linux_root_three_thousand_executions_keep_the_ledger_bounded() {
+    let real = Real::new(NodeOptions::default()).await;
+    let (runtime, context, _) = create(&real).await;
+    let (boot, inner) = wait_ready(&real, &runtime, &context).await;
+    const EXECUTIONS: u64 = 3_000;
+    let began = std::time::Instant::now();
+    for index in 0..EXECUTIONS {
+        let ran = exec(&real, &runtime, &context, &boot, &["true"], Vec::new()).await;
+        let reply = ran.reply.unwrap();
+        assert!(
+            reply.reusable && reply.finish == WireFinishFc::Completed,
+            "execution {index}: {reply:?}"
+        );
+    }
+    evidence(
+        "three thousand executions",
+        format!("{EXECUTIONS} in {:?}", began.elapsed()),
+    );
+    let rows: Vec<String> = real.fixture.read(|view| {
+        let mut statement = view.prepare(
+            "SELECT detail FROM resource_events WHERE allocation_id = ?1
+               AND kind IN ('exec','exec_history') ORDER BY generation",
+        )?;
+        let rows = statement
+            .query_map([context.allocation_id.to_string()], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    });
+    evidence("execution rows after the run", format!("{rows:?}"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].contains(&format!("\"settled\":{EXECUTIONS}")),
+        "{rows:?}"
+    );
+    assert!(matches!(
+        validate(&real, &runtime, &context, &boot, &inner).await,
+        ValidateReply::Ready { .. }
+    ));
+    removed_cleanly(&real, &runtime, &context).await;
+}
+
+/// B5-04 (Daybreak's live PoC): the test guest's root wrapper kills the persistent
+/// sandbox's init five seconds after it appears, leaving the broker Idle. Validate
+/// must not call that sandbox Ready: the broker's liveness check faults the session,
+/// and H retires the VM. The guest comes from `scripts/b5-test-guest.sh`.
+#[tokio::test]
+#[ignore = "needs root with the B4 launch capabilities: run scripts/b4-vm-tests.sh"]
+async fn b5_linux_root_a_killed_inner_sandbox_is_never_ready() {
+    let guest = PathBuf::from(
+        std::env::var("KILND_B5_KILL_INNER_GUEST")
+            .expect("KILND_B5_KILL_INNER_GUEST names the test guest (scripts/b5-test-guest.sh)"),
+    );
+    let real = Real::with_guest(NodeOptions::default(), Some(&guest)).await;
+    let (runtime, context, _) = create(&real).await;
+    let (boot, inner) = wait_ready(&real, &runtime, &context).await;
+    evidence("kill-inner guest", format!("READY boot {boot} inner {inner}"));
+    // The wrapper kills init five seconds after it appears; eight is past that.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let reply = validate(&real, &runtime, &context, &boot, &inner).await;
+    evidence("validate after the inner sandbox died", format!("{reply:?}"));
+    assert!(
+        !matches!(reply, ValidateReply::Ready { .. }),
+        "a dead inner sandbox was reported Ready"
+    );
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while !vm_subtree_gone(&context) {
+        assert!(std::time::Instant::now() < end, "the VM was not retired");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(stop_reasons(&real, &context)
+        .iter()
+        .any(|reason| reason.contains("not idle")));
+    let ran = exec(&real, &runtime, &context, &boot, &["true"], Vec::new()).await;
+    assert!(
+        !ran.reply.unwrap().dispatched,
+        "nothing runs in the retired boot"
+    );
+    removed_cleanly(&real, &runtime, &context).await;
+}
+
 /// B5 exit: timeout, the caller's disconnect and a Stop during execution each retire
 /// the VM (design 5.5): reusable = false, VM stopped, no second dispatch.
 #[tokio::test]
@@ -744,6 +830,7 @@ fn hostile_expected() -> Expected {
         },
         work_uuid: kilnd_broker_protocol::WorkUuid::new("51b8e65e-23b9-4eba-a21c-7c1cce2c5f94")
             .unwrap(),
+        broker_sha256: kilnd_broker_protocol::Hex32([7; 32]),
         boot_id: None,
         inner_id: None,
     }

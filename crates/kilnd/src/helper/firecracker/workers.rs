@@ -146,7 +146,7 @@ pub(super) struct Envelope<T> {
 pub(super) fn encode_frame<T: Serialize>(envelope: &Envelope<T>) -> io::Result<Vec<u8>> {
     let body = serde_json::to_vec(envelope).map_err(io::Error::other)?;
     if body.is_empty() || body.len() > MAX_IPC_FRAME {
-        return Err(io::Error::other("worker frame size exceeded"));
+        return Err(oversized(body.len()));
     }
     let mut frame = Vec::with_capacity(body.len() + 4);
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
@@ -154,13 +154,58 @@ pub(super) fn encode_frame<T: Serialize>(envelope: &Envelope<T>) -> io::Result<V
     Ok(frame)
 }
 
+/// A frame too large for the worker protocol, refused before any byte is written.
+fn oversized(bytes: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("worker frame size exceeded: {bytes} bytes"),
+    )
+}
+
+/// True when `error` is `encode_frame`'s size refusal: nothing was written.
+pub fn oversized_frame(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidData
+        && !partial_send(error)
+        && error.to_string().starts_with("worker frame size exceeded")
+}
+
 /// Blocking only inside bounded `poll`; every read and write is `MSG_DONTWAIT`.
+///
+/// A frame is all or nothing (B5-03). A write given up before its first byte reached
+/// the kernel drops that frame whole and the stream stays usable. A write that fails
+/// or times out after any byte was handed over **poisons** the endpoint: the socket is
+/// shut down both ways, so the peer reads a torn frame and then EOF and never a late
+/// delivery, and every later `send` returns the stored error. The unsent tail is never
+/// flushed and the connection is never resumed.
 pub struct Endpoint {
     fd: OwnedFd,
     buffer: Vec<u8>,
-    /// The unsent tail of a frame a slow peer did not take in time. It goes first next
-    /// time, so giving a write up can drop a whole frame but never tear the stream.
-    unsent: Vec<u8>,
+    poisoned: Option<(io::ErrorKind, String)>,
+}
+
+/// The marker inside an error from a frame that was partly handed to the kernel: the
+/// peer may have any prefix of it, so the send is uncertain, not undelivered.
+#[derive(Debug)]
+pub struct PartialFrame(pub String);
+
+impl std::fmt::Display for PartialFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} after a partial frame; the connection is poisoned",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for PartialFrame {}
+
+/// True when `error` came from a send that had already handed bytes of its frame to
+/// the kernel, or from an endpoint poisoned by one: delivery is uncertain.
+pub fn partial_send(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<PartialFrame>().is_some())
 }
 
 pub enum Received<T> {
@@ -177,8 +222,31 @@ impl Endpoint {
         Self {
             fd: stream.into(),
             buffer: Vec::new(),
-            unsent: Vec::new(),
+            poisoned: None,
         }
+    }
+
+    /// True once a partial write poisoned this endpoint.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    fn poisoned_error(&self) -> Option<io::Error> {
+        self.poisoned
+            .as_ref()
+            .map(|(kind, why)| io::Error::new(*kind, PartialFrame(why.clone())))
+    }
+
+    /// Records the failure and shuts the socket both ways; the peer sees EOF after
+    /// whatever prefix arrived, which never decodes as a frame.
+    fn poison(&mut self, error: io::Error) -> io::Error {
+        if self.poisoned.is_none() {
+            self.poisoned = Some((error.kind(), error.to_string()));
+            // SAFETY: the descriptor is owned; shutdown never blocks.
+            unsafe { libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR) };
+        }
+        self.poisoned_error()
+            .unwrap_or_else(|| io::Error::other("poisoned"))
     }
 
     pub fn raw_fd(&self) -> RawFd {
@@ -263,12 +331,13 @@ impl Endpoint {
 
     /// Sends one frame under an absolute bound; a peer that never reads cannot pin
     /// this process, because the worker gives the frame up instead.
+    /// A frame that cannot be encoded (too large) is refused before any byte is
+    /// written and leaves the endpoint usable.
     pub fn send<T: Serialize>(&mut self, id: u64, body: &T, within: Duration) -> io::Result<()> {
-        let end = std::time::Instant::now() + within;
-        if !self.unsent.is_empty() {
-            let tail = std::mem::take(&mut self.unsent);
-            self.write_until(tail, end)?;
+        if let Some(error) = self.poisoned_error() {
+            return Err(error);
         }
+        let end = std::time::Instant::now() + within;
         let frame = encode_frame(&Envelope {
             id,
             deadline_ns: 0,
@@ -279,18 +348,31 @@ impl Endpoint {
 
     fn write_until(&mut self, frame: Vec<u8>, end: std::time::Instant) -> io::Result<()> {
         let mut sent = 0;
-        while sent < frame.len() {
+        let result = self.write_frame(&frame, &mut sent, end);
+        match result {
+            Err(error) if sent > 0 => Err(self.poison(error)),
+            other => other,
+        }
+    }
+
+    fn write_frame(
+        &mut self,
+        frame: &[u8],
+        sent: &mut usize,
+        end: std::time::Instant,
+    ) -> io::Result<()> {
+        while *sent < frame.len() {
             // SAFETY: the unsent suffix is readable and the descriptor is owned.
             let n = unsafe {
                 libc::send(
                     self.fd.as_raw_fd(),
-                    frame[sent..].as_ptr().cast(),
-                    frame.len() - sent,
+                    frame[*sent..].as_ptr().cast(),
+                    frame.len() - *sent,
                     libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
                 )
             };
             if n >= 0 {
-                sent += n as usize;
+                *sent += n as usize;
                 continue;
             }
             let error = io::Error::last_os_error();
@@ -299,10 +381,7 @@ impl Endpoint {
                 io::ErrorKind::WouldBlock => {
                     let left = end.saturating_duration_since(std::time::Instant::now());
                     if left.is_zero() {
-                        // Nothing of an untouched frame is kept: it is simply dropped.
-                        if sent > 0 {
-                            self.unsent = frame[sent..].to_vec();
-                        }
+                        // An untouched frame is simply dropped; a started one poisons.
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "worker frame write deadline",
@@ -1058,6 +1137,11 @@ pub enum LedgerReply {
     Failed {
         reason: String,
     },
+    /// The answer would exceed the worker frame bound (B5-01). L stays up; nothing
+    /// was changed by encoding it, and the caller treats the state as Unknown.
+    Oversized {
+        bytes: u64,
+    },
 }
 
 fn handle_ledger(
@@ -1352,9 +1436,30 @@ pub fn ledger_main(
                 .unwrap_or_else(ledger_failure),
         };
         fault_point("L.reply");
-        if endpoint.send(id, &reply, Duration::from_secs(5)).is_err() {
+        if send_ledger_reply(&mut endpoint, id, &reply).is_err() {
             return;
         }
+    }
+}
+
+/// L's answer, or in its place a typed refusal when it is too large for one frame
+/// (B5-01): a reply's size must never take the shared ledger down. Only a transport
+/// failure is an error, and it ends L.
+pub(super) fn send_ledger_reply(
+    endpoint: &mut Endpoint,
+    id: u64,
+    reply: &LedgerReply,
+) -> io::Result<()> {
+    match endpoint.send(id, reply, Duration::from_secs(5)) {
+        Err(error) if oversized_frame(&error) => {
+            let bytes = serde_json::to_vec(reply).map_or(u64::MAX, |b| b.len() as u64);
+            endpoint.send(
+                id,
+                &LedgerReply::Oversized { bytes },
+                Duration::from_secs(5),
+            )
+        }
+        other => other,
     }
 }
 
@@ -2943,39 +3048,168 @@ pub(super) mod tests {
         let mut receiver = Endpoint::new(right);
         let body = vec![7u8; MAX_IPC_FRAME / 8];
         let mut delivered = 0;
-        for _ in 0..64 {
-            if sender.send(1, &body, Duration::from_millis(10)).is_ok() {
-                delivered += 1;
-            } else {
-                break;
+        let error = loop {
+            match sender.send(1, &body, Duration::from_millis(10)) {
+                Ok(()) => delivered += 1,
+                Err(error) => break error,
+            }
+            assert!(delivered < 64, "the kernel buffer should have filled");
+        };
+        // Whatever arrives is whole frames, then EOF if a frame was torn: never a
+        // frame stitched from a given-up tail and a later send.
+        let poisoned = sender.is_poisoned();
+        assert_eq!(poisoned, partial_send(&error), "{error}");
+        let later = sender.send(2, &body, Duration::from_secs(1));
+        if poisoned {
+            let later = later.expect_err("a poisoned endpoint refuses every later send");
+            assert!(partial_send(&later));
+        }
+        drop(sender);
+        let mut frames = 0;
+        loop {
+            match receiver.receive::<Vec<u8>>(Duration::from_millis(200)) {
+                Ok(Received::Message { id, body, .. }) => {
+                    assert_eq!(body.len(), MAX_IPC_FRAME / 8);
+                    assert!(!poisoned || id == 1, "nothing after the torn frame");
+                    frames += 1;
+                }
+                Ok(Received::Idle) => {}
+                Ok(Received::Closed) | Err(_) => break,
             }
         }
-        assert!(delivered < 64, "the kernel buffer should have filled");
-        // Whatever arrives is whole frames: the kept tail goes out before anything new.
+        assert!(frames >= delivered, "{frames} {delivered}");
+    }
+
+    fn small_send_buffer(stream: &std::os::unix::net::UnixStream) {
+        let bytes: libc::c_int = 4096;
+        // SAFETY: the option pointer and size describe a live c_int.
+        let rc = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&bytes as *const libc::c_int).cast(),
+                std::mem::size_of_val(&bytes) as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+    }
+
+    /// B5-03 (Daybreak's `endpoint_resume`): a frame that timed out after a partial
+    /// write is never completed by the next send. The endpoint is poisoned, the second
+    /// send fails with the stored error, and the receiver sees no frame 101.
+    #[test]
+    fn b5_03_a_timed_out_partial_frame_is_never_delivered_later() {
+        #[derive(Debug, Deserialize, Serialize)]
+        struct Job {
+            generation: u64,
+            payload: String,
+        }
+        let (sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        small_send_buffer(&sender);
+        let mut sender = Endpoint::new(sender);
+        let first = Job {
+            generation: 1,
+            payload: "A".repeat(900_000),
+        };
+        let error = sender
+            .send(101, &first, Duration::from_millis(5))
+            .expect_err("a peer that never reads must time out after a partial write");
+        assert!(partial_send(&error), "{error}");
+        assert!(sender.is_poisoned());
         let reader = std::thread::spawn(move || {
-            let mut frames = 0;
-            let mut last = 0;
-            while last != 2 {
-                match receiver
-                    .receive::<Vec<u8>>(Duration::from_millis(200))
-                    .unwrap()
-                {
-                    Received::Message { id, body, .. } => {
-                        assert_eq!(body.len(), MAX_IPC_FRAME / 8);
-                        last = id;
-                        frames += 1;
+            let mut receiver = Endpoint::new(receiver);
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            let mut seen = Vec::new();
+            while std::time::Instant::now() < end {
+                match receiver.receive::<Job>(Duration::from_millis(50)) {
+                    Ok(Received::Message { id, body, .. }) => {
+                        seen.push((id, body.generation, body.payload.len()))
                     }
+                    Ok(Received::Idle) => {}
+                    Ok(Received::Closed) | Err(_) => break,
+                }
+            }
+            seen
+        });
+        let second = Job {
+            generation: 2,
+            payload: "B".repeat(32),
+        };
+        let later = sender
+            .send(102, &second, Duration::from_secs(5))
+            .expect_err("the poisoned endpoint refuses the next frame");
+        assert!(partial_send(&later), "{later}");
+        drop(sender);
+        assert_eq!(reader.join().unwrap(), Vec::<(u64, u64, usize)>::new());
+    }
+
+    /// B5-01 defense in depth: an `AllocationState` larger than one frame (Daybreak's
+    /// 5,890 Exec rows) is answered with a typed refusal, and L's endpoint stays up.
+    #[test]
+    fn b5_01_an_oversized_ledger_answer_is_refused_and_l_stays_up() {
+        let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut l = Endpoint::new(left);
+        let mut h = Endpoint::new(right);
+        let record = super::super::supervisor::ResourceRecord::Exec {
+            token: "00112233445566778899aabbccddeeff".into(),
+            execution_id: "ex-00112233445566778899aabbccddeeff".into(),
+            boot_id: "00112233-4455-6677-8899-aabbccddeeff".into(),
+            state: "interrupted".into(),
+        };
+        let state = LedgerReply::State(Some(Box::new(super::super::journal::AllocationState {
+            sandbox_id: "sb-00112233445566778899aabbccddeeff".into(),
+            plan_digest: crate::model::Digest::of(b"plan"),
+            phase: "stop_intent".into(),
+            created_generation: 1,
+            plan: b"{}".to_vec(),
+            resources: vec![record; 5_890],
+        })));
+        let reader = std::thread::spawn(move || {
+            let mut answers = Vec::new();
+            while answers.len() < 2 {
+                match h.receive::<LedgerReply>(Duration::from_secs(2)).unwrap() {
+                    Received::Message { id, body, .. } => answers.push((id, body)),
                     Received::Idle => {}
                     Received::Closed => break,
                 }
             }
-            (frames, last)
+            answers
         });
-        std::thread::sleep(Duration::from_millis(50));
-        sender.send(2, &body, Duration::from_secs(5)).unwrap();
-        let (frames, last) = reader.join().unwrap();
-        assert!(frames > delivered, "{frames} {delivered}");
-        assert_eq!(last, 2);
+        send_ledger_reply(&mut l, 7, &state).unwrap();
+        send_ledger_reply(&mut l, 8, &LedgerReply::Done).unwrap();
+        let answers = reader.join().unwrap();
+        assert!(
+            matches!(&answers[0], (7, LedgerReply::Oversized { bytes }) if *bytes > MAX_IPC_FRAME as u64),
+            "{answers:?}"
+        );
+        assert!(matches!(answers[1], (8, LedgerReply::Done)));
+        assert!(!l.is_poisoned());
+    }
+
+    /// A frame that cannot be encoded is refused before any byte: the endpoint stays
+    /// usable (L answers such a reply with a typed refusal, B5-01).
+    #[test]
+    fn an_oversized_frame_is_refused_without_poisoning() {
+        let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut sender = Endpoint::new(left);
+        let mut receiver = Endpoint::new(right);
+        let huge = vec![0u8; MAX_IPC_FRAME];
+        let error = sender
+            .send(1, &huge, Duration::from_millis(50))
+            .unwrap_err();
+        assert!(!partial_send(&error));
+        assert!(!sender.is_poisoned());
+        sender
+            .send(2, &"small".to_string(), Duration::from_secs(1))
+            .unwrap();
+        match receiver
+            .receive::<String>(Duration::from_millis(500))
+            .unwrap()
+        {
+            Received::Message { id, body, .. } => assert_eq!((id, body.as_str()), (2, "small")),
+            _ => panic!("no message"),
+        }
     }
 
     #[test]

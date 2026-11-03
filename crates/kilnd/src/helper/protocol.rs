@@ -589,6 +589,9 @@ pub enum ValidateReply {
     Ready { boot_id: String, inner_id: String },
     /// An execution is in flight: the recorded state, without guest polling.
     Busy { execution_token: Id128 },
+    /// Another control operation held this allocation's control slot until the
+    /// deadline (B5-05). Nothing was asked of the guest; not a breach.
+    ControlBusy,
     /// Booted again, another inner sandbox, or not READY.
     Incompatible { message: String },
     /// No proof either way: stays charged and is not reusable.
