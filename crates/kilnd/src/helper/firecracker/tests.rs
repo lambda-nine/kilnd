@@ -5018,4 +5018,6 @@ mod control_plane;
 #[cfg(target_os = "linux")]
 mod lifecycle;
 #[cfg(target_os = "linux")]
+mod recovery;
+#[cfg(target_os = "linux")]
 mod session;

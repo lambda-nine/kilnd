@@ -1090,83 +1090,8 @@ async fn b5_linux_root_hostile_sources_leave_memory_flat_and_a_healthy_fourth_me
     let real = Real::new(NodeOptions::default()).await;
     let (runtime, context, _) = create(&real).await;
     let (boot, inner) = wait_ready(&real, &runtime, &context).await;
-    // The isolated hostile tree, with the contract's relay and console limits.
-    let parent = PathBuf::from(format!(
-        "/sys/fs/cgroup/kilnd-b5-hostile-{}",
-        Id128::random()
-    ));
-    std::fs::create_dir(&parent).unwrap();
-    std::fs::write(parent.join("cgroup.subtree_control"), "+memory +pids +cpu").unwrap();
-    let parent_guard = scopeguard_dir(parent.clone());
-    let relay_a = TestCgroup::new(&parent, "relay-endless", 16 << 20, 4);
-    let relay_b = TestCgroup::new(&parent, "relay-silent", 16 << 20, 4);
-    let console = TestCgroup::new(&parent, "console-flood", 4 << 20, 2);
-    let mut relays = Vec::new();
-    for (cgroup, endless, uid) in [(&relay_a, true, 300_990), (&relay_b, false, 300_991)] {
-        let (control_s, control_r) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (fds_s, fds_r) = std::os::unix::net::UnixDatagram::pair().unwrap();
-        let child = spawn_worker("relay", cgroup, uid, control_r.into(), fds_r.into());
-        let mut hostile = HostileRelay {
-            child,
-            control: super::super::workers::Endpoint::new(control_s),
-            fds: fds_s,
-            endless,
-            next: 0,
-            refused: 0,
-        };
-        hostile.submit();
-        relays.push(hostile);
-    }
-    let mut pipe = [0; 2];
-    unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) };
-    let mut report = [0; 2];
-    unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-    let (console_read, console_write) =
-        unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
-    let (report_read, report_write) = unsafe {
-        (
-            OwnedFd::from_raw_fd(report[0]),
-            OwnedFd::from_raw_fd(report[1]),
-        )
-    };
-    let mut drainer = spawn_worker("drainer", &console, 300_992, console_read, report_write);
-    let flooded = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let stop_flood = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flood = {
-        let flooded = flooded.clone();
-        let stop = stop_flood.clone();
-        std::thread::spawn(move || {
-            let chunk = vec![b'#'; 64 * 1024];
-            let mut file = std::fs::File::from(console_write);
-            use std::io::Write;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if file.write_all(&chunk).is_err() {
-                    return;
-                }
-                flooded.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            }
-        })
-    };
-    // Warm up, then take the baseline.
-    for _ in 0..40 {
-        for relay in relays.iter_mut() {
-            relay.pump();
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let memory_before = [relay_a.memory(), relay_b.memory(), console.memory()];
-    let helper_before = helper_rss_kib(&real);
-    let flood_before = flooded.load(std::sync::atomic::Ordering::Relaxed);
-    let cpu_before = [relay_a.cpu(), relay_b.cpu(), console.cpu()];
+    let mut hostile = HostileSources::start(&real).await;
     // The healthy fourth, under attack. Each operation against its own deadline.
-    let pump = async {
-        loop {
-            for relay in relays.iter_mut() {
-                relay.pump();
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    };
     let healthy = async {
         let mut timings = Vec::new();
         for _ in 0..5 {
@@ -1201,88 +1126,234 @@ async fn b5_linux_root_hostile_sources_leave_memory_flat_and_a_healthy_fourth_me
         timings.push(("remove", t.elapsed(), Duration::from_secs(60)));
         timings
     };
-    let timings = tokio::select! {
-        timings = healthy => timings,
-        _ = pump => unreachable!(),
-    };
-    for relay in relays.iter_mut() {
-        relay.pump();
+    let timings = hostile.beside(healthy).await;
+    hostile.finish(&real, &timings, &["inspect", "validate", "exec", "remove"]);
+}
+
+/// B5's three simultaneous hostile sources, each in its own capped cgroup under its own
+/// UID: a relay fed endless valid frames, a relay whose peer never sends, and a 64 KiB
+/// write console flood into a real drainer. B6 runs them beside real lifecycle requests.
+pub(super) struct HostileSources {
+    relays: Vec<HostileRelay>,
+    drainer: std::process::Child,
+    report_read: OwnedFd,
+    flooded: Arc<std::sync::atomic::AtomicU64>,
+    stop_flood: Arc<std::sync::atomic::AtomicBool>,
+    flood: Option<std::thread::JoinHandle<()>>,
+    cgroups: Option<[TestCgroup; 3]>,
+    memory_before: [u64; 3],
+    cpu_before: [u64; 3],
+    helper_before: u64,
+    flood_before: u64,
+    parent_guard: Option<DirGuard>,
+}
+
+impl HostileSources {
+    /// Starts all three and warms them up, then takes the baseline.
+    pub(super) async fn start(real: &Real) -> Self {
+        // The isolated hostile tree, with the contract's relay and console limits.
+        let parent = PathBuf::from(format!(
+            "/sys/fs/cgroup/kilnd-b5-hostile-{}",
+            Id128::random()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("cgroup.subtree_control"), "+memory +pids +cpu").unwrap();
+        let parent_guard = scopeguard_dir(parent.clone());
+        let relay_a = TestCgroup::new(&parent, "relay-endless", 16 << 20, 4);
+        let relay_b = TestCgroup::new(&parent, "relay-silent", 16 << 20, 4);
+        let console = TestCgroup::new(&parent, "console-flood", 4 << 20, 2);
+        let mut relays = Vec::new();
+        for (cgroup, endless, uid) in [(&relay_a, true, 300_990), (&relay_b, false, 300_991)] {
+            let (control_s, control_r) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (fds_s, fds_r) = std::os::unix::net::UnixDatagram::pair().unwrap();
+            let child = spawn_worker("relay", cgroup, uid, control_r.into(), fds_r.into());
+            let mut hostile = HostileRelay {
+                child,
+                control: super::super::workers::Endpoint::new(control_s),
+                fds: fds_s,
+                endless,
+                next: 0,
+                refused: 0,
+            };
+            hostile.submit();
+            relays.push(hostile);
+        }
+        let mut pipe = [0; 2];
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) };
+        let mut report = [0; 2];
+        unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        let (console_read, console_write) =
+            unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
+        let (report_read, report_write) = unsafe {
+            (
+                OwnedFd::from_raw_fd(report[0]),
+                OwnedFd::from_raw_fd(report[1]),
+            )
+        };
+        let drainer = spawn_worker("drainer", &console, 300_992, console_read, report_write);
+        let flooded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop_flood = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flood = {
+            let flooded = flooded.clone();
+            let stop = stop_flood.clone();
+            std::thread::spawn(move || {
+                let chunk = vec![b'#'; 64 * 1024];
+                let mut file = std::fs::File::from(console_write);
+                use std::io::Write;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if file.write_all(&chunk).is_err() {
+                        return;
+                    }
+                    flooded.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+        // Warm up, then take the baseline.
+        for _ in 0..40 {
+            for relay in relays.iter_mut() {
+                relay.pump();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let memory_before = [relay_a.memory(), relay_b.memory(), console.memory()];
+        let cpu_before = [relay_a.cpu(), relay_b.cpu(), console.cpu()];
+        Self {
+            relays,
+            drainer,
+            report_read,
+            flood_before: flooded.load(std::sync::atomic::Ordering::Relaxed),
+            flooded,
+            stop_flood,
+            flood: Some(flood),
+            cgroups: Some([relay_a, relay_b, console]),
+            memory_before,
+            cpu_before,
+            helper_before: helper_rss_kib(real),
+            parent_guard: Some(parent_guard),
+        }
     }
-    let memory_after = [relay_a.memory(), relay_b.memory(), console.memory()];
-    let helper_after = helper_rss_kib(&real);
-    let flood_after = flooded.load(std::sync::atomic::Ordering::Relaxed);
-    let cpu_after = [relay_a.cpu(), relay_b.cpu(), console.cpu()];
-    for (name, took, limit) in &timings {
-        assert!(took < limit, "{name} took {took:?} against {limit:?}");
+
+    /// Runs `work` while the hostile relays keep being fed.
+    pub(super) async fn beside<T>(&mut self, work: impl std::future::Future<Output = T>) -> T {
+        let relays = &mut self.relays;
+        let pump = async {
+            loop {
+                for relay in relays.iter_mut() {
+                    relay.pump();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            done = work => done,
+            _ = pump => unreachable!(),
+        }
     }
-    let worst: Vec<_> = ["inspect", "validate", "exec", "remove"]
-        .iter()
-        .map(|n| {
-            let max = timings
-                .iter()
-                .filter(|t| t.0 == *n)
-                .map(|t| t.1)
-                .max()
-                .unwrap();
-            format!("{n} max {max:?}")
-        })
-        .collect();
-    evidence("healthy fourth under attack", worst.join(", "));
-    evidence(
-        "hostile memory",
-        format!(
-            "before {memory_before:?} after {memory_after:?} bytes; helper RSS {helper_before} -> {helper_after} KiB"
-        ),
-    );
-    for (before, after) in memory_before.iter().zip(memory_after) {
-        assert!(
-            after <= before + (2 << 20),
-            "a hostile source grew: {before} -> {after}"
+
+    /// Checks every operation met its deadline, memory stayed flat, CPU was charged to
+    /// the hostile cgroups, each offender ended at its bound and the console drained.
+    pub(super) fn finish(
+        mut self,
+        real: &Real,
+        timings: &[(&'static str, Duration, Duration)],
+        names: &[&str],
+    ) {
+        for relay in self.relays.iter_mut() {
+            relay.pump();
+        }
+        let [relay_a, relay_b, console] = self.cgroups.take().unwrap();
+        let memory_after = [relay_a.memory(), relay_b.memory(), console.memory()];
+        let helper_after = helper_rss_kib(real);
+        let flood_after = self.flooded.load(std::sync::atomic::Ordering::Relaxed);
+        let cpu_after = [relay_a.cpu(), relay_b.cpu(), console.cpu()];
+        let (memory_before, cpu_before, helper_before, flood_before) = (
+            self.memory_before,
+            self.cpu_before,
+            self.helper_before,
+            self.flood_before,
         );
+        for (name, took, limit) in timings {
+            assert!(took < limit, "{name} took {took:?} against {limit:?}");
+        }
+        let worst: Vec<_> = names
+            .iter()
+            .map(|n| {
+                let max = timings
+                    .iter()
+                    .filter(|t| t.0 == *n)
+                    .map(|t| t.1)
+                    .max()
+                    .unwrap();
+                format!("{n} max {max:?}")
+            })
+            .collect();
+        evidence("healthy fourth under attack", worst.join(", "));
+        evidence(
+            "hostile memory",
+            format!(
+                "before {memory_before:?} after {memory_after:?} bytes; helper RSS {helper_before} -> {helper_after} KiB"
+            ),
+        );
+        for (before, after) in memory_before.iter().zip(memory_after) {
+            assert!(
+                after <= before + (2 << 20),
+                "a hostile source grew: {before} -> {after}"
+            );
+        }
+        assert!(
+            helper_after <= helper_before + 8 * 1024,
+            "H grew: {helper_before} -> {helper_after} KiB"
+        );
+        evidence(
+            "hostile cpu (usec, charged to their own cgroups)",
+            format!("{cpu_before:?} -> {cpu_after:?}"),
+        );
+        assert!(cpu_after.iter().zip(cpu_before).all(|(a, b)| *a > b));
+        // Every offender was ended at its bound, again and again.
+        evidence(
+            "offenders ended",
+            format!(
+                "endless frames {} jobs, silent peer {} jobs",
+                self.relays[0].refused, self.relays[1].refused
+            ),
+        );
+        assert!(self.relays[0].refused >= 5 && self.relays[1].refused >= 2);
+        // The console was drained after its prefix, far past 64 KiB, and the flood was
+        // reported once.
+        let mut byte = [0u8; 1];
+        let reported =
+            unsafe { libc::read(self.report_read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+        evidence(
+            "console flood",
+            format!(
+                "{} bytes drained during the healthy run; report {:?}",
+                flood_after - flood_before,
+                (reported, byte[0] as char)
+            ),
+        );
+        assert_eq!((reported, byte[0]), (1, b'R'));
+        assert!(flood_after - flood_before > 1 << 20);
+        drop((relay_a, relay_b, console));
     }
-    assert!(
-        helper_after <= helper_before + 8 * 1024,
-        "H grew: {helper_before} -> {helper_after} KiB"
-    );
-    evidence(
-        "hostile cpu (usec, charged to their own cgroups)",
-        format!("{cpu_before:?} -> {cpu_after:?}"),
-    );
-    assert!(cpu_after.iter().zip(cpu_before).all(|(a, b)| *a > b));
-    // Every offender was ended at its bound, again and again.
-    evidence(
-        "offenders ended",
-        format!(
-            "endless frames {} jobs, silent peer {} jobs",
-            relays[0].refused, relays[1].refused
-        ),
-    );
-    assert!(relays[0].refused >= 5 && relays[1].refused >= 2);
-    // The console was drained after its prefix, far past 64 KiB, and the flood was
-    // reported once.
-    let mut byte = [0u8; 1];
-    let reported = unsafe { libc::read(report_read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
-    evidence(
-        "console flood",
-        format!(
-            "{} bytes drained during the healthy run; report {:?}",
-            flood_after - flood_before,
-            (reported, byte[0] as char)
-        ),
-    );
-    assert_eq!((reported, byte[0]), (1, b'R'));
-    assert!(flood_after - flood_before > 1 << 20);
-    stop_flood.store(true, std::sync::atomic::Ordering::Relaxed);
-    for relay in relays.iter_mut() {
-        let _ = relay.child.kill();
-        let _ = relay.child.wait();
+}
+
+impl Drop for HostileSources {
+    fn drop(&mut self) {
+        self.stop_flood
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for relay in self.relays.iter_mut() {
+            let _ = relay.child.kill();
+            let _ = relay.child.wait();
+        }
+        let _ = self.drainer.kill();
+        let _ = self.drainer.wait();
+        // The flood thread's writes fail once the drainer's read end is gone.
+        if let Some(flood) = self.flood.take() {
+            let _ = flood.join();
+        }
+        drop(self.cgroups.take());
+        drop(self.parent_guard.take());
     }
-    let _ = drainer.kill();
-    let _ = drainer.wait();
-    drop(report_read);
-    let _ = flood.join();
-    drop((relay_a, relay_b, console));
-    drop(parent_guard);
 }
 
 /// Removes a test cgroup directory when dropped.

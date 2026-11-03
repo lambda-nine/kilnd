@@ -7,6 +7,10 @@
 //! patched jailer, the release VMM and the pinned production guest bundle) under the test
 //! approval gate, which exists only in test builds: this is the isolated test deployment
 //! of `deploy/firecracker-test/`, and nothing here can run in production.
+//!
+//! The harness here (`Deployment` and `Daemon`) is shared with B6 milestone 2's crash
+//! matrix and attack regressions (`recovery.rs`): any number of daemons, each its own
+//! account, unit, state and enrollment, against one helper.
 use super::lifecycle::{Real, host_leftovers, install_root_file, root_dir};
 use super::*;
 use crate::helper::firecracker::peer::{self, Enrollment};
@@ -19,17 +23,17 @@ const EVIDENCE_ENV: &str = "KILND_B6_EVIDENCE";
 /// The root-owned, protected place the enrolled daemon image is installed.
 const IMAGE_DIR: &str = "/opt/kilnd/b6-session";
 
-fn evidence(name: &str, value: impl std::fmt::Display) {
+pub(super) fn evidence(name: &str, value: impl std::fmt::Display) {
     eprintln!("B6 evidence: {name}: {value}");
 }
 
-fn output(command: &mut Command) -> std::process::Output {
+pub(super) fn output(command: &mut Command) -> std::process::Output {
     command
         .output()
         .unwrap_or_else(|e| panic!("{command:?}: {e}"))
 }
 
-fn checked(command: &mut Command) -> String {
+pub(super) fn checked(command: &mut Command) -> String {
     let out = output(command);
     assert!(
         out.status.success(),
@@ -42,18 +46,32 @@ fn checked(command: &mut Command) -> String {
 
 /// Every command the caller ran, with its output and exit code, in order.
 #[derive(Default)]
-struct Transcript {
-    text: String,
+pub(super) struct Transcript {
+    pub(super) text: String,
 }
 
-struct Ran {
-    code: i32,
-    stdout: String,
-    stderr: String,
+pub(super) struct Ran {
+    pub(super) code: i32,
+    pub(super) stdout: String,
+    pub(super) stderr: String,
+}
+
+impl Drop for Transcript {
+    fn drop(&mut self) {
+        if std::thread::panicking() && !self.text.is_empty() {
+            eprintln!("--- kilndctl transcript ---\n{}", self.text);
+        }
+    }
 }
 
 impl Transcript {
-    fn kilndctl(&mut self, bin: &Path, socket: &Path, args: &[&str], stdin: Option<&[u8]>) -> Ran {
+    pub(super) fn kilndctl(
+        &mut self,
+        bin: &Path,
+        socket: &Path,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> Ran {
         use std::io::Write;
         let started = std::time::Instant::now();
         let mut command = Command::new(bin.join("kilndctl"));
@@ -111,7 +129,7 @@ impl Transcript {
 }
 
 /// Health after its one-second cache, and the node's reserved sandbox slots from it.
-async fn node_sandboxes(transcript: &mut Transcript, bin: &Path, socket: &Path) -> u64 {
+pub(super) async fn node_sandboxes(transcript: &mut Transcript, bin: &Path, socket: &Path) -> u64 {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let health = transcript.kilndctl(bin, socket, &["health"], None);
     assert!(health.stdout.contains("authoritative"), "{}", health.stdout);
@@ -150,7 +168,28 @@ fn unit_properties(name: &str) -> Vec<String> {
     properties
 }
 
-/// Removes everything this test made for the daemon, whatever state it stopped in.
+/// The second daemon's instance name, beside the checked-in `fctest`.
+pub(super) const SECOND: &str = "fctest2";
+
+/// The checked-in deployment for `fctest`; any other name is the same deployment with
+/// that name in the account, group, unit, socket and state, and the same helper.
+pub(super) fn deployment_for(name: &str) -> TestDeployment {
+    let checked_in = TestDeployment::parse(CHECKED_IN.as_bytes()).unwrap();
+    if name == "fctest" {
+        return checked_in;
+    }
+    let mut value: Value = serde_json::from_str(CHECKED_IN).unwrap();
+    for field in ["socket", "socket_group", "state_dir", "account", "unit"] {
+        let text = value["kilnd"][field]
+            .as_str()
+            .unwrap()
+            .replace("fctest", name);
+        value["kilnd"][field] = json!(text);
+    }
+    TestDeployment::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
+/// Removes everything a daemon of the test deployment owned, whatever state it is in.
 struct DaemonGuard {
     unit: String,
     account: String,
@@ -166,13 +205,508 @@ impl Drop for DaemonGuard {
             .args(["reset-failed", &self.unit])
             .status();
         let _ = std::fs::remove_dir_all(&self.state_dir);
-        let _ = std::fs::remove_dir_all(IMAGE_DIR);
         let _ = Command::new("userdel").arg(&self.account).status();
         let _ = Command::new("groupdel").arg(&self.account).status();
     }
 }
 
-fn account_ids(account: &str) -> (u32, u32) {
+/// Removes the shared image directory last.
+struct ImageGuard;
+impl Drop for ImageGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(IMAGE_DIR);
+    }
+}
+
+/// One test daemon: its deployment, enrolled instance and account.
+pub(super) struct Daemon {
+    pub(super) name: String,
+    pub(super) deployment: TestDeployment,
+    pub(super) file: PathBuf,
+    pub(super) instance: Id128,
+    pub(super) uid: u32,
+    pub(super) gid: u32,
+    pub(super) log: PathBuf,
+    pub(super) bin: PathBuf,
+}
+
+/// The helper and its daemons, none started yet.
+pub(super) struct Deployment {
+    pub(super) daemons: Vec<Daemon>,
+    // Fields drop in order: the daemons stop before the helper goes, the image last.
+    _guards: Vec<DaemonGuard>,
+    pub(super) real: Real,
+    pub(super) bin: PathBuf,
+    pub(super) image: PathBuf,
+    _image: ImageGuard,
+}
+
+impl Drop for Deployment {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            for daemon in &self.daemons {
+                let log = std::fs::read_to_string(&daemon.log).unwrap_or_default();
+                let tail: Vec<&str> = log.lines().rev().take(60).collect();
+                eprintln!(
+                    "--- {} daemon log (last 60 lines) ---\n{}",
+                    daemon.name,
+                    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                );
+            }
+        }
+    }
+}
+
+impl Deployment {
+    /// Accounts, the protected daemon image, each instance's state and the real helper at
+    /// the deployment's root; root enrolls every daemon's account, unit, cgroup and image
+    /// with the helper stopped, as add-instance.sh does, then starts it.
+    pub(super) async fn new(names: &[&str], options: NodeOptions) -> Self {
+        let bin =
+            PathBuf::from(std::env::var(BIN_ENV).expect("KILND_B6_BIN names kilnd and kilndctl"));
+        let first = deployment_for("fctest");
+        for name in names {
+            let deployment = deployment_for(name);
+            for leftover in [&deployment.kilnd.state_dir, &first.helper.root] {
+                assert!(
+                    !leftover.exists(),
+                    "{} exists: run scripts/b4-vm-cleanup.py",
+                    leftover.display()
+                );
+            }
+            assert!(
+                !output(Command::new("id").arg(&deployment.kilnd.account))
+                    .status
+                    .success(),
+                "account {} exists: run scripts/b4-vm-cleanup.py",
+                deployment.kilnd.account
+            );
+        }
+        assert!(!Path::new(IMAGE_DIR).exists(), "{IMAGE_DIR} exists");
+        let image_guard = ImageGuard;
+        root_dir(Path::new("/opt/kilnd"), 0o755);
+        root_dir(Path::new(IMAGE_DIR), 0o755);
+        let image = Path::new(IMAGE_DIR).join("kilnd");
+        install_root_file(&bin.join("kilnd"), &image, 0o755);
+        let mut guards = Vec::new();
+        let mut daemons = Vec::new();
+        for name in names {
+            let deployment = deployment_for(name);
+            let account = deployment.kilnd.account.clone();
+            guards.push(DaemonGuard {
+                unit: deployment.kilnd.unit.clone(),
+                account: account.clone(),
+                state_dir: deployment.kilnd.state_dir.clone(),
+            });
+            checked(Command::new("useradd").args([
+                "--system",
+                "--user-group",
+                "--no-create-home",
+                "--home-dir",
+                "/nonexistent",
+                "--shell",
+                "/usr/sbin/nologin",
+                &account,
+            ]));
+            let (uid, gid) = account_ids(&account);
+            let file = Path::new(IMAGE_DIR).join(format!("{name}.json"));
+            std::fs::write(
+                &file,
+                serde_json::to_vec_pretty(&deployment_json(&deployment)).unwrap(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let instance = init_state(&image, &deployment);
+            daemons.push(Daemon {
+                name: name.to_string(),
+                log: first.helper.root.join(format!("kilnd-{name}.log")),
+                deployment,
+                file,
+                instance,
+                uid,
+                gid,
+                bin: bin.clone(),
+            });
+        }
+        let real = Real::unstarted(
+            NodeOptions {
+                peers: PeerEvidence::Real,
+                auto_enroll: false,
+                hash_peers: true,
+                ..options
+            },
+            None,
+            Some(&first.helper.root),
+        );
+        let config = real.config();
+        for daemon in &daemons {
+            enroll(&real, &config, &image, daemon);
+        }
+        real.fixture.allow_other_accounts();
+        real.start().await;
+        Self {
+            daemons,
+            _guards: guards,
+            real,
+            bin,
+            image,
+            _image: image_guard,
+        }
+    }
+
+    pub(super) fn daemon(&self, name: &str) -> &Daemon {
+        self.daemons.iter().find(|d| d.name == name).unwrap()
+    }
+
+    /// Unreleased node claims, across every instance.
+    pub(super) fn claims(&self) -> i64 {
+        self.real.fixture.read(|v| {
+            v.query_row(
+                "SELECT COUNT(*) FROM capacity_claims WHERE released_generation IS NULL",
+                [],
+                |r| r.get(0),
+            )
+        })
+    }
+
+    /// This instance's allocations and their phases, oldest first.
+    pub(super) fn allocations(&self, instance: Id128) -> Vec<(Id128, String)> {
+        self.real.fixture.read(|v| {
+            let mut statement = v.prepare(
+                "SELECT allocation_id, phase FROM allocations WHERE instance_id = ?1
+                 ORDER BY created_generation",
+            )?;
+            let rows = statement
+                .query_map([instance.to_string()], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows
+                .into_iter()
+                .map(|(a, p)| (Id128::parse(&a).unwrap(), p))
+                .collect())
+        })
+    }
+
+    /// Waits until one of this instance's allocations reaches one of `phases`.
+    pub(super) async fn wait_allocation(
+        &self,
+        instance: Id128,
+        phases: &[&str],
+        seconds: u64,
+    ) -> Id128 {
+        let end = std::time::Instant::now() + Duration::from_secs(seconds);
+        loop {
+            if let Some((allocation, _)) = self
+                .allocations(instance)
+                .into_iter()
+                .find(|(_, phase)| phases.contains(&phase.as_str()))
+            {
+                return allocation;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "no allocation reached {phases:?}: {:?}\n{}",
+                self.allocations(instance),
+                self.real.fixture.log()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    pub(super) async fn wait_phase(&self, allocation: Id128, phases: &[&str], seconds: u64) {
+        let end = std::time::Instant::now() + Duration::from_secs(seconds);
+        loop {
+            let phase = self.real.phase(allocation);
+            if phases.contains(&phase.as_str()) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "allocation stayed {phase}, never {phases:?}\n{}",
+                self.real.fixture.log()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Kills the helper process H alone, then starts a new one on the same ledger.
+    pub(super) async fn restart_helper(&self) {
+        self.real.fixture.kill_helper().await;
+        self.real.start().await;
+    }
+}
+
+/// The deployment as its daemon reads it.
+fn deployment_json(deployment: &TestDeployment) -> Value {
+    json!({
+        "schema": deployment.schema,
+        "deployment": deployment.deployment,
+        "profile": deployment.profile,
+        "kilnd": {
+            "socket": deployment.kilnd.socket,
+            "socket_group": deployment.kilnd.socket_group,
+            "state_dir": deployment.kilnd.state_dir,
+            "account": deployment.kilnd.account,
+            "unit": deployment.kilnd.unit,
+        },
+        "helper": {
+            "root": deployment.helper.root,
+            "socket": deployment.helper.socket,
+        },
+    })
+}
+
+/// `kilnd init-state` as root, for the instance ID to enroll.
+pub(super) fn init_state(image: &Path, deployment: &TestDeployment) -> Id128 {
+    Id128::parse(
+        checked(
+            Command::new(image)
+                .args(["init-state", "--state-dir"])
+                .arg(&deployment.kilnd.state_dir)
+                .args(["--account", &deployment.kilnd.account]),
+        )
+        .trim(),
+    )
+    .unwrap()
+}
+
+/// Root's enrollment of one daemon, with the helper stopped.
+fn enroll(real: &Real, config: &ChildConfig, image: &Path, daemon: &Daemon) {
+    let executable = peer::read_installed_kilnd(&WalkPolicy::production(), image).unwrap();
+    let enrollment = Enrollment {
+        instance_id: daemon.instance,
+        unit: daemon.deployment.kilnd.unit.clone(),
+        cgroup: format!("/system.slice/{}", daemon.deployment.kilnd.unit),
+        uid: daemon.uid,
+        gid: daemon.gid,
+        executable,
+    };
+    let enrolled = super::super::with_node_lock(&ledger_config(config), |ledger| {
+        ledger
+            .enroll_instance(&enrollment, config.options.max_enrolled)
+            .map_err(|e| e.to_string())
+    })
+    .unwrap();
+    evidence(
+        "enrolled",
+        format!("{} {enrolled:?} {enrollment:?}", daemon.name),
+    );
+    let _ = real;
+}
+
+impl Daemon {
+    pub(super) fn unit(&self) -> &str {
+        &self.deployment.kilnd.unit
+    }
+
+    pub(super) fn socket(&self) -> &Path {
+        &self.deployment.kilnd.socket
+    }
+
+    pub(super) fn state_dir(&self) -> &Path {
+        &self.deployment.kilnd.state_dir
+    }
+
+    /// Starts the daemon in its own transient unit with kilnd@.service's hardening.
+    pub(super) fn start(&self, image: &Path) {
+        let _ = Command::new("systemctl")
+            .args(["reset-failed", self.unit()])
+            .status();
+        let mut run = Command::new("systemd-run");
+        run.args(["--unit", self.unit(), "--collect", "--quiet"]);
+        for property in unit_properties(&self.name) {
+            run.arg(format!("--property={property}"));
+        }
+        run.arg(format!(
+            "--property=StandardOutput=append:{}",
+            self.log.display()
+        ))
+        .arg(format!(
+            "--property=StandardError=append:{}",
+            self.log.display()
+        ))
+        .arg("--")
+        .arg(image)
+        .arg("--socket")
+        .arg(self.socket())
+        .args(["--socket-group", &self.deployment.kilnd.socket_group])
+        .arg("--state-dir")
+        .arg(self.state_dir())
+        .arg("--helper-socket")
+        .arg(&self.deployment.helper.socket)
+        .args(["--log-format", "json", "--backend", "firecracker"])
+        // A one-second Health cache, so Health shows each step's charge.
+        .args(["--health-success-cache-secs", "1"])
+        .arg("--firecracker-test-deployment")
+        .arg(&self.file);
+        checked(&mut run);
+    }
+
+    /// Whether systemd still runs the unit.
+    pub(super) fn active(&self) -> bool {
+        let state = output(Command::new("systemctl").args(["is-active", self.unit()]));
+        matches!(
+            String::from_utf8_lossy(&state.stdout).trim(),
+            "active" | "activating" | "deactivating"
+        )
+    }
+
+    /// Waits until Health answers, failing early if the unit died.
+    pub(super) async fn wait_serving(&self, real: &Real) {
+        let started = std::time::Instant::now();
+        loop {
+            let probe = output(
+                Command::new(self.bin.join("kilndctl"))
+                    .arg("--socket")
+                    .arg(self.socket())
+                    .arg("health"),
+            );
+            if String::from_utf8_lossy(&probe.stdout).contains("status:") {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(90) && self.active(),
+                "{} never served: {}\n{}\n{}",
+                self.name,
+                String::from_utf8_lossy(&probe.stderr),
+                std::fs::read_to_string(&self.log).unwrap_or_default(),
+                real.fixture.log()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Waits until the unit is no longer running, at most `seconds`.
+    pub(super) async fn wait_inactive(&self, seconds: u64) -> bool {
+        let end = std::time::Instant::now() + Duration::from_secs(seconds);
+        while self.active() {
+            if std::time::Instant::now() > end {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        true
+    }
+
+    /// A clean stop through systemd (SIGTERM and the shutdown grace).
+    pub(super) async fn stop(&self) {
+        checked(Command::new("systemctl").args(["stop", self.unit()]));
+        assert!(self.wait_inactive(60).await);
+    }
+
+    /// The daemon's death: SIGKILL to every process of its unit, no shutdown at all.
+    pub(super) async fn kill(&self) {
+        checked(Command::new("systemctl").args([
+            "kill",
+            "--signal=SIGKILL",
+            "--kill-whom=all",
+            self.unit(),
+        ]));
+        assert!(
+            self.wait_inactive(30).await,
+            "{} survived SIGKILL",
+            self.name
+        );
+        let _ = Command::new("systemctl")
+            .args(["reset-failed", self.unit()])
+            .status();
+    }
+
+    pub(super) fn kilndctl(
+        &self,
+        transcript: &mut Transcript,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> Ran {
+        transcript.text.push_str(&format!("# {}\n", self.name));
+        transcript.kilndctl(&self.bin, self.socket(), args, stdin)
+    }
+
+    /// One kilndctl call on its own thread, for a request a crash interrupts.
+    pub(super) fn kilndctl_background(
+        &self,
+        args: &[&str],
+    ) -> std::thread::JoinHandle<(String, Ran)> {
+        let (bin, socket, name) = (
+            self.bin.clone(),
+            self.socket().to_path_buf(),
+            self.name.clone(),
+        );
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        std::thread::spawn(move || {
+            let mut transcript = Transcript::default();
+            transcript
+                .text
+                .push_str(&format!("# {name} (in the background)\n"));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let ran = transcript.kilndctl(&bin, &socket, &args, None);
+            (std::mem::take(&mut transcript.text), ran)
+        })
+    }
+
+    /// A query-only view of the daemon's own database.
+    pub(super) fn view(&self) -> rusqlite::Connection {
+        kilnd_view(self.state_dir())
+    }
+
+    /// One column of one sandbox row.
+    pub(super) fn row(&self, id: &str, column: &str) -> Option<String> {
+        self.view()
+            .query_row(
+                &format!("SELECT {column} FROM sandboxes WHERE id = ?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Every sandbox ID in the daemon's database, oldest first.
+    pub(super) fn sandbox_ids(&self) -> Vec<String> {
+        let view = self.view();
+        let mut statement = view
+            .prepare("SELECT id FROM sandboxes ORDER BY list_seq")
+            .unwrap();
+        statement
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// A byte copy of the stopped daemon's database files, owner and mode kept.
+    pub(super) fn copy_state(&self, to: &Path) {
+        assert!(!self.active(), "copy only a stopped daemon's state");
+        let _ = std::fs::remove_dir_all(to);
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(self.state_dir()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    /// Puts a byte copy back in place of the daemon's database files.
+    pub(super) fn restore_state(&self, from: &Path) {
+        assert!(!self.active(), "restore only a stopped daemon's state");
+        for entry in std::fs::read_dir(self.state_dir()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = self.state_dir().join(entry.file_name());
+            std::fs::copy(entry.path(), &target).unwrap();
+            std::os::unix::fs::chown(&target, Some(self.uid), Some(self.gid)).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+}
+
+pub(super) fn account_ids(account: &str) -> (u32, u32) {
     let id = |flag| -> u32 {
         checked(Command::new("id").args([flag, account]))
             .trim()
@@ -184,7 +718,11 @@ fn account_ids(account: &str) -> (u32, u32) {
 
 /// Every row a query returns, as JSON: integers, text, and blobs as their length and,
 /// when UTF-8, their text.
-fn dump(view: &rusqlite::Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Value {
+pub(super) fn dump(
+    view: &rusqlite::Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Value {
     let mut statement = view.prepare(sql).unwrap();
     let names: Vec<String> = statement
         .column_names()
@@ -218,7 +756,7 @@ fn dump(view: &rusqlite::Connection, sql: &str, params: &[&dyn rusqlite::ToSql])
     Value::Array(rows)
 }
 
-fn kilnd_view(state_dir: &Path) -> rusqlite::Connection {
+pub(super) fn kilnd_view(state_dir: &Path) -> rusqlite::Connection {
     let view = rusqlite::Connection::open_with_flags(
         state_dir.join("kilnd.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -228,7 +766,7 @@ fn kilnd_view(state_dir: &Path) -> rusqlite::Connection {
     view
 }
 
-fn write_evidence(name: &str, contents: &str) {
+pub(super) fn write_evidence(name: &str, contents: &str) {
     if let Ok(dir) = std::env::var(EVIDENCE_ENV) {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(Path::new(&dir).join(name), contents).unwrap();
@@ -241,145 +779,18 @@ fn write_evidence(name: &str, contents: &str) {
 #[tokio::test]
 #[ignore = "needs root with the B4 launch capabilities: run scripts/b4-vm-tests.sh b6_linux_root"]
 async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
-    let deployment = TestDeployment::parse(CHECKED_IN.as_bytes()).unwrap();
-    let bin = PathBuf::from(std::env::var(BIN_ENV).expect("KILND_B6_BIN names kilnd and kilndctl"));
-    let account = deployment.kilnd.account.clone();
-    let unit = deployment.kilnd.unit.clone();
-    let instance_name = account.strip_prefix("kilnd-").unwrap().to_string();
-    assert_eq!(unit, format!("kilnd-{instance_name}.service"));
-    let socket = deployment.kilnd.socket.clone();
-    let state_dir = deployment.kilnd.state_dir.clone();
-    for leftover in [&state_dir, &deployment.helper.root, Path::new(IMAGE_DIR)] {
-        assert!(
-            !leftover.exists(),
-            "{} exists: run scripts/b4-vm-cleanup.py",
-            leftover.display()
-        );
-    }
-    assert!(
-        !output(Command::new("id").arg(&account)).status.success(),
-        "account {account} exists: run scripts/b4-vm-cleanup.py"
-    );
-
-    // The daemon's account, its protected image and its deployment file.
-    let _cleanup = DaemonGuard {
-        unit: unit.clone(),
-        account: account.clone(),
-        state_dir: state_dir.clone(),
-    };
-    checked(Command::new("useradd").args([
-        "--system",
-        "--user-group",
-        "--no-create-home",
-        "--home-dir",
-        "/nonexistent",
-        "--shell",
-        "/usr/sbin/nologin",
-        &account,
-    ]));
-    let (uid, gid) = account_ids(&account);
-    root_dir(Path::new("/opt/kilnd"), 0o755);
-    root_dir(Path::new(IMAGE_DIR), 0o755);
-    let image = Path::new(IMAGE_DIR).join("kilnd");
-    install_root_file(&bin.join("kilnd"), &image, 0o755);
-    let deployment_file = Path::new(IMAGE_DIR).join("deployment.json");
-    std::fs::write(&deployment_file, CHECKED_IN).unwrap();
-    std::fs::set_permissions(&deployment_file, std::fs::Permissions::from_mode(0o444)).unwrap();
-    let instance = Id128::parse(
-        checked(
-            Command::new(&image)
-                .args(["init-state", "--state-dir"])
-                .arg(&state_dir)
-                .args(["--account", &account]),
-        )
-        .trim(),
-    )
-    .unwrap();
+    let deployment = Deployment::new(&["fctest"], NodeOptions::default()).await;
+    let daemon = deployment.daemon("fctest");
+    let (real, bin) = (&deployment.real, deployment.bin.clone());
+    let instance = daemon.instance;
+    let unit = daemon.unit().to_string();
+    let socket = daemon.socket().to_path_buf();
+    let state_dir = daemon.state_dir().to_path_buf();
+    let log = daemon.log.clone();
     evidence("instance", instance);
-
-    // The helper, at the deployment's root, attesting real peers; root enrolls the
-    // daemon's account, unit and image before it starts, as add-instance.sh does.
-    let options = NodeOptions {
-        peers: PeerEvidence::Real,
-        auto_enroll: false,
-        hash_peers: true,
-        ..NodeOptions::default()
-    };
-    let real = Real::unstarted(options, None, Some(&deployment.helper.root));
-    let config = real.config();
-    let executable = peer::read_installed_kilnd(&WalkPolicy::production(), &image).unwrap();
-    let enrollment = Enrollment {
-        instance_id: instance,
-        unit: unit.clone(),
-        cgroup: format!("/system.slice/{unit}"),
-        uid,
-        gid,
-        executable,
-    };
-    let enrolled = super::super::with_node_lock(&ledger_config(&config), |ledger| {
-        ledger
-            .enroll_instance(&enrollment, config.options.max_enrolled)
-            .map_err(|e| e.to_string())
-    })
-    .unwrap();
-    evidence("enrolled", format!("{enrolled:?} {enrollment:?}"));
-    real.fixture.allow_other_accounts();
-    real.start().await;
-
-    // The daemon, in its own unit, with kilnd@.service's hardening.
-    let log = deployment.helper.root.join("kilnd.log");
-    let mut run = Command::new("systemd-run");
-    run.args(["--unit", &unit, "--collect", "--quiet"]);
-    for property in unit_properties(&instance_name) {
-        run.arg(format!("--property={property}"));
-    }
-    run.arg(format!(
-        "--property=StandardOutput=append:{}",
-        log.display()
-    ))
-    .arg(format!("--property=StandardError=append:{}", log.display()))
-    .arg("--")
-    .arg(&image)
-    .arg("--socket")
-    .arg(&socket)
-    .args(["--socket-group", &deployment.kilnd.socket_group])
-    .arg("--state-dir")
-    .arg(&state_dir)
-    .arg("--helper-socket")
-    .arg(&deployment.helper.socket)
-    .args(["--log-format", "json", "--backend", "firecracker"])
-    // A one-second Health cache, so the transcript's Health calls show each step's charge.
-    .args(["--health-success-cache-secs", "1"])
-    .arg("--firecracker-test-deployment")
-    .arg(&deployment_file);
-    checked(&mut run);
+    daemon.start(&deployment.image);
     let mut transcript = Transcript::default();
-    let started = std::time::Instant::now();
-    loop {
-        let probe = output(
-            Command::new(bin.join("kilndctl"))
-                .arg("--socket")
-                .arg(&socket)
-                .arg("health"),
-        );
-        // Any answer ends the wait; the transcript's first Health must say serving.
-        if String::from_utf8_lossy(&probe.stdout).contains("status:") {
-            break;
-        }
-        let active = output(Command::new("systemctl").args(["is-active", &unit]));
-        assert!(
-            started.elapsed() < Duration::from_secs(60)
-                && matches!(
-                    String::from_utf8_lossy(&active.stdout).trim(),
-                    "active" | "activating"
-                ),
-            "kilnd never served: {}\n{}\n{}",
-            String::from_utf8_lossy(&probe.stderr),
-            std::fs::read_to_string(&log).unwrap_or_default(),
-            real.fixture.log()
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    daemon.wait_serving(real).await;
     let daemon_pid =
         checked(Command::new("systemctl").args(["show", "--property=MainPID", "--value", &unit]));
     evidence(
@@ -494,7 +905,7 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
         sandbox_id: id.clone(),
     };
     let vmm = real.vmm(allocation);
-    let before_rm = host_leftovers(&real, &context, vmm);
+    let before_rm = host_leftovers(real, &context, vmm);
     evidence("owned before Delete", format!("{before_rm:?}"));
     assert!(
         !before_rm.is_empty(),
@@ -521,7 +932,7 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
 
     // Nothing is left: no VMM, loop, mount, cgroup or file, no node claim, and the
     // daemon's row released by its matching ABSENT receipt.
-    let left = host_leftovers(&real, &context, vmm);
+    let left = host_leftovers(real, &context, vmm);
     evidence("owned after Delete", format!("{left:?}"));
     assert!(left.is_empty(), "left behind: {left:?}");
     let phase = real.phase(allocation);
@@ -625,4 +1036,10 @@ async fn b6_linux_root_a_whole_session_through_kilnd_and_kilndctl() {
     write_evidence("helper.log", &real.fixture.log());
     eprintln!("B6 transcript:\n{}", transcript.text);
     evidence("journal", serde_json::to_string(&journal).unwrap());
+    eprintln!(
+        "B6 matrix: {}",
+        json!({"scenario": "whole session through kilnd and kilndctl", "passed": true,
+            "outcome": {"persistent_files": true, "timeout": "exit 124, lost, sandbox_stopped",
+                "release": {"phase": phase, "receipt": evidence_id}}})
+    );
 }

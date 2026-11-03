@@ -24,17 +24,25 @@ DEPLOYMENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'dep
                           'firecracker-test', 'deployment.json')
 
 
-def test_deployment():
+# B6's crash matrix and regressions add a second daemon: the same deployment with this
+# name in place of the checked-in one (session.rs's deployment_for).
+SECOND = 'fctest2'
+
+
+def test_deployments():
     with open(DEPLOYMENT) as f:
         deployment = json.load(f)
     if deployment.get('deployment') != 'isolated-test':
         raise SystemExit('not the isolated test deployment')
     kilnd = deployment['kilnd']
-    for value in (kilnd['account'], kilnd['unit'], kilnd['state_dir'],
-                  deployment['helper']['root']):
-        if value in ('kilnd', 'kilnd.service', '/var/lib/kilnd', '/run/kilnd-helper'):
-            raise SystemExit(f'refusing a production name: {value}')
-    return kilnd['unit'], kilnd['account'], kilnd['state_dir'], deployment['helper']['root']
+    found = []
+    for name in ('fctest', SECOND):
+        names = [kilnd[k].replace('fctest', name) for k in ('unit', 'account', 'state_dir')]
+        for value in names + [deployment['helper']['root']]:
+            if value in ('kilnd', 'kilnd.service', '/var/lib/kilnd', '/run/kilnd-helper'):
+                raise SystemExit(f'refusing a production name: {value}')
+        found.append((*names, deployment['helper']['root']))
+    return found
 
 
 def account_exists(name):
@@ -42,7 +50,17 @@ def account_exists(name):
 
 
 def remove_test_deployment():
-    unit, account, state_dir, helper_root = test_deployment()
+    problems = []
+    for unit, account, state_dir, helper_root in test_deployments():
+        problems += remove_one(unit, account, state_dir, helper_root)
+    # The crash matrix's byte copies of daemon state.
+    shutil.rmtree('/var/lib/kilnd-b6-copies', ignore_errors=True)
+    if os.path.exists('/var/lib/kilnd-b6-copies'):
+        problems.append('path /var/lib/kilnd-b6-copies')
+    return problems
+
+
+def remove_one(unit, account, state_dir, helper_root):
     subprocess.run(['systemctl', 'stop', unit], capture_output=True)
     subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True)
     shutil.rmtree(state_dir, ignore_errors=True)
