@@ -383,6 +383,10 @@ Frame assembly/transfer and expected request/response stages are bounded to two 
 
 For control-only exchanges request IDs are random. Exec request IDs are the execution token; reconnect never resends an Exec. New Hello challenges prevent stale responses on a reused path. The helper compares identity to its journal and independently observed process/cgroup, not to fields supplied by the guest alone. The bootstrap record proves routing and freshness under the trusted-image assumption; it is not a provider secret, bearer authorization for other sessions, or remote attestation.
 
+**Probe health (B5-04).** Probe answers Idle only for a persistent sandbox that is alive now, not from cached state: the broker runs kiln's fixed capability request against the inner ID (`kiln capabilities <id>`, the existing argv mapping, answered only by the sandbox's live init over its control socket) and checks that its cgroup exists, within 1.5 seconds. A failure faults the session for good, so the reply is Faulted, which the host treats as a breach and retires the VM. During an execution Probe still reports the recorded Executing or Draining state without the check.
+
+**Identity checks (B5-06, B5-10).** HelloReply's `broker_sha256` must equal the `kilnd-guest-broker` artifact the plan's approved manifest pins (S takes it from its profile's verified manifest, whose digest must be the plan's `manifest_sha256`). Hello and Ready must both report kiln protocol 1 with features `0x1f` (the private v1 protocol's four and persistent-create certainty). A Result's `inner_id` must be the journaled inner sandbox. Any mismatch is a protocol failure that retires the VM.
+
 Ready requires the newly approved init hardening checks, the broker handshake, successful persistent kiln initialization and empty execution cgroup. Serial `KG_READY`/`KG_FIRST_COMMAND` may be collected as diagnostics but cannot independently authorize readiness. The current guest's markers refer to a different initialization flow; update its definition and benchmark labels in B1/B5.
 
 A guest cannot echo its enclosing rootfs's manifest hash by embedding that same final manifest recursively. Instead vdc supplies the host-pinned bundle identity; the broker separately reports its compiled build identity, kernel and kiln capabilities. Artifact authenticity is established on the host before boot, not from the echoed digest.
@@ -406,6 +410,10 @@ On timeout, RPC disconnect, Delete, shutdown or transport/protocol failure after
 3. Wait for VMM exit and the `vm` subtree populated=0; fence and settle every worker permit that could start another guest or command. A trusted cleanup-only S may remain in `control`, still charged. Verify identities before signals; use `cgroup.kill` for surviving owned VM tasks. If not settled within the 60-second cleanup attempt, return CleanupFailed with disposition Quarantined, hold durable reservations and refuse further Exec. A cleanup worker remains journal-owned/retryable; no success is claimed.
 4. With host stop proof, a genuine timeout/cancel may return TimedOut/Canceled **with `reusable=false`** and the sandbox becomes LOST. A protocol/cleanup error remains Failed even if teardown succeeded. Observed command termination and output prefixes remain separate evidence. Delete subsequently removes the disk and all other resources before capacity returns.
 
+**Containment is always polled (B5-02).** No ledger call is ever awaited inside the execution's wait. BUSY is its own future, polled beside cancellation, the deadline and the 50 ms session watch (S's exit, V's death, a fence), so a stalled L can never hide them. Every journal write on the Validate and Exec paths is bounded (five seconds); one that is not durable within its bound is uncertainty, like a timeout, and retires the VM. Containment itself needs no ledger: the in-memory stop fence revokes S's permit and K kills the `vm` subtree through `proven.rs` under section 4.4's precommitted emergency authority, while STOP_INTENT is queued for when L answers. The reservation stays until absence is proven. An EXEC_INTENT write whose outcome is unknown retires the VM before anything is dispatched, since the journal may still commit it.
+
+**The pre-dispatch split (B5-07).** Every relay failure carries its reach. `Local` is a host-side failure no guest behavior caused, before any byte of the job reached the guest or R: short or late stdin from kilnd (our own validation), no remaining budget at send time, an occupied relay channel, a missing stdio descriptor. Only `Local` may journal `undispatched` and restore READY. `Guest` is a guest that broke the session protocol before any Exec byte: a malformed frame, a wrong binding, boot or inner sandbox, missing hardening, a wrong broker digest or kiln features, a Faulted or refusing broker, a VMM that gives no `OK`. Nothing ran, so the reply is `dispatched: false` with known-zero capture, but the guest is not reusable: H retires the VM (without a Cancel). `Dispatched` is everything from the job's first frame byte or descriptor on (B5-03), and retires the VM as an interruption.
+
 Pre-dispatch cancellation with proof no Exec bytes could have been sent can preserve the ready VM. A normal completed result that was validated before the first cancellation wins over a later disconnect, as today. If the daemon/helper crashes during EXEC_INTENT/BUSY, startup stops the VM; it never retries the command or adopts the session based on a later “idle” claim. Mark the execution INTERRUPTED only after the host stop barrier, or FAILED/CleanupFailed with quarantine if that barrier is unavailable. Reconnection is for observation/cleanup only; commands are not replay-safe.
 
 This intentionally extends the Runtime contract: cleanup success no longer always means reusable sandbox. Section 9 makes that explicit for every caller and test; otherwise a builder could accidentally run the next queued command in a retired guest.
@@ -415,6 +423,10 @@ This intentionally extends the Runtime contract: cleanup success no longer alway
 Enforce these bounds at the **host relay**, even if guest root has replaced the broker. A valid per-frame length never authorizes an unbounded stream. Per execution, cumulative stdout and stderr payloads may each be at most their negotiated retained-prefix limit (at most 1 MiB each); all other guest control payloads combined may be at most 64 KiB. Count both channels and headers: at most 128 guest-to-host frames, including empty frames, and at most `stdout_limit + stderr_limit + 64 KiB + 128*36` wire bytes. Each non-exec exchange has a separate guest-to-host 64 KiB/16-frame cap; only one control request may be outstanding. Unsolicited or repeated control replies fail immediately, including while idle. During BUSY, Validate reports the recorded busy state and host process watches establish liveness; do not spend the execution frame allowance on periodic guest polling. Cancel/CancelAck is idempotent and budgeted once per token. Each limit is checked before allocating/reading the advertised body. Exceeding any bound, a sequence overflow or output after Result is a protocol breach: fence reuse, request durable stop and retire the VM. Guest-observed totals can be larger than kept prefixes, but cannot authorize additional transport. Host-to-guest stdin remains at most 1 MiB and is subject to equivalent counters and write deadlines.
 
 Start timers at connect/accept, **before the first byte**. UDS connect/CONNECT/OK, Hello, each newly accepted control exchange and Exec acceptance have absolute two-second stage budgets bounded by the original operation deadline. An unsolicited/unassigned accepted channel gets two seconds to identify its role; at most two are retained. A frame's entire header and body must arrive within two seconds once that frame is due; trickled bytes never reset it. After Accepted, waiting for a legitimate long-running command's first output/result is bounded by the original execution deadline, not a new two-second execution limit. Once result transfer starts, all retained output/Result/EOF must settle within two seconds. Every write, including Cancel and output delivery to kilnd, has a bounded settlement deadline; never-read peers cannot pin a worker indefinitely. No new deadline extends the original execution budget.
+
+**Frames are all or nothing (B5-03).** Every worker channel (S↔R and each worker's channel to H) uses one `Endpoint`. A write given up before its first byte reached the kernel drops that frame whole and the stream stays usable. A write that fails or times out after any byte was handed over **poisons** the endpoint: it shuts the socket both ways, so the peer reads a torn frame and EOF and never a late delivery, and every later send returns the stored error; the unsent tail is never flushed. For a job, S's sequence is the vsock connect, the descriptors, then the frame: a refused connect is the guest side's (`Guest`), a refused descriptor send leaves R untouched (`Local`), and once the descriptors are queued any failure, even before the frame's first byte, is `Dispatched`. A poisoned S→R stream ends S's steady loop and retires the VM. R's reports to S are written whole or R ends. A frame too large to encode is refused before any byte and never poisons.
+
+**One control operation per allocation (B5-05, B5-09).** H holds a control slot per allocation. A Probe takes it and keeps it until R's job reports its end, even past Validate's deadline: a late report is still judged and a late breach still retires the VM, and a relay that never reports within ten seconds after the deadline is itself a breach. A second Validate queues for the slot within its own deadline and then answers `control_busy`, never a breach. Exec admission takes the slot before marking the allocation busy, so a Probe can never observe our own execution starting. Cancel uses the slot only when it is free; an occupied slot never delays escalation. R's own refusal of a second job on a busy channel is `Local` and is never treated as a broker breach.
 
 A relay reads or writes at most **64 KiB or four frames**, whichever comes first, before yielding and checking cancellation, generation, cumulative counts and remaining time. Limit reading to 4 MiB/s with a 256 KiB burst; backpressure within the same deadlines is allowed, accumulated work is not. Parsing has bounded JSON depth/fields and no per-byte logging. One session-specific unprivileged relay process, outside H's listener runtime, handles both channels with a reserved control queue. Its memory/CPU/PIDs are charged to that allocation (section 6.4). A breached or stalled relay cannot take a recovery worker or run code on the root listener.
 
@@ -687,6 +699,18 @@ The 512 MiB profile needs its own approved contract and workload validation; it 
 Daemons report node totals from the helper ledger, with freshness/generation and unavailable status when it cannot be read, rather than presenting a local sum as global. Keep owner-filtered API lists and private per-instance metadata; global totals reveal no other session identities. Each enrolled instance has one attachment slot, a queue for attach attempts that only its own account can join, a few framing slots of its own, its own share of the 128 detached operations, and its own quota of 4096/N non-durable token gates (N is the policy's enrollment maximum), none of them drawn from a common pool. Attach writes only its own row, once, and that first binding refuses past the fence-headroom floor; a reattachment writes nothing. AttachInstance and startup reconciliation compare database UUID/instance, all owned allocations and helper receipts before admitting. A missing/stale/restored daemon DB never reduces helper charges. Unknown or conflicting ownership quarantines admission; helper-ledger loss/corruption disables Create/Exec for the node until resource inventory and operator repair establish authority. Never recreate an empty ledger over possibly live resources. Helper restart replays all unreleased claims before serving; raw node capacity is not recalculated from idle PSS or currently visible PIDs.
 
 No pool members initially. A future pool of one is a fresh cold-booted, never-used guest with the same global claim vector, leaving two active 768 MiB sessions while holding one spare under this policy. Assignment needs an atomic ledger ownership transfer and new identity handshake; it never releases/reclaims capacity in the middle, reuses a tenant disk or clones a snapshot.
+
+## 7.4 Per-allocation journal retention (B5-01)
+
+No per-allocation row may grow without bound under ordinary use, and nothing L sends may depend on an allocation's history for its size.
+
+- **Executions.** An allocation holds at most the in-flight execution's `exec` rows (`intent`, `busy`) plus one fixed-size `exec_history` summary: how many executions settled, and the last one's token, execution ID and state. The transaction that records an execution's settlement (`idle`, `undispatched` or `interrupted`) writes the new summary and deletes every older `exec` and `exec_history` row of that allocation. A second settlement of the same token updates the state without counting it twice. The `resource_events_no_delete` trigger permits only that: an `exec` or `exec_history` row may be deleted only when a newer `exec_history` row of the same allocation exists; every other resource row stays permanent. `AllocationState` reads only execution rows at or after the latest summary, so its encoded size does not depend on how many executions ran (about 400 bytes of execution evidence after 3 or 100,000).
+- **Stop reasons.** Each Stop or Remove attempt may record a reason; the first sixteen per allocation are kept, and later stops only move the phase to `stop_intent`.
+- **Cleanup workers.** Each cleanup attempt journals a worker intent. When a new one is recorded, settled rows of the same allocation and mode beyond the newest eight are deleted; the `worker_intents_no_delete` trigger permits only that. Unsettled and node-level rows stay permanent, so recovery and accounting see every worker that could still be running.
+- **Everything else** is written once per boot (one boot per allocation) or once per loop slot, and is already bounded.
+- **Defense in depth.** L never exits because an answer is too large: it replies `oversized {bytes}` instead, H raises a health fault (`ledger_fault` in Capabilities), and the caller treats the state as Unknown, so Stop and Remove contain the VM and the allocation stays charged.
+
+The ledger keeps schema version 1: no B5 ledger has shipped, and one from an earlier B5 build fails its schema audit, closed, and needs provisioning again (the B3 rule).
 
 # 8. Delete, list, GC, reconcile and retention
 
@@ -2525,14 +2549,17 @@ and List reports `ready`.
 touching the guest. Otherwise it requires the journaled boot and inner IDs, sends `Probe`
 on a fresh control connection, and answers `ready` only for an idle broker on that boot
 and inner sandbox with no active token. Any other answer, or a refusal or failure, retires
-the VM; a missing answer within the deadline is `unknown`, never absence.
+the VM; a missing answer within the deadline is `unknown`, never absence. (Since the B5
+break-it corrections, a local relay refusal is `unknown` without retirement, the probe
+holds the allocation's control slot until R reports, and a late breach still retires.)
 
 *Exec* (`helper/firecracker/exec.rs`) marks the allocation busy in memory, then journals an
 `exec` resource record (`intent`, with the token, execution ID and boot ID) and `ready →
 exec_intent` before any byte can reach the guest. It hands the three stdio sockets to S,
 which passes them to R with the vsock connection. R reads the declared stdin from kilnd
-first (a failure there is `dispatched: false`, journaled `undispatched`, and the VM goes
-back to `ready`), then sends `Exec`; on `Accepted` H journals `busy` and `exec_intent →
+first (a failure there is `Local`, journaled `undispatched`, and the VM goes back to
+`ready`; a guest protocol violation before dispatch retires it, section 5.5), then sends
+`Exec`; on `Accepted` H journals `busy` and `exec_intent →
 busy`. R holds the output until the `Result` is validated against it, then writes it to
 kilnd within two seconds. Only a validated, delivered result with the guest's drain
 evidence journals `idle` and returns to `ready` with `reusable: true`. Every other ending
@@ -2545,8 +2572,9 @@ its own task, so the caller's disconnect cannot drop it, and H polls every 50 ms
 session ending under it.
 
 *Journal.* The phase CHECK gains `ready`, `exec_intent` and `busy`, all three stoppable;
-`resource_events` gains the `broker` and `exec` kinds, which recovery's `absorb` ignores
-(the VM itself is the resource). The ledger keeps schema 1, as the B4 notes allow.
+`resource_events` gains the `broker`, `exec` and (B5-01) `exec_history` kinds, which
+recovery's `absorb` ignores (the VM itself is the resource); section 7.4 gives their
+retention. The ledger keeps schema 1, as the B4 notes allow.
 
 ### Decisions made in milestone 2
 
@@ -2639,3 +2667,66 @@ The guest and broker take under half a second from BOOTING to a smoke-tested inn
 sandbox. The roughly 13 s before BOOTING is B4's host path in this nested VM (the work
 disk, jail, jailer and VMM launch and adoption), which B5 does not change and these runs
 do not break down; B7 owns that profile.
+
+## B5 break-it corrections (November 3, 2026)
+
+Daybreak's B5 break-it review (`reviews/2026-11-03-b5-breakit.md`, kilnd `38aefb4`,
+kiln-guest `74f3a89`) found three HIGH, six MEDIUM and one LOW defect. Stephen's rule
+governs every fix: any post-dispatch timeout, cancel or uncertainty terminates the VM,
+and a guest that breaks the session protocol is not reusable. The attacks that held
+(framing and budgets, retirement on timeout, disconnect, Stop and worker death, the
+console drain, relay pacing, the terminal Faulted state, `/init`'s supervision, the
+destructive-action gate, provenance) are unchanged and rerun below.
+
+- **B5-01, unbounded execution history (HIGH).** Section 7.4: settled `exec` rows fold
+  into one `exec_history` summary in the settling transaction, stop reasons and settled
+  cleanup workers are capped, and L answers an oversized reply with `oversized` and a
+  health fault instead of exiting. Tests: `journal::tests::b5_01_execution_history_never_grows_the_allocation_state`
+  (100,000 executions; the state's frame stays about 400 bytes; Stop and Remove reach
+  ABSENT), `journal::tests::b5_01_stop_reasons_and_cleanup_workers_are_bounded`,
+  `workers::tests::b5_01_an_oversized_ledger_answer_is_refused_and_l_stays_up`, and in the
+  VM `b5_linux_root_three_thousand_executions_keep_the_ledger_bounded`.
+- **B5-02, a stalled BUSY write blocked containment (HIGH).** Section 5.5's
+  containment-always-polled rule. `exec.rs` is now written against a `Host` trait so its
+  decisions run against a scripted relay and ledger. Tests:
+  `exec::tests::b5_02_a_stalled_busy_write_never_blocks_cancellation` (BUSY stalls
+  forever; cancel, deadline expiry and the session ending each retire the VM within
+  Cancel's two seconds), `b5_02_a_busy_write_past_its_bound_retires_the_vm`,
+  `b5_02_an_unanswered_exec_intent_retires_without_dispatch`. The audit also bounds
+  Remove's Inspect, CLEANING and cleanup-worker intent by the wire deadline. S's own
+  journal records (Create's path) keep their existing acknowledgement protocol.
+- **B5-03, a timed-out partial frame was delivered later (HIGH).** Section 5.6's
+  all-or-nothing frames. Tests: `workers::tests::b5_03_a_timed_out_partial_frame_is_never_delivered_later`
+  (Daybreak's `endpoint_resume`: frame 101 never arrives), the rewritten
+  `a_given_up_write_never_tears_the_frame_stream`, `an_oversized_frame_is_refused_without_poisoning`,
+  and `exec::tests::b5_03_an_uncertain_dispatch_failure_retires_the_vm`.
+- **B5-04, stale health (MEDIUM).** Section 5.3's Probe health. Tests: the guest
+  broker's `server::tests::b5_04_probe_reports_a_dead_inner_sandbox_as_faulted`, and in
+  the VM `b5_linux_root_a_killed_inner_sandbox_is_never_ready` with the kill-inner test
+  guest (`scripts/b5-test-guest.sh`, Daybreak's wrapper).
+- **B5-05, concurrent Validate and Exec (MEDIUM).** Section 5.6's control slot and the
+  `control_busy` Validate answer. Test: `exec::tests::b5_05_control_operations_are_serialized_per_allocation`.
+- **B5-06, Result's inner ID (MEDIUM).** Test: `exec::tests::b5_06_a_result_for_another_inner_sandbox_retires_the_vm`.
+- **B5-07, pre-dispatch violations restored READY (MEDIUM).** Section 5.5's
+  pre-dispatch split; `RelayReport::Failed` and `Refused` carry `reach` instead of
+  `dispatched`. Tests: `exec::tests::b5_07_pre_dispatch_guest_violations_retire_and_local_failures_do_not`,
+  and the relay's `readiness_needs_the_journaled_identity_and_full_hardening` and
+  `short_stdin_fails_before_any_exec_byte` (now `Guest` and `Local`).
+- **B5-08, capture metadata (MEDIUM).** Without a validated Result both captures are
+  `known: false`; when forwarding to kilnd stops part way, R reports the bytes each
+  socket took and H reports them, truncated. Tests: `exec::tests::b5_08_capture_evidence_is_never_fabricated`
+  and the relay's `b5_08_a_partial_delivery_reports_the_bytes_delivered`.
+- **B5-09, Validate forgot a late failure (MEDIUM).** Section 5.6: the probe keeps its
+  waiter and the control slot until R reports. Test: `exec::tests::b5_09_a_late_probe_failure_is_still_recorded`.
+- **B5-10, digest and feature bits (LOW).** Section 5.3's identity checks. Test: the
+  relay's `readiness_needs_the_journaled_identity_and_full_hardening` with the
+  wrong-digest, no-features and Ready-without-features guests.
+
+*Decisions made here.* A ledger write on the Exec path is bounded at five seconds, and a
+probe may report up to ten seconds after Validate's deadline before the relay itself is
+treated as broken. An EXEC_INTENT whose outcome is unknown retires the VM rather than
+trying to repair the journal. A queued Validate answers the new `control_busy` rather
+than queueing past its deadline. The ledger keeps schema 1 (no B5 ledger has shipped).
+The real guest console flood, previously a disposable review patch, is now the VM
+regression `b5_linux_root_a_real_guest_console_flood_keeps_the_drainer_flat` with its
+own test guest.

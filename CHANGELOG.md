@@ -6,6 +6,19 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B5 break-it corrections (Daybreak, November 3). The ledger compacts settled
+  execution rows into one `exec_history` summary in the settling transaction, caps stop
+  reasons and settled cleanup workers per allocation, and answers an oversized reply with
+  `oversized` instead of exiting; Exec polls cancellation, the deadline and the session
+  watch beside a bounded BUSY write, and any unanswered journal write retires the VM; a
+  worker `Endpoint` write that fails after any byte poisons the connection, and S reports
+  such a job as dispatch-uncertain; relay failures carry their reach and only local ones
+  restore READY; one control operation per allocation (`control_busy`), late probe
+  failures still retire; a Result for another inner sandbox, a wrong broker digest or
+  missing kiln features retire the VM; capture facts are unknown without a Result and
+  count delivered bytes when forwarding stops. The guest broker answers Probe idle only
+  for a live persistent sandbox. Remove's ledger calls are bounded by its deadline.
+
 - Phase 1b B5 milestone 2. New `kilnd-guest-broker` crate: the guest broker baked into
   kiln-guest (pinned there at kilnd `fb9034d`, broker `d4eb4cac`), started by `/init` as
   guest root and never restarted, listening on vsock 5252 for the host only, with one
