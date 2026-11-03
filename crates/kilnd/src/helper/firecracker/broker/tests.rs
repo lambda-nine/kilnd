@@ -328,7 +328,7 @@ async fn readiness_needs_the_journaled_identity_and_full_hardening() {
             }
             other => panic!("{other:?}"),
         }
-        for mode in [Mode::ForeignIdentity, Mode::Unhardened, Mode::BadConnect] {
+        for mode in [Mode::ForeignIdentity, Mode::Unhardened] {
             let (host, _) = spawn_guest(mode);
             assert!(
                 matches!(
@@ -341,6 +341,12 @@ async fn readiness_needs_the_journaled_identity_and_full_hardening() {
                 "{mode:?}"
             );
         }
+        // No OK: nothing listens yet. Only readiness retries this.
+        let (host, _) = spawn_guest(Mode::BadConnect);
+        assert!(matches!(
+            initialize(host, 1, &expected(), init(), soon(100)).await,
+            RelayReport::Unreachable { .. }
+        ));
         // Once READY, a different boot or inner sandbox is another guest.
         let mut later = expected();
         later.boot_id = Some(BootId::new("00000000-0000-4000-8000-000000000000").unwrap());

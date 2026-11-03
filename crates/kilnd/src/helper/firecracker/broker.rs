@@ -297,7 +297,7 @@ async fn open<S: AsyncRead + AsyncWrite + Unpin, B: Budget>(
     let first = stage();
     connect_port(&mut stream, first)
         .await
-        .map_err(Fail::Broken)?;
+        .map_err(Fail::Unreachable)?;
     let (read, write) = tokio::io::split(stream);
     let challenge = Hex32::random().map_err(|e| Fail::Broken(e.to_string()))?;
     let hello_id = Id128::random().map_err(|e| Fail::Broken(e.to_string()))?;
