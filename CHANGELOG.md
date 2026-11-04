@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Design the Phase 1b retired-token compaction for B7 (design section 16): today's node
+  ledger admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1
+  refusals; helper-issued sequence tokens with a per-instance durable watermark remove
+  both limits without trusting clocks or daemon state. Design only; no code changes.
+
 - Phase 1b B6 break-it corrections (Daybreak, November 3). B6-BI-01: `--backend
   firecracker` and `--firecracker-test-deployment` exist only in a build with the new
   non-default `firecracker-test-deployment` cargo feature; a default (release, installed)
