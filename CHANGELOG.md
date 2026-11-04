@@ -15,6 +15,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   exactly, L alone classifies tokens, compaction and admission headroom get guaranteed
   shares (RTC-17, RTC-18), and ledger restore is stated as outside the fault model with a
   mandatory offline inventory. Design only; no code changes.
+- Revise it again for Daybreak's recheck (section 16.8): the rollback detector accepts only
+  a helper-issued token whose tag verifies, and its durable latch refuses every forward
+  effect node-wide until a root offline clear; the issue pointer is a high-water mark, not
+  a delivery record; watermark checkpoints are bounded per pass; section 9.1's Runtime
+  listing is the B7 contract; every policy slot's headroom share is reserved. Design only;
+  no code changes.
 
 - Phase 1b B6 break-it corrections (Daybreak, November 3). B6-BI-01: `--backend
   firecracker` and `--firecracker-test-deployment` exist only in a build with the new
