@@ -81,7 +81,9 @@ impl Observed {
     /// Only Linux can say which account and unit a process runs as here.
     #[cfg(not(target_os = "linux"))]
     pub fn current(_socket_gid: Option<u32>) -> Result<Self> {
-        bail!("the isolated Firecracker test deployment runs only on Linux, where its identity is observed")
+        bail!(
+            "the isolated Firecracker test deployment runs only on Linux, where its identity is observed"
+        )
     }
 }
 
@@ -324,7 +326,11 @@ impl TestDeployment {
                 "account {account:?} has the production {PRODUCTION_ACCOUNT:?} account's UID {uid}"
             ));
         }
-        let uids = [observed.real_uid, observed.effective_uid, observed.saved_uid];
+        let uids = [
+            observed.real_uid,
+            observed.effective_uid,
+            observed.saved_uid,
+        ];
         if uids.iter().any(|&observed| observed != uid) {
             wrong.push(format!(
                 "this process runs as UIDs {}/{}/{} (real/effective/saved), not account {account:?} (UID {uid})",
@@ -483,7 +489,9 @@ mod tests {
         deployment.check_identity(&resolved(), &observed()).unwrap();
         // A user service's cgroup ends in the unit too.
         let mut user = observed();
-        user.cgroup = "0::/user.slice/user-990.slice/user@990.service/app.slice/kilnd-fctest.service\n".into();
+        user.cgroup =
+            "0::/user.slice/user-990.slice/user@990.service/app.slice/kilnd-fctest.service\n"
+                .into();
         deployment.check_identity(&resolved(), &user).unwrap();
 
         let account = |set: fn(&mut Observed)| {
@@ -497,11 +505,20 @@ mod tests {
             account(|o| o.saved_uid = 1000),
         ] {
             assert!(error.contains("not account \"kilnd-fctest\""), "{error}");
-            assert!(!error.contains("socket-group") && !error.contains("unit"), "{error}");
+            assert!(
+                !error.contains("socket-group") && !error.contains("unit"),
+                "{error}"
+            );
         }
         let error = account(|o| o.socket_gid = Some(50));
-        assert!(error.contains("--socket-group resolves to GID 50"), "{error}");
-        assert!(!error.contains("UIDs") && !error.contains("unit"), "{error}");
+        assert!(
+            error.contains("--socket-group resolves to GID 50"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("UIDs") && !error.contains("unit"),
+            "{error}"
+        );
         let error = account(|o| o.socket_gid = None);
         assert!(error.contains("--socket-group is empty"), "{error}");
         for cgroup in [
@@ -517,8 +534,14 @@ mod tests {
             let mut o = observed();
             o.cgroup = cgroup.into();
             let error = identity_error(&resolved(), &o);
-            assert!(error.contains("not in unit \"kilnd-fctest.service\""), "{cgroup:?}: {error}");
-            assert!(!error.contains("UIDs") && !error.contains("socket-group"), "{error}");
+            assert!(
+                error.contains("not in unit \"kilnd-fctest.service\""),
+                "{cgroup:?}: {error}"
+            );
+            assert!(
+                !error.contains("UIDs") && !error.contains("socket-group"),
+                "{error}"
+            );
         }
     }
 
@@ -531,7 +554,10 @@ mod tests {
         let mut o = observed();
         (o.real_uid, o.effective_uid, o.saved_uid) = (0, 0, 0);
         let error = identity_error(&root, &o);
-        assert!(error.contains("is UID 0") && error.contains("has UID 0"), "{error}");
+        assert!(
+            error.contains("is UID 0") && error.contains("has UID 0"),
+            "{error}"
+        );
 
         let mut production = resolved();
         production.account_uid = 980;

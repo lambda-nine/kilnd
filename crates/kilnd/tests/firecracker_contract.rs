@@ -909,7 +909,9 @@ fn production_stays_disabled_without_the_broker() {
         .unwrap();
     let (arm, _) = run.split_once("FirecrackerRuntime::new(").unwrap();
     assert!(
-        arm.contains("#[cfg(feature = \"firecracker-test-deployment\")]\n        Some(deployment) =>"),
+        arm.contains(
+            "#[cfg(feature = \"firecracker-test-deployment\")]\n        Some(deployment) =>"
+        ),
         "{arm}"
     );
     let (_, selection) = main

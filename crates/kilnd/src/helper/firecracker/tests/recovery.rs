@@ -545,7 +545,9 @@ async fn b6_linux_root_crash_helper_restart_while_create_polls_never_publishes_r
     let allocation = deployment
         .wait_allocation(daemon.instance, &["booting"], 60)
         .await;
-    let vmm = real.vmm(allocation).expect("a booting allocation has a VMM");
+    let vmm = real
+        .vmm(allocation)
+        .expect("a booting allocation has a VMM");
     deployment.restart_helper().await;
     assert!(
         !broker_recorded(&deployment, allocation),
@@ -555,7 +557,11 @@ async fn b6_linux_root_crash_helper_restart_while_create_polls_never_publishes_r
         "# the helper (H) killed and restarted after C2, while Create polled for READY\n\n",
     );
     let phase_after_restart = real.phase(allocation);
-    assert_eq!(deployment.claims(), 1, "the new helper replays the one claim");
+    assert_eq!(
+        deployment.claims(),
+        1,
+        "the new helper replays the one claim"
+    );
     assert!(
         wait_gone(vmm.pid, 30).await,
         "the old VMM {} survived its helper",
@@ -571,7 +577,10 @@ async fn b6_linux_root_crash_helper_restart_while_create_polls_never_publishes_r
     let state = daemon.row(&id, "state").unwrap();
     assert_ne!(state, "ready");
     assert_ne!(state, "creating", "the Create ended");
-    assert!(!broker_recorded(&deployment, allocation), "READY never came");
+    assert!(
+        !broker_recorded(&deployment, allocation),
+        "READY never came"
+    );
     assert_eq!(
         deployment.allocations(daemon.instance).len(),
         1,
@@ -680,7 +689,10 @@ async fn b6_linux_root_crash_daemon_death_mid_remove_stays_charged_until_absent(
     tokio::time::sleep(Duration::from_secs(5)).await;
     let phase_after_old_removal = real.phase(allocation);
     assert_eq!(daemon.row(&id, "state").as_deref(), Some("deleting"));
-    assert!(charged(daemon, &id), "no release without the daemon's own receipt");
+    assert!(
+        charged(daemon, &id),
+        "no release without the daemon's own receipt"
+    );
     let get = daemon.kilndctl(&mut transcript, &["get", &id], None);
     assert!(get.stdout.contains("deleting"), "{}", get.stdout);
     // Reconciliation at the next start finishes it, from the matching ABSENT receipt.

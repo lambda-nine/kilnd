@@ -722,7 +722,11 @@ mod tests {
     fn b6_bi_01_a_default_build_has_no_firecracker_flags() {
         for argv in [
             &["kilnd", "--backend", "firecracker"][..],
-            &["kilnd", "--firecracker-test-deployment", "/tmp/deployment.json"],
+            &[
+                "kilnd",
+                "--firecracker-test-deployment",
+                "/tmp/deployment.json",
+            ],
             &[
                 "kilnd",
                 "--backend",

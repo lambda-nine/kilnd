@@ -288,7 +288,7 @@ mod linux {
         const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
         const RESOLVE_NO_SYMLINKS: u64 = 0x04;
         const RESOLVE_BENEATH: u64 = 0x08;
-        const PROC_SUPER_MAGIC: i64 = 0x9fa0;
+        const PROC_SUPER_MAGIC: libc::__fsword_t = 0x9fa0;
 
         static ROOT_FD: AtomicI32 = AtomicI32::new(-1);
         static ROOT_ID: AtomicU64 = AtomicU64::new(0);
@@ -459,7 +459,7 @@ mod linux {
                 if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stat) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                if stat.f_type as i64 != PROC_SUPER_MAGIC {
+                if stat.f_type != PROC_SUPER_MAGIC {
                     return Err(io::Error::other(format!(
                         "{relative:?} leaves procfs at {part:?}"
                     )));
@@ -470,27 +470,6 @@ mod linux {
                 at = Some(file);
             }
             Err(io::Error::from(io::ErrorKind::InvalidInput))
-        }
-
-        #[cfg(test)]
-        mod tests {
-            use std::io::Read;
-
-            /// The unprivileged fallback reads what `openat2` reads, and follows no link.
-            #[test]
-            fn the_component_walk_reads_what_openat2_reads() {
-                let relative = super::own("cgroup");
-                let root = super::root().unwrap();
-                let mut walked = String::new();
-                super::open_by_components(root, &relative, libc::O_RDONLY)
-                    .unwrap()
-                    .read_to_string(&mut walked)
-                    .unwrap();
-                assert_eq!(walked, super::read_to_string(&relative).unwrap());
-                assert!(walked.starts_with("0::/"), "{walked}");
-                // `self` is a link: never followed.
-                assert!(super::open_by_components(root, "self/cgroup", libc::O_RDONLY).is_err());
-            }
         }
 
         /// A directory beneath the private instance, as [`open`].
@@ -533,6 +512,27 @@ mod linux {
             }
             // SAFETY: a new owned descriptor.
             Ok(unsafe { File::from_raw_fd(fd) })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use std::io::Read;
+
+            /// The unprivileged fallback reads what `openat2` reads, and follows no link.
+            #[test]
+            fn the_component_walk_reads_what_openat2_reads() {
+                let relative = super::own("cgroup");
+                let root = super::root().unwrap();
+                let mut walked = String::new();
+                super::open_by_components(root, &relative, libc::O_RDONLY)
+                    .unwrap()
+                    .read_to_string(&mut walked)
+                    .unwrap();
+                assert_eq!(walked, super::read_to_string(&relative).unwrap());
+                assert!(walked.starts_with("0::/"), "{walked}");
+                // `self` is a link: never followed.
+                assert!(super::open_by_components(root, "self/cgroup", libc::O_RDONLY).is_err());
+            }
         }
     }
 
