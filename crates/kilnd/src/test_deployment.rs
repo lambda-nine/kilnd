@@ -1,11 +1,15 @@
 //! B6's isolated Firecracker test deployment (`deploy/firecracker-test/`). Until B7,
-//! `kilnd --backend firecracker` runs only with this file, and only at the exact
-//! non-production paths it names. It is one half of the gate: the other is the
-//! helper's, whose production build serves no Firecracker profile at all (the test
-//! approval exists only in test builds), so even a daemon started this way against the
-//! installed helper gets a C0 refusal for every Create.
+//! `kilnd --backend firecracker` exists only in a build with the non-default
+//! `firecracker-test-deployment` feature, runs only with this file, only at the exact
+//! non-production paths it names, and only as the account, socket group and systemd
+//! unit it names, compared with what the kernel says this process is (B6-BI-01). It is
+//! one half of the gate: the other is the helper's, whose production build serves no
+//! Firecracker profile at all (the test approval exists only in test builds), so even a
+//! daemon started this way against the installed helper gets a C0 refusal for every
+//! Create.
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::ffi::CString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +30,121 @@ const PRODUCTION_PATHS: [&str; 6] = [
     "/var/lib/kilnd-helper",
     "/etc/kilnd",
 ];
+
+/// The production daemon's account and group. The test deployment may be neither.
+const PRODUCTION_ACCOUNT: &str = "kilnd";
+
+/// The deployment's account and group as the account databases resolve them, beside
+/// production's, which may not exist on a test host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub account_uid: u32,
+    pub group_gid: u32,
+    pub production_uid: Option<u32>,
+    pub production_gid: Option<u32>,
+}
+
+/// What this process is, as the kernel reports it, never as a file names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Observed {
+    pub real_uid: u32,
+    pub effective_uid: u32,
+    pub saved_uid: u32,
+    /// The resolved CLI `--socket-group`; `None` when it is empty (root only).
+    pub socket_gid: Option<u32>,
+    /// This process's own `cgroup` file, read beneath `sys::procfs`.
+    pub cgroup: String,
+}
+
+impl Observed {
+    /// The real, effective and saved UIDs, and the cgroup from this process's own
+    /// procfs entry: `<pid>/cgroup` beneath the private procfs instance, not a pathname
+    /// another mount could shadow.
+    #[cfg(target_os = "linux")]
+    pub fn current(socket_gid: Option<u32>) -> Result<Self> {
+        let (mut real_uid, mut effective_uid, mut saved_uid) = (0, 0, 0);
+        // SAFETY: getresuid writes three live u32s.
+        if unsafe { libc::getresuid(&mut real_uid, &mut effective_uid, &mut saved_uid) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("read this process's UIDs");
+        }
+        let cgroup = crate::sys::procfs::read_to_string(&crate::sys::procfs::own("cgroup"))
+            .context("read this process's own cgroup")?;
+        Ok(Self {
+            real_uid,
+            effective_uid,
+            saved_uid,
+            socket_gid,
+            cgroup,
+        })
+    }
+
+    /// Only Linux can say which account and unit a process runs as here.
+    #[cfg(not(target_os = "linux"))]
+    pub fn current(_socket_gid: Option<u32>) -> Result<Self> {
+        bail!("the isolated Firecracker test deployment runs only on Linux, where its identity is observed")
+    }
+}
+
+/// The single cgroup v2 path in a `cgroup` file (`0::/path`). Anything else, such as a
+/// hybrid hierarchy's several lines, is refused rather than guessed at.
+fn unified_cgroup(text: &str) -> Result<&str> {
+    let mut lines = text.lines();
+    match (lines.next(), lines.next()) {
+        (Some(line), None) => match line.strip_prefix("0::") {
+            Some(path) if path.starts_with('/') => Ok(path),
+            _ => bail!("this process's cgroup {line:?} is not a cgroup v2 path"),
+        },
+        _ => bail!("this process is not in exactly one cgroup v2 hierarchy: {text:?}"),
+    }
+}
+
+/// An account's UID through `getpwnam_r`, or `None` when it does not exist.
+fn account_uid(name: &str) -> Result<Option<u32>> {
+    let cname = CString::new(name).context("account name contains NUL")?;
+    // SAFETY: passwd is plain data; zeroed is a valid empty value.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer refers to a live, correctly sized buffer.
+    let rc = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc))
+            .with_context(|| format!("look up account {name:?}"));
+    }
+    Ok((!found.is_null()).then_some(pwd.pw_uid))
+}
+
+/// A group's GID through `getgrnam_r`, or `None` when it does not exist.
+fn group_gid(name: &str) -> Result<Option<u32>> {
+    let cname = CString::new(name).context("group name contains NUL")?;
+    // SAFETY: group is plain data; zeroed is a valid empty value.
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut found: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: every pointer refers to a live, correctly sized buffer.
+    let rc = unsafe {
+        libc::getgrnam_r(
+            cname.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc))
+            .with_context(|| format!("look up group {name:?}"));
+    }
+    Ok((!found.is_null()).then_some(grp.gr_gid))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +280,110 @@ impl TestDeployment {
         }
         Ok(())
     }
+
+    /// B6-BI-01: the deployment's account, group and unit must be what this process
+    /// observably is. Called before any state is opened or any runtime built; refuses
+    /// on any mismatch, naming each one.
+    pub fn check_process(&self, socket_gid: Option<u32>) -> Result<()> {
+        let resolved = self.resolve()?;
+        let observed = Observed::current(socket_gid)?;
+        self.check_identity(&resolved, &observed)
+    }
+
+    /// The deployment's names through `getpwnam`/`getgrnam`. Each must exist.
+    pub fn resolve(&self) -> Result<Resolved> {
+        let account = &self.kilnd.account;
+        let group = &self.kilnd.socket_group;
+        Ok(Resolved {
+            account_uid: account_uid(account)?.with_context(|| {
+                format!("the test deployment's account {account:?} does not exist")
+            })?,
+            group_gid: group_gid(group)?.with_context(|| {
+                format!("the test deployment's socket group {group:?} does not exist")
+            })?,
+            production_uid: account_uid(PRODUCTION_ACCOUNT)?,
+            production_gid: group_gid(PRODUCTION_ACCOUNT)?,
+        })
+    }
+
+    /// Compares the resolved deployment with the observed process. Every mismatch is
+    /// collected, so the refusal names all of them.
+    pub fn check_identity(&self, resolved: &Resolved, observed: &Observed) -> Result<()> {
+        let mut wrong = Vec::new();
+        let account = &self.kilnd.account;
+        let group = &self.kilnd.socket_group;
+        let unit = &self.kilnd.unit;
+
+        // The account: real, effective and saved UIDs, never root, never production's.
+        let uid = resolved.account_uid;
+        if uid == 0 {
+            wrong.push(format!("account {account:?} is UID 0"));
+        }
+        if resolved.production_uid == Some(uid) {
+            wrong.push(format!(
+                "account {account:?} has the production {PRODUCTION_ACCOUNT:?} account's UID {uid}"
+            ));
+        }
+        let uids = [observed.real_uid, observed.effective_uid, observed.saved_uid];
+        if uids.iter().any(|&observed| observed != uid) {
+            wrong.push(format!(
+                "this process runs as UIDs {}/{}/{} (real/effective/saved), not account {account:?} (UID {uid})",
+                uids[0], uids[1], uids[2]
+            ));
+        }
+        if uids.contains(&0) {
+            wrong.push("this process has UID 0".into());
+        }
+        if let Some(production) = resolved.production_uid
+            && uids.contains(&production)
+        {
+            wrong.push(format!(
+                "this process runs as the production {PRODUCTION_ACCOUNT:?} account"
+            ));
+        }
+
+        // The socket group: the CLI's resolved GID, never production's.
+        let gid = resolved.group_gid;
+        if resolved.production_gid == Some(gid) {
+            wrong.push(format!(
+                "socket group {group:?} has the production {PRODUCTION_ACCOUNT:?} group's GID {gid}"
+            ));
+        }
+        match observed.socket_gid {
+            Some(cli) if cli == gid => {}
+            Some(cli) => wrong.push(format!(
+                "--socket-group resolves to GID {cli}, not group {group:?} (GID {gid})"
+            )),
+            None => wrong.push(format!(
+                "--socket-group is empty (root only), not group {group:?}"
+            )),
+        }
+        if let Some(production) = resolved.production_gid
+            && observed.socket_gid == Some(production)
+        {
+            wrong.push(format!(
+                "--socket-group is the production {PRODUCTION_ACCOUNT:?} group"
+            ));
+        }
+
+        // The unit: this process's own cgroup is exactly the unit's (`.../<unit>`).
+        match unified_cgroup(&observed.cgroup) {
+            Ok(path) if path.rsplit('/').next() == Some(unit.as_str()) => {}
+            Ok(path) => wrong.push(format!(
+                "this process runs in cgroup {path}, not in unit {unit:?}"
+            )),
+            Err(error) => wrong.push(format!("{error:#}; not in unit {unit:?}")),
+        }
+
+        if wrong.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "this process is not the isolated Firecracker test deployment's daemon: {}",
+                wrong.join("; ")
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +443,132 @@ mod tests {
         assert!(parse(&extra).is_err(), "an unknown field was accepted");
         let duplicate = CHECKED_IN.replacen('{', r#"{"schema": "x","#, 1);
         assert!(TestDeployment::parse(duplicate.as_bytes()).is_err());
+    }
+
+    const UID: u32 = 990;
+    const GID: u32 = 991;
+
+    fn resolved() -> Resolved {
+        Resolved {
+            account_uid: UID,
+            group_gid: GID,
+            production_uid: Some(980),
+            production_gid: Some(981),
+        }
+    }
+
+    fn observed() -> Observed {
+        Observed {
+            real_uid: UID,
+            effective_uid: UID,
+            saved_uid: UID,
+            socket_gid: Some(GID),
+            cgroup: "0::/system.slice/kilnd-fctest.service\n".into(),
+        }
+    }
+
+    fn identity_error(resolved: &Resolved, observed: &Observed) -> String {
+        let deployment = TestDeployment::parse(CHECKED_IN.as_bytes()).unwrap();
+        format!(
+            "{:#}",
+            deployment.check_identity(resolved, observed).unwrap_err()
+        )
+    }
+
+    /// B6-BI-01: the account, socket group and unit are compared with what the process
+    /// is, each refused on its own, and every mismatch is named.
+    #[test]
+    fn b6_bi_01_identity_is_observed_not_declared() {
+        let deployment = TestDeployment::parse(CHECKED_IN.as_bytes()).unwrap();
+        deployment.check_identity(&resolved(), &observed()).unwrap();
+        // A user service's cgroup ends in the unit too.
+        let mut user = observed();
+        user.cgroup = "0::/user.slice/user-990.slice/user@990.service/app.slice/kilnd-fctest.service\n".into();
+        deployment.check_identity(&resolved(), &user).unwrap();
+
+        let account = |set: fn(&mut Observed)| {
+            let mut o = observed();
+            set(&mut o);
+            identity_error(&resolved(), &o)
+        };
+        for error in [
+            account(|o| o.real_uid = 1000),
+            account(|o| o.effective_uid = 1000),
+            account(|o| o.saved_uid = 1000),
+        ] {
+            assert!(error.contains("not account \"kilnd-fctest\""), "{error}");
+            assert!(!error.contains("socket-group") && !error.contains("unit"), "{error}");
+        }
+        let error = account(|o| o.socket_gid = Some(50));
+        assert!(error.contains("--socket-group resolves to GID 50"), "{error}");
+        assert!(!error.contains("UIDs") && !error.contains("unit"), "{error}");
+        let error = account(|o| o.socket_gid = None);
+        assert!(error.contains("--socket-group is empty"), "{error}");
+        for cgroup in [
+            "0::/system.slice/kilnd.service\n",
+            "0::/system.slice/kilnd-fctest.service/extra\n",
+            "0::/system.slice/xkilnd-fctest.service\n",
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+            "0::/\n",
+            "",
+            "0::relative/kilnd-fctest.service\n",
+            "1:name=systemd:/system.slice/kilnd-fctest.service\n0::/system.slice/kilnd-fctest.service\n",
+        ] {
+            let mut o = observed();
+            o.cgroup = cgroup.into();
+            let error = identity_error(&resolved(), &o);
+            assert!(error.contains("not in unit \"kilnd-fctest.service\""), "{cgroup:?}: {error}");
+            assert!(!error.contains("UIDs") && !error.contains("socket-group"), "{error}");
+        }
+    }
+
+    /// B6-BI-01: root and production's account and group are refused even when the
+    /// process matches them.
+    #[test]
+    fn b6_bi_01_root_and_production_identities_are_refused() {
+        let mut root = resolved();
+        root.account_uid = 0;
+        let mut o = observed();
+        (o.real_uid, o.effective_uid, o.saved_uid) = (0, 0, 0);
+        let error = identity_error(&root, &o);
+        assert!(error.contains("is UID 0") && error.contains("has UID 0"), "{error}");
+
+        let mut production = resolved();
+        production.account_uid = 980;
+        let mut o = observed();
+        (o.real_uid, o.effective_uid, o.saved_uid) = (980, 980, 980);
+        let error = identity_error(&production, &o);
+        assert!(error.contains("production \"kilnd\" account"), "{error}");
+
+        let mut production = resolved();
+        production.group_gid = 981;
+        let mut o = observed();
+        o.socket_gid = Some(981);
+        let error = identity_error(&production, &o);
+        assert!(error.contains("production \"kilnd\" group"), "{error}");
+
+        // Every mismatch at once is named at once (Daybreak's PoC).
+        let mut o = observed();
+        (o.real_uid, o.effective_uid, o.saved_uid) = (501, 501, 501);
+        o.socket_gid = Some(20);
+        o.cgroup = "0::/user.slice/user-501.slice/session-1.scope\n".into();
+        let error = identity_error(&resolved(), &o);
+        for needle in ["UIDs 501/501/501", "GID 20", "not in unit"] {
+            assert!(error.contains(needle), "{needle}: {error}");
+        }
+    }
+
+    /// A deployment whose account or group does not exist is refused before anything
+    /// is compared.
+    #[test]
+    fn b6_bi_01_names_must_resolve() {
+        let mut value = checked_in();
+        value["kilnd"]["account"] = json!("kilnd-no-such-account-b6");
+        value["kilnd"]["socket_group"] = json!("kilnd-no-such-group-b6");
+        let deployment = parse(&value).unwrap();
+        let error = format!("{:#}", deployment.resolve().unwrap_err());
+        assert!(error.contains("does not exist"), "{error}");
+        assert!(deployment.check_process(Some(0)).is_err());
     }
 
     #[test]

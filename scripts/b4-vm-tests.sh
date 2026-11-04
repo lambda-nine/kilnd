@@ -14,7 +14,9 @@
 #   B6_EVIDENCE  where b6_linux_root writes its transcript and SQLite/journal evidence
 #              (default: none). B6's session test also runs the kilnd and kilndctl
 #              binaries, built here as ordinary dynamic executables in their own
-#              target directory ($HOME/.cache/kilnd-target-b6)
+#              target directory ($HOME/.cache/kilnd-target-b6). kilnd is built with the
+#              non-default firecracker-test-deployment feature, without which it has no
+#              Firecracker flags (B6-BI-01); release and installed builds never enable it
 # The test binary is built static (crt-static) because it is installed as the helper
 # image and the contract approves static ELFs only. Everything the tests create under
 # /opt/kilnd, /var/lib/kilnd-helper/{jails,work} and /sys/fs/cgroup/kilnd-firecracker is
@@ -30,7 +32,8 @@ target=aarch64-unknown-linux-gnu
 # B6: the daemon and client the session test runs as an ordinary installed kilnd would
 # be, before the static flags below apply to anything.
 bins=${B6_TARGET_DIR:-$HOME/.cache/kilnd-target-b6}
-CARGO_TARGET_DIR=$bins cargo build --locked --release -p kilnd -p kilndctl --bin kilnd --bin kilndctl
+CARGO_TARGET_DIR=$bins cargo build --locked --release -p kilnd -p kilndctl --bin kilnd --bin kilndctl \
+    --features kilnd/firecracker-test-deployment
 
 export CARGO_TARGET_DIR=${B4_TARGET_DIR:-$HOME/.cache/kilnd-target-static}
 export RUSTFLAGS="-C target-feature=+crt-static"

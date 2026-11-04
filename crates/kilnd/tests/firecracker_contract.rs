@@ -897,21 +897,29 @@ fn production_stays_disabled_without_the_broker() {
             .contains("they grant no deployment")
     );
     // B6: the default stays kiln, and Firecracker is constructed only after the isolated
-    // test deployment was read and its paths checked (deploy/firecracker-test/).
+    // test deployment was read and its paths and observed identity checked
+    // (deploy/firecracker-test/), and only in a build with the non-default
+    // `firecracker-test-deployment` feature (B6-BI-01).
     let main =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")).unwrap();
     assert!(main.contains("default_value_t = Backend::Kiln"));
     assert_eq!(main.matches("FirecrackerRuntime::new(").count(), 1);
     let (_, run) = main
-        .split_once("let deployment = selected_deployment(&args)?;")
+        .split_once("let deployment = selected_deployment(&args, gid)?;")
         .unwrap();
     let (arm, _) = run.split_once("FirecrackerRuntime::new(").unwrap();
-    assert!(arm.contains("Some(deployment) =>"), "{arm}");
-    let (_, selection) = main.split_once("fn selected_deployment(").unwrap();
+    assert!(
+        arm.contains("#[cfg(feature = \"firecracker-test-deployment\")]\n        Some(deployment) =>"),
+        "{arm}"
+    );
+    let (_, selection) = main
+        .split_once("#[cfg(feature = \"firecracker-test-deployment\")]\nfn selected_deployment(")
+        .unwrap();
     let (read, checked) = selection.split_once("TestDeployment::read(").unwrap();
     assert!(read.contains("(Backend::Firecracker, Some(path)) =>"));
     let (checked, _) = checked.split_once("Ok(Some(deployment))").unwrap();
     assert!(checked.contains("check_daemon("));
+    assert!(checked.contains("check_process(socket_gid)?"));
 }
 
 // This type exists only in this integration-test binary. It cannot construct a

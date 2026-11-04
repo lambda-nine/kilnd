@@ -48,6 +48,13 @@ jobs:
           rustup toolchain install 1.99.0 --profile minimal --component clippy
           cargo +1.99.0 clippy --locked --all-targets -- -D warnings -D clippy::disallowed_methods
 
+      # B6-BI-01's build boundary: the release build CI and the installers make has no
+      # Firecracker flags, and refuses Daybreak's PoC command at argument parsing.
+      - name: Release build refuses the Firecracker test deployment
+        run: |
+          cargo build --locked --release -p kilnd --bin kilnd
+          sh scripts/test-deployment-gate-regressions.sh release target/release/kilnd
+
       - name: Shell syntax
         run: |
           git ls-files -z '*.sh' | while IFS= read -r -d '' f; do
@@ -62,3 +69,46 @@ jobs:
 
       - name: Whitespace
         run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+  # The same checks with the non-default `firecracker-test-deployment` feature, which only
+  # the B6 VM scripts enable: tests, clippy (the destructive-action gate) on both
+  # toolchains, and the feature build's refusal of a mismatched identity (B6-BI-01).
+  feature:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      FEATURES: kilnd/firecracker-test-deployment
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component clippy
+          rustup default 1.88.0
+          rustc --version
+          cargo clippy --version
+
+      - name: cargo test (feature)
+        run: cargo test --locked --features "$FEATURES"
+
+      - name: cargo clippy (feature, 1.88)
+        run: cargo clippy --locked --all-targets --features "$FEATURES" -- -D warnings -D clippy::disallowed_methods
+
+      - name: cargo clippy (feature, 1.99)
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component clippy
+          cargo +1.99.0 clippy --locked --all-targets --features "$FEATURES" -- -D warnings -D clippy::disallowed_methods
+
+      - name: Feature build refuses a mismatched identity
+        run: |
+          cargo build --locked -p kilnd --bin kilnd --features "$FEATURES"
+          sh scripts/test-deployment-gate-regressions.sh feature target/debug/kilnd

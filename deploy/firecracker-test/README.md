@@ -19,17 +19,32 @@ B6 can drive whole sessions through the real daemon and `kilndctl` on the dev VM
 | `kilnd.unit` | `kilnd-fctest.service` | Its own unit, so its own cgroup to enroll |
 | `helper.root`, `helper.socket` | `/run/kilnd-fctest-helper`, `…/helper.sock` | The test helper's private root (ledger, logs) and socket, never `/run/kilnd-helper` |
 
-The daemon side is `kilnd --backend firecracker --firecracker-test-deployment <file>`.
-kilnd reads the file strictly (exact fields, no duplicate keys, at most 64 KiB) and
-refuses to start unless:
+The daemon side is `kilnd --backend firecracker --firecracker-test-deployment <file>`, and
+both flags exist only in a kilnd built with the non-default `firecracker-test-deployment`
+cargo feature (`cargo build -p kilnd --features firecracker-test-deployment`). A default
+build, which is what `cargo build --release`, `scripts/install.sh` and CI's release step
+make, refuses both at argument parsing. A feature build reads the file strictly (exact
+fields, no duplicate keys, at most 64 KiB) and, before it opens any state, refuses to
+start unless:
 
 - its `--socket`, `--state-dir` and `--helper-socket` are exactly the file's;
 - no path in the file is, contains or lies under a production path (`/run/kilnd`,
   `/var/lib/kilnd`, `/run/kilnd-helper`, `/var/lib/kilnd-helper`, `/etc/kilnd`);
-- the account, group and unit are its own, not `kilnd`, `root` or `kilnd.service`.
+- the account, group and unit are named as its own, not `kilnd`, `root` or
+  `kilnd.service`;
+- and they are what the process observably is (B6-BI-01): its real, effective and saved
+  UIDs are the UID `getpwnam` gives the file's account (which must exist, and is never 0
+  or the production `kilnd` account's), the GID of the CLI's `--socket-group` is the
+  file's group's (never the production `kilnd` group's), and its own cgroup, read from
+  its procfs entry beneath kilnd's private procfs instance, ends in exactly
+  `/<unit>`. Every mismatch is named in the refusal.
 
 `--backend firecracker` without the file is refused, and so is the file with the default
 `kiln` backend. The installed units never pass either flag.
+`scripts/test-deployment-gate-regressions.sh` checks all of this: `release` mode against a
+default build, `feature` mode against a feature build unprivileged, and `root` mode (in
+the VM) with a real account and transient unit, where each wrong account, group or unit
+is refused on its own and the matching identity is selected.
 
 ## Why production stays off
 
@@ -41,8 +56,9 @@ The gate has two halves, and B6 changes neither's production behavior:
    no policy spelling. So the production helper serves no Firecracker profile: every
    Preflight is a C0 refusal with zero session effects, even for a daemon started with
    this file. `exit1_production_gate_leaves_every_catalog_profile_refused` checks both.
-2. **The daemon.** Only this file selects the backend, at these non-production paths
-   (`test_deployment::tests`).
+2. **The daemon.** Only a feature build has the backend at all, and only this file
+   selects it, at these non-production paths and as this account, group and unit
+   (`test_deployment::tests`, `scripts/test-deployment-gate-regressions.sh`).
 
 The helper that does serve the test profile is the real node code (H and its L/P/S/M/K
 workers, R and D, the patched jailer, the release Firecracker VMM and the pinned
@@ -58,8 +74,8 @@ and with the B5 production bundle at `$HOME/kiln-guest-build/bundle-a`:
 B6_EVIDENCE=$HOME/b6-evidence scripts/b4-vm-tests.sh b6_linux_root
 ```
 
-The script builds `kilnd` and `kilndctl` (ordinary dynamic release binaries, in
-`$HOME/.cache/kilnd-target-b6`) and the static test binary, then runs
+The script builds `kilnd` (with the `firecracker-test-deployment` feature) and `kilndctl`
+(ordinary dynamic release binaries, in `$HOME/.cache/kilnd-target-b6`) and the static test binary, then runs
 `b6_linux_root_a_whole_session_through_kilnd_and_kilndctl`, which:
 
 1. creates the `kilnd-fctest` system account, installs the daemon image root-owned at

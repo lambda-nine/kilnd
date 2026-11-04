@@ -10,11 +10,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use kilnd::manager::{Limits, Manager};
 use kilnd::model::Id128;
 use kilnd::runtime::Runtime;
+#[cfg(feature = "firecracker-test-deployment")]
 use kilnd::runtime::firecracker::FirecrackerRuntime;
 use kilnd::runtime::kiln::KilnRuntime;
 use kilnd::store::Store;
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 /// Control daemon for kiln sandboxes: gRPC over a Unix socket, state in SQLite.
@@ -124,12 +125,16 @@ struct Args {
     shutdown_grace_secs: u64,
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
-    /// The execution backend. Until B7, `firecracker` runs only as the isolated test
+    /// The execution backend. Until B7, `firecracker` exists only in a build with the
+    /// `firecracker-test-deployment` feature, and runs only as the isolated test
     /// deployment named by --firecracker-test-deployment, never in production.
     #[arg(long, value_enum, default_value_t = Backend::Kiln)]
     backend: Backend,
     /// deploy/firecracker-test/deployment.json: the isolated test deployment's paths,
-    /// which must match this daemon's flags. Required with --backend firecracker.
+    /// which must match this daemon's flags, and its account, group and unit, which
+    /// must match this process. Required with --backend firecracker. Only in a build
+    /// with the `firecracker-test-deployment` feature.
+    #[cfg(feature = "firecracker-test-deployment")]
     #[arg(long)]
     firecracker_test_deployment: Option<PathBuf>,
     #[command(subcommand)]
@@ -166,8 +171,17 @@ enum Command {
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Backend {
     Kiln,
+    /// B6-BI-01's build boundary: a default (release, installed) build has no such value.
+    #[cfg(feature = "firecracker-test-deployment")]
     Firecracker,
 }
+
+/// What `selected_deployment` can select besides kiln: the isolated test deployment in a
+/// feature build, nothing at all otherwise.
+#[cfg(feature = "firecracker-test-deployment")]
+type Selected = kilnd::test_deployment::TestDeployment;
+#[cfg(not(feature = "firecracker-test-deployment"))]
+type Selected = std::convert::Infallible;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum LogFormat {
@@ -246,7 +260,7 @@ async fn run(args: Args) -> Result<()> {
 
     // The backend is settled before anything is opened: a refused test deployment
     // touches no state.
-    let deployment = selected_deployment(&args)?;
+    let deployment = selected_deployment(&args, gid)?;
 
     // Store::open takes the state-directory lock before opening SQLite. Bind
     // then takes the socket-directory lock and reserves the endpoint. Both
@@ -262,8 +276,11 @@ async fn run(args: Args) -> Result<()> {
             let runtime = KilnRuntime::new(args.helper_socket.clone());
             serve_with(args, store, socket, runtime, limits).await
         }
+        #[cfg(not(feature = "firecracker-test-deployment"))]
+        Some(never) => match never {},
+        #[cfg(feature = "firecracker-test-deployment")]
         Some(deployment) => {
-            warn!(
+            tracing::warn!(
                 deployment = %deployment.deployment,
                 profile = %deployment.profile,
                 "serving the isolated Firecracker test deployment; this is not a production configuration"
@@ -279,8 +296,19 @@ async fn run(args: Args) -> Result<()> {
     }
 }
 
-/// Kiln, or until B7 the isolated Firecracker test deployment and nothing else.
-fn selected_deployment(args: &Args) -> Result<Option<kilnd::test_deployment::TestDeployment>> {
+/// Kiln, and in a default build nothing else.
+#[cfg(not(feature = "firecracker-test-deployment"))]
+fn selected_deployment(args: &Args, _socket_gid: Option<u32>) -> Result<Option<Selected>> {
+    match args.backend {
+        Backend::Kiln => Ok(None),
+    }
+}
+
+/// Kiln, or until B7 the isolated Firecracker test deployment and nothing else: its
+/// paths are this daemon's flags, and its account, socket group and unit are what this
+/// process observably is (B6-BI-01), all before any state is opened.
+#[cfg(feature = "firecracker-test-deployment")]
+fn selected_deployment(args: &Args, socket_gid: Option<u32>) -> Result<Option<Selected>> {
     match (args.backend, &args.firecracker_test_deployment) {
         (Backend::Kiln, None) => Ok(None),
         (Backend::Kiln, Some(_)) => {
@@ -292,6 +320,7 @@ fn selected_deployment(args: &Args) -> Result<Option<kilnd::test_deployment::Tes
         (Backend::Firecracker, Some(path)) => {
             let deployment = kilnd::test_deployment::TestDeployment::read(path)?;
             deployment.check_daemon(&args.socket, &args.state_dir, &args.helper_socket)?;
+            deployment.check_process(socket_gid)?;
             Ok(Some(deployment))
         }
     }
@@ -687,6 +716,28 @@ fn group_id(name: &str) -> Result<u32> {
 mod tests {
     use super::*;
 
+    /// B6-BI-01's build boundary: a default build refuses both flags at argument parsing.
+    #[cfg(not(feature = "firecracker-test-deployment"))]
+    #[test]
+    fn b6_bi_01_a_default_build_has_no_firecracker_flags() {
+        for argv in [
+            &["kilnd", "--backend", "firecracker"][..],
+            &["kilnd", "--firecracker-test-deployment", "/tmp/deployment.json"],
+            &[
+                "kilnd",
+                "--backend",
+                "firecracker",
+                "--firecracker-test-deployment",
+                "/tmp/deployment.json",
+            ],
+        ] {
+            assert!(Args::try_parse_from(argv).is_err(), "{argv:?} parsed");
+        }
+        let args = Args::try_parse_from(["kilnd", "--backend", "kiln"]).unwrap();
+        assert!(selected_deployment(&args, None).unwrap().is_none());
+    }
+
+    #[cfg(feature = "firecracker-test-deployment")]
     #[test]
     fn firecracker_runs_only_as_the_isolated_test_deployment() {
         let deployment = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -694,7 +745,7 @@ mod tests {
         let parse = |extra: &[&str]| {
             let mut argv = vec!["kilnd"];
             argv.extend_from_slice(extra);
-            selected_deployment(&Args::try_parse_from(argv).unwrap())
+            selected_deployment(&Args::try_parse_from(argv).unwrap(), None)
         };
         assert!(parse(&[]).unwrap().is_none());
         assert!(parse(&["--backend", "firecracker"]).is_err());
@@ -710,7 +761,9 @@ mod tests {
             ])
             .is_err()
         );
-        let selected = parse(&[
+        // The right paths are not enough: this test process is not the deployment's
+        // account, group or unit (B6-BI-01), so the file is refused here too.
+        let error = parse(&[
             "--backend",
             "firecracker",
             "--firecracker-test-deployment",
@@ -722,9 +775,12 @@ mod tests {
             "--helper-socket",
             "/run/kilnd-fctest-helper/helper.sock",
         ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(selected.deployment, "isolated-test");
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("kilnd-fctest") && !error.contains("differs from"),
+            "{error}"
+        );
     }
 
     #[test]

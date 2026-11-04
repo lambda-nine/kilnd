@@ -4810,19 +4810,50 @@ fn exit1_production_gate_leaves_every_catalog_profile_refused() {
     assert!(!production.contains("TestApproved"));
     assert!(production.contains("ManifestGate::ProductionDisabled"));
     // B6: the daemon selects this backend only from the isolated test deployment, read
-    // and checked against its own paths first; the helper above still serves no profile.
+    // and checked against its own paths and its observed identity first (B6-BI-01); the
+    // helper above still serves no profile.
     let main = include_str!("../../main.rs");
     assert_eq!(main.matches("FirecrackerRuntime::new(").count(), 1);
     let (_, run) = main
-        .split_once("let deployment = selected_deployment(&args)?;")
+        .split_once("let deployment = selected_deployment(&args, gid)?;")
         .unwrap();
     let (arm, _) = run.split_once("FirecrackerRuntime::new(").unwrap();
-    assert!(arm.contains("Some(deployment) =>"), "{arm}");
-    let (_, selection) = main.split_once("fn selected_deployment(").unwrap();
+    let (_, arm) = arm.split_once("Some(deployment) =>").unwrap();
+    assert!(!arm.contains("Store::open("), "{arm}");
+    let (before_store, _) = run.split_once("Store::open(").unwrap();
+    assert!(!before_store.contains("FirecrackerRuntime"), "{before_store}");
+    let (_, selection) = main
+        .split_once("#[cfg(feature = \"firecracker-test-deployment\")]\nfn selected_deployment(")
+        .unwrap();
     let (read, checked) = selection.split_once("TestDeployment::read(").unwrap();
     assert!(read.contains("(Backend::Firecracker, Some(path)) =>"));
     let (checked, _) = checked.split_once("Ok(Some(deployment))").unwrap();
-    assert!(checked.contains("check_daemon("));
+    let (paths, identity) = checked.split_once("check_daemon(").unwrap();
+    let _ = paths;
+    assert!(identity.contains("check_process(socket_gid)?"), "{identity}");
+    // B6-BI-01's build boundary: every Firecracker name in the binary is behind the
+    // non-default feature, which only test builds enable.
+    for (needle, gate) in [
+        ("use kilnd::runtime::firecracker::FirecrackerRuntime;", 1),
+        ("    Firecracker,\n", 1),
+        ("    firecracker_test_deployment: Option<PathBuf>,", 1),
+        ("\n        Some(deployment) => {", 1),
+    ] {
+        let (before, _) = main.split_once(needle).unwrap_or_else(|| panic!("{needle}"));
+        let preceding: Vec<&str> = before.lines().rev().take(4).collect();
+        assert!(
+            preceding
+                .iter()
+                .any(|line| line.trim() == "#[cfg(feature = \"firecracker-test-deployment\")]"),
+            "{needle} is not behind the feature: {preceding:?}"
+        );
+        assert_eq!(main.matches(needle).count(), gate, "{needle}");
+    }
+    let manifest = include_str!("../../../Cargo.toml");
+    let (_, features) = manifest.split_once("[features]").unwrap();
+    let (features, _) = features.split_once("\n[").unwrap();
+    assert!(features.contains("firecracker-test-deployment = []"));
+    assert!(!features.contains("default"), "{features}");
 }
 
 /// B5-R1 (the recheck's `remove_fence_stall` PoC, against the real helper): L stops
