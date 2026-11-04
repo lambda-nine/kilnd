@@ -10,6 +10,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   ledger admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1
   refusals; helper-issued sequence tokens with a per-instance durable watermark remove
   both limits without trusting clocks or daemon state. Design only; no code changes.
+- Revise the retired-token compaction design for Daybreak's design review (section 16.8):
+  Inspect, Remove and each Gc target carry the plan digest, the issue pointer is persisted
+  exactly, L alone classifies tokens, compaction and admission headroom get guaranteed
+  shares (RTC-17, RTC-18), and ledger restore is stated as outside the fault model with a
+  mandatory offline inventory. Design only; no code changes.
 
 - Phase 1b B6 break-it corrections (Daybreak, November 3). B6-BI-01: `--backend
   firecracker` and `--firecracker-test-deployment` exist only in a build with the new

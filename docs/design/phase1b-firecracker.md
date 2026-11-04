@@ -944,7 +944,7 @@ kiln-guest embeds the broker at a pinned kilnd commit/binary digest, adds the vd
 
 **Files:** setup/threat-model/architecture/validation/roadmap docs, CLI help and operator catalog examples. Install the reviewed approved digest; only now allow `--backend firecracker`. Networking, pooling and snapshots remain unsupported.
 
-**Retired-token compaction comes first.** Without it a node admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1 refusals. B7 implements [section 16](#retired-token-compaction-pre-b7-design) (helper-issued sequence tokens and a per-instance watermark, rules RTC-1 to RTC-16, node ledger schema 2 and Firecracker group schema 2) and passes its section 16.6 acceptance criteria, including the lifetime test past 16,384 sessions, before production is enabled.
+**Retired-token compaction comes first.** Without it a node admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1 refusals. B7 implements [section 16](#retired-token-compaction-pre-b7-design) (helper-issued sequence tokens and a per-instance watermark, rules RTC-1 to RTC-18, node ledger schema 2 and Firecracker group schema 2) and passes its section 16.6 acceptance criteria, including the lifetime test past 16,384 sessions, before production is enabled.
 
 **Exit:** node-global stress across at least two daemon namespaces supports the chosen profile, accounting for all per-allocation S/P/R/D and VMM/KVM costs plus shared H/L/M/K, the full tmpfs allowance, journal/WAL/fence and bundle-store headroom. Measure peak CPU/PIDs/memory/storage and workload density; reapprove limits if 128 MiB per-session or shared allowances fail. Legacy privileged suites pass; Daybreak recheck closes the findings (or Stephen explicitly accepts any residual risk); Stephen's section 12 choices are reflected in fixtures. These tests alone do not establish hostile multi-tenant production readiness.
 
@@ -3161,9 +3161,15 @@ measures that limit, states what any compaction must preserve, compares five des
 recommends one: **helper-issued sequence tokens with a per-instance durable low
 watermark**, in which a row always outranks the watermark, everything below the watermark
 is permanently absent, and the watermark's movement is a liveness choice that no safety
-rule depends on. Rules RTC-1 to RTC-16 in section 16.5 are what B7 builds and what
+rule depends on. Rules RTC-1 to RTC-18 in section 16.5 are what B7 builds and what
 Daybreak should attack. Nothing here changes Stephen's settled decisions (one VM per
 session, terminate on uncertainty, no API socket, offline and cold only).
+
+*Revised the same day for Daybreak Blue's design review
+(`reviews/2026-11-04-rtc-design-review.md`): every request that can meet a compacted token
+now carries its plan digest, the issue pointer is persisted exactly, L alone classifies,
+compaction has a guaranteed share of L, admission headroom has a guaranteed per-instance
+share, and the rollback claims are corrected. Section 16.8 maps each finding to its change.*
 
 ## 16.1 The problem, measured
 
@@ -3247,9 +3253,15 @@ A token whose rows were compacted must never lead to:
 This must hold through every replay path: a stale or restored daemon database; a lost
 database (another instance); a copied database or token used elsewhere; two daemons; a
 delayed Create or Remove queued in H or L; a helper restart (with its orphaned supervisors);
-a host reboot; a crash at every step of compaction; a clock step in either direction; a
-token presented by a different instance; and a node ledger restored from an older copy
-(root's action, out of model today, but it must not get worse). It must also keep B3's
+a host reboot; a crash at every step of compaction; a clock step in either direction; and a
+token presented by a different instance. A node ledger restored from an older copy, or
+cloned, is root's action and stays **outside the fault model** (section 16.7). This design
+does not make the node safe against it. Measured against today it is better in some cases
+and worse in one: a restored ledger refuses tokens issued after its copy, and RTC-14
+detects some restores, but a coordinated restore of ledger and daemon, or a cloned ledger,
+re-mints identical tokens, where today's random IDs never repeat. RTC-14 is a partial
+detector, not a defense; any ledger restore requires the node-wide offline inventory in
+section 16.7 before the helper serves again. It must also keep B3's
 anti-flood properties (no unbounded rows or gates from any one instance, admitted tokens
 never refused a fence, quotas checked inside the fence transaction), B6's crash matrix and
 terminal publication rules, crash safety and idempotence of compaction itself, and the
@@ -3277,33 +3289,54 @@ Advancing W too early only turns a slow honest Create into a failed, released on
 therefore choose *when* W moves (a lease after issuance) but can never make an unsafe
 answer.
 
-**Schema and wire.** Node ledger schema 2: `token_key`, `instance_tokens` (issue ceiling,
-watermark, watermark generation), `issue_seq` columns with a hex-prefix CHECK on
-`allocations` and `retired_tokens`, `compaction_log`, and delete triggers that permit only
-compactable rows (section 16.6). Firecracker group schema 2: Preflight stops taking an
-allocation ID and returns the issued one inside the plan's substitutions; AttachInstance
-carries the daemon's highest issued sequence; Accounting gains retained and watermark
-fields. Inspect, Create, Remove, FenceAbsent and Gc keep their shape (still a 128-bit ID)
-and gain the compacted answer. The daemon database needs no schema change: it stores the
-helper's token where it stored its own.
+**Schema and wire.** Node ledger schema 2: `token_key`, `instance_tokens` (exact issue
+pointer, watermark, watermark generation, retained admitted count), `issue_seq` columns with
+a hex-prefix CHECK on `allocations` and `retired_tokens`, `compaction_log`, `node_faults`,
+and delete triggers that permit only compactable rows (section 16.6). Firecracker group
+schema 2: Preflight stops taking an allocation ID and returns the issued one inside the
+plan's substitutions; AttachInstance carries the daemon's highest recorded sequence;
+Accounting gains retained and watermark fields. Every request that can meet a compacted
+token carries the plan digest the daemon's Store bound at C1: Create and FenceAbsent already
+do, Inspect and Remove gain a required `plan_digest`, and each Gc target becomes an
+`(allocation_id, plan_digest)` pair. The Runtime calls pass the Store's immutable binding
+through (`inspect_allocation` already receives it; `remove` and `gc` gain it). The daemon
+database needs no schema change: it stores the helper's token where it stored its own.
 
 **Migration.** Schema 1 has never shipped beyond test. A schema-1 ledger fails its audit,
 closed, with a message to re-provision, as B3 to B5 did; the isolated test deployment is
 re-provisioned with its daemons' Firecracker rows settled first. Production has no ledger.
 
-**Replay paths.** Stale or restored database: its tokens below W get synthesized absence
-receipts and release; its tokens above W behave as today; active ones answer from rows; it
-cannot obtain a new token without Preflight. Lost database: another instance, refused as in
-B6. Copied database or token in another instance: the tag binds the instance, so the token
-is Malformed there and never reaches the ledger. Two daemons: separate sequences and
-watermarks. Delayed Create: refused by the lookup inside C2 once W passes it, with the
-synthesized receipt. Delayed Remove: answered with a receipt and no host action, because
-Remove acts only on journaled resources. Helper restart: the watermark is durable, the issue
-pointer restarts at the durable ceiling, and no advance happens for one lease. Host reboot:
-same. Crash during compaction: each step is one transaction and every intermediate state
-answers identically. Clock steps: change only when W moves. Restored node ledger: the
-daemon's highest sequence at attach exceeds the restored ceiling, so admission closes for
-that instance (new: today nothing detects it).
+**Replay paths** (intact node ledger; the restored-ledger case follows). Stale or restored
+daemon database: each of its CREATING or DELETING rows reaches Inspect, Remove or FenceAbsent
+carrying the digest from its own immutable binding. Tokens with rows answer from the rows,
+and a digest that differs from the rows' is refused as Conflict, so evidence for one plan
+can never release another plan's charge. Rowless tokens below W get a receipt synthesized
+for that digest and release. Tokens at or above W behave as today. It cannot obtain a new
+token without Preflight. Lost database: another instance, refused as in B6. Copied database
+or token in another instance: the tag binds the instance, so the token is Malformed there
+and never reaches the ledger. Two daemons: separate sequences and watermarks. Delayed
+Create: if C2 commits first, its allocation row pins the token below W; if W's advance
+commits first, the lookup inside C2 and the INSERT trigger refuse it with the synthesized
+receipt (SQLite's IMMEDIATE transactions order the two). Delayed Remove, FenceAbsent or Gc:
+an active, stopped, quarantined or worker-unsettled allocation keeps its rows, which outrank
+W; a rowless compacted token gets a receipt and causes no host action, because Remove and
+Gc act only on journaled resources. Helper restart: the watermark and the exact issue
+pointer are durable, no request depends on a digest the helper remembered, and no advance
+happens for one lease. Host reboot: the same; `CLOCK_BOOTTIME` restarts, which only delays
+W. Suspend: `CLOCK_BOOTTIME` counts it, so a resumed, long-delayed honest Create can fail
+released; it cannot bypass C2 or hide an active row. Crash during compaction: the advance
+and each delete batch are separate atomic transactions, so rows present after an advance
+answer from rows, and rows gone after a delete commit passed RTC-10. Clock steps: change
+only when W moves.
+
+**Restored or cloned node ledger** (outside the fault model, section 16.7). A copy restored
+under a current daemon refuses as NotIssued every token issued after the copy, and RTC-14
+closes admission when the daemon has recorded such a token. It cannot see a token that was
+issued before the copy but admitted, retired and compacted after it: the restored ledger
+has no row for it and an older W, so it is Unknown and C2 could admit its replay. A restore
+of both the ledger and the daemon database together, or two helpers running copies of one
+ledger, re-mint the identical next token. Only the node-wide offline inventory in
+section 16.7 covers these.
 
 **Quota, recovery and the ceiling.** Never-admitted rows below W are compacted, so each
 instance's quota becomes a budget per lease window instead of per lifetime; fences below W
@@ -3312,10 +3345,11 @@ terminal publication are unchanged except that a token's receipt may be a synthe
 (still `AbsentFenced`, still bound to node, instance, allocation and plan digest, with a
 generation above anything published for it). The lifetime ceiling disappears: rows retained
 are the active allocations plus what was issued within one lease, bounded by the
-allowance; the sequence is 2^63 per instance.
+allowance, of which each instance has a guaranteed share (RTC-17); the sequence is about
+2^63 per instance.
 
 **Operator repair and observability.** No manual compaction or force flag exists. Accounting
-and `kilnd-helper ledger-stats` (root, read-only) show per instance the issue ceiling, W,
+and `kilnd-helper ledger-stats` (root, read-only) show per instance the issue pointer, W,
 retained admitted and never-admitted rows, pinned active allocations below W, and the last
 compaction's generation and lag; Health degrades on low retained headroom or compaction lag.
 A stuck compaction (a row a trigger refuses) is a health fault naming the token, not a
@@ -3323,8 +3357,9 @@ deletion.
 
 **Cost.** Moderate: about 800 to 1,200 lines in `journal.rs`, `workers.rs` (L requests and
 the compactor), `mod.rs` (issuance, classification before gates), `runtime/firecracker.rs`
-and `manager.rs` (token from Preflight), plus tests. One HMAC over `sha2` (no new
-dependency). Steady-state cost is one FULL-sync write per 64 issuances and one small
+and `manager.rs` (token from Preflight, digests to Inspect, Remove and Gc), plus tests. One
+HMAC over `sha2` (no new dependency). Steady-state cost is one FULL-sync write per issued
+token (the exact pointer, section 16.6 measures it at about 0.2 ms) and one small
 transaction per compaction batch.
 
 ### B. Instance epochs, bumped by re-enrollment or rotation
@@ -3375,10 +3410,12 @@ state.
 A member is treated as retired forever; there are no false negatives, so a retired token is
 always refused, and a false positive is a fresh token treated as absent.
 
-**Why rejected.** It does not remove the limit, it moves it: a filter cannot delete, its
-false-positive rate climbs with every insertion, and at a few percent it fails honest
+**Why rejected.** It does not remove the limit, it moves it: a plain filter cannot delete,
+its false-positive rate climbs with every insertion, and at a few percent it fails honest
 Creates at random (each spurious refusal is itself a post-C1 failure for the daemon to
-fence). It does nothing for the 9.8 KB of allocation history per session, which is most of
+fence). Stable or rotating filters can retire old entries, but keeping them free of false
+negatives across deletion needs generations or epochs (B or A again), and saturation stays
+a lifetime concern. It does nothing for the 9.8 KB of allocation history per session, which is most of
 the space. It must be keyed (the daemon chooses IDs today) and rewritten inside the fence's
 FULL-sync transaction. Operators and Daybreak cannot enumerate or audit what it contains,
 and every safety argument becomes probabilistic. An exact summary of random IDs is the
@@ -3405,7 +3442,7 @@ current.
 | Safe for restored or stale daemon DB | Yes | Yes | Only if clocks are honest | Yes | **No** |
 | Operator action needed | None | Scheduled outage | None | None | None |
 | Bounds allocation history (9.8 KB/session) | Yes | Yes, per rotation | Yes | No | Yes |
-| Wire change | Preflight returns the token | Attach returns epoch | Token issuance | None | Ack message |
+| Wire change | Preflight returns the token; digests on Inspect, Remove, Gc | Attach returns epoch | Token issuance | None | Ack message |
 | Code size | Moderate | Small | Moderate | Moderate | Small |
 
 ## 16.4 Recommendation
@@ -3417,108 +3454,173 @@ never be admitted. Its cost is concentrated in the ledger, which already owns th
 plus one change to where the daemon gets its token.
 
 Defaults: lease 15 minutes (well over four times Preflight's 30 s plus Create's 120 s), a
-compaction pass every 60 s, at most 256 tokens per delete transaction, issuance blocks of 64,
-a per-token space bound set from a measured worst case (section 16.6), and a 128 MiB fence
-allowance (8,192 entries at 16 KiB; a quarter, 2,048, is the never-admitted pool, 256 per
-instance per window at the default 8 instances). All are root policy, never daemon input.
+compaction pass every 60 s on its own one-slot L lane, at most 256 tokens per delete
+transaction, an exact issue pointer persisted with each issuance, a per-token space bound
+set from a measured worst case (section 16.6), and a 128 MiB fence allowance (8,192 entries
+at 16 KiB; a quarter, 2,048, is the never-admitted pool, 256 per instance per window at the
+default 8 instances; of the remaining 6,143 admitted entries each instance is guaranteed
+767 and may borrow unreserved space). All are root policy, never daemon input.
 
-## 16.5 Rules for B7 (RTC-1 to RTC-16)
+## 16.5 Rules for B7 (RTC-1 to RTC-18)
 
-1. **RTC-1 Token form.** A Firecracker allocation ID is seq ‖ tag: `seq` is the instance's
-   issue sequence as 8 big-endian bytes, 1 ≤ seq ≤ 2^63 − 1; `tag` is the first 8 bytes of
-   HMAC-SHA-256(K, `"kilnd-fc-token-v1"` ‖ node_id ‖ instance_id ‖ seq). K is 32 random bytes
-   made at provisioning, stored only in the node ledger, never sent to a daemon or logged,
-   and never changed. The text form stays 32 lowercase hex digits, so `backend_id`, jail
-   names and every 128-bit field keep their shape.
+1. **RTC-1 Token form and key.** A Firecracker allocation ID is seq ‖ tag: `seq` is the
+   instance's issue sequence as 8 big-endian bytes, 1 ≤ seq ≤ 2^63 − 2; `tag` is the first 8
+   bytes of HMAC-SHA-256(K, `"kilnd-fc-token-v1"` ‖ node_id ‖ instance_id ‖ seq). K is 32
+   bytes from the OS CSPRNG (`getrandom`), written in the schema-provisioning transaction
+   with a check value, the first 16 bytes of HMAC-SHA-256(K, `"kilnd-fc-key-check-v1"` ‖
+   node_id). Triggers refuse every UPDATE, DELETE and INSERT OR REPLACE of it. K lives only
+   in the node ledger (so every copy of the ledger carries it) and in H's and L's memory,
+   and never appears in a reply, log, error or Accounting field. Open never generates a
+   replacement: a missing, truncated or substituted K fails the open audit and closes the
+   Firecracker group. K never rotates: changing it invalidates every outstanding token, so
+   loss or compromise is recovered by node-wide drain, verified absence and re-provisioning
+   (section 16.7). The text form stays 32 lowercase hex digits, so `backend_id`, jail names
+   and every 128-bit field keep their shape.
 2. **RTC-2 Only the helper mints.** Tokens are issued only by Preflight, only to the live
    holder of the instance (section 4.1), only when headroom allows. The daemon never mints a
    Firecracker token; it uses the one bound into the verified plan.
-3. **RTC-3 Classification before anything else.** Before any gate, quota, lookup or ledger
-   call, H checks the tag in the caller's authenticated instance (L hands H the key once, at
-   startup, over its private channel); L repeats the whole classification inside every
-   transaction that reads a token. A wrong tag or seq 0 is **Malformed**; seq at or above
-   L's issued pointer is **NotIssued**. Both are refused as `Incompatible` with no row,
-   gate, generation or receipt, and the daemon's charge stays. Another instance's token is
-   Malformed here.
-4. **RTC-4 Issuance is durable before use.** Each instance's issue ceiling only increases,
-   in a FULL-sync transaction committed before any seq at or above the old ceiling is handed
-   out. On start, L's issued pointer for each instance is its durable ceiling. No seq is
-   ever handed out twice, and unused seqs in a block are skipped forever.
-5. **RTC-5 The watermark.** Each instance has a durable W with 1 ≤ W ≤ ceiling. W only
-   increases, in a FULL-sync transaction that takes a fresh generation G_W, and never above
-   L's issued pointer. No other path writes W.
-6. **RTC-6 Rows outrank the watermark.** Every token read follows: fence row (its original
-   receipt, or Conflict on another plan digest), then allocation row (as today), then
-   seq < W (Compacted), then Unknown.
+3. **RTC-3 H checks the tag; L classifies.** Before any gate, quota or L call, H performs
+   only a constant-time check of the tag in the caller's authenticated instance and of
+   seq ≠ 0 (L hands H the key once, at startup, over its private channel). A failure is
+   **Malformed**: refused as `Incompatible` with no gate, L call, row, generation or receipt,
+   and the daemon's charge stays. Another instance's token is Malformed here. H holds no
+   issue pointer, watermark or row state and never classifies further: it never infers
+   Compacted from seq < W, because a pinned active allocation can sit below W and rows win.
+   L classifies authoritatively inside the transaction that reads the token: it repeats the
+   tag check, answers **NotIssued** for seq at or above the durable issue pointer it reads in
+   that transaction, then applies RTC-6. H acts on L's answer alone (RTC-15).
+4. **RTC-4 Issuance is exact and durable before use.** Each instance has a durable exclusive
+   issue pointer `issue_next`. Issuing seq = `issue_next` raises it by exactly one in the same
+   FULL-sync IMMEDIATE transaction that takes Preflight's identity and headroom snapshot,
+   committed before the token leaves L. On start, L reads the pointer as committed. No seq is
+   handed out twice, and no seq below the pointer was skipped: every such seq was delivered
+   to Preflight or its transaction rolled back. At `issue_next` = 2^63 − 1 Preflight refuses
+   with a health fault and never wraps.
+5. **RTC-5 The watermark.** Each instance has a durable W with 1 ≤ W ≤ `issue_next`. W only
+   increases, in a FULL-sync transaction that takes a fresh generation G_W. No other path
+   writes W.
+6. **RTC-6 Rows outrank the watermark, and the digest binds.** Every token read follows:
+   fence row (its original receipt, or Conflict on another plan digest), then allocation row
+   (as today, or Conflict when its plan digest is not the caller's), then seq < W
+   (Compacted), then Unknown. A Conflict changes nothing and the daemon's charge stays.
 7. **RTC-7 Nothing below W is admitted or newly fenced.** C2 commits INTENT only for
    seq ≥ W, checked by the lookup in the admission transaction and by an INSERT trigger on
    `allocations`. A fence row for seq < W is written only for a token that has an allocation
    row (a pinned active allocation reaching ABSENT).
-8. **RTC-8 Compacted means absent, and nothing else.** For a Compacted token, Create, Inspect,
-   Remove, FenceAbsent and Gc answer `AbsentFenced` with a synthesized receipt: helper
-   generation G_W; receipt ID the first 16 bytes of SHA-256(`"kilnd-fc-compacted-v1"` ‖ node
-   ‖ instance ‖ allocation ‖ plan digest ‖ G_W); the caller's plan digest; observations
-   `compacted;watermark=<W>;issue_seq=<seq>`. The answer writes nothing and touches no host
-   resource. No Ready, Busy, Present, Stopped, Accepted or reusable answer is ever given for
-   it, and Remove, Stop and Gc never act on a token with no rows.
+8. **RTC-8 Compacted means absent, and nothing else.** Every request that can reach a token
+   lookup carries the plan digest from the daemon Store's immutable binding: Create and
+   FenceAbsent today, and in group schema 2 Inspect and Remove (a required `plan_digest`)
+   and each Gc target (an `(allocation_id, plan_digest)` pair). For a Compacted token those
+   five answer `AbsentFenced` with a synthesized receipt: helper generation G_W; receipt ID
+   the first 16 bytes of SHA-256(`"kilnd-fc-compacted-v1"` ‖ node ‖ instance ‖ allocation ‖
+   plan digest ‖ G_W); the request's plan digest; observations
+   `compacted;watermark=<W>;issue_seq=<seq>`. The digest comes from the request and nowhere
+   else: no cache, row or reply supplies it, so the answer is the same after any helper
+   restart. Binding the caller's digest is truthful, because a compacted token owns nothing
+   under any plan, and the receipt can release only a Store row whose own immutable binding
+   names that digest (the daemon's `receipt.matches(binding)` and the Store's identity
+   triggers, unchanged). The answer writes nothing and touches no host resource. No Ready,
+   Busy, Present, Stopped, Accepted or reusable answer is ever given for it, and Remove,
+   Stop and Gc never act on a token with no rows.
 9. **RTC-9 Synthesized receipts are never stale.** A token's rows are compacted only when
    its fence generation is below G_W (RTC-10), so G_W exceeds every generation the helper
    ever reported for a token that answers Compacted; a never-admitted token below W was
    issued before W passed it, and the advance took a new generation. When a pinned
    allocation is fenced after the last advance, the compactor refreshes G_W (a new
-   generation, W unchanged) before compacting it. The daemon's `release_evidence_not_stale` trigger and C1's
-   `last_helper_generation = 0` therefore accept it, and only for a row whose identity it
-   matches.
+   generation, W unchanged) before compacting it. The daemon's `release_evidence_not_stale`
+   trigger and C1's `last_helper_generation = 0` therefore accept it, and only for a row
+   whose identity it matches. A later G_W gives a later, different receipt for the same
+   token; evidence the daemon already published stays authoritative and immutable, and a
+   charged row accepts only a generation newer than its own last publication.
 10. **RTC-10 Only absent rows are compacted.** A token's rows may be deleted only when
-    seq < W, its fence row exists with a helper generation below G_W, and, if it was admitted, its allocation is `absent`
-    with the claim and every identity and executable lease released and every worker row
-    settled. Children go first, then the allocation, then the fence row last, in one
-    transaction. SQL triggers enforce each condition. Active, stopped, quarantined or
-    ambiguous allocations are never deleted, whatever their seq.
+    seq < W, its fence row exists with a helper generation below G_W, and, if it was
+    admitted, its allocation is `absent` with the claim and every identity and executable
+    lease released and every worker row settled. Children go first, then the allocation,
+    then the fence row last, in one transaction. SQL triggers enforce each condition.
+    Active, stopped, quarantined or ambiguous allocations are never deleted, whatever their
+    seq.
 11. **RTC-11 Crash-safe and idempotent.** Advancing W and deleting rows are separate atomic
     transactions; any crash leaves a state where RTC-6 to RTC-8 give the same answers, and a
     rerun deletes nothing more than the rule allows. Compaction runs only in L, performs no
     host action and calls nothing in `proven.rs` or `sys.rs`.
-12. **RTC-12 Quotas per window.** The never-admitted quota counts only retained never-admitted
-    fence rows (seq ≥ W or not yet compacted), checked inside the fence transaction as today.
-    Admitted tokens are never refused a fence. Headroom counts retained allocation rows plus
-    the reserved pool plus one, at an honest per-token bound.
-13. **RTC-13 Advance policy is liveness only.** L advances W to the highest issuance
-    checkpoint at least one lease old by `CLOCK_BOOTTIME`; checkpoints are memory only, and
-    after any L start the only checkpoint is (ceiling, now), so nothing advances for one
-    lease. No wall clock is read. A test that steps any clock must find no unsafe answer.
-14. **RTC-14 Daemon cross-check.** AttachInstance carries the highest seq among the daemon's
-    Firecracker rows and its permanent release evidence. If it is at or above the ledger's ceiling, the ledger is behind
-    (restored or rolled back): that instance's admission closes with a health fault naming
-    it, and nothing raises the ceiling to match. This is a detector, not authority.
-15. **RTC-15 Gates follow classification.** H drops any non-durable gate for a token
-    classified Malformed, NotIssued or Compacted, and such tokens never count toward the
-    instance's gate quota (B3-03).
-16. **RTC-16 Audit and observability.** The open audit checks K's presence and length, every
-    stored seq's hex prefix and tag, W ≤ ceiling, no allocation below W that is absent without
-    its fence row, and includes G_W and `compaction_log` in the generation rollback check.
-    Accounting reports, for the caller's own instance only, W, ceiling, retained admitted and
-    never-admitted rows, pinned allocations below W and compaction lag, plus node retained
-    totals. Health degrades below 25% retained headroom or past two leases of lag.
+12. **RTC-12 Quotas per window.** The never-admitted quota counts only retained
+    never-admitted fence rows (seq ≥ W or not yet compacted), checked inside the fence
+    transaction as today. Admitted tokens are never refused a fence. Headroom counts retained
+    allocation rows plus the reserved pool plus one, at an honest per-token bound, and is
+    shared under RTC-17.
+13. **RTC-13 Advance policy is liveness only.** After each issuance L records the checkpoint
+    (`issue_next`, now), the exclusive pointer, so the last token issued is below the target
+    once its lease passes. L advances W to the highest checkpoint at least one lease old by
+    `CLOCK_BOOTTIME`. Checkpoints are memory only, and after any L start the only checkpoint
+    is (`issue_next`, now), so nothing advances for one lease. No wall clock is read. A test
+    that steps any clock must find no unsafe answer.
+14. **RTC-14 Daemon cross-check, a partial detector.** AttachInstance carries the highest
+    seq among the daemon's Firecracker rows and its permanent release evidence. If it is at
+    or above the ledger's `issue_next`, the ledger is behind that daemon: L records a durable
+    `node_faults` row and closes Firecracker admission for **every** instance, because the
+    ledger is node-wide. Only the offline repair in section 16.7 clears it, and nothing
+    raises the pointer to match. It detects a ledger restored to before any token the
+    daemon has recorded. It does not detect a restore to a point after the daemon's last
+    recorded token (a token issued before the copy and admitted, retired and compacted
+    after it then answers Unknown), a coordinated restore of the ledger and the daemon
+    database together, or two helpers running clones of one ledger. It is evidence, never
+    authority, and its silence proves nothing.
+15. **RTC-15 Gates follow L.** While a flow waits for L it holds only B3-03's per-token
+    serialization entry, which leaves with the flow. H closes or retains a gate only on L's
+    answer. A token that fails H's tag check, or that L answers NotIssued or Compacted,
+    creates and retains no closed gate and never counts toward the instance's gate quota
+    (B3-03).
+16. **RTC-16 Audit and observability.** The open audit checks K's presence, length and
+    check value; every stored seq's hex prefix and tag; W ≤ `issue_next`; every stored
+    seq < `issue_next`; no allocation below W that is absent without its fence row; each
+    instance's retained-admitted counter against its rows; and includes G_W, `node_faults`
+    and `compaction_log` in the generation rollback check. Accounting reports, for the
+    caller's own instance only, W, `issue_next`, retained admitted and never-admitted rows,
+    its guaranteed share, pinned allocations below W and compaction lag, plus node retained
+    totals. Health degrades below 25% retained headroom or past two leases of lag, and fails
+    on any `node_faults` row.
+17. **RTC-17 A guaranteed share of admitted headroom.** Let E be the admitted entries (the
+    allowance's entries, less the never-admitted pool, less one) and
+    share = floor(E / max(policy instance maximum, enrolled instances)) (767 at the defaults). An
+    instance whose retained admitted rows are below its share is never refused for
+    admitted headroom. Above its share it may borrow free entries only while the remaining
+    free space still covers every other enrolled instance's unused share. Preflight checks
+    this before issuance and C2 rechecks it inside the admission transaction (section 16.6).
+18. **RTC-18 Compaction has a guaranteed share of L.** H keeps one L permit for compaction
+    on its own lane, separate from the normal, reserved and attach lanes, and submits a due
+    batch without waiting for the normal lane to go idle. L serves one request at a time in
+    arrival order, so a due batch waits behind at most the 96 requests the other lanes can
+    queue (28 + 4 + 64), and any other request waits behind at most one batch. Compaction
+    never takes a reserved permit, so cleanup and recovery keep their capacity and priority
+    over new work exactly as today.
 
 ## 16.6 B7 implementation and test plan
 
 **Node ledger schema 2** (`journal.rs`; schema 1 refuses to open with "re-provision"):
 
 ```text
-token_key(id = 1, key BLOB length 32, created_generation)          immutable, no delete
-instance_tokens(instance_id PK -> instances, issue_ceiling >= 1,
+token_key(id = 1, key BLOB length 32, check BLOB length 16,
+          created_generation)                                      written once at provisioning;
+                                                                   UPDATE, DELETE, REPLACE refused
+instance_tokens(instance_id PK -> instances, issue_next >= 1,
                 watermark >= 1, watermark_generation >= 1,
-                CHECK watermark <= issue_ceiling)                  both only increase; no delete;
-                                                                   row written by enroll
+                retained_admitted >= 0,
+                CHECK watermark <= issue_next,
+                CHECK issue_next <= 9223372036854775807)           issue_next and watermark only
+                                                                   increase; no delete; row
+                                                                   written by enroll
 allocations.issue_seq, retired_tokens.issue_seq  INTEGER NOT NULL,
-    CHECK (issue_seq BETWEEN 1 AND 9223372036854775807
+    CHECK (issue_seq BETWEEN 1 AND 9223372036854775806
            AND substr(allocation_id, 1, 16) = printf('%016x', issue_seq))
 INDEX (instance_id, issue_seq) on both
 compaction_log(id, instance_id, from_w, to_w, generation UNIQUE,
                tokens_deleted, rows_deleted)                       newest 64 per instance kept
-INSERT triggers: allocations refused for issue_seq < W or >= ceiling;
-                 retired_tokens refused for issue_seq >= ceiling, or < W with no allocation row
+node_faults(id, generation UNIQUE, kind, detail)                   insert only; cleared only by
+                                                                   the offline repair command
+INSERT triggers: allocations refused for issue_seq < W or >= issue_next;
+                 retired_tokens refused for issue_seq >= issue_next, or < W with no
+                 allocation row
+COUNTER triggers: allocations INSERT / DELETE adjust instance_tokens.retained_admitted
 DELETE triggers (replacing the "permanent" ones): a child row only if its token is
   compactable and the row is released or settled; an allocation only if absent and
   compactable; a fence row only if issue_seq < W and no allocation row remains.
@@ -3528,54 +3630,118 @@ compactable(I, A) := EXISTS fence row (I, A) with issue_seq < W(I)
 ```
 
 `FENCE_ENTRY_BOUND` becomes a measured worst case: a new test fills every bounded
-per-allocation table to its cap (16 stop events, 8 settled workers per mode, every resource
-kind, the largest receipt) and asserts the bound; 16 KiB is the expected value against the
-9.8 KB typical footprint. The fence allowance becomes 128 MiB of the 512 MiB shared storage
-reservation, and the ledger-size guard measures live pages, (page_count − freelist_count) ×
-page_size, since SQLite reuses freed pages without shrinking the file.
+per-allocation table to its cap (16 stop events, 8 settled workers per mode with B5-01's
+settled-worker retention applied, every resource kind, the largest receipt) and asserts the
+bound; 16 KiB is the expected value against the 9.8 KB typical footprint. The fence allowance
+becomes 128 MiB of the 512 MiB shared storage reservation, and the ledger-size guard measures
+live pages, (page_count − freelist_count) × page_size, since SQLite reuses freed pages
+without shrinking the file.
 
 **Messages** (Firecracker group schema 2; old daemons are refused at capability preflight):
 
 | Message | Change |
 |---|---|
 | Preflight | Request drops `allocation_id`; reply's plan substitutions carry the issued token, and the reply names it. `verify_prepared` binds substitutions to the reply's token and the caller's instance |
-| AttachInstance | Adds `highest_issue_seq` (RTC-14) |
+| AttachInstance | Adds `highest_issue_seq`: the highest seq among the instance's Firecracker rows and release evidence (RTC-14) |
 | Accounting | Adds the RTC-16 fields (`AccountingSnapshot` is `deny_unknown_fields`, hence the schema bump) |
-| Create, Inspect, Remove, FenceAbsent, Gc | Same shapes; Compacted answers `AbsentFenced` with the synthesized receipt; Malformed and NotIssued answer `Incompatible` |
-| L protocol | `PreflightSnapshot` becomes `IssueAndSnapshot { instance }`; new `Compact { max_tokens }` and `CompactReply`; `TokenLookup` gains `Compacted { receipt }`, `Malformed`, `NotIssued` |
+| Create, FenceAbsent | Shapes unchanged; both already carry `plan_digest`. Compacted answers `AbsentFenced` synthesized for that digest; Malformed and NotIssued answer `Incompatible` |
+| Inspect | `Inspect { allocation_id, plan_digest }`, digest required. Rows answer when the digest matches and Conflict when it does not; Compacted answers `AbsentFenced` synthesized for that digest |
+| Remove | `Remove { allocation_id, plan_digest }`, digest required. Same lookup; it acts only on the journaled resources of a row whose digest matches |
+| Gc | `Gc { targets: Vec<GcTarget> }` with `GcTarget { allocation_id, plan_digest }`, today's length bound, duplicate IDs refused. Each target is answered as Remove would answer it; a Compacted target contributes its synthesized receipt to the reply |
+| Stop, Validate, Exec | Unchanged. None is a release; a rowless token is refused with no action |
+| L protocol | `PreflightSnapshot` becomes `IssueAndSnapshot { instance }`; `Inspect { instance, allocation, plan_digest }`; new `Compact { instance, max_tokens }` and `CompactReply` on the new compaction lane; `TokenLookup` gains `Compacted { receipt }`, `Malformed`, `NotIssued`. H sends L no classification of its own |
 | Daemon | `CreateContext` is built after `prepare`, from `PreparedCreate::allocation_id()` (Firecracker) or `Id128::random()` (kiln, which records no allocation). No store schema change |
+
+*Rejected: "Compacted, then FenceAbsent".* The review's alternative, in which Inspect, Remove
+and Gc return a non-releasing `Compacted` and the daemon then calls the digest-bearing
+FenceAbsent, is not taken: it costs a second round trip on every compacted recovery and
+opens a window between the two calls in which state can change and must be re-proved.
+Carrying the digest answers in one transaction.
+
+**Daemon and Runtime changes.** The Runtime trait stays backend-neutral; section 8's
+listing changes the same way.
+
+```rust
+// runtime/mod.rs
+/// What a removal names: never a backend ID alone for a fenced allocation.
+pub enum RemoveTarget<'a> {
+    /// A kiln sandbox: its backend ID, released only through the legacy tag.
+    Legacy { backend_id: &'a str },
+    /// A fenced allocation: the daemon Store's immutable binding, read from its row.
+    Fenced { binding: &'a AllocationBinding },
+}
+
+fn inspect_allocation(&self, context: &CreateContext, prepared_digest: &Digest,
+                      deadline: Instant, cancel: &CancellationToken)
+    -> impl Future<Output = Result<AllocationObservation, RuntimeError>> + Send; // unchanged
+fn remove(&self, target: RemoveTarget<'_>, deadline: Instant, cancel: &CancellationToken)
+    -> impl Future<Output = Result<AbsenceReceipt, RuntimeError>> + Send;
+fn gc(&self, targets: &[RemoveTarget<'_>], deadline: Instant, cancel: &CancellationToken)
+    -> impl Future<Output = Result<Vec<AbsenceReceipt>, RuntimeError>> + Send;
+```
+
+- **Firecracker adapter** (`runtime/firecracker.rs`): `inspect_allocation` sends
+  `prepared_digest` as `Inspect.plan_digest` instead of discarding it. `remove` and `gc` send
+  `binding.allocation_id` and `binding.plan_digest`, after checking the binding's node and
+  instance against the attached identity. A `Legacy` target is refused as
+  `RuntimeError::Incompatible` before any wire call, so no Firecracker request can leave
+  without a digest.
+- **kiln adapters** (`KilnRuntime`, `DirectKilnRuntime`) accept only `Legacy` targets and
+  refuse `Fenced`; their behavior is otherwise unchanged.
+- **Manager** (`manager.rs`): the fenced release path calls
+  `remove(RemoveTarget::Fenced { binding })` with the binding from `fenced_binding(sandbox)`,
+  and `remove_legacy` calls `remove(RemoveTarget::Legacy { backend_id })`. Reconciliation's
+  Gc list becomes `Vec<RemoveTarget>`. Today it sends only legacy rows (`stale_owned`
+  excludes fenced rows, which recover through Inspect, Remove and FenceAbsent), and B7 keeps
+  that, but any fenced row sent to Gc carries its Store binding, and every fenced receipt
+  goes through `commit_absence`, which already requires `receipt.matches(binding)`. A
+  binding comes only from the Store row: never from List inventory, a helper reply or a
+  cache.
+- **Helper** (`helper/firecracker/mod.rs`, `workers.rs`, `journal.rs`): `Ledger::inspect`
+  takes the digest; the Remove and Gc handlers pass each request digest to the lookup;
+  an allocation row whose plan digest differs answers Conflict, as a fence row already does.
 
 **Transaction order** (all IMMEDIATE, FULL-sync, in L):
 
 ```text
-issue(I):                                   -- inside IssueAndSnapshot, after headroom
-  if next[I] == ceiling[I]:
-      tx: UPDATE instance_tokens SET issue_ceiling = ceiling + 64
-          WHERE instance_id = I AND issue_ceiling = ceiling;  commit
-      ceiling[I] += 64
-  seq = next[I]; next[I] += 1
-  maybe_checkpoint(I, seq, boottime_now())   -- memory only
-  return seq_be8 || hmac(K, node, I, seq)[0..8]
+issue(tx, I):                               -- IssueAndSnapshot, one transaction
+  n = issue_next(I)                         -- durable, exclusive
+  require n <= 2^63 - 2                     -- else refuse, health fault, no write
+  require headroom(tx, I) and the never-admitted issuance floor (RTC-12)
+  snapshot = claimed identities
+  UPDATE instance_tokens SET issue_next = n + 1
+    WHERE instance_id = I AND issue_next = n;  commit
+  checkpoint(I, n + 1, boottime_now())      -- memory only; exclusive pointer (RTC-13)
+  return be64(n) || hmac(K, node, I, n)[0..8], snapshot
 
-classify(I, A):                              -- H before any call, L inside each tx
+tag_check(I, A):                            -- H before any gate or call; L again in lookup
   seq = be64(A[0..8])
   if seq == 0 or not ct_eq(A[8..16], hmac(K, node, I, seq)[0..8]): Malformed
-  if seq >= next[I]: NotIssued
 
-lookup(tx, I, A, plan):
-  classify(I, A)?
-  fence row (I, A)        -> Fenced(original) | Conflict(other plan)
-  allocation row (I, A)   -> Active(...)      (as today)
-  seq < W(I)              -> Compacted(synth(I, A, plan, W, G_W))
+lookup(tx, I, A, digest):                   -- L only, inside every tx that reads a token
+  tag_check(I, A)?
+  if seq >= issue_next(I) (read in tx): NotIssued
+  fence row (I, A)        -> digest == row's ? Fenced(original) : Conflict
+  allocation row (I, A)   -> digest == row's ? Active(...)      : Conflict
+  seq < W(I)              -> Compacted(synth(I, A, digest, W, G_W))
   otherwise               -> Unknown
 
-admit (C2): lookup; Compacted -> AdmitOutcome::Fenced(synth); Unknown -> today's checks,
-            insert allocation with issue_seq (trigger rechecks seq >= W)
+headroom(tx, I):                            -- RTC-17, at issue and again in C2
+  E = entries - pool - 1;  share = E / max(policy_max_instances, enrolled)
+  free = E - sum(retained_admitted)
+  reserve = sum over enrolled J != I of max(0, share - retained_admitted(J))
+  return free >= 1 and (retained_admitted(I) < share or free - 1 >= reserve)
+
+admit (C2): lookup; Compacted -> AdmitOutcome::Fenced(synth); Unknown -> headroom and
+            today's checks, insert allocation with issue_seq (trigger rechecks
+            W <= seq < issue_next)
 commit_fence: lookup; Compacted -> Absent(synth, replay = true);
               Unknown -> quota over retained never-admitted rows -> insert fence with issue_seq
+inspect / remove / gc target: lookup with the request's digest; Compacted -> synth;
+              Conflict, NotIssued, Malformed -> refuse, no action; Active -> as today
 
-advance(I):                                  -- compactor, every 60 s
-  target = max(W, min(highest checkpoint seq older than LEASE, next[I]))
+advance(I):                                 -- compactor
+  target = max(W, min(highest checkpoint pointer older than LEASE, issue_next(I)))
   tx: if target == W and no fence row of I has issue_seq < W
                       and helper_generation >= G_W: done
       G = next_generation()                 -- also refreshes G_W for late pinned fences
@@ -3583,7 +3749,7 @@ advance(I):                                  -- compactor, every 60 s
         WHERE instance_id = I AND watermark = W
       INSERT compaction_log(I, W, target, G, 0, 0);  commit
 
-compact_batch(I, 256):                       -- repeat while it deletes and L is idle
+compact_batch(I, 256):
   tx: for A in fence rows of I with issue_seq < W and helper_generation < G_W
           ORDER BY issue_seq LIMIT 256:
         if allocation row (I, A):
@@ -3593,24 +3759,72 @@ compact_batch(I, 256):                       -- repeat while it deletes and L is
                   identity_leases, capacity_claims (I, A); DELETE allocations (I, A)
         DELETE retired_tokens (I, A)
       UPDATE compaction_log counts;  commit
+
+compactor (H, RTC-18):
+  due(I) := 60 s since I's last pass, or I's last batch deleted max_tokens, or advance
+            moved W with compactable rows left
+  loop: for I in round-robin order with due(I):
+          Compact { instance: I, max_tokens: 256 } on the compaction lane (one permit),
+          awaiting each reply before the next
 ```
 
-H drives the compactor with a `Compact` call on the normal lane every 60 s and only when
-that lane has no waiting request, so compaction never delays a Create, Remove or fence by
-more than one bounded batch.
+The headroom check keeps one invariant: free entries always cover the sum of every enrolled
+instance's unused share. An admission below its share uses one entry of its own share; an
+admission above it is allowed only if the invariant still holds afterwards; compaction frees
+an entry for every unit of share it returns. So an instance below its share always finds an
+entry. Two edges are deliberate: enrolling a new instance (a root maintenance action with
+the helper stopped) can find its share already borrowed, in which case enrollment reports
+the shortfall and the guarantee starts once borrowed rows drain (absent ones within a lease
+and a compaction pass, active ones when their sessions end); and the policy's instance
+maximum, not the enrolled count, sets the share, so unenrolled slots are free to borrow. The
+cost is one counter column kept by triggers and a sum over at most 64 instance rows per
+check. At the defaults the guarantee does not limit throughput: 767 retained admitted rows
+per instance per 15-minute lease is about 51 sessions a minute, several times what a node's
+capacity claims can boot (about 14 s per boot on mini-one).
+
+**What exact issuance costs.** Today's Preflight writes nothing to the ledger
+(`PreflightSnapshot` is a read), and the 424c74c design committed only every 64th issuance,
+so persisting the exact pointer adds one FULL-sync commit per issued token. Measured on
+mini-one with `research/retired-token-compaction/probe_issue_commit_cost.py` (WAL,
+synchronous=FULL, one conditional single-row UPDATE per IMMEDIATE transaction, 2,000
+commits): median 53 µs (p99 217 µs) with plain fsync, and median 168 µs (p99 443 µs) with
+F_FULLFSYNC, which is the closer analogue of a real Linux flush. The Linux ledger in the
+kiln VM (ext4 on the Lima virtio disk) was not measured here; the lifetime test records it.
+An admitted session's modeled lifecycle already makes about 50 ledger write transactions
+(the byte probe's sequence), so this is about 2% more ledger writes and nothing measurable
+next to a 14 s boot. L serializes every transaction, so even at 1 ms per commit issuance is
+limited to about 1,000 tokens a second, far above anything capacity admits. A Preflight
+refused for headroom, quota or exhaustion aborts before the UPDATE and writes nothing, and
+Preflight floods remain bounded by B3's per-instance limits and P's two slots. In return
+there are no skipped seqs, restarts keep the exact pointer, and a valid-tag unused seq is
+NotIssued before and after restart.
 
 **Crash points** to add to `firecracker-crash-matrix.py` (each a `b7_linux_root_crash_*`
 scenario in `tests/recovery.rs`, run alone under the VM lock with the 90-minute uptime rule):
 
 | Scenario | Fault point | Required outcome |
 |---|---|---|
-| Issuance block commit lost | `L.issue.before_commit`, `L.issue.after_commit` | No seq handed out twice; tokens from before the crash answer from rows or as NotIssued; no claim leaks |
+| Issuance commit lost | `L.issue.before_commit`, `L.issue.after_commit`, `L.issue.after_reply` (reply delivered, daemon killed before C1) | No seq handed out twice. Before commit: pointer unchanged, nothing delivered. After commit: the delivered token is below the pointer and, rowless and at or above W, answers **Unknown** (admittable, as an issued token should be) until W passes it, then Compacted; it is never NotIssued. No claim leaks |
+| H/L split restart | Restart L alone while H survives, and H alone while L survives, mid-churn | H keeps no pointer or classification state, so every answer after the restart comes from L's committed state; K is handed over again; open serialization entries settle with their flows |
 | Watermark advance | `L.compact.advance.before_commit`, `.after_commit` | Before: W unchanged. After: W durable, rows still present answer from rows, a Create below W gets the synthesized receipt and allocates nothing |
-| Delete batch | `L.compact.delete.before_commit`, `.after_commit`, `L.compact.sync_fail` | Atomic: a token is either fully present or fully gone; answers identical either way; the rerun is idempotent |
-| Create racing compaction | Create held at `L.admit` while W passes its seq | Fenced with the synthesized receipt; zero claims; the daemon publishes FAILED released by that receipt |
+| G_W refresh for a late pinned fence | Advance W past a READY allocation, fence it at a generation at or above the old G_W, crash before and after the W-unchanged refresh and before and after its delete; restore the old READY daemon DB | Only a fresh synthesized receipt for the matching digest is accepted; nothing is compacted before the refresh commits |
+| Delete batch, every boundary | `L.compact.delete.after_<family>` for each child family, `.after_allocation`, `.after_fence`, `.after_commit_before_reply`, `L.compact.sync_fail` | Every uncommitted batch rolls back whole and stays charged; after commit, a lost reply changes nothing; the rerun is idempotent |
+| Non-compactable rows in a batch | A STOPPED, a QUARANTINED, a failed-cleanup, an unreleased-lease, an unsettled-worker and a root-replaced-resource allocation below W | Each is skipped with a health fault naming it and never deleted; the rest of the batch proceeds |
+| Create racing compaction | Create held at `L.admit` while W passes its seq, and a delayed C2 released immediately before and immediately after W's commit | Fenced with the synthesized receipt or admitted and pinned, by commit order; zero claims in the fenced case; the daemon publishes FAILED released by that receipt |
 | Remove racing compaction | Remove held at `H.remove.after_state` while its token is compacted | Impossible by RTC-10 (the token is not absent yet); the scenario proves the batch skips it and the Remove completes with its own receipt |
-| Restored stale DB after compaction | Restore a daemon DB copied before 200 sessions, after compaction passed them | Every compacted row released by a synthesized receipt; no VM, disk or claim; B6 admission blocking rules unchanged for active tokens |
-| Helper restart resets checkpoints | Restart H and L mid-churn | Issue pointer jumps to the ceiling, no advance for one lease, no seq reused |
+| Restored stale DB after compaction | Restore a daemon DB copied before 200 sessions, after compaction passed them, with H and L restarted | Every compacted row released by a synthesized receipt for its own Store digest; no VM, disk or claim; B6 admission blocking rules unchanged for active tokens |
+| Helper restart resets checkpoints | Restart H and L mid-churn | Issue pointer is exactly the committed one, no advance for one lease, no seq reused |
+
+**Real-wire digest tests** (RTC-DR-01). `b7_linux_root_digest_*_after_restart`, one each for
+Inspect (through reconciliation), Remove (through Delete) and Gc (through a direct
+`FirecrackerRuntime::gc` call with typed targets), plus Create and FenceAbsent: finish a
+session, compact all its rows, restart H and L, restore a charged daemon snapshot in which
+the row is CREATING or DELETING, and drive the request through the real manager, adapter,
+listener, H and L. Each must return `AbsentFenced` synthesized for the Store's digest, which
+the daemon accepts through `commit_absence`. To prove no cache supplies the digest, the same
+request sent with another digest must yield a receipt for that other digest, which the
+daemon's match refuses, so the row stays charged; and while rows still exist, a mismatched
+digest must answer Conflict with no action.
 
 **Attack regressions** (`firecracker-regressions.py` and `tests/control_plane.rs`):
 
@@ -3618,67 +3832,152 @@ scenario in `tests/recovery.rs`, run alone under the VM lock with the 90-minute 
   then replay Create (with the original plan), FenceAbsent, Remove, Inspect and Gc from the
   enrolled daemon's own unit: every answer is the synthesized `AbsentFenced`, with no row,
   claim, VM, disk, jail or worker, and Accounting unchanged.
-- **Forged and foreign tokens.** Random IDs (the old format), a valid token with one tag bit
-  flipped, seq 0, seq beyond the pointer, and another instance's valid token: refused before
-  any L call, no gate retained, nothing written (B3-03's PoC turned around).
-- **Never-admitted flood.** Fence issued tokens until the window quota refuses, prove other
-  instances unaffected, then advance the test clock one lease and prove the quota refills.
+- **Forged, foreign and unissued tokens.** Random IDs (the old format), a valid token with
+  one tag bit flipped, seq 0, and another instance's valid token are refused by H with no L
+  call and no gate (instrumented counters prove both). A valid-tag seq at and beyond the
+  pointer reaches L and is NotIssued, before and after an L restart. Nothing is written
+  (B3-03's PoC turned around).
+- **Gates.** Fill an instance's gate table with closed gates, then present its pinned active
+  token below W: L answers from rows. Reorder two concurrent issuance replies: both tokens
+  work, since H holds no pointer.
+- **Never-admitted flood.** Fence issued tokens until the window quota refuses, then advance
+  the test clock one lease and prove the quota refills. The never-admitted quota is per
+  instance, so other instances' isolation is proven by the two starvation tests below, not
+  by this one.
+- **Compactor starvation.** Keep the normal lane continuously nonempty from two instances for
+  several leases while a third needs its quota refilled: compaction still runs at its
+  RTC-18 share, W keeps pace, and the third instance's quota refills within a lease plus one
+  pass.
+- **Headroom hog.** One instance repeatedly takes every freed admitted entry while a victim
+  below its share waits: the victim is never refused for headroom (RTC-17), and the hog is
+  refused only when its borrowing would cut into another instance's unused share.
 - **Pinned active session.** Keep one session READY while 5,000 others churn past it; it
   still validates and executes, is never compacted, and its eventual Remove returns its own
   receipt before it is compacted in turn.
-- **Clock steps.** Step the injected boot clock forward a day and back a day: W jumps or
-  stops, in-flight Creates fail released, and nothing below W is ever admitted.
-- **Rolled-back node ledger.** Swap in an older copy of the ledger with the helper stopped:
-  the daemon's attach reports a higher seq, its admission closes with the named fault, and no
-  token is reissued to it.
+- **Synthesized receipt changes.** Publish synthetic receipt R1, advance G_W, then receive
+  the matching R2: an already-released row keeps R1 and stays idempotently released; a
+  charged stale row accepts R2 only when its generation is newer than the row's own last
+  publication.
+- **Clock lifecycle.** On the injected boot clock: step forward a day and back a day (W jumps
+  or stops, in-flight Creates fail released, nothing below W is admitted); suspend and
+  resume (BOOTTIME advances while no process runs); reboot (BOOTTIME resets; the restart
+  checkpoint waits a lease); helper-only restart.
+- **Key lifecycle.** Missing, truncated and same-length substituted K (with and without rows
+  left to check against; the check value catches the rowless case); UPDATE, DELETE and
+  REPLACE of `token_key` refused through standard SQL; a crash during provisioning leaves no
+  half-provisioned ledger; open never regenerates K; K appears in no reply, log or error
+  (scanned); drain and re-provision documented for loss or compromise.
+- **Rollback boundaries, with expected limits marked.** Same-block restore (a ledger copy
+  taken before a token the daemon then records): RTC-14 detects it and closes admission
+  node-wide. Restore after issuance but before C2, restore of both databases, a ledger
+  cloned into two helpers, and retention of a live resource from the discarded future:
+  **expected limitation**, the test asserts that the outcome is the documented one (no
+  detection, or a re-minted token) and that the section 16.7 offline inventory finds the
+  live resource. A ledger with a different K: the open audit fails closed.
+- **Bounds.** `issue_next` at 2^63 − 1 refuses Preflight with a fault and never wraps; W and
+  the pointer cannot be lowered; every bounded row family at its true maximum fits the
+  measured per-token bound, including B5-01's settled-worker retention.
 - **Trigger matrix.** Extend `exit6_every_unique_key_and_conflict_algorithm_is_guarded`: every
-  delete of a non-compactable row, every lowering of W or the ceiling, and every insert below
-  W fails through standard SQL with triggers on.
+  delete of a non-compactable row, every lowering of W or the pointer, every insert below W
+  or at or above the pointer, every write to `token_key`, and every counter drift fails
+  through standard SQL with triggers on.
 
-**The lifetime test past 16,384 sessions.** `b7_lifetime_past_16384_sessions` runs the real
-H and L processes behind the real listener, with a real FULL-sync ledger and B3's fake host
-effects, two attached instances, lease 60 s on the injected clock (advanced by the test,
-so quota windows pass quickly), and drives **20,000 admitted sessions** (create, three
-executions, Remove) plus **2,000 post-C1 refusals per instance**, eight times the window
-quota. It asserts no LedgerSpace or headroom refusal ever, retained rows never above
-the allowance, every session released by a receipt the daemon accepted, the ledger's live
-bytes flat after the first lease, open-audit time flat, and the issue sequence past 16,384
-on both instances. It runs on macOS and in CI. On the real chain (boot to READY is about
-14 s on mini-one's nested KVM, so 16,384 real boots would take about a day), the
-companion `b7_linux_root_compaction_cycles` uses a test policy of a 64-entry allowance and
-a 3-minute lease and runs 300 real sessions, crossing the old count limit about five times
-over and many compaction cycles, inside one VM window.
+**The lifetime test past 16,384 issuances per instance.** `b7_lifetime_past_16384_sessions`
+runs the real H and L processes behind the real listener, with a real FULL-sync ledger and
+B3's fake host effects, two attached instances, and lease 60 s on the injected clock
+(advanced by the test after every 500 sessions per instance, so quota windows pass quickly
+and each instance stays within its guaranteed share). **Each instance** drives **14,000
+admitted sessions** (create, three executions, Remove) plus **2,500 post-C1 refusals**, more
+than ten times the window's issuance limit: 16,500 issuances per instance, 33,000 in total.
+Per instance it asserts the issue pointer past 16,385, no LedgerSpace or headroom refusal
+ever, and every session released by a receipt the daemon accepted. Separately, for the node,
+it asserts 28,000 admitted sessions (past the old 12,287-session limit and the old
+16,384-entry count), retained rows never above the allowance, the ledger's live bytes flat
+after the first lease, and open-audit time flat. Finally it issues one token on one instance
+and goes idle for two leases: W reaches the exclusive pointer, that last token is compacted,
+and the instance retains no rows (RTC-DR-06). It runs on macOS and in CI and records its
+duration and the per-commit cost (about 1.4 million ledger transactions; if CI cannot
+afford it, it moves to the nightly job rather than shrinking the counts). On the real chain
+(boot to READY is about 14 s on mini-one's nested KVM, so 16,384 real boots would take about
+a day), the companion `b7_linux_root_compaction_cycles` uses a test policy of a 64-entry
+allowance and a 3-minute lease and runs 300 real sessions, crossing the old count limit
+about five times over and many compaction cycles, inside one VM window.
 
 **B7 acceptance criteria.**
 
-1. RTC-1 to RTC-16 hold, each named by at least one failing-without-the-rule test.
-2. The lifetime test passes past 16,384 sessions with no admission refusal for ledger space,
-   and the real-chain cycle test passes at more than five times the configured entry count.
-3. B6's eleven crash scenarios and seven regressions still pass, plus the seven new crash
-   scenarios and the attack regressions above.
+1. RTC-1 to RTC-18 hold, each named by at least one failing-without-the-rule test.
+2. The lifetime test passes with more than 16,384 issuances on each instance and no
+   admission refusal for ledger space, and the real-chain cycle test passes at more than
+   five times the configured entry count.
+3. B6's eleven crash scenarios and seven regressions still pass, plus the ten crash
+   scenarios, the real-wire digest tests and the attack regressions above.
 4. The fence allowance's per-token bound is the measured worst case, not an estimate.
 5. Daybreak attacks this design and its implementation and finds no path to a VM, disk,
    claim release, absence, DELETED row or READY for a compacted token (or Stephen accepts a
    named residual risk).
-6. Section 4.1's "never prune fences by age" and B3's lifetime-budget limit are rewritten to
-   point here, and the operator docs describe the new Health fields.
+6. Section 4.1's "never prune fences by age", B3's lifetime-budget limit and section 8's
+   Runtime listing are rewritten to point here, and the operator docs describe the new
+   Health fields and the restore procedure in section 16.7.
 
 ## 16.7 Residual risks and open decisions
 
-- **One instance can fill the shared window allowance.** As with capacity today (B3 known
-  limits, "shared node budgets"), one instance churning fast can use the retained-token
-  allowance and deny others admission, now for at most one lease rather than forever.
-  Per-instance slices would close it at the cost of each instance's peak rate.
-  Recommendation: keep it shared, with the Health warning; decide again at B7 measurement.
-- **Restored node ledger** stays root's action and out of model, but RTC-14 now detects the
-  common case of a daemon newer than its ledger.
+- **Restored or cloned node ledger: outside the fault model.** Restoring or copying
+  `node.db` is root's action. RTC-14 detects only a ledger older than every token its
+  daemons have recorded. These are not detected, and the design does not claim otherwise:
+  a ledger restored to a point after the daemon's last recorded token, whose tokens issued
+  before the copy but compacted after it become Unknown and C2-admittable; a coordinated
+  restore of the ledger and the daemon database together, after which the next Preflight
+  re-mints the identical token (and its jail and work names, which may still exist from the
+  discarded future); and two helpers running clones of one ledger, which mint identical
+  tokens (the node lock excludes two helpers on one node, not a copy on another host or VM).
+  Because K is inside the ledger, every copy carries it; there is no "ledger restored but
+  key kept" state. Closing these would need rollback-resistant authority outside the
+  ledger and daemon pair, such as a TPM monotonic counter or a remote witness, which is not
+  in Phase 1b. **Operator procedure:** any restore, copy-back or suspected clone of
+  `node.db` is treated as ledger loss (section 8.3): stop every instance's daemon and the
+  helper, take a mandatory node-wide offline inventory of every jail, cgroup, loop device,
+  work file and VMM process against the ledger, settle or destroy everything the ledger
+  does not own, and only then let the helper serve; if any resource cannot be explained,
+  re-provision after verified absence. The same applies after an RTC-14 fault.
+- **Key loss or compromise.** K never rotates. Recovery is node-wide drain, verified absence
+  and re-provisioning, as for any ledger loss. A substituted K with every old row already
+  compacted may not be visible from rows (the check value is root-writable like the rest of
+  the ledger); old tokens then fail as Malformed and stay charged, which is safe.
+- **Admission share.** RTC-17 replaces the earlier "shared, first come" allowance: an
+  instance below its share is never refused for headroom. The cost is that an instance can
+  borrow only what other instances' unused shares do not reserve; at the defaults that is
+  still several times what a node can boot. A newly enrolled instance's guarantee starts
+  once rows borrowed before its enrollment drain. Recommendation: keep it; measure at B7.
+- **Compaction share.** RTC-18 bounds compaction's wait to the requests already queued
+  (at most 96) and every other request's added wait to one batch. B7 measures a full
+  256-token batch's duration and lowers the batch size if it exceeds 100 ms.
 - **Daemon-side growth.** `release_evidence` rows (about 1 KB each with indexes) stay
   permanent in each daemon database. That is disk, not a ceiling, and nothing refuses
   admission on it. Pruning evidence together with its retention-pruned sandbox row is safe
-  once tokens are helper-issued and can be a follow-up after B7.
+  once tokens are helper-issued, except that it lowers RTC-14's recorded maximum, so a
+  follow-up after B7 must keep the highest seq as its own permanent value.
 - **Synthesized receipts differ from originals.** A daemon that lost its terminal commit
-  after compaction gets a different, equally valid receipt. Section 8.3's "replay the same
-  receipt" becomes "replay a matching receipt"; B6's assertion that `release_evidence_id`
-  equals the fence's receipt holds whenever the fence row still exists.
+  after compaction gets a different, equally valid receipt, and a later G_W gives yet
+  another. Section 8.3's "replay the same receipt" becomes "replay a matching receipt"; B6's
+  assertion that `release_evidence_id` equals the fence's receipt holds whenever the fence
+  row still exists.
 - **Node-level worker rows** (infrastructure workers recorded at each helper start) remain
   permanent; they grow with helper restarts, not sessions, and are out of this scope.
+
+## 16.8 Design review corrections (November 4, 2026)
+
+Daybreak Blue's design review of `424c74c` (`reviews/2026-11-04-rtc-design-review.md`,
+models in `reviews/poc-rtc-design/`) rejected the design as written for one HIGH and found
+the rows-first core sound. Every finding is accepted; none is rejected.
+
+| Finding | Change |
+|---|---|
+| RTC-DR-01 (HIGH) Synthesized receipts need a digest that Inspect, Remove and Gc did not carry | Inspect and Remove gain a required `plan_digest`; Gc targets become `(allocation_id, plan_digest)` pairs; `remove` and `gc` take a typed `RemoveTarget` carrying the Store's immutable binding, and the adapter sends the digest `inspect_allocation` already receives. Rows win and a mismatched digest is Conflict; below W with no rows the receipt is synthesized for the caller's digest. "Compacted, then FenceAbsent" rejected (second round trip, race window). RTC-6, RTC-8, message table, Runtime signatures, replay analysis, real-wire tests after helper restart |
+| RTC-DR-02 (MEDIUM) RTC-14 misses same-block, coordinated and cloned-ledger rollback | Ledger restore stated as outside the fault model and RTC-14 as a partial detector (RTC-14, sections 16.2, 16.3, 16.7, the brief). Blocks of 64 replaced by the exact pointer, persisted with each issuance in Preflight's issuance transaction (measured: about 0.17 ms per commit, about 2% more ledger writes per session), which closes the same-block case. Undetected cases listed; detection now closes admission node-wide with a durable fault; mandatory node-wide offline inventory after any restore |
+| RTC-DR-03 (MEDIUM) Idle-only compaction can starve; "at most one lease" unproven | RTC-18: compaction on its own one-permit lane, waiting behind at most 96 queued requests, never taking cleanup or recovery permits. RTC-17: a guaranteed per-instance share of admitted headroom with borrowing, which replaces the "at most one lease" claim with "never refused below its share". Starvation and headroom-hog tests |
+| RTC-DR-04 (MEDIUM) H's classification state underspecified | Contract (1): H checks only tag and seq ≠ 0; L classifies NotIssued, rows, Compacted and Unknown inside its transaction; H keeps no pointer and never infers Compacted; gates follow L's answer. RTC-3, RTC-15, pseudocode, H/L split-restart crash scenario |
+| RTC-DR-05 (MEDIUM) Lifetime arithmetic could not reach 16,384 on both instances | Per-instance counts: 14,000 admitted plus 2,500 refusals each (16,500 issuances per instance), node-lifetime property asserted separately |
+| RTC-DR-06 (LOW) Checkpointing seq keeps the last token | Checkpoints record the exclusive pointer (`issue_next`); the lifetime test's idle tail proves the last token compacts |
+| B7 test-plan gaps 1 to 12 | 1: real-wire digest tests. 2: G_W refresh crash scenario. 3: every delete boundary and the non-compactable-row scenario. 4: synthesized receipt changes. 5: issuance oracle corrected (an issued rowless token is Unknown, not NotIssued) plus H/L split restart. 6: tag-check instrumentation, NotIssued before and after restart, reordered replies, pinned token with a full gate table. 7: rollback boundaries with expected limits marked. 8: compactor starvation and headroom hog. 9: clock lifecycle. 10: key lifecycle (and RTC-1's key rules). 11: per-instance lifetime counts and the idle tail. 12: overflow and true-maximum bounds |
+| Rejected alternatives | Unchanged verdicts; D's "a filter cannot delete" narrowed to plain filters, with rotating filters needing generations or epochs |
+| Key handling | RTC-1: CSPRNG key in the provisioning transaction, check value, immutable by trigger, never regenerated or logged, no rotation; drain and re-provision on loss (section 16.7) |
