@@ -953,6 +953,21 @@ kiln-guest embeds the broker at a pinned kilnd commit/binary digest, adds the vd
 3. *Serialize initialization of the private procfs cache* (LOW). The cache publishes its mount ID and descriptor through two atomics; concurrent first callers can each create a procfs root, and the losers' descriptors leak for the process's life. Use `OnceLock` or a mutex.
 4. *Give `read_dir_fd` an independent file description* (LOW). `F_DUPFD_CLOEXEC` shares the directory offset, so its rewind also rewinds the original description. Reopen `.` beneath the held descriptor instead, preserving the fd-native property.
 
+**B6 break-it follow-up** (`reviews/2026-11-03-b6-breakit.md`, B6-BI-03, MEDIUM; does not
+block B6):
+
+5. *Keep idle public sockets from starving Health and cleanup.* The server takes one of
+   the 64 global connection permits before it reads peer credentials and holds it for
+   the connection's life, and admission has only global connection and ordinary-RPC
+   budgets. Any principal the socket's filesystem gate lets in can open 64 sockets that
+   never send an HTTP/2 preface, and a new Health, Get or Delete connection is then
+   dropped before authorization or Health's reserved RPC lane can help (Daybreak's
+   `reviews/poc-b6/public-connection-starvation.py`). An accepted, manager-owned
+   detached Delete still drains. Direction: reserve ingress capacity (a connection slot
+   held back for Health and cleanup RPCs), and after reading peer credentials enforce
+   per-UID shares of connections and of ordinary RPCs. Add a real-daemon hostile
+   public-caller test beside the existing guest/helper I/O fairness scenario.
+
 # 12. Decisions confirmed by Stephen — October 31, 2026
 
 Stephen confirmed the first five decisions below on **October 31, 2026**, matching the proposed recommendations. The remaining defaults stand as design decisions. None is awaiting approval; the provisional overhead estimates and implementation/review gates remain to be validated.
@@ -2850,7 +2865,10 @@ and only when the file is strict JSON with exact fields, its kind is `isolated-t
 daemon's `--socket`, `--state-dir` and `--helper-socket` are exactly the file's, no path
 in it is, contains or lies under a production path (`/run/kilnd`, `/var/lib/kilnd`,
 `/run/kilnd-helper`, `/var/lib/kilnd-helper`, `/etc/kilnd`), and its account, group and
-unit are its own. Either flag alone is refused. The other half of the gate is unchanged:
+unit are its own. Either flag alone is refused. (As first built, "its own" only checked
+the names in the file; since the B6 break-it corrections they are compared with what the
+process observably is, and only a build with the `firecracker-test-deployment` feature
+has either flag: B6-BI-01 below.) The other half of the gate is unchanged:
 the installed helper loads every profile through `ManifestGate::ProductionDisabled`, and
 `TestApproved` has no constructor outside test builds, so a daemon started this way against
 the production helper gets a C0 refusal for every Create.
@@ -2905,7 +2923,8 @@ tests in step. The scripts refuse to start past 90 minutes of VM uptime.
 *Two defects the real chain found.*
 
 - **A dropped POSIX lock let another reader unlink the daemon's live WAL.** `Store::open`
-  (since B2, never on main or installed) checked the database's and its sidecars' owner,
+  (since `7c3cd14`, so also on main `b58d94a` and in the installed `734e275`, where
+  Daybreak demonstrated the loss: B6-BI-02 below) checked the database's and its sidecars' owner,
   mode and link count by opening and closing its own descriptors, some after SQLite had
   opened them. Closing any descriptor to a file drops every POSIX lock the process holds
   on it, SQLite's included. Another process's connection, such as an operator's `sqlite3`,
@@ -3014,3 +3033,117 @@ Matrices, transcripts and daemon and helper logs are in `reviews/2026-11-03-b6-v
 
 The managed VM was restarted before each long phase (21:04 and 21:52 UTC) and never died
 during milestone 2. Milestone 1's evidence records its earlier interruptions.
+
+## B6 break-it corrections (November 3, 2026)
+
+Daybreak Blue reviewed `phase1b/b6-lifecycle` at `1973a14`
+(`reviews/2026-11-03-b6-breakit.md`, PoCs in `reviews/poc-b6/`): REJECT on one HIGH,
+with a HIGH operational exposure on main and two MEDIUM follow-ups. All four are
+answered here; B6-BI-03 is scheduled for B7.
+
+*B6-BI-01 (HIGH): the isolated deployment's identity was only declared.* The daemon
+compared the manifest's paths with its flags, but its account, socket group and unit only
+had to look non-production. A release `kilnd` running as `estradafamily`, with
+`--socket-group staff`, outside any unit, selected `FirecrackerRuntime` for a manifest
+naming `kilnd-fctest-manifest-only` for all three. Two fixes, either sufficient:
+
+- *Observed identity.* `TestDeployment::check_process`, called in `selected_deployment`
+  right after the path check and before `Store::open`, the socket bind or any runtime,
+  resolves the manifest account with `getpwnam` and its group with `getgrnam` (both must
+  exist), then compares them with what the kernel reports: the real, effective and saved
+  UIDs (`getresuid`) must all be the account's UID, which is never 0 or the production
+  `kilnd` account's; the resolved CLI `--socket-group` GID must be the manifest group's,
+  never the production `kilnd` group's (an empty `--socket-group` is refused); and this
+  process's own `<pid>/cgroup`, read through `sys::procfs` (the private procfs instance,
+  or `/proc` for an unprivileged process, as everywhere else) must be exactly one cgroup
+  v2 line whose path's last component is the manifest unit (`…/kilnd-fctest.service`).
+  Every mismatch is collected and named in one refusal. The comparison is a pure function
+  over `Resolved` and `Observed` (`test_deployment::tests::b6_bi_01_*`). The real
+  session test found that `kilnd@.service`'s `RestrictSUIDSGID=` makes systemd answer
+  `openat2` with `ENOSYS` (it cannot filter the mode argument), so `sys::procfs::open`
+  now falls back, for an unprivileged process and on `ENOSYS` only, to opening one
+  component at a time with `O_NOFOLLOW`, each checked to be on procfs (`fstatfs`); root
+  keeps `openat2` with `RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV`
+  (`sys::tests::the_component_walk_reads_what_openat2_reads`).
+- *Build boundary.* `kilnd`'s new cargo feature `firecracker-test-deployment` is not a
+  default. Without it, `Backend` has no `Firecracker` value, `Args` has no
+  `--firecracker-test-deployment` field, `selected_deployment` can select only kiln (its
+  other type is `Infallible`), and `FirecrackerRuntime` is not even imported, so a
+  release or installed build refuses both flags at argument parsing (clap's usage error,
+  exit 2) and cannot construct the runtime. `scripts/b4-vm-tests.sh` builds the B6 test
+  daemon with the feature; nothing else does. The lexical gate tests
+  (`exit1_production_gate_leaves_every_catalog_profile_refused`,
+  `production_stays_disabled_without_the_broker`) now also require `check_process`
+  after `check_daemon`, every Firecracker name in `main.rs` behind the feature, and the
+  feature absent from `default`.
+
+Regressions: `scripts/test-deployment-gate-regressions.sh` turns Daybreak's PoC into
+three modes. `release` runs the PoC command and each flag alone against a default build
+and requires clap's refusal, no Firecracker selection and no state; CI runs it after
+`cargo build --release`. `feature` runs the PoC against a feature build, with the PoC's
+unresolvable names and again with resolvable ones (`nobody`, `nogroup`), and requires the
+named refusal; CI's new `feature` job runs it with the feature's tests and clippy on both
+toolchains. `root` (in the VM) creates the account `kilnd-fcgate` and runs the feature
+build with `systemd-run` as that account in `kilnd-fcgate.service`: the matching identity
+is selected (the control), and a wrong account, a wrong `--socket-group`, a wrong unit
+and no unit at all (`setpriv`) are each refused on their own, naming only that mismatch,
+before any state exists. The whole B6 session test still runs as `kilnd-fctest` in
+`kilnd-fctest.service`.
+
+*B6-BI-02 (HIGH operational exposure): the WAL lock-drop bug is on main and installed.*
+The milestone-2 note above said the `Store::open` defect was never on main or installed.
+That was wrong: it came with `7c3cd14` and is on main `b58d94a` and in the installed
+`734e275`, and Daybreak's `reviews/poc-b6/store-wal-lock-drop.py` lost a committed row
+there on Linux. `1089aab` on this branch fixes it (Daybreak assessed the fix as sound).
+**Until main carries `1089aab` and the installed build is replaced, nobody opens the live
+`/var/lib/kilnd/kilnd.db` with `sqlite3` (or any other SQLite client) while the daemon
+runs; inspect only stopped byte copies.** Updating main is the roadmap lead's.
+
+*B6-BI-03 (MEDIUM): idle public sockets starve ingress.* Not fixed in B6: it is B7
+follow-up 5 above (a reserved ingress slot for Health and cleanup, per-UID connection and
+RPC shares after peer credentials).
+
+*B6-BI-04 (MEDIUM): two crash interleavings were missing.* The matrix now has 11
+scenarios (`scripts/firecracker-crash-matrix.py`, `tests/recovery.rs`):
+
+| Interleaving | Scenario | What it proves |
+|---|---|---|
+| H restarts after C2 while the public Create polls for READY | `crash_helper_restart_while_create_polls_never_publishes_ready` | Killed at BOOTING, before S journaled the broker's handshake; the old VMM is gone; the new helper replays one claim; while the Create polls the row is CREATING and charged on both ledgers; the Create fails (no READY, no broker record, one allocation); the claim is released only by the token's ABSENT receipt, which the row's `release_evidence_id` names |
+| kilnd dies mid-Remove, after the helper owns it and before ABSENT | `crash_daemon_death_mid_remove_stays_charged_until_absent` | Held at `H.remove.after_state` in the helper's detached Remove; after the kill, after a restart whose reconciliation meets the removal still held, and after the old removal resumes for a daemon that is gone, the row stays DELETING and charged and the claim unreleased; the next start's reconciliation settles it from the matching ABSENT receipt |
+
+In the first interleaving the release came from the failed Create's own settlement by
+exact token, not from a later Delete: the Create waits out its 120 s deadline (the new
+helper reports the orphaned boot as still `booting` without a fresh supervisor
+observation), publishes FAILED and charged, and its `settle_fenced` removes the token
+through the new helper and commits the ABSENT receipt. Delete then finds the row released.
+The claim was charged on both ledgers for the whole polling window. In the second, the
+old removal resumed for a dead daemon's epoch and did nothing (phase still `ready`), so
+only the restarted daemon's reconciliation produced ABSENT.
+
+The existing `crash_capacity_commit_reply_lost_keeps_one_claim` failed once in its first
+VM run here: when H has already replaced the dead L, the failed Create's immediate
+settlement can prove the never-launched allocation absent and release the row with the
+token's own receipt, which the scenario had treated as a failure. That is the design's
+behavior, so the scenario now accepts either path and asserts one claim, never a second,
+released only by the matching receipt (it took the immediate path in 2 of 4 runs).
+
+*Evidence (VM, November 3–4).* In the `kiln` Lima VM under the managed `kiln-vm`
+process, restarted at 03:18 UTC for a fresh window, at `7474f4f`, with the approved
+jailer `42e9dea3…` and `mkfs.xfs` `9571cecc…` rebuilt by `build-phase1b-tools.sh`,
+release Firecracker v1.17.0 `fe726e0b…` and kiln-guest `86fbf26`'s bundle (broker
+`35fad74f…`): `test-deployment-gate-regressions.sh` release, feature and root all pass,
+and Daybreak's PoC no longer selects Firecracker from either build; the whole session
+through kilnd and kilndctl as `kilnd-fctest` in `kilnd-fctest.service` passes;
+`firecracker-crash-matrix.py` 11/11; `firecracker-regressions.py` 7/7; B5's
+`b5_linux_root` 8/8 (862 s). B4's `b4_linux_root` (not required: no B4 code changed)
+passed 30 of 31: `b4_linux_root_cleanup_refuses_a_foreign_backing_loop_replacement`
+failed in its third phase on a Prepare's 10 s request deadline, again on a rerun at
+`cc79d7b`, then passed at `cc79d7b` and at `1973a14`, so it is timing-flaky on this VM
+rather than changed by these commits. `cc79d7b` after `7474f4f` only moves a test module
+in `sys.rs` (the destructive-call gate stops scanning a file at its test module). Linux
+clippy (`-D warnings -D clippy::disallowed_methods`, Rust 1.88 and 1.99, default and
+feature builds) is clean, and CI's `check` and `feature` jobs are green. Logs, matrices
+and transcripts are in `reviews/2026-11-03-b6-fixes-vm/`. Before the phase,
+`/var/lib/kilnd` was byte-copied with the installed `734e275` daemon stopped; afterwards
+it was restored, `cmp` found `kilnd.db` and `kilnd.lock` identical, a stopped copy is
+schema 7 with `quick_check` ok, and the installed binaries' hashes are unchanged.

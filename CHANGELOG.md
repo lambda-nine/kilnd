@@ -6,6 +6,22 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B6 break-it corrections (Daybreak, November 3). B6-BI-01: `--backend
+  firecracker` and `--firecracker-test-deployment` exist only in a build with the new
+  non-default `firecracker-test-deployment` cargo feature; a default (release, installed)
+  build refuses both at argument parsing. A feature build selects the isolated test
+  deployment only when this process's real, effective and saved UIDs are the manifest
+  account's (`getpwnam`, never root or `kilnd`), the resolved `--socket-group` is the
+  manifest group (never `kilnd`), and its own cgroup, read beneath `sys::procfs`, ends in
+  the manifest unit; any mismatch is refused, by name, before state is opened. Where
+  systemd's `RestrictSUIDSGID=` refuses `openat2` with `ENOSYS`, an unprivileged
+  `sys::procfs::open` walks the path one `O_NOFOLLOW` component at a time on procfs. New
+  `scripts/test-deployment-gate-regressions.sh` (release, feature and root modes) and a CI
+  feature job. B6-BI-04: the crash matrix gains a helper restart while Create polls for
+  READY and a daemon death mid-Remove (11 scenarios), and the capacity scenario accepts a
+  failed Create's own receipt-backed settlement. `scripts/b4-vm-tests.sh` builds the test
+  daemon with the feature.
+
 - Phase 1b B6 milestone 2. `Store::open` no longer opens and closes descriptors to the
   database or its sidecars (it `fstatat`s them and creates a new database itself, 0600,
   before SQLite opens it): a close dropped SQLite's own POSIX locks, so another process's
