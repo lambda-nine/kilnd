@@ -265,9 +265,12 @@ mod linux {
     /// no other process can reach a mount there, so nothing can shadow a path below
     /// it. Every lookup is `openat2` beneath that root with `RESOLVE_BENEATH`,
     /// `RESOLVE_NO_SYMLINKS`, `RESOLVE_NO_MAGICLINKS` and `RESOLVE_NO_XDEV`, except
-    /// [`open_image`]'s one magic link. Without `CAP_SYS_ADMIN` (only an unprivileged
-    /// test process, never the root helper) it falls back to `/proc`; as root, failure
-    /// to make the instance is an error.
+    /// [`open_image`]'s one magic link. Without `CAP_SYS_ADMIN` (an unprivileged
+    /// process: a test, or the daemon reading its own cgroup, never the root helper) it
+    /// falls back to `/proc`; as root, failure to make the instance is an error. Where
+    /// `openat2` itself is refused with `ENOSYS` (systemd's `RestrictSUIDSGID=`, which
+    /// `kilnd@.service` sets, cannot filter its mode argument), an unprivileged process
+    /// walks one component at a time instead, each `O_NOFOLLOW` and proved on procfs.
     ///
     /// The descriptor is cached with the instance's unique mount ID (never reused
     /// within a boot) and re-verified on every use, so a forked worker that closed
@@ -285,6 +288,7 @@ mod linux {
         const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
         const RESOLVE_NO_SYMLINKS: u64 = 0x04;
         const RESOLVE_BENEATH: u64 = 0x08;
+        const PROC_SUPER_MAGIC: i64 = 0x9fa0;
 
         static ROOT_FD: AtomicI32 = AtomicI32::new(-1);
         static ROOT_ID: AtomicU64 = AtomicU64::new(0);
@@ -404,7 +408,7 @@ mod linux {
             };
             // SAFETY: a live root descriptor, a NUL-terminated path and a complete
             // version-0 open_how.
-            let fd = sys_ret(unsafe {
+            let opened = sys_ret(unsafe {
                 libc::syscall(
                     libc::SYS_openat2,
                     root,
@@ -412,9 +416,81 @@ mod linux {
                     &how,
                     std::mem::size_of::<OpenHow>(),
                 )
-            })?;
-            // SAFETY: a new owned descriptor.
-            Ok(unsafe { File::from_raw_fd(fd as RawFd) })
+            });
+            match opened {
+                // SAFETY: a new owned descriptor.
+                Ok(fd) => Ok(unsafe { File::from_raw_fd(fd as RawFd) }),
+                // SAFETY: geteuid has no preconditions.
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENOSYS)
+                        && unsafe { libc::geteuid() } != 0 =>
+                {
+                    open_by_components(root, relative, flags)
+                }
+                Err(error) => Err(error),
+            }
+        }
+
+        /// `openat2`'s resolution by hand, for an unprivileged process whose seccomp
+        /// filter refuses `openat2`: `check` already allowed only plain names, each is
+        /// opened `O_NOFOLLOW` beneath the previous one (no link of any kind is followed),
+        /// and each must still be procfs (`RESOLVE_NO_XDEV`'s substitute).
+        fn open_by_components(root: RawFd, relative: &str, flags: libc::c_int) -> io::Result<File> {
+            let parts: Vec<&str> = relative.split('/').collect();
+            let mut at: Option<File> = None;
+            for (index, part) in parts.iter().enumerate() {
+                let name = std::ffi::CString::new(*part)?;
+                let last = index + 1 == parts.len();
+                let step = if last {
+                    flags | libc::O_CLOEXEC | libc::O_NOFOLLOW
+                } else {
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+                };
+                let dir = at.as_ref().map_or(root, |file| file.as_raw_fd());
+                // SAFETY: a live directory descriptor and a NUL-terminated single name.
+                let fd = unsafe { libc::openat(dir, name.as_ptr(), step) };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: openat returned a new owned descriptor.
+                let file = unsafe { File::from_raw_fd(fd) };
+                // SAFETY: fstatfs writes into the zeroed buffer.
+                let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stat) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if stat.f_type as i64 != PROC_SUPER_MAGIC {
+                    return Err(io::Error::other(format!(
+                        "{relative:?} leaves procfs at {part:?}"
+                    )));
+                }
+                if last {
+                    return Ok(file);
+                }
+                at = Some(file);
+            }
+            Err(io::Error::from(io::ErrorKind::InvalidInput))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use std::io::Read;
+
+            /// The unprivileged fallback reads what `openat2` reads, and follows no link.
+            #[test]
+            fn the_component_walk_reads_what_openat2_reads() {
+                let relative = super::own("cgroup");
+                let root = super::root().unwrap();
+                let mut walked = String::new();
+                super::open_by_components(root, &relative, libc::O_RDONLY)
+                    .unwrap()
+                    .read_to_string(&mut walked)
+                    .unwrap();
+                assert_eq!(walked, super::read_to_string(&relative).unwrap());
+                assert!(walked.starts_with("0::/"), "{walked}");
+                // `self` is a link: never followed.
+                assert!(super::open_by_components(root, "self/cgroup", libc::O_RDONLY).is_err());
+            }
         }
 
         /// A directory beneath the private instance, as [`open`].
