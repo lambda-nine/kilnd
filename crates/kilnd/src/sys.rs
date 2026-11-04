@@ -357,7 +357,7 @@ mod linux {
         }
 
         /// The cached root, re-verified by its unique mount ID; a fresh one otherwise.
-        fn root() -> io::Result<RawFd> {
+        pub(in crate::sys) fn root() -> io::Result<RawFd> {
             let fd = ROOT_FD.load(Ordering::Acquire);
             if fd >= 0 && unique_mount_id(fd).ok() == Some(ROOT_ID.load(Ordering::Acquire)) {
                 return Ok(fd);
@@ -435,7 +435,11 @@ mod linux {
         /// filter refuses `openat2`: `check` already allowed only plain names, each is
         /// opened `O_NOFOLLOW` beneath the previous one (no link of any kind is followed),
         /// and each must still be procfs (`RESOLVE_NO_XDEV`'s substitute).
-        fn open_by_components(root: RawFd, relative: &str, flags: libc::c_int) -> io::Result<File> {
+        pub(in crate::sys) fn open_by_components(
+            root: RawFd,
+            relative: &str,
+            flags: libc::c_int,
+        ) -> io::Result<File> {
             let parts: Vec<&str> = relative.split('/').collect();
             let mut at: Option<File> = None;
             for (index, part) in parts.iter().enumerate() {
@@ -512,27 +516,6 @@ mod linux {
             }
             // SAFETY: a new owned descriptor.
             Ok(unsafe { File::from_raw_fd(fd) })
-        }
-
-        #[cfg(test)]
-        mod tests {
-            use std::io::Read;
-
-            /// The unprivileged fallback reads what `openat2` reads, and follows no link.
-            #[test]
-            fn the_component_walk_reads_what_openat2_reads() {
-                let relative = super::own("cgroup");
-                let root = super::root().unwrap();
-                let mut walked = String::new();
-                super::open_by_components(root, &relative, libc::O_RDONLY)
-                    .unwrap()
-                    .read_to_string(&mut walked)
-                    .unwrap();
-                assert_eq!(walked, super::read_to_string(&relative).unwrap());
-                assert!(walked.starts_with("0::/"), "{walked}");
-                // `self` is a link: never followed.
-                assert!(super::open_by_components(root, "self/cgroup", libc::O_RDONLY).is_err());
-            }
         }
     }
 
@@ -1215,5 +1198,29 @@ pub mod socket {
             return Err(error);
         }
         Ok(Removal::Removed)
+    }
+}
+
+// After every production item: the destructive-call gate stops scanning this file at its
+// test module.
+#[cfg(test)]
+mod tests {
+    /// The unprivileged fallback reads what `openat2` reads, and follows no link.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_component_walk_reads_what_openat2_reads() {
+        use super::linux::procfs;
+        use std::io::Read;
+        let relative = procfs::own("cgroup");
+        let root = procfs::root().unwrap();
+        let mut walked = String::new();
+        procfs::open_by_components(root, &relative, libc::O_RDONLY)
+            .unwrap()
+            .read_to_string(&mut walked)
+            .unwrap();
+        assert_eq!(walked, procfs::read_to_string(&relative).unwrap());
+        assert!(walked.starts_with("0::/"), "{walked}");
+        // `self` is a link: never followed.
+        assert!(procfs::open_by_components(root, "self/cgroup", libc::O_RDONLY).is_err());
     }
 }
