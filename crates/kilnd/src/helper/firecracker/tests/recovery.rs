@@ -418,7 +418,26 @@ async fn b6_linux_root_crash_capacity_commit_reply_lost_keeps_one_claim() {
     real.fixture.clear("L.admit.after_commit.panic");
     let id = daemon.sandbox_ids()[0].clone();
     let allocation = Id128::parse(&daemon.row(&id, "allocation_id").unwrap()).unwrap();
-    assert!(charged(daemon, &id), "an ambiguous create stays charged");
+    // The failed Create settles its token at once. When H has already replaced L, that
+    // settlement can prove the never-launched allocation absent and release the row with
+    // the token's own ABSENT receipt (once in three VM runs, Nov 3); otherwise the row stays
+    // charged and the claim must survive a helper restart. Either way there is one claim,
+    // never a second, and only a matching receipt releases it.
+    if !charged(daemon, &id) {
+        transcript
+            .text
+            .push_str("# the failed Create's own settlement proved the token absent at once\n\n");
+        assert_eq!(deployment.allocations(daemon.instance).len(), 1);
+        let released = assert_released(&deployment, daemon, &id, allocation, "failed");
+        assert_eq!(deployment.claims(), 0);
+        daemon.kilndctl(&mut transcript, &["get", &id], None);
+        finish("crash-capacity-reply-lost", &transcript, &deployment);
+        matrix(
+            "capacity commit, reply lost (L dies after commit)",
+            json!({"released_by": "the failed Create's settlement (ABSENT receipt)", "release": released}),
+        );
+        return;
+    }
     assert!(
         unreleased_claim(&deployment, allocation),
         "the claim committed"
@@ -447,7 +466,7 @@ async fn b6_linux_root_crash_capacity_commit_reply_lost_keeps_one_claim() {
     finish("crash-capacity-reply-lost", &transcript, &deployment);
     matrix(
         "capacity commit, reply lost (L dies after commit)",
-        json!({"claims_after_helper_restart": 1, "release": released}),
+        json!({"claims_after_helper_restart": 1, "released_by": "Delete (ABSENT receipt)", "release": released}),
     );
 }
 
