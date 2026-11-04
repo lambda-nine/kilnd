@@ -18,6 +18,12 @@ recovery.rs, run alone with a clean host before and after:
   capacity commit, reply lost     L dies after the commit: one claim survives L's death and
                                   the helper's restart, never a second
   helper restart                  every claim replayed; the stopped boot never runs again
+  helper restart while Create     after C2, before READY: no false READY, no second
+  polls                           allocation, the old VM stopped, the one claim released
+                                  only by its ABSENT receipt (B6-BI-04)
+  daemon death mid-Remove         the helper owns the removal, before ABSENT: the row stays
+                                  DELETING and charged until reconciliation settles it from
+                                  the matching ABSENT receipt (B6-BI-04)
   stale database restored         admission blocked, the node keeps the charge, another
                                   daemon is never given the slot
   database lost                   the replacement instance is refused; the node ledger
@@ -38,6 +44,8 @@ SCENARIOS = [
     'b6_linux_root_crash_absent_sync_failure_stays_charged_until_retried',
     'b6_linux_root_crash_capacity_commit_reply_lost_keeps_one_claim',
     'b6_linux_root_crash_helper_restart_keeps_every_claim',
+    'b6_linux_root_crash_helper_restart_while_create_polls_never_publishes_ready',
+    'b6_linux_root_crash_daemon_death_mid_remove_stays_charged_until_absent',
     'b6_linux_root_crash_restored_stale_db_blocks_admission_and_keeps_the_charge',
     'b6_linux_root_crash_lost_db_never_discounts_the_node_claim',
 ]

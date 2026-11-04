@@ -501,6 +501,213 @@ async fn b6_linux_root_crash_helper_restart_keeps_every_claim() {
     );
 }
 
+/// Whether S ever journaled the broker's handshake for this allocation: the record READY
+/// is published from, written just before the phase moves to `ready`.
+fn broker_recorded(deployment: &Deployment, allocation: Id128) -> bool {
+    deployment.real.fixture.read(|v| {
+        v.query_row(
+            "SELECT COUNT(*) FROM resource_events WHERE allocation_id = ?1 AND kind = 'broker'",
+            [allocation.to_string()],
+            |r| r.get::<_, i64>(0),
+        )
+    }) > 0
+}
+
+/// Waits until a process no longer exists, at most `seconds`.
+async fn wait_gone(pid: i32, seconds: u64) -> bool {
+    let end = std::time::Instant::now() + Duration::from_secs(seconds);
+    while std::time::Instant::now() < end {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    !Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// B6-BI-04 (1): the helper restarts after C2, while the public Create is still polling
+/// for READY. H's death stops the booting VM; the new helper replays the one claim and
+/// never supervises that boot, so the Create can never see READY. It ends ambiguous and
+/// charged, with no second allocation, and the one claim is released only by an ABSENT
+/// receipt for the exact token.
+#[tokio::test]
+#[ignore = "needs root with the B4 launch capabilities: run scripts/firecracker-crash-matrix.py"]
+async fn b6_linux_root_crash_helper_restart_while_create_polls_never_publishes_ready() {
+    let deployment = Deployment::new(&["fctest"], NodeOptions::default()).await;
+    let daemon = deployment.daemon("fctest");
+    let real = &deployment.real;
+    let mut transcript = Transcript::default();
+    daemon.start(&deployment.image);
+    daemon.wait_serving(real).await;
+    let create = daemon.kilndctl_background(&["create", "--net", "none"]);
+    // Booting is past C2: the claim is committed, S has spawned the VMM, and the daemon's
+    // Create is polling Inspect for READY.
+    let allocation = deployment
+        .wait_allocation(daemon.instance, &["booting"], 60)
+        .await;
+    let vmm = real.vmm(allocation).expect("a booting allocation has a VMM");
+    deployment.restart_helper().await;
+    assert!(
+        !broker_recorded(&deployment, allocation),
+        "the boot reached READY before the helper was killed: the scenario did not run"
+    );
+    transcript.text.push_str(
+        "# the helper (H) killed and restarted after C2, while Create polled for READY\n\n",
+    );
+    let phase_after_restart = real.phase(allocation);
+    assert_eq!(deployment.claims(), 1, "the new helper replays the one claim");
+    assert!(
+        wait_gone(vmm.pid, 30).await,
+        "the old VMM {} survived its helper",
+        vmm.pid
+    );
+    let id = daemon.sandbox_ids()[0].clone();
+    // While the Create still polls, the row is CREATING and charged on both ledgers.
+    let polling = daemon.row(&id, "state").unwrap();
+    let polling_charged = charged(daemon, &id) && unreleased_claim(&deployment, allocation);
+    let (text, created) = create.join().unwrap();
+    transcript.text.push_str(&text);
+    assert_ne!(created.code, 0, "no READY from a boot no helper supervises");
+    let state = daemon.row(&id, "state").unwrap();
+    assert_ne!(state, "ready");
+    assert_ne!(state, "creating", "the Create ended");
+    assert!(!broker_recorded(&deployment, allocation), "READY never came");
+    assert_eq!(
+        deployment.allocations(daemon.instance).len(),
+        1,
+        "no second allocation for one Create"
+    );
+    // Whatever released the claim (the failed Create's own settlement by exact token, or
+    // Delete below), it was the token's ABSENT receipt, and only then.
+    let released_by_create = !charged(daemon, &id);
+    if released_by_create {
+        assert!(!unreleased_claim(&deployment, allocation));
+    } else {
+        assert!(
+            unreleased_claim(&deployment, allocation),
+            "the claim stays while the row is charged"
+        );
+        assert_eq!(deployment.claims(), 1);
+    }
+    let failure = daemon.row(&id, "failure_reason");
+    daemon.kilndctl(&mut transcript, &["get", &id], None);
+    let removed = daemon.kilndctl(&mut transcript, &["rm", &id], None);
+    assert_eq!(removed.code, 0, "{}", removed.stderr);
+    let released = assert_released(&deployment, daemon, &id, allocation, "deleted");
+    assert_eq!(deployment.claims(), 0);
+    assert!(
+        polling == "creating" && polling_charged,
+        "charged and CREATING while the Create polled: {polling}"
+    );
+    finish(
+        "crash-helper-restart-while-create-polls",
+        &transcript,
+        &deployment,
+    );
+    matrix(
+        "helper restart after C2, while Create polls for READY",
+        json!({
+            "phase_after_restart": phase_after_restart,
+            "old_vmm_stopped": true,
+            "while_polling": "creating, charged on both ledgers",
+            "create_exit": created.code,
+            "row_after_create": state,
+            "failure": failure,
+            "broker_handshake_recorded": false,
+            "allocations": 1,
+            "released_by": if released_by_create {
+                "the failed Create's settlement by exact token (ABSENT receipt)"
+            } else {
+                "Delete (ABSENT receipt)"
+            },
+            "release": released,
+        }),
+    );
+}
+
+/// B6-BI-04 (2): the daemon is killed while its Delete's Remove is held inside the
+/// helper, after the helper owns the removal and before ABSENT. The row stays DELETING
+/// and charged through the kill, a restart whose reconciliation meets the removal still
+/// in progress, and the old removal's end; the next reconciliation finishes it only from
+/// the matching ABSENT receipt.
+#[tokio::test]
+#[ignore = "needs root with the B4 launch capabilities: run scripts/firecracker-crash-matrix.py"]
+async fn b6_linux_root_crash_daemon_death_mid_remove_stays_charged_until_absent() {
+    let deployment = Deployment::new(&["fctest"], NodeOptions::default()).await;
+    let daemon = deployment.daemon("fctest");
+    let real = &deployment.real;
+    let mut transcript = Transcript::default();
+    daemon.start(&deployment.image);
+    daemon.wait_serving(real).await;
+    let (id, allocation) = ready_session(daemon, &mut transcript);
+    let vmm = real.vmm(allocation).expect("a VMM was journaled");
+    // Held in the helper's detached Remove, after it read the journal and before it
+    // stops anything: the removal is the helper's, and nothing is ABSENT yet.
+    let hold = "H.remove.after_state";
+    real.fixture.fault(&format!("{hold}.hold"));
+    let remove = daemon.kilndctl_background(&["rm", &id]);
+    real.fixture.wait_reached(hold).await;
+    assert_eq!(daemon.row(&id, "state").as_deref(), Some("deleting"));
+    daemon.kill().await;
+    let (text, interrupted) = remove.join().unwrap();
+    transcript.text.push_str(&text);
+    assert_ne!(interrupted.code, 0, "the caller lost its daemon");
+    transcript
+        .text
+        .push_str("# kilnd SIGKILLed with its Delete's Remove held in the helper\n\n");
+    let check_charged = |when: &str| {
+        assert_eq!(
+            daemon.row(&id, "state").as_deref(),
+            Some("deleting"),
+            "{when}"
+        );
+        assert!(charged(daemon, &id), "{when}: the row stays charged");
+        assert!(
+            unreleased_claim(&deployment, allocation),
+            "{when}: the node claim stays"
+        );
+        assert_ne!(real.phase(allocation), "absent", "{when}");
+    };
+    check_charged("after the kill");
+    // The restart's reconciliation meets the held removal: nothing is proven absent.
+    daemon.start(&deployment.image);
+    daemon.wait_serving(real).await;
+    check_charged("after a restart with the removal still held");
+    let phase_held = real.phase(allocation);
+    // The old removal resumes for a daemon that is gone, and ends without a receipt the
+    // daemon could have seen. Still nothing is released.
+    real.fixture.clear(&format!("{hold}.hold"));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let phase_after_old_removal = real.phase(allocation);
+    assert_eq!(daemon.row(&id, "state").as_deref(), Some("deleting"));
+    assert!(charged(daemon, &id), "no release without the daemon's own receipt");
+    let get = daemon.kilndctl(&mut transcript, &["get", &id], None);
+    assert!(get.stdout.contains("deleting"), "{}", get.stdout);
+    // Reconciliation at the next start finishes it, from the matching ABSENT receipt.
+    transcript
+        .text
+        .push_str("# kilnd restarted: its reconciliation settles the DELETING row\n\n");
+    daemon.stop().await;
+    daemon.start(&deployment.image);
+    daemon.wait_serving(real).await;
+    assert!(wait_gone(vmm.pid, 30).await, "the VMM survived ABSENT");
+    let released = assert_released(&deployment, daemon, &id, allocation, "deleted");
+    assert_eq!(deployment.claims(), 0);
+    daemon.kilndctl(&mut transcript, &["get", &id], None);
+    finish("crash-daemon-death-mid-remove", &transcript, &deployment);
+    matrix(
+        "daemon killed mid-Remove (helper-owned, before ABSENT)",
+        json!({
+            "after_kill": "deleting, charged on both ledgers",
+            "after_restart_while_held": "deleting, charged",
+            "phase_while_held": phase_held,
+            "phase_after_old_removal_ended": phase_after_old_removal,
+            "settled_by": "startup reconciliation, ABSENT receipt",
+            "release": released,
+        }),
+    );
+}
+
 /// An operator restores a stale database. The surviving node ledger still holds the
 /// session the old database never heard of: the daemon blocks its own admission, the node
 /// keeps the charge, and a second daemon sees one slot fewer. Restoring the current
