@@ -663,7 +663,7 @@ Each allow is `#[allow(clippy::disallowed_methods)]` (inner for a whole module) 
 
 Test fixtures are excluded from the gate. Outside the approved items above, nothing in the workspace calls or names any listed capability.
 
-*The dependency gate (B7, B4 recheck 6 item 2).* Clippy matches paths, so a dependency could offer an equivalent of a listed capability under a name `clippy.toml` does not know. `dependency-gate.json` at the workspace root classifies the dependencies, and `proven::tests::dependencies_that_can_wrap_syscalls_are_allowlisted` checks it against `Cargo.lock`, every workspace manifest and `clippy.toml` on every `cargo test`. A package *can wrap system calls* when it is a raw binding (`libc`, `linux-raw-sys`, `rustix`, `nix`, `syscalls`, `sc`), a `*-sys` crate, or depends directly on one; the rule is in the test, not the file. The test fails when a normal or build dependency of any workspace crate is not under `direct` (each with its `destructive` paths and a reason); a dev-only one is not under `dev`; any package that can wrap system calls is not listed at all (transitive ones under `transitive`, with what pulls them in); an entry names a package `Cargo.lock` lacks or a kind it does not have; an entry's `syscalls` flag disagrees with `Cargo.lock`; a direct entry's `destructive` paths differ, in either direction, from `clippy.toml`'s paths under that crate; `clippy.toml` names a crate that is neither `std` nor a direct entry; a raw binding is direct with no destructive paths; or a dependency is renamed. Today `libc` and `tokio` carry exactly their `clippy.toml` lists, `hyper-util`, `tokio-util` and `rusqlite` reach system calls with no destructive API, `tempfile` is dev-only, and thirteen transitive packages (`mio`, `socket2`, `rustix`, `libsqlite3-sys` and the rest) are listed with their reasons. So a new dependency that can reach system calls joins the file, and its destructive methods join `clippy.toml`, in the same change. `the_dependency_gate_refuses_unlisted_syscall_dependencies` proves each refusal on synthetic lockfiles. Like the rest of the gate it catches honest mistakes, not a malicious dependency.
+*The dependency gate (B7, B4 recheck 6 item 2; rebuilt after the B7 milestone 2 break-it).* Clippy matches paths, so a dependency could offer an equivalent of a listed capability under a name `clippy.toml` does not know. `dependency-gate.json` at the workspace root records a reviewed decision for **every** direct dependency of every workspace crate (normal, build and dev): its `kind` (`runtime`, `build-only` or `dev-only`), its `capability` (`none`, or a set of `filesystem`, `process`, `signals`, `syscalls` and `network`) and why. `proven::tests::dependency_gate` checks it on every `cargo test`. The gate never overrides an honest declaration: `Cargo.lock` can only *require* more. A raw system-call crate (`libc`, `linux-raw-sys`, `rustix`, `nix`, `syscalls`, `sc`, any `*-sys`) must declare `syscalls`, and a `none` dependency that depends directly on one must record in `raw_use` what it uses it for (`tokio-util`: `libc::memchr`). A dependency with a destructive-capable category (filesystem, process, signals, syscalls) lists its `destructive` paths and `clippy.toml` disallows each one, or records in `no_destructive_api` why its API has none (only `rusqlite`, and never a raw crate); `clippy.toml` names no dependency path its entry does not list. The test also fails on a direct dependency with no entry, an unknown field or capability, a kind the manifests contradict, a `build-only` or `dev-only` dependency that `Cargo.lock` reaches from the runtime dependencies (unless `runtime_via` names the path: `h2` is a dev dependency and also `tonic`'s transport), a package that can wrap system calls without being listed (transitive ones under `transitive`), a stale entry or a renamed dependency. Two lexical backstops catch a mistaken `none`: production code (every crate's `src` and build script, comments and strings ignored, `use` aliases resolved) that names a destructive-looking function through a dependency's path that `clippy.toml` does not disallow, or glob-imports a dependency reviewed as having no destructive API; and a `none`, `network` or no-destructive-API dependency whose own locked registry source reaches a `std`, Tokio or libc path `clippy.toml` disallows. Completeness is tested, not asserted: `every_destructive_libc_function_is_disallowed` reads every exported function of the locked `libc` (all targets, from the registry source `Cargo.lock` pins) and requires each one matching the curated patterns (`*unlink*`, `rmdir`, `rename*`, `*truncate*`, `creat*`, `exec*`, `posix_spawn*`, `system`, `popen`, `*kill*`, `tkill`, `tgkill`, `*sigqueue*`, `pidfd_send_signal`, `umount*`, `mount`, `remove*`, `*removexattr`, `fallocate*`, `ptrace`, `process_vm_writev`, `prctl`, `syscall`, `reboot`, `swapoff`) to be disallowed, 104 in libc 0.2.190, most of them other targets' (marked `allow-invalid`); `std_and_tokio_destructive_surfaces_are_disallowed` holds `clippy.toml` to a curated, justified review of `std::fs`, `std::process` and the Unix extensions (std is not a `Cargo.lock` input; the list is re-read at each toolchain bump) and to every public function of the locked Tokio's `fs` module, failing on one the review does not classify. Reviewed and not gated: `fork`, `vfork` and `clone` (they duplicate the caller; running another program needs `exec*`, which is gated), `unshare`, `setns` and `chroot` (the caller's own view), `mknod`, `link` and `symlink` (they create, never replace), descriptor writes and `O_TRUNC` passed by flag to `open`/`openat`, which no path-based gate can see. The jail base's two mounts moved into typed wrappers (`sys::bind_onto_itself`, `sys::make_private_recursive`) when `libc::mount` joined the list, and `kilnd-api/build.rs` carries the one approved allow for `tonic-prost-build`. `scripts/dependency-gate-regressions.sh` (and a CI job) replays Daybreak's PoCs against the real crates and clippy on Rust 1.88 and 1.99. Like the rest of the gate it catches honest mistakes, not a malicious dependency.
 
 ## 7.2 Durable reservation vector
 
@@ -3222,9 +3222,26 @@ budget by the caller's kernel UID:
   a socket that sends nothing is woken for it, and the transport then closes the
   connection and drops its slot. A slow drip of 23 bytes gets the same deadline.
 
+- *Strict invariants (B7 milestone 2 break-it, HIGH-2).* `admission::validate_ingress`
+  refuses to start unless `--reserved-connections` is at least 1 and below
+  `--max-connections`; `--max-connections-per-uid` is strictly below the general pool
+  (`--max-connections` minus `--reserved-connections`); that share plus the UID's one
+  reserved slot is strictly below `--max-connections`; `--max-concurrent-rpcs-per-uid`
+  is strictly below `--max-concurrent-rpcs`; and `--max-concurrent-cleanup` is at least
+  1. Equality is refused: Daybreak's accepted `33/1/32` let one UID hold all 32 general
+  slots and the only reserved one.
+- *Root's slot (B7 milestone 2 break-it, MEDIUM-2).* Beyond `--max-connections`, one
+  connection slot only UID 0 may take, after the general and reserved slots refuse it,
+  and one RPC permit only UID 0 may use for Health, GetSandbox and DeleteSandbox after
+  their own lanes refuse it. A connection on it serves those three RPCs only. So the
+  operator always reaches Health and cleanup.
+
 Residual: a client that sends the preface may then idle on its slot (bounded by its UID's
-share), and several colluding UIDs can fill the general pool; the reserved slots and
-lanes still serve Health and cleanup to up to four other UIDs. Tests:
+share). The reserve is first-come and bounded per UID, not per caller: colluding UIDs can
+hold all of it (four UIDs holding 33, 29, 1 and 1 connections at the defaults take every
+slot), as the threat model accepts colluding UIDs filling shared capacity; a further
+non-root UID is then refused, and root alone still gets Health, Get and Delete on its
+own slot. Tests:
 `admission::tests::b7_one_uid_cannot_exhaust_connections`,
 `b7_rpc_shares_and_the_cleanup_lane`, `b7_shares_hold_under_concurrent_callers`;
 `service::tests::b7_rpc_shares_cleanup_lane_and_reserved_connections`;
@@ -3259,9 +3276,9 @@ mapping, every platform) and, as root in a private mount namespace on a real ram
 ### The dependency gate (B4 recheck 6 item 2, LOW)
 
 Section 7.1's *The dependency gate*: `dependency-gate.json`, checked against `Cargo.lock`,
-the manifests and `clippy.toml` by `proven::tests::dependencies_that_can_wrap_syscalls_are_allowlisted`
-on every `cargo test` (so in CI), with
-`the_dependency_gate_refuses_unlisted_syscall_dependencies` for each refusal.
+the manifests and `clippy.toml` on every `cargo test` (so in CI). The B7 milestone 2
+break-it replaced its Cargo.lock inference with reviewed capability decisions; see the
+corrections below.
 
 ### One procfs root (B4 recheck 6 item 3, LOW)
 
@@ -3393,6 +3410,154 @@ Logs, matrices and transcripts are in `reviews/2026-11-04-b7-m2-vm/`. The first 
 attempt, before the `sha2` profile, failed every scenario at "timed out waiting: the
 helper listens" on this branch and on main alike (`phase2/debug-session-main*.log`);
 a `gdb` sample showed H in `sha2::sha256::soft` under `verify_self_image`.
+
+## B7 milestone 2 break-it corrections (November 5, 2026)
+
+Daybreak Blue's break-it review of milestone 2 at `01cc7bc`
+(`reviews/2026-11-05-b7m2-breakit.md`) returned MUST-FIX with two HIGH findings, two
+MEDIUM and two LOW. All six are accepted and corrected on `phase1b/b7-hardening`; none is
+rejected. Production Firecracker stays disabled.
+
+### HIGH-1: a wrapper around std passed the dependency gate
+
+The gate inferred whether a dependency could wrap system calls from `Cargo.lock` (a raw
+crate, or a direct dependency on one) and then *required* each entry's `syscalls` flag to
+equal that inference. `fs-err`, a drop-in wrapper around `std::fs` that depends only on
+`autocfg`, therefore had to be declared `syscalls: false` with no destructive paths, and
+production could call `fs_err::remove_dir_all`, which clippy saw under the wrapper's name.
+The gate now records a reviewed decision for every direct dependency (kind, capability,
+reason) and never overrides it; `Cargo.lock` can only require more. A destructive-capable
+category lists its destructive paths and `clippy.toml` disallows them. Two backstops catch
+a mistaken `none`: a production path to a destructive-looking function that clippy does
+not disallow (aliases, grouped imports and `extern crate ... as` resolved; a glob import of
+such a crate refused), and a dependency whose own locked source reaches a disallowed
+std, Tokio or libc path (the real `fs-err` 3.3.2 reaches thirteen). Section 7.1 has the
+whole model. Tests: `proven::tests::dependency_gate::b7m2_an_fs_err_wrapper_declared_none_is_refused`
+(Daybreak's PoC on a synthetic lockfile, manifest and source: unreviewed, `none`, aliased,
+glob, `filesystem` without paths and with paths not disallowed are refused; listed and
+disallowed passes, though `Cargo.lock` shows no raw crate), `the_lock_graph_requires_but_never_overrides`
+and `the_dependency_gate_holds`; on the real crates, `scripts/dependency-gate-regressions.sh`
+shows the gate refusing `fs-err` reviewed as `none` and, reviewed as `filesystem` with its
+paths disallowed, clippy rejecting the call on Rust 1.88 and 1.99.
+
+### HIGH-2: accepted flags let one UID own every connection slot
+
+`main.rs` refused a per-UID share only *above* the general pool, so
+`--max-connections 33 --reserved-connections 1 --max-connections-per-uid 32` let one UID
+hold all 32 general slots and the only reserved one with preface-complete idle sockets,
+starving every other UID's fresh Health, Get and Delete. `admission::validate_ingress` now
+holds the strict invariants (section *Ingress fairness* above) and kilnd refuses to start on
+a violation, naming the flags. Tests: `admission::tests::b7m2_ingress_invariants` (each
+invariant at equality and one below, and that 33/1/31 leaves another UID a general slot)
+and `main`'s `b7m2_ingress_flags_are_refused_at_their_boundaries` (33/1/32 refused, 33/1/31,
+64/4/59 and 3/1/1 accepted, 64/4/60, 2/1/1, 3/2/1, 3/3/1, a zero reserve, RPC 8/8 and a
+zero cleanup lane refused).
+
+### MEDIUM-1: the destructive lists were incomplete
+
+`std::fs::copy` and `tokio::fs::copy` overwrite and truncate a destination by name;
+`libc::creat` opens with `O_TRUNC`; `sigqueue`, `creat64`, `truncate64`, `ftruncate64`,
+`execl`, `execle`, `execlp` and `popen` were missing too. All are disallowed now, with
+`std::os::unix::process::CommandExt::exec` and every other locked libc function matching
+the curated destructive patterns (`mount`, `removexattr`, `shm_unlink`, `pthread_kill`,
+`reboot`, `swapoff` and other targets' names: 104 in libc 0.2.190). Completeness is now a
+test rather than two hand-written lists agreeing: `every_destructive_libc_function_is_disallowed`
+reads the pinned libc source, and `std_and_tokio_destructive_surfaces_are_disallowed` holds
+`clippy.toml` to a curated std review and to every public `tokio::fs` function of the
+locked Tokio. Gating `libc::mount` moved the jail base's two production mounts into the
+typed `sys::bind_onto_itself` and `sys::make_private_recursive`. Daybreak's
+`missing-methods` fixture is part of `scripts/dependency-gate-regressions.sh`: clippy
+rejects both calls on 1.88 and 1.99.
+
+### MEDIUM-2: four UIDs could consume the whole reserve
+
+The design said the reserve still served up to four *other* UIDs after colluding UIDs
+filled the general pool; four UIDs holding 33, 29, 1 and 1 connections take all 64 slots.
+The claim is narrowed: the reserve is first-come and bounded per UID, consistent with the
+threat model's acceptance of colluding UIDs. One connection slot and one Health/cleanup
+RPC permit beyond the budget belong to UID 0, so the operator always reaches Health,
+GetSandbox and DeleteSandbox. Tests: `admission::tests::b7m2_root_gets_its_slot_after_a_four_uid_fill`
+(the exact fill at the defaults; a fifth UID and unknown credentials refused, root
+admitted on its slot, once), `b7m2_root_keeps_one_health_and_cleanup_permit` and
+`service::tests::b7m2_root_reaches_health_and_cleanup_with_every_lane_held`.
+
+### LOW-1: build-only status was not enforced
+
+Every entry now has a `kind` the manifests must agree with, and a build-only or dev-only
+dependency that `Cargo.lock` reaches from the runtime dependencies is refused unless
+`runtime_via` names the path (`h2`, also `tonic`'s transport). Test:
+`b7m2_build_and_dev_only_kinds_are_enforced` (moving `tonic-prost-build` to a normal
+dependency fails twice over; a runtime dependency pulling in a dev-only crate fails).
+
+### LOW-2: the reserved-lane tests did not cover every ordinary RPC
+
+`service::tests::b7_rpc_shares_cleanup_lane_and_reserved_connections` (reserved and root
+lanes) and `server::tests::b7_a_reserved_slot_serves_health_and_cleanup_only` (the real
+transport) now send valid Exec and GetExecution requests too, each first shown valid on a
+general connection.
+
+### Corrections evidence
+
+Branch `phase1b/b7-hardening`: `13c3a50` (ingress: HIGH-2, MEDIUM-2, LOW-2), `5d3ab15`
+(the dependency gate and destructive lists: HIGH-1, MEDIUM-1, LOW-1), `62fb76e` (the CI
+job) and the documentation commit after them. The VM runs used `62fb76e`.
+
+- *macOS.* `cargo test --locked`, default and `firecracker-test-deployment` features:
+  every test passes (kilnd lib 506 passed, 3 ignored). `cargo clippy --locked
+  --all-targets -- -D warnings -D clippy::disallowed_methods` on Rust 1.88 and 1.99, both
+  feature sets: clean. `git diff --check` and `scripts/kilnd-maintenance-tests.py` pass.
+  `scripts/dependency-gate-regressions.sh`: `fs-err` reviewed as `none` refused on 1.88
+  and 1.99 (the production call and its own source); reviewed as `filesystem`, the gate
+  holds and clippy rejects `fs_err::remove_dir_all` on both; `std::fs::copy` and
+  `libc::creat` rejected on both.
+- *CI.* Run 41995571790 on `62fb76e`: `check`, `feature` and the new `gate-regressions`
+  jobs green. The first attempt's `feature` job failed only the untouched
+  `kilnd-broker-protocol` timing test `wide_objects_check_in_well_under_quadratic_time`
+  (229 ms against its 200 ms bound; see milestone 2's evidence); the rerun passed.
+- *VM, phase 1.* Linux clippy, both feature sets, clean (so `libc::mount` is gated with
+  every production use behind the typed wrappers). `cargo test --locked --workspace`:
+  default all passed (kilnd lib 515 passed, 77 ignored); feature all passed except the
+  same timing test, which then passed 3/3 alone. The root `b7_linux_root_sys_*` tests (the
+  ramfs `EOPNOTSUPP` refusal and the procfs component walk's mount check): 2/2. The
+  Linux `b7_*`, procfs and `read_dir_fd` tests: 10/10. `scripts/test-deployment-gate-regressions.sh`
+  `feature` and `root`: all checks passed, the slice and no-unit cases refused.
+  `scripts/dependency-gate-regressions.sh` on Linux: all passed.
+- *VM, phase 2, the real chain.* `scripts/firecracker-regressions.py`: **8/8 passed**, the
+  whole session and the hostile public caller included (773,153 sockets opened and closed
+  by the daemon, 66 held to the 5-second deadline, longest 5.003 s, none left open, while
+  Health, Get and Delete answered in 3 ms, 1 ms and 110 ms). `scripts/firecracker-crash-matrix.py`:
+  **11/11 passed**.
+- *VM, phase 3, the PoCs on the wire* (`ingress.py` in the evidence directory: daemons
+  run as `kilnd` on private sockets against the installed helper, callers `b7m2a` to
+  `b7m2e` in the `kilnd` group; **16/16 passed**). HIGH-2 at `33/1/32`: on the reviewed
+  `01cc7bc`, one UID held 33 of 33 slots and another UID's fresh Health, Get and Delete
+  were each closed at the transport, then served once the holder exited; this branch
+  refused the flags at startup ("--max-connections-per-uid (32) must be below the general
+  connection slots (--max-connections 33 - --reserved-connections 1 = 32)"). MEDIUM-2 at
+  the defaults: four UIDs held exactly 33, 29, 1 and 1 on both builds and a fifth UID was
+  refused on both; root was refused on `01cc7bc` and got Health, Get and Delete on this
+  branch, and a non-root UID could not take root's slot. Floods on this branch, each 30 s
+  over the attacker's whole share of 33 connections while another UID repeated Health,
+  Get and Delete: SETTINGS 6,573 served and 0 refused, PING 7,089/0, slow headers 8,736/0
+  (the daemon closed all 33 attacker connections), slow frames 8,520/0, rapid reset
+  8,727/0 (all 33 closed); the daemon survived every one, and afterwards the four-UID fill
+  reached exactly 33, 29, 1 and 1 again (the attacker's 34th refused), so every permit
+  had been returned.
+- *VM, phase 3, installed daemon* (`62fb76e` installed with `scripts/install.sh`):
+  `scripts/integration-test.sh`, `daemon-singleton-regressions.sh`,
+  `state-path-regressions.sh`, `sudo python3 -I scripts/phase0-regressions.py`,
+  `scripts/smoke.sh`, `scripts/hostile-public-caller.py` (794,539 sockets, 66 held to the
+  deadline, longest 5.002 s, none left) and `scripts/kilnd-maintenance-tests.py`: all
+  passed.
+- *Installed state.* Before installing, with kilnd stopped, `/var/lib/kilnd` and the three
+  installed binaries were byte-copied and `cmp` found `kilnd.db`, `kilnd.lock` and the
+  binaries identical; a copy reported schema 10 and `quick_check` ok (the live database
+  was never opened with `sqlite3`). Afterwards `2a1faea` was reinstalled, whose binaries
+  `cmp` identical to the pre-phase copies (and hash as before the phase), the state was
+  restored and `cmp` found `kilnd.db` and `kilnd.lock` identical, and the daemon served
+  with no test account, group, unit, mount, cgroup, VMM or temporary path left.
+
+Logs, matrices and the PoC harness are in `reviews/2026-11-05-b7m2-fixes-vm/`.
 
 # 16. Retired-token compaction (pre-B7 design)
 

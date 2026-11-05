@@ -141,10 +141,16 @@ sandbox compromises the host.
   hold at most its share of connections (32 of 64) and ordinary RPCs (32 of
   64), and Health and cleanup keep reserved connection slots and RPC lanes
   (B6-BI-03); a socket that never sends the HTTP/2 preface is closed after 5
-  seconds. There is still no tenant scheduling: a UID's own slow clients fill
-  its share, several colluding UIDs can fill the general pool, and a client
-  that sends the preface can then idle on its slot. There is no body-progress
-  or idle watchdog after the preface.
+  seconds. kilnd refuses to start with flags that would let one UID's share
+  cover the whole general pool, or its share plus its reserved slot the whole
+  budget (B7 milestone 2). There is still no tenant scheduling: a UID's own
+  slow clients fill its share, and the reserve is first-come and bounded per
+  UID, not per caller, so colluding UIDs can fill the general pool and every
+  reserved slot (four UIDs holding 33, 29, 1 and 1 connections at the
+  defaults). Root keeps one connection slot and one Health/cleanup RPC permit
+  of its own beyond the budget, so the operator still reaches Health,
+  GetSandbox and DeleteSandbox. A client that sends the preface can then idle
+  on its slot. There is no body-progress or idle watchdog after the preface.
   Raw connection rejection closes the transport and cannot guarantee a gRPC
   status. Service permits end after response construction; transport caps
   bound slots held during response backpressure. These are capacity bounds,

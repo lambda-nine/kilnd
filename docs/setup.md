@@ -288,10 +288,16 @@ The daemon's admission flags and defaults are:
 | `--health-success-cache-secs`, `--health-failure-cache-secs` | 5, 1 |
 
 Limits are validated before state/socket creation. Required values must be
-nonzero except `--max-queued-execs-per-sandbox`, which may be zero. The reserved
-connections must leave at least one general slot, one UID's connection share must
-fit in the general slots, its RPC share in `--max-concurrent-rpcs`, and the
-preface deadline is 100 to 60000 ms. Counts
+nonzero except `--max-queued-execs-per-sandbox`, which may be zero. The ingress
+flags must keep every UID's share strictly below what it shares (B7 milestone 2):
+at least one reserved connection, fewer than `--max-connections`; one UID's
+connection share strictly below the general slots (`--max-connections` minus
+`--reserved-connections`), and that share plus its one reserved slot strictly below
+`--max-connections`; its RPC share strictly below `--max-concurrent-rpcs`; and at
+least one cleanup permit. So `--max-connections 33 --reserved-connections 1
+--max-connections-per-uid 32` is refused, and 31 is the most one UID may hold there.
+The preface deadline is 100 to 60000 ms. Beyond these limits, UID 0 keeps one
+connection slot and one Health/cleanup RPC permit of its own. Counts
 used by semaphores and stream counts must fit `u32`; the per-sandbox queue
 plus one must fit too. Request bytes must cover stdin + argv + 64 KiB, and
 response bytes must cover twice `--max-output-bytes`, maximum argv, and 64 KiB.

@@ -6,6 +6,23 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B7 milestone 2 break-it corrections (design section 15, *B7 milestone 2
+  break-it corrections*). Ingress: kilnd refuses to start unless one UID's connection
+  share is strictly below the general pool and, with its reserved slot, below
+  `--max-connections`, its RPC share strictly below `--max-concurrent-rpcs`, and at
+  least one reserved connection and one cleanup permit exist (Daybreak's accepted
+  `33/1/32` let one UID hold every slot); UID 0 keeps one connection slot and one
+  Health/cleanup RPC permit beyond the budget; the design and threat model now call the
+  reserve first-come and bounded per UID. Dependency gate: `dependency-gate.json`
+  records a reviewed kind and capability for every direct dependency instead of
+  inferring capability from `Cargo.lock`, a destructive-capable one lists its
+  destructive paths for `clippy.toml`, build-only and dev-only kinds are checked against
+  the lock graph, and two backstops catch a mistaken `none` (Daybreak's `fs-err`
+  wrapper). `clippy.toml` gains `std::fs::copy`, `tokio::fs::copy`, `CommandExt::exec`
+  and every locked libc function matching the destructive patterns (`creat`, `execl`,
+  `popen`, `sigqueue`, `mount`, `truncate64` and the rest), with completeness tests that
+  read libc and `tokio::fs` from the pinned sources. New
+  `scripts/dependency-gate-regressions.sh` (also a CI job).
 - Phase 1b B7 milestone 2: the hardening follow-ups (design section 15, *B7 milestone
   2*). Ingress fairness (B6-BI-03): 4 of the 64 connection slots are held back for
   Health, GetSandbox and DeleteSandbox (one per UID; a connection on one serves nothing
