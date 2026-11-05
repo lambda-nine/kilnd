@@ -3099,7 +3099,7 @@ answered here; B6-BI-03 is scheduled for B7.
 
 *B6-BI-01 (HIGH): the isolated deployment's identity was only declared.* The daemon
 compared the manifest's paths with its flags, but its account, socket group and unit only
-had to look non-production. A release `kilnd` running as `estradafamily`, with
+had to look non-production. A release `kilnd` running as the developer's own login account, with
 `--socket-group staff`, outside any unit, selected `FirecrackerRuntime` for a manifest
 naming `kilnd-fctest-manifest-only` for all three. Two fixes, either sufficient:
 

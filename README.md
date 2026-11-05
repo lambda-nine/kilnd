@@ -5,6 +5,29 @@ sandboxes. kilnd owns sandbox state, records every execution in SQLite, and
 serves a versioned gRPC API on a Unix socket. It is the runtime control plane
 the future agent harness will sit on; there is no LLM code here.
 
+**Status: experimental.** kilnd's isolation is kiln's: experimental,
+shared-kernel, reviewed adversarially by AI models but not audited, and **not a
+boundary for hostile multi-tenant workloads.** The Firecracker microVM backend
+(Phase 1b) is **disabled for production**: it is compiled only with the
+non-default `firecracker-test-deployment` cargo feature, and release builds
+refuse it. Tested on Ubuntu 24.04 (Linux 6.8+, cgroups v2) in kiln's Lima VM.
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+Licensed under [Apache-2.0](LICENSE).
+
+| Lambda IX repository | What it is |
+|----------------------|------------|
+| [kiln](https://github.com/lambda-nine/kiln) | Shared-kernel Linux sandbox runtime; kilnd drives its installed CLI through a root helper |
+| **kilnd** (this repository) | Per-node control daemon, `kilndctl` client, and the guest broker for the Firecracker backend |
+| [kiln-guest](https://github.com/lambda-nine/kiln-guest) | Builds the Firecracker guest image (kiln plus this repository's `kilnd-guest-broker`) that the test backend boots |
+| [kiln-harness](https://github.com/lambda-nine/kiln-harness) | Provider-neutral agent loop that uses kilnd's API |
+
+**Quickstart:** see [Quick start](#quick-start-in-kilns-lima-vm) below; it
+installs kiln at a pinned commit, then kilnd, inside kiln's Lima VM on a Mac.
+On an Ubuntu 24.04 host with Linux 6.8+, follow kiln's README to install kiln,
+then run the "in the VM" half directly. Builds use `cargo` as shown here; a
+`scripts/build.sh` wrapper with a closed compiler environment arrives with
+Phase 1b B7.
+
 ```
 kilndctl ──gRPC over /run/kilnd/kilnd.sock──▶ kilnd ──typed Unix IPC──▶ root kilnd-helper ──argv──▶ kiln
                                                │

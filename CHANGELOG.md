@@ -607,6 +607,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   instance bound. Ambiguous platforms fail closed. Duplicate starts cannot
   interrupt active daemon-owned work.
 
+- Prepare the repository for public visibility (documentation only): add
+  `SECURITY.md` with private vulnerability reporting, scope and the statement
+  that the Firecracker backend is disabled for production; open the README
+  with status, the four Lambda IX repositories and a quickstart; clone over
+  HTTPS in `docs/setup.md`; drop a host name and a local account name from
+  the setup guide and design document.
+
 ## 0.1.0 - 2026-10-13
 
 First vertical slice.

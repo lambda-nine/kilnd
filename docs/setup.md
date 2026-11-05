@@ -3,7 +3,7 @@
 kilnd runs where kiln runs: Linux 6.8+ with cgroups v2. The daemon runs
 as the unprivileged `kilnd` system account; only `kilnd-helper` runs as root. On a Mac
 that means kiln's Lima VM (Ubuntu 24.04, aarch64). These steps take a fresh
-Mac to a working kilnd; they were run on the Mac mini (Estradas-Mac-mini)
+Mac to a working kilnd; they were run on an Apple silicon Mac mini
 on 2026-10-13, with the Phase 0 service split revalidated on 2026-10-30.
 
 ## 1. Mac prerequisites
@@ -11,10 +11,9 @@ on 2026-10-13, with the Phase 0 service split revalidated on 2026-10-30.
 ```sh
 brew install lima protobuf          # protoc is only needed to build on macOS
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-gh auth login                        # both repositories are private
 mkdir -p ~/Projects/lambda-nine
-gh repo clone lambda-nine/kiln  ~/Projects/lambda-nine/kiln
-gh repo clone lambda-nine/kilnd ~/Projects/lambda-nine/kilnd
+git clone https://github.com/lambda-nine/kiln  ~/Projects/lambda-nine/kiln
+git clone https://github.com/lambda-nine/kilnd ~/Projects/lambda-nine/kilnd
 ```
 
 Both checkouts must be at these paths: kiln's `lima.yaml` mounts
