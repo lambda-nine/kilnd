@@ -354,6 +354,8 @@ pub struct Link<'a> {
     pub last_helper: Instant,
     seq: u64,
     console: Option<Console>,
+    /// The launch step forward work last entered, named in a refusal's reason.
+    step: &'static str,
 }
 
 const CONSOLE_PREFIX: usize = 64 * 1024;
@@ -407,7 +409,13 @@ impl<'a> Link<'a> {
             last_helper: Instant::now(),
             seq: 0,
             console: None,
+            step: "start",
         }
+    }
+
+    /// The launch step forward work last entered.
+    pub fn current_step(&self) -> &'static str {
+        self.step
     }
 
     pub fn context(&self) -> &SupervisorContext {
@@ -452,7 +460,8 @@ impl<'a> Link<'a> {
 
     /// The point before each forward effect: heartbeat, commands, deadline, and the
     /// test fault points that stall or kill S exactly here.
-    pub fn step(&mut self, name: &str) -> Result<(), Abort> {
+    pub fn step(&mut self, name: &'static str) -> Result<(), Abort> {
+        self.step = name;
         self.beat();
         fault_point(&format!("S.step.{name}"));
         self.beat();

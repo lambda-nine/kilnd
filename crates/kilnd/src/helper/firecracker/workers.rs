@@ -2351,7 +2351,10 @@ fn real_supervisor(
     let _ = super::supervisor::contain(&parsed, created.as_ref());
     match end {
         Some(Abort::Expired) => link.event(&SupervisorEvent::SetupExpired),
-        Some(Abort::Refused(reason)) => link.event(&SupervisorEvent::LaunchRefused { reason }),
+        Some(Abort::Refused(reason)) => {
+            let reason = format!("at {}: {reason}", link.current_step());
+            link.event(&SupervisorEvent::LaunchRefused { reason })
+        }
         Some(Abort::Revoked | Abort::HelperGone) | None => {}
     }
     drop(link);
