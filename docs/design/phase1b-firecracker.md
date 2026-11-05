@@ -4554,3 +4554,18 @@ zero (`b7_rtc13_completed_sessions_leave_no_digest_entries`).
 
 **Validate.** It journals no intent, so there is nothing for L to refuse; H refuses it at
 its request gate under the latch, as before.
+
+**Evidence** (`reviews/2026-11-05-b7m1-fixes-vm/`). Kiln VM, each suite in its own phase:
+crash matrix 29 of 29 (B6's 11 on the real chain, B7's 18 with the lost-`SyncFailed`
+replacement); attack regressions 21 of 21, B6's whole session through kilnd and kilndctl
+included (201.7 s), with the OpenGate recheck and the digest regression; the real-host
+offline walk as root found exactly one orphan in each of the six families and none after;
+B4 31 of 31 and the capability-drop test. B5: 5 of 8 in the full run; the killed-inner and
+timeout/cancel/kill tests (the latter refused once at adopt, "VMM credentials differ:
+Seccomp") passed on rerun, and the console-flood guest, freshly built from the current
+`bundle-a`, fails its readiness check ("kiln protocol is not 1") identically at the reviewed
+`179837c`, so it is a test-guest fixture problem, not these changes. macOS: workspace tests
+pass on both feature sets except `runtime::kiln_direct`'s fake-kiln timing tests, untouched
+here, which time out under host load on the base commit too; CI is green. The installed
+kilnd (main `2a1faea`, schema 10) was never replaced; `/var/lib/kilnd` was restored from its
+`cmp`-verified copy (`kilnd.db` SHA-256 `ef02941f…`).
