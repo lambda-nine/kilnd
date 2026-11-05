@@ -95,8 +95,8 @@ sudo kilndctl ls --all
 ## 4. Tests
 
 ```sh
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+scripts/build.sh default test
+scripts/build.sh default clippy --all-targets -- -D warnings
 scripts/integration-test.sh          # dedicated admission stress, root + real kiln, FD-exec properties
 scripts/daemon-singleton-regressions.sh # duplicate starts preserve active work
 scripts/state-path-regressions.sh    # ownership, mode, type, link and symlink defenses

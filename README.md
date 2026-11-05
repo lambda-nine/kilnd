@@ -195,8 +195,8 @@ you created, so one made with `sudo` above stays visible only to root.
 ## Checks
 
 ```sh
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+scripts/build.sh default test
+scripts/build.sh default clippy --all-targets -- -D warnings
 git diff --check
 ```
 

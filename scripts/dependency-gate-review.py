@@ -6,8 +6,12 @@
 
 Every package in Cargo.lock outside the workspace needs an entry under `packages`, keyed
 `name@version`, pinned to Cargo.lock's checksum and to the features cargo resolves for it
-(`cargo metadata --locked --all-features`), with its kind (from the dependency graph; a
-direct dependency's from the manifests), a capability and a justification. This script
+in any supported build profile (`profiles`: `cargo metadata --locked` with exactly the
+profile's flags, as scripts/build.sh passes them, the union over the profiles), with its
+kind (from the union of the profiles' dependency graphs; a direct dependency's from the
+manifests), a capability and a justification. One name@version from two sources (two
+registries, say) cannot be reviewed under one key: the script refuses it, as the gate does.
+This script
 reports new, stale and changed packages. With --write it adds a draft for each new one:
 the checksum, features and kind filled in, and `capability` and `why` left empty, so
 proven::tests::dependency_gate fails until a person reviews the package and writes them.
@@ -35,12 +39,49 @@ def lock_packages(text):
     return out
 
 
-def metadata():
-    out = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--locked", "--all-features",
-         "--manifest-path", str(ROOT / "Cargo.toml")],
-        check=True, capture_output=True, text=True, cwd=ROOT).stdout
+def duplicate_identities(keys):
+    seen, out = set(), set()
+    for key in keys:
+        (out if key in seen else seen).add(key)
+    return sorted(out)
+
+
+def metadata(features):
+    command = ["cargo", "metadata", "--format-version", "1", "--locked",
+               "--manifest-path", str(ROOT / "Cargo.toml")]
+    if features:
+        command += ["--features", ",".join(features)]
+    out = subprocess.run(command, check=True, capture_output=True, text=True, cwd=ROOT).stdout
     return json.loads(out)
+
+
+def union(metas):
+    """The profiles' resolves as one: every package, each node's features and edges
+    merged (edges by package, with every kind any profile gives them)."""
+    packages, nodes, members = {}, {}, set()
+    for meta in metas:
+        keys = [f'{p["name"]}@{p["version"]}' for p in meta["packages"]]
+        for key in duplicate_identities(keys):
+            sys.exit(f"cargo metadata resolves two packages with the same identity {key}: "
+                     "the gate keys every review by name@version and does not support one "
+                     "name and version from two sources; resolve one")
+        packages.update({p["id"]: p for p in meta["packages"]})
+        members.update(meta["workspace_members"])
+        for node in meta["resolve"]["nodes"]:
+            merged = nodes.setdefault(node["id"], {"id": node["id"], "features": set(), "deps": {}})
+            merged["features"].update(node["features"])
+            for dep in node["deps"]:
+                kinds = merged["deps"].setdefault(dep["pkg"], set())
+                kinds.update(k["kind"] for k in dep["dep_kinds"])
+    return {
+        "packages": list(packages.values()),
+        "workspace_members": sorted(members),
+        "resolve": {"nodes": [
+            {"id": n["id"], "features": sorted(n["features"]),
+             "deps": [{"pkg": pkg, "dep_kinds": [{"kind": k} for k in kinds]}
+                      for pkg, kinds in n["deps"].items()]}
+            for n in nodes.values()]},
+    }
 
 
 def kinds(meta):
@@ -106,10 +147,17 @@ def kinds(meta):
 def main():
     write = "--write" in sys.argv[1:]
     packages = lock_packages((ROOT / "Cargo.lock").read_text())
+    for key in duplicate_identities(f'{p["name"]}@{p["version"]}' for p in packages):
+        sys.exit(f"Cargo.lock locks two packages with the same identity {key}: the gate keys "
+                 "every review by name@version and does not support one name and version "
+                 "from two sources; resolve one")
     locked = {f'{p["name"]}@{p["version"]}': p for p in packages if "source" in p}
-    kind, features = kinds(metadata())
     gate_path = ROOT / "dependency-gate.json"
     gate = json.loads(gate_path.read_text())
+    profiles = gate.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        sys.exit("dependency-gate.json has no `profiles` (the supported builds) to resolve")
+    kind, features = kinds(union(metadata(p.get("features") or []) for p in profiles.values()))
     entries = gate.setdefault("packages", {})
     problems = 0
     for key in sorted(set(entries) - set(locked)):

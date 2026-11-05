@@ -3,6 +3,8 @@
 # transaction: scripts/kilnd-maintenance.py documents it, docs/setup.md explains it.
 #   scripts/upgrade.sh <directory holding the new binaries>
 #   scripts/upgrade.sh --recover      finishes whatever a killed upgrade or a reboot left
+# Build the binaries with the supported entry point, as scripts/install.sh does:
+# `scripts/build.sh default build --release` (they land in target/release).
 # Exit status 3 means something could not be put back: fix what it reported, and --recover again.
 set -eu
 maintenance=$(cd "$(dirname "$0")" && pwd)/kilnd-maintenance.py

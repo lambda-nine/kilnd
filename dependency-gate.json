@@ -23,6 +23,18 @@
     "entry scoped to that package, version and feature set, with why.",
     "proven::tests::dependency_gate checks all of it; section 7.1 has the model and its limits."
   ],
+  "profiles": {
+    "default": {
+      "features": [],
+      "why": "the release build scripts/install.sh installs (and so scripts/upgrade.sh's binaries), the default CI jobs' tests, clippy and release build, and the library tests the VM scripts build"
+    },
+    "firecracker-test-deployment": {
+      "features": [
+        "kilnd/firecracker-test-deployment"
+      ],
+      "why": "Phase 1b B6's isolated Firecracker test deployment: CI's feature job (tests, clippy, the feature build) and the daemon and client scripts/b4-vm-tests.sh builds"
+    }
+  },
   "groups": {
     "pure-computation": "Pure computation: in-memory data structures, parsing, encoding, hashing, formatting, type-level code and async plumbing (futures, wakers, channels, pin projection). It opens, removes, renames, truncates and runs nothing and makes no raw system call: the gate checks that its library source names no std::fs, std::process, std::os fs, fd or process extension, libc or tokio::fs/process path at all, and that no raw system-call crate is under it.",
     "compile-time": "Build-time code generation: a procedural macro, or a library only procedural macros and code generators use (token streams, Rust syntax trees, pretty-printing). It runs in the compiler or a build script on the source it is given and is never linked into a kilnd binary; the gate checks its library source names no std::fs, std::process, std::os fs, fd or process extension, libc or tokio::fs/process path at all."
@@ -1643,7 +1655,7 @@
         "std"
       ],
       "sinks": [
-        ".truncate("
+        "truncate"
       ],
       "why": "String::truncate trimming a formatted backtrace: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
@@ -1656,7 +1668,7 @@
         "std"
       ],
       "sinks": [
-        ".truncate("
+        "truncate"
       ],
       "why": "Vec::truncate to the bytes written by its encoder and decoder (and in its own decoder_tests.rs): in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
@@ -1667,7 +1679,7 @@
         "std"
       ],
       "sinks": [
-        ".truncate("
+        "truncate"
       ],
       "why": "Flags::truncate, which clears bits outside the defined flags, called in bitflags' own src/tests/truncate.rs (compiled only for its tests): an in-memory bit operation, not OpenOptions::truncate."
     },
@@ -1679,10 +1691,11 @@
         "std"
       ],
       "sinks": [
-        ".set_len(",
-        ".truncate("
+        "copy",
+        "set_len",
+        "truncate"
       ],
-      "why": "BytesMut/Vec set_len and truncate inside its buffer implementation: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+      "why": "BytesMut/Vec set_len and truncate inside its buffer implementation: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate. copy is core::ptr::copy moving bytes inside its own allocation."
     },
     {
       "package": "futures-util",
@@ -1697,19 +1710,20 @@
         "std"
       ],
       "sinks": [
-        ".set_len(",
-        ".truncate(",
-        ".unlink("
+        "copy",
+        "set_len",
+        "truncate",
+        "unlink"
       ],
-      "why": "Vec::set_len and Vec/String truncate in its buffered I/O adapters (in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate); unlink is FuturesUnordered removing a task from its own intrusive linked list."
+      "why": "Vec::set_len and Vec/String truncate in its buffered I/O adapters (in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate); unlink is FuturesUnordered removing a task from its own intrusive linked list. copy is futures::io::copy, a stream-to-writer copy between two caller-supplied async streams (and its module), not a file copy by name."
     },
     {
       "package": "h2",
       "version": "0.4.20",
       "features": [],
       "sinks": [
-        ".truncate(",
-        ".unlink("
+        "truncate",
+        "unlink"
       ],
       "why": "BytesMut::truncate on frame payloads and HPACK buffers (in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate); unlink removes a stream from h2's own intrusive stream queues."
     },
@@ -1721,8 +1735,8 @@
         "std"
       ],
       "sinks": [
-        ".set_len(",
-        ".truncate("
+        "set_len",
+        "truncate"
       ],
       "why": "Vec::set_len(0) clearing a HeaderMap's own entries and BytesMut::truncate on a path buffer: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
@@ -1737,9 +1751,29 @@
         "server"
       ],
       "sinks": [
-        ".truncate("
+        "exec",
+        "truncate"
       ],
-      "why": "Vec::truncate rolling back a partly encoded HTTP/1 head: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+      "why": "Vec::truncate rolling back a partly encoded HTTP/1 head: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate. exec is its executor: the `exec` parameters and fields holding the caller's task executor, which spawns futures, not a program."
+    },
+    {
+      "package": "hyper-util",
+      "version": "0.1.21",
+      "features": [
+        "client",
+        "client-legacy",
+        "default",
+        "http1",
+        "http2",
+        "server",
+        "server-auto",
+        "service",
+        "tokio"
+      ],
+      "sinks": [
+        "exec"
+      ],
+      "why": "exec is its executor plumbing: the common::exec module, Exec type and `exec` fields holding the caller's task executor (and the rt-tracing-exec-force feature name in cfg attributes); it spawns futures, never a program."
     },
     {
       "package": "indexmap",
@@ -1749,10 +1783,31 @@
         "std"
       ],
       "sinks": [
-        ".set_len(",
-        ".truncate("
+        "set_len",
+        "truncate"
       ],
       "why": "Vec::set_len and truncate on the map's own entry vector: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "libc",
+      "version": "0.2.190",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "copy",
+        "kill",
+        "rename",
+        "send_signal",
+        "truncate",
+        "umount",
+        "umount2",
+        "unlink",
+        "unlinkat",
+        "unmount"
+      ],
+      "why": "libc's own declarations of the C functions (extern fn kill, rename, truncate, umount, umount2, unlink, unlinkat, unmount, Haiku's send_signal), a struct field named copy (Apple) and solarish siginfo accessors' `kill` bindings. libc is reviewed with its destructive capabilities, and clippy.toml disallows each destructive function for workspace code; a package declared non-destructive that calls one names it in its own source, where this scan flags it."
     },
     {
       "package": "matchit",
@@ -1761,7 +1816,7 @@
         "default"
       ],
       "sinks": [
-        ".truncate("
+        "truncate"
       ],
       "why": "Vec/String truncate on route, parameter and escape buffers: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
@@ -1774,7 +1829,7 @@
         "os-poll"
       ],
       "sinks": [
-        ".set_len(",
+        "set_len",
         "libc::ioctl"
       ],
       "why": "Vec::set_len to the event count epoll/kqueue/event ports (and Windows named pipes) filled in (in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate); libc::ioctl is FIONBIO, setting O_NONBLOCK on a pipe mio created (sys/unix/pipe.rs)."
@@ -1794,8 +1849,8 @@
         "unicode-bool"
       ],
       "sinks": [
-        ".set_len(",
-        ".truncate("
+        "set_len",
+        "truncate"
       ],
       "why": "Vec set_len and truncate on DFA transition tables, bitsets and serialization buffers: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
@@ -1807,7 +1862,7 @@
         "unicode-bool"
       ],
       "sinks": [
-        ".truncate("
+        "truncate"
       ],
       "why": "Vec::truncate on literal and Unicode class buffers: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
@@ -1821,7 +1876,7 @@
         "std"
       ],
       "sinks": [
-        ".truncate("
+        "truncate"
       ],
       "why": "String::truncate in a Deserialize impl's own buffer: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
@@ -1834,7 +1889,7 @@
         "std"
       ],
       "sinks": [
-        ".truncate("
+        "truncate"
       ],
       "why": "String::truncate in a Deserialize impl's own buffer: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
@@ -1846,10 +1901,11 @@
         "std"
       ],
       "sinks": [
-        ".set_len(",
-        ".truncate("
+        "copy",
+        "set_len",
+        "truncate"
       ],
-      "why": "Vec::set_len after writing escaped UTF-8 into its scratch buffer and String::truncate on an error message: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+      "why": "Vec::set_len after writing escaped UTF-8 into its scratch buffer and String::truncate on an error message: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate. copy is a macro metavariable ($copy:tt) in json!."
     },
     {
       "package": "smallvec",
@@ -1859,10 +1915,11 @@
         "const_new"
       ],
       "sinks": [
-        ".set_len(",
-        ".truncate("
+        "copy",
+        "set_len",
+        "truncate"
       ],
-      "why": "SmallVec's own set_len and truncate, and Vec::set_len when it spills: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+      "why": "SmallVec's own set_len and truncate, and Vec::set_len when it spills: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate. copy is core::ptr::copy shifting elements inside its own buffer."
     },
     {
       "package": "tokio",
@@ -1888,22 +1945,28 @@
         "windows-sys"
       ],
       "sinks": [
-        ".kill(",
-        ".set_len(",
-        ".start_kill(",
-        ".truncate(",
+        "copy",
+        "exec",
         "impl for std::fs::OpenOptions",
         "impl for std::process::Child",
+        "kill",
         "libc::syscall",
+        "remove_dir",
+        "remove_dir_all",
+        "remove_file",
+        "rename",
+        "set_len",
+        "start_kill",
         "std::fs::copy",
         "std::fs::remove_dir",
         "std::fs::remove_dir_all",
         "std::fs::remove_file",
         "std::fs::rename",
         "std::fs::write",
-        "std::process::Command::new"
+        "std::process::Command::new",
+        "truncate"
       ],
-      "why": "Tokio's own implementation of the API its entry declares (filesystem, process, signals): tokio::fs wraps std::fs::{copy, remove_dir, remove_dir_all, remove_file, rename, write} and File::set_len/OpenOptions::truncate, tokio::process wraps std::process::Command, Child::kill (and its pidfd reaper's libc::syscall pidfd_open), and Vec::set_len/truncate appear in its I/O buffers. Each of those Tokio paths is disallowed in clippy.toml, so workspace code reaches none of them outside the approved modules; the impls are Tokio's own wrappers for std's OpenOptions and Child."
+      "why": "Tokio's own implementation of the API its entry declares (filesystem, process, signals): tokio::fs wraps std::fs::{copy, remove_dir, remove_dir_all, remove_file, rename, write} and File::set_len/OpenOptions::truncate, tokio::process wraps std::process::Command, Child::kill (and its pidfd reaper's libc::syscall pidfd_open), and Vec::set_len/truncate appear in its I/O buffers. Each of those Tokio paths is disallowed in clippy.toml, so workspace code reaches none of them outside the approved modules; the impls are Tokio's own wrappers for std's OpenOptions and Child. The identifier scan also sees tokio::fs's own copy, remove_dir, remove_dir_all, remove_file and rename (definitions and re-exports of the wrappers above, each disallowed in clippy.toml as tokio::fs::...), its io-uring rename op, tokio::io::copy (stream to writer), and `exec` as the name of a runtime scheduler binding."
     },
     {
       "package": "tokio-util",
@@ -1917,9 +1980,25 @@
         "rt"
       ],
       "sinks": [
-        ".truncate("
+        "truncate"
       ],
       "why": "BytesMut::truncate dropping a codec's delimiter byte: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "tonic",
+      "version": "0.14.6",
+      "features": [
+        "channel",
+        "codegen",
+        "router",
+        "server",
+        "transport"
+      ],
+      "sinks": [
+        "copy",
+        "exec"
+      ],
+      "why": "copy is std::io::copy streaming a gRPC message through a (de)compressor into its output buffer (codec/compression.rs, behind compression features kilnd does not enable); exec is the executor a channel spawns its connection futures on."
     },
     {
       "package": "tracing-subscriber",
@@ -1946,9 +2025,54 @@
         "tracing-serde"
       ],
       "sinks": [
-        "impl for std::fs::File"
+        "impl for std::fs::File",
+        "type alias for std::fs::File"
       ],
-      "why": "MakeWriter for std::fs::File lets a subscriber write log lines to a file the caller opened; kilnd's subscriber writes to stderr. It writes, never sets a length, removes or renames."
+      "why": "MakeWriter for std::fs::File lets a subscriber write log lines to a file the caller opened; kilnd's subscriber writes to stderr. It writes, never sets a length, removes or renames. Its associated type Writer = &'a std::fs::File is that impl's writer."
+    },
+    {
+      "package": "windows-sys",
+      "version": "0.61.2",
+      "features": [
+        "Wdk",
+        "Wdk_Foundation",
+        "Wdk_Storage",
+        "Wdk_Storage_FileSystem",
+        "Wdk_System",
+        "Wdk_System_IO",
+        "Win32",
+        "Win32_Foundation",
+        "Win32_Networking",
+        "Win32_Networking_WinSock",
+        "Win32_Security",
+        "Win32_Storage",
+        "Win32_Storage_FileSystem",
+        "Win32_System",
+        "Win32_System_Console",
+        "Win32_System_Diagnostics",
+        "Win32_System_Diagnostics_Debug",
+        "Win32_System_IO",
+        "Win32_System_Pipes",
+        "Win32_System_SystemServices",
+        "Win32_System_Threading",
+        "Win32_System_WindowsProgramming",
+        "default"
+      ],
+      "sinks": [
+        "copy",
+        "persist",
+        "persistentlogininfo"
+      ],
+      "why": "Win32 binding declarations: parameters and fields named copy, persist and persistentlogininfo in its link! externs and structs. It is a Windows-only dependency kilnd never builds for; its own capability is reviewed separately."
+    },
+    {
+      "package": "zmij",
+      "version": "1.0.23",
+      "features": [],
+      "sinks": [
+        "copy"
+      ],
+      "why": "core::ptr::copy shifting digits inside its own float-formatting buffer."
     }
   ]
 }

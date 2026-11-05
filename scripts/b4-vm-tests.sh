@@ -32,15 +32,15 @@ target=aarch64-unknown-linux-gnu
 # B6: the daemon and client the session test runs as an ordinary installed kilnd would
 # be, before the static flags below apply to anything.
 bins=${B6_TARGET_DIR:-$HOME/.cache/kilnd-target-b6}
-CARGO_TARGET_DIR=$bins cargo build --locked --release -p kilnd -p kilndctl --bin kilnd --bin kilndctl \
-    --features kilnd/firecracker-test-deployment
+CARGO_TARGET_DIR=$bins scripts/build.sh firecracker-test-deployment build --release \
+    -p kilnd -p kilndctl --bin kilnd --bin kilndctl
 
 export CARGO_TARGET_DIR=${B4_TARGET_DIR:-$HOME/.cache/kilnd-target-static}
 export RUSTFLAGS="-C target-feature=+crt-static"
 
 # kilnd's library tests, and since Phase 1b B5 the direct-kiln core's, which hold the
 # moved capability-drop regression (process::tests).
-built=$(cargo test --locked -p kilnd -p kilnd-exec-core --lib --no-run --target "$target" \
+built=$(scripts/build.sh default test -p kilnd -p kilnd-exec-core --lib --no-run --target "$target" \
     --message-format=json \
     | python3 -I -c '
 import json, sys

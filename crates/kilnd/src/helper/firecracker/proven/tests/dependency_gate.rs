@@ -59,7 +59,10 @@ const CAPABILITIES: [&str; 6] = [
 /// destructive paths, and clippy.toml disallows each one.
 const DESTRUCTIVE_CAPABILITIES: [&str; 4] = ["filesystem", "process", "signals", "syscalls"];
 const KINDS: [&str; 3] = ["runtime", "build-only", "dev-only"];
-const SECTIONS: [&str; 4] = ["about", "groups", "packages", "sink_exceptions"];
+const SECTIONS: [&str; 5] = ["about", "groups", "packages", "profiles", "sink_exceptions"];
+/// A supported build profile's fields: the workspace features it enables and who builds
+/// it. `scripts/build.sh` reads the same section.
+const PROFILE_FIELDS: [&str; 2] = ["features", "why"];
 const ENTRY_FIELDS: [&str; 10] = [
     "checksum",
     "features",
@@ -324,18 +327,57 @@ pub(super) struct Resolved {
     library: Option<(PathBuf, BTreeSet<PathBuf>)>,
     /// The package's own directory (where its Cargo.toml is).
     root: Option<PathBuf>,
+    /// The names in its manifest's feature table (a profile may enable a workspace
+    /// member's).
+    declared: BTreeSet<String>,
 }
 
-/// The resolve `cargo metadata --locked --all-features` reports, by `name@version`:
-/// every target's edges, every workspace feature enabled, so the reviewed features are
-/// the union any supported build can enable.
+/// The resolve `cargo metadata --locked` reports for one supported build profile, by
+/// `name@version`: every target's edges, with exactly the profile's features.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Resolve {
     packages: BTreeMap<String, Resolved>,
 }
 
+impl Resolve {
+    /// The union of the profiles' resolves: every package any of them resolves, each with
+    /// every feature and edge kind any of them gives it. The reviewed features are this
+    /// union, and kinds are judged from it.
+    fn union<'a>(resolves: impl IntoIterator<Item = &'a Resolve>) -> Resolve {
+        let mut out = Resolve::default();
+        for resolve in resolves {
+            for (key, package) in &resolve.packages {
+                let merged = out.packages.entry(key.clone()).or_insert_with(|| Resolved {
+                    features: BTreeSet::new(),
+                    deps: BTreeMap::new(),
+                    ..package.clone()
+                });
+                merged.features.extend(package.features.iter().cloned());
+                for (dep, kinds) in &package.deps {
+                    merged
+                        .deps
+                        .entry(dep.clone())
+                        .or_default()
+                        .extend(kinds.iter().copied());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One supported build profile (`profiles` in dependency-gate.json): its name, the
+/// workspace features `scripts/build.sh` passes for it, and what cargo resolves with
+/// exactly those flags.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Profile {
+    pub name: String,
+    pub features: Vec<String>,
+    pub resolve: Resolve,
+}
+
 fn parse_metadata(metadata: &serde_json::Value) -> Result<Resolve, String> {
-    let mut keys = BTreeMap::new();
+    let mut keys: BTreeMap<String, String> = BTreeMap::new();
     let mut resolve = Resolve::default();
     let members: BTreeSet<&str> = metadata["workspace_members"]
         .as_array()
@@ -355,8 +397,23 @@ fn parse_metadata(metadata: &serde_json::Value) -> Result<Resolve, String> {
                 .as_str()
                 .ok_or("a package without a version")?
         );
+        if resolve.packages.contains_key(&key) {
+            // Recheck 2 MEDIUM-1: two packages with one name and version (two registries,
+            // a registry and a path) would collapse into one review.
+            return Err(format!(
+                "cargo metadata resolves two packages with the same identity {key} ({} and {}): the gate keys every review by name@version and does not support one name and version from two sources; resolve one",
+                keys.iter()
+                    .find(|(_, k)| **k == key)
+                    .map_or("?", |(id, _)| id.as_str()),
+                id
+            ));
+        }
         let mut resolved = Resolved {
             member: members.contains(id),
+            declared: package["features"]
+                .as_object()
+                .map(|table| table.keys().cloned().collect())
+                .unwrap_or_default(),
             root: package["manifest_path"]
                 .as_str()
                 .and_then(|m| Path::new(m).parent())
@@ -722,7 +779,7 @@ fn tokens(text: &str) -> Vec<Token<'_>> {
 }
 
 /// One name a `use` brings in: its full path and the name it is known by, or a glob.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct UseItem {
     path: Vec<String>,
     alias: Option<String>,
@@ -953,34 +1010,6 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
     word_spans(text).map(|(_, word)| word)
 }
 
-/// Whether a `.` could come before the word at `at`, with only whitespace (or a comment,
-/// which might hide one) between them.
-fn dot_before(bytes: &[u8], at: usize) -> bool {
-    let mut i = at;
-    let mut crossed_line = false;
-    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
-        crossed_line |= bytes[i - 1] == b'\n';
-        i -= 1;
-    }
-    if i == 0 {
-        return false;
-    }
-    match bytes[i - 1] {
-        b'.' => true,
-        // The end of a block comment.
-        b'/' => true,
-        _ if crossed_line => {
-            // The line before may end in a `//` comment after a `.`.
-            let line_start = bytes[..i]
-                .iter()
-                .rposition(|b| *b == b'\n')
-                .map_or(0, |n| n + 1);
-            bytes[line_start..i].windows(2).any(|w| w == b"//")
-        }
-        _ => false,
-    }
-}
-
 /// The word after `at`, past whitespace; `Some("/")` when a comment intervenes, so the
 /// caller treats it as possible.
 fn word_after(bytes: &[u8], mut at: usize) -> Option<&str> {
@@ -1118,14 +1147,15 @@ fn without_test_modules(toks: Vec<Token<'_>>) -> Vec<Token<'_>> {
     out
 }
 
-/// The types a file defines itself (`struct`, `enum`, `union`, `type` and `trait`
-/// names), so a trait impl for a package's own `File` or `Command` is not mistaken for
-/// std's.
+/// The types a file defines itself (`struct`, `enum`, `union` and `trait` names), so a
+/// trait impl for a package's own `File` or `Command` is not mistaken for std's. A
+/// `type` alias defines no type of its own: it is resolved to its target instead
+/// ([`type_aliases`]).
 fn defined_types(toks: &[Token<'_>]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for pair in toks.windows(2) {
         if let [Token::Ident(keyword), Token::Ident(name)] = pair
-            && ["struct", "enum", "union", "type", "trait"].contains(keyword)
+            && ["struct", "enum", "union", "trait"].contains(keyword)
         {
             out.insert(name.to_string());
         }
@@ -1157,28 +1187,8 @@ fn impl_self_types(toks: &[Token]) -> Vec<Vec<String>> {
                 _ => {}
             }
         }
-        let Some(mut j) = at else { continue };
-        let mut referenced = false;
-        loop {
-            match toks.get(j) {
-                Some(Token::Punct('&')) => referenced = true,
-                Some(Token::Punct('*')) | Some(Token::PathSep) => {}
-                Some(Token::Ident(word)) if ["mut", "dyn", "const"].contains(word) => {}
-                // `&'a File`: the lexer leaves a lifetime's name as an identifier.
-                Some(Token::Ident(_))
-                    if referenced && matches!(toks.get(j + 1), Some(Token::Ident(_))) => {}
-                _ => break,
-            }
-            j += 1;
-        }
-        let mut path = Vec::new();
-        while let Some(Token::Ident(segment)) = toks.get(j) {
-            path.push(segment.to_string());
-            if toks.get(j + 1) != Some(&Token::PathSep) {
-                break;
-            }
-            j += 2;
-        }
+        let Some(j) = at else { continue };
+        let path = type_path_at(toks, j);
         if !path.is_empty() {
             out.push(path);
         }
@@ -1186,25 +1196,102 @@ fn impl_self_types(toks: &[Token]) -> Vec<Vec<String>> {
     out
 }
 
+/// The path of the type starting at `j`, with references, pointers, `mut`, `dyn`,
+/// `const` and lifetimes removed (`&'a mut std::fs::File` is `std::fs::File`).
+fn type_path_at(toks: &[Token], mut j: usize) -> Vec<String> {
+    let mut referenced = false;
+    loop {
+        match toks.get(j) {
+            Some(Token::Punct('&')) => referenced = true,
+            Some(Token::Punct('*')) | Some(Token::PathSep) => {}
+            Some(Token::Ident(word)) if ["mut", "dyn", "const"].contains(word) => {}
+            // `&'a File`: the lexer leaves a lifetime's name as an identifier.
+            Some(Token::Ident(_))
+                if referenced && matches!(toks.get(j + 1), Some(Token::Ident(_))) => {}
+            _ => break,
+        }
+        j += 1;
+    }
+    let mut path = Vec::new();
+    while let Some(Token::Ident(segment)) = toks.get(j) {
+        path.push(segment.to_string());
+        if toks.get(j + 1) != Some(&Token::PathSep) {
+            break;
+        }
+        j += 2;
+    }
+    path
+}
+
+/// Each `type Name = Target;` in a file (any visibility, an associated type's included,
+/// generics skipped), with the target's path as [`type_path_at`] reads it. Recheck 2
+/// HIGH-2: `pub type LocalFile = File;` then `impl Reset for LocalFile` is an impl for
+/// std's `File`.
+fn type_aliases(toks: &[Token]) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for (at, token) in toks.iter().enumerate() {
+        if *token != Token::Ident("type") {
+            continue;
+        }
+        let Some(Token::Ident(name)) = toks.get(at + 1) else {
+            continue;
+        };
+        let mut j = at + 2;
+        if toks.get(j) == Some(&Token::Punct('<')) {
+            let mut depth = 0;
+            while j < toks.len() {
+                match toks[j] {
+                    Token::Punct('<') => depth += 1,
+                    Token::Punct('>') if toks[j - 1] != Token::Punct('-') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        // `type Item;` and `type Item: Bound;` declare no target.
+        if toks.get(j) != Some(&Token::Punct('=')) {
+            continue;
+        }
+        let path = type_path_at(toks, j + 1);
+        if !path.is_empty() {
+            out.push((name.to_string(), path));
+        }
+    }
+    out
+}
+
 /// One file's scan: its sink labels, the bare flagged type names it implements a trait
-/// for (`impl X for File`, unresolved by any `use`), and the types it defines.
+/// for (`impl X for File`, unresolved by any `use` or `type` alias) or aliases (`type X =
+/// File`), and the types it defines.
 #[derive(Default)]
 struct FileScan {
     sinks: BTreeSet<String>,
     bare_impls: BTreeSet<String>,
+    bare_aliases: BTreeSet<String>,
     defined: BTreeSet<String>,
 }
 
 /// What a dependency's own library source reaches that a non-destructive declaration
 /// must account for, by sink label:
 ///
-/// - `.name(`: a method call whose name is a [`METHOD_SINKS`] pattern, whatever the
-///   receiver;
+/// - `name`: an identifier matching a [`METHOD_SINKS`] pattern, wherever it is (recheck 2
+///   HIGH-2): a method call whatever the receiver, a UFCS or associated call through any
+///   qualifier (`LocalFile::set_len(f, 0)`), a function value, a `use` list, a
+///   definition. Only comments, strings and inline test modules hide one;
 /// - a std, Tokio or libc (or other reviewed crate's) path clippy.toml disallows, named
 ///   through any `use` alias;
 /// - `impl for std::fs::File` and the like: a trait impl for a [`FLAGGED_IMPL_TYPES`]
-///   type, or `impl for File` (and `OpenOptions`, `Child`, `Command`) when the bare name
-///   is neither imported by a `use` nor a type the package defines (a glob import).
+///   type, named through any `use` or `type` alias, or `impl for File` (and
+///   `OpenOptions`, `Child`, `Command`) when the bare name is neither imported nor a type
+///   the package defines (a glob import);
+/// - `type alias for std::fs::File` and the like: a `type` alias whose target is one of
+///   those types, resolved the same way (recheck 2 HIGH-2).
 struct SinkScanner<'a> {
     disallowed: &'a BTreeSet<String>,
     /// Every proper prefix of a disallowed path, so a path is followed only as far as it
@@ -1246,7 +1333,7 @@ impl<'a> SinkScanner<'a> {
             .copied()
             .chain(METHOD_SINKS.iter().map(|(p, _)| p.trim_matches('*')))
             .chain(FLAGGED_NAMES)
-            .chain(["for"])
+            .chain(["for", "type"])
         {
             initial[word.as_bytes()[0] as usize] = true;
         }
@@ -1280,10 +1367,10 @@ impl<'a> SinkScanner<'a> {
     /// Whether a file could make a hit, from its raw text. Each hit is built from the
     /// file's own tokens, so a file passes only if it has one of:
     ///
-    /// - a method-sink name with a `.` before it (whitespace, or a comment that might
-    ///   hide one, between them);
+    /// - a method-sink name anywhere;
     /// - a flagged type's name after `for` (references, `mut`, `dyn`, lifetimes and path
     ///   segments between them) or before `as` (an aliasing `use`);
+    /// - a flagged type's name and the word `type` (a `type` alias);
     /// - every segment of some disallowed path, its crate included (`core` or `alloc`
     ///   for std).
     ///
@@ -1292,6 +1379,7 @@ impl<'a> SinkScanner<'a> {
     fn worth_lexing(&self, text: &str) -> bool {
         let bytes = text.as_bytes();
         let mut seen = vec![false; self.needed.len()];
+        let (mut flagged_name, mut type_keyword) = (false, false);
         let mut at = 0;
         while at < bytes.len() {
             // The next word, by hand: this loop runs over every scanned byte.
@@ -1309,10 +1397,17 @@ impl<'a> SinkScanner<'a> {
             }
             let word = &text[start..at];
             let at = start;
-            if method_sink(word) && dot_before(bytes, at) {
+            if method_sink(word) {
                 return true;
             }
-            if FLAGGED_NAMES.contains(&word) && word_after(bytes, at + word.len()) == Some("as") {
+            if FLAGGED_NAMES.contains(&word) {
+                if word_after(bytes, at + word.len()) == Some("as") {
+                    return true;
+                }
+                flagged_name = true;
+            }
+            type_keyword |= word == "type";
+            if flagged_name && type_keyword {
                 return true;
             }
             if word == "for" && flagged_type_after(text, at + 3) {
@@ -1347,14 +1442,12 @@ impl<'a> SinkScanner<'a> {
         }
         let toks = without_test_modules(tokens(text));
         out.defined = defined_types(&toks);
-        // Method-form sinks.
-        for (at, token) in toks.iter().enumerate() {
-            if *token == Token::Punct('.')
-                && let Some(Token::Ident(name)) = toks.get(at + 1)
-                && matches!(toks.get(at + 2), Some(Token::Punct('(') | Token::PathSep))
+        // Sink identifiers, wherever they are.
+        for token in &toks {
+            if let Token::Ident(name) = token
                 && method_sink(name)
             {
-                out.sinks.insert(format!(".{name}("));
+                out.sinks.insert((*name).to_string());
             }
         }
         // Disallowed paths.
@@ -1400,20 +1493,45 @@ impl<'a> SinkScanner<'a> {
                 }
             }
         }
-        // Trait impls for std's and Tokio's file and process types.
-        let aliases = alias_map(&uses, &self.impl_roots);
+        // Trait impls for std's and Tokio's file and process types, and `type` aliases of
+        // them: a `type` alias resolves like a `use` alias.
+        let declared_aliases = type_aliases(&toks);
+        let mut names = uses.clone();
+        names.extend(declared_aliases.iter().map(|(name, target)| UseItem {
+            path: target.clone(),
+            alias: Some(name.clone()),
+        }));
+        let aliases = alias_map(&names, &self.impl_roots);
+        let named = |bare: &str| names.iter().any(|u| u.alias.as_deref() == Some(bare));
+        let flagged = |path: &[String]| {
+            resolve_path(&aliases, &self.impl_roots, path)
+                .map(|p| as_std(&p.join("::")))
+                .map(|full| (FLAGGED_IMPL_TYPES.contains(&full.as_str()), full))
+        };
         for path in impl_self_types(&toks) {
-            match resolve_path(&aliases, &self.impl_roots, &path).map(|p| as_std(&p.join("::"))) {
-                Some(full) if FLAGGED_IMPL_TYPES.contains(&full.as_str()) => {
+            match flagged(&path) {
+                Some((true, full)) => {
                     out.sinks.insert(format!("impl for {full}"));
                 }
                 None if path.len() == 1
                     && FLAGGED_NAMES.contains(&path[0].as_str())
-                    && !uses
-                        .iter()
-                        .any(|u| u.alias.as_deref() == Some(path[0].as_str())) =>
+                    && !named(&path[0]) =>
                 {
                     out.bare_impls.insert(path[0].clone());
+                }
+                _ => {}
+            }
+        }
+        for (_, target) in &declared_aliases {
+            match flagged(target) {
+                Some((true, full)) => {
+                    out.sinks.insert(format!("type alias for {full}"));
+                }
+                None if target.len() == 1
+                    && FLAGGED_NAMES.contains(&target[0].as_str())
+                    && !named(&target[0]) =>
+                {
+                    out.bare_aliases.insert(target[0].clone());
                 }
                 _ => {}
             }
@@ -1436,6 +1554,11 @@ fn package_sinks(
         }
         for name in scan.bare_impls.iter().filter(|n| !defined.contains(n)) {
             out.entry(format!("impl for {name}"))
+                .or_default()
+                .insert(file.clone());
+        }
+        for name in scan.bare_aliases.iter().filter(|n| !defined.contains(n)) {
+            out.entry(format!("type alias for {name}"))
                 .or_default()
                 .insert(file.clone());
         }
@@ -1499,11 +1622,12 @@ fn impure_paths(files: &[(String, String)]) -> BTreeSet<String> {
 
 /// What the gate reads. `sources` is the workspace's production source (path label,
 /// text); `package_sources` each locked package's own library source by `name@version`;
-/// `resolve` what `cargo metadata` resolves (features, edge kinds, proc macros).
+/// `profiles` what `cargo metadata` resolves (features, edge kinds, proc macros) for each
+/// supported build profile, with exactly the flags `scripts/build.sh` passes.
 pub(super) struct Inputs {
     pub lock: String,
     pub manifests: Vec<(String, String)>,
-    pub resolve: Resolve,
+    pub profiles: Vec<Profile>,
     pub sources: Vec<(String, String)>,
     pub package_sources: BTreeMap<String, Vec<(String, String)>>,
     pub gate: serde_json::Value,
@@ -1541,7 +1665,30 @@ struct Exception {
 pub(super) fn violations(inputs: &Inputs) -> Vec<String> {
     let mut wrong = Vec::new();
     let lock = lock_entries(&inputs.lock);
-    let resolve = &inputs.resolve;
+    // Recheck 2 MEDIUM-1: one name and version from two sources cannot be reviewed under
+    // one key, so it fails before anything is matched by name@version.
+    let mut identities: BTreeMap<String, Vec<&LockEntry>> = BTreeMap::new();
+    for entry in &lock {
+        identities.entry(entry.key()).or_default().push(entry);
+    }
+    for (key, entries) in identities.iter().filter(|(_, e)| e.len() > 1) {
+        let describe = |entry: &&LockEntry| {
+            format!(
+                "{} {}",
+                entry.source.as_deref().unwrap_or("(workspace or path)"),
+                entry.checksum.as_deref().unwrap_or("(no checksum)")
+            )
+        };
+        wrong.push(format!(
+            "Cargo.lock locks {} packages with the same identity {key} ({}): the gate keys every review by name@version and does not support one name and version from two sources; resolve one",
+            entries.len(),
+            entries.iter().map(describe).collect::<Vec<_>>().join("; ")
+        ));
+    }
+    if !wrong.is_empty() {
+        return wrong;
+    }
+    let resolve = &Resolve::union(inputs.profiles.iter().map(|p| &p.resolve));
     let graph = graph_kinds(resolve);
     let disallowed = clippy_paths(&inputs.clippy);
     let empty = BTreeSet::new();
@@ -1562,6 +1709,106 @@ pub(super) fn violations(inputs: &Inputs) -> Vec<String> {
     let mut by_name: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
     for (key, entry) in &locked {
         by_name.entry(entry.name.as_str()).or_default().push(key);
+    }
+
+    // Recheck 2 HIGH-1: the supported build profiles. Each enables only checked-in
+    // workspace features, and the graph each one resolves is the graph its build uses.
+    let reviewed_profiles: BTreeMap<String, serde_json::Value> = match inputs.gate["profiles"]
+        .as_object()
+    {
+        Some(profiles) if !profiles.is_empty() => profiles
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        _ => {
+            wrong.push("dependency-gate.json needs `profiles`, the supported builds scripts/build.sh makes: at least `default`, with no features".into());
+            BTreeMap::new()
+        }
+    };
+    for (name, profile) in &reviewed_profiles {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            wrong.push(format!(
+                "profile {name:?} is not a lower-case name (letters, digits and `-`)"
+            ));
+        }
+        let Some(object) = profile.as_object() else {
+            wrong.push(format!("profile {name} is not an object"));
+            continue;
+        };
+        for field in object.keys() {
+            if !PROFILE_FIELDS.contains(&field.as_str()) {
+                wrong.push(format!("profile {name} has an unknown field {field:?}"));
+            }
+        }
+        if text(&profile["why"]).is_none() {
+            wrong.push(format!(
+                "profile {name} gives no reason (`why`: who builds it)"
+            ));
+        }
+        match strings(&profile["features"]).filter(|_| profile["features"].is_array()) {
+            Some(features) if name == "default" && !features.is_empty() => wrong.push(
+                "profile default enables features; it is the build with none".into(),
+            ),
+            Some(_) => {}
+            None => wrong.push(format!(
+                "profile {name} needs `features`, the list of workspace features (member/feature) it enables"
+            )),
+        }
+    }
+    if !reviewed_profiles.is_empty() && !reviewed_profiles.contains_key("default") {
+        wrong.push(
+            "dependency-gate.json's `profiles` has no `default`, the build with no features".into(),
+        );
+    }
+    let resolved_profiles: BTreeMap<&str, &Profile> = inputs
+        .profiles
+        .iter()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
+    for (name, profile) in &reviewed_profiles {
+        let features = strings(&profile["features"]).unwrap_or_default();
+        match resolved_profiles.get(name.as_str()) {
+            Some(resolved) if resolved.features == features => {}
+            _ => wrong.push(format!(
+                "profile {name} was not resolved with exactly its features {}",
+                list(&features.into_iter().collect())
+            )),
+        }
+    }
+    for profile in &inputs.profiles {
+        if !reviewed_profiles.contains_key(&profile.name) {
+            wrong.push(format!(
+                "profile {} was resolved but is not in dependency-gate.json",
+                profile.name
+            ));
+        }
+        for feature in &profile.features {
+            let declared = feature.split_once('/').is_some_and(|(member, feature)| {
+                profile.resolve.packages.iter().any(|(key, package)| {
+                    package.member
+                        && key.split('@').next() == Some(member)
+                        && package.declared.contains(feature)
+                })
+            });
+            if !declared {
+                wrong.push(format!(
+                    "profile {} selects {feature}, which is not a feature a workspace member declares: a profile enables only checked-in workspace features (member/feature), so forward a dependency's feature through one",
+                    profile.name
+                ));
+            }
+        }
+        for (key, package) in &profile.resolve.packages {
+            if !package.member && !locked.contains_key(key) {
+                wrong.push(format!(
+                    "profile {} resolves {key}, which Cargo.lock does not lock: the build would use a package no review covers",
+                    profile.name
+                ));
+            }
+        }
     }
     let raw_underneath = |key: &str| {
         let name = key.split('@').next().unwrap();
@@ -1663,7 +1910,7 @@ pub(super) fn violations(inputs: &Inputs) -> Vec<String> {
         }
         if !resolve.packages.contains_key(key) {
             wrong.push(format!(
-                "{key} is in Cargo.lock but cargo metadata did not resolve it"
+                "{key} is in Cargo.lock but no supported build profile resolves it"
             ));
         }
         if !entries.contains_key(key) {
@@ -2193,15 +2440,32 @@ pub(super) fn violations(inputs: &Inputs) -> Vec<String> {
 // ---------------------------------------------------------------------------------
 // The workspace as it is: the actual source loader.
 
+/// The workspace this test binary was built from (cargo sets `CARGO_MANIFEST_DIR` at
+/// compile time). The authoritative gate checks this root and nothing else.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The workspace the gate test checks: this one, unless `KILND_DEPENDENCY_GATE_ROOT`
-/// names another. Only `scripts/dependency-gate-regressions.sh` sets it, to run this same
-/// test binary, and so this same loader, against its fixture copies of the workspace.
-fn gate_root() -> PathBuf {
-    std::env::var_os("KILND_DEPENDENCY_GATE_ROOT").map_or_else(workspace_root, PathBuf::from)
+/// The variable naming a fixture workspace for [`regression_fixture_gate`], the ignored
+/// test only `scripts/dependency-gate-regressions.sh` runs. The authoritative
+/// [`the_dependency_gate_holds`] never reads it (recheck 2 MEDIUM-2).
+const FIXTURE_VARIABLE: &str = "KILND_DEPENDENCY_GATE_FIXTURE";
+
+/// Each supported build profile dependency-gate.json defines, with the workspace
+/// features `scripts/build.sh` passes for it. A malformed section yields what it can;
+/// the gate refuses it.
+fn profile_flags(gate: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    gate["profiles"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, profile)| {
+            let features = strings(&profile["features"])
+                .filter(|_| profile["features"].is_array())
+                .unwrap_or_default();
+            (name.clone(), features)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2209,21 +2473,21 @@ fn gate_root() -> PathBuf {
 // features, edge kinds and each package's extracted source; `cargo metadata` reads and
 // downloads, and changes nothing outside cargo's own cache.
 #[allow(clippy::disallowed_methods)]
-fn cargo_metadata(root: &Path) -> Result<serde_json::Value, String> {
+fn cargo_metadata(root: &Path, features: &[String]) -> Result<serde_json::Value, String> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     // From the workspace itself, so its own `.cargo/config.toml` (a vendored source, in
-    // the regression script's fixtures) applies.
-    let output = std::process::Command::new(cargo)
+    // the regression script's fixtures) applies. Exactly the profile's flags, as
+    // scripts/build.sh passes them: `--locked`, and `--features` only if it has some.
+    let mut command = std::process::Command::new(cargo);
+    command
         .current_dir(root)
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--locked",
-            "--all-features",
-        ])
+        .args(["metadata", "--format-version", "1", "--locked"])
         .arg("--manifest-path")
-        .arg(root.join("Cargo.toml"))
+        .arg(root.join("Cargo.toml"));
+    if !features.is_empty() {
+        command.arg("--features").arg(features.join(","));
+    }
+    let output = command
         .output()
         .map_err(|e| format!("cargo metadata: {e}"))?;
     if !output.status.success() {
@@ -2235,10 +2499,41 @@ fn cargo_metadata(root: &Path) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&output.stdout).map_err(|e| format!("cargo metadata: {e}"))
 }
 
-/// This workspace's resolve, once per test binary.
+/// What cargo resolves for each supported build profile of the workspace at `root`.
+fn profiles_at(root: &Path, gate: &serde_json::Value) -> Vec<Profile> {
+    profile_flags(gate)
+        .into_iter()
+        .map(|(name, features)| {
+            let resolve = cargo_metadata(root, &features)
+                .and_then(|metadata| parse_metadata(&metadata))
+                .unwrap_or_else(|e| panic!("profile {name}: {e}"));
+            Profile {
+                name,
+                features,
+                resolve,
+            }
+        })
+        .collect()
+}
+
+fn gate_file(root: &Path) -> serde_json::Value {
+    serde_json::from_str(&read(&root.join("dependency-gate.json")))
+        .expect("dependency-gate.json is not JSON")
+}
+
+/// This workspace's profiles, once per test binary.
+fn workspace_profiles() -> &'static Vec<Profile> {
+    static PROFILES: std::sync::OnceLock<Vec<Profile>> = std::sync::OnceLock::new();
+    PROFILES.get_or_init(|| {
+        let root = workspace_root();
+        profiles_at(&root, &gate_file(&root))
+    })
+}
+
+/// The union of this workspace's profile resolves, once per test binary.
 fn workspace_resolve() -> &'static Resolve {
     static RESOLVE: std::sync::OnceLock<Resolve> = std::sync::OnceLock::new();
-    RESOLVE.get_or_init(|| parse_metadata(&cargo_metadata(&workspace_root()).unwrap()).unwrap())
+    RESOLVE.get_or_init(|| Resolve::union(workspace_profiles().iter().map(|p| &p.resolve)))
 }
 
 /// The extracted source directory of each locked version of `name` (cargo verified it
@@ -2337,10 +2632,13 @@ fn inputs_at(root: &Path) -> Inputs {
         manifests.len() >= 6,
         "the workspace's crates were not found"
     );
-    let resolve = if root == workspace_root() {
-        workspace_resolve().clone()
+    let gate = gate_file(root);
+    let (profiles, resolve) = if root == workspace_root() {
+        (workspace_profiles().clone(), workspace_resolve().clone())
     } else {
-        parse_metadata(&cargo_metadata(root).unwrap()).unwrap()
+        let profiles = profiles_at(root, &gate);
+        let resolve = Resolve::union(profiles.iter().map(|p| &p.resolve));
+        (profiles, resolve)
     };
     let mut package_sources = BTreeMap::new();
     for (key, package) in resolve.packages.iter().filter(|(_, p)| !p.member) {
@@ -2373,26 +2671,122 @@ fn inputs_at(root: &Path) -> Inputs {
     Inputs {
         lock: read(&root.join("Cargo.lock")),
         manifests,
-        resolve,
+        profiles,
         sources: workspace_sources(root),
         package_sources,
-        gate: serde_json::from_str(&read(&root.join("dependency-gate.json")))
-            .expect("dependency-gate.json is not JSON"),
+        gate,
         clippy: read(&root.join("clippy.toml")),
     }
 }
 
-/// HIGH-1: the gate holds for the workspace as it is.
-#[test]
-fn the_dependency_gate_holds() {
-    let root = gate_root();
-    let wrong = violations(&inputs_at(&root));
+fn assert_gate_holds(root: &Path) {
+    let wrong = violations(&inputs_at(root));
     assert!(
         wrong.is_empty(),
         "the dependency gate fails for {}:\n{}",
         root.display(),
         wrong.join("\n")
     );
+}
+
+/// HIGH-1: the gate holds for the workspace as it is. This is the authoritative test:
+/// it checks the workspace this binary was built from, and reads no environment
+/// variable to choose another (recheck 2 MEDIUM-2).
+#[test]
+fn the_dependency_gate_holds() {
+    assert_gate_holds(&workspace_root());
+}
+
+/// The same gate and loader against a fixture copy of the workspace, for
+/// `scripts/dependency-gate-regressions.sh` alone: ignored by default, so `cargo test`
+/// (and CI's gate) never runs it, and it refuses to run without its variable.
+#[test]
+#[ignore = "run only by scripts/dependency-gate-regressions.sh, against a fixture workspace"]
+fn regression_fixture_gate() {
+    let root = std::env::var_os(FIXTURE_VARIABLE)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("{FIXTURE_VARIABLE} names no fixture workspace"));
+    assert_gate_holds(&root);
+}
+
+/// Recheck 2 HIGH-1: every supported build runs cargo through `scripts/build.sh` and a
+/// profile, so the graph it builds is one the gate reviewed. CI, the installer, the
+/// upgrade path, the VM scripts and the setup instructions name no cargo build of their
+/// own (comments, CI step names and version queries aside).
+#[test]
+fn supported_builds_use_the_build_entry_point() {
+    const BUILDS: [&str; 8] = [
+        "build", "test", "clippy", "check", "run", "rustc", "doc", "install",
+    ];
+    let root = workspace_root();
+    let mut raw = Vec::new();
+    for file in [
+        ".github/workflows/ci.yml",
+        "scripts/install.sh",
+        "scripts/upgrade.sh",
+        "scripts/add-instance.sh",
+        "scripts/b4-vm-tests.sh",
+        "scripts/integration-test.sh",
+        "docs/setup.md",
+        "README.md",
+    ] {
+        for (number, line) in read(&root.join(file)).lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || trimmed.starts_with("- name:") {
+                continue;
+            }
+            let code = line.split(" #").next().unwrap();
+            let words: Vec<&str> = code
+                .split(|c: char| c.is_whitespace() || "();|&`\"'$=".contains(c))
+                .filter(|w| !w.is_empty())
+                .collect();
+            for (at, word) in words.iter().enumerate() {
+                if *word != "cargo" {
+                    continue;
+                }
+                let mut next = at + 1;
+                if words.get(next).is_some_and(|w| w.starts_with('+')) {
+                    next += 1;
+                }
+                // `cargo clippy --version` only reports the toolchain.
+                if words.get(next).is_some_and(|w| BUILDS.contains(w))
+                    && words.get(next + 1) != Some(&"--version")
+                {
+                    raw.push(format!("{file}:{}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        raw.is_empty(),
+        "supported builds go through scripts/build.sh PROFILE:\n{}",
+        raw.join("\n")
+    );
+}
+
+/// Recheck 2 MEDIUM-2: the authoritative test's root comes from the build alone. Its
+/// body and `workspace_root` read no environment variable at run time.
+#[test]
+fn the_authoritative_gate_reads_no_environment() {
+    // cargo compiles workspace members from the workspace root, so `file!()` is relative
+    // to it.
+    let source = read(&workspace_root().join(file!()));
+    for function in [
+        "fn the_dependency_gate_holds() {",
+        "fn workspace_root() -> PathBuf {",
+        "fn assert_gate_holds(root: &Path) {",
+    ] {
+        let start = source
+            .find(function)
+            .unwrap_or_else(|| panic!("{function} not found"));
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        for read_at_run_time in ["env::var", "var_os", "FIXTURE_VARIABLE", "KILND_"] {
+            assert!(
+                !body.contains(read_at_run_time),
+                "{function} uses {read_at_run_time}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -3015,10 +3409,17 @@ fn demo(extra_lock: &str, extra_dependencies: &str, extra_workspace: &[&str]) ->
                 "[package]\nname = \"demo\"\n\n[dependencies]\nlibc.workspace = true\n{extra_dependencies}\n[dev-dependencies]\ntempfile = \"3\"\n"
             ),
         )],
-        resolve: Resolve::default(),
+        profiles: vec![Profile {
+            name: "default".into(),
+            ..Profile::default()
+        }],
         sources: vec![("demo/src/lib.rs".into(), "pub fn f() {}\n".into())],
         package_sources: BTreeMap::new(),
-        gate: serde_json::json!({"packages": {}, "sink_exceptions": []}),
+        gate: serde_json::json!({
+            "profiles": {"default": {"features": [], "why": "x"}},
+            "packages": {},
+            "sink_exceptions": [],
+        }),
         clippy: "disallowed-methods = [\n  { path = \"libc::kill\", reason = \"x\" },\n  { path = \"tempfile::NamedTempFile::persist\", reason = \"x\" },\n]\n".into(),
     };
     review(
@@ -3065,20 +3466,38 @@ fn source(inputs: &mut Inputs, name: &str, text: &str) {
     );
 }
 
-/// Runs the gate on a synthetic workspace: the resolve is derived from its lock and
-/// manifests, with any features the test set in `inputs.resolve`.
+/// Runs the gate on a synthetic workspace: each profile's resolve is derived from its
+/// lock and manifests, with the features, proc macros and declared features the test set
+/// in that profile's `resolve`, and any package the test added there that the lock does
+/// not have.
 fn check(inputs: &Inputs) -> String {
-    let mut resolve = synthetic_resolve(&inputs.lock, &inputs.manifests);
-    for (key, package) in &inputs.resolve.packages {
-        if let Some(resolved) = resolve.packages.get_mut(key) {
-            resolved.features = package.features.clone();
-            resolved.proc_macro = package.proc_macro;
-        }
-    }
+    let profiles = inputs
+        .profiles
+        .iter()
+        .map(|profile| {
+            let mut resolve = synthetic_resolve(&inputs.lock, &inputs.manifests);
+            for (key, package) in &profile.resolve.packages {
+                match resolve.packages.get_mut(key) {
+                    Some(resolved) => {
+                        resolved.features = package.features.clone();
+                        resolved.proc_macro = package.proc_macro;
+                        resolved.declared = package.declared.clone();
+                    }
+                    None => {
+                        resolve.packages.insert(key.clone(), package.clone());
+                    }
+                }
+            }
+            Profile {
+                resolve,
+                ..profile.clone()
+            }
+        })
+        .collect();
     let inputs = Inputs {
         lock: inputs.lock.clone(),
         manifests: inputs.manifests.clone(),
-        resolve,
+        profiles,
         sources: inputs.sources.clone(),
         package_sources: inputs.package_sources.clone(),
         gate: inputs.gate.clone(),
@@ -3088,7 +3507,7 @@ fn check(inputs: &Inputs) -> String {
 }
 
 fn set_features(inputs: &mut Inputs, key: &str, features: &[&str]) {
-    inputs
+    inputs.profiles[0]
         .resolve
         .packages
         .entry(key.to_string())
@@ -3150,9 +3569,9 @@ fn b7m2_an_fs_err_wrapper_declared_none_is_refused() {
         "{wrong}"
     );
     assert!(
-        wrong.contains(
-            "fs-err@1.0.0 is declared `none`, but its runtime subtree reaches `std::fs::remove_dir_all` in fs-err@1.0.0"
-        ),
+        wrong.contains("fs-err@1.0.0 is declared `none`, but its runtime subtree reaches")
+            && wrong.contains("`std::fs::remove_dir_all` in fs-err@1.0.0")
+            && wrong.contains("`remove_dir_all` in fs-err@1.0.0"),
         "{wrong}"
     );
     // The same through an alias, a grouped import or a crate rename.
@@ -3269,7 +3688,7 @@ fn b7m2_recheck_a_method_wrapper_is_refused() {
     // Daybreak's direct case: `filesystem` with `no_destructive_api`.
     let wrong = check(&method_wrapper(no_destructive_api()));
     assert!(
-        wrong.contains("method-wrapper@1.0.0 is declared `filesystem` with no destructive API, but its runtime subtree reaches `.set_len(` in method-wrapper@1.0.0 (method-wrapper-1.0.0/src/lib.rs)"),
+        wrong.contains("method-wrapper@1.0.0 is declared `filesystem` with no destructive API, but its runtime subtree reaches `impl for std::fs::File` in method-wrapper@1.0.0 (method-wrapper-1.0.0/src/lib.rs); `set_len` in method-wrapper@1.0.0 (method-wrapper-1.0.0/src/lib.rs)"),
         "{wrong}"
     );
     assert!(
@@ -3277,7 +3696,7 @@ fn b7m2_recheck_a_method_wrapper_is_refused() {
         "{wrong}"
     );
     assert!(
-        wrong.contains(r#"{"features":[],"package":"method-wrapper","sinks":[".set_len(","impl for std::fs::File"],"version":"1.0.0"}"#),
+        wrong.contains(r#"{"features":[],"package":"method-wrapper","sinks":["impl for std::fs::File","set_len"],"version":"1.0.0"}"#),
         "the refusal drafts the exception: {wrong}"
     );
     // And `none`.
@@ -3286,7 +3705,7 @@ fn b7m2_recheck_a_method_wrapper_is_refused() {
     ));
     assert!(
         wrong.contains(
-            "method-wrapper@1.0.0 is declared `none`, but its runtime subtree reaches `.set_len(`"
+            "method-wrapper@1.0.0 is declared `none`, but its runtime subtree reaches `impl for std::fs::File` in method-wrapper@1.0.0 (method-wrapper-1.0.0/src/lib.rs); `set_len`"
         ),
         "{wrong}"
     );
@@ -3310,6 +3729,16 @@ fn b7m2_recheck_a_method_wrapper_is_refused() {
         "use std::fs::*;\npub fn tidy(p: &std::path::Path) { let _ = remove_file(p); }\n",
         "use std::fs::*;\npub fn fresh(p: &std::path::Path) { let _ = File::create(p); }\n",
         "use std::{fs::*, io};\npub fn tidy(p: &std::path::Path) -> io::Result<()> { remove_dir_all(p) }\n",
+        // Recheck 2 HIGH-2: the identifier itself, whatever surrounds it. Daybreak's type
+        // alias plus UFCS, a qualifier of any kind, a function value, a `use` list, a
+        // definition and a field.
+        "use std::fs::File;\npub type LocalFile = File;\npub trait Reset { fn reset(&self) -> std::io::Result<()>; }\nimpl Reset for LocalFile { fn reset(&self) -> std::io::Result<()> { LocalFile::set_len(self, 0) } }\n",
+        "pub fn f(x: &Handle) { let _ = Handle::set_len(x, 0); }\n",
+        "pub fn f(x: &Handle) { let _ = <Handle as Len>::set_len(x, 0); }\n",
+        "pub fn f() -> fn(&Handle, u64) -> u8 { Handle::set_len }\n",
+        "pub use crate::handle::{open, set_len};\n",
+        "pub trait SetLen { fn set_len(&self, n: u64); }\n",
+        "pub fn f(s: &S) { s.exec.run(); }\n",
     ] {
         let mut inputs = method_wrapper(no_destructive_api());
         source(&mut inputs, "method-wrapper", wrapper);
@@ -3319,11 +3748,12 @@ fn b7m2_recheck_a_method_wrapper_is_refused() {
             "{wrapper}\n{wrong}"
         );
     }
-    // Not sinks: a definition, a field, other methods, strings and comments, a trait impl
-    // for the package's own `File`, or for a `File` it imports from elsewhere.
+    // Not sinks: other methods, strings and comments, a trait impl for the package's own
+    // `File`, or for a `File` it imports from elsewhere, or an alias of either.
     for wrapper in [
-        "pub trait SetLen { fn set_len(&self, n: u64); }\n",
-        "pub fn f(s: &S) { s.exec.run(); s.write(b\"x\"); let _ = \".set_len(0)\"; } // .kill()\n",
+        "pub fn f(s: &S) { s.write(b\"x\"); let _ = \".set_len(0)\"; } // .kill() Handle::set_len\n",
+        "pub struct File;\npub type LocalFile = File;\npub trait Reset {}\nimpl Reset for LocalFile {}\n",
+        "use crate::fs::File;\npub type Handle<'a> = &'a File;\n",
         "pub struct File;\npub trait Reset {}\nimpl Reset for File {}\n",
         "use crate::fs::File;\npub trait Reset {}\nimpl Reset for File {}\n",
         "pub trait Reset {}\nimpl<T: Fn() -> u8> Reset for T where T: Copy {}\n",
@@ -3338,14 +3768,14 @@ fn b7m2_recheck_a_method_wrapper_is_refused() {
 #[test]
 fn b7m2_recheck_a_transitive_wrapper_is_refused() {
     // Daybreak's transitive case: the inner package is unreviewed, and the `none` outer
-    // package's subtree scan reaches the inner package's `.set_len(`.
+    // package's subtree scan reaches the inner package's `set_len`.
     let wrong = check(&transitive_wrapper());
     assert!(
         wrong.contains("inner-wrapper@1.0.0 is in Cargo.lock with no reviewed entry"),
         "{wrong}"
     );
     assert!(
-        wrong.contains("outer-wrapper@1.0.0 is declared `none`, but its runtime subtree reaches `.set_len(` in inner-wrapper@1.0.0"),
+        wrong.contains("outer-wrapper@1.0.0 is declared `none`, but its runtime subtree reaches `impl for std::fs::File` in inner-wrapper@1.0.0 (inner-wrapper-1.0.0/src/lib.rs); `set_len` in inner-wrapper@1.0.0"),
         "{wrong}"
     );
     // Reviewing the inner package as `none` too does not help: both declarations fail.
@@ -3359,12 +3789,12 @@ fn b7m2_recheck_a_transitive_wrapper_is_refused() {
     assert!(!wrong.contains("no reviewed entry"), "{wrong}");
     assert!(
         wrong.contains(
-            "inner-wrapper@1.0.0 is declared `none`, but its runtime subtree reaches `.set_len(`"
+            "inner-wrapper@1.0.0 is declared `none`, but its runtime subtree reaches `impl for std::fs::File` in inner-wrapper@1.0.0 (inner-wrapper-1.0.0/src/lib.rs); `set_len`"
         ),
         "{wrong}"
     );
     assert!(
-        wrong.contains("outer-wrapper@1.0.0 is declared `none`, but its runtime subtree reaches `.set_len(` in inner-wrapper@1.0.0"),
+        wrong.contains("outer-wrapper@1.0.0 is declared `none`, but its runtime subtree reaches `impl for std::fs::File` in inner-wrapper@1.0.0 (inner-wrapper-1.0.0/src/lib.rs); `set_len` in inner-wrapper@1.0.0"),
         "{wrong}"
     );
     // Its source must be there to scan.
@@ -3503,7 +3933,7 @@ fn b7m2_recheck_an_exception_holds_only_for_its_scope() {
             "package": "method-wrapper",
             "version": "1.0.0",
             "features": [],
-            "sinks": [".set_len(", "impl for std::fs::File"],
+            "sinks": ["impl for std::fs::File", "set_len"],
             "why": "fixture: reviewed",
         })
     };
@@ -3524,7 +3954,7 @@ fn b7m2_recheck_an_exception_holds_only_for_its_scope() {
         "{wrong}"
     );
     assert!(
-        wrong.contains("but its runtime subtree reaches `.set_len(` in method-wrapper@1.0.0"),
+        wrong.contains("but its runtime subtree reaches `impl for std::fs::File` in method-wrapper@1.0.0 (method-wrapper-1.0.0/src/lib.rs); `set_len` in method-wrapper@1.0.0"),
         "{wrong}"
     );
     // Another version: stale, and the new version is unreviewed and unexcepted.
@@ -3544,14 +3974,14 @@ fn b7m2_recheck_an_exception_holds_only_for_its_scope() {
     );
     // Another sink: the uncovered one still refuses, and the unused one is stale.
     let mut other = exception();
-    other["sinks"] = serde_json::json!([".kill(", "impl for std::fs::File"]);
+    other["sinks"] = serde_json::json!(["impl for std::fs::File", "kill"]);
     let wrong = check(&reviewed(other));
     assert!(
-        wrong.contains("reaches `.set_len(` in method-wrapper@1.0.0"),
+        wrong.contains("reaches `set_len` in method-wrapper@1.0.0"),
         "{wrong}"
     );
     assert!(
-        wrong.contains("the sink exception for method-wrapper@1.0.0 names .kill(, which its source does not reach"),
+        wrong.contains("the sink exception for method-wrapper@1.0.0 names kill, which its source does not reach"),
         "{wrong}"
     );
     // Another package: the exception covers only the package the hit is in.
@@ -3566,7 +3996,7 @@ fn b7m2_recheck_an_exception_holds_only_for_its_scope() {
     inputs.gate["sink_exceptions"] = serde_json::json!([outer]);
     let wrong = check(&inputs);
     assert!(
-        wrong.contains("reaches `.set_len(` in inner-wrapper@1.0.0"),
+        wrong.contains("reaches `impl for std::fs::File` in inner-wrapper@1.0.0 (inner-wrapper-1.0.0/src/lib.rs); `set_len` in inner-wrapper@1.0.0"),
         "{wrong}"
     );
     // No reason, no features: refused.
@@ -3773,7 +4203,7 @@ fn b7m2_recheck_proc_macros_are_build_time() {
         + &package("serde_derive", &["syn"])
         + &package("syn", &[]);
     let mut inputs = demo(&lock, "serde = \"1\"\n", &["serde"]);
-    inputs
+    inputs.profiles[0]
         .resolve
         .packages
         .entry("serde_derive@1.0.0".into())
@@ -3792,7 +4222,7 @@ fn b7m2_recheck_proc_macros_are_build_time() {
     }
     source(&mut inputs, "serde", "");
     assert_eq!(check(&inputs), "");
-    inputs.resolve.packages.clear();
+    inputs.profiles[0].resolve.packages.clear();
     let wrong = check(&inputs);
     assert!(
         wrong.contains(
@@ -3800,6 +4230,175 @@ fn b7m2_recheck_proc_macros_are_build_time() {
         ),
         "{wrong}"
     );
+}
+
+/// Recheck 2 HIGH-1: the gate reviews each supported profile's own graph. A profile
+/// enables only workspace features; what one resolves must be locked and reviewed, with
+/// the union of every profile's features.
+#[test]
+fn b7m2_recheck2_each_profile_graph_is_reviewed() {
+    let with_profile = |features: &[&str]| {
+        let mut inputs = demo("", "", &[]);
+        inputs.gate["profiles"]["full"] = serde_json::json!({"features": features, "why": "x"});
+        inputs.profiles.push(Profile {
+            name: "full".into(),
+            features: features.iter().map(|f| f.to_string()).collect(),
+            ..Profile::default()
+        });
+        inputs
+    };
+    // Daybreak's feature injection as a profile: a dependency's feature directly.
+    let wrong = check(&with_profile(&["tokio/full"]));
+    assert!(
+        wrong.contains(
+            "profile full selects tokio/full, which is not a feature a workspace member declares"
+        ),
+        "{wrong}"
+    );
+    // Through a workspace feature that forwards it: the profile's own graph has a package
+    // Cargo.lock does not lock and a feature no review covers.
+    let mut inputs = with_profile(&["demo/full"]);
+    let full = &mut inputs.profiles[1].resolve.packages;
+    full.entry("demo@0.1.0".into()).or_default().declared = ["full".to_string()].into();
+    full.entry("libc@1.0.0".into()).or_default().features = ["extra".to_string()].into();
+    full.insert("parking_lot@0.12.5".into(), Resolved::default());
+    let wrong = check(&inputs);
+    assert!(!wrong.contains("selects demo/full"), "{wrong}");
+    assert!(
+        wrong.contains("profile full resolves parking_lot@0.12.5, which Cargo.lock does not lock"),
+        "{wrong}"
+    );
+    assert!(
+        wrong.contains(
+            r#"libc@1.0.0's reviewed features [] are not the resolved features ["extra"]"#
+        ),
+        "{wrong}"
+    );
+    // Reviewing the union holds (the default profile resolves no features for libc).
+    inputs.profiles[1]
+        .resolve
+        .packages
+        .remove("parking_lot@0.12.5");
+    inputs.gate["packages"]["libc@1.0.0"]["features"] = serde_json::json!(["extra"]);
+    assert_eq!(check(&inputs), "");
+    // A declared feature that is not the member's.
+    let mut inputs = with_profile(&["demo/full"]);
+    let wrong = check(&inputs);
+    assert!(
+        wrong.contains(
+            "profile full selects demo/full, which is not a feature a workspace member declares"
+        ),
+        "{wrong}"
+    );
+    // The section itself: required, a featureless `default`, only resolved profiles.
+    inputs.gate["profiles"]["default"]["features"] = serde_json::json!(["demo/full"]);
+    inputs.gate["profiles"]["extra"] =
+        serde_json::json!({"features": [], "why": "x", "flags": "--all-features"});
+    let wrong = check(&inputs);
+    for expected in [
+        "profile default enables features",
+        "profile default was not resolved with exactly its features [\"demo/full\"]",
+        "profile extra has an unknown field \"flags\"",
+        "profile extra was not resolved with exactly its features []",
+    ] {
+        assert!(wrong.contains(expected), "{expected}\n{wrong}");
+    }
+    let mut inputs = demo("", "", &[]);
+    inputs.gate.as_object_mut().unwrap().remove("profiles");
+    assert!(
+        check(&inputs).contains("dependency-gate.json needs `profiles`"),
+        "{}",
+        check(&inputs)
+    );
+}
+
+/// Recheck 2 MEDIUM-1: one name and version from two sources is refused outright, in
+/// Cargo.lock and in cargo metadata, before any review is matched by name@version.
+#[test]
+fn b7m2_recheck2_duplicate_identities_are_refused() {
+    let second = package("dupe", &[]).replace(
+        "registry+https://github.com/rust-lang/crates.io-index",
+        "registry+file:///other/index",
+    );
+    let mut inputs = demo(
+        &(package("dupe", &[]) + &second.replace("dupe-1.0.0-checksum", "other-checksum")),
+        "dupe = \"1\"\n",
+        &["dupe"],
+    );
+    review(
+        &mut inputs,
+        "dupe",
+        serde_json::json!({"kind": "runtime", "capability": "none", "why": "x"}),
+    );
+    let wrong = check(&inputs);
+    assert_eq!(
+        wrong,
+        "Cargo.lock locks 2 packages with the same identity dupe@1.0.0 (registry+https://github.com/rust-lang/crates.io-index dupe-1.0.0-checksum; registry+file:///other/index other-checksum): the gate keys every review by name@version and does not support one name and version from two sources; resolve one"
+    );
+    let metadata = serde_json::json!({
+        "workspace_members": [],
+        "packages": [
+            {"id": "registry+a#dupe@1.0.0", "name": "dupe", "version": "1.0.0", "targets": []},
+            {"id": "registry+z#dupe@1.0.0", "name": "dupe", "version": "1.0.0", "targets": []},
+        ],
+        "resolve": {"nodes": []},
+    });
+    let error = parse_metadata(&metadata).unwrap_err();
+    assert!(
+        error.contains("cargo metadata resolves two packages with the same identity dupe@1.0.0 (registry+a#dupe@1.0.0 and registry+z#dupe@1.0.0)"),
+        "{error}"
+    );
+}
+
+/// Recheck 2 HIGH-2: `type` aliases resolve like `use` aliases in the impl check, and an
+/// alias of a flagged type is flagged itself.
+#[test]
+fn b7m2_recheck2_type_aliases_resolve() {
+    let disallowed = BTreeSet::new();
+    let scanner = SinkScanner::new(&disallowed);
+    let sinks = |text: &str| {
+        let files = vec![("lib.rs".to_string(), text.to_string())];
+        let scan = scanner.scan_file(text);
+        package_sinks(&files, &[&scan])
+            .into_keys()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sinks(
+            "use std::fs::File;\npub type LocalFile = File;\npub trait R {}\nimpl R for LocalFile {}\n"
+        ),
+        ["impl for std::fs::File", "type alias for std::fs::File"]
+    );
+    assert_eq!(
+        sinks("pub(crate) type F<'a> = &'a mut ::std::fs::File;\n"),
+        ["type alias for std::fs::File"]
+    );
+    assert_eq!(
+        sinks(
+            "use tokio::process as p;\ntype C = p::Child;\ntype D = C;\ntrait R {}\nimpl R for D {}\n"
+        ),
+        [
+            "impl for tokio::process::Child",
+            "type alias for tokio::process::Child"
+        ]
+    );
+    assert_eq!(
+        sinks("use std::fs::*;\ntype F = File;\n"),
+        ["type alias for File"]
+    );
+    assert_eq!(
+        sinks("impl W for X { type Writer = &'static std::process::Command; }\n"),
+        ["type alias for std::process::Command"]
+    );
+    // Not flagged: the package's own `File`, another crate's, or an associated type with
+    // no target.
+    for text in [
+        "pub struct File;\npub type F = File;\ntrait R {}\nimpl R for F {}\n",
+        "use crate::fs::File;\npub type F = File;\n",
+        "pub trait T { type File; type Child: Send; }\n",
+    ] {
+        assert!(sinks(text).is_empty(), "{text}: {:?}", sinks(text));
+    }
 }
 
 /// The lexer sees paths however they are spaced or commented, and nothing in strings,
