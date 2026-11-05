@@ -1,38 +1,45 @@
 {
   "about": [
-    "Design section 7.1's dependency gate (Phase 1b B7, B4 recheck 6 item 2). clippy.toml",
-    "disallows destructive paths by name; a dependency could expose an equivalent under",
-    "another name. proven::tests::dependencies_that_can_wrap_syscalls_are_allowlisted",
-    "checks this file against Cargo.lock and every workspace manifest. It fails when:",
-    "a direct (normal or build) dependency of any workspace crate is not under `direct`;",
-    "a dev-only one is not under `dev`; any package in Cargo.lock that can wrap system",
-    "calls (libc, linux-raw-sys, rustix, nix, syscalls, sc, any *-sys crate, or one that",
-    "depends directly on any of them) is not listed at all; an entry names a package",
-    "Cargo.lock lacks, or a kind it does not have; `syscalls` disagrees with Cargo.lock;",
-    "a direct entry's `destructive` paths and clippy.toml's paths under that crate differ;",
-    "clippy.toml names a crate that is neither std nor a direct entry; or a raw-syscall",
-    "crate is direct with no destructive paths. So a new dependency that can reach",
-    "system calls joins this file, and its destructive methods join clippy.toml, in the",
-    "same change. std is the toolchain's, gated by its clippy.toml paths directly."
+    "Design section 7.1's dependency gate (B4 recheck 6 item 2; rebuilt for the B7 milestone 2",
+    "break-it, HIGH-1, MEDIUM-1 and LOW-1). Every direct dependency of every workspace crate",
+    "(normal, build and dev) has a reviewed entry under `dependencies`: its `kind` (runtime,",
+    "build-only or dev-only, checked against the manifests and the Cargo.lock graph), its",
+    "`capability` (`none`, or a set of filesystem, process, signals, syscalls, network) and why.",
+    "A destructive-capable category (filesystem, process, signals, syscalls) lists its",
+    "`destructive` paths, each disallowed in clippy.toml, or records in `no_destructive_api` why",
+    "its API has none (never for a raw system-call crate). Cargo.lock can only require more: a",
+    "raw system-call crate underneath a `none` dependency needs a `raw_use` reason. Packages that",
+    "can wrap system calls without being direct are named under `transitive`.",
+    "proven::tests::dependency_gate checks all of it, and two backstops for a mistaken `none`:",
+    "production code naming a destructive-looking function through a dependency's path that",
+    "clippy.toml does not disallow, and a `none`, `network` or no-destructive-API dependency",
+    "whose own locked source reaches a std, Tokio or libc path clippy.toml disallows. std is",
+    "the toolchain's, gated by its clippy.toml paths directly (a curated review in the same test)."
   ],
-  "direct": {
+  "dependencies": {
     "anyhow": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "error values"
     },
     "clap": {
-      "syscalls": false,
-      "destructive": [],
-      "why": "argument parsing"
+      "kind": "runtime",
+      "capability": "none",
+      "why": "argument parsing: reads the arguments and environment it is given and prints help"
     },
     "hyper-util": {
-      "syscalls": true,
-      "destructive": [],
-      "why": "TokioIo adapters for the Unix-socket transport; its libc use is socket options, with no removal, signal or subprocess API"
+      "kind": "runtime",
+      "capability": "network",
+      "why": "TokioIo adapters for the Unix-socket transport; its libc use is socket options, with no file, signal or subprocess API"
     },
     "libc": {
-      "syscalls": true,
+      "kind": "runtime",
+      "capability": [
+        "filesystem",
+        "process",
+        "signals",
+        "syscalls"
+      ],
       "destructive": [
         "libc::kill",
         "libc::killpg",
@@ -69,42 +76,124 @@
         "libc::fexecve",
         "libc::posix_spawn",
         "libc::posix_spawnp",
-        "libc::system"
+        "libc::system",
+        "libc::__syscall_SYS_ftruncate",
+        "libc::__syscall_SYS_kill",
+        "libc::__syscall_SYS_tkill",
+        "libc::__syscall_SYS_unlink",
+        "libc::__syscall_SYS_unlinkat",
+        "libc::__wasilibc_nocwd___wasilibc_unlinkat",
+        "libc::__wasilibc_unlinkat",
+        "libc::_sigqueue",
+        "libc::creat",
+        "libc::creat64",
+        "libc::create_area",
+        "libc::create_port",
+        "libc::create_sem",
+        "libc::execl",
+        "libc::execle",
+        "libc::execlp",
+        "libc::execlpe",
+        "libc::exect",
+        "libc::execvP",
+        "libc::fremovexattr",
+        "libc::ftruncate64",
+        "libc::kill_team",
+        "libc::kill_thread",
+        "libc::lremovexattr",
+        "libc::mount",
+        "libc::mq_unlink",
+        "libc::pdkill",
+        "libc::popen",
+        "libc::posix_spawn_file_actions_addchdir",
+        "libc::posix_spawn_file_actions_addchdir_np",
+        "libc::posix_spawn_file_actions_addclose",
+        "libc::posix_spawn_file_actions_addclosefrom_np",
+        "libc::posix_spawn_file_actions_adddup2",
+        "libc::posix_spawn_file_actions_addfchdir",
+        "libc::posix_spawn_file_actions_addfchdir_np",
+        "libc::posix_spawn_file_actions_addopen",
+        "libc::posix_spawn_file_actions_addtcsetpgrp_np",
+        "libc::posix_spawn_file_actions_destroy",
+        "libc::posix_spawn_file_actions_init",
+        "libc::posix_spawnattr_destroy",
+        "libc::posix_spawnattr_get_qos_class_np",
+        "libc::posix_spawnattr_getarchpref_np",
+        "libc::posix_spawnattr_getbinpref_np",
+        "libc::posix_spawnattr_getflags",
+        "libc::posix_spawnattr_getpgroup",
+        "libc::posix_spawnattr_getschedparam",
+        "libc::posix_spawnattr_getschedpolicy",
+        "libc::posix_spawnattr_getsigdefault",
+        "libc::posix_spawnattr_getsigignore_np",
+        "libc::posix_spawnattr_getsigmask",
+        "libc::posix_spawnattr_init",
+        "libc::posix_spawnattr_set_qos_class_np",
+        "libc::posix_spawnattr_setarchpref_np",
+        "libc::posix_spawnattr_setbinpref_np",
+        "libc::posix_spawnattr_setflags",
+        "libc::posix_spawnattr_setpgroup",
+        "libc::posix_spawnattr_setschedparam",
+        "libc::posix_spawnattr_setschedpolicy",
+        "libc::posix_spawnattr_setsigdefault",
+        "libc::posix_spawnattr_setsigignore_np",
+        "libc::posix_spawnattr_setsigmask",
+        "libc::pthread_kill",
+        "libc::pthread_sigqueue",
+        "libc::reboot",
+        "libc::removexattr",
+        "libc::rename_thread",
+        "libc::renamex_np",
+        "libc::sem_unlink",
+        "libc::shm_unlink",
+        "libc::sigqueue",
+        "libc::swapoff",
+        "libc::thr_kill",
+        "libc::thr_kill2",
+        "libc::truncate64",
+        "libc::vfs_unlink_path"
       ],
-      "why": "the raw system-call surface: every destructive function is in clippy.toml, reachable only from the approved modules"
+      "why": "the raw system-call surface: every destructive function (every_destructive_libc_function_is_disallowed checks the locked source) is in clippy.toml, reachable only from the approved modules"
     },
     "prost": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "protobuf encoding"
     },
     "rusqlite": {
-      "syscalls": true,
-      "destructive": [],
-      "why": "SQLite through bundled libsqlite3-sys; no removal API. SQLite's own -wal/-shm/-journal maintenance is the one dependency-internal unlink (design 7.1)"
+      "kind": "runtime",
+      "capability": "filesystem",
+      "no_destructive_api": "with the enabled features (bundled, functions) its API opens and writes the database it is given by path and has no removal, rename, truncation or copy function; SQLite's own -wal/-shm/-journal maintenance is the one dependency-internal unlink (design 7.1)",
+      "why": "SQLite through bundled libsqlite3-sys, for kilnd's own database"
     },
     "serde": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "serialization"
     },
     "serde_json": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "JSON"
     },
     "sha2": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "SHA-256"
     },
     "thiserror": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "error derives"
     },
     "tokio": {
-      "syscalls": true,
+      "kind": "runtime",
+      "capability": [
+        "filesystem",
+        "network",
+        "process",
+        "signals"
+      ],
       "destructive": [
         "tokio::process::Child::kill",
         "tokio::process::Child::start_kill",
@@ -116,59 +205,77 @@
         "tokio::fs::File::create",
         "tokio::fs::OpenOptions::truncate",
         "tokio::fs::write",
-        "tokio::process::Command::new"
+        "tokio::process::Command::new",
+        "tokio::fs::copy"
       ],
-      "why": "the async runtime: its file removal, rename, truncation, signal and subprocess APIs are in clippy.toml"
+      "why": "the async runtime: its file removal, rename, copy, truncation, signal and subprocess APIs are in clippy.toml (std_and_tokio_destructive_surfaces_are_disallowed reviews tokio::fs from the locked source)"
     },
     "tokio-stream": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "stream adapters"
     },
     "tokio-util": {
-      "syscalls": true,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
+      "raw_use": "libc::memchr only, for its codec's delimiter search",
       "why": "CancellationToken and task trackers; no file, signal or subprocess API"
     },
     "tonic": {
-      "syscalls": false,
-      "destructive": [],
-      "why": "gRPC"
+      "kind": "runtime",
+      "capability": "network",
+      "why": "gRPC over the Unix socket"
     },
     "tonic-prost": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "gRPC codec"
     },
     "tonic-prost-build": {
-      "syscalls": false,
-      "destructive": [],
-      "why": "kilnd-api's build script only: generates the gRPC stubs on the build host, linked into no binary"
+      "kind": "build-only",
+      "capability": [
+        "filesystem",
+        "process"
+      ],
+      "destructive": [
+        "tonic_prost_build::compile_protos",
+        "tonic_prost_build::compile_fds",
+        "tonic_prost_build::Builder::compile_protos",
+        "tonic_prost_build::Builder::compile_with_config",
+        "tonic_prost_build::Builder::compile_fds",
+        "tonic_prost_build::Builder::compile_fds_with_config"
+      ],
+      "why": "kilnd-api's build script only: runs protoc and writes the gRPC stubs on the build host; LOW-1 keeps it out of the runtime graph"
     },
     "tower": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "service adapters"
     },
     "tracing": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "logging"
     },
     "tracing-subscriber": {
-      "syscalls": false,
-      "destructive": [],
+      "kind": "runtime",
+      "capability": "none",
       "why": "log formatting to stderr"
-    }
-  },
-  "dev": {
+    },
     "h2": {
-      "syscalls": false,
-      "why": "raw HTTP/2 clients in admission tests"
+      "kind": "dev-only",
+      "runtime_via": "tonic",
+      "capability": "network",
+      "why": "raw HTTP/2 clients in admission tests; also linked through tonic, whose transport it is"
     },
     "tempfile": {
-      "syscalls": true,
-      "why": "test scratch directories; TempDir removes its own on drop. Never a normal dependency"
+      "kind": "dev-only",
+      "capability": "filesystem",
+      "destructive": [
+        "tempfile::NamedTempFile::persist",
+        "tempfile::TempPath::persist"
+      ],
+      "why": "test scratch directories; TempDir removes only its own on drop. Never a normal dependency"
     }
   },
   "transitive": {

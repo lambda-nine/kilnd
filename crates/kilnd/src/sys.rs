@@ -773,6 +773,39 @@ mod linux {
         .map(drop)
     }
 
+    /// Binds a directory onto itself, making it a mount point (the jail base, so its
+    /// propagation can be made private). `libc::mount` is disallowed elsewhere since
+    /// B7 milestone 2 (MEDIUM-1); these two fixed forms are all the helper needs.
+    pub fn bind_onto_itself(path: &CStr) -> io::Result<()> {
+        // SAFETY: a NUL-terminated path, as both source and target of a plain bind.
+        let rc = unsafe {
+            libc::mount(
+                path.as_ptr(),
+                path.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        sys_ret(libc::c_long::from(rc)).map(drop)
+    }
+
+    /// Makes a mount and every mount below it private, so later mounts there never
+    /// propagate elsewhere. It changes propagation only.
+    pub fn make_private_recursive(path: &CStr) -> io::Result<()> {
+        // SAFETY: a NUL-terminated target; no source, type or data.
+        let rc = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                path.as_ptr(),
+                std::ptr::null(),
+                libc::MS_PRIVATE | libc::MS_REC,
+                std::ptr::null(),
+            )
+        };
+        sys_ret(libc::c_long::from(rc)).map(drop)
+    }
+
     /// Loop and block-device ioctls: read requests, attaching a free slot, and clearing
     /// autoclear on a slot this process configured. Nothing here detaches a slot or
     /// changes any other binding field (B4 recheck 5 finding 3).
