@@ -33,8 +33,8 @@ target=aarch64-unknown-linux-gnu
 # B6: the daemon and client the session test runs as an ordinary installed kilnd would
 # be, before the static flags below apply to anything.
 bins=${B6_TARGET_DIR:-$HOME/.cache/kilnd-target-b6}
-CARGO_TARGET_DIR=$bins cargo build --locked --release -p kilnd -p kilndctl --bin kilnd --bin kilndctl \
-    --features kilnd/firecracker-test-deployment
+CARGO_TARGET_DIR=$bins scripts/build.sh firecracker-test-deployment build --release \
+    -p kilnd -p kilndctl --bin kilnd --bin kilndctl
 
 export CARGO_TARGET_DIR=${B4_TARGET_DIR:-$HOME/.cache/kilnd-target-static}
 export RUSTFLAGS="-C target-feature=+crt-static"
@@ -44,9 +44,10 @@ export RUSTFLAGS="-C target-feature=+crt-static"
 # Dependencies are optimized (kilnd itself stays a debug build with its overflow checks):
 # a real helper hashes its own image and parses the bundle's 33 MB manifest at start and
 # in every Preflight, which unoptimized sha2 and serde_json made slower than the wire
-# deadlines on a loaded host.
-built=$(cargo test --locked -p kilnd -p kilnd-exec-core --lib --no-run --target "$target" \
-    --config 'profile.dev.package."*".opt-level=2' \
+# deadlines on a loaded host. The workspace Cargo.toml's `vm-test` profile is `dev` with
+# every dependency at opt-level 2.
+built=$(scripts/build.sh default test -p kilnd -p kilnd-exec-core --lib --no-run --target "$target" \
+    --profile vm-test \
     --message-format=json \
     | python3 -I -c '
 import json, sys

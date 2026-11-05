@@ -669,30 +669,11 @@ mod linux {
         let mounts = parse_mountinfo(&sys::procfs::read_to_string(&sys::procfs::own(
             "mountinfo",
         ))?)?;
-        if !mounts.iter().any(|m| m.mount_point == base) {
-            let path = CString::new(base.as_os_str().as_bytes()).unwrap();
-            // SAFETY: both paths are NUL-terminated; a bind of the directory onto itself.
-            cvt(unsafe {
-                libc::mount(
-                    path.as_ptr(),
-                    path.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND,
-                    std::ptr::null(),
-                )
-            })?;
-        }
         let path = CString::new(base.as_os_str().as_bytes()).unwrap();
-        // SAFETY: changes only propagation of the base and below.
-        cvt(unsafe {
-            libc::mount(
-                std::ptr::null(),
-                path.as_ptr(),
-                std::ptr::null(),
-                libc::MS_PRIVATE | libc::MS_REC,
-                std::ptr::null(),
-            )
-        })?;
+        if !mounts.iter().any(|m| m.mount_point == base) {
+            sys::bind_onto_itself(&path)?;
+        }
+        sys::make_private_recursive(&path)?;
         Ok(())
     }
 

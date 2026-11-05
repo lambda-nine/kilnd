@@ -3,8 +3,8 @@ firecracker-crash-matrix.py). Run in the kiln Lima VM as your user, under the sh
 lock, with the inputs scripts/b4-vm-tests.sh documents. It runs the named privileged
 tests through b4-vm-tests.sh (which builds, installs the test helper image and the
 daemon, and always runs scripts/b4-vm-cleanup.py), and B7's unprivileged fixture
-scenarios through cargo test as your user; collects each test's `B6 matrix:` (or B7) line
-and libtest result, and writes matrix.json and matrix.md. It fails if any expected
+scenarios through `scripts/build.sh default test` as your user; collects each test's
+`B6 matrix:` (or B7) line and libtest result, and writes matrix.json and matrix.md. It fails if any expected
 scenario is missing, failed or produced no matrix line. Nothing here touches the installed
 kilnd, its database or production paths."""
 import argparse
@@ -68,7 +68,8 @@ def run(title, prefix, scenarios, argv=None):
                 # account, and an instance account is never root.
                 env.setdefault('CARGO_TARGET_DIR',
                                os.path.join(os.environ['HOME'], '.cache', 'kilnd-target'))
-                command = ['cargo', 'test', '--locked', '-p', 'kilnd', '--lib', '--',
+                command = [os.path.join(HERE, 'build.sh'), 'default', 'test', '-p', 'kilnd',
+                           '--lib', '--',
                            '--exact', f'helper::firecracker::tests::compaction::{name}',
                            '--nocapture']
             else:

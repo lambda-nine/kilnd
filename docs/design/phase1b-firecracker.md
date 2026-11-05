@@ -603,7 +603,7 @@ Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no laz
 - *The compile-time gate guards against honest mistakes by kilnd developers (B4 recheck 5).* It is not a defence against malicious source changes; code review covers those. A deliberately obfuscated bypass, such as `build.rs` code generation, names assembled from fragments or `include!` of generated code, is out of scope. Cheap checks still close the obvious routes: a test fails on any build script but `kilnd-api`'s and on any `include!` or `OUT_DIR` outside its protobuf stubs.
 - *Kernel facts relied on,* verified on the VM's 6.8.0-147 by `b4_linux_root_kernel_generation_ids_are_never_reused`: a replacement tmpfs gets a new unique mount ID although the reusable tuple is reused; a detached mount keeps its unique ID when attached; detach plus reattach of the same slot, inode and tuple changes the disk sequence number; `LOOP_SET_STATUS64` does not. B4 recheck 2 added, on the same kernel: ext4 gave a recreated work file the deleted file's inode number at once, with a later birth time (`b4_linux_root_cleanup_refuses_a_work_file_reusing_the_inode`). Also observed: while cleanup's descriptor on a slot is open, another opener's `LOOP_CLR_FD` only marks it autoclear and a rebinding `LOOP_CONFIGURE` fails `EBUSY`, so a replacement cannot land inside cleanup's own comparison-to-clear window. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
 
-**The destructive-action invariant (B4 recheck 3, November 2, 2026).** No destructive action may run on a resource unless the caller holds proof that the resource's current generation equals a durable journaled generation from the current boot. A resource with no such proof is Unknown: it stays charged, nothing is done to it, and it never counts toward ABSENT. The destructive actions are signals (`pidfd_send_signal`, `kill`), writes to `cgroup.kill`, `rmdir` of a cgroup or directory, `unlink` of a file, `umount2` and `LOOP_CLR_FD`. The type system enforces it: `crates/kilnd/src/helper/firecracker/proven.rs` holds one proof type per resource kind (`ProvenProcess`, `ProvenCgroupVm` and `ProvenCgroupTree`, `ProvenFile`, `ProvenDir`, `ProvenMount`, `ProvenLoop`), none `Clone` and none constructible outside that module. Only its verification functions make them, each from the journaled identity, the current boot ID and the live kernel object, returning `Result<Proven*, Unprovable>` (`Gone`, `Replaced` or `Unknown`). Every destructive helper takes its proof, and the raw capabilities appear nowhere else: since B4 recheck 4 clippy enforces it semantically for the whole workspace (*The clippy gate* below), with the lexical test `proven::tests::no_destructive_call_outside_the_gate` kept as defense in depth. Each check stays as close to its action as the kernel allows, which is the decided residual window: a pidfd for processes, the `vm` node's descriptor for `cgroup.kill` with its children re-listed from that descriptor (`getdents64` on a rewound duplicate) just before, the parent's descriptor with the child's inode or birth time re-read just before each `rmdir` and `unlinkat`, the loop descriptor the generation was compared on, and for mounts a fresh descriptor's unique mount ID read just before `umount2` of the single name resolved from the held parent descriptor (that descriptor must be closed first, or a non-lazy unmount is busy). No proof reads a `/proc/self/fd` pathname (B4 recheck 5).
+**The destructive-action invariant (B4 recheck 3, November 2, 2026).** No destructive action may run on a resource unless the caller holds proof that the resource's current generation equals a durable journaled generation from the current boot. A resource with no such proof is Unknown: it stays charged, nothing is done to it, and it never counts toward ABSENT. The destructive actions are signals (`pidfd_send_signal`, `kill`), writes to `cgroup.kill`, `rmdir` of a cgroup or directory, `unlink` of a file, `umount2` and `LOOP_CLR_FD`. The type system enforces it: `crates/kilnd/src/helper/firecracker/proven.rs` holds one proof type per resource kind (`ProvenProcess`, `ProvenCgroupVm` and `ProvenCgroupTree`, `ProvenFile`, `ProvenDir`, `ProvenMount`, `ProvenLoop`), none `Clone` and none constructible outside that module. Only its verification functions make them, each from the journaled identity, the current boot ID and the live kernel object, returning `Result<Proven*, Unprovable>` (`Gone`, `Replaced` or `Unknown`). Every destructive helper takes its proof, and the raw capabilities appear nowhere else: since B4 recheck 4 clippy enforces it semantically for the whole workspace (*The clippy gate* below), with the lexical test `proven::tests::no_destructive_call_outside_the_gate` kept as defense in depth. Each check stays as close to its action as the kernel allows, which is the decided residual window: a pidfd for processes, the `vm` node's descriptor for `cgroup.kill` with its children re-listed from that descriptor (`getdents64` on a fresh open file description of it, `openat(fd, ".")`, since B7) just before, the parent's descriptor with the child's inode or birth time re-read just before each `rmdir` and `unlinkat`, the loop descriptor the generation was compared on, and for mounts a fresh descriptor's unique mount ID read just before `umount2` of the single name resolved from the held parent descriptor (that descriptor must be closed first, or a non-lazy unmount is busy). No proof reads a `/proc/self/fd` pathname (B4 recheck 5).
 
 - *Boot ID everywhere.* Every durable process identity (`ProcessId`, so `ResourceRecord::Vmm`, `StopTarget`, M's and K's targets and the worker rows) carries a validated boot ID. A process whose PID and start time match is proven only when its journaled boot ID is this boot's. A different boot ID only shows that the journaled process is gone, and never leads to a signal. An absent or invalid one, from an older row, proves nothing: that process is never signaled and stays charged until it is provably gone. An unreadable host boot ID is an error, never `unknown`.
 - *The cgroup tree.* `cgroup.kill` needs `ProvenCgroupVm`: the boot ID and the journaled inodes of the parent, `vm`, `vm/vmm` and `vm/console`, and no other cgroup anywhere below `vm`. A replaced or unexpected child is Replaced, with no signal. Removal needs `ProvenCgroupTree`, which covers every node and admits no other cgroup below the parent. H's monitor target, K's emergency target, `kill_recorded`, `contain` and `remove_tree` all go through these.
@@ -635,7 +635,7 @@ The executable store has no destructive call at all since B4 recheck 4: `executa
 
 | Use | Before | Now |
 |---|---|---|
-| `proven::child_cgroups` (the `cgroup.kill` and removal proofs) | `read_dir("/proc/self/fd/N")` | `sys::read_dir_fd`: `getdents64` on an `F_DUPFD_CLOEXEC` duplicate of the retained node descriptor, rewound with `lseek(0)` |
+| `proven::child_cgroups` (the `cgroup.kill` and removal proofs) | `read_dir("/proc/self/fd/N")` | `sys::read_dir_fd`: `getdents64` on a fresh open file description of the retained node descriptor, `openat(fd, ".", O_RDONLY\|O_DIRECTORY\|O_CLOEXEC)` (B7; until then an `F_DUPFD_CLOEXEC` duplicate rewound with `lseek(0)`, which also rewound the caller's offset) |
 | `proven::unmount` | `umount2("/proc/self/fd/<parent>/<name>")` after checking the real parent | `umount2(name)` from a thread whose working directory is the parent descriptor (below) |
 | `storage::list` (the jail hardening walk) | `read_dir("/proc/self/fd/N")` | `sys::read_dir_fd` |
 | `cgroup::allocation_names` (inventory) | `read_dir("/proc/self/fd/N")` | `sys::read_dir_fd` |
@@ -662,6 +662,24 @@ The other `/proc` pathname reads moved beneath `sys::procfs`, a private procfs s
 Each allow is `#[allow(clippy::disallowed_methods)]` (inner for a whole module) with an `// Approved (design 7.1):` justification immediately above it. The CI test `proven::tests::disallowed_allows_only_in_approved_modules` scans every Rust source in the workspace and fails on an `allow` or `expect` of `disallowed_methods`, `disallowed_types` or anything that would silence them (`clippy::style`, `clippy::all`, `warnings`, also inside `cfg_attr`) other than exactly these, on a `#[cfg(test)]` item, or on a test-only file (a `tests.rs` its parent declares `#[cfg(test)] mod tests;`, or an integration test); on one without the justification; on any `[lints]` table or `.cargo/config`; and on a `clippy.toml` that drops a required path. (`kilnd-api`'s generated code no longer allows `clippy::all`.) `proven::tests::no_foreign_declarations_or_inline_assembly` rejects a local `extern` block, inline assembly, `#[link]`, `link_name` or `dlsym` anywhere, which clippy cannot see through. Since B4 recheck 5, `proven::tests::no_unapproved_build_scripts_or_generated_includes` fails on any build script other than `kilnd-api/build.rs`, a `build` key in a manifest, and any `include!`, `include_proto!` or `OUT_DIR` other than `kilnd-api`'s `tonic::include_proto!("kilnd.v1")`, since generated code is invisible to every source check; and `proven::tests::proc_and_control_paths_only_in_approved_modules` fails on a production string literal containing `/proc/` or `cgroup.` outside `sys.rs`, `cgroup.rs` and `proven.rs`, except four justified ones (the two publish `linkat` paths above, kiln's read-only `exec/cgroup.events`, and one `cfg(test)` fixture). Every helper write under `/proc` or `/sys` goes through `cgroup::write_control`'s `ControlFile` enum, `proven::write_cgroup_kill` (the two `/sys/fs/cgroup` writers) or `sys::write_sysfs` (the one `/sys/block` file); nothing writes under `/proc`. The lexical test now matches whole expressions with comments and whitespace removed, so an allowed expression cannot hide another on the same line, and its needles also catch aliases (`libc::kill` without a call), `rename`, subprocesses, `start_kill`, raw `syscall`, `ioctl`, `prctl`, `ptrace` and `fallocate` outside `sys.rs`, truncation (`set_len`, `.truncate(true)`, `File::create(`, `truncate`, `ftruncate`), `process_vm_writev`, `pidfd_getfd`, foreign declarations and inline assembly; it scans the helper and `sys.rs`, where its one `unlinkat` is allow-listed by exact expression.
 
 Test fixtures are excluded from the gate. Outside the approved items above, nothing in the workspace calls or names any listed capability.
+
+*The dependency gate (B7, B4 recheck 6 item 2; rebuilt after the B7 milestone 2 break-it and its two rechecks).* Clippy resolves workspace code, but it never lints a dependency's own body, so a dependency can offer a destructive operation under a name `clippy.toml` does not know, or perform one inside a method that workspace code calls under a harmless name (an extension trait on `std::fs::File` whose `reset` calls `set_len(0)`). The gate therefore fails closed on *review*, not on detection. For builds made through the supported entry point, `scripts/build.sh` with one of the reviewed build profiles, it guarantees exactly two things: **no unreviewed package enters the build**, and **every occurrence of a curated destructive sink identifier, and every trait impl or type alias on std's and Tokio's file and process types, in the runtime subtree of a package declared non-destructive is flagged for review**. A raw `cargo build` (or `test`, `clippy`) given other feature flags builds a graph the gate has not reviewed, and is outside the guarantee. Deciding whether an API is destructive is the reviewer's job. The gate is a lexical aid to that review, not a proof, and it is built for honest mistakes, not for a dependency written to hide one. `proven::tests::dependency_gate` checks it on every `cargo test`.
+
+*Supported builds.* `dependency-gate.json`'s `profiles` lists every supported build: `default` (no features: the release build `scripts/install.sh` installs and `scripts/upgrade.sh` takes, CI's default tests, clippy and release build, and the library tests the VM scripts build) and `firecracker-test-deployment` (`kilnd/firecracker-test-deployment`: CI's feature job and the daemon and client `scripts/b4-vm-tests.sh` builds). `scripts/build.sh [+TOOLCHAIN] PROFILE build|test|clippy|check ...` reads the same list and runs `cargo COMMAND --locked`, with `--features` only for the profile's own. A profile enables only features a workspace member declares (`member/feature`), so a dependency feature a build needs is forwarded through a checked-in workspace feature. Before `--`, `build.sh` refuses every argument that selects features or another graph: `--features` and `-F` (so `dep/feature` selectors such as `tokio/full`), `--all-features`, `--no-default-features`, `--manifest-path`, `--config` and `-Z`, in every spelling cargo accepts (`--features=x`, `-Fx`, `-rF x`). The gate runs `cargo metadata --locked` once per profile with exactly those flags, and refuses a profile that names anything but a declared workspace feature, any package a profile resolves that `Cargo.lock` does not lock, and any locked package no profile resolves. The reviewed features are the union over the profiles, and kinds are judged from the union of their graphs. `supported_builds_use_the_build_entry_point` fails on a raw `cargo build`, `test`, `clippy`, `check`, `run`, `rustc`, `doc` or `install` in CI, the installer, the upgrade path, the VM scripts or the setup instructions.
+
+*Every locked package is reviewed.* `dependency-gate.json` has an entry under `packages` for every package in `Cargo.lock` outside the workspace, direct and transitive (144 today), keyed `name@version` and pinned to `Cargo.lock`'s `checksum` and to the `features` that `cargo metadata --locked` resolves for it in any supported profile (their union). A `name@version` key cannot tell two sources apart, so two packages with one name and version (two registries, or a registry and a path) are refused outright, in `Cargo.lock` and in each profile's metadata, before any review is matched; the drafter refuses them too. Each entry has a `kind`, a `capability` (`none`, or a set of `filesystem`, `process`, `signals`, `syscalls` and `network`) and a justification: its own `why`, or a `group` with a shared one. A new package, a changed version or checksum, or a changed feature set fails the test, so every lock change needs a person's review; a path or git dependency outside the workspace has no checksum and is refused. `scripts/dependency-gate-review.py --write` drafts entries for new packages, filling the checksum, features and kind and leaving the capability and justification empty, so the test fails until someone writes them. A group is allowed only for `none` packages with no raw system-call crate underneath whose library source names no `std::fs`, `std::process`, `std::os` fs, fd or process extension (or the Unix prelude that re-exports them), libc, or `tokio::fs`/`tokio::process` path at all, and the test checks that. Today 78 packages share `pure-computation` and 15 share `compile-time` (procedural macros and the syntax libraries only they use); the other 51 have their own justification. A direct dependency's kind comes from the manifests and any other package's from the dependency graph: `runtime` if a workspace crate's normal dependencies reach it through normal edges, otherwise `build-only` or `dev-only`. A procedural macro runs in the compiler, so it and what only it reaches are build-only. A direct `build-only` or `dev-only` dependency that the runtime graph also reaches records `runtime_via` (`h2`, also `tonic`'s transport).
+
+*Capabilities.* `Cargo.lock` can only require more, never override a reviewed decision. A raw system-call crate (`libc`, `linux-raw-sys`, `rustix`, `nix`, `syscalls`, `sc`, any `*-sys`) declares `syscalls`, and a `none` package directly over one records in `raw_use` what it uses it for (`tokio-util`: `libc::memchr`; `errno`, `cpufeatures`, `getrandom` and three Windows console crates likewise). A direct dependency with a destructive-capable category (filesystem, process, signals, syscalls) lists its `destructive` paths and `clippy.toml` disallows each one, or records in `no_destructive_api` why its API has none (only `rusqlite`, and never a raw crate). `clippy.toml` names only std and direct dependencies, and no path an entry does not list. Workspace code cannot name a transitive crate, so a transitive entry lists no paths: its API reaches the workspace only through a direct dependency, whose own review covers it. The test also refuses an unknown field, capability or group, a stale entry or exception, and a renamed dependency. Production code (every crate's `src` and build script, comments and strings ignored, `use` aliases resolved) may not name a destructive-looking function through a dependency path `clippy.toml` does not disallow, or glob-import a dependency reviewed as non-destructive.
+
+*The subtree scan.* For every package declared `none`, `network` or `no_destructive_api` that is in the runtime graph or is a direct dependency, the test reads the library source of its whole runtime dependency subtree (normal edges for any target; procedural macros excluded) from where cargo extracted it. In each package of that subtree it flags four things. First, every occurrence of an identifier the curated, justified list in `METHOD_SINKS` names, wherever it is: `set_len`, `truncate`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `unlink*`, `copy`, `kill`, `start_kill`, `send_signal`, `persist*`, `exec`, `umount*` and `unmount*`. The identifier token is the sink, not a call shape: a method call on any receiver, a call through any qualifier or type alias (`LocalFile::set_len(self, 0)`, `<T as Tr>::set_len`), a function value, a `use` list, a definition, a field and an attribute argument all count. Second, any path `clippy.toml` disallows, however it is aliased or glob-imported (`use std::fs::*;` then `remove_file(p)`). Third, a trait impl for `std::fs::File`, `std::fs::OpenOptions`, `std::process::Child` or `Command`, or Tokio's file and process types, named directly or through a `use` or `type` alias (a bare `File` counts unless the package imports it from elsewhere or defines its own). Fourth, a `type` alias (`pub type LocalFile = File;`, an associated type's included) whose target resolves to one of those types. A hit refuses the declaration unless `sink_exceptions` records a reviewed exception for that package, version and exact feature set, naming the sinks and why. An exception does nothing outside that scope, and one that no longer matches a hit is refused as stale. Today there are 27 exceptions: harmless identifiers that share a sink's name (`Vec`, `BytesMut` and `SmallVec` `set_len` and `truncate`, `core::ptr::copy` inside a package's own buffer, `futures::io::copy` and `tokio::io::copy` between streams, executor bindings named `exec` in hyper, hyper-util, tonic and Tokio, a `$copy` macro metavariable in serde_json, bitflags' `Flags::truncate` in its own tests), `unlink` on h2's and futures-util's own intrusive lists, libc's own declarations of the C functions (each destructive one disallowed for workspace code), Win32 binding parameters in windows-sys, mio's `FIONBIO` `ioctl` on its own pipe, writer impls for a `File` the caller passes (anstream, anstyle-wincon, tracing-subscriber, whose writer type alias is `&std::fs::File`), and Tokio's own implementation of the API its entry lists. Inline `#[cfg(test)]` modules are skipped; out-of-line test files are scanned.
+
+*What the gate does not see.* A build outside `scripts/build.sh` and the reviewed profiles. A destructive operation behind a name not on the list, on a receiver of unknown type and without a flagged impl or alias (for example a generic method that is only later instantiated with `File`). Code generated by build scripts, procedural macros or macros built from strings. C code behind FFI (SQLite's own journal files, under `rusqlite`'s `no_destructive_api`). Windows API names (`windows-sys` is reviewed, scanned and never compiled for kilnd's targets). Build-only and dev-only packages are reviewed but not scanned, since they never link into a kilnd binary.
+
+*Completeness.* This is tested, not asserted. `every_destructive_libc_function_is_disallowed` reads every exported function of the locked `libc` (all targets, from the source cargo resolved) and requires each one matching the curated patterns (`*unlink*`, `rmdir`, `rename*`, `*truncate*`, `creat*`, `exec*`, `posix_spawn*`, `system`, `popen`, `*kill*`, `tkill`, `tgkill`, `*sigqueue*`, `pidfd_send_signal`, `umount*`, `mount`, `remove*`, `*removexattr`, `fallocate*`, `ptrace`, `process_vm_writev`, `prctl`, `syscall`, `reboot`, `swapoff`) to be disallowed: 104 in libc 0.2.190, most of them for other targets (marked `allow-invalid`). `std_and_tokio_destructive_surfaces_are_disallowed` holds `clippy.toml` to a curated, justified review of `std::fs`, `std::process` and the Unix extensions (std is not a `Cargo.lock` input, so the list is re-read at each toolchain bump), and to every public function of the locked Tokio's `fs` module, failing on any the review does not classify.
+
+*Reviewed and not gated.* `fork`, `vfork` and `clone` duplicate the caller, and running another program needs `exec*`, which is gated. `unshare`, `setns` and `chroot` change only the caller's own view. `mknod`, `link` and `symlink` create and never replace. Descriptor writes, and `O_TRUNC` passed by flag to `open`/`openat`, are invisible to any path-based gate.
+
+The jail base's two mounts moved into typed wrappers (`sys::bind_onto_itself`, `sys::make_private_recursive`) when `libc::mount` joined the list, and `kilnd-api/build.rs` carries the one approved allow, for `tonic-prost-build`. `scripts/dependency-gate-regressions.sh` (and a CI job) replays Daybreak's PoCs on Rust 1.88 and 1.99 through the actual source loader, cargo and clippy. Its method, transitive and type-alias wrappers are vendored registry packages with `Cargo.lock` checksums. The script points the ignored `regression_fixture_gate` test (the same loader and gate) at each case's workspace with `KILND_DEPENDENCY_GATE_FIXTURE`; the authoritative `the_dependency_gate_holds` always checks the workspace its test binary was built from and reads no variable, which `the_authoritative_gate_reads_no_environment` checks in its source and the script checks by setting both variables.
 
 ## 7.2 Durable reservation vector
 
@@ -979,15 +997,17 @@ kiln-guest embeds the broker at a pinned kilnd commit/binary digest, adds the vd
 
 **B4 recheck 6 hardening follow-ups** (`reviews/2026-11-03-b4-recheck6.md`, ranked; none blocks B5):
 
-1. *Fail closed when a socket filesystem cannot export a file handle* (MEDIUM). `name_to_handle_at` returning `EOPNOTSUPP` becomes the all-zero handle, so the API socket's generation silently falls back to device, inode and birth time; ramfs accepts Unix sockets and returns `EOPNOTSUPP`. Reject `EOPNOTSUPP`, or validate an explicit allowlist of socket filesystems that export handles (`sys.rs` socket generation).
-2. *Make the destructive-method gate dependency-aware* (LOW). Clippy's list names libc/std/tokio paths; a future system-call crate could expose an equivalent the lexical backstop misses. Reject new syscall-wrapper dependencies by manifest allowlist, or require their destructive methods to join `clippy.toml` in the same change.
-3. *Serialize initialization of the private procfs cache* (LOW). The cache publishes its mount ID and descriptor through two atomics; concurrent first callers can each create a procfs root, and the losers' descriptors leak for the process's life. Use `OnceLock` or a mutex.
-4. *Give `read_dir_fd` an independent file description* (LOW). `F_DUPFD_CLOEXEC` shares the directory offset, so its rewind also rewinds the original description. Reopen `.` beneath the held descriptor instead, preserving the fd-native property.
+All five are done in B7 milestone 2 (section 15, *B7 milestone 2: hardening follow-ups*), with the B6 recheck's three LOW items.
+
+1. **Done.** *Fail closed when a socket filesystem cannot export a file handle* (MEDIUM). `name_to_handle_at` returning `EOPNOTSUPP` becomes the all-zero handle, so the API socket's generation silently falls back to device, inode and birth time; ramfs accepts Unix sockets and returns `EOPNOTSUPP`. Reject `EOPNOTSUPP`, or validate an explicit allowlist of socket filesystems that export handles (`sys.rs` socket generation).
+2. **Done.** *Make the destructive-method gate dependency-aware* (LOW). Clippy's list names libc/std/tokio paths; a future system-call crate could expose an equivalent the lexical backstop misses. Reject new syscall-wrapper dependencies by manifest allowlist, or require their destructive methods to join `clippy.toml` in the same change.
+3. **Done.** *Serialize initialization of the private procfs cache* (LOW). The cache publishes its mount ID and descriptor through two atomics; concurrent first callers can each create a procfs root, and the losers' descriptors leak for the process's life. Use `OnceLock` or a mutex.
+4. **Done.** *Give `read_dir_fd` an independent file description* (LOW). `F_DUPFD_CLOEXEC` shares the directory offset, so its rewind also rewinds the original description. Reopen `.` beneath the held descriptor instead, preserving the fd-native property.
 
 **B6 break-it follow-up** (`reviews/2026-11-03-b6-breakit.md`, B6-BI-03, MEDIUM; does not
 block B6):
 
-5. *Keep idle public sockets from starving Health and cleanup.* The server takes one of
+5. **Done.** *Keep idle public sockets from starving Health and cleanup.* The server takes one of
    the 64 global connection permits before it reads peer credentials and holds it for
    the connection's life, and admission has only global connection and ordinary-RPC
    budgets. Any principal the socket's filesystem gate lets in can open 64 sockets that
@@ -3179,6 +3199,648 @@ and transcripts are in `reviews/2026-11-03-b6-fixes-vm/`. Before the phase,
 `/var/lib/kilnd` was byte-copied with the installed `734e275` daemon stopped; afterwards
 it was restored, `cmp` found `kilnd.db` and `kilnd.lock` identical, a stopped copy is
 schema 7 with `quick_check` ok, and the installed binaries' hashes are unchanged.
+
+## B7 milestone 2: hardening follow-ups (November 4, 2026)
+
+Milestone 2 of B7 closes section 11's five B7 follow-ups (B4 recheck 6 items 1 to 4 and
+B6-BI-03) and the three LOW items of the B6 recheck (`reviews/2026-11-04-b6-recheck.md`,
+B6-RC-01 to B6-RC-03), each with a regression test. Milestone 1, retired-token compaction
+(section 16), is separate work on `phase1b/b7-compaction`. Production Firecracker stays
+disabled.
+
+### Ingress fairness (B6-BI-03, MEDIUM)
+
+Daybreak's PoC held all 64 connection slots with idle sockets that never sent an HTTP/2
+preface; a new Health, Get or Delete connection was closed before authorization or
+Health's reserved RPC lane could help. Admission (`admission.rs`) now splits each shared
+budget by the caller's kernel UID:
+
+- *Reserved connection slots.* `--reserved-connections` (default 4) of the
+  `--max-connections` slots are held back from the general pool. A connection takes a
+  general slot while its UID holds fewer than `--max-connections-per-uid` (default 32,
+  half the general pool), otherwise one reserved slot, at most one per UID, otherwise the
+  socket is closed at accept. A reserved-slot connection carries its lane in
+  `PeerIdentity` and serves only Health, GetSandbox and DeleteSandbox; Create, List, Exec
+  and GetExecution on it are `RESOURCE_EXHAUSTED`. The UID comes from `SO_PEERCRED`,
+  read once, before any byte, with one `getsockopt`; unavailable credentials share one
+  bucket (and every RPC but Health from them is still `UNAUTHENTICATED`). There is no
+  public Gc RPC: garbage collection is manager-owned, so the cleanup set is Get and
+  Delete.
+- *Per-UID RPC shares and a cleanup lane.* An ordinary RPC needs a global permit and room
+  in its UID's `--max-concurrent-rpcs-per-uid` share (default 32 of 64). GetSandbox and
+  DeleteSandbox try that lane first and, when it refuses, take one of the
+  `--max-concurrent-cleanup` permits (default 4, at most one per UID). Health keeps its
+  own four. Each share's check and increment happen under one lock, so concurrent
+  callers of one UID never overshoot it. Health exposes the existing totals; the new
+  per-lane counters are internal (`AdmissionSnapshot`), so `kilnd.v1` is unchanged.
+- *Preface deadline.* `AdmittedUnixStream` fails its next read once
+  `--connection-preface-timeout-ms` (default 5000, 100 to 60000) passes before the
+  24-byte HTTP/2 client preface has arrived. The deadline is polled with every read, so
+  a socket that sends nothing is woken for it, and the transport then closes the
+  connection and drops its slot. A slow drip of 23 bytes gets the same deadline.
+
+- *Strict invariants (B7 milestone 2 break-it, HIGH-2).* `admission::validate_ingress`
+  refuses to start unless `--reserved-connections` is at least 1 and below
+  `--max-connections`; `--max-connections-per-uid` is strictly below the general pool
+  (`--max-connections` minus `--reserved-connections`); that share plus the UID's one
+  reserved slot is strictly below `--max-connections`; `--max-concurrent-rpcs-per-uid`
+  is strictly below `--max-concurrent-rpcs`; and `--max-concurrent-cleanup` is at least
+  1. Equality is refused: Daybreak's accepted `33/1/32` let one UID hold all 32 general
+  slots and the only reserved one.
+- *Root's slot (B7 milestone 2 break-it, MEDIUM-2).* Beyond `--max-connections`, one
+  connection slot only UID 0 may take, after the general and reserved slots refuse it,
+  and one RPC permit only UID 0 may use for Health, GetSandbox and DeleteSandbox after
+  their own lanes refuse it. A connection on it serves those three RPCs only. So the
+  operator always reaches Health and cleanup.
+
+Residual: a client that sends the preface may then idle on its slot (bounded by its UID's
+share). The reserve is first-come and bounded per UID, not per caller: colluding UIDs can
+hold all of it (four UIDs holding 33, 29, 1 and 1 connections at the defaults take every
+slot), as the threat model accepts colluding UIDs filling shared capacity; a further
+non-root UID is then refused, and root alone still gets Health, Get and Delete on its
+own slot. Tests:
+`admission::tests::b7_one_uid_cannot_exhaust_connections`,
+`b7_rpc_shares_and_the_cleanup_lane`, `b7_shares_hold_under_concurrent_callers`;
+`service::tests::b7_rpc_shares_cleanup_lane_and_reserved_connections`;
+`server::tests::b7_idle_sockets_are_dropped_at_the_preface_deadline` (fails without the
+deadline: the idle sockets outlive it) and `b7_a_reserved_slot_serves_health_and_cleanup_only`
+on the real transport. The real-daemon regression is
+`scripts/hostile-public-caller.py`, Daybreak's PoC made harder: as root it starts a
+hostile caller under another UID (`nobody` with the socket's group as its one
+supplementary group), which keeps 64 idle sockets open for the whole victim phase and
+reconnects each one the daemon closes; while that runs, Health, GetSandbox and
+DeleteSandbox as root must each succeed within 5, 5 and 60 s; afterwards every hostile
+socket must have been closed by the daemon, none living past the preface deadline plus
+3 s, and at least one must have held its slot until about the deadline (so the victim's
+success is not a failed attack). It runs against the installed daemon and, as the new
+`b7_linux_root_attack_hostile_public_caller_cannot_starve_health_or_cleanup` in
+`scripts/firecracker-regressions.py`, against the Firecracker test deployment's daemon
+with a READY session that the Delete then releases with its ABSENT receipt.
+
+### Socket file handles fail closed (B4 recheck 6 item 1, MEDIUM)
+
+`sys::socket` no longer turns `name_to_handle_at`'s `EOPNOTSUPP` into the all-zero
+handle. A socket filesystem that exports no handle is refused (`ErrorKind::Unsupported`,
+"cannot export file handles"), so `server::bind` fails rather than keep a socket whose
+generation is device, inode and birth time alone; a zero-length or oversized handle is
+an error too. The handle is read before the birth-time check, so ramfs (which lacks
+both) is refused by name. Rejecting outright was chosen over a filesystem allowlist:
+kilnd's socket directories are tmpfs (`/run`), ext4 or XFS, all of which export handles.
+Tests: `sys::tests::b7_a_socket_filesystem_without_file_handles_is_refused` (the errno
+mapping, every platform) and, as root in a private mount namespace on a real ramfs,
+`b7_linux_root_sys_a_ramfs_socket_has_no_generation_and_is_refused`.
+
+### The dependency gate (B4 recheck 6 item 2, LOW)
+
+Section 7.1's *The dependency gate*: `dependency-gate.json`, checked against `Cargo.lock`,
+the manifests and `clippy.toml` on every `cargo test` (so in CI). The B7 milestone 2
+break-it replaced its Cargo.lock inference with reviewed capability decisions; see the
+corrections below.
+
+### One procfs root (B4 recheck 6 item 3, LOW)
+
+`sys::procfs::root` now goes through `sys::RootCache`, one mutex over the cached
+descriptor and its unique mount ID: the identity check and, at most once, the creation
+happen under it, so concurrent first callers make exactly one private procfs instance and
+none leaks. A cached descriptor whose identity no longer reads (a forked worker closed it,
+or the number was reused) is replaced and never closed, as before. Workers fork only from
+single-threaded processes, so no child inherits the mutex held. Test:
+`sys::tests::b7_concurrent_first_callers_make_exactly_one_procfs_root` (16 callers behind
+a barrier with a slowed creation: one creation, one shared answer; replacement once
+stale; a failed creation caches nothing).
+
+### Directory listings read their own file description (B4 recheck 6 item 4, LOW)
+
+`sys::read_dir_fd` lists `openat(fd, ".", O_RDONLY|O_DIRECTORY|O_CLOEXEC)`, a fresh open
+file description of the held directory, instead of an `F_DUPFD_CLOEXEC` duplicate
+rewound with `lseek`. `.` resolves to the descriptor's own mount and dentry, so the
+listing is still fd-native, and reading from offset 0 no longer moves the caller's
+offset. Test: `sys::tests::b7_read_dir_fd_leaves_the_callers_offset_alone` (a partly read
+200-entry directory keeps its offset, the listing is whole, and an `O_PATH` descriptor,
+as the helper holds, lists the same).
+
+### The B6 recheck's LOW items
+
+- *B6-RC-01: procfs fallback redirection.* The unprivileged `ENOSYS` component walk
+  (`sys::procfs::open_by_components`) now also compares every component's unique mount
+  ID with the procfs root's. A bind mount of another process's `/proc/<pid>` over this
+  one's is on the same procfs superblock, so `fstatfs` cannot see it, but it is a new
+  mount with a new ID, so the walk is refused ("crosses a mount"), restoring
+  `RESOLVE_NO_XDEV`'s meaning. Cheap (one `statx` per component, on the kernels the
+  walk already requires); the attack still needs root control of the daemon's own mount
+  namespace, which is in its TCB. Tests:
+  `sys::tests::the_component_walk_reads_what_openat2_reads` (a wrong root ID is refused)
+  and, as root, `b7_linux_root_sys_the_component_walk_refuses_a_bind_mounted_procfs_directory`
+  (the PoC's bind mount in a private namespace, with an unredirected control).
+- *B6-RC-02: unit basename under another slice.* The test deployment's schema is now
+  `kilnd-firecracker-test-deployment/2`, which adds `kilnd.cgroup`, the unit's whole
+  cgroup path (`/system.slice/kilnd-fctest.service` for the checked-in file). It must be
+  absolute, normal, below a slice and end in the unit; the daemon's own cgroup must equal
+  it exactly. The session harness enrolls that same path with the helper. Tests:
+  `test_deployment::tests::b6_bi_01_identity_is_observed_not_declared` (the recheck's
+  `/b6.slice/b6-recheck.slice/kilnd-fctest.service`, and a user service's cgroup, are
+  refused), `production_paths_names_and_other_kinds_are_refused` (bad `cgroup` values and
+  schema 1), and `scripts/test-deployment-gate-regressions.sh root`'s new case: the right
+  unit under `b7gate.slice` is refused.
+- *B6-RC-03: nondeterministic capacity coverage.* A test-only hold at H's Inspect entry
+  (`H.inspect`, compiled only into the test helper) holds a failed Create's settlement
+  at its first look. `b6_linux_root_crash_capacity_commit_reply_lost_keeps_one_claim` now
+  runs both settle paths on every run: first H is killed and restarted while the
+  settlement is held, so it fails, the row stays FAILED and charged, the restarted
+  helper replays exactly one claim and only Delete's ABSENT receipt releases it; then a
+  second Create's settlement is held until the census shows H's replacement L, so the
+  failed Create's own settlement proves the token absent and releases the row with that
+  receipt.
+
+### Debug-build hashing
+
+The VM runs found the test helper no longer starting within its fixtures' 30-second wait,
+on main `1c107f9` as on this branch: H hashes its own image (the 71 MiB stripped debug
+test binary) and every approved artifact at start, and unoptimized `sha2` (its portable
+code, since the crate's `asm` feature is off) hashes about 5 MiB/s on the VM (71 MiB in
+13.9 s, 0.68 s at opt-level 3). The workspace `Cargo.toml` now builds `sha2` at
+opt-level 3 in dev and test profiles only (`[profile.dev.package.sha2]`); release builds,
+dependencies and `Cargo.lock` are unchanged.
+
+### Files shared with milestone 1
+
+`helper/firecracker/mod.rs` gains only the five-line test hold above, `manager.rs` only
+the five new `Limits` fields and their defaults, and the workspace `Cargo.toml` only the
+`sha2` profile override. Everything else is in `sys.rs`,
+`server.rs`, `service.rs`, `admission.rs`, `main.rs`, `test_deployment.rs`, the gate
+(`proven.rs` tests, `dependency-gate.json`), the B6 test harness (`tests/session.rs`,
+`tests/recovery.rs`), scripts and docs.
+
+### Evidence
+
+Branch `phase1b/b7-hardening` from main `1c107f9`: `51d1733` (the code), `0147703` (a
+needless borrow clippy 1.88 found on Linux), `ddafe5d` (the `sha2` profile) and the
+documentation commit after it.
+
+- *macOS.* `cargo test --locked --workspace`, default and `firecracker-test-deployment`
+  features: every test passes (kilnd lib 496 passed, 3 ignored). `cargo clippy --locked
+  --all-targets -- -D warnings -D clippy::disallowed_methods` on Rust 1.88 and 1.99,
+  both feature sets: clean. The gate tests, the new dependency gate included, pass;
+  `git diff --check` and `scripts/kilnd-maintenance-tests.py` pass. Mutation check: with
+  the preface deadline removed, `b7_idle_sockets_are_dropped_at_the_preface_deadline`
+  fails ("an idle socket outlived the preface deadline").
+- *CI.* Green on `0147703` (run 41958571713) and `ddafe5d` (run 41969039008): both jobs,
+  tests and clippy on 1.88 and 1.99, default and feature. The first push failed only that
+  needless borrow.
+- *VM, Linux unit tests* (`0147703`, `umask 022`). Default and feature
+  `cargo test --locked --workspace --no-fail-fast`: everything passes (kilnd lib 505
+  passed, 77 ignored) except the untouched `kilnd-broker-protocol` timing test
+  `wide_objects_check_in_well_under_quadratic_time`, whose 200 ms bound the VM's debug
+  build misses (211 to 226 ms alone; main `1c107f9` in the same VM: 180, 180 and 200.5 ms,
+  one failure in three). The new root tests (`b7_linux_root_sys_*`, run with `sudo`):
+  2/2 passed.
+- *VM, gate regressions.* `scripts/test-deployment-gate-regressions.sh feature` and `root`
+  against a feature build: all checks passed, the new slice case refused with "runs in
+  cgroup /b7gate.slice/kilnd-fcgate.service, not in unit "kilnd-fcgate.service" at
+  /system.slice/kilnd-fcgate.service".
+- *VM, real chain* (`ddafe5d`, with jailer and mkfs.xfs rebuilt by
+  `scripts/build-phase1b-tools.sh` at their approved digests, the Firecracker v1.17.0
+  release at `fe726e0b…`, and `bundle-a` rebuilt from kiln-guest `86fbf26` with broker
+  `35fad74f…`). `scripts/firecracker-regressions.py`: **8/8 passed**, the whole session
+  and the new hostile public caller included; under the attack the hostile UID opened and
+  had closed 798,341 sockets, held 66 to the 5-second deadline (none longer than 5.003 s,
+  none left open), while Health, Get and Delete answered in 3 ms, 1 ms and 116 ms and the
+  Delete released the session with its ABSENT receipt. `scripts/firecracker-crash-matrix.py`:
+  **11/11 passed**; the capacity scenario reported both paths, and three more runs of it
+  alone each reported both again.
+- *VM, installed daemon* (`ddafe5d` installed with `scripts/install.sh`): Linux clippy
+  (both feature sets) clean, `scripts/integration-test.sh`,
+  `scripts/daemon-singleton-regressions.sh`, `scripts/state-path-regressions.sh`,
+  `sudo python3 -I scripts/phase0-regressions.py`, `scripts/smoke.sh`,
+  `scripts/kilnd-maintenance-tests.py` and `scripts/hostile-public-caller.py` against
+  `/run/kilnd/kilnd.sock` all passed; the hostile caller there held 66 sockets to the
+  deadline (longest 5.004 s), none left, while Health, Get and Delete succeeded.
+- *Installed state.* Before installing, with kilnd stopped, `/var/lib/kilnd` and the
+  installed binaries were byte-copied and `cmp` found `kilnd.db`, `kilnd.lock` and the
+  three binaries identical; a copy reported schema 10 and `quick_check` ok (the live
+  database was never opened with `sqlite3`). Afterwards main `2a1faea` was reinstalled,
+  whose rebuilt binaries `cmp` identical to the pre-phase copies, the state was restored
+  and `cmp` found `kilnd.db` and `kilnd.lock` identical, and the daemon served with no
+  test account, unit, mount, cgroup, VMM or path left.
+
+Logs, matrices and transcripts are in `reviews/2026-11-04-b7-m2-vm/`. The first real-chain
+attempt, before the `sha2` profile, failed every scenario at "timed out waiting: the
+helper listens" on this branch and on main alike (`phase2/debug-session-main*.log`);
+a `gdb` sample showed H in `sha2::sha256::soft` under `verify_self_image`.
+
+## B7 milestone 2 break-it corrections (November 5, 2026)
+
+Daybreak Blue's break-it review of milestone 2 at `01cc7bc`
+(`reviews/2026-11-05-b7m2-breakit.md`) returned MUST-FIX with two HIGH findings, two
+MEDIUM and two LOW. All six are accepted and corrected on `phase1b/b7-hardening`; none is
+rejected. Daybreak's recheck of those fixes at `1d11ac9`
+(`reviews/2026-11-05-b7m2-recheck.md`) found HIGH-1 only partly fixed; *HIGH-1 recheck*
+below closes it. Production Firecracker stays disabled.
+
+### HIGH-1: a wrapper around std passed the dependency gate
+
+The gate inferred whether a dependency could wrap system calls from `Cargo.lock` (a raw
+crate, or a direct dependency on one) and then *required* each entry's `syscalls` flag to
+equal that inference. `fs-err`, a drop-in wrapper around `std::fs` that depends only on
+`autocfg`, therefore had to be declared `syscalls: false` with no destructive paths, and
+production could call `fs_err::remove_dir_all`, which clippy saw under the wrapper's name.
+The gate now records a reviewed decision for every direct dependency (kind, capability,
+reason) and never overrides it; `Cargo.lock` can only require more. A destructive-capable
+category lists its destructive paths and `clippy.toml` disallows them. Two lexical checks
+flag a mistaken `none`: a production path to a destructive-looking function that clippy
+does not disallow (aliases, grouped imports and `extern crate ... as` resolved; a glob
+import of such a crate refused), and a dependency whose own locked source reaches a
+disallowed std, Tokio or libc path (the real `fs-err` 3.3.2 reaches thirteen). The recheck
+showed these were narrower than this section first claimed; see *HIGH-1 recheck*. Tests: `proven::tests::dependency_gate::b7m2_an_fs_err_wrapper_declared_none_is_refused`
+(Daybreak's PoC on a synthetic lockfile, manifest and source: unreviewed, `none`, aliased,
+glob, `filesystem` without paths and with paths not disallowed are refused; listed and
+disallowed passes, though `Cargo.lock` shows no raw crate), `the_lock_graph_requires_but_never_overrides`
+and `the_dependency_gate_holds`; on the real crates, `scripts/dependency-gate-regressions.sh`
+shows the gate refusing `fs-err` reviewed as `none` and, reviewed as `filesystem` with its
+paths disallowed, clippy rejecting the call on Rust 1.88 and 1.99.
+
+### HIGH-1 recheck: method and transitive wrappers
+
+Daybreak's recheck (`reviews/poc-b7m2-recheck/`) showed that both lexical checks missed two
+ordinary shapes. In the first, `method-wrapper`, reviewed `filesystem` with
+`no_destructive_api`, implements an extension trait for `std::fs::File` whose `reset`
+calls `self.set_len(0)`; production imports it `as _` and calls `file.reset()`. In the
+second, `outer-wrapper`, reviewed `none`, re-exports the same trait from `inner-wrapper`,
+a transitive package with no entry and no scanned source. Neither check could see a method
+call: the source scan matched only rooted paths, read only direct dependencies, and cut each
+file at its first `#[cfg(test)] mod`, so an out-of-line `mod tests;` near the top hid the
+rest of the file (`smallvec`'s `lib.rs`, for one). Workspace clippy accepted both, because
+it does not lint dependency bodies.
+
+The gate now fails closed on review, not detection (section 7.1 has the model):
+
+- *Every locked package is reviewed.* There are 144 entries, one per package in
+  `Cargo.lock` outside the workspace, keyed `name@version` and pinned to the lock
+  checksum and the resolved feature set, each with a kind, a capability and a written
+  justification. Shared justifications are limited to packages the test proves name no
+  file, process, libc or Tokio fs/process path: 78 under `pure-computation` and 15 under
+  `compile-time`. A new package, a version or checksum change or a feature change fails
+  until reviewed. `scripts/dependency-gate-review.py` drafted the initial entries and their
+  mechanical fields; each capability and justification was written by hand.
+- *Method-form sinks across the subtree.* For each `none`, `network` or
+  `no_destructive_api` declaration, the whole runtime subtree's source is scanned for the
+  curated method names (whatever the receiver), disallowed paths and trait impls on
+  std's and Tokio's file and process types. The sources come from cargo's own resolve
+  (`cargo metadata`), so the loader also reads transitive packages and libraries rooted
+  outside `src/` (`fnv`'s is). Inline test modules are skipped by their braces, not by
+  truncating the file, and out-of-line test files in the library directory are read too. Each hit
+  needs a `sink_exceptions` entry scoped to package, version and feature set. The 22 today
+  are listed with their reasons in `dependency-gate.json`.
+- *The claim is narrowed.* Section 7.1 and `dependency-gate.json`'s `about` now promise
+  only that no unreviewed package enters the build and that common destructive sinks in
+  packages declared non-destructive are flagged for review. Wording that the backstops
+  *catch* a mistaken capability is gone; identifying a destructive API is the reviewer's
+  job.
+
+Tests (synthetic, under `cargo test`):
+
+- `b7m2_recheck_a_method_wrapper_is_refused`: Daybreak's direct case, reviewed
+  `filesystem` with `no_destructive_api` or `none`, is refused for `.set_len(` and
+  `impl for std::fs::File`, and the refusal drafts the scoped exception. So is the same
+  shape through a lifetime-qualified reference, UFCS, an aliased module, a glob-imported
+  `File` and glob-imported free functions, and each other sink name. A definition, a field, `write`, strings, comments, the
+  package's own `File` and an imported non-std `File` are not hits.
+- `b7m2_recheck_a_transitive_wrapper_is_refused`: the unreviewed inner package is refused,
+  and the outer package's subtree reaches the inner `.set_len(`. Reviewing the inner package
+  as `none` leaves both declarations refused, and missing source is refused.
+- `b7m2_recheck_every_locked_package_is_reviewed`: a version bump (new version
+  unreviewed, old entry stale), a checksum change, a feature change, a transitive kind the
+  graph contradicts, a git dependency, the group purity check, an unknown group and a
+  transitive `destructive` list.
+- `b7m2_recheck_an_exception_holds_only_for_its_scope`: it holds at its exact scope.
+  Another feature set, another version, another sink, another package, or no reason or
+  features is refused.
+- `b7m2_recheck_proc_macros_are_build_time`; `the_dependency_gate_holds` on the real
+  workspace.
+
+On the real crates, `scripts/dependency-gate-regressions.sh` uses the actual loader, cargo
+and clippy, with the fixtures as vendored registry packages. The cases and their results
+are under *Recheck corrections evidence* below.
+
+### HIGH-2: accepted flags let one UID own every connection slot
+
+`main.rs` refused a per-UID share only *above* the general pool, so
+`--max-connections 33 --reserved-connections 1 --max-connections-per-uid 32` let one UID
+hold all 32 general slots and the only reserved one with preface-complete idle sockets,
+starving every other UID's fresh Health, Get and Delete. `admission::validate_ingress` now
+holds the strict invariants (section *Ingress fairness* above) and kilnd refuses to start on
+a violation, naming the flags. Tests: `admission::tests::b7m2_ingress_invariants` (each
+invariant at equality and one below, and that 33/1/31 leaves another UID a general slot)
+and `main`'s `b7m2_ingress_flags_are_refused_at_their_boundaries` (33/1/32 refused, 33/1/31,
+64/4/59 and 3/1/1 accepted, 64/4/60, 2/1/1, 3/2/1, 3/3/1, a zero reserve, RPC 8/8 and a
+zero cleanup lane refused).
+
+### MEDIUM-1: the destructive lists were incomplete
+
+`std::fs::copy` and `tokio::fs::copy` overwrite and truncate a destination by name;
+`libc::creat` opens with `O_TRUNC`; `sigqueue`, `creat64`, `truncate64`, `ftruncate64`,
+`execl`, `execle`, `execlp` and `popen` were missing too. All are disallowed now, with
+`std::os::unix::process::CommandExt::exec` and every other locked libc function matching
+the curated destructive patterns (`mount`, `removexattr`, `shm_unlink`, `pthread_kill`,
+`reboot`, `swapoff` and other targets' names: 104 in libc 0.2.190). Completeness is now a
+test rather than two hand-written lists agreeing: `every_destructive_libc_function_is_disallowed`
+reads the pinned libc source, and `std_and_tokio_destructive_surfaces_are_disallowed` holds
+`clippy.toml` to a curated std review and to every public `tokio::fs` function of the
+locked Tokio. Gating `libc::mount` moved the jail base's two production mounts into the
+typed `sys::bind_onto_itself` and `sys::make_private_recursive`. Daybreak's
+`missing-methods` fixture is part of `scripts/dependency-gate-regressions.sh`: clippy
+rejects both calls on 1.88 and 1.99.
+
+### MEDIUM-2: four UIDs could consume the whole reserve
+
+The design said the reserve still served up to four *other* UIDs after colluding UIDs
+filled the general pool; four UIDs holding 33, 29, 1 and 1 connections take all 64 slots.
+The claim is narrowed: the reserve is first-come and bounded per UID, consistent with the
+threat model's acceptance of colluding UIDs. One connection slot and one Health/cleanup
+RPC permit beyond the budget belong to UID 0, so the operator always reaches Health,
+GetSandbox and DeleteSandbox. Tests: `admission::tests::b7m2_root_gets_its_slot_after_a_four_uid_fill`
+(the exact fill at the defaults; a fifth UID and unknown credentials refused, root
+admitted on its slot, once), `b7m2_root_keeps_one_health_and_cleanup_permit` and
+`service::tests::b7m2_root_reaches_health_and_cleanup_with_every_lane_held`.
+
+### LOW-1: build-only status was not enforced
+
+Every entry now has a `kind` the manifests must agree with, and a build-only or dev-only
+dependency that `Cargo.lock` reaches from the runtime dependencies is refused unless
+`runtime_via` names the path (`h2`, also `tonic`'s transport). Test:
+`b7m2_build_and_dev_only_kinds_are_enforced` (moving `tonic-prost-build` to a normal
+dependency fails twice over; a runtime dependency pulling in a dev-only crate fails).
+
+### LOW-2: the reserved-lane tests did not cover every ordinary RPC
+
+`service::tests::b7_rpc_shares_cleanup_lane_and_reserved_connections` (reserved and root
+lanes) and `server::tests::b7_a_reserved_slot_serves_health_and_cleanup_only` (the real
+transport) now send valid Exec and GetExecution requests too, each first shown valid on a
+general connection.
+
+### Corrections evidence
+
+Branch `phase1b/b7-hardening`: `13c3a50` (ingress: HIGH-2, MEDIUM-2, LOW-2), `5d3ab15`
+(the dependency gate and destructive lists: HIGH-1, MEDIUM-1, LOW-1), `62fb76e` (the CI
+job) and the documentation commit after them. The VM runs used `62fb76e`.
+
+- *macOS.* `cargo test --locked`, default and `firecracker-test-deployment` features:
+  every test passes (kilnd lib 506 passed, 3 ignored). `cargo clippy --locked
+  --all-targets -- -D warnings -D clippy::disallowed_methods` on Rust 1.88 and 1.99, both
+  feature sets: clean. `git diff --check` and `scripts/kilnd-maintenance-tests.py` pass.
+  `scripts/dependency-gate-regressions.sh`: `fs-err` reviewed as `none` refused on 1.88
+  and 1.99 (the production call and its own source); reviewed as `filesystem`, the gate
+  holds and clippy rejects `fs_err::remove_dir_all` on both; `std::fs::copy` and
+  `libc::creat` rejected on both.
+- *CI.* Run 41995571790 on `62fb76e`: `check`, `feature` and the new `gate-regressions`
+  jobs green. The first attempt's `feature` job failed only the untouched
+  `kilnd-broker-protocol` timing test `wide_objects_check_in_well_under_quadratic_time`
+  (229 ms against its 200 ms bound; see milestone 2's evidence); the rerun passed.
+- *VM, phase 1.* Linux clippy, both feature sets, clean (so `libc::mount` is gated with
+  every production use behind the typed wrappers). `cargo test --locked --workspace`:
+  default all passed (kilnd lib 515 passed, 77 ignored); feature all passed except the
+  same timing test, which then passed 3/3 alone. The root `b7_linux_root_sys_*` tests (the
+  ramfs `EOPNOTSUPP` refusal and the procfs component walk's mount check): 2/2. The
+  Linux `b7_*`, procfs and `read_dir_fd` tests: 10/10. `scripts/test-deployment-gate-regressions.sh`
+  `feature` and `root`: all checks passed, the slice and no-unit cases refused.
+  `scripts/dependency-gate-regressions.sh` on Linux: all passed.
+- *VM, phase 2, the real chain.* `scripts/firecracker-regressions.py`: **8/8 passed**, the
+  whole session and the hostile public caller included (773,153 sockets opened and closed
+  by the daemon, 66 held to the 5-second deadline, longest 5.003 s, none left open, while
+  Health, Get and Delete answered in 3 ms, 1 ms and 110 ms). `scripts/firecracker-crash-matrix.py`:
+  **11/11 passed**.
+- *VM, phase 3, the PoCs on the wire* (`ingress.py` in the evidence directory: daemons
+  run as `kilnd` on private sockets against the installed helper, callers `b7m2a` to
+  `b7m2e` in the `kilnd` group; **16/16 passed**). HIGH-2 at `33/1/32`: on the reviewed
+  `01cc7bc`, one UID held 33 of 33 slots and another UID's fresh Health, Get and Delete
+  were each closed at the transport, then served once the holder exited; this branch
+  refused the flags at startup ("--max-connections-per-uid (32) must be below the general
+  connection slots (--max-connections 33 - --reserved-connections 1 = 32)"). MEDIUM-2 at
+  the defaults: four UIDs held exactly 33, 29, 1 and 1 on both builds and a fifth UID was
+  refused on both; root was refused on `01cc7bc` and got Health, Get and Delete on this
+  branch, and a non-root UID could not take root's slot. Floods on this branch, each 30 s
+  over the attacker's whole share of 33 connections while another UID repeated Health,
+  Get and Delete: SETTINGS 6,573 served and 0 refused, PING 7,089/0, slow headers 8,736/0
+  (the daemon closed all 33 attacker connections), slow frames 8,520/0, rapid reset
+  8,727/0 (all 33 closed); the daemon survived every one, and afterwards the four-UID fill
+  reached exactly 33, 29, 1 and 1 again (the attacker's 34th refused), so every permit
+  had been returned.
+- *VM, phase 3, installed daemon* (`62fb76e` installed with `scripts/install.sh`):
+  `scripts/integration-test.sh`, `daemon-singleton-regressions.sh`,
+  `state-path-regressions.sh`, `sudo python3 -I scripts/phase0-regressions.py`,
+  `scripts/smoke.sh`, `scripts/hostile-public-caller.py` (794,539 sockets, 66 held to the
+  deadline, longest 5.002 s, none left) and `scripts/kilnd-maintenance-tests.py`: all
+  passed.
+- *Installed state.* Before installing, with kilnd stopped, `/var/lib/kilnd` and the three
+  installed binaries were byte-copied and `cmp` found `kilnd.db`, `kilnd.lock` and the
+  binaries identical; a copy reported schema 10 and `quick_check` ok (the live database
+  was never opened with `sqlite3`). Afterwards `2a1faea` was reinstalled, whose binaries
+  `cmp` identical to the pre-phase copies (and hash as before the phase), the state was
+  restored and `cmp` found `kilnd.db` and `kilnd.lock` identical, and the daemon served
+  with no test account, group, unit, mount, cgroup, VMM or temporary path left.
+
+Logs, matrices and the PoC harness are in `reviews/2026-11-05-b7m2-fixes-vm/`.
+
+### Recheck corrections evidence
+
+Branch `phase1b/b7-hardening`: `a65bbe2` (the gate: every locked package reviewed,
+the subtree scan, the narrowed claim), `9986dd7` (the regression script and CI job) and
+the documentation commit after them. No runtime code changed, so no VM run was needed.
+
+- *macOS, the gate.* `proven::tests::dependency_gate`: 13 passed on Rust 1.88 and 1.99,
+  `the_dependency_gate_holds` included. That is 144 reviewed packages (78
+  `pure-computation`, 15 `compile-time`, 51 with their own justification; 102 runtime, 40
+  build-only, 2 dev-only) and 22 scoped exceptions. On a 10-core Mac the gate test reads
+  48 MB of dependency source, lexes the 15 MB that could hold a hit, and takes about 7 s
+  wall.
+- *macOS, clippy.* `cargo clippy --locked --all-targets -- -D warnings
+  -D clippy::disallowed_methods` on Rust 1.88 and 1.99, default and
+  `firecracker-test-deployment` features: clean. `git diff --check` and
+  `scripts/kilnd-maintenance-tests.py` pass.
+- *macOS, the full suites.* `cargo test --locked --no-fail-fast`, default and
+  `firecracker-test-deployment` features, ran with the Mac mini at a load average of
+  3 to 12 from other work. Every test binary passed except three timing-bound tests:
+  `runtime::kiln_direct`'s `late_failure_frame_settles_after_kill_and_retains_cleanup_proof`
+  and `received_runtime_failure_wins_cancellation_and_timeout_while_cli_is_alive` (5 s
+  fixture-marker waits), and the broker's `wide_objects_check_in_well_under_quadratic_time`
+  (kilnd lib 509 passed, 2 failed, 3 ignored). The unchanged `1d11ac9`, run the same way
+  under the same load, failed the same `kiln_direct` tests (503 passed, 3 failed). No
+  runtime code changed, and the Linux CI below passes them.
+- *`scripts/dependency-gate-regressions.sh` on Rust 1.88 and 1.99* (macOS, at
+  `9986dd7`): all passed.
+  - fs-err reviewed `none`: refused, for the production call and for
+    `std::fs::remove_dir_all` in its source. Reviewed `filesystem` with its paths
+    disallowed: the gate holds, and clippy rejects `fs_err::remove_dir_all`.
+  - `method-wrapper`, reviewed `filesystem` with `no_destructive_api` or reviewed `none`:
+    refused for `.set_len(` (and `impl for std::fs::File`) in its source, while clippy
+    accepts the workspace.
+  - `outer-wrapper` (`none`) over `inner-wrapper`: refused. With the drafter's skeleton
+    entry for the inner package, it needs a reviewed capability; with no entry at all,
+    it is in Cargo.lock with no reviewed entry. Both times the outer package's subtree
+    reaches the inner `.set_len(`, and clippy accepts the workspace.
+  - With a reviewed exception for `method-wrapper` 1.0.0 and no features, the gate holds
+    and clippy accepts.
+  - A lock change to 1.0.1 is refused (1.0.1 unreviewed, the 1.0.0 entry and exception
+    stale), and holds once 1.0.1 is reviewed.
+  - Enabling `extra` is refused: the reviewed features, the exception's scope and the
+    `.set_len(` hit all fail.
+  - `std::fs::copy` and `libc::creat`: clippy rejects both.
+- *CI.* Run 42032865841 on `9986dd7`: `check` and `gate-regressions` green.
+  `gate-regressions` ran every case above on Linux with Rust 1.88 and 1.99, all
+  passed, in 25 minutes; `the_dependency_gate_holds` took 14 s on the 4-core runner. The
+  first attempt's `feature` job failed only the untouched
+  `exit3_second_helper_is_refused_by_the_persistent_node_lock`, which read the second
+  helper's `start-error` file before its reason was written; the rerun passed.
+
+Logs: `reviews/2026-11-05-b7m2-recheck-fixes/` (the regression script on macOS and in
+CI, the full suites, and the `1d11ac9` baseline).
+
+### Recheck 2: the build's own graph, identifiers, identities and the root
+
+Daybreak's second recheck (`reviews/2026-11-05-b7m2-recheck2.md`, PoCs in
+`reviews/poc-b7m2-recheck2/`) at `c500a6e` failed the gate on two HIGHs and raised two
+MEDIUMs:
+
+- *HIGH-1: the gate reviewed a different feature graph from the build.* The gate test ran
+  its own `cargo metadata --locked --all-features`, which does not inherit a dependency
+  feature the parent command selects. `cargo test --locked --all-features --features
+  tokio/full` passed the gate while the build used four unreviewed Tokio features (`full`,
+  `io-std`, `parking_lot`, `rt-multi-thread`) and four packages in neither `Cargo.lock` nor
+  the review (`lock_api`, `parking_lot`, `parking_lot_core`, `scopeguard`). `--locked`
+  left the lock byte-identical.
+- *HIGH-2: a type alias plus UFCS evaded the method and impl checks.* In a package
+  reviewed `none`, `pub type LocalFile = File;` and `LocalFile::set_len(self, 0)` inside an
+  extension trait's impl for `LocalFile` is not a `.set_len(` call, not a rooted std path,
+  and not an impl on a flagged type: the alias counted as a type the package defines.
+- *MEDIUM-1: `name@version` collapsed distinct source identities.* Two local registries'
+  `dupe@1.0.0` became one key in the gate and the drafter, so one review covered both and
+  the unreviewed one (whose `tidy` removes a file) disappeared. The drafter reported
+  `145 locked packages, 0 to review`.
+- *MEDIUM-2: an ambient root override.* `KILND_DEPENDENCY_GATE_ROOT` redirected the
+  authoritative test from a dirty workspace it refused to a clean copy that passed.
+
+The corrections:
+
+- *One supported entry point, one graph per profile* (HIGH-1). `scripts/build.sh PROFILE
+  COMMAND` is the only supported way to build, test or lint, and `dependency-gate.json`'s
+  `profiles` (`default`; `firecracker-test-deployment`, which enables
+  `kilnd/firecracker-test-deployment`) is the one list it and the gate read. It runs
+  `cargo COMMAND --locked` with only the profile's workspace features and refuses every
+  argument that would select features or another graph, in every spelling cargo accepts.
+  The gate resolves each profile with exactly those flags; a profile may name only a
+  feature a workspace member declares, so a dependency feature goes through a checked-in
+  workspace feature; every package a profile resolves must be locked and reviewed; the
+  reviewed features are the union over the profiles and kinds come from the union of
+  their graphs. CI's jobs, `scripts/install.sh` (and so the binaries `scripts/upgrade.sh`
+  takes), `scripts/b4-vm-tests.sh`, `scripts/integration-test.sh`, `docs/setup.md` and the
+  README build through it, and `supported_builds_use_the_build_entry_point` refuses a raw
+  cargo build in any of them. No build needs a dependency feature today; the two profiles
+  resolve the same 150 packages.
+- *Identifiers, not call shapes* (HIGH-2). Every identifier matching a `METHOD_SINKS`
+  pattern is a hit wherever it occurs in the scanned subtree (labelled by the identifier:
+  `set_len`, not `.set_len(`). `type` aliases (any visibility, generics skipped, associated
+  types included) resolve like `use` aliases in the impl check, and an alias whose target
+  is one of std's or Tokio's file or process types is flagged itself (`type alias for
+  std::fs::File`, or `type alias for File` through a glob import). A `type` name no longer
+  counts as a type the package defines. The wider match reached harmless identifiers in 12
+  packages; each was read and recorded: seven existing exceptions widened (bytes,
+  futures-util, hyper, serde_json, smallvec, Tokio, tracing-subscriber) and five added
+  (hyper-util and tonic executor bindings, libc's own declarations, windows-sys binding
+  parameters, zmij's `ptr::copy`), 27 in all, each still scoped to package, version and
+  feature set.
+- *Duplicate identities refused* (MEDIUM-1). Two packages with one `name@version` in
+  `Cargo.lock` fail the gate before any review is matched, naming both sources and
+  checksums; two in a profile's `cargo metadata` fail the loader; the drafter refuses both.
+  Multiple sources for one name and version are not supported.
+- *A fixed root* (MEDIUM-2). `the_dependency_gate_holds` always checks
+  `workspace_root()`, the workspace its test binary was compiled from, and reads no
+  variable (`the_authoritative_gate_reads_no_environment` checks its body). The regression
+  script runs the same loader and gate through `regression_fixture_gate`, a test ignored by
+  default that requires `KILND_DEPENDENCY_GATE_FIXTURE`; `cargo test` and CI never run it.
+- *The claim, narrowed again.* Section 7.1, the CHANGELOG and `dependency-gate.json`'s
+  `about` now promise only builds made through `scripts/build.sh` and a reviewed profile,
+  describe the sink check as identifier-level, and state that duplicate identities are
+  refused. A raw `cargo build` with other feature flags is outside the guarantee.
+
+Tests (synthetic, under `cargo test`):
+
+- `b7m2_recheck2_each_profile_graph_is_reviewed`: a profile selecting `tokio/full` is no
+  workspace feature; a workspace feature forwarding it resolves an unlocked
+  `parking_lot` and an unreviewed `libc` feature, and reviewing the union holds; an
+  undeclared feature, a `default` with features, an unknown field, an unresolved profile
+  and a missing section are refused.
+- `b7m2_recheck2_duplicate_identities_are_refused`: two `dupe@1.0.0` lock entries return
+  only the identity error; two metadata packages fail the loader.
+- `b7m2_recheck2_type_aliases_resolve`: aliases (with references and lifetimes, through
+  `use` aliases and chains, glob-imported, associated) are flagged and their impls
+  resolved; the package's own `File`, another crate's and target-less associated types
+  are not.
+- `b7m2_recheck_a_method_wrapper_is_refused` now also refuses Daybreak's alias-UFCS
+  wrapper, `Handle::set_len(x, 0)`, `<Handle as Len>::set_len`, a function value, a `use`
+  list, a definition and a field; strings, comments and aliases of non-std types are not
+  hits.
+- `supported_builds_use_the_build_entry_point`,
+  `the_authoritative_gate_reads_no_environment`, and `the_dependency_gate_holds` on the
+  real workspace (both profiles).
+
+`scripts/dependency-gate-regressions.sh` keeps every earlier case and adds Daybreak's
+type-alias UFCS wrapper (vendored, its source exact), feature injection through
+`build.sh`, a profile's own graph, the two-registry collision and the root override.
+Results are under *Recheck 2 corrections evidence*.
+
+### Recheck 2 corrections evidence
+
+Branch `phase1b/b7-hardening`: `aaff49b` (build profiles and `scripts/build.sh`, the
+per-profile gate, identifier matching and type aliases, duplicate identities, the fixed
+root, the regression cases and CI) and the documentation commit after it. No runtime code
+changed, so no VM run was needed.
+
+- *macOS, the gate.* `proven::tests::dependency_gate`: 18 passed and 1 ignored
+  (`regression_fixture_gate`) on Rust 1.88 and 1.99, `the_dependency_gate_holds` included.
+  That is two profiles resolving the same 150 packages, 144 reviewed packages (unchanged:
+  78 `pure-computation`, 15 `compile-time`, 51 with their own justification; 102 runtime,
+  40 build-only, 2 dev-only) and 27 scoped exceptions. `scripts/dependency-gate-review.py`
+  reports `144 locked packages, 0 to review`.
+- *macOS, clippy.* `scripts/build.sh [+1.99.0] PROFILE clippy --all-targets -- -D warnings
+  -D clippy::disallowed_methods` on Rust 1.88 and 1.99, both profiles: clean. `git diff
+  --check` and `scripts/kilnd-maintenance-tests.py` pass.
+- *macOS, the full suites.* `scripts/build.sh +1.88.0 PROFILE test --no-fail-fast`, both
+  profiles: every test binary passed (kilnd lib 516 passed, 4 ignored). The timing-bound
+  `kiln_direct` tests and the broker's `wide_objects_check_in_well_under_quadratic_time`,
+  which failed under load at the recheck, passed this time.
+- *`scripts/dependency-gate-regressions.sh` on Rust 1.88 and 1.99* (macOS, at `aaff49b`):
+  all passed. Every earlier case held its result (fs-err `none` refused and `filesystem`
+  holding with clippy rejecting the call; `method-wrapper` refused as `filesystem` with
+  `no_destructive_api` and as `none`; `outer-wrapper` over `inner-wrapper` refused with
+  and without the inner entry; the exception holding at its scope; the 1.0.1 bump refused
+  until reviewed; `extra` refused; clippy rejecting `std::fs::copy` and `libc::creat`),
+  with hits now labelled `set_len` rather than `.set_len(`. The new cases:
+  - Daybreak's type-alias UFCS wrapper, reviewed `none`: refused for `set_len`, `type
+    alias for std::fs::File` and `impl for std::fs::File`; clippy accepts the workspace.
+  - Feature injection through `build.sh`: the PoC's `--all-features --features
+    tokio/full` and ten other spellings (`--features=`, `-F`, `-Fx`, `-rF`,
+    `--all-features`, `--no-default-features`, `--manifest-path`, `--config`, `-Z`) are
+    refused before cargo runs.
+  - A profile selecting `tokio/full`: `build.sh` refuses it; the gate refuses it as no
+    workspace feature and for `lock_api`, `parking_lot`, `parking_lot_core` and
+    `scopeguard`, which its graph resolves and `Cargo.lock` does not lock. `Cargo.lock` is
+    unchanged.
+  - A workspace feature forwarding `tokio/full`, in a profile: refused for the
+    unreviewed `parking_lot` (and the rest) it locks and Tokio's unreviewed features.
+  - Two `dupe@1.0.0` registries: the drafter and the gate refuse the duplicate identity.
+  - The root override: the dirty workspace's authoritative test refuses with both
+    variables naming a clean copy; the pristine copy's holds with both naming the dirty
+    one; the ignored fixture test follows its variable and refuses the dirty one.
+- *CI.* Run 42051232479 on `aaff49b`: `check` and `gate-regressions` green.
+  `gate-regressions` ran every case above on Linux with Rust 1.88 and 1.99, with the same
+  73 outcomes as on macOS, in 25 minutes. The first attempt's `feature` job failed only
+  the untouched `b3_04_startup_that_cannot_journal_never_serves_and_leaves_no_workers`,
+  which read the helper's `start-error` file before its reason was written (the same race
+  as the recheck's `exit3_second_helper…` flake); the rerun passed, and the run concluded
+  green.
+
+Logs: `reviews/2026-11-05-b7m2-recheck2-fixes/` (the regression script on macOS and in
+CI, the full suites, and the failed `feature` attempt).
 
 # 16. Retired-token compaction (pre-B7 design)
 

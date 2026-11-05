@@ -1,0 +1,2087 @@
+{
+  "about": [
+    "Design section 7.1's dependency gate (B4 recheck 6 item 2; rebuilt for the B7 milestone 2",
+    "break-it and its two rechecks). It fails closed on review, not on detection. For builds made",
+    "through the supported entry point, scripts/build.sh with a profile below, it guarantees two",
+    "things: no unreviewed package enters the build, and every occurrence of a curated",
+    "destructive sink identifier, and every trait impl or type alias on std's and Tokio's file",
+    "and process types, in the runtime subtree of a package declared non-destructive is flagged",
+    "for review. A raw cargo build with other feature flags is outside the guarantee. Deciding",
+    "whether an API is destructive is the reviewer's job; the gate is not a proof. `profiles`",
+    "lists every supported build: the workspace features (member/feature) scripts/build.sh",
+    "passes, with --locked, and nothing else; it refuses --features, -F, --all-features,",
+    "--no-default-features, --manifest-path, --config and -Z. The gate runs cargo metadata",
+    "--locked with exactly each profile's flags: a profile may name only a declared workspace",
+    "feature, and every package a profile resolves must be locked and reviewed. `packages` has an",
+    "entry for every package in Cargo.lock outside the workspace, keyed name@version and pinned",
+    "to its Cargo.lock `checksum` and the `features` the profiles resolve (their union); one",
+    "name@version from two sources is refused outright. Each has its `kind` (runtime, build-only",
+    "or dev-only, from the manifests for a direct dependency and the union of the profiles'",
+    "graphs otherwise), its `capability` (`none`, or a set of filesystem, process, signals,",
+    "syscalls, network) and a justification (`why`, or a `group` from `groups`, allowed only for",
+    "`none` packages whose source names no std::fs, std::process, std::os fs/fd/process, libc or",
+    "tokio::fs/process path at all). A new package, version, checksum or feature set fails until",
+    "reviewed; scripts/dependency-gate-review.py drafts the mechanical fields. A direct",
+    "dependency with a destructive-capable category lists its `destructive` paths, each",
+    "disallowed in clippy.toml, or records `no_destructive_api`; a `none` package over a raw",
+    "system-call crate records `raw_use`. For every `none`, `network` or `no_destructive_api`",
+    "package in the runtime graph (or direct), the source of its whole runtime subtree is scanned",
+    "for the curated sink identifiers wherever they occur (method calls, UFCS, function values,",
+    "use lists, definitions), paths clippy.toml disallows, trait impls on std's and Tokio's file",
+    "and process types (through use and type aliases) and type aliases of them; each hit needs a",
+    "`sink_exceptions` entry scoped to that package, version and feature set, with why.",
+    "proven::tests::dependency_gate checks all of it; section 7.1 has the model and its limits."
+  ],
+  "profiles": {
+    "default": {
+      "features": [],
+      "why": "the release build scripts/install.sh installs (and so scripts/upgrade.sh's binaries), the default CI jobs' tests, clippy and release build, and the library tests the VM scripts build"
+    },
+    "firecracker-test-deployment": {
+      "features": [
+        "kilnd/firecracker-test-deployment"
+      ],
+      "why": "Phase 1b B6's isolated Firecracker test deployment: CI's feature job (tests, clippy, the feature build) and the daemon and client scripts/b4-vm-tests.sh builds"
+    }
+  },
+  "groups": {
+    "pure-computation": "Pure computation: in-memory data structures, parsing, encoding, hashing, formatting, type-level code and async plumbing (futures, wakers, channels, pin projection). It opens, removes, renames, truncates and runs nothing and makes no raw system call: the gate checks that its library source names no std::fs, std::process, std::os fs, fd or process extension, libc or tokio::fs/process path at all, and that no raw system-call crate is under it.",
+    "compile-time": "Build-time code generation: a procedural macro, or a library only procedural macros and code generators use (token streams, Rust syntax trees, pretty-printing). It runs in the compiler or a build script on the source it is given and is never linked into a kilnd binary; the gate checks its library source names no std::fs, std::process, std::os fs, fd or process extension, libc or tokio::fs/process path at all."
+  },
+  "packages": {
+    "aho-corasick@1.1.5": {
+      "checksum": "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba",
+      "features": [
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "anstream@1.0.0": {
+      "checksum": "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d",
+      "features": [
+        "auto",
+        "default",
+        "wincon"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "clap's styled output: writes ANSI-styled text to the stream it is given (stdout, stderr, or a File the caller passes, hence its writer impls for std::fs::File) and strips styles when that stream is not a terminal; it opens, removes or renames nothing"
+    },
+    "anstyle-parse@1.0.0": {
+      "checksum": "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e",
+      "features": [
+        "default",
+        "utf8"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "anstyle-query@1.1.5": {
+      "checksum": "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "raw_use": "Windows console mode query (GetConsoleMode/SetConsoleMode on the process's own console) through windows-sys, on Windows only; elsewhere it reads TERM, COLORTERM, NO_COLOR and CLICOLOR",
+      "why": "clap's terminal colour detection from environment variables"
+    },
+    "anstyle-wincon@3.0.11": {
+      "checksum": "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "raw_use": "Windows console text attributes (SetConsoleTextAttribute) through windows-sys",
+      "why": "styling for legacy Windows consoles (anstream's wincon feature); Windows only: never compiled for kilnd's Linux helper or its macOS development builds. Its stream impl for std::fs::File writes to a file it is given"
+    },
+    "anstyle@1.0.14": {
+      "checksum": "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "anyhow@1.0.104": {
+      "checksum": "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "error values and context chains: carries and formats errors in memory; no file, process or system-call API"
+    },
+    "async-trait@0.1.92": {
+      "checksum": "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "atomic-waker@1.1.2": {
+      "checksum": "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "axum-core@0.5.6": {
+      "checksum": "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "axum@0.8.9": {
+      "checksum": "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "base64@0.22.1": {
+      "checksum": "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6",
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "bitflags@2.13.2": {
+      "checksum": "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06",
+      "features": [
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "block-buffer@0.10.4": {
+      "checksum": "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "bytes@1.12.1": {
+      "checksum": "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "byte buffers (Bytes, BytesMut): in-memory only; its one std::process path is std::process::abort on a reference-count overflow, ending this process"
+    },
+    "cc@1.8.0": {
+      "checksum": "6651c9ed80effdc7db0ff72512157f901af5e3549e341e24b1dd4887d836d838",
+      "features": [],
+      "kind": "build-only",
+      "capability": [
+        "filesystem",
+        "process"
+      ],
+      "why": "build-time only, for libsqlite3-sys's build script: runs the C compiler and archiver and writes object files and the archive under OUT_DIR on the build host; never linked into kilnd"
+    },
+    "cfg-if@1.0.5": {
+      "checksum": "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "clap@4.6.7": {
+      "checksum": "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946",
+      "features": [
+        "color",
+        "default",
+        "derive",
+        "env",
+        "error-context",
+        "help",
+        "std",
+        "suggestions",
+        "usage"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "argument parsing: reads the arguments and environment it is given and prints help"
+    },
+    "clap_builder@4.6.7": {
+      "checksum": "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d",
+      "features": [
+        "color",
+        "env",
+        "error-context",
+        "help",
+        "std",
+        "suggestions",
+        "usage"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "clap's argument parser: reads the arguments and environment it is given, prints help and errors, and on a parse error ends this process (std::process::exit); its own clap::Command type is not std::process::Command"
+    },
+    "clap_derive@4.6.7": {
+      "checksum": "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0",
+      "features": [
+        "default"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "clap_lex@1.1.1": {
+      "checksum": "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "colorchoice@1.0.5": {
+      "checksum": "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "cpufeatures@0.2.17": {
+      "checksum": "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "raw_use": "libc::getauxval (Linux) and libc::sysctlbyname (macOS) to read CPU feature flags, nothing else",
+      "why": "sha2's runtime CPU feature detection"
+    },
+    "crypto-common@0.1.7": {
+      "checksum": "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a",
+      "features": [
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "digest@0.10.7": {
+      "checksum": "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292",
+      "features": [
+        "alloc",
+        "block-buffer",
+        "core-api",
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "either@1.19.0": {
+      "checksum": "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be",
+      "features": [
+        "std",
+        "use_std"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "equivalent@1.0.3": {
+      "checksum": "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "errno@0.3.14": {
+      "checksum": "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "raw_use": "libc's errno location, to read and set this thread's errno",
+      "why": "rustix's portable errno access (tempfile, build and test only) and signal-hook-registry's"
+    },
+    "fallible-iterator@0.3.0": {
+      "checksum": "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649",
+      "features": [
+        "alloc",
+        "default"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "fallible-streaming-iterator@0.1.9": {
+      "checksum": "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "fastrand@2.5.0": {
+      "checksum": "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223",
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "find-msvc-tools@0.1.14": {
+      "checksum": "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484",
+      "features": [],
+      "kind": "build-only",
+      "capability": "process",
+      "why": "build-time only, for cc on Windows: finds the MSVC toolchain through the registry and vswhere.exe; Windows only: never compiled for kilnd's Linux helper or its macOS development builds"
+    },
+    "fixedbitset@0.5.7": {
+      "checksum": "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "fnv@1.0.7": {
+      "checksum": "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "foldhash@0.1.5": {
+      "checksum": "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "futures-channel@0.3.34": {
+      "checksum": "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4",
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "futures-core@0.3.34": {
+      "checksum": "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e",
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "futures-macro@0.3.34": {
+      "checksum": "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "futures-sink@0.3.34": {
+      "checksum": "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d",
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "futures-task@0.3.34": {
+      "checksum": "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd",
+      "features": [
+        "alloc",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "futures-util@0.3.34": {
+      "checksum": "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc",
+      "features": [
+        "alloc",
+        "async-await",
+        "async-await-macro",
+        "default",
+        "futures-macro",
+        "slab",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "generic-array@0.14.7": {
+      "checksum": "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a",
+      "features": [
+        "more_lengths"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "getrandom@0.4.3": {
+      "checksum": "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "raw_use": "getrandom(2)/getentropy(2) through libc for random bytes, nothing else",
+      "why": "build-time and test only (tempfile's random names, through fastrand's seed on some targets)"
+    },
+    "h2@0.4.20": {
+      "checksum": "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118",
+      "features": [],
+      "kind": "dev-only",
+      "runtime_via": "tonic",
+      "capability": "network",
+      "why": "raw HTTP/2 clients in admission tests; also linked through tonic, whose transport it is"
+    },
+    "hashbrown@0.15.5": {
+      "checksum": "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1",
+      "features": [
+        "default-hasher",
+        "inline-more"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "hashbrown@0.17.1": {
+      "checksum": "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "SwissTable hash maps, in memory (indexmap's backing table). Its only libc use is mmap/munmap in its own map.rs test allocator, compiled only for its tests: hashbrown has no libc dependency"
+    },
+    "hashlink@0.10.0": {
+      "checksum": "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "heck@0.5.0": {
+      "checksum": "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "http-body-util@0.1.5": {
+      "checksum": "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c",
+      "features": [
+        "default"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "http-body@1.1.0": {
+      "checksum": "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "http@1.5.0": {
+      "checksum": "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "httparse@1.10.1": {
+      "checksum": "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "httpdate@1.0.3": {
+      "checksum": "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "hyper-timeout@0.5.2": {
+      "checksum": "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0",
+      "features": [],
+      "kind": "runtime",
+      "capability": "network",
+      "why": "tonic's client connector with connect/read/write timeouts over hyper and Tokio's sockets; kilnd uses tonic only over its Unix socket"
+    },
+    "hyper-util@0.1.21": {
+      "checksum": "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff",
+      "features": [
+        "client",
+        "client-legacy",
+        "default",
+        "http1",
+        "http2",
+        "server",
+        "server-auto",
+        "service",
+        "tokio"
+      ],
+      "kind": "runtime",
+      "capability": "network",
+      "why": "TokioIo adapters for the Unix-socket transport; its libc use is socket options, with no file, signal or subprocess API"
+    },
+    "hyper@1.12.0": {
+      "checksum": "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c",
+      "features": [
+        "client",
+        "default",
+        "http1",
+        "http2",
+        "server"
+      ],
+      "kind": "runtime",
+      "capability": "network",
+      "why": "HTTP/1 and HTTP/2 over the transport tonic and hyper-util give it (Tokio sockets): parses and writes frames on that connection; no file or process API. Its one std::process path is std::process::abort in its C FFI layer, not compiled without hyper's ffi cfg"
+    },
+    "indexmap@2.14.2": {
+      "checksum": "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "is_terminal_polyfill@1.70.2": {
+      "checksum": "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695",
+      "features": [
+        "default"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "an IsTerminal trait for older toolchains, implemented for std::fs::File, the standard streams and descriptors: asks whether a descriptor is a terminal and nothing else"
+    },
+    "itertools@0.14.0": {
+      "checksum": "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285",
+      "features": [
+        "default",
+        "use_alloc",
+        "use_std"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "itoa@1.0.18": {
+      "checksum": "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "lazy_static@1.5.1": {
+      "checksum": "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "libc@0.2.190": {
+      "checksum": "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": [
+        "filesystem",
+        "process",
+        "signals",
+        "syscalls"
+      ],
+      "destructive": [
+        "libc::kill",
+        "libc::killpg",
+        "libc::tgkill",
+        "libc::pidfd_send_signal",
+        "libc::syscall",
+        "libc::unlink",
+        "libc::unlinkat",
+        "libc::rmdir",
+        "libc::remove",
+        "libc::umount",
+        "libc::umount2",
+        "libc::unmount",
+        "libc::rename",
+        "libc::renameat",
+        "libc::renameat2",
+        "libc::renameatx_np",
+        "libc::truncate",
+        "libc::ftruncate",
+        "libc::fallocate",
+        "libc::fallocate64",
+        "libc::posix_fallocate",
+        "libc::prctl",
+        "libc::ptrace",
+        "libc::process_vm_writev",
+        "libc::process_vm_readv",
+        "libc::pidfd_getfd",
+        "libc::ioctl",
+        "libc::execve",
+        "libc::execv",
+        "libc::execvp",
+        "libc::execvpe",
+        "libc::execveat",
+        "libc::fexecve",
+        "libc::posix_spawn",
+        "libc::posix_spawnp",
+        "libc::system",
+        "libc::__syscall_SYS_ftruncate",
+        "libc::__syscall_SYS_kill",
+        "libc::__syscall_SYS_tkill",
+        "libc::__syscall_SYS_unlink",
+        "libc::__syscall_SYS_unlinkat",
+        "libc::__wasilibc_nocwd___wasilibc_unlinkat",
+        "libc::__wasilibc_unlinkat",
+        "libc::_sigqueue",
+        "libc::creat",
+        "libc::creat64",
+        "libc::create_area",
+        "libc::create_port",
+        "libc::create_sem",
+        "libc::execl",
+        "libc::execle",
+        "libc::execlp",
+        "libc::execlpe",
+        "libc::exect",
+        "libc::execvP",
+        "libc::fremovexattr",
+        "libc::ftruncate64",
+        "libc::kill_team",
+        "libc::kill_thread",
+        "libc::lremovexattr",
+        "libc::mount",
+        "libc::mq_unlink",
+        "libc::pdkill",
+        "libc::popen",
+        "libc::posix_spawn_file_actions_addchdir",
+        "libc::posix_spawn_file_actions_addchdir_np",
+        "libc::posix_spawn_file_actions_addclose",
+        "libc::posix_spawn_file_actions_addclosefrom_np",
+        "libc::posix_spawn_file_actions_adddup2",
+        "libc::posix_spawn_file_actions_addfchdir",
+        "libc::posix_spawn_file_actions_addfchdir_np",
+        "libc::posix_spawn_file_actions_addopen",
+        "libc::posix_spawn_file_actions_addtcsetpgrp_np",
+        "libc::posix_spawn_file_actions_destroy",
+        "libc::posix_spawn_file_actions_init",
+        "libc::posix_spawnattr_destroy",
+        "libc::posix_spawnattr_get_qos_class_np",
+        "libc::posix_spawnattr_getarchpref_np",
+        "libc::posix_spawnattr_getbinpref_np",
+        "libc::posix_spawnattr_getflags",
+        "libc::posix_spawnattr_getpgroup",
+        "libc::posix_spawnattr_getschedparam",
+        "libc::posix_spawnattr_getschedpolicy",
+        "libc::posix_spawnattr_getsigdefault",
+        "libc::posix_spawnattr_getsigignore_np",
+        "libc::posix_spawnattr_getsigmask",
+        "libc::posix_spawnattr_init",
+        "libc::posix_spawnattr_set_qos_class_np",
+        "libc::posix_spawnattr_setarchpref_np",
+        "libc::posix_spawnattr_setbinpref_np",
+        "libc::posix_spawnattr_setflags",
+        "libc::posix_spawnattr_setpgroup",
+        "libc::posix_spawnattr_setschedparam",
+        "libc::posix_spawnattr_setschedpolicy",
+        "libc::posix_spawnattr_setsigdefault",
+        "libc::posix_spawnattr_setsigignore_np",
+        "libc::posix_spawnattr_setsigmask",
+        "libc::pthread_kill",
+        "libc::pthread_sigqueue",
+        "libc::reboot",
+        "libc::removexattr",
+        "libc::rename_thread",
+        "libc::renamex_np",
+        "libc::sem_unlink",
+        "libc::shm_unlink",
+        "libc::sigqueue",
+        "libc::swapoff",
+        "libc::thr_kill",
+        "libc::thr_kill2",
+        "libc::truncate64",
+        "libc::vfs_unlink_path"
+      ],
+      "why": "the raw system-call surface: every destructive function (every_destructive_libc_function_is_disallowed checks the locked source) is in clippy.toml, reachable only from the approved modules"
+    },
+    "libsqlite3-sys@0.35.0": {
+      "checksum": "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f",
+      "features": [
+        "bundled",
+        "bundled_bindings",
+        "cc",
+        "default",
+        "min_sqlite_version_3_14_0",
+        "pkg-config",
+        "vcpkg"
+      ],
+      "kind": "runtime",
+      "capability": [
+        "filesystem",
+        "syscalls"
+      ],
+      "why": "rusqlite's bundled SQLite: the C library compiled by its build script (cc), with Rust bindings only. SQLite opens and writes the database file rusqlite gives it and creates, truncates and unlinks that database's own -journal, -wal and -shm files (design 7.1); kilnd's code never names this crate"
+    },
+    "linux-raw-sys@0.12.1": {
+      "checksum": "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53",
+      "features": [
+        "auxvec",
+        "elf",
+        "errno",
+        "general",
+        "ioctl",
+        "no_std"
+      ],
+      "kind": "build-only",
+      "capability": "syscalls",
+      "why": "Linux UAPI constants and structs for rustix; build-time and test only (tempfile, through prost-build and kilnd's dev-dependencies), never linked into kilnd"
+    },
+    "log@0.4.34": {
+      "checksum": "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6",
+      "features": [
+        "alloc",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "matchers@0.2.0": {
+      "checksum": "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "matchit@0.8.4": {
+      "checksum": "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3",
+      "features": [
+        "default"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "memchr@2.8.3": {
+      "checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "mime@0.3.17": {
+      "checksum": "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "mio@1.2.4": {
+      "checksum": "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee",
+      "features": [
+        "net",
+        "os-ext",
+        "os-poll"
+      ],
+      "kind": "runtime",
+      "capability": "network",
+      "why": "Tokio's event loop: epoll/kqueue registration, sockets, pipes and the waker (an eventfd or pipe it creates itself). Its libc::ioctl is FIONBIO, setting O_NONBLOCK on a pipe it owns"
+    },
+    "multimap@0.10.1": {
+      "checksum": "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "nu-ansi-term@0.50.3": {
+      "checksum": "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "raw_use": "enables ANSI processing on the Windows console (SetConsoleMode) through windows-sys, on Windows only",
+      "why": "tracing-subscriber's ANSI colours for its log lines"
+    },
+    "once_cell@1.21.4": {
+      "checksum": "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50",
+      "features": [
+        "alloc",
+        "default",
+        "race",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "once_cell_polyfill@1.70.2": {
+      "checksum": "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe",
+      "features": [
+        "default"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "percent-encoding@2.3.2": {
+      "checksum": "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220",
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "petgraph@0.8.3": {
+      "checksum": "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455",
+      "features": [
+        "std"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "pin-project-internal@1.1.13": {
+      "checksum": "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "pin-project-lite@0.2.17": {
+      "checksum": "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "pin-project@1.1.13": {
+      "checksum": "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "pkg-config@0.3.34": {
+      "checksum": "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548",
+      "features": [],
+      "kind": "build-only",
+      "capability": "process",
+      "why": "build-time only, for libsqlite3-sys's build script: runs pkg-config on the build host (unused with the bundled feature); never linked into kilnd"
+    },
+    "prettyplease@0.2.37": {
+      "checksum": "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "proc-macro2@1.0.107": {
+      "checksum": "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9",
+      "features": [
+        "default",
+        "proc-macro"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "prost-build@0.14.4": {
+      "checksum": "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042",
+      "features": [
+        "cleanup-markdown",
+        "default",
+        "format"
+      ],
+      "kind": "build-only",
+      "capability": [
+        "filesystem",
+        "process"
+      ],
+      "why": "build-time only, under tonic-prost-build in kilnd-api's build script: runs protoc, writes the generated Rust into OUT_DIR and uses a tempfile scratch directory on the build host; never linked into kilnd"
+    },
+    "prost-derive@0.14.4": {
+      "checksum": "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "prost-types@0.14.4": {
+      "checksum": "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "prost@0.14.4": {
+      "checksum": "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1",
+      "features": [
+        "default",
+        "derive",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "protobuf message encoding and decoding over in-memory buffers"
+    },
+    "pulldown-cmark-to-cmark@22.0.3": {
+      "checksum": "84bbb29c624230c4bd1047bbdb2aa47e41c860e9665ce62ba9504eebe91bf867",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "pulldown-cmark@0.13.4": {
+      "checksum": "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "quote@1.0.47": {
+      "checksum": "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001",
+      "features": [
+        "default",
+        "proc-macro"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "r-efi@6.0.0": {
+      "checksum": "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "why": "UEFI protocol type definitions for getrandom's UEFI backend; build-time only and never compiled for Linux or macOS"
+    },
+    "regex-automata@0.4.18": {
+      "checksum": "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2",
+      "features": [
+        "alloc",
+        "dfa-build",
+        "dfa-search",
+        "meta",
+        "nfa-pikevm",
+        "nfa-thompson",
+        "std",
+        "syntax",
+        "unicode-bool"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "regex-syntax@0.8.11": {
+      "checksum": "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4",
+      "features": [
+        "std",
+        "unicode-bool"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "regex@1.13.1": {
+      "checksum": "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d",
+      "features": [
+        "std",
+        "unicode-bool"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "rusqlite@0.37.0": {
+      "checksum": "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f",
+      "features": [
+        "bundled",
+        "functions",
+        "modern_sqlite"
+      ],
+      "kind": "runtime",
+      "capability": "filesystem",
+      "no_destructive_api": "with the enabled features (bundled, functions) its API opens and writes the database it is given by path and has no removal, rename, truncation or copy function; SQLite's own -wal/-shm/-journal maintenance is the one dependency-internal unlink (design 7.1)",
+      "why": "SQLite through bundled libsqlite3-sys, for kilnd's own database"
+    },
+    "rustix@1.1.5": {
+      "checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
+      "features": [
+        "alloc",
+        "default",
+        "fs",
+        "std"
+      ],
+      "kind": "build-only",
+      "capability": [
+        "filesystem",
+        "syscalls"
+      ],
+      "why": "tempfile's system calls (create, write and remove its own temporary files and directories); build-time (prost-build's scratch directory) and test only, never linked into kilnd"
+    },
+    "serde@1.0.229": {
+      "checksum": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+      "features": [
+        "default",
+        "derive",
+        "serde_derive",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "serialization traits and their derives (serde_derive runs at build time); in memory"
+    },
+    "serde_core@1.0.229": {
+      "checksum": "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48",
+      "features": [
+        "default",
+        "result",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "serde_derive@1.0.229": {
+      "checksum": "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348",
+      "features": [
+        "default"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "serde_json@1.0.154": {
+      "checksum": "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "JSON encoding and decoding over buffers and the readers and writers it is given; opens nothing"
+    },
+    "sha2@0.10.9": {
+      "checksum": "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "SHA-256 over the bytes it is given (cpufeatures underneath only reads CPU feature flags)"
+    },
+    "sharded-slab@0.1.7": {
+      "checksum": "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "shlex@2.0.1": {
+      "checksum": "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "signal-hook-registry@1.4.8": {
+      "checksum": "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b",
+      "features": [],
+      "kind": "runtime",
+      "capability": "signals",
+      "why": "Tokio's signal module: installs signal handlers with sigaction and forwards deliveries to Tokio; it sends no signal to another process (its libc::raise calls re-raise to this process when emulating a default handler)"
+    },
+    "slab@0.4.12": {
+      "checksum": "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "smallvec@1.16.3": {
+      "checksum": "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b",
+      "features": [
+        "const_generics",
+        "const_new"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "socket2@0.6.5": {
+      "checksum": "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4",
+      "features": [
+        "all"
+      ],
+      "kind": "runtime",
+      "capability": "network",
+      "why": "socket options and creation for Tokio and hyper-util (setsockopt, SO_* and the like) on sockets they own"
+    },
+    "strsim@0.11.1": {
+      "checksum": "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "syn@2.0.119": {
+      "checksum": "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297",
+      "features": [
+        "clone-impls",
+        "default",
+        "derive",
+        "extra-traits",
+        "full",
+        "parsing",
+        "printing",
+        "proc-macro",
+        "visit-mut"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "syn@3.0.9": {
+      "checksum": "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b",
+      "features": [
+        "clone-impls",
+        "default",
+        "derive",
+        "full",
+        "parsing",
+        "printing",
+        "proc-macro",
+        "visit-mut"
+      ],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "sync_wrapper@1.0.2": {
+      "checksum": "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "tempfile@3.27.0": {
+      "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
+      "features": [
+        "default",
+        "getrandom"
+      ],
+      "kind": "dev-only",
+      "capability": "filesystem",
+      "destructive": [
+        "tempfile::NamedTempFile::persist",
+        "tempfile::TempPath::persist"
+      ],
+      "why": "test scratch directories; TempDir removes only its own on drop. Never a normal dependency"
+    },
+    "thiserror-impl@2.0.21": {
+      "checksum": "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "thiserror@2.0.21": {
+      "checksum": "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "error-type derives (thiserror-impl is the build-time macro); at runtime only the Display and Error impls it generates"
+    },
+    "thread_local@1.1.10": {
+      "checksum": "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "tokio-macros@2.7.2": {
+      "checksum": "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "tokio-stream@0.1.19": {
+      "checksum": "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b",
+      "features": [
+        "default",
+        "net",
+        "time"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "Stream adapters over Tokio types (its net feature wraps listeners kilnd already owns); no file, signal or subprocess API"
+    },
+    "tokio-util@0.7.20": {
+      "checksum": "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b",
+      "features": [
+        "codec",
+        "default",
+        "futures-util",
+        "io",
+        "libc",
+        "rt"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "raw_use": "libc::memchr only, for its codec's delimiter search",
+      "why": "CancellationToken and task trackers; no file, signal or subprocess API"
+    },
+    "tokio@1.53.3": {
+      "checksum": "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e",
+      "features": [
+        "bytes",
+        "default",
+        "fs",
+        "io-util",
+        "libc",
+        "macros",
+        "mio",
+        "net",
+        "process",
+        "rt",
+        "signal",
+        "signal-hook-registry",
+        "socket2",
+        "sync",
+        "test-util",
+        "time",
+        "tokio-macros",
+        "windows-sys"
+      ],
+      "kind": "runtime",
+      "capability": [
+        "filesystem",
+        "network",
+        "process",
+        "signals"
+      ],
+      "destructive": [
+        "tokio::process::Child::kill",
+        "tokio::process::Child::start_kill",
+        "tokio::fs::remove_file",
+        "tokio::fs::remove_dir",
+        "tokio::fs::remove_dir_all",
+        "tokio::fs::rename",
+        "tokio::fs::File::set_len",
+        "tokio::fs::File::create",
+        "tokio::fs::OpenOptions::truncate",
+        "tokio::fs::write",
+        "tokio::process::Command::new",
+        "tokio::fs::copy"
+      ],
+      "why": "the async runtime: its file removal, rename, copy, truncation, signal and subprocess APIs are in clippy.toml (std_and_tokio_destructive_surfaces_are_disallowed reviews tokio::fs from the locked source)"
+    },
+    "tonic-build@0.14.6": {
+      "checksum": "c68f61875ac5293cf72e6c8cf0158086428c82c37229e98c840878f1706b0322",
+      "features": [
+        "transport"
+      ],
+      "kind": "build-only",
+      "capability": "filesystem",
+      "why": "build-time only, under tonic-prost-build: generates the gRPC service code that prost-build writes into OUT_DIR; never linked into kilnd"
+    },
+    "tonic-prost-build@0.14.6": {
+      "checksum": "654e5643eff75d7f8c99197ce1440ed19a3474eada74c12bbac488b2cafdae27",
+      "features": [
+        "cleanup-markdown",
+        "default",
+        "transport"
+      ],
+      "kind": "build-only",
+      "capability": [
+        "filesystem",
+        "process"
+      ],
+      "destructive": [
+        "tonic_prost_build::compile_protos",
+        "tonic_prost_build::compile_fds",
+        "tonic_prost_build::Builder::compile_protos",
+        "tonic_prost_build::Builder::compile_with_config",
+        "tonic_prost_build::Builder::compile_fds",
+        "tonic_prost_build::Builder::compile_fds_with_config"
+      ],
+      "why": "kilnd-api's build script only: runs protoc and writes the gRPC stubs on the build host; LOW-1 keeps it out of the runtime graph"
+    },
+    "tonic-prost@0.14.6": {
+      "checksum": "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "gRPC codec between prost messages and tonic's bodies, in memory"
+    },
+    "tonic@0.14.6": {
+      "checksum": "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef",
+      "features": [
+        "channel",
+        "codegen",
+        "router",
+        "server",
+        "transport"
+      ],
+      "kind": "runtime",
+      "capability": "network",
+      "why": "gRPC client and server over the Unix socket kilnd binds (transport over hyper, h2 and Tokio's sockets)"
+    },
+    "tower-layer@0.3.3": {
+      "checksum": "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "tower-service@0.3.3": {
+      "checksum": "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "tower@0.5.3": {
+      "checksum": "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4",
+      "features": [
+        "balance",
+        "buffer",
+        "discover",
+        "futures-core",
+        "futures-util",
+        "indexmap",
+        "limit",
+        "load",
+        "load-shed",
+        "make",
+        "pin-project-lite",
+        "ready-cache",
+        "slab",
+        "sync_wrapper",
+        "tokio",
+        "tokio-util",
+        "tracing",
+        "util"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "service middleware (util feature): in-memory combinators around tonic's services"
+    },
+    "tracing-attributes@0.1.31": {
+      "checksum": "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "tracing-core@0.1.36": {
+      "checksum": "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a",
+      "features": [
+        "default",
+        "once_cell",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "tracing-log@0.2.0": {
+      "checksum": "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3",
+      "features": [
+        "log-tracer",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "tracing-serde@0.2.0": {
+      "checksum": "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "tracing-subscriber@0.3.23": {
+      "checksum": "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319",
+      "features": [
+        "alloc",
+        "ansi",
+        "default",
+        "env-filter",
+        "fmt",
+        "json",
+        "matchers",
+        "nu-ansi-term",
+        "once_cell",
+        "registry",
+        "serde",
+        "serde_json",
+        "sharded-slab",
+        "smallvec",
+        "std",
+        "thread_local",
+        "tracing",
+        "tracing-log",
+        "tracing-serde"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "formats log lines (fmt, json, env-filter) to the writer it is given; kilnd gives it stderr"
+    },
+    "tracing@0.1.44": {
+      "checksum": "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100",
+      "features": [
+        "attributes",
+        "default",
+        "std",
+        "tracing-attributes"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "structured logging macros and spans, dispatched to the installed subscriber"
+    },
+    "try-lock@0.2.5": {
+      "checksum": "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "typenum@1.20.1": {
+      "checksum": "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "unicase@2.10.0": {
+      "checksum": "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "unicode-ident@1.0.27": {
+      "checksum": "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563",
+      "features": [],
+      "kind": "build-only",
+      "capability": "none",
+      "group": "compile-time"
+    },
+    "utf8parse@0.2.2": {
+      "checksum": "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821",
+      "features": [
+        "default"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "valuable@0.1.1": {
+      "checksum": "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65",
+      "features": [
+        "alloc",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "vcpkg@0.2.15": {
+      "checksum": "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426",
+      "features": [],
+      "kind": "build-only",
+      "capability": "filesystem",
+      "why": "build-time only, for libsqlite3-sys's build script on Windows: reads a vcpkg tree to find native libraries (unused with the bundled feature); never linked into kilnd"
+    },
+    "version_check@0.9.5": {
+      "checksum": "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a",
+      "features": [],
+      "kind": "build-only",
+      "capability": "process",
+      "why": "build-time only, for generic-array's build script: runs rustc --version on the build host; never linked into kilnd"
+    },
+    "want@0.3.2": {
+      "checksum": "ec4cdd0dd910afe868b7ef477227d8d538b46b3075031afee8a9f2acb0a2ed0b",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    },
+    "wasi@0.11.1+wasi-snapshot-preview1": {
+      "checksum": "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b",
+      "features": [
+        "default",
+        "std"
+      ],
+      "kind": "runtime",
+      "capability": "syscalls",
+      "why": "WASI system-call bindings for mio on wasm32-wasi; never compiled for kilnd's Linux or macOS targets"
+    },
+    "windows-link@0.2.1": {
+      "checksum": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "why": "the link! macro windows-sys declares its imports with: a declarative macro with no code of its own; Windows only: never compiled for kilnd's Linux helper or its macOS development builds"
+    },
+    "windows-sys@0.61.2": {
+      "checksum": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+      "features": [
+        "Wdk",
+        "Wdk_Foundation",
+        "Wdk_Storage",
+        "Wdk_Storage_FileSystem",
+        "Wdk_System",
+        "Wdk_System_IO",
+        "Win32",
+        "Win32_Foundation",
+        "Win32_Networking",
+        "Win32_Networking_WinSock",
+        "Win32_Security",
+        "Win32_Storage",
+        "Win32_Storage_FileSystem",
+        "Win32_System",
+        "Win32_System_Console",
+        "Win32_System_Diagnostics",
+        "Win32_System_Diagnostics_Debug",
+        "Win32_System_IO",
+        "Win32_System_Pipes",
+        "Win32_System_SystemServices",
+        "Win32_System_Threading",
+        "Win32_System_WindowsProgramming",
+        "default"
+      ],
+      "kind": "runtime",
+      "capability": [
+        "filesystem",
+        "network",
+        "process",
+        "signals",
+        "syscalls"
+      ],
+      "why": "raw Windows API bindings (DeleteFileW, TerminateProcess and the rest) for mio, socket2, Tokio, anstream and errno; Windows only: never compiled for kilnd's Linux helper or its macOS development builds"
+    },
+    "zmij@1.0.23": {
+      "checksum": "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b",
+      "features": [],
+      "kind": "runtime",
+      "capability": "none",
+      "group": "pure-computation"
+    }
+  },
+  "sink_exceptions": [
+    {
+      "package": "anstream",
+      "version": "1.0.0",
+      "features": [
+        "auto",
+        "default",
+        "wincon"
+      ],
+      "sinks": [
+        "impl for std::fs::File"
+      ],
+      "why": "Its stream traits (RawStream, IsTerminal, AsLockedWrite, Sealed) are implemented for std::fs::File so styled text can be written to a file the caller passes; the impls write and query a terminal, never set a length, remove or rename."
+    },
+    {
+      "package": "anstyle-wincon",
+      "version": "3.0.11",
+      "features": [],
+      "sinks": [
+        "impl for std::fs::File"
+      ],
+      "why": "WinconStream for std::fs::File writes styled text to a file it is given; Windows console attributes otherwise. Windows only."
+    },
+    {
+      "package": "anyhow",
+      "version": "1.0.104",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "truncate"
+      ],
+      "why": "String::truncate trimming a formatted backtrace: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "base64",
+      "version": "0.22.1",
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "truncate"
+      ],
+      "why": "Vec::truncate to the bytes written by its encoder and decoder (and in its own decoder_tests.rs): in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "bitflags",
+      "version": "2.13.2",
+      "features": [
+        "std"
+      ],
+      "sinks": [
+        "truncate"
+      ],
+      "why": "Flags::truncate, which clears bits outside the defined flags, called in bitflags' own src/tests/truncate.rs (compiled only for its tests): an in-memory bit operation, not OpenOptions::truncate."
+    },
+    {
+      "package": "bytes",
+      "version": "1.12.1",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "copy",
+        "set_len",
+        "truncate"
+      ],
+      "why": "BytesMut/Vec set_len and truncate inside its buffer implementation: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate. copy is core::ptr::copy moving bytes inside its own allocation."
+    },
+    {
+      "package": "futures-util",
+      "version": "0.3.34",
+      "features": [
+        "alloc",
+        "async-await",
+        "async-await-macro",
+        "default",
+        "futures-macro",
+        "slab",
+        "std"
+      ],
+      "sinks": [
+        "copy",
+        "set_len",
+        "truncate",
+        "unlink"
+      ],
+      "why": "Vec::set_len and Vec/String truncate in its buffered I/O adapters (in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate); unlink is FuturesUnordered removing a task from its own intrusive linked list. copy is futures::io::copy, a stream-to-writer copy between two caller-supplied async streams (and its module), not a file copy by name."
+    },
+    {
+      "package": "h2",
+      "version": "0.4.20",
+      "features": [],
+      "sinks": [
+        "truncate",
+        "unlink"
+      ],
+      "why": "BytesMut::truncate on frame payloads and HPACK buffers (in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate); unlink removes a stream from h2's own intrusive stream queues."
+    },
+    {
+      "package": "http",
+      "version": "1.5.0",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "set_len",
+        "truncate"
+      ],
+      "why": "Vec::set_len(0) clearing a HeaderMap's own entries and BytesMut::truncate on a path buffer: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "hyper",
+      "version": "1.12.0",
+      "features": [
+        "client",
+        "default",
+        "http1",
+        "http2",
+        "server"
+      ],
+      "sinks": [
+        "exec",
+        "truncate"
+      ],
+      "why": "Vec::truncate rolling back a partly encoded HTTP/1 head: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate. exec is its executor: the `exec` parameters and fields holding the caller's task executor, which spawns futures, not a program."
+    },
+    {
+      "package": "hyper-util",
+      "version": "0.1.21",
+      "features": [
+        "client",
+        "client-legacy",
+        "default",
+        "http1",
+        "http2",
+        "server",
+        "server-auto",
+        "service",
+        "tokio"
+      ],
+      "sinks": [
+        "exec"
+      ],
+      "why": "exec is its executor plumbing: the common::exec module, Exec type and `exec` fields holding the caller's task executor (and the rt-tracing-exec-force feature name in cfg attributes); it spawns futures, never a program."
+    },
+    {
+      "package": "indexmap",
+      "version": "2.14.2",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "set_len",
+        "truncate"
+      ],
+      "why": "Vec::set_len and truncate on the map's own entry vector: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "libc",
+      "version": "0.2.190",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "copy",
+        "kill",
+        "rename",
+        "send_signal",
+        "truncate",
+        "umount",
+        "umount2",
+        "unlink",
+        "unlinkat",
+        "unmount"
+      ],
+      "why": "libc's own declarations of the C functions (extern fn kill, rename, truncate, umount, umount2, unlink, unlinkat, unmount, Haiku's send_signal), a struct field named copy (Apple) and solarish siginfo accessors' `kill` bindings. libc is reviewed with its destructive capabilities, and clippy.toml disallows each destructive function for workspace code; a package declared non-destructive that calls one names it in its own source, where this scan flags it."
+    },
+    {
+      "package": "matchit",
+      "version": "0.8.4",
+      "features": [
+        "default"
+      ],
+      "sinks": [
+        "truncate"
+      ],
+      "why": "Vec/String truncate on route, parameter and escape buffers: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "mio",
+      "version": "1.2.4",
+      "features": [
+        "net",
+        "os-ext",
+        "os-poll"
+      ],
+      "sinks": [
+        "set_len",
+        "libc::ioctl"
+      ],
+      "why": "Vec::set_len to the event count epoll/kqueue/event ports (and Windows named pipes) filled in (in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate); libc::ioctl is FIONBIO, setting O_NONBLOCK on a pipe mio created (sys/unix/pipe.rs)."
+    },
+    {
+      "package": "regex-automata",
+      "version": "0.4.18",
+      "features": [
+        "alloc",
+        "dfa-build",
+        "dfa-search",
+        "meta",
+        "nfa-pikevm",
+        "nfa-thompson",
+        "std",
+        "syntax",
+        "unicode-bool"
+      ],
+      "sinks": [
+        "set_len",
+        "truncate"
+      ],
+      "why": "Vec set_len and truncate on DFA transition tables, bitsets and serialization buffers: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "regex-syntax",
+      "version": "0.8.11",
+      "features": [
+        "std",
+        "unicode-bool"
+      ],
+      "sinks": [
+        "truncate"
+      ],
+      "why": "Vec::truncate on literal and Unicode class buffers: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "serde",
+      "version": "1.0.229",
+      "features": [
+        "default",
+        "derive",
+        "serde_derive",
+        "std"
+      ],
+      "sinks": [
+        "truncate"
+      ],
+      "why": "String::truncate in a Deserialize impl's own buffer: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "serde_core",
+      "version": "1.0.229",
+      "features": [
+        "default",
+        "result",
+        "std"
+      ],
+      "sinks": [
+        "truncate"
+      ],
+      "why": "String::truncate in a Deserialize impl's own buffer: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "serde_json",
+      "version": "1.0.154",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "copy",
+        "set_len",
+        "truncate"
+      ],
+      "why": "Vec::set_len after writing escaped UTF-8 into its scratch buffer and String::truncate on an error message: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate. copy is a macro metavariable ($copy:tt) in json!."
+    },
+    {
+      "package": "smallvec",
+      "version": "1.16.3",
+      "features": [
+        "const_generics",
+        "const_new"
+      ],
+      "sinks": [
+        "copy",
+        "set_len",
+        "truncate"
+      ],
+      "why": "SmallVec's own set_len and truncate, and Vec::set_len when it spills: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate. copy is core::ptr::copy shifting elements inside its own buffer."
+    },
+    {
+      "package": "tokio",
+      "version": "1.53.3",
+      "features": [
+        "bytes",
+        "default",
+        "fs",
+        "io-util",
+        "libc",
+        "macros",
+        "mio",
+        "net",
+        "process",
+        "rt",
+        "signal",
+        "signal-hook-registry",
+        "socket2",
+        "sync",
+        "test-util",
+        "time",
+        "tokio-macros",
+        "windows-sys"
+      ],
+      "sinks": [
+        "copy",
+        "exec",
+        "impl for std::fs::OpenOptions",
+        "impl for std::process::Child",
+        "kill",
+        "libc::syscall",
+        "remove_dir",
+        "remove_dir_all",
+        "remove_file",
+        "rename",
+        "set_len",
+        "start_kill",
+        "std::fs::copy",
+        "std::fs::remove_dir",
+        "std::fs::remove_dir_all",
+        "std::fs::remove_file",
+        "std::fs::rename",
+        "std::fs::write",
+        "std::process::Command::new",
+        "truncate"
+      ],
+      "why": "Tokio's own implementation of the API its entry declares (filesystem, process, signals): tokio::fs wraps std::fs::{copy, remove_dir, remove_dir_all, remove_file, rename, write} and File::set_len/OpenOptions::truncate, tokio::process wraps std::process::Command, Child::kill (and its pidfd reaper's libc::syscall pidfd_open), and Vec::set_len/truncate appear in its I/O buffers. Each of those Tokio paths is disallowed in clippy.toml, so workspace code reaches none of them outside the approved modules; the impls are Tokio's own wrappers for std's OpenOptions and Child. The identifier scan also sees tokio::fs's own copy, remove_dir, remove_dir_all, remove_file and rename (definitions and re-exports of the wrappers above, each disallowed in clippy.toml as tokio::fs::...), its io-uring rename op, tokio::io::copy (stream to writer), and `exec` as the name of a runtime scheduler binding."
+    },
+    {
+      "package": "tokio-util",
+      "version": "0.7.20",
+      "features": [
+        "codec",
+        "default",
+        "futures-util",
+        "io",
+        "libc",
+        "rt"
+      ],
+      "sinks": [
+        "truncate"
+      ],
+      "why": "BytesMut::truncate dropping a codec's delimiter byte: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "tonic",
+      "version": "0.14.6",
+      "features": [
+        "channel",
+        "codegen",
+        "router",
+        "server",
+        "transport"
+      ],
+      "sinks": [
+        "copy",
+        "exec"
+      ],
+      "why": "copy is std::io::copy streaming a gRPC message through a (de)compressor into its output buffer (codec/compression.rs, behind compression features kilnd does not enable); exec is the executor a channel spawns its connection futures on."
+    },
+    {
+      "package": "tracing-subscriber",
+      "version": "0.3.23",
+      "features": [
+        "alloc",
+        "ansi",
+        "default",
+        "env-filter",
+        "fmt",
+        "json",
+        "matchers",
+        "nu-ansi-term",
+        "once_cell",
+        "registry",
+        "serde",
+        "serde_json",
+        "sharded-slab",
+        "smallvec",
+        "std",
+        "thread_local",
+        "tracing",
+        "tracing-log",
+        "tracing-serde"
+      ],
+      "sinks": [
+        "impl for std::fs::File",
+        "type alias for std::fs::File"
+      ],
+      "why": "MakeWriter for std::fs::File lets a subscriber write log lines to a file the caller opened; kilnd's subscriber writes to stderr. It writes, never sets a length, removes or renames. Its associated type Writer = &'a std::fs::File is that impl's writer."
+    },
+    {
+      "package": "windows-sys",
+      "version": "0.61.2",
+      "features": [
+        "Wdk",
+        "Wdk_Foundation",
+        "Wdk_Storage",
+        "Wdk_Storage_FileSystem",
+        "Wdk_System",
+        "Wdk_System_IO",
+        "Win32",
+        "Win32_Foundation",
+        "Win32_Networking",
+        "Win32_Networking_WinSock",
+        "Win32_Security",
+        "Win32_Storage",
+        "Win32_Storage_FileSystem",
+        "Win32_System",
+        "Win32_System_Console",
+        "Win32_System_Diagnostics",
+        "Win32_System_Diagnostics_Debug",
+        "Win32_System_IO",
+        "Win32_System_Pipes",
+        "Win32_System_SystemServices",
+        "Win32_System_Threading",
+        "Win32_System_WindowsProgramming",
+        "default"
+      ],
+      "sinks": [
+        "copy",
+        "persist",
+        "persistentlogininfo"
+      ],
+      "why": "Win32 binding declarations: parameters and fields named copy, persist and persistentlogininfo in its link! externs and structs. It is a Windows-only dependency kilnd never builds for; its own capability is reviewed separately."
+    },
+    {
+      "package": "zmij",
+      "version": "1.0.23",
+      "features": [],
+      "sinks": [
+        "copy"
+      ],
+      "why": "core::ptr::copy shifting digits inside its own float-formatting buffer."
+    }
+  ]
+}

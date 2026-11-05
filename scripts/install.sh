@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 target=${CARGO_TARGET_DIR:-target}
 
 [ -x /usr/local/bin/kiln ] || { echo "install kiln first: kiln/scripts/install.sh" >&2; exit 1; }
-cargo build --release --locked
+scripts/build.sh default build --release
 getent group kilnd >/dev/null || sudo groupadd --system kilnd
 getent passwd kilnd >/dev/null || sudo useradd --system --gid kilnd --home-dir /nonexistent --shell /usr/sbin/nologin kilnd
 getent group kilnd-helper >/dev/null || sudo groupadd --system kilnd-helper

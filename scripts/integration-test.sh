@@ -5,8 +5,8 @@
 #   scripts/integration-test.sh
 set -eu
 cd "$(dirname "$0")/.."
-cargo test --locked -p kilnd --test admission_stress -- --ignored --test-threads=1 --nocapture
-bin=$(cargo test --locked -p kilnd --test kiln_integration --no-run --message-format=json \
+scripts/build.sh default test -p kilnd --test admission_stress -- --ignored --test-threads=1 --nocapture
+bin=$(scripts/build.sh default test -p kilnd --test kiln_integration --no-run --message-format=json \
     | python3 -I -c '
 import json, sys
 for line in sys.stdin:
@@ -18,7 +18,7 @@ for line in sys.stdin:
 sudo env KILND_INTEGRATION=1 KILN_BIN="${KILN_BIN:-/usr/local/bin/kiln}" "$bin" --ignored --test-threads=1 --nocapture
 # Firecracker B3's retained-descriptor evidence: real traversal from /, real ACLs and
 # file capabilities, real execveat and /proc/<pid>/exe tuples. It launches no VM.
-lib=$(cargo test --locked -p kilnd --lib --no-run --message-format=json \
+lib=$(scripts/build.sh default test -p kilnd --lib --no-run --message-format=json \
     | python3 -I -c '
 import json, sys
 for line in sys.stdin:

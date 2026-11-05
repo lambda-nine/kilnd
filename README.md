@@ -89,6 +89,12 @@ API callers can control only their own sandboxes; root can control all of them. 
   stdin. Admission is immediate; a full budget returns `RESOURCE_EXHAUSTED`
   (excess raw connections are closed). Slow callers can hold bounded slots.
   Health exposes current use, maxima and rejection totals since daemon startup.
+- **Ingress shares:** 4 of the 64 connection slots are held back for Health,
+  GetSandbox and DeleteSandbox (one per UID), one UID may hold at most 32 of
+  the rest and 32 ordinary RPC handlers, and GetSandbox and DeleteSandbox
+  fall back to 4 reserved cleanup handlers (one per UID). A connection that
+  has not sent the HTTP/2 preface within 5 seconds is closed. So one UID's
+  idle or busy sockets cannot keep another UID from Health or cleanup.
 - **Exclusive daemon ownership:** a persistent advisory lock in the state
   directory prevents a second process from opening the same database, while
   a separate socket-directory lock prevents endpoint takeover. Both are held
@@ -148,8 +154,9 @@ certainty and creator UID. Older databases migrate at open: historical create
 certainty stays ambiguous and historical ownership becomes root. Older binaries
 refuse the result. See [setup](docs/setup.md) before upgrading.
 
-These bounds do not provide tenant fairness: authorized callers share one set
-of node budgets and can monopolize capacity, including with slow connections. Messages decode before service RPC
+These bounds are not tenant isolation: authorized callers share one set of node
+budgets, and per-UID shares only stop one UID from taking more than its share of
+connections and RPCs. Messages decode before service RPC
 admission, under the connection, stream and message caps. SQLite/filesystem
 work is synchronous. Terminal history has age/count retention; charged and
 unfinished rows remain protected. Defaults and
@@ -188,8 +195,8 @@ you created, so one made with `sudo` above stays visible only to root.
 ## Checks
 
 ```sh
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+scripts/build.sh default test
+scripts/build.sh default clippy --all-targets -- -D warnings
 git diff --check
 ```
 

@@ -14,7 +14,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// The only schema this build reads.
-pub const SCHEMA: &str = "kilnd-firecracker-test-deployment/1";
+/// Version 2 (B7) adds `kilnd.cgroup`, the exact cgroup the daemon must run in.
+pub const SCHEMA: &str = "kilnd-firecracker-test-deployment/2";
 /// The only deployment kind B6 has.
 pub const ISOLATED_TEST: &str = "isolated-test";
 /// The checked-in deployment, which the privileged end-to-end test also reads.
@@ -156,6 +157,10 @@ pub struct Daemon {
     pub state_dir: PathBuf,
     pub account: String,
     pub unit: String,
+    /// The unit's whole cgroup v2 path, `/<slice>/.../<unit>` (B7, B6-RC-02): the
+    /// daemon must run in exactly this cgroup, the one the helper enrolls, not merely
+    /// in some cgroup named after the unit.
+    pub cgroup: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -251,6 +256,24 @@ impl TestDeployment {
         }
         if !self.kilnd.unit.ends_with(".service") || self.kilnd.unit.starts_with("kilnd.") {
             bail!("the test daemon runs in its own service unit");
+        }
+        let cgroup = Path::new(&self.kilnd.cgroup);
+        if !self.kilnd.cgroup.starts_with('/')
+            || self.kilnd.cgroup.ends_with('/')
+            || self.kilnd.cgroup.contains("//")
+            || cgroup.components().any(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+            || cgroup.file_name().and_then(|n| n.to_str()) != Some(self.kilnd.unit.as_str())
+            || cgroup.components().count() < 3
+        {
+            bail!(
+                "the test daemon's cgroup must be an absolute, normal path below a slice, ending in its unit {:?}",
+                self.kilnd.unit
+            );
         }
         Ok(())
     }
@@ -372,13 +395,15 @@ impl TestDeployment {
             ));
         }
 
-        // The unit: this process's own cgroup is exactly the unit's (`.../<unit>`).
+        // The unit: this process's own cgroup is exactly the deployment's whole cgroup
+        // path, not merely one ending in the unit's name (B6-RC-02).
+        let expected = &self.kilnd.cgroup;
         match unified_cgroup(&observed.cgroup) {
-            Ok(path) if path.rsplit('/').next() == Some(unit.as_str()) => {}
+            Ok(path) if path == expected => {}
             Ok(path) => wrong.push(format!(
-                "this process runs in cgroup {path}, not in unit {unit:?}"
+                "this process runs in cgroup {path}, not in unit {unit:?} at {expected}"
             )),
-            Err(error) => wrong.push(format!("{error:#}; not in unit {unit:?}")),
+            Err(error) => wrong.push(format!("{error:#}; not in unit {unit:?} at {expected}")),
         }
 
         if wrong.is_empty() {
@@ -422,7 +447,8 @@ mod tests {
     #[test]
     fn production_paths_names_and_other_kinds_are_refused() {
         let mutations: Vec<(&str, Value)> = vec![
-            ("/schema", json!("kilnd-firecracker-test-deployment/2")),
+            ("/schema", json!("kilnd-firecracker-test-deployment/1")),
+            ("/schema", json!("kilnd-firecracker-test-deployment/3")),
             ("/deployment", json!("production")),
             ("/profile", json!("Offline")),
             ("/kilnd/socket", json!("/run/kilnd/kilnd.sock")),
@@ -438,6 +464,21 @@ mod tests {
             ("/kilnd/socket_group", json!("root")),
             ("/kilnd/unit", json!("kilnd.service")),
             ("/kilnd/unit", json!("kilnd-fctest")),
+            ("/kilnd/cgroup", json!("kilnd-fctest.service")),
+            ("/kilnd/cgroup", json!("/kilnd-fctest.service")),
+            ("/kilnd/cgroup", json!("/system.slice/kilnd.service")),
+            (
+                "/kilnd/cgroup",
+                json!("/system.slice/kilnd-fctest.service/"),
+            ),
+            (
+                "/kilnd/cgroup",
+                json!("/system.slice/../kilnd-fctest.service"),
+            ),
+            (
+                "/kilnd/cgroup",
+                json!("/system.slice//kilnd-fctest.service"),
+            ),
         ];
         for (pointer, value) in mutations {
             let mut mutated = checked_in();
@@ -487,12 +528,6 @@ mod tests {
     fn b6_bi_01_identity_is_observed_not_declared() {
         let deployment = TestDeployment::parse(CHECKED_IN.as_bytes()).unwrap();
         deployment.check_identity(&resolved(), &observed()).unwrap();
-        // A user service's cgroup ends in the unit too.
-        let mut user = observed();
-        user.cgroup =
-            "0::/user.slice/user-990.slice/user@990.service/app.slice/kilnd-fctest.service\n"
-                .into();
-        deployment.check_identity(&resolved(), &user).unwrap();
 
         let account = |set: fn(&mut Observed)| {
             let mut o = observed();
@@ -522,6 +557,9 @@ mod tests {
         let error = account(|o| o.socket_gid = None);
         assert!(error.contains("--socket-group is empty"), "{error}");
         for cgroup in [
+            // B6-RC-02: the right unit name under another slice, or a user service's.
+            "0::/b6.slice/b6-recheck.slice/kilnd-fctest.service\n",
+            "0::/user.slice/user-990.slice/user@990.service/app.slice/kilnd-fctest.service\n",
             "0::/system.slice/kilnd.service\n",
             "0::/system.slice/kilnd-fctest.service/extra\n",
             "0::/system.slice/xkilnd-fctest.service\n",

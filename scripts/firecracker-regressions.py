@@ -20,6 +20,11 @@ recovery.rs (and the milestone-1 session in session.rs), run alone with a clean 
   stalled ledger in Remove       B5-R1: Delete answers in bound and gives its slot back
   quarantine and Unknown         blocked proof quarantines and Delete stays honest until
                                  proof exists
+  hostile public caller          B7 (B6-BI-03): one UID holds 64 idle sockets that never
+                                 send the HTTP/2 preface, reconnecting each one closed;
+                                 Health, Get and Delete from another UID answer in their
+                                 deadlines and every idle socket is closed
+                                 (scripts/hostile-public-caller.py)
 
 The crash matrix is scripts/firecracker-crash-matrix.py; B4's and B5's suites remain
 scripts/b4-vm-tests.sh b4_linux_root and b5_linux_root.
@@ -39,6 +44,7 @@ SCENARIOS = [
     'b6_linux_root_attack_hostile_io_beside_real_lifecycle_requests',
     'b6_linux_root_attack_a_stalled_ledger_fence_never_holds_remove',
     'b6_linux_root_attack_quarantine_stays_deletable_and_unknown_is_honest',
+    'b7_linux_root_attack_hostile_public_caller_cannot_starve_health_or_cleanup',
 ]
 
 # B7 attack regressions (design 16.6), in crates/kilnd/src/helper/firecracker/tests/
@@ -65,5 +71,6 @@ B7_SCENARIOS = [
 ]
 
 if __name__ == '__main__':
-    sys.exit(run('Phase 1b B6 and B7 attack regressions', 'b6_linux_root_attack_ and b7_rtc',
+    sys.exit(run('Phase 1b B6 and B7 attack regressions',
+                 'b6_linux_root_attack_, b7_linux_root_attack_ and b7_rtc',
                  SCENARIOS + B7_SCENARIOS))

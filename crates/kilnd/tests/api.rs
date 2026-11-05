@@ -91,7 +91,13 @@ async fn many_socket_clients_share_one_serialized_delete() {
     let manager = Arc::new(Manager::new(
         fake.clone(),
         Store::open(&tmp.path().join("state")).unwrap(),
-        Limits::default(),
+        // One UID's 33 clients: this is about the serialized Delete, so the per-UID
+        // shares (B7, B6-BI-03) are opened to the whole budget.
+        Limits {
+            max_connections_per_uid: 60,
+            max_concurrent_rpcs_per_uid: 64,
+            ..Limits::default()
+        },
     ));
     let listener = kilnd::server::bind(&socket, None).await.unwrap();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();

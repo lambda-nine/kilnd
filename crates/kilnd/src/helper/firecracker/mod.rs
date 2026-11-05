@@ -2624,6 +2624,10 @@ impl Node {
                             allocation_id,
                             plan_digest,
                         } => {
+                            // Holds a settlement's first look for the deterministic
+                            // capacity crash scenario (B7, B6-RC-03).
+                            #[cfg(test)]
+                            workers::faults::hold("H.inspect").await;
                             self.inspect(instance, allocation_id, plan_digest, deadline)
                                 .await
                         }

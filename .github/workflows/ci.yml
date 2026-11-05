@@ -34,25 +34,27 @@ jobs:
           rustc --version
           cargo clippy --version
 
+      # Every build goes through scripts/build.sh and a dependency-gate.json profile
+      # (design section 7.1): the gate reviews exactly the graph each profile resolves.
       - name: cargo test
-        run: cargo test --locked
+        run: sh scripts/build.sh default test
 
       # -D warnings makes clippy.toml's disallowed-methods (design section 7.1's
       # destructive-action gate) an error; the explicit flag keeps that true if the
       # warnings level ever changes. Both the MSRV and the current toolchain.
       - name: cargo clippy (1.88)
-        run: cargo clippy --locked --all-targets -- -D warnings -D clippy::disallowed_methods
+        run: sh scripts/build.sh default clippy --all-targets -- -D warnings -D clippy::disallowed_methods
 
       - name: cargo clippy (1.99)
         run: |
           rustup toolchain install 1.99.0 --profile minimal --component clippy
-          cargo +1.99.0 clippy --locked --all-targets -- -D warnings -D clippy::disallowed_methods
+          sh scripts/build.sh +1.99.0 default clippy --all-targets -- -D warnings -D clippy::disallowed_methods
 
       # B6-BI-01's build boundary: the release build CI and the installers make has no
       # Firecracker flags, and refuses Daybreak's PoC command at argument parsing.
       - name: Release build refuses the Firecracker test deployment
         run: |
-          cargo build --locked --release -p kilnd --bin kilnd
+          sh scripts/build.sh default build --release -p kilnd --bin kilnd
           sh scripts/test-deployment-gate-regressions.sh release target/release/kilnd
 
       - name: Shell syntax
@@ -70,15 +72,15 @@ jobs:
       - name: Whitespace
         run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
 
-  # The same checks with the non-default `firecracker-test-deployment` feature, which only
-  # the B6 VM scripts enable: tests, clippy (the destructive-action gate) on both
-  # toolchains, and the feature build's refusal of a mismatched identity (B6-BI-01).
+  # The same checks with the `firecracker-test-deployment` profile (the non-default
+  # feature only the B6 VM scripts enable): tests, clippy (the destructive-action gate) on
+  # both toolchains, and the feature build's refusal of a mismatched identity (B6-BI-01).
   feature:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       CARGO_TERM_COLOR: always
-      FEATURES: kilnd/firecracker-test-deployment
+      PROFILE: firecracker-test-deployment
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -98,17 +100,49 @@ jobs:
           cargo clippy --version
 
       - name: cargo test (feature)
-        run: cargo test --locked --features "$FEATURES"
+        run: sh scripts/build.sh "$PROFILE" test
 
       - name: cargo clippy (feature, 1.88)
-        run: cargo clippy --locked --all-targets --features "$FEATURES" -- -D warnings -D clippy::disallowed_methods
+        run: sh scripts/build.sh "$PROFILE" clippy --all-targets -- -D warnings -D clippy::disallowed_methods
 
       - name: cargo clippy (feature, 1.99)
         run: |
           rustup toolchain install 1.99.0 --profile minimal --component clippy
-          cargo +1.99.0 clippy --locked --all-targets --features "$FEATURES" -- -D warnings -D clippy::disallowed_methods
+          sh scripts/build.sh +1.99.0 "$PROFILE" clippy --all-targets -- -D warnings -D clippy::disallowed_methods
 
       - name: Feature build refuses a mismatched identity
         run: |
-          cargo build --locked -p kilnd --bin kilnd --features "$FEATURES"
+          sh scripts/build.sh "$PROFILE" build -p kilnd --bin kilnd
           sh scripts/test-deployment-gate-regressions.sh feature target/debug/kilnd
+
+  # B7 milestone 2 and its rechecks: Daybreak's dependency-gate PoCs through the actual
+  # source loader, cargo and clippy on both toolchains (fs-err reviewed as none and as
+  # filesystem; the method, transitive and type-alias UFCS wrappers as vendored registry
+  # packages, a version bump and an exception's scope; std::fs::copy and libc::creat;
+  # build.sh's refusal of feature injection and a profile's unreviewed graph; one
+  # name@version from two registries; the authoritative test's fixed root). It resolves
+  # fs-err and parking_lot and vendors the locked crates from the registry in disposable
+  # copies.
+  gate-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install Rust 1.88 and 1.99
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component clippy
+          rustup toolchain install 1.99.0 --profile minimal --component clippy
+          rustup default 1.88.0
+
+      - name: Dependency gate regressions
+        run: sh scripts/dependency-gate-regressions.sh 1.88.0 1.99.0

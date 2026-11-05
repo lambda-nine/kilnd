@@ -499,15 +499,34 @@ ticket without inserting a row. Admission does not promise arrival order
 before the sandbox lock wait.
 
 Each accepted Unix stream owns a connection permit until the transport drops
-the stream. Accepting at capacity drops that socket immediately; at most one
-transient accepted descriptor exists beyond the cap. Only admitted peers are
-logged. Transport rejection is a close, with no guaranteed gRPC status.
+the stream. The server reads the peer's credentials (`SO_PEERCRED`, one
+`getsockopt` before any byte is read) and admits by UID (Phase 1b B7,
+B6-BI-03): a general slot while the UID holds fewer than
+`--max-connections-per-uid`, otherwise one of the `--reserved-connections`
+slots held back for Health and cleanup (at most one per UID), otherwise, for
+UID 0 only, one root slot beyond `--max-connections`, otherwise none. The
+reserve is first-come and bounded per UID: colluding UIDs can hold all of it,
+and the root slot keeps Health and cleanup reachable for the operator. A
+connection on a reserved slot or the root slot serves only Health, GetSandbox
+and DeleteSandbox; any other RPC on it is `RESOURCE_EXHAUSTED`. A connection that
+has not delivered the 24-byte HTTP/2 client preface within
+`--connection-preface-timeout-ms` fails its next read, so the transport closes
+it and its slot returns; the deadline is polled with every read, so a socket
+that sends nothing is woken for it. Accepting without a slot drops that socket
+immediately; at most one transient accepted descriptor exists beyond the cap.
+Only admitted peers are logged. Transport rejection is a close, with no
+guaranteed gRPC status.
 HTTP/2 has bounded streams, fixed 64 KiB stream / 256 KiB connection windows,
 16 KiB headers and frames, and disabled adaptive windows. Per-connection
 concurrency is limited with load shedding. Generated services cap decoded
-requests and encoded responses. After decoding, every handler immediately
-acquires an ordinary RPC or reserved Health RPC permit and holds it through
-manager waiting and response construction. Thus decoding precedes service
+requests and encoded responses. After decoding, every handler checks its
+caller's UID and immediately acquires a reserved Health permit or an ordinary
+RPC permit within the UID's `--max-concurrent-rpcs-per-uid` share, and holds
+it through manager waiting and response construction. GetSandbox and
+DeleteSandbox that the ordinary lane refuses take one of the
+`--max-concurrent-cleanup` permits instead, at most one per UID; and UID 0's
+Health, GetSandbox and DeleteSandbox that every lane refuses take its one root
+permit. Thus decoding precedes service
 admission; connection, stream and message caps bound that concurrent work.
 Response transport backpressure can still occupy bounded connection/stream
 slots after the handler returns.

@@ -61,7 +61,20 @@ pub struct Limits {
     pub max_stdin_bytes: usize,
     pub max_argv_bytes: usize,
     pub max_connections: usize,
+    /// Connection slots, of `max_connections`, held back for Health and cleanup RPCs
+    /// (B7, B6-BI-03); each UID may hold one.
+    pub reserved_connections: usize,
+    /// General connection slots one UID may hold: by default half of the general pool,
+    /// so no one UID holds most of it.
+    pub max_connections_per_uid: usize,
+    /// How long an accepted connection may take to send the HTTP/2 client preface.
+    pub connection_preface_timeout: Duration,
     pub max_concurrent_rpcs: usize,
+    /// Ordinary RPC permits one UID may hold: by default half of them.
+    pub max_concurrent_rpcs_per_uid: usize,
+    /// The cleanup lane (GetSandbox and DeleteSandbox once the ordinary lane refuses
+    /// them); each UID may hold one.
+    pub max_concurrent_cleanup: usize,
     pub max_concurrent_health: usize,
     pub max_concurrent_execs: usize,
     pub max_queued_execs_per_sandbox: usize,
@@ -102,7 +115,12 @@ impl Default for Limits {
             max_stdin_bytes: 1 << 20,
             max_argv_bytes: 256 << 10,
             max_connections: 64,
+            reserved_connections: 4,
+            max_connections_per_uid: 32,
+            connection_preface_timeout: Duration::from_secs(5),
             max_concurrent_rpcs: 64,
+            max_concurrent_rpcs_per_uid: 32,
+            max_concurrent_cleanup: 4,
             max_concurrent_health: 4,
             max_concurrent_execs: 32,
             max_queued_execs_per_sandbox: 8,

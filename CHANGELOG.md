@@ -50,7 +50,80 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   launches in a hundred under load. It now waits out that refusal, bounded, and refusal
   reasons name their launch step. The VM test build optimizes dependencies so a real
   helper meets its wire deadlines.
-
+- Phase 1b B7 milestone 2 recheck 2 (design section 15, *Recheck 2*): the dependency
+  gate's guarantee now covers builds made through the one supported entry point, new
+  `scripts/build.sh PROFILE COMMAND`. `dependency-gate.json` gains `profiles` (`default`,
+  `firecracker-test-deployment`), each a set of workspace features; `build.sh` runs cargo
+  with `--locked` and only its profile's features, and refuses `--features`/`-F` (so
+  `tokio/full`-style dependency selectors), `--all-features`, `--no-default-features`,
+  `--manifest-path`, `--config` and `-Z`. The gate resolves every profile with exactly
+  those flags instead of one `--all-features` resolve, so a package or feature any profile
+  builds must be locked and reviewed, and kinds come from the union of the profiles' graphs.
+  CI, `scripts/install.sh`, the VM scripts and the setup instructions build through it, and
+  a test refuses a raw cargo build there; a raw `cargo build` with other feature flags is
+  outside the guarantee. The subtree scan now flags every occurrence of a sink identifier
+  (`LocalFile::set_len(self, 0)`, a function value, a `use` list, a definition), not only
+  `.name(` calls, resolves `type` aliases in the impl check and flags an alias of std's or
+  Tokio's file or process types itself; exceptions are labelled by identifier (27, five
+  new). One `name@version` from two sources is refused by the gate and the drafter. The
+  authoritative `the_dependency_gate_holds` always checks its own workspace; the
+  regression script uses the ignored `regression_fixture_gate` instead of
+  `KILND_DEPENDENCY_GATE_ROOT`, and adds Daybreak's feature-injection, type-alias UFCS,
+  two-registry and root-override cases.
+- Phase 1b B7 milestone 2 recheck, HIGH-1 (design section 15, *HIGH-1 recheck*):
+  the dependency gate now fails closed on review. `dependency-gate.json` reviews every
+  package in `Cargo.lock` (144: direct and transitive), each keyed `name@version` and
+  pinned to its lock checksum and resolved features, with a kind, a capability and a
+  written justification (shared ones only for packages the test proves name no file,
+  process, libc or Tokio fs/process path). A new package, version, checksum or feature set
+  fails until reviewed; new `scripts/dependency-gate-review.py` drafts the mechanical
+  fields. For every package declared `none`, `network` or `no_destructive_api`, the
+  source of its whole runtime subtree, read from cargo's own resolve, is scanned for
+  curated destructive method names whatever the receiver (`.set_len(`, `.truncate(`,
+  `.remove_file(`, `.kill(` and the rest), disallowed paths and trait impls on std's and
+  Tokio's file and process types. Each hit needs a `sink_exceptions` entry scoped to
+  package, version and feature set (22 today). This refuses Daybreak's extension-trait
+  `method-wrapper` and the re-exporting `outer-wrapper`/`inner-wrapper`. The claim is
+  narrowed to what the gate guarantees, and identifying a destructive API stays the
+  reviewer's job. `scripts/dependency-gate-regressions.sh` runs the recheck PoCs, a
+  version bump and an exception's scope through the actual loader, cargo and clippy.
+- Phase 1b B7 milestone 2 break-it corrections (design section 15, *B7 milestone 2
+  break-it corrections*). Ingress: kilnd refuses to start unless one UID's connection
+  share is strictly below the general pool and, with its reserved slot, below
+  `--max-connections`, its RPC share strictly below `--max-concurrent-rpcs`, and at
+  least one reserved connection and one cleanup permit exist (Daybreak's accepted
+  `33/1/32` let one UID hold every slot); UID 0 keeps one connection slot and one
+  Health/cleanup RPC permit beyond the budget; the design and threat model now call the
+  reserve first-come and bounded per UID. Dependency gate: `dependency-gate.json`
+  records a reviewed kind and capability for every direct dependency instead of
+  inferring capability from `Cargo.lock`, a destructive-capable one lists its
+  destructive paths for `clippy.toml`, build-only and dev-only kinds are checked against
+  the lock graph, and two backstops catch a mistaken `none` (Daybreak's `fs-err`
+  wrapper). `clippy.toml` gains `std::fs::copy`, `tokio::fs::copy`, `CommandExt::exec`
+  and every locked libc function matching the destructive patterns (`creat`, `execl`,
+  `popen`, `sigqueue`, `mount`, `truncate64` and the rest), with completeness tests that
+  read libc and `tokio::fs` from the pinned sources. New
+  `scripts/dependency-gate-regressions.sh` (also a CI job).
+- Phase 1b B7 milestone 2: the hardening follow-ups (design section 15, *B7 milestone
+  2*). Ingress fairness (B6-BI-03): 4 of the 64 connection slots are held back for
+  Health, GetSandbox and DeleteSandbox (one per UID; a connection on one serves nothing
+  else), one UID holds at most 32 general slots and 32 ordinary RPCs, Get and Delete
+  fall back to a 4-permit cleanup lane (one per UID), and a connection that has not sent
+  the HTTP/2 preface within 5 s is closed. New flags `--reserved-connections`,
+  `--max-connections-per-uid`, `--connection-preface-timeout-ms`,
+  `--max-concurrent-rpcs-per-uid` and `--max-concurrent-cleanup`; new
+  `scripts/hostile-public-caller.py` (64 idle sockets from one UID, Health, Get and
+  Delete from another), also run on the Firecracker chain by
+  `scripts/firecracker-regressions.py`. B4 recheck 6: a socket filesystem without file
+  handles (`EOPNOTSUPP`) is refused instead of falling back to an all-zero handle;
+  `dependency-gate.json` and a new gate test check every dependency that can wrap
+  system calls against `Cargo.lock` and `clippy.toml`; the private procfs root is made
+  once under a mutex; `sys::read_dir_fd` lists a fresh `openat(fd, ".")` description, so
+  the caller's offset is untouched. B6 recheck: the unprivileged procfs component walk
+  refuses a component on another mount; the isolated test deployment's schema 2 names
+  the unit's exact cgroup (`kilnd.cgroup`); the capacity crash scenario runs both settle
+  paths on every run. Debug and test builds compile `sha2` at opt-level 3, so the debug
+  test helper hashes its 71 MiB image in under a second instead of about 14 s on the VM.
 - Design the Phase 1b retired-token compaction for B7 (design section 16): today's node
   ledger admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1
   refusals; helper-issued sequence tokens with a per-instance durable watermark remove

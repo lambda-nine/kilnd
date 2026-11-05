@@ -1318,7 +1318,7 @@ mod tests {
         // the subprocess runner, the kiln probe/exec owner and the child setup's
         // capability and prctl wrappers to kilnd-exec-core unchanged, so their allows
         // moved with them; the wrapper subset is that crate's own typed `sys` module.
-        const APPROVED: [(&str, &str, &str, &str); 8] = [
+        const APPROVED: [(&str, &str, &str, &str); 9] = [
             (
                 "kilnd",
                 "src/helper/firecracker/proven.rs",
@@ -1366,6 +1366,12 @@ mod tests {
                 "src/lock.rs",
                 "fn finish_acquire(",
                 "truncating this process's own verified lock file",
+            ),
+            (
+                "kilnd-api",
+                "build.rs",
+                "fn main(",
+                "tonic-prost-build writes the gRPC stubs on the build host (B7 milestone 2)",
             ),
         ];
         const SILENCERS: [&str; 5] = [
@@ -1535,6 +1541,14 @@ mod tests {
             "libc::prctl",
             "libc::ptrace",
             "libc::process_vm_writev",
+            // B7 milestone 2 (MEDIUM-1); the completeness tests hold the rest.
+            "std::fs::copy",
+            "tokio::fs::copy",
+            "libc::creat",
+            "libc::popen",
+            "libc::execl",
+            "libc::sigqueue",
+            "libc::mount",
         ] {
             assert!(
                 clippy.contains(&format!("path = \"{path}\"")),
@@ -1872,4 +1886,8 @@ mod tests {
             })
         })
     }
+
+    /// Design section 7.1's dependency gate and the destructive-list completeness tests
+    /// (B7 milestone 2: HIGH-1, MEDIUM-1, LOW-1).
+    mod dependency_gate;
 }

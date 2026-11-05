@@ -2588,7 +2588,8 @@ fn b7_scenario_names_match_the_scripts() {
     // The scripts refuse to report a matrix with a missing scenario; keep all in step.
     let crash = include_str!("../../../../../../scripts/firecracker-crash-matrix.py");
     let attacks = include_str!("../../../../../../scripts/firecracker-regressions.py");
-    let source = include_str!("compaction.rs");
+    // B7 milestone 2's real-chain hostile public caller lives with B6's attacks.
+    let source = [include_str!("compaction.rs"), include_str!("recovery.rs")].concat();
     let mut names = Vec::new();
     for line in source.lines() {
         if let Some(name) = line

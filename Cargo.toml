@@ -42,3 +42,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 kilnd-api = { path = "crates/kilnd-api" }
 kilnd-broker-protocol = { path = "crates/kilnd-broker-protocol" }
 kilnd-exec-core = { path = "crates/kilnd-exec-core" }
+
+# The helper hashes its own image and every approved artifact when it starts and on
+# each Create. Unoptimized SHA-256 runs at about 5 MiB/s on the dev VM (71 MiB in 13.9 s,
+# against 0.68 s at opt-level 3), which pushed the debug test helper past its fixtures'
+# 30-second start (Phase 1b B7). Optimizing this one dependency in debug and test builds
+# keeps them representative; release builds are unchanged.
+[profile.dev.package.sha2]
+opt-level = 3
+
+# Phase 1b B7: the library tests scripts/b4-vm-tests.sh installs as a real helper. kilnd
+# itself stays a debug build with its overflow checks; every dependency is optimized,
+# because a real helper hashes its own image and parses the bundle's 33 MB manifest at
+# start and in every Preflight, which unoptimized sha2 and serde_json made slower than
+# the wire deadlines on a loaded host.
+[profile.vm-test]
+inherits = "dev"
+
+[profile.vm-test.package."*"]
+opt-level = 2
