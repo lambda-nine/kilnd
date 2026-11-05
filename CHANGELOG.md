@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix the B7 milestone 1 recheck residuals (design section 16.10, "Recheck residuals").
+  A lost answer to a fault-bearing ledger request (its deadline or cancellation dropped the
+  helper's wait) is consumed when it arrives and its fault imported, and forward effects are
+  held until then. Under the latch the ledger process serves only an explicit allowlist:
+  supervisor resource intents, forward phases and a new check before every guest-broker
+  Initialize are refused, and the helper acknowledges only teardown. A stale Inspect reply no
+  longer relearns a forgotten digest, and a complete List drops digests of allocations the
+  helper no longer holds. VMM adoption waits out, within its bound, only a seccomp filter not
+  yet installed. A missing or unreadable `/sys/block` makes the offline inventory unknown. The
+  console-flood test guest floods only after Initialize.
 - Fix the B7 milestone 1 break-it findings (design section 16.10). A replacement ledger
   process now hands its latch state (fault rows, fail-stop marker, in-memory latch) to the
   helper together with the token key, and the helper latches before publishing it, so a
