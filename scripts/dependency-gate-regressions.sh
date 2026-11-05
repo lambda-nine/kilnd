@@ -74,6 +74,15 @@
 #    a. Refused on hidden.rs's `set_len`, alias and impl; clippy accepts the workspace.
 #    b. The module under tests/, reached only by its `#[path]`: refused the same way.
 #    c. A `#[path]` outside the package root: refused as unscannable.
+# 10. Integrated recheck HIGH-1, Daybreak's ordinary-child PoC (reviews/poc-b7-integrated/
+#    ordinary-child-module.sh): its exact vendored nested-module-wrapper (src/lib.rs
+#    reaches tests/common/mod.rs through `#[path]`, whose ordinary `mod reset;` is
+#    tests/common/reset.rs, an extension trait on std::fs::File calling `set_len(0)`),
+#    reviewed `none`.
+#    a. Refused on reset.rs's `set_len` and impl; clippy accepts the workspace.
+#    b. Two levels: tests/common/mod.rs's `mod a;` is tests/common/a.rs, whose `mod b;`
+#       is tests/common/a/b.rs (the sink): refused on b.rs.
+#    c. The same through tests/common/a/mod.rs: refused on b.rs.
 #
 # Default toolchains: 1.88.0 and 1.99.0. It resolves fs-err and parking_lot from the
 # registry and vendors the locked crates (the network, or cargo's cache), so it is not
@@ -801,6 +810,61 @@ for toolchain in $toolchains; do
     path_wrapper ../../../outside.rs hidden.rs
     expect_refused "$toolchain" "$fixture" \
         "path-module-wrapper@1.0.0's source cannot be scanned completely, so the gate refuses it: path-module-wrapper-1.0.0/src/lib.rs: \`#[path = \"../../../outside.rs\"]\` resolves outside the package root"
+done
+
+# --- 10. ordinary child modules below a #[path] module (integrated recheck HIGH-1) ----
+# ordinary-child-module.sh's vendored wrapper, exactly, with its sink module at $1
+# reached through tests/common/mod.rs's `mod $2;`, and through $3's `mod b;` if set.
+child_wrapper() { # sink-file child-name [intermediate-file]
+    dir=$fixture/vendor/nested-module-wrapper-1.0.0
+    rm -rf "$dir"
+    mkdir -p "$dir/src" "$dir/tests/common" "$(dirname "$dir/$1")"
+    printf '[package]\nname = "nested-module-wrapper"\nversion = "1.0.0"\nedition = "2021"\n' \
+        >"$dir/Cargo.toml"
+    printf '#[path = "../tests/common/mod.rs"]\nmod common;\npub use common::Reset;\n' \
+        >"$dir/src/lib.rs"
+    printf 'mod %s;\npub use %s::Reset;\n' "$2" "$2" >"$dir/tests/common/mod.rs"
+    if [ -n "${3:-}" ]; then
+        mkdir -p "$(dirname "$dir/$3")"
+        printf 'mod b;\npub use b::Reset;\n' >"$dir/$3"
+    fi
+    cat >"$dir/$1" <<'EOF'
+use std::fs::File;
+
+pub trait Reset {
+    fn reset(&self) -> std::io::Result<()>;
+}
+
+impl Reset for File {
+    fn reset(&self) -> std::io::Result<()> {
+        self.set_len(0)
+    }
+}
+EOF
+    python3 -I -c 'import hashlib, json
+print(json.dumps({"files": {}, "package": hashlib.sha256(b"nested-module-wrapper 1.0.0").hexdigest()}))' \
+        >"$dir/.cargo-checksum.json"
+    uses 'nested-module-wrapper = "=1.0.0"' nested_module_wrapper
+    review "$fixture" 'nested-module-wrapper={"capability": "none", "why": "a convenience trait reached through a shared common module"}'
+}
+for toolchain in $toolchains; do
+    echo "== Rust $toolchain: nested-module-wrapper (none), tests/common/mod.rs's ordinary mod reset; =="
+    child_wrapper tests/common/reset.rs reset
+    expect_refused "$toolchain" "$fixture" \
+        "nested-module-wrapper@1.0.0 is declared \`none\`, but its runtime subtree reaches" \
+        "\`set_len\` in nested-module-wrapper@1.0.0 (nested-module-wrapper-1.0.0/tests/common/reset.rs)" \
+        "\`impl for std::fs::File\` in nested-module-wrapper@1.0.0 (nested-module-wrapper-1.0.0/tests/common/reset.rs)"
+    clippy_accepts "$toolchain" "$fixture"
+
+    echo "== Rust $toolchain: two levels, tests/common/a.rs's mod b; =="
+    child_wrapper tests/common/a/b.rs a tests/common/a.rs
+    expect_refused "$toolchain" "$fixture" \
+        "\`set_len\` in nested-module-wrapper@1.0.0 (nested-module-wrapper-1.0.0/tests/common/a/b.rs)"
+
+    echo "== Rust $toolchain: two levels, tests/common/a/mod.rs's mod b; =="
+    child_wrapper tests/common/a/b.rs a tests/common/a/mod.rs
+    expect_refused "$toolchain" "$fixture" \
+        "\`set_len\` in nested-module-wrapper@1.0.0 (nested-module-wrapper-1.0.0/tests/common/a/b.rs)"
 done
 
 if [ "$failed" -ne 0 ]; then

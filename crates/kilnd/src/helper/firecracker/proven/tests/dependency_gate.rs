@@ -2598,16 +2598,23 @@ fn locked_source(name: &str) -> Vec<(String, PathBuf)> {
 /// Recheck 3 HIGH-2: the checked-in source files of a package the gate scans, as paths
 /// relative to its root (the directory cargo extracted it to), from every file under it
 /// (`paths`). Every `.rs` file is scanned except those under the package's top-level
-/// `tests`, `benches` and `examples` directories, and every file a literal `#[path]` or
-/// `include!` edge from a scanned file reaches is scanned too, wherever it is, so a module
-/// outside the library target's directory (`#[path = "../hidden.rs"]`) is read. An edge
-/// that resolves outside the package root is an error, which refuses the package outright.
-/// An edge that resolves to no file, or an `include!` of anything but a literal path or
-/// generated `OUT_DIR` code, cannot be followed: it is reported as an `unresolved source
-/// edge` hit, refused like a sink unless a reviewed exception scoped to the package,
-/// version and features names it (a `cfg_attr` path only one configuration uses, to a
-/// file the package does not ship, cannot be compiled, so it reaches nothing). Generated
-/// `OUT_DIR` code stays the documented exception; it is not checked in.
+/// `tests`, `benches` and `examples` directories, and every file a literal `#[path]`,
+/// `include!` or ordinary out-of-line `mod name;` edge from a scanned file reaches is
+/// scanned too, wherever it is, so a module outside the library target's directory
+/// (`#[path = "../hidden.rs"]`) is read, and so is each ordinary child module below one
+/// (integrated recheck HIGH-1: `tests/common/mod.rs`'s `mod reset;`). An ordinary module
+/// is resolved conservatively, by both of Rust's readings: its children are looked up in
+/// the file's directory (a crate root, a `mod.rs` or a `#[path]` file) and, unless the
+/// file is a `mod.rs`, `lib.rs` or `main.rs`, in the directory named after its stem too,
+/// below any inline modules, as `name.rs` and `name/mod.rs`; every candidate that exists
+/// is scanned. An edge that resolves outside the package root is an error, which refuses
+/// the package outright. An edge that resolves to no file, or an `include!` of anything
+/// but a literal path or generated `OUT_DIR` code, cannot be followed: it is reported as
+/// an `unresolved source edge` hit, refused like a sink unless a reviewed exception scoped
+/// to the package, version and features names it (a `cfg_attr` path only one
+/// configuration uses, to a file the package does not ship, cannot be compiled, so it
+/// reaches nothing). Generated `OUT_DIR` code stays the documented exception; it is not
+/// checked in.
 fn package_source_files(
     paths: &BTreeSet<PathBuf>,
     read: &dyn Fn(&Path) -> Option<String>,
@@ -2643,7 +2650,27 @@ fn package_source_files(
         let mod_rs = file
             .file_name()
             .is_some_and(|n| n == "mod.rs" || n == "lib.rs" || n == "main.rs");
+        // The directory a module's out-of-line children are in, beneath its inline modules,
+        // by each reading: the file's own directory and, for a non-mod-rs file, its stem's.
+        let module_dirs = |inline: &[String]| -> Vec<Option<PathBuf>> {
+            let mut bases = vec![Some(dir.clone())];
+            if !mod_rs {
+                bases.push(file.file_stem().map(|s| dir.join(s)));
+            }
+            bases
+                .into_iter()
+                .map(|base| {
+                    inline
+                        .iter()
+                        .try_fold(base?, |at, component| within(&at, component))
+                })
+                .collect()
+        };
         for edge in source_edges(&text) {
+            // `every`: an ordinary module follows each candidate that exists, not the first.
+            // `optional`: one that finds none is not reported ([`SourceEdge::Child`]).
+            let mut every = false;
+            let mut optional = false;
             let (written, candidates, fallback): (String, Vec<Option<PathBuf>>, Vec<PathBuf>) =
                 match &edge {
                     SourceEdge::Generated => continue,
@@ -2681,20 +2708,62 @@ fn package_source_files(
                                 .collect(),
                         )
                     }
-                };
-            let found = candidates.iter().flatten().find(|c| paths.contains(*c));
-            let escapes = found.is_none() && candidates.iter().any(Option::is_none);
-            match found.or_else(|| fallback.iter().find(|c| !escapes && paths.contains(*c))) {
-                Some(found) => {
-                    if chosen.insert(found.clone()) {
-                        queue.push(found.clone());
+                    SourceEdge::Child {
+                        name,
+                        inline,
+                        fallback,
+                    } => {
+                        every = true;
+                        optional = *fallback;
+                        let leaves = [format!("{name}.rs"), format!("{name}/mod.rs")];
+                        let resolve = |at: &Option<PathBuf>| -> Vec<Option<PathBuf>> {
+                            leaves
+                                .iter()
+                                .map(|leaf| at.as_ref().and_then(|at| within(at, leaf)))
+                                .collect()
+                        };
+                        (
+                            format!("mod {name};"),
+                            module_dirs(inline).iter().flat_map(resolve).collect(),
+                            source_dirs
+                                .iter()
+                                .flat_map(|d| {
+                                    let at = inline.iter().try_fold(d.clone(), |at, component| {
+                                        within(&at, component)
+                                    });
+                                    resolve(&at)
+                                })
+                                .flatten()
+                                .collect(),
+                        )
                     }
+                };
+            let mut found: Vec<&PathBuf> = candidates
+                .iter()
+                .flatten()
+                .filter(|c| paths.contains(*c))
+                .collect();
+            let escapes = found.is_empty() && candidates.iter().any(Option::is_none);
+            if found.is_empty() && !escapes {
+                found = fallback.iter().filter(|c| paths.contains(*c)).collect();
+            }
+            if !every {
+                found.truncate(1);
+            }
+            for found in &found {
+                if chosen.insert((*found).clone()) {
+                    queue.push((*found).clone());
                 }
-                None if escapes => errors.push(format!(
-                    "{}: `{written}` resolves outside the package root",
-                    file.display()
-                )),
-                None => unresolved.push((format!("{UNRESOLVED} `{written}`"), file.clone())),
+            }
+            if found.is_empty() {
+                if escapes {
+                    errors.push(format!(
+                        "{}: `{written}` resolves outside the package root",
+                        file.display()
+                    ));
+                } else if !optional {
+                    unresolved.push((format!("{UNRESOLVED} `{written}`"), file.clone()));
+                }
             }
         }
     }
@@ -2747,8 +2816,20 @@ fn within(dir: &Path, relative: &str) -> Option<PathBuf> {
 #[derive(Debug, PartialEq, Eq)]
 enum SourceEdge {
     /// `#[path = "…"] mod name;` (or through `cfg_attr`), inside these inline modules,
-    /// each by its name or by its own `#[path]`.
+    /// each by its name or by its own `#[path]`. A module with several `#[path]`s has an
+    /// edge for each, and one for each reading of inline modules with several.
     Module { path: String, inline: Vec<String> },
+    /// An out-of-line `mod name;` with no unconditional `#[path]`, inside these inline
+    /// modules: resolved by Rust's `name.rs` / `name/mod.rs` rules from the declaring file
+    /// (integrated recheck HIGH-1). A module whose `#[path]`s are all `cfg_attr` has one
+    /// too, `fallback`, for a configuration none of them applies to: its file is scanned
+    /// if it exists, and if it does not, no such build compiles (rustc looks only where
+    /// this edge does), so it reaches nothing and is not reported.
+    Child {
+        name: String,
+        inline: Vec<String>,
+        fallback: bool,
+    },
     /// `include!("…")`, relative to the file's directory.
     Include(String),
     /// `include!` of an expression naming `OUT_DIR`: generated code, the documented
@@ -2816,16 +2897,19 @@ fn closing(toks: &[Token], open: usize) -> usize {
     toks.len()
 }
 
-/// Every literal `#[path]` module and `include!` in a file's source (test modules
-/// included: an edge is followed wherever it is).
+/// Every literal `#[path]` module, ordinary out-of-line `mod name;` and `include!` in a
+/// file's source (test modules included: an edge is followed wherever it is).
 fn source_edges(text: &str) -> Vec<SourceEdge> {
     let toks = literal_tokens(text);
     let mut edges = Vec::new();
-    // The inline modules the scan is inside: (directory component, brace depth).
-    let mut inline: Vec<(String, usize)> = Vec::new();
+    // The inline modules the scan is inside: (each directory component it may have, brace
+    // depth).
+    let mut inline: Vec<(Vec<String>, usize)> = Vec::new();
     let mut depth = 0;
-    // A `#[path]` waiting for the `mod` it applies to.
-    let mut pending: Option<String> = None;
+    // The `#[path]`s waiting for the `mod` they apply to, each with whether it is
+    // conditional (`cfg_attr`): every one is followed, and so is the module's ordinary
+    // location unless one is unconditional (rustix's per-architecture `cfg_attr` paths).
+    let mut pending: Vec<(String, bool)> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
         match toks[i] {
@@ -2833,13 +2917,15 @@ fn source_edges(text: &str) -> Vec<SourceEdge> {
                 let open = i + 1 + usize::from(toks.get(i + 1) == Some(&Token::Punct('!')));
                 if toks.get(open) == Some(&Token::Punct('[')) {
                     let close = closing(&toks, open);
-                    if let Some(path) = path_attribute(&toks[open + 1..close.min(toks.len())]) {
-                        pending = Some(path.to_string());
+                    let content = &toks[open + 1..close.min(toks.len())];
+                    if let Some(path) = path_attribute(content) {
+                        let conditional = content.first() != Some(&Token::Ident("path"));
+                        pending.push((path.to_string(), conditional));
                     }
                     i = close + 1;
                     continue;
                 }
-                pending = None;
+                pending.clear();
             }
             Token::Ident("include")
                 if toks.get(i + 1) == Some(&Token::Punct('!'))
@@ -2869,55 +2955,97 @@ fn source_edges(text: &str) -> Vec<SourceEdge> {
                             .collect(),
                     ),
                 });
-                pending = None;
+                pending.clear();
                 i = close + 1;
+                continue;
+            }
+            // A restricted visibility between the attributes and `mod`
+            // (`pub(in crate::backend)`), skipped whole.
+            Token::Ident("pub") if toks.get(i + 1) == Some(&Token::Punct('(')) => {
+                i = closing(&toks, i + 1) + 1;
                 continue;
             }
             Token::Ident("mod") => {
                 if let Some(Token::Ident(name)) = toks.get(i + 1) {
                     match toks.get(i + 2) {
                         Some(Token::Punct(';')) => {
-                            if let Some(path) = pending.take() {
-                                edges.push(SourceEdge::Module {
-                                    path,
-                                    inline: inline.iter().map(|(c, _)| c.clone()).collect(),
-                                });
+                            let ordinary = pending.iter().all(|(_, conditional)| *conditional);
+                            let fallback = !pending.is_empty();
+                            for inline in inline_readings(&inline) {
+                                for (path, _) in &pending {
+                                    edges.push(SourceEdge::Module {
+                                        path: path.clone(),
+                                        inline: inline.clone(),
+                                    });
+                                }
+                                if ordinary {
+                                    edges.push(SourceEdge::Child {
+                                        name: name.to_string(),
+                                        inline,
+                                        fallback,
+                                    });
+                                }
                             }
+                            pending.clear();
                             i += 3;
                             continue;
                         }
                         Some(Token::Punct('{')) => {
                             depth += 1;
-                            let component = pending.take().unwrap_or_else(|| name.to_string());
-                            inline.push((component, depth));
+                            let mut components: Vec<String> =
+                                pending.iter().map(|(path, _)| path.clone()).collect();
+                            if pending.iter().all(|(_, conditional)| *conditional) {
+                                components.push(name.to_string());
+                            }
+                            inline.push((components, depth));
+                            pending.clear();
                             i += 3;
                             continue;
                         }
                         _ => {}
                     }
                 }
-                pending = None;
+                pending.clear();
             }
             Token::Punct('{') => {
                 depth += 1;
-                pending = None;
+                pending.clear();
             }
             Token::Punct('}') => {
                 if inline.last().is_some_and(|(_, d)| *d == depth) {
                     inline.pop();
                 }
                 depth = depth.saturating_sub(1);
-                pending = None;
+                pending.clear();
             }
-            // A visibility between the attributes and `mod` (`pub(in crate::x)`).
+            // A visibility between the attributes and `mod` (`pub(crate)`, `crate`).
             Token::Ident("pub" | "crate" | "super" | "self" | "in")
             | Token::Punct('(' | ')')
             | Token::PathSep => {}
-            _ => pending = None,
+            _ => pending.clear(),
         }
         i += 1;
     }
     edges
+}
+
+/// Every combination of the inline modules' directory components, outermost first: an
+/// inline module with conditional `#[path]`s may be at each of them.
+fn inline_readings(inline: &[(Vec<String>, usize)]) -> Vec<Vec<String>> {
+    inline
+        .iter()
+        .fold(vec![Vec::new()], |readings, (components, _)| {
+            readings
+                .iter()
+                .flat_map(|reading| {
+                    components.iter().map(move |component| {
+                        let mut next = reading.clone();
+                        next.push(component.clone());
+                        next
+                    })
+                })
+                .collect()
+        })
 }
 
 /// Every file under a package's root, relative to it, and the scanned source
@@ -4910,6 +5038,13 @@ fn unbar(text: &str) -> String {
         .replace("OUT|_DIR", GENERATED)
 }
 
+/// `files` as paths, in a scan's (path) order.
+fn paths_of(files: &[&str]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    paths.sort();
+    paths
+}
+
 fn names(files: &[PathBuf]) -> Vec<String> {
     files.iter().map(|f| f.display().to_string()).collect()
 }
@@ -5021,6 +5156,243 @@ fn b7m2_recheck3_an_edge_outside_the_package_or_to_nothing_is_reported() {
             "unresolved source edge `#[path = \"missing.rs\"]`",
             &unbar("unresolved source edge `include|!(path_from_a_macro!())`"),
         ]
+    );
+}
+
+#[test]
+fn b7int_ordinary_out_of_line_modules_are_source_edges() {
+    let edges = source_edges(
+        "#[path = \"x.rs\"]\nmod a;\npub(crate) mod b;\nmod c { mod d; }\n\
+         #[path = \"p\"]\nmod e { mod f; }\nmod g {}\n#[cfg(test)]\nmod h;\n",
+    );
+    let child = |name: &str, inline: &[&str]| SourceEdge::Child {
+        name: name.into(),
+        inline: inline.iter().map(|c| c.to_string()).collect(),
+        fallback: false,
+    };
+    let fallback = |name: &str, inline: &[&str]| SourceEdge::Child {
+        name: name.into(),
+        inline: inline.iter().map(|c| c.to_string()).collect(),
+        fallback: true,
+    };
+    assert_eq!(
+        edges,
+        [
+            SourceEdge::Module {
+                path: "x.rs".into(),
+                inline: vec![]
+            },
+            child("b", &[]),
+            child("d", &["c"]),
+            child("f", &["p"]),
+            child("h", &[]),
+        ]
+    );
+
+    // Every `#[path]` of a module is an edge, through a restricted visibility; a module
+    // whose paths are all conditional also has its ordinary location, and so does an
+    // inline module's directory.
+    let module = |path: &str, inline: &[&str]| SourceEdge::Module {
+        path: path.into(),
+        inline: inline.iter().map(|c| c.to_string()).collect(),
+    };
+    let edges = source_edges(
+        "#[cfg_attr(a, path = \"a.rs\")]\n#[cfg_attr(b, path = \"b.rs\")]\n\
+         pub(in crate::backend) mod asm;\n\
+         #[cfg_attr(a, path = \"x.rs\")]\n#[path = \"y.rs\"]\nmod m;\n\
+         #[cfg_attr(a, path = \"p\")]\nmod i { mod j; }\n",
+    );
+    assert_eq!(
+        edges,
+        [
+            module("a.rs", &[]),
+            module("b.rs", &[]),
+            fallback("asm", &[]),
+            module("x.rs", &[]),
+            module("y.rs", &[]),
+            child("j", &["p"]),
+            child("j", &["i"]),
+        ]
+    );
+}
+
+#[test]
+fn b7int_ordinary_child_modules_below_a_path_module_are_scanned() {
+    // Daybreak's integrated-recheck HIGH-1 shape: a #[path] into tests/, then `mod reset;`.
+    let found = package_tree(&[
+        (
+            "src/lib.rs",
+            "#[path = \"../tests/common/mod.rs\"]\nmod common;\npub use common::Reset;\n",
+        ),
+        ("tests/common/mod.rs", "mod reset;\npub use reset::Reset;\n"),
+        ("tests/common/reset.rs", "pub trait Reset {}\n"),
+        ("tests/unreached.rs", "#[test] fn t() {}\n"),
+    ]);
+    assert_eq!(
+        found.files,
+        paths_of(&["src/lib.rs", "tests/common/mod.rs", "tests/common/reset.rs"])
+    );
+    assert!(
+        found.errors.is_empty() && found.unresolved.is_empty(),
+        "{found:?}"
+    );
+
+    // Two levels, through `a.rs` (its children under `a/`) and through `a/mod.rs`.
+    for a in ["tests/common/a.rs", "tests/common/a/mod.rs"] {
+        let found = package_tree(&[
+            (
+                "src/lib.rs",
+                "#[path = \"../tests/common/mod.rs\"]\nmod common;\n",
+            ),
+            ("tests/common/mod.rs", "mod a;\n"),
+            (a, "mod b;\n"),
+            ("tests/common/a/b.rs", "pub fn reset() {}\n"),
+        ]);
+        assert_eq!(
+            found.files,
+            paths_of(&[
+                "src/lib.rs",
+                "tests/common/mod.rs",
+                a,
+                "tests/common/a/b.rs"
+            ])
+        );
+        assert!(
+            found.errors.is_empty() && found.unresolved.is_empty(),
+            "{found:?}"
+        );
+    }
+
+    // Inline modules nest the directory, in a #[path] file (its children are siblings)
+    // and in an ordinary non-mod-rs child (its children are under its stem).
+    let found = package_tree(&[
+        ("src/lib.rs", "#[path = \"../tests/t.rs\"]\nmod t;\n"),
+        ("tests/t.rs", "mod x { mod y; }\nmod common;\n"),
+        ("tests/x/y.rs", ""),
+        ("tests/common.rs", "mod a;\n"),
+        ("tests/common/a.rs", "pub mod x { pub mod z; }\n"),
+        ("tests/common/a/x/z.rs", ""),
+        ("tests/unreached/x/y.rs", ""),
+    ]);
+    assert_eq!(
+        found.files,
+        paths_of(&[
+            "src/lib.rs",
+            "tests/common.rs",
+            "tests/common/a.rs",
+            "tests/common/a/x/z.rs",
+            "tests/t.rs",
+            "tests/x/y.rs"
+        ])
+    );
+    assert!(
+        found.errors.is_empty() && found.unresolved.is_empty(),
+        "{found:?}"
+    );
+
+    // Every reading that exists is scanned, not just the first.
+    let found = package_tree(&[
+        ("src/lib.rs", "#[path = \"../tests/a.rs\"]\nmod a;\n"),
+        ("tests/a.rs", "mod b;\n"),
+        ("tests/b.rs", ""),
+        ("tests/a/b.rs", ""),
+        ("tests/a/b/mod.rs", ""),
+    ]);
+    assert_eq!(
+        found.files,
+        paths_of(&[
+            "src/lib.rs",
+            "tests/a.rs",
+            "tests/a/b.rs",
+            "tests/a/b/mod.rs",
+            "tests/b.rs"
+        ])
+    );
+}
+
+#[test]
+fn b7int_every_path_of_a_module_is_scanned() {
+    // rustix's per-architecture `cfg_attr` paths behind `pub(in crate::backend)`: each is
+    // scanned. The ordinary location no path covers is scanned if it exists; if it does
+    // not, no build without those cfgs compiles, so it is not reported (socket2's `sys`).
+    let found = package_tree(&[
+        (
+            "src/lib.rs",
+            "#[cfg_attr(a, path = \"../tests/a.rs\")]\n\
+             #[cfg_attr(b, path = \"../tests/b.rs\")]\n\
+             pub(in crate::backend) mod asm;\n\
+             #[path = \"../tests/c.rs\"]\nmod c;\n",
+        ),
+        ("tests/a.rs", ""),
+        ("tests/b.rs", ""),
+        ("tests/c.rs", ""),
+        ("tests/unreached.rs", ""),
+    ]);
+    assert_eq!(
+        found.files,
+        paths_of(&["src/lib.rs", "tests/a.rs", "tests/b.rs", "tests/c.rs"])
+    );
+    assert!(
+        found.errors.is_empty() && found.unresolved.is_empty(),
+        "{found:?}"
+    );
+    // Below tests/, where only edges reach: a conditional-only module's ordinary location
+    // that exists is scanned; an unconditional `#[path]` module has none.
+    let found = package_tree(&[
+        ("src/lib.rs", "#[path = \"../tests/t.rs\"]\nmod t;\n"),
+        (
+            "tests/t.rs",
+            "#[cfg_attr(a, path = \"a.rs\")]\nmod asm;\n#[path = \"c.rs\"]\nmod c;\n",
+        ),
+        ("tests/a.rs", ""),
+        ("tests/asm/mod.rs", ""),
+        ("tests/c.rs", ""),
+        ("tests/c/mod.rs", ""),
+        ("tests/t/c.rs", ""),
+    ]);
+    assert_eq!(
+        found.files,
+        paths_of(&[
+            "src/lib.rs",
+            "tests/a.rs",
+            "tests/asm/mod.rs",
+            "tests/c.rs",
+            "tests/t.rs"
+        ])
+    );
+    assert!(
+        found.errors.is_empty() && found.unresolved.is_empty(),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn b7int_an_ordinary_child_module_to_nothing_or_outside_is_reported() {
+    let found = package_tree(&[
+        (
+            "src/lib.rs",
+            "#[path = \"../tests/common/mod.rs\"]\nmod common;\n",
+        ),
+        (
+            "tests/common/mod.rs",
+            "mod missing;\n#[path = \"../../..\"]\nmod up { mod escape; }\n",
+        ),
+    ]);
+    assert_eq!(
+        found.errors,
+        ["tests/common/mod.rs: `mod escape;` resolves outside the package root"]
+    );
+    let unresolved: Vec<(&str, String)> = found
+        .unresolved
+        .iter()
+        .map(|(s, f)| (s.as_str(), f.display().to_string()))
+        .collect();
+    assert_eq!(
+        unresolved,
+        [(
+            "unresolved source edge `mod missing;`",
+            "tests/common/mod.rs".to_string()
+        )]
     );
 }
 
