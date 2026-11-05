@@ -4616,4 +4616,17 @@ consumed `SyncFailed` and the queued Create is refused; the latched L answers th
 intent `Latched` and writes nothing; no stale digest survives and Preflight is served; a
 missing `/sys/block` is `unknown`.
 
-**Evidence** (`reviews/2026-11-05-b7m1-residuals/`). EVIDENCE-PENDING
+**Evidence** (`reviews/2026-11-05-b7m1-residuals/`). Kiln VM at `3c33774` (the R2
+real-chain tests again at `b8c0a31`, which only corrects their own assertions and matrix
+line), each suite in its own phase: crash matrix 31 of 31 (B6's 11 on the real chain, B7's
+20 with both R1 scenarios); attack regressions 22 of 22 for the existing scenarios, B6's
+whole session through kilnd and kilndctl included, with the R3 race; the three R2
+real-chain tests 3 of 3; B5 8 of 8 with both test guests rebuilt from the current
+`bundle-a`, the console flood included; B4 32 of 32, the R4 seccomp test included (strict
+mode refused 60 ms after adoption, a filter never seen refused after 5.1 s), and the
+capability-drop test; the real-host offline walk as root. macOS: the workspace tests pass on
+both feature sets except `runtime::kiln_direct`'s fake-kiln timing tests and
+`manager::fenced_tests::invalid_exec_claims_fail_cleanup_and_quarantine_end_to_end`, which
+fail identically at the unchanged `d7f7b44`; clippy is clean on 1.88 and 1.99. The VM's
+mounted checkout was returned to main `1c107f9` and `/var/lib/kilnd` restored from its
+copy, every file `cmp`-identical (`kilnd.db` SHA-256 `ef02941f…`).
