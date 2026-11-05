@@ -13,10 +13,16 @@ through its CLI. Read [README.md](README.md),
   kiln`), which mounts this checkout at the same path. In the VM,
   `CARGO_TARGET_DIR=$HOME/.cache/kilnd-target` keeps Linux builds out of
   `target/`.
-- **Checks before every commit:** `cargo test --locked`,
-  `cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`,
-  `python3 -I scripts/kilnd-maintenance-tests.py`.
+- **Checks before every commit:** `scripts/build.sh default test`,
+  `scripts/build.sh default clippy --all-targets` (it supplies `-D warnings -D
+  clippy::disallowed_methods`), the same two with the `firecracker-test-deployment`
+  profile, `git diff --check` and `python3 -I scripts/kilnd-maintenance-tests.py`.
   CI runs them with Rust 1.88 (the MSRV), and clippy again with 1.99.
+- **Every build goes through `scripts/build.sh PROFILE`** (design section 7.1's
+  dependency gate): a profile from `dependency-gate.json` is the build's only feature
+  input, and build.sh refuses feature flags, `--config`, `-Z`, a clippy tail, and an
+  ambient `RUSTFLAGS`, `RUSTC_WRAPPER` and the like. Never run raw `cargo` builds in
+  scripts, CI or instructions.
 - **Crates:** `kilnd` (daemon, helper, store), `kilnd-api` (generated gRPC), `kilndctl`,
   `kilnd-exec-core` (the direct-kiln process/status/capture/validation core, shared with the
   guest broker; kilnd re-exports it from the old paths) and `kilnd-broker-protocol` (the

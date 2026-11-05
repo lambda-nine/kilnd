@@ -31,13 +31,12 @@ guest=${B4_GUEST:-$HOME/kiln-guest-build/bundle-a}
 target=aarch64-unknown-linux-gnu
 
 # B6: the daemon and client the session test runs as an ordinary installed kilnd would
-# be, before the static flags below apply to anything.
+# be, before the static build below.
 bins=${B6_TARGET_DIR:-$HOME/.cache/kilnd-target-b6}
 CARGO_TARGET_DIR=$bins scripts/build.sh firecracker-test-deployment build --release \
     -p kilnd -p kilndctl --bin kilnd --bin kilndctl
 
 export CARGO_TARGET_DIR=${B4_TARGET_DIR:-$HOME/.cache/kilnd-target-static}
-export RUSTFLAGS="-C target-feature=+crt-static"
 
 # kilnd's library tests, and since Phase 1b B5 the direct-kiln core's, which hold the
 # moved capability-drop regression (process::tests).
@@ -46,8 +45,10 @@ export RUSTFLAGS="-C target-feature=+crt-static"
 # in every Preflight, which unoptimized sha2 and serde_json made slower than the wire
 # deadlines on a loaded host. The workspace Cargo.toml's `vm-test` profile is `dev` with
 # every dependency at opt-level 2.
-built=$(scripts/build.sh default test -p kilnd -p kilnd-exec-core --lib --no-run --target "$target" \
-    --profile vm-test \
+# --crt-static: build.sh's one compiler flag, -C target-feature=+crt-static, for the
+# --target artifacts only (it refuses an ambient RUSTFLAGS).
+built=$(scripts/build.sh --crt-static default test -p kilnd -p kilnd-exec-core --lib --no-run \
+    --target "$target" --profile vm-test \
     --message-format=json \
     | python3 -I -c '
 import json, sys

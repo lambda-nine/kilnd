@@ -524,7 +524,7 @@
       ],
       "kind": "runtime",
       "capability": "none",
-      "group": "pure-computation"
+      "why": "HTTP/1 request and response parsing in memory (hyper's). Its library opens, removes and runs nothing; its build script (build-time only) runs `rustc --version` to choose SIMD cfgs, so the whole-package scan (recheck 3) no longer lets it share pure-computation."
     },
     "httpdate@1.0.3": {
       "checksum": "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9",
@@ -921,7 +921,7 @@
       "features": [],
       "kind": "build-only",
       "capability": "none",
-      "group": "compile-time"
+      "why": "Pretty-prints generated Rust syntax trees for prost-build and tonic-prost-build at build time; never linked into a kilnd binary. Its build script only checks the compiler version and exits (process::exit) on an unsupported one, so the whole-package scan (recheck 3) no longer lets it share compile-time."
     },
     "proc-macro2@1.0.107": {
       "checksum": "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9",
@@ -931,7 +931,7 @@
       ],
       "kind": "build-only",
       "capability": "none",
-      "group": "compile-time"
+      "why": "Token streams for procedural macros and code generators, at build time; never linked into a kilnd binary. Its build script runs rustc in a probe directory under OUT_DIR, which it creates and removes, so the whole-package scan (recheck 3) no longer lets it share compile-time."
     },
     "prost-build@0.14.4": {
       "checksum": "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042",
@@ -987,7 +987,7 @@
       "features": [],
       "kind": "build-only",
       "capability": "none",
-      "group": "pure-computation"
+      "why": "Markdown parsing for prost-build's generated doc comments, at build time; never linked into a kilnd binary. Its build script (spec-test generation, its gen-tests feature, not enabled) and its command-line binary (src/main.rs, not built as a dependency) open files, so the whole-package scan (recheck 3) no longer lets it share pure-computation."
     },
     "quote@1.0.47": {
       "checksum": "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001",
@@ -997,7 +997,7 @@
       ],
       "kind": "build-only",
       "capability": "none",
-      "group": "compile-time"
+      "why": "Quasi-quoting for procedural macros and code generators, at build time; never linked into a kilnd binary. Its build script runs `rustc --version`, so the whole-package scan (recheck 3) no longer lets it share compile-time."
     },
     "r-efi@6.0.0": {
       "checksum": "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf",
@@ -1091,7 +1091,7 @@
       ],
       "kind": "runtime",
       "capability": "none",
-      "group": "pure-computation"
+      "why": "serde's core traits and impls (serde re-exports them), in memory. Its library opens, removes and runs nothing; its build script (build-time only) writes OUT_DIR/private.rs and runs `rustc --version`, so the whole-package scan (recheck 3) no longer lets it share pure-computation."
     },
     "serde_derive@1.0.229": {
       "checksum": "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348",
@@ -1630,7 +1630,7 @@
       "features": [],
       "kind": "runtime",
       "capability": "none",
-      "group": "pure-computation"
+      "why": "Float-to-string formatting in its own buffer (serde_json's). Its library opens, removes and runs nothing; its build script (build-time only) runs `rustc --version`, so the whole-package scan (recheck 3) no longer lets it share pure-computation."
     }
   },
   "sink_exceptions": [
@@ -1667,6 +1667,20 @@
         "truncate"
       ],
       "why": "String::truncate trimming a formatted backtrace: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "anyhow",
+      "version": "1.0.104",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "remove_dir_all",
+        "std::fs::remove_dir_all",
+        "std::process::Command::new"
+      ],
+      "why": "build.rs only (recheck 3's whole-package scan reads build scripts too): it runs on the build host at compile time and is never linked into a kilnd binary. It runs the rustc cargo names (Command::new) to probe for std backtrace support, then removes its own probe directory, OUT_DIR/probe (fs::remove_dir_all)."
     },
     {
       "package": "base64",
@@ -1750,6 +1764,18 @@
       "why": "Vec::set_len(0) clearing a HeaderMap's own entries and BytesMut::truncate on a path buffer: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
     {
+      "package": "httparse",
+      "version": "1.10.1",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "std::process::Command::new"
+      ],
+      "why": "build.rs only (recheck 3's whole-package scan reads build scripts too): it runs on the build host at compile time and is never linked into a kilnd binary. It runs `rustc --version` (the RUSTC cargo names) to choose its SIMD cfgs."
+    },
+    {
       "package": "hyper",
       "version": "1.12.0",
       "features": [
@@ -1817,6 +1843,54 @@
         "unmount"
       ],
       "why": "libc's own declarations of the C functions (extern fn kill, rename, truncate, umount, umount2, unlink, unlinkat, unmount, Haiku's send_signal), a struct field named copy (Apple) and solarish siginfo accessors' `kill` bindings. libc is reviewed with its destructive capabilities, and clippy.toml disallows each destructive function for workspace code; a package declared non-destructive that calls one names it in its own source, where this scan flags it."
+    },
+    {
+      "package": "libc",
+      "version": "0.2.190",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "std::process::Command::new"
+      ],
+      "why": "build.rs only (recheck 3's whole-package scan reads build scripts too): it runs on the build host at compile time and is never linked into a kilnd binary. It runs `rustc --version` (or the RUSTC_WRAPPER cargo names) to choose its cfgs, and on FreeBSD and Emscripten hosts `freebsd-version` and `emcc -dumpversion`."
+    },
+    {
+      "package": "libsqlite3-sys",
+      "version": "0.35.0",
+      "features": [
+        "bundled",
+        "bundled_bindings",
+        "cc",
+        "default",
+        "min_sqlite_version_3_14_0",
+        "pkg-config",
+        "vcpkg"
+      ],
+      "sinks": [
+        "copy",
+        "std::fs::copy",
+        "std::fs::write"
+      ],
+      "why": "build.rs only (recheck 3's whole-package scan reads build scripts too): it runs on the build host at compile time and is never linked into a kilnd binary. It copies the checked-in bindings for the bundled SQLite into OUT_DIR (fs::copy, its copy_bindings) and writes bindgen's output there (fs::write)."
+    },
+    {
+      "package": "libsqlite3-sys",
+      "version": "0.35.0",
+      "features": [
+        "bundled",
+        "bundled_bindings",
+        "cc",
+        "default",
+        "min_sqlite_version_3_14_0",
+        "pkg-config",
+        "vcpkg"
+      ],
+      "sinks": [
+        "exec"
+      ],
+      "why": "`exec`, the sqlite3_api_routines field holding the loadable-extension API's pointer to sqlite3_exec (runs SQL on a connection), and its accessor, in the checked-in bindgen_3.14.0_ext.rs and bindgen_bundled_version_ext.rs, which only the loadable_extension feature (not enabled) copies into the build. Not a process exec."
     },
     {
       "package": "matchit",
@@ -1890,6 +1964,21 @@
       "why": "String::truncate in a Deserialize impl's own buffer: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
     },
     {
+      "package": "serde",
+      "version": "1.0.229",
+      "features": [
+        "default",
+        "derive",
+        "serde_derive",
+        "std"
+      ],
+      "sinks": [
+        "std::fs::write",
+        "std::process::Command::new"
+      ],
+      "why": "build.rs only (recheck 3's whole-package scan reads build scripts too): it runs on the build host at compile time and is never linked into a kilnd binary. It writes its generated OUT_DIR/private.rs (fs::write) and runs `rustc --version`."
+    },
+    {
       "package": "serde_core",
       "version": "1.0.229",
       "features": [
@@ -1901,6 +1990,37 @@
         "truncate"
       ],
       "why": "String::truncate in a Deserialize impl's own buffer: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate."
+    },
+    {
+      "package": "serde_core",
+      "version": "1.0.229",
+      "features": [
+        "default",
+        "result",
+        "std"
+      ],
+      "sinks": [
+        "std::fs::write",
+        "std::process::Command::new"
+      ],
+      "why": "build.rs only (recheck 3's whole-package scan reads build scripts too): it runs on the build host at compile time and is never linked into a kilnd binary. It writes its generated OUT_DIR/private.rs (fs::write) and runs `rustc --version`."
+    },
+    {
+      "package": "serde_core",
+      "version": "1.0.229",
+      "features": [
+        "default",
+        "result",
+        "std"
+      ],
+      "sinks": [
+        "unresolved source edge `#[path = \"core/de/mod.rs\"]`",
+        "unresolved source edge `#[path = \"core/format.rs\"]`",
+        "unresolved source edge `#[path = \"core/private/mod.rs\"]`",
+        "unresolved source edge `#[path = \"core/ser/mod.rs\"]`",
+        "unresolved source edge `#[path = \"core/std_error.rs\"]`"
+      ],
+      "why": "The crate_root! macro's docs.rs-only `cfg_attr(all(docsrs, if_docsrs_then_no_serde_core), path = \"core/...\")`, serde's facade layout (serde ships src/core and the gate follows these there). serde_core ships no src/core, so a build with that cfg could not compile, and no supported build sets it; every checked-in .rs file under serde_core is scanned whatever these paths would name."
     },
     {
       "package": "serde_json",
@@ -1929,6 +2049,21 @@
         "truncate"
       ],
       "why": "SmallVec's own set_len and truncate, and Vec::set_len when it spills: in-memory length changes on its own buffers (Vec, String, BytesMut, SmallVec and the like), not File::set_len or OpenOptions::truncate. copy is core::ptr::copy shifting elements inside its own buffer."
+    },
+    {
+      "package": "thiserror",
+      "version": "2.0.21",
+      "features": [
+        "default",
+        "std"
+      ],
+      "sinks": [
+        "remove_dir_all",
+        "std::fs::remove_dir_all",
+        "std::fs::write",
+        "std::process::Command::new"
+      ],
+      "why": "build.rs only (recheck 3's whole-package scan reads build scripts too): it runs on the build host at compile time and is never linked into a kilnd binary. It writes its generated OUT_DIR/private.rs (fs::write), runs the rustc cargo names to probe for std backtrace support (Command::new), then removes its own probe directory, OUT_DIR/probe (fs::remove_dir_all)."
     },
     {
       "package": "tokio",
@@ -2082,6 +2217,15 @@
         "copy"
       ],
       "why": "core::ptr::copy shifting digits inside its own float-formatting buffer."
+    },
+    {
+      "package": "zmij",
+      "version": "1.0.23",
+      "features": [],
+      "sinks": [
+        "std::process::Command::new"
+      ],
+      "why": "build.rs only (recheck 3's whole-package scan reads build scripts too): it runs on the build host at compile time and is never linked into a kilnd binary. It runs `rustc --version` to choose its cfgs."
     }
   ]
 }

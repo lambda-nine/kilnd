@@ -1602,10 +1602,21 @@ mod tests {
     #[test]
     fn no_unapproved_build_scripts_or_generated_includes() {
         // (crate-relative path, why).
-        const BUILD_SCRIPTS: [(&str, &str); 1] = [(
-            "kilnd-api/build.rs",
-            "tonic-prost-build compiles proto/kilnd/v1 into its out directory",
-        )];
+        // Every other crate's build script is only recheck 3's compiler-flag backstop,
+        // which generates nothing (dependency_gate's
+        // b7m2_recheck3_every_workspace_crate_refuses_compiler_cfg_flags holds each to it).
+        const BACKSTOP: &str = "only the recheck 3 compiler-flag backstop; generates nothing";
+        const BUILD_SCRIPTS: [(&str, &str); 6] = [
+            (
+                "kilnd-api/build.rs",
+                "tonic-prost-build compiles proto/kilnd/v1 into its out directory",
+            ),
+            ("kilnd/build.rs", BACKSTOP),
+            ("kilnd-broker-protocol/build.rs", BACKSTOP),
+            ("kilnd-exec-core/build.rs", BACKSTOP),
+            ("kilnd-guest-broker/build.rs", BACKSTOP),
+            ("kilndctl/build.rs", BACKSTOP),
+        ];
         // (crate-relative file, squashed expression, why). Each exactly once.
         const INCLUDES: [(&str, &str, &str); 1] = [(
             "kilnd-api/src/lib.rs",

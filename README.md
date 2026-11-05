@@ -196,7 +196,7 @@ you created, so one made with `sudo` above stays visible only to root.
 
 ```sh
 scripts/build.sh default test
-scripts/build.sh default clippy --all-targets -- -D warnings
+scripts/build.sh default clippy --all-targets
 git diff --check
 ```
 

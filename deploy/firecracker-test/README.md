@@ -22,8 +22,9 @@ B6 can drive whole sessions through the real daemon and `kilndctl` on the dev VM
 
 The daemon side is `kilnd --backend firecracker --firecracker-test-deployment <file>`, and
 both flags exist only in a kilnd built with the non-default `firecracker-test-deployment`
-cargo feature (`cargo build -p kilnd --features firecracker-test-deployment`). A default
-build, which is what `cargo build --release`, `scripts/install.sh` and CI's release step
+cargo feature, through its build profile
+(`scripts/build.sh firecracker-test-deployment build -p kilnd`). A default build, which is
+what `scripts/build.sh default build --release`, `scripts/install.sh` and CI's release step
 make, refuses both at argument parsing. A feature build reads the file strictly (exact
 fields, no duplicate keys, at most 64 KiB) and, before it opens any state, refuses to
 start unless:

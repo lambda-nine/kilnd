@@ -39,16 +39,17 @@ jobs:
       - name: cargo test
         run: sh scripts/build.sh default test
 
-      # -D warnings makes clippy.toml's disallowed-methods (design section 7.1's
-      # destructive-action gate) an error; the explicit flag keeps that true if the
-      # warnings level ever changes. Both the MSRV and the current toolchain.
+      # build.sh passes clippy its fixed `-D warnings -D clippy::disallowed_methods`, so
+      # clippy.toml's disallowed-methods (design section 7.1's destructive-action gate)
+      # is an error, and refuses any other clippy arguments. Both the MSRV and the
+      # current toolchain.
       - name: cargo clippy (1.88)
-        run: sh scripts/build.sh default clippy --all-targets -- -D warnings -D clippy::disallowed_methods
+        run: sh scripts/build.sh default clippy --all-targets
 
       - name: cargo clippy (1.99)
         run: |
           rustup toolchain install 1.99.0 --profile minimal --component clippy
-          sh scripts/build.sh +1.99.0 default clippy --all-targets -- -D warnings -D clippy::disallowed_methods
+          sh scripts/build.sh +1.99.0 default clippy --all-targets
 
       # B6-BI-01's build boundary: the release build CI and the installers make has no
       # Firecracker flags, and refuses Daybreak's PoC command at argument parsing.
@@ -103,12 +104,12 @@ jobs:
         run: sh scripts/build.sh "$PROFILE" test
 
       - name: cargo clippy (feature, 1.88)
-        run: sh scripts/build.sh "$PROFILE" clippy --all-targets -- -D warnings -D clippy::disallowed_methods
+        run: sh scripts/build.sh "$PROFILE" clippy --all-targets
 
       - name: cargo clippy (feature, 1.99)
         run: |
           rustup toolchain install 1.99.0 --profile minimal --component clippy
-          sh scripts/build.sh +1.99.0 "$PROFILE" clippy --all-targets -- -D warnings -D clippy::disallowed_methods
+          sh scripts/build.sh +1.99.0 "$PROFILE" clippy --all-targets
 
       - name: Feature build refuses a mismatched identity
         run: |
@@ -120,7 +121,8 @@ jobs:
   # filesystem; the method, transitive and type-alias UFCS wrappers as vendored registry
   # packages, a version bump and an exception's scope; std::fs::copy and libc::creat;
   # build.sh's refusal of feature injection and a profile's unreviewed graph; one
-  # name@version from two registries; the authoritative test's fixed root). It resolves
+  # name@version from two registries; the authoritative test's fixed root; recheck 3's
+  # compiler cfg inputs and #[path] module outside the library directory). It resolves
   # fs-err and parking_lot and vendors the locked crates from the registry in disposable
   # copies.
   gate-regressions:

@@ -56,6 +56,24 @@
 #    with an unreviewed path dependency, the authoritative test refuses even with
 #    KILND_DEPENDENCY_GATE_ROOT and KILND_DEPENDENCY_GATE_FIXTURE naming a clean copy, and
 #    the pristine copy's authoritative test holds with both naming the dirty one.
+# 8. Recheck 3 HIGH-1, Daybreak's compiler-cfg PoC (reviews/poc-b7m2-recheck3/
+#    rustflags-feature.sh): a declared `ambient-poc` feature no profile selects, and a
+#    test compiled only under it.
+#    a. RUSTFLAGS and CARGO_BUILD_RUSTFLAGS='--cfg feature="ambient-poc"' through
+#       scripts/build.sh: refused before cargo runs.
+#    b. The Clippy tail `-- --cfg 'feature="ambient-poc"'`: refused.
+#    c. The same cfg from a Cargo config file (`build.rustflags` and a
+#       `target.'cfg(all())'` table) and a config `rustc-wrapper`: build.sh's closed
+#       environment overrides them, and the feature's test is not compiled.
+#    d. A raw cargo build with that RUSTFLAGS: the workspace build scripts' backstop
+#       refuses the `--cfg`.
+# 9. Recheck 3 HIGH-2, Daybreak's path-module PoC (path-module-sink.sh): its exact
+#    vendored path-module-wrapper (src/lib.rs delegates through `#[path = "../hidden.rs"]`
+#    to a package-root file whose `File` alias impl calls `LocalFile::set_len(self, 0)`),
+#    reviewed `none`.
+#    a. Refused on hidden.rs's `set_len`, alias and impl; clippy accepts the workspace.
+#    b. The module under tests/, reached only by its `#[path]`: refused the same way.
+#    c. A `#[path]` outside the package root: refused as unscannable.
 #
 # Default toolchains: 1.88.0 and 1.99.0. It resolves fs-err and parking_lot from the
 # registry and vendors the locked crates (the network, or cargo's cache), so it is not
@@ -642,6 +660,147 @@ for toolchain in $toolchains; do
     fi
     echo "-- the ignored fixture test does follow its variable:"
     expect_refused "$toolchain" "$dirty" "unreviewed@1.0.0 is not a registry package"
+done
+
+# --- 8. compiler cfg inputs (recheck 3 HIGH-1) ------------------------------------
+ambient=$scratch/ambient
+copy_head "$ambient"
+cd "$ambient"
+python3 -I - <<'EOF'
+from pathlib import Path
+
+manifest = Path("crates/kilnd/Cargo.toml")
+text = manifest.read_text()
+assert "firecracker-test-deployment = []\n" in text
+manifest.write_text(text.replace(
+    "firecracker-test-deployment = []\n",
+    "firecracker-test-deployment = []\nambient-poc = []\n", 1))
+lib = Path("crates/kilnd/src/lib.rs")
+lib.write_text(lib.read_text() + r"""
+
+#[cfg(feature = "ambient-poc")]
+#[deprecated(note = "ambient-poc cfg reached clippy")]
+pub fn ambient_profile_marker() {}
+
+#[cfg(feature = "ambient-poc")]
+pub fn use_ambient_profile_marker() {
+    ambient_profile_marker();
+}
+
+#[cfg(all(test, feature = "ambient-poc"))]
+mod ambient_profile_poc {
+    #[test]
+    fn unreviewed_feature_entered_default_profile() {}
+}
+""")
+EOF
+ambient_test=ambient_profile_poc::unreviewed_feature_entered_default_profile
+expect_build_refused() { # what message command...
+    what=$1 message=$2
+    shift 2
+    if "$@" >"$scratch/build.log" 2>&1; then
+        cat "$scratch/build.log" >&2
+        fail "build.sh ran cargo with $what"
+    elif grep -qF -- "scripts/build.sh: refused: $message" "$scratch/build.log"; then
+        echo "build.sh refuses: $what"
+    else
+        cat "$scratch/build.log" >&2
+        fail "build.sh failed for another reason with $what"
+    fi
+}
+for toolchain in $toolchains; do
+    echo "== Rust $toolchain: Daybreak's compiler cfg inputs through scripts/build.sh =="
+    for route in RUSTFLAGS CARGO_BUILD_RUSTFLAGS; do
+        expect_build_refused "$route" "$route is set; build.sh runs cargo in a closed compiler environment" \
+            env "$route=--cfg feature=\"ambient-poc\"" sh scripts/build.sh "+$toolchain" default test \
+            -p kilnd --lib "$ambient_test" -- --exact
+    done
+    expect_build_refused "the clippy tail" "clippy takes no arguments after --" \
+        sh scripts/build.sh "+$toolchain" default clippy -p kilnd --lib -- --cfg 'feature="ambient-poc"'
+
+    echo "-- the same cfg from a Cargo config file, and a config rustc-wrapper:"
+    mkdir -p .cargo
+    cat >.cargo/config.toml <<'EOF'
+[build]
+rustflags = ["--cfg", "feature=\"ambient-poc\""]
+rustc-wrapper = "/nonexistent/rustc-wrapper"
+
+[target.'cfg(all())']
+rustflags = ["--cfg", "feature=\"ambient-poc\""]
+EOF
+    if sh scripts/build.sh "+$toolchain" default test -p kilnd --lib "$ambient_test" -- --exact \
+        >"$scratch/build.log" 2>&1 && grep -q '^running 0 tests' "$scratch/build.log" &&
+        ! grep -q 'unreviewed_feature_entered_default_profile' "$scratch/build.log"; then
+        echo "build.sh's closed environment overrides the config: the feature's test is not compiled"
+    else
+        cat "$scratch/build.log" >&2
+        fail "a Cargo config file reached build.sh's build"
+    fi
+    rm -r .cargo
+
+    echo "-- a raw cargo build with that RUSTFLAGS:"
+    if RUSTFLAGS='--cfg feature="ambient-poc"' cargo "+$toolchain" test --locked -q -p kilnd --lib \
+        --no-run >"$scratch/build.log" 2>&1; then
+        fail "the raw build compiled the ambient feature"
+    elif grep -qF 'refused compiler flag "--cfg"' "$scratch/build.log"; then
+        echo "the build scripts' backstop refuses the --cfg"
+    else
+        cat "$scratch/build.log" >&2
+        fail "the raw build failed for another reason"
+    fi
+done
+
+# --- 9. a #[path] module outside the library directory (recheck 3 HIGH-2) -----------
+cd "$fixture"
+# path-module-sink.sh's vendored wrapper, exactly, with its module at $2 reached by
+# `#[path = "$1"]` from src/lib.rs.
+path_wrapper() { # module-path module-file
+    dir=$fixture/vendor/path-module-wrapper-1.0.0
+    rm -rf "$dir"
+    mkdir -p "$dir/src" "$(dirname "$dir/$2")"
+    printf '[package]\nname = "path-module-wrapper"\nversion = "1.0.0"\nedition = "2021"\n' \
+        >"$dir/Cargo.toml"
+    printf '#[path = "%s"]\nmod hidden;\npub use hidden::Reset;\n' "$1" >"$dir/src/lib.rs"
+    cat >"$dir/$2" <<'EOF'
+use std::fs::File;
+
+pub type LocalFile = File;
+
+pub trait Reset {
+    fn reset(&self) -> std::io::Result<()>;
+}
+
+impl Reset for LocalFile {
+    fn reset(&self) -> std::io::Result<()> {
+        LocalFile::set_len(self, 0)
+    }
+}
+EOF
+    python3 -I -c 'import hashlib, json
+print(json.dumps({"files": {}, "package": hashlib.sha256(b"path-module-wrapper 1.0.0").hexdigest()}))' \
+        >"$dir/.cargo-checksum.json"
+    uses 'path-module-wrapper = "=1.0.0"' path_module_wrapper
+    review "$fixture" 'path-module-wrapper={"capability": "none", "why": "a file convenience trait whose library root delegates to a checked-in path module"}'
+}
+for toolchain in $toolchains; do
+    echo "== Rust $toolchain: path-module-wrapper (none), a #[path] module at the package root =="
+    path_wrapper ../hidden.rs hidden.rs
+    expect_refused "$toolchain" "$fixture" \
+        "path-module-wrapper@1.0.0 is declared \`none\`, but its runtime subtree reaches" \
+        "\`set_len\` in path-module-wrapper@1.0.0 (path-module-wrapper-1.0.0/hidden.rs)" \
+        "\`type alias for std::fs::File\` in path-module-wrapper@1.0.0 (path-module-wrapper-1.0.0/hidden.rs)" \
+        "\`impl for std::fs::File\` in path-module-wrapper@1.0.0 (path-module-wrapper-1.0.0/hidden.rs)"
+    clippy_accepts "$toolchain" "$fixture"
+
+    echo "== Rust $toolchain: the module under tests/, reached only by its #[path] =="
+    path_wrapper ../tests/hidden.rs tests/hidden.rs
+    expect_refused "$toolchain" "$fixture" \
+        "\`set_len\` in path-module-wrapper@1.0.0 (path-module-wrapper-1.0.0/tests/hidden.rs)"
+
+    echo "== Rust $toolchain: a #[path] outside the package root =="
+    path_wrapper ../../../outside.rs hidden.rs
+    expect_refused "$toolchain" "$fixture" \
+        "path-module-wrapper@1.0.0's source cannot be scanned completely, so the gate refuses it: path-module-wrapper-1.0.0/src/lib.rs: \`#[path = \"../../../outside.rs\"]\` resolves outside the package root"
 done
 
 if [ "$failed" -ne 0 ]; then

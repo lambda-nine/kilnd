@@ -333,9 +333,9 @@ pub(super) struct Resolved {
     features: BTreeSet<String>,
     /// Direct dependencies by `name@version`, with every kind of edge (any target).
     deps: BTreeMap<String, BTreeSet<DependencyKind>>,
-    /// The directory of the library target's root file, and the files of the package's
-    /// other targets (build script, binaries) that may sit under it.
-    library: Option<(PathBuf, BTreeSet<PathBuf>)>,
+    /// Whether it has a library target (a dependency is only ever used as one). Since
+    /// recheck 3 the gate scans the whole package directory, not the library target's.
+    library: bool,
     /// The package's own directory (where its Cargo.toml is).
     root: Option<PathBuf>,
     /// The names in its manifest's feature table (a profile may enable a workspace
@@ -431,7 +431,6 @@ fn parse_metadata(metadata: &serde_json::Value) -> Result<Resolve, String> {
                 .map(Path::to_path_buf),
             ..Resolved::default()
         };
-        let mut others = BTreeSet::new();
         for target in package["targets"].as_array().into_iter().flatten() {
             let kinds: Vec<&str> = target["kind"]
                 .as_array()
@@ -439,7 +438,6 @@ fn parse_metadata(metadata: &serde_json::Value) -> Result<Resolve, String> {
                 .flatten()
                 .filter_map(|k| k.as_str())
                 .collect();
-            let path = PathBuf::from(target["src_path"].as_str().unwrap_or(""));
             if kinds.contains(&"proc-macro") {
                 resolved.proc_macro = true;
             }
@@ -447,15 +445,8 @@ fn parse_metadata(metadata: &serde_json::Value) -> Result<Resolve, String> {
                 .iter()
                 .any(|k| ["lib", "rlib", "dylib", "proc-macro"].contains(k))
             {
-                resolved.library = path
-                    .parent()
-                    .map(|dir| (dir.to_path_buf(), BTreeSet::new()));
-            } else {
-                others.insert(path);
+                resolved.library = true;
             }
-        }
-        if let Some((_, other)) = resolved.library.as_mut() {
-            *other = others;
         }
         keys.insert(id.to_string(), key.clone());
         resolve.packages.insert(key, resolved);
@@ -664,9 +655,21 @@ enum Token<'a> {
     Ident(&'a str),
     PathSep,
     Punct(char),
+    /// A string literal's text between its quotes, unescaped as written. Only
+    /// [`literal_tokens`] keeps them (for the source edges); [`tokens`] drops them.
+    Literal(&'a str),
 }
 
 fn tokens(text: &str) -> Vec<Token<'_>> {
+    lex(text, false)
+}
+
+/// [`tokens`], keeping each (raw) string literal as a [`Token::Literal`].
+fn literal_tokens(text: &str) -> Vec<Token<'_>> {
+    lex(text, true)
+}
+
+fn lex(text: &str, literals: bool) -> Vec<Token<'_>> {
     let chars: Vec<char> = text.chars().collect();
     // Each char's byte offset, and the text's end.
     let offsets: Vec<usize> = text
@@ -725,7 +728,11 @@ fn tokens(text: &str) -> Vec<Token<'_>> {
                 }
             }
         } else if c == '"' {
-            i = skip_string(i, false);
+            let end = skip_string(i, false);
+            if literals && end > i + 1 && chars.get(end - 1) == Some(&'"') {
+                out.push(Token::Literal(slice(i + 1, end - 1)));
+            }
+            i = end;
         } else if c == '\'' {
             if chars.get(i + 1) == Some(&'\\') {
                 i += 2;
@@ -765,7 +772,15 @@ fn tokens(text: &str) -> Vec<Token<'_>> {
             }
             match (word, chars.get(i)) {
                 ("b" | "c", Some('"')) => i = skip_string(i, false),
-                ("r" | "br" | "cr", Some('"' | '#')) => i = skip_string(i, true),
+                ("r", Some('"' | '#')) => {
+                    let end = skip_string(i, true);
+                    let hashes = chars[i..].iter().take_while(|c| **c == '#').count();
+                    if literals && end >= i + 2 * hashes + 2 {
+                        out.push(Token::Literal(slice(i + hashes + 1, end - hashes - 1)));
+                    }
+                    i = end;
+                }
+                ("br" | "cr", Some('"' | '#')) => i = skip_string(i, true),
                 ("b", Some('\'')) => {
                     i += 1;
                     while i < chars.len() && chars[i] != '\'' {
@@ -1632,7 +1647,8 @@ fn impure_paths(files: &[(String, String)]) -> BTreeSet<String> {
 // The gate.
 
 /// What the gate reads. `sources` is the workspace's production source (path label,
-/// text); `package_sources` each locked package's own library source by `name@version`;
+/// text); `package_sources` each locked package's own checked-in source by `name@version`
+/// (since recheck 3 its whole directory, [`package_source_files`]);
 /// `profiles` what `cargo metadata` resolves (features, edge kinds, proc macros) for each
 /// supported build profile, with exactly the flags `scripts/build.sh` passes.
 pub(super) struct Inputs {
@@ -1641,6 +1657,12 @@ pub(super) struct Inputs {
     pub profiles: Vec<Profile>,
     pub sources: Vec<(String, String)>,
     pub package_sources: BTreeMap<String, Vec<(String, String)>>,
+    /// Recheck 3 HIGH-2: why a package's source cannot be scanned completely (a source
+    /// edge outside its root, a symbolic link, an unreadable file), by `name@version`.
+    pub source_errors: BTreeMap<String, Vec<String>>,
+    /// Recheck 3 HIGH-2: the source edges a package's loader could not follow, each
+    /// `(sink, file label)`; a hit like any sink.
+    pub unresolved_edges: BTreeMap<String, Vec<(String, String)>>,
     pub gate: serde_json::Value,
     pub clippy: String,
 }
@@ -2323,6 +2345,12 @@ pub(super) fn violations(inputs: &Inputs) -> Vec<String> {
     let scanner = SinkScanner::new(&disallowed);
     let mut work: Vec<(&String, usize, usize)> = Vec::new();
     for key in &scanned {
+        if let Some(errors) = inputs.source_errors.get(*key) {
+            wrong.push(format!(
+                "{key}'s source cannot be scanned completely, so the gate refuses it: {}",
+                errors.join("; ")
+            ));
+        }
         match inputs.package_sources.get(*key) {
             Some(files) => work.extend(
                 files
@@ -2346,7 +2374,11 @@ pub(super) fn violations(inputs: &Inputs) -> Vec<String> {
         file_scans.sort_by_key(|(at, _)| *at);
         let files = &inputs.package_sources[key];
         let scans: Vec<&FileScan> = file_scans.iter().map(|(_, scan)| *scan).collect();
-        for (sink, files) in package_sinks(files, &scans) {
+        let mut hits = package_sinks(files, &scans);
+        for (sink, file) in inputs.unresolved_edges.get(key).into_iter().flatten() {
+            hits.entry(sink.clone()).or_default().insert(file.clone());
+        }
+        for (sink, files) in hits {
             let covered = exceptions.iter().position(|e| {
                 &e.key == key && &e.features == features_of(key) && e.sinks.contains(&sink)
             });
@@ -2560,39 +2592,360 @@ fn locked_source(name: &str) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// A package's own library source files: every `.rs` file under its library target's
-/// directory, except the package's `tests`, `examples`, `benches` and `src/bin`
-/// directories and the root file of any other target (a build script beside a
-/// root-level `lib.rs`). Test files inside the library directory are read: only inline
-/// `#[cfg(test)]` modules are skipped, by the scan itself.
-fn library_files(dir: &Path, package: Option<&Path>, others: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
-    let skip: Vec<PathBuf> = package
-        .map(|root| {
-            ["tests", "examples", "benches", "target", "src/bin"]
-                .iter()
-                .map(|d| root.join(d))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut files = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(directory) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
+/// Recheck 3 HIGH-2: the checked-in source files of a package the gate scans, as paths
+/// relative to its root (the directory cargo extracted it to), from every file under it
+/// (`paths`). Every `.rs` file is scanned except those under the package's top-level
+/// `tests`, `benches` and `examples` directories, and every file a literal `#[path]` or
+/// `include!` edge from a scanned file reaches is scanned too, wherever it is, so a module
+/// outside the library target's directory (`#[path = "../hidden.rs"]`) is read. An edge
+/// that resolves outside the package root is an error, which refuses the package outright.
+/// An edge that resolves to no file, or an `include!` of anything but a literal path or
+/// generated `OUT_DIR` code, cannot be followed: it is reported as an `unresolved source
+/// edge` hit, refused like a sink unless a reviewed exception scoped to the package,
+/// version and features names it (a `cfg_attr` path only one configuration uses, to a
+/// file the package does not ship, cannot be compiled, so it reaches nothing). Generated
+/// `OUT_DIR` code stays the documented exception; it is not checked in.
+fn package_source_files(
+    paths: &BTreeSet<PathBuf>,
+    read: &dyn Fn(&Path) -> Option<String>,
+) -> PackageSource<PathBuf> {
+    let held = |path: &Path| {
+        matches!(path.components().next(),
+            Some(std::path::Component::Normal(first))
+                if ["tests", "benches", "examples"].iter().any(|d| first == *d))
+    };
+    let mut queue: Vec<PathBuf> = paths
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "rs") && !held(p))
+        .cloned()
+        .collect();
+    let mut chosen: BTreeSet<PathBuf> = queue.iter().cloned().collect();
+    let mut errors = Vec::new();
+    let mut unresolved = Vec::new();
+    // An edge inside a macro body resolves from wherever the macro is invoked (serde's
+    // `crate_root!`): one the file's own directory cannot resolve is looked up from every
+    // directory holding Rust source in the package too, and scanned if found there.
+    let source_dirs: BTreeSet<PathBuf> = paths
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .chain(std::iter::once(PathBuf::new()))
+        .collect();
+    while let Some(file) = queue.pop() {
+        let Some(text) = read(&file) else {
+            errors.push(format!("{} cannot be read", file.display()));
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if !skip.contains(&path) {
-                    stack.push(path);
+        let dir = file.parent().unwrap_or(Path::new("")).to_path_buf();
+        let mod_rs = file
+            .file_name()
+            .is_some_and(|n| n == "mod.rs" || n == "lib.rs" || n == "main.rs");
+        for edge in source_edges(&text) {
+            let (written, candidates, fallback): (String, Vec<Option<PathBuf>>, Vec<PathBuf>) =
+                match &edge {
+                SourceEdge::Generated => continue,
+                SourceEdge::Unresolved(what) => {
+                    unresolved.push((format!("{UNRESOLVED} `{INCLUDE}({what})`"), file.clone()));
+                    continue;
                 }
-            } else if path.extension().is_some_and(|e| e == "rs") && !others.contains(&path) {
-                files.push(path);
+                SourceEdge::Include(path) => (
+                    format!("{INCLUDE}(\"{path}\")"),
+                    vec![within(&dir, path)],
+                    source_dirs.iter().filter_map(|d| within(d, path)).collect(),
+                ),
+                SourceEdge::Module { path, inline } => {
+                    // Outside an inline module the path is relative to the file's
+                    // directory. Inside one it is relative to that directory plus the
+                    // inline modules' components, after the file's own stem for a
+                    // non-mod-rs file; both readings are tried.
+                    let mut bases = vec![Some(dir.clone())];
+                    if !inline.is_empty() && !mod_rs {
+                        bases.push(file.file_stem().map(|s| dir.join(s)));
+                    }
+                    let resolve = |base: Option<PathBuf>| {
+                        inline
+                            .iter()
+                            .try_fold(base?, |at, component| within(&at, component))
+                            .and_then(|at| within(&at, path))
+                    };
+                    (
+                        format!("#[path = \"{path}\"]"),
+                        bases.into_iter().map(resolve).collect(),
+                        source_dirs.iter().filter_map(|d| resolve(Some(d.clone()))).collect(),
+                    )
+                }
+            };
+            let found = candidates.iter().flatten().find(|c| paths.contains(*c));
+            let escapes = found.is_none() && candidates.iter().any(Option::is_none);
+            match found.or_else(|| fallback.iter().find(|c| !escapes && paths.contains(*c))) {
+                Some(found) => {
+                    if chosen.insert(found.clone()) {
+                        queue.push(found.clone());
+                    }
+                }
+                None if escapes => errors.push(format!(
+                    "{}: `{written}` resolves outside the package root",
+                    file.display()
+                )),
+                None => unresolved.push((format!("{UNRESOLVED} `{written}`"), file.clone())),
             }
         }
     }
-    files.sort();
-    files
+    errors.sort();
+    unresolved.sort();
+    PackageSource {
+        files: chosen.into_iter().collect(),
+        errors,
+        unresolved,
+    }
+}
+
+/// The sink name of a source edge the loader cannot follow.
+const UNRESOLVED: &str = "unresolved source edge";
+/// The include macro and the generated-code directory's variable, spelled apart so that
+/// `no_unapproved_build_scripts_or_generated_includes` sees no include in this file.
+const INCLUDE: &str = concat!("include", "!");
+const GENERATED: &str = concat!("OUT", "_DIR");
+
+/// One package's scanned source: its files (paths, or loaded as `(label, text)`), the
+/// errors that refuse it outright, and the edges it cannot follow, each `(sink, file)`.
+#[derive(Debug, Default)]
+struct PackageSource<F> {
+    files: Vec<F>,
+    errors: Vec<String>,
+    unresolved: Vec<(String, F)>,
+}
+
+/// `relative` joined to the package-relative `dir`, lexically; `None` if it is absolute or
+/// climbs out of the package root.
+fn within(dir: &Path, relative: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in dir.components().chain(Path::new(relative).components()) {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A literal source edge in one file.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceEdge {
+    /// `#[path = "…"] mod name;` (or through `cfg_attr`), inside these inline modules,
+    /// each by its name or by its own `#[path]`.
+    Module { path: String, inline: Vec<String> },
+    /// `include!("…")`, relative to the file's directory.
+    Include(String),
+    /// `include!` of an expression naming `OUT_DIR`: generated code, the documented
+    /// exception.
+    Generated,
+    /// `include!` of anything else, as written.
+    Unresolved(String),
+}
+
+/// The `path = "…"` an attribute's tokens (between `#[` and `]`) set, directly or through
+/// `cfg_attr(condition, …, path = "…")`.
+fn path_attribute<'a>(content: &[Token<'a>]) -> Option<&'a str> {
+    match content {
+        [Token::Ident("path"), Token::Punct('='), Token::Literal(path)] => Some(path),
+        [Token::Ident("cfg_attr"), Token::Punct('('), inner @ .., Token::Punct(')')] => {
+            let mut depth = 0;
+            for (at, token) in inner.iter().enumerate() {
+                match token {
+                    Token::Punct('(' | '[' | '{') => depth += 1,
+                    Token::Punct(')' | ']' | '}') => depth -= 1,
+                    Token::Punct(',') if depth == 0 => {
+                        if let [Token::Ident("path"), Token::Punct('='), Token::Literal(path), ..] =
+                            &inner[at + 1..]
+                        {
+                            return Some(path);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The index of the bracket closing the one at `open`.
+fn closing(toks: &[Token], open: usize) -> usize {
+    let mut depth = 0;
+    for (at, token) in toks.iter().enumerate().skip(open) {
+        match token {
+            Token::Punct('(' | '[' | '{') => depth += 1,
+            Token::Punct(')' | ']' | '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return at;
+                }
+            }
+            _ => {}
+        }
+    }
+    toks.len()
+}
+
+/// Every literal `#[path]` module and `include!` in a file's source (test modules
+/// included: an edge is followed wherever it is).
+fn source_edges(text: &str) -> Vec<SourceEdge> {
+    let toks = literal_tokens(text);
+    let mut edges = Vec::new();
+    // The inline modules the scan is inside: (directory component, brace depth).
+    let mut inline: Vec<(String, usize)> = Vec::new();
+    let mut depth = 0;
+    // A `#[path]` waiting for the `mod` it applies to.
+    let mut pending: Option<String> = None;
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i] {
+            Token::Punct('#') => {
+                let open = i + 1 + usize::from(toks.get(i + 1) == Some(&Token::Punct('!')));
+                if toks.get(open) == Some(&Token::Punct('[')) {
+                    let close = closing(&toks, open);
+                    if let Some(path) = path_attribute(&toks[open + 1..close.min(toks.len())]) {
+                        pending = Some(path.to_string());
+                    }
+                    i = close + 1;
+                    continue;
+                }
+                pending = None;
+            }
+            Token::Ident("include")
+                if toks.get(i + 1) == Some(&Token::Punct('!'))
+                    && matches!(toks.get(i + 2), Some(Token::Punct('(' | '[' | '{'))) =>
+            {
+                let close = closing(&toks, i + 2);
+                let inner = &toks[i + 3..close.min(toks.len())];
+                edges.push(match inner {
+                    [Token::Literal(path)] | [Token::Literal(path), Token::Punct(',')] => {
+                        SourceEdge::Include(path.to_string())
+                    }
+                    _ if inner
+                        .iter()
+                        .any(|t| matches!(t, Token::Literal(s) | Token::Ident(s) if *s == GENERATED)) =>
+                    {
+                        SourceEdge::Generated
+                    }
+                    _ => SourceEdge::Unresolved(
+                        inner
+                            .iter()
+                            .map(|t| match t {
+                                Token::Ident(s) => s.to_string(),
+                                Token::Literal(s) => format!("\"{s}\""),
+                                Token::PathSep => "::".into(),
+                                Token::Punct(c) => c.to_string(),
+                            })
+                            .collect(),
+                    ),
+                });
+                pending = None;
+                i = close + 1;
+                continue;
+            }
+            Token::Ident("mod") => {
+                if let Some(Token::Ident(name)) = toks.get(i + 1) {
+                    match toks.get(i + 2) {
+                        Some(Token::Punct(';')) => {
+                            if let Some(path) = pending.take() {
+                                edges.push(SourceEdge::Module {
+                                    path,
+                                    inline: inline.iter().map(|(c, _)| c.clone()).collect(),
+                                });
+                            }
+                            i += 3;
+                            continue;
+                        }
+                        Some(Token::Punct('{')) => {
+                            depth += 1;
+                            let component = pending.take().unwrap_or_else(|| name.to_string());
+                            inline.push((component, depth));
+                            i += 3;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                pending = None;
+            }
+            Token::Punct('{') => {
+                depth += 1;
+                pending = None;
+            }
+            Token::Punct('}') => {
+                if inline.last().is_some_and(|(_, d)| *d == depth) {
+                    inline.pop();
+                }
+                depth = depth.saturating_sub(1);
+                pending = None;
+            }
+            // A visibility between the attributes and `mod` (`pub(in crate::x)`).
+            Token::Ident("pub" | "crate" | "super" | "self" | "in")
+            | Token::Punct('(' | ')')
+            | Token::PathSep => {}
+            _ => pending = None,
+        }
+        i += 1;
+    }
+    edges
+}
+
+/// Every file under a package's root, relative to it, and the scanned source
+/// ([`package_source_files`]) with its errors. A symbolic link anywhere under the root is
+/// an error: cargo packages regular files, and a link could reach outside the package.
+fn package_sources_at(root: &Path) -> PackageSource<(PathBuf, String)> {
+    let mut paths = BTreeSet::new();
+    let mut errors = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(relative) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(root.join(&relative)) else {
+            errors.push(format!("{} cannot be listed", relative.display()));
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = relative.join(entry.file_name());
+            match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => {
+                    errors.push(format!("{} is a symbolic link", path.display()))
+                }
+                Ok(kind) if kind.is_dir() => stack.push(path),
+                Ok(_) => {
+                    paths.insert(path);
+                }
+                Err(e) => errors.push(format!("{}: {e}", path.display())),
+            }
+        }
+    }
+    let read = |path: &Path| {
+        std::fs::read(root.join(path))
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let found = package_source_files(&paths, &read);
+    errors.extend(found.errors);
+    PackageSource {
+        files: found
+            .files
+            .into_iter()
+            .filter_map(|file| Some((file.clone(), read(&file)?)))
+            .collect(),
+        errors,
+        unresolved: found
+            .unresolved
+            .into_iter()
+            .map(|(sink, file)| (sink, (file, String::new())))
+            .collect(),
+    }
 }
 
 fn read(path: &Path) -> String {
@@ -2652,31 +3005,35 @@ fn inputs_at(root: &Path) -> Inputs {
         (profiles, resolve)
     };
     let mut package_sources = BTreeMap::new();
-    for (key, package) in resolve.packages.iter().filter(|(_, p)| !p.member) {
-        let Some((dir, others)) = &package.library else {
-            continue;
-        };
-        let files: Vec<(String, String)> = library_files(dir, package.root.as_deref(), others)
+    let mut source_errors = BTreeMap::new();
+    let packages: Vec<(&String, &Path)> = resolve
+        .packages
+        .iter()
+        .filter(|(_, p)| !p.member && p.library)
+        .filter_map(|(key, p)| Some((key, p.root.as_deref()?)))
+        .collect();
+    let mut unresolved_edges = BTreeMap::new();
+    let loaded = parallel_map(&packages, |(_, root)| package_sources_at(root));
+    for ((key, _), source) in packages.into_iter().zip(loaded) {
+        let label = key.replace('@', "-");
+        let files: Vec<(String, String)> = source
+            .files
             .into_iter()
-            .map(|path| {
-                let base = package
-                    .root
-                    .as_deref()
-                    .filter(|r| path.starts_with(r))
-                    .unwrap_or(dir);
-                let label = format!(
-                    "{}/{}",
-                    key.replace('@', "-"),
-                    path.strip_prefix(base).unwrap().display()
-                );
-                let text = std::fs::read(&path)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                (label, text)
-            })
+            .map(|(path, text)| (format!("{label}/{}", path.display()), text))
             .collect();
         if !files.is_empty() {
             package_sources.insert(key.clone(), files);
+        }
+        if !source.errors.is_empty() {
+            let errors = source.errors.iter().map(|e| format!("{label}/{e}"));
+            source_errors.insert(key.clone(), errors.collect::<Vec<_>>());
+        }
+        if !source.unresolved.is_empty() {
+            let edges = source
+                .unresolved
+                .into_iter()
+                .map(|(sink, (path, _))| (sink, format!("{label}/{}", path.display())));
+            unresolved_edges.insert(key.clone(), edges.collect::<Vec<_>>());
         }
     }
     Inputs {
@@ -2685,6 +3042,8 @@ fn inputs_at(root: &Path) -> Inputs {
         profiles,
         sources: workspace_sources(root),
         package_sources,
+        source_errors,
+        unresolved_edges,
         gate,
         clippy: read(&root.join("clippy.toml")),
     }
@@ -2721,26 +3080,66 @@ fn regression_fixture_gate() {
 }
 
 /// Recheck 2 HIGH-1: every supported build runs cargo through `scripts/build.sh` and a
-/// profile, so the graph it builds is one the gate reviewed. CI, the installer, the
-/// upgrade path, the VM scripts and the setup instructions name no cargo build of their
-/// own (comments, CI step names and version queries aside).
+/// profile, so the graph it builds is one the gate reviewed. Since recheck 3 (MEDIUM-1)
+/// every Markdown, shell, Python and workflow file in the workspace is inspected, and none
+/// names a cargo build of its own (comments, CI step names and version queries aside)
+/// except the entry point, the gate's regression fixtures, the Firecracker jailer build
+/// and the counted records of past runs.
 #[test]
 fn supported_builds_use_the_build_entry_point() {
     const BUILDS: [&str; 8] = [
         "build", "test", "clippy", "check", "run", "rustc", "doc", "install",
     ];
+    // Recheck 3 MEDIUM-1: every Markdown, shell, Python and workflow file is inspected,
+    // not a fixed list. Raw cargo builds are allowed only in these files: (file, why).
+    const RAW: [(&str, &str); 2] = [
+        ("scripts/build.sh", "the entry point itself"),
+        (
+            "scripts/dependency-gate-regressions.sh",
+            "builds disposable fixture workspaces with raw cargo to show the gate refuses them",
+        ),
+    ];
+    // The Firecracker jailer build (a patched upstream workspace, not kilnd's): a raw
+    // cargo build naming `-p jailer` on the same line, in these files only.
+    const JAILER: [&str; 2] = ["scripts/build-phase1b-tools.sh", "deploy/firecracker/README.md"];
+    // Records, not instructions: past runs' evidence and the guarantee's stated limits
+    // ("a raw `cargo build` ... is outside the guarantee"). Each file's exact number of
+    // raw mentions, so a new one anywhere fails until it is looked at.
+    const RECORDS: [(&str, usize); 2] = [
+        ("CHANGELOG.md", 2),
+        ("docs/design/phase1b-firecracker.md", 25),
+    ];
     let root = workspace_root();
+    let mut files = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if !["target", ".git", "vendor", "__pycache__"].contains(&name.as_str()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let relative = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+            let workflow = relative.starts_with(".github/workflows/")
+                && (name.ends_with(".yml") || name.ends_with(".yaml"));
+            if workflow || [".md", ".sh", ".py"].iter().any(|e| name.ends_with(e)) {
+                files.push(relative);
+            }
+        }
+    }
+    files.sort();
+    for needed in [".github/workflows/ci.yml", "CLAUDE.md", "scripts/install.sh"] {
+        assert!(files.iter().any(|f| f == needed), "{needed} was not inspected");
+    }
     let mut raw = Vec::new();
-    for file in [
-        ".github/workflows/ci.yml",
-        "scripts/install.sh",
-        "scripts/upgrade.sh",
-        "scripts/add-instance.sh",
-        "scripts/b4-vm-tests.sh",
-        "scripts/integration-test.sh",
-        "docs/setup.md",
-        "README.md",
-    ] {
+    let mut records: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for file in &files {
+        if RAW.iter().any(|(allowed, _)| allowed == file) {
+            continue;
+        }
         for (number, line) in read(&root.join(file)).lines().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with('#') || trimmed.starts_with("- name:") {
@@ -2748,7 +3147,7 @@ fn supported_builds_use_the_build_entry_point() {
             }
             let code = line.split(" #").next().unwrap();
             let words: Vec<&str> = code
-                .split(|c: char| c.is_whitespace() || "();|&`\"'$=".contains(c))
+                .split(|c: char| c.is_whitespace() || "();|&`\"'$=,[]".contains(c))
                 .filter(|w| !w.is_empty())
                 .collect();
             for (at, word) in words.iter().enumerate() {
@@ -2760,10 +3159,18 @@ fn supported_builds_use_the_build_entry_point() {
                     next += 1;
                 }
                 // `cargo clippy --version` only reports the toolchain.
-                if words.get(next).is_some_and(|w| BUILDS.contains(w))
-                    && words.get(next + 1) != Some(&"--version")
+                if !words.get(next).is_some_and(|w| BUILDS.contains(w))
+                    || words.get(next + 1) == Some(&"--version")
                 {
-                    raw.push(format!("{file}:{}: {}", number + 1, line.trim()));
+                    continue;
+                }
+                let found = format!("{file}:{}: {}", number + 1, line.trim());
+                if JAILER.contains(&file.as_str()) && words.windows(2).any(|w| w == ["-p", "jailer"]) {
+                    continue;
+                }
+                match RECORDS.iter().find(|(record, _)| record == file) {
+                    Some((record, _)) => records.entry(record).or_default().push(found),
+                    None => raw.push(found),
                 }
             }
         }
@@ -2773,6 +3180,16 @@ fn supported_builds_use_the_build_entry_point() {
         "supported builds go through scripts/build.sh PROFILE:\n{}",
         raw.join("\n")
     );
+    for (record, count) in RECORDS {
+        let found = records.remove(record).unwrap_or_default();
+        assert_eq!(
+            found.len(),
+            count,
+            "{record} records {} raw cargo builds, not {count}: a new one must be a record (a past run, or the guarantee's limit), never an instruction; then update the count\n{}",
+            found.len(),
+            found.join("\n")
+        );
+    }
 }
 
 /// Recheck 2 MEDIUM-2: the authoritative test's root comes from the build alone. Its
@@ -3426,6 +3843,8 @@ fn demo(extra_lock: &str, extra_dependencies: &str, extra_workspace: &[&str]) ->
         }],
         sources: vec![("demo/src/lib.rs".into(), "pub fn f() {}\n".into())],
         package_sources: BTreeMap::new(),
+        source_errors: BTreeMap::new(),
+        unresolved_edges: BTreeMap::new(),
         gate: serde_json::json!({
             "profiles": {"default": {"features": [], "why": "x"}},
             "packages": {},
@@ -3511,6 +3930,8 @@ fn check(inputs: &Inputs) -> String {
         profiles,
         sources: inputs.sources.clone(),
         package_sources: inputs.package_sources.clone(),
+        source_errors: inputs.source_errors.clone(),
+        unresolved_edges: inputs.unresolved_edges.clone(),
         gate: inputs.gate.clone(),
         clippy: inputs.clippy.clone(),
     };
@@ -4431,4 +4852,292 @@ fn the_path_scanner_sees_code_not_strings() {
     assert_eq!(destructive_name("read", true), None);
     assert_eq!(destructive_name("write", true), Some("write"));
     assert_eq!(destructive_name("write", false), None);
+}
+
+// ---------------------------------------------------------------------------------
+// Recheck 3 HIGH-2: the whole package directory is scanned, and its source edges
+// followed.
+
+/// [`package_source_files`] over an in-memory package: (path, text) pairs.
+/// Texts write `include|!` and `OUT|_DIR` (see [`INCLUDE`]); the bars are removed.
+fn package_tree(files: &[(&str, &str)]) -> PackageSource<PathBuf> {
+    let map: BTreeMap<PathBuf, String> = files
+        .iter()
+        .map(|(path, text)| (PathBuf::from(path), unbar(text)))
+        .collect();
+    let paths: BTreeSet<PathBuf> = map.keys().cloned().collect();
+    package_source_files(&paths, &|path: &Path| map.get(path).cloned())
+}
+
+fn unbar(text: &str) -> String {
+    text.replace("include|!", INCLUDE).replace("OUT|_DIR", GENERATED)
+}
+
+fn names(files: &[PathBuf]) -> Vec<String> {
+    files.iter().map(|f| f.display().to_string()).collect()
+}
+
+#[test]
+fn b7m2_recheck3_the_whole_package_is_scanned_and_its_edges_followed() {
+    // Daybreak's layout: the library root delegates to a package-root module.
+    let found = package_tree(&[
+        ("src/lib.rs", "#[path = \"../hidden.rs\"]\nmod hidden;\npub use hidden::Reset;\n"),
+        ("hidden.rs", "pub trait Reset {}\n"),
+        ("build.rs", "fn main() {}\n"),
+        ("src/bin/tool.rs", "fn main() {}\n"),
+        ("README.md", "#[path = \"../../nowhere.rs\"] mod x;\n"),
+        ("tests/unreached.rs", "#[test] fn t() {}\n"),
+        ("benches/unreached.rs", "fn b() {}\n"),
+        ("examples/unreached.rs", "fn main() {}\n"),
+    ]);
+    assert_eq!(
+        names(&found.files),
+        ["build.rs", "hidden.rs", "src/bin/tool.rs", "src/lib.rs"]
+    );
+    assert!(found.errors.is_empty() && found.unresolved.is_empty(), "{found:?}");
+
+    // Edges reach into tests/, benches/ and examples/, through cfg_attr, an inline
+    // module, a visibility and an include!, and on from the files they reach.
+    let found = package_tree(&[
+        (
+            "src/lib.rs",
+            "#[cfg(unix)]\n#[path = \"../tests/a.rs\"]\npub(crate) mod a;\n\
+             #[cfg_attr(feature = \"x\", path = \"../benches/b.rs\")]\nmod b;\n\
+             mod inner {\n    #[path = \"c.rs\"]\n    mod c;\n}\n\
+             include|!(\"../examples/d.rs\");\n\
+             include|!(concat!(env!(\"OUT|_DIR\"), \"/generated.rs\"));\n\
+             // #[path = \"../tests/comment.rs\"] mod e;\n\
+             const S: &str = \"#[path = \\\"../tests/string.rs\\\"] mod f;\";\n",
+        ),
+        ("tests/a.rs", "include|!(\"nested.in\");\n"),
+        ("tests/nested.in", "pub fn n() {}\n"),
+        ("benches/b.rs", ""),
+        ("src/inner/c.rs", ""),
+        ("examples/d.rs", ""),
+        ("tests/comment.rs", ""),
+        ("tests/string.rs", ""),
+    ]);
+    assert_eq!(
+        names(&found.files),
+        [
+            "benches/b.rs",
+            "examples/d.rs",
+            "src/inner/c.rs",
+            "src/lib.rs",
+            "tests/a.rs",
+            "tests/nested.in"
+        ]
+    );
+    assert!(found.errors.is_empty() && found.unresolved.is_empty(), "{found:?}");
+
+    // A macro body's path resolves from where the macro is invoked (serde's crate_root!).
+    let found = package_tree(&[
+        ("src/lib.rs", "#[path = \"core/root.rs\"]\nmod root;\nroot!();\n"),
+        (
+            "src/core/root.rs",
+            "macro_rules! root { () => { #[path = \"core/de.rs\"] mod de; } }\n",
+        ),
+        ("src/core/de.rs", ""),
+    ]);
+    assert!(found.errors.is_empty() && found.unresolved.is_empty(), "{found:?}");
+}
+
+#[test]
+fn b7m2_recheck3_an_edge_outside_the_package_or_to_nothing_is_reported() {
+    let found = package_tree(&[(
+        "src/lib.rs",
+        "#[path = \"../../other-1.0.0/src/lib.rs\"]\nmod escape;\n\
+         #[path = \"/etc/absolute.rs\"]\nmod absolute;\n\
+         include|!(\"../../../outside.rs\");\n\
+         #[path = \"missing.rs\"]\nmod missing;\n\
+         include|!(path_from_a_macro!());\n",
+    )]);
+    assert_eq!(
+        found.errors,
+        [
+            "src/lib.rs: `#[path = \"../../other-1.0.0/src/lib.rs\"]` resolves outside the package root",
+            "src/lib.rs: `#[path = \"/etc/absolute.rs\"]` resolves outside the package root",
+            &unbar("src/lib.rs: `include|!(\"../../../outside.rs\")` resolves outside the package root"),
+        ]
+    );
+    let unresolved: Vec<&str> = found.unresolved.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(
+        unresolved,
+        [
+            "unresolved source edge `#[path = \"missing.rs\"]`",
+            &unbar("unresolved source edge `include|!(path_from_a_macro!())`"),
+        ]
+    );
+}
+
+/// `edges`: a `none` package whose source the loader could not follow or scan fully.
+fn wrapper_with_edges(errors: &[&str], unresolved: &[&str]) -> Inputs {
+    let mut inputs = demo(
+        &package("path-wrapper", &[]),
+        "path-wrapper = \"1\"\n",
+        &["path-wrapper"],
+    );
+    review(
+        &mut inputs,
+        "path-wrapper",
+        serde_json::json!({"kind": "runtime", "capability": "none", "why": "x"}),
+    );
+    source(&mut inputs, "path-wrapper", "pub fn f() {}\n");
+    let key = "path-wrapper@1.0.0".to_string();
+    if !errors.is_empty() {
+        inputs.source_errors.insert(
+            key.clone(),
+            errors.iter().map(|e| e.to_string()).collect(),
+        );
+    }
+    if !unresolved.is_empty() {
+        inputs.unresolved_edges.insert(
+            key,
+            unresolved
+                .iter()
+                .map(|s| (s.to_string(), "path-wrapper-1.0.0/src/lib.rs".to_string()))
+                .collect(),
+        );
+    }
+    inputs
+}
+
+#[test]
+fn b7m2_recheck3_unscannable_source_refuses_and_unresolved_edges_need_review() {
+    let outside = "path-wrapper-1.0.0/src/lib.rs: `#[path = \"../../x.rs\"]` resolves outside the package root";
+    let wrong = check(&wrapper_with_edges(&[outside], &[]));
+    assert!(
+        wrong.contains(&format!(
+            "path-wrapper@1.0.0's source cannot be scanned completely, so the gate refuses it: {outside}"
+        )),
+        "{wrong}"
+    );
+    // An escape cannot be excepted.
+    let mut excepted = wrapper_with_edges(&[outside], &[]);
+    excepted.gate["sink_exceptions"] = serde_json::json!([{
+        "package": "path-wrapper", "version": "1.0.0", "features": [],
+        "sinks": [format!("{UNRESOLVED} `#[path = \"../../x.rs\"]`")], "why": "x",
+    }]);
+    assert!(check(&excepted).contains("cannot be scanned completely"));
+
+    let edge = format!("{UNRESOLVED} `#[path = \"missing.rs\"]`");
+    let mut inputs = wrapper_with_edges(&[], &[&edge]);
+    let wrong = check(&inputs);
+    assert!(
+        wrong.contains(&format!(
+            "path-wrapper@1.0.0 is declared `none`, but its runtime subtree reaches `{edge}` in path-wrapper@1.0.0 (path-wrapper-1.0.0/src/lib.rs)"
+        )),
+        "{wrong}"
+    );
+    inputs.gate["sink_exceptions"] = serde_json::json!([{
+        "package": "path-wrapper", "version": "1.0.0", "features": [],
+        "sinks": [edge], "why": "a cfg_attr path to a file the package does not ship",
+    }]);
+    assert_eq!(check(&inputs), "");
+}
+
+// ---------------------------------------------------------------------------------
+// Recheck 3 HIGH-1: compiler cfg inputs.
+
+/// The body of a build script's `refuse_compiler_cfg_inputs`.
+fn backstop_of(text: &str) -> Option<&str> {
+    let start = text.find("fn refuse_compiler_cfg_inputs() {")?;
+    let end = start + text[start..].find("\n}\n")?;
+    Some(&text[start..end])
+}
+
+/// Every workspace crate ships in a kilnd binary (kilnd, kilnd-helper, kilndctl, the
+/// guest broker), so each has a build script with the same compiler-flag backstop, and
+/// its `main` calls it first: a raw cargo build given `--cfg feature="x"` through
+/// RUSTFLAGS, a config file or anything else that reaches CARGO_ENCODED_RUSTFLAGS fails.
+#[test]
+fn b7m2_recheck3_every_workspace_crate_refuses_compiler_cfg_flags() {
+    let root = workspace_root();
+    let reference = read(&root.join("crates/kilnd/build.rs"));
+    let reference = backstop_of(&reference).expect("kilnd/build.rs has no backstop");
+    for needle in [
+        "CARGO_ENCODED_RUSTFLAGS",
+        "split('\\x1f')",
+        "starts_with(\"--cfg\")",
+        "starts_with(\"-Z\")",
+        "starts_with('@')",
+        "panic!(",
+    ] {
+        assert!(reference.contains(needle), "the backstop lacks {needle}");
+    }
+    let mut members = 0;
+    for krate in std::fs::read_dir(root.join("crates")).unwrap().flatten() {
+        if !krate.path().join("Cargo.toml").is_file() {
+            continue;
+        }
+        members += 1;
+        let name = krate.file_name().to_string_lossy().into_owned();
+        let script = read(&krate.path().join("build.rs"));
+        assert_eq!(
+            backstop_of(&script),
+            Some(reference),
+            "{name}/build.rs must hold the same refuse_compiler_cfg_inputs as kilnd's"
+        );
+        let main = &script[script.find("\nfn main(").expect("no main") + 1..];
+        let body = main[main.find('{').unwrap() + 1..].trim_start();
+        assert!(
+            body.starts_with("refuse_compiler_cfg_inputs();"),
+            "{name}/build.rs must call refuse_compiler_cfg_inputs first"
+        );
+    }
+    assert!(members >= 6, "the workspace's crates were not found");
+}
+
+/// No workspace build script turns on a feature cfg (`cargo:rustc-cfg=feature=...`), which
+/// would compile feature-gated code no profile selects: a cfg a build script emits must be
+/// a literal name other than `feature`.
+#[test]
+fn b7m2_recheck3_workspace_build_scripts_emit_no_feature_cfg() {
+    let root = workspace_root();
+    let mut wrong = Vec::new();
+    for krate in std::fs::read_dir(root.join("crates")).unwrap().flatten() {
+        let path = krate.path().join("build.rs");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = krate.file_name().to_string_lossy().into_owned();
+        wrong.extend(feature_cfgs(&text).into_iter().map(|e| format!("{name}/build.rs: {e}")));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    for bad in [
+        "println!(\"cargo:rustc-cfg=feature=\\\"x\\\"\");",
+        "println!(\"cargo::rustc-cfg=feature=\\\"x\\\"\");",
+        "println!(\"cargo:rustc-cfg={}\", name);",
+        "println!(\"cargo:rustc-cfg= feature\");",
+    ] {
+        assert!(!feature_cfgs(bad).is_empty(), "{bad} was not refused");
+    }
+    for fine in [
+        "println!(\"cargo:rustc-cfg=has_foo\");",
+        "println!(\"cargo:rustc-check-cfg=cfg(has_foo)\");",
+    ] {
+        assert!(feature_cfgs(fine).is_empty(), "{fine} was refused");
+    }
+}
+
+/// Each `rustc-cfg` a build script's text emits that is not a literal cfg name other
+/// than `feature`.
+fn feature_cfgs(text: &str) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (at, _) in text.match_indices("rustc-cfg") {
+        let rest = &text[at + "rustc-cfg".len()..];
+        let name: String = rest
+            .strip_prefix('=')
+            .unwrap_or("")
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() || name == "feature" {
+            wrong.push(format!(
+                "emits `rustc-cfg{}`",
+                rest.chars().take(24).collect::<String>()
+            ));
+        }
+    }
+    wrong
 }
