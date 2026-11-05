@@ -1221,8 +1221,10 @@ mod tests {
                 host_pids: 64,
             },
             over_committed: false,
+            node_fault: None,
+            degraded: None,
         };
-        fake.state().node_totals = Some(totals);
+        fake.state().node_totals = Some(totals.clone());
         let manager = Arc::new(Manager::new(
             fake.clone(),
             Store::open_in_memory().unwrap(),

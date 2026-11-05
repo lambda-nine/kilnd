@@ -18,7 +18,9 @@ pub const MAX_OUTPUT: usize = 1 << 20;
 pub const MAX_ARGV: usize = 256 << 10;
 pub const MAX_GC_IDS: usize = 1024;
 /// The Firecracker group's own schema inside the v3 envelope.
-pub const FIRECRACKER_GROUP_VERSION: u32 = 1;
+/// Group schema 2 (B7): helper-issued tokens, digests on Inspect, Remove and Gc, and
+/// the verified highest token on AttachInstance. Schema 1 daemons are refused.
+pub const FIRECRACKER_GROUP_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -193,13 +195,17 @@ pub struct FirecrackerRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum FirecrackerOperation {
+    /// B7 RTC-14: `highest_token` is the complete token with the highest seq among the
+    /// daemon's Firecracker rows and release evidence, or none. There is no bare
+    /// sequence field: H and L verify the tag before its seq means anything.
     AttachInstance {
         database_uuid: Id128,
+        highest_token: Option<Id128>,
     },
     Capabilities,
     Accounting,
+    /// B7 RTC-2: no allocation ID. The helper issues the token and the reply names it.
     Preflight {
-        allocation_id: Id128,
         sandbox_id: String,
         profile: String,
         spec: SandboxSpec,
@@ -210,8 +216,10 @@ pub enum FirecrackerOperation {
         plan: PlanBytes,
         plan_digest: Digest,
     },
+    /// B7 RTC-8: the plan digest from the daemon Store's immutable binding.
     Inspect {
         allocation_id: Id128,
+        plan_digest: Digest,
     },
     List,
     FenceAbsent {
@@ -227,13 +235,16 @@ pub enum FirecrackerOperation {
         expected_generation: u64,
         reason: StopReason,
     },
-    /// Stop, remove exactly the owned resources and persist ABSENT. Idempotent.
+    /// Stop, remove exactly the owned resources and persist ABSENT. Idempotent. B7: it
+    /// acts only on the journaled resources of a row whose digest is `plan_digest`.
     Remove {
         allocation_id: Id128,
+        plan_digest: Digest,
     },
     /// Section 8.2's scoped collection: only named, proven dead or stopped allocations.
+    /// B7: each target carries its Store digest; validation is all-or-nothing.
     Gc {
-        allocation_ids: Vec<Id128>,
+        targets: Vec<GcTarget>,
     },
     /// B5: the broker's process and idle validation. During an execution the recorded
     /// busy state answers, with no guest polling. Never absence on a socket failure.
@@ -260,6 +271,14 @@ pub enum FirecrackerOperation {
     TestDispatchProbe {
         allocation_id: Id128,
     },
+}
+
+/// One Gc target: an allocation token and the plan digest its Store row binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcTarget {
+    pub allocation_id: Id128,
+    pub plan_digest: Digest,
 }
 
 /// Why a stop was requested. Typed, never free text from a caller.
@@ -365,11 +384,10 @@ impl FirecrackerRequest {
             }
             FirecrackerOperation::FenceAbsent { sandbox_id, .. } => sandbox(sandbox_id),
             FirecrackerOperation::Stop { .. } | FirecrackerOperation::Remove { .. } => Ok(()),
-            FirecrackerOperation::Gc { allocation_ids } => {
-                let unique: std::collections::BTreeSet<_> = allocation_ids.iter().collect();
-                if allocation_ids.len() > MAX_FIRECRACKER_GC_IDS
-                    || unique.len() != allocation_ids.len()
-                {
+            FirecrackerOperation::Gc { targets } => {
+                let unique: std::collections::BTreeSet<_> =
+                    targets.iter().map(|t| t.allocation_id).collect();
+                if targets.len() > MAX_FIRECRACKER_GC_IDS || unique.len() != targets.len() {
                     return Err("Gc takes at most 1024 unique allocation IDs".into());
                 }
                 Ok(())
@@ -434,6 +452,11 @@ pub enum AmbiguousClass {
     ObservationUnavailable,
     /// This instance has used its quota of fences for never-admitted tokens.
     ResourceExhausted,
+    /// B7 RTC-3: a valid tag at or above the durable issue pointer. The daemon's charge
+    /// stays; the adapter reports it as Incompatible.
+    NotIssued,
+    /// B7 RTC-14: forward effects are latched node-wide.
+    Latched,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +507,11 @@ pub struct WorkersHealth {
     pub recovery: [WorkerHealth; 2],
     pub supervisors: u64,
     pub ledger_fault: Option<String>,
+    /// B7 RTC-16: a durable or in-memory RTC-14 latch. Other instances see only its
+    /// kind; the detecting instance also sees that its own token detected it.
+    pub node_fault: Option<String>,
+    /// B7: a compaction health fault naming a token that cannot be compacted.
+    pub compaction_fault: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,6 +539,8 @@ pub enum AccountingReply {
 #[serde(deny_unknown_fields)]
 pub struct PreparedReply {
     pub node_id: Id128,
+    /// B7 RTC-2: the token the helper issued, also bound into the plan's substitutions.
+    pub allocation_id: Id128,
     pub profile: String,
     pub manifest_sha256: Digest,
     pub plan_version: u32,

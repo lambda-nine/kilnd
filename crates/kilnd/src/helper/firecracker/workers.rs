@@ -11,11 +11,13 @@ use super::executable::{
 };
 use super::identity::{self, AllocationKey, ClaimedIdentities, IdentityLeases, IdentityRanges};
 use super::inventory::{NamespaceObservation, NodeObservation, ObservationBackend};
+use super::compaction::{self, CompactReply, Compactor};
 use super::journal::{
     AccountingSnapshot, AdmitOutcome, AdmitRequest, AttachOutcome, FenceOutcome, FenceRequest,
-    InventorySnapshot, Ledger, LedgerConfig, LedgerError, ReplaySnapshot, TokenLookup,
-    WorkerIntentSpec,
+    InventorySnapshot, IssueOutcome, Ledger, LedgerConfig, LedgerError, ReplaySnapshot,
+    TokenLookup, WorkerIntentSpec,
 };
+use super::token::KeyTransfer;
 use super::manifest::{self, ManifestGate};
 use super::peer::PeerAttestor;
 use crate::helper::protocol::{AmbiguousClass, PreparedReply, WireBytes};
@@ -43,6 +45,8 @@ pub const LEDGER_QUEUE_RESERVED: usize = 4;
 /// One attachment proof per enrolled instance, separate from the lanes above: no volume
 /// of other traffic takes this lane, and attach traffic never takes theirs.
 pub const LEDGER_QUEUE_ATTACH: usize = super::config::MAX_ENROLLED_HARD as usize;
+/// B7 RTC-18: one permit for compaction on its own lane, never a reserved one.
+pub const LEDGER_QUEUE_COMPACTION: usize = 1;
 pub const PREP_SLOTS: usize = 2;
 pub const RECOVERY_SLOTS: usize = 2;
 
@@ -64,6 +68,25 @@ pub mod faults {
     pub fn write(name: &str, bytes: &[u8]) {
         if let Some(directory) = DIRECTORY.get() {
             let _ = std::fs::write(directory.join(name), bytes);
+        }
+    }
+
+    /// A fixture-written value, such as the injected boot clock offset.
+    pub fn read(name: &str) -> Option<String> {
+        let directory = DIRECTORY.get()?;
+        std::fs::read_to_string(directory.join(name)).ok()
+    }
+
+    /// Appends one line to a test artifact (L's frame order for RTC-18).
+    pub fn append(name: &str, line: &str) {
+        use std::io::Write;
+        if let Some(directory) = DIRECTORY.get()
+            && let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join(name))
+        {
+            let _ = writeln!(file, "{line}");
         }
     }
 
@@ -520,6 +543,8 @@ pub enum Lane {
     Normal,
     Reserved,
     Attach,
+    /// B7 RTC-18: the compactor's one permit.
+    Compaction,
 }
 
 struct PendingCall {
@@ -537,6 +562,7 @@ pub struct Channel {
     normal: Arc<Semaphore>,
     reserved: Arc<Semaphore>,
     attach: Arc<Semaphore>,
+    compaction: Arc<Semaphore>,
     closed: CancellationToken,
 }
 
@@ -547,21 +573,22 @@ impl Channel {
         normal: usize,
         reserved: usize,
     ) -> io::Result<(Arc<Self>, mpsc::Receiver<Value>)> {
-        Self::spawn_with_attach(stream, normal, reserved, 0)
+        Self::spawn_with_attach(stream, normal, reserved, 0, 0)
     }
 
-    /// L's channel, which alone has an attachment lane.
+    /// L's channel, which alone has attachment and compaction lanes.
     pub fn spawn_with_attach(
         stream: std::os::unix::net::UnixStream,
         normal: usize,
         reserved: usize,
         attach: usize,
+        compaction: usize,
     ) -> io::Result<(Arc<Self>, mpsc::Receiver<Value>)> {
         stream.set_nonblocking(true)?;
         let stream = crate::helper::socket::Socket(UnixStream::from_std(stream)?);
         let (mut read_half, mut write_half) = tokio::io::split(stream);
         let (writer, mut outgoing) =
-            mpsc::channel::<Vec<u8>>((normal + reserved + attach).max(4) + 8);
+            mpsc::channel::<Vec<u8>>((normal + reserved + attach + compaction).max(4) + 8);
         let (event_tx, events) = mpsc::channel(64);
         let pending: Arc<Mutex<HashMap<u64, PendingCall>>> = Arc::default();
         let closed = CancellationToken::new();
@@ -572,6 +599,7 @@ impl Channel {
             normal: Arc::new(Semaphore::new(normal)),
             reserved: Arc::new(Semaphore::new(reserved)),
             attach: Arc::new(Semaphore::new(attach)),
+            compaction: Arc::new(Semaphore::new(compaction)),
             closed: closed.clone(),
         });
         {
@@ -647,6 +675,7 @@ impl Channel {
                 .try_acquire_owned()
                 .or_else(|_| self.normal.clone().try_acquire_owned()),
             Lane::Attach => self.attach.clone().try_acquire_owned(),
+            Lane::Compaction => self.compaction.clone().try_acquire_owned(),
         }
         .map_err(|_| CallError::Full)?;
         if self.is_closed() {
@@ -895,6 +924,10 @@ pub struct Timings {
     pub heartbeat_timeout: Duration,
     /// How long startup retries its infrastructure rows before giving up on serving.
     pub startup_journal: Duration,
+    /// B7 RTC-18: how often H offers each instance a compaction pass. L's boot clock,
+    /// not this, decides when a checkpoint or advance is due; production uses a quarter
+    /// of the pass so no pass is missed by timer jitter.
+    pub compaction_tick: Duration,
 }
 
 impl Default for Timings {
@@ -904,6 +937,7 @@ impl Default for Timings {
             heartbeat: Duration::from_millis(250),
             heartbeat_timeout: Duration::from_secs(1),
             startup_journal: Duration::from_secs(30),
+            compaction_tick: Duration::from_millis(super::journal::DEFAULT_COMPACTION_PASS_MS / 4),
         }
     }
 }
@@ -986,6 +1020,8 @@ pub enum LedgerRequest {
         instance: Id128,
         database_uuid: Id128,
         peer_pid: i32,
+        /// B7 RTC-14: the daemon's highest recorded complete token, already H-checked.
+        highest_token: Option<Id128>,
     },
     /// Root's enrollment, for fixtures testing something other than enrollment. It
     /// enrolls the peer's real image. Production enrolls only from the root command.
@@ -1005,10 +1041,24 @@ pub enum LedgerRequest {
     Inspect {
         instance: Id128,
         allocation: Id128,
+        plan_digest: Digest,
     },
-    PreflightSnapshot {
+    /// B7 RTC-4: Preflight's issuance and identity snapshot, in one transaction.
+    IssueAndSnapshot {
         instance: Id128,
-        allocation: Id128,
+    },
+    /// B7 RTC-3: K, over this private channel only, before H checks any tag.
+    TokenKey,
+    /// B7 RTC-14: H has latched; commit the pending fault (idempotent).
+    CommitFault {
+        instance: Id128,
+        token: Id128,
+        issue_next: u64,
+    },
+    /// B7 RTC-18: one compaction pass, on the compaction lane.
+    Compact {
+        instance: Id128,
+        max_tokens: u64,
     },
     Admit {
         request: Box<AdmitRequest>,
@@ -1084,7 +1134,9 @@ pub enum LedgerRequest {
         allocation: Id128,
     },
     Fence(Box<FenceRequest>),
-    Accounting,
+    Accounting {
+        instance: Option<Id128>,
+    },
     Inventory {
         instance: Id128,
     },
@@ -1110,10 +1162,21 @@ pub enum LedgerReply {
     },
     Lookup(TokenLookup),
     NeverAdmittedFenceAllowed(bool),
-    PreflightSnapshot {
-        claimed: ClaimedIdentities,
-        retired_or_active: bool,
-        headroom: bool,
+    /// B7 RTC-14: rollback evidence. L has latched and written nothing; H latches, then
+    /// asks for the commit.
+    FaultPending {
+        token: Id128,
+        issue_next: u64,
+    },
+    FaultCommitted {
+        generation: u64,
+    },
+    Issued(IssueOutcome),
+    TokenKey(KeyTransfer),
+    Compacted(Box<CompactReply>),
+    /// A ledger commit failed: L wrote the fail-stop marker and latched (RTC-R2-01).
+    SyncFailed {
+        reason: String,
     },
     Admit(AdmitOutcome),
     Identity {
@@ -1144,8 +1207,21 @@ pub enum LedgerReply {
     },
 }
 
+/// L's in-memory state beside the ledger: the RTC-14 latch and the compactor's
+/// checkpoints. Neither survives L; the durable fault rows and the fail-stop marker do.
+pub(super) struct LedgerState {
+    /// Set before any fault commit is attempted, and by any failed commit. Never cleared
+    /// while this L lives.
+    pub(super) latched: bool,
+    pub(super) failstop: bool,
+    pub(super) compactor: Compactor,
+    /// The ledger directory, for the fail-stop marker.
+    pub(super) config: LedgerConfig,
+}
+
 fn handle_ledger(
     ledger: &mut Ledger,
+    state: &mut LedgerState,
     attestor: &mut PeerAttestor,
     revocations: &RevocationTable,
     request: LedgerRequest,
@@ -1155,6 +1231,7 @@ fn handle_ledger(
             instance,
             database_uuid,
             peer_pid,
+            highest_token,
         } => {
             let Some(enrollment) = ledger.enrollment(instance)? else {
                 return Ok(LedgerReply::AttachRefused {
@@ -1170,10 +1247,66 @@ fn handle_ledger(
                     });
                 }
             };
-            LedgerReply::Attached {
-                outcome: ledger.attach_instance(instance, database_uuid)?,
-                peer_start,
+            let latched = state.latched || state.failstop;
+            match ledger.attach_instance(instance, database_uuid, highest_token, latched)? {
+                // L latches here, before anything is committed; H latches on this
+                // answer and only then asks for the commit (RTC-R2-03).
+                AttachOutcome::RollbackDetected { token, issue_next } => {
+                    state.latched = true;
+                    // RTC-R2-01 fail-stop: durable from detection, before any commit is
+                    // attempted, so no restart of H or L can serve forward effects
+                    // until root's offline clear, whatever happens to the fault row.
+                    if let Err(error) = compaction::write_failstop(&state.config, true) {
+                        return Err(LedgerError::SyncFailed(format!(
+                            "the fail-stop marker could not be written: {error}"
+                        )));
+                    }
+                    state.failstop = true;
+                    fault_point("L.fault.detected");
+                    LedgerReply::FaultPending { token, issue_next }
+                }
+                outcome => LedgerReply::Attached {
+                    outcome,
+                    peer_start,
+                },
             }
+        }
+        LedgerRequest::TokenKey => LedgerReply::TokenKey(KeyTransfer::of(ledger.token_key())),
+        LedgerRequest::CommitFault {
+            instance,
+            token,
+            issue_next,
+        } => {
+            state.latched = true;
+            // A replacement L handed a pending fault makes it fail-stop first, too.
+            if !state.failstop {
+                compaction::write_failstop(&state.config, true).map_err(|error| {
+                    LedgerError::SyncFailed(format!("the fail-stop marker: {error}"))
+                })?;
+                state.failstop = true;
+            }
+            let generation = ledger.commit_fault(instance, token, issue_next)?;
+            fault_point("L.fault.after_commit_before_reply");
+            LedgerReply::FaultCommitted { generation }
+        }
+        LedgerRequest::IssueAndSnapshot { instance } => {
+            let latched = state.latched || state.failstop;
+            let outcome = ledger.issue_and_snapshot(instance, latched)?;
+            fault_point("L.issue.after_commit_before_reply");
+            LedgerReply::Issued(outcome)
+        }
+        LedgerRequest::Compact {
+            instance,
+            max_tokens,
+        } => {
+            let reply = state.compactor.pass(
+                ledger,
+                instance,
+                max_tokens.min(super::journal::COMPACTION_BATCH),
+                compaction::boot_ms(),
+            )?;
+            fault_point("L.compact.after_commit_before_reply");
+            LedgerReply::Compacted(Box::new(reply))
         }
         #[cfg(test)]
         LedgerRequest::TestEnroll { instance, peer_pid } => {
@@ -1209,18 +1342,8 @@ fn handle_ledger(
         LedgerRequest::Inspect {
             instance,
             allocation,
-        } => LedgerReply::Lookup(ledger.inspect(instance, allocation)?),
-        LedgerRequest::PreflightSnapshot {
-            instance,
-            allocation,
-        } => LedgerReply::PreflightSnapshot {
-            claimed: ledger.claimed_identities()?,
-            retired_or_active: !matches!(
-                ledger.inspect(instance, allocation)?,
-                TokenLookup::Unknown
-            ),
-            headroom: ledger.fence_headroom()? && ledger.pre_intent_headroom(instance)?,
-        },
+            plan_digest,
+        } => LedgerReply::Lookup(ledger.inspect(instance, allocation, &plan_digest)?),
         LedgerRequest::Admit { request, authority } => {
             fault_point("L.admit");
             let authorized = || revocations.is_current(&authority);
@@ -1379,12 +1502,54 @@ fn handle_ledger(
             fault_point("L.fence");
             LedgerReply::Fence(ledger.commit_fence(&request)?)
         }
-        LedgerRequest::Accounting => LedgerReply::Accounting(Box::new(ledger.accounting()?)),
+        LedgerRequest::Accounting { instance } => {
+            let mut snapshot = ledger.accounting(instance)?;
+            let now = compaction::boot_ms();
+            let lease = state.compactor.lease_ms();
+            if let (Some(instance), Some(tokens)) = (instance, snapshot.tokens.as_mut()) {
+                tokens.checkpoints = state.compactor.checkpoints(instance);
+                tokens.compaction_lag_ms = state.compactor.lag_ms(instance, now);
+                if tokens.compaction_lag_ms > lease.saturating_mul(2) {
+                    snapshot.degraded = Some(format!(
+                        "compaction lags {} ms, past two leases",
+                        tokens.compaction_lag_ms
+                    ));
+                }
+            }
+            if let Some((instance, tokens)) = state.compactor.stuck().next() {
+                snapshot.degraded = Some(format!(
+                    "{} fenced tokens of instance {instance} cannot be compacted, first {}",
+                    tokens.len(),
+                    tokens[0]
+                ));
+            }
+            if snapshot.node_fault.is_none() && state.latched {
+                snapshot.node_fault = Some("rollback".into());
+            }
+            if snapshot.node_fault.is_none() && state.failstop {
+                snapshot.node_fault = Some("fail_stop".into());
+            }
+            LedgerReply::Accounting(Box::new(snapshot))
+        }
         LedgerRequest::Inventory { instance } => {
             LedgerReply::Inventory(ledger.inventory(instance)?)
         }
-        LedgerRequest::Replay => LedgerReply::Replay(Box::new(ledger.replay()?)),
+        LedgerRequest::Replay => {
+            let mut snapshot = ledger.replay()?;
+            if state.failstop {
+                snapshot.node_faults.push("fail_stop".into());
+            }
+            if state.latched && snapshot.node_faults.is_empty() {
+                snapshot.node_faults.push("rollback".into());
+            }
+            LedgerReply::Replay(Box::new(snapshot))
+        }
     })
+}
+
+/// A failed or uncertain durable commit: never evidence, and RTC-R2-01's fail-stop.
+fn sync_failure(error: &LedgerError) -> bool {
+    matches!(error, LedgerError::CommitFailed | LedgerError::SyncFailed(_))
 }
 
 /// A failure in the ledger itself: refusing the request keeps claims held.
@@ -1413,7 +1578,17 @@ pub fn ledger_main(
     }
     #[cfg(all(target_os = "linux", not(test)))]
     crate::process::require_firecracker_launch_capabilities_dropped();
+    let directory_config = config.clone();
+    let policy = config.compaction;
     let mut ledger = Ledger::open(config);
+    // RTC-R2-01: a marker left by any earlier failed commit latches this L at open.
+    let failstop = compaction::failstop_latched(&directory_config).unwrap_or(true);
+    let mut state = LedgerState {
+        latched: false,
+        failstop,
+        compactor: Compactor::start(policy, ledger.as_ref().ok(), compaction::boot_ms()),
+        config: directory_config.clone(),
+    };
     loop {
         heartbeat.beat();
         fault_point("L.loop");
@@ -1427,16 +1602,46 @@ pub fn ledger_main(
             Ok(Received::Idle) => continue,
             Ok(Received::Closed) | Err(_) => return,
         };
+        #[cfg(test)]
+        if faults::present("L.frame_log") {
+            let kind = serde_json::to_value(&request)
+                .ok()
+                .and_then(|v| match v {
+                    Value::String(name) => Some(name),
+                    Value::Object(map) => map.keys().next().cloned(),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            faults::append("L.frames", &kind);
+        }
+        let fault_commit = matches!(request, LedgerRequest::CommitFault { .. });
+        let mut exit_after = false;
         let reply = match &mut ledger {
             Err(error) => LedgerReply::Unavailable {
                 reason: error.to_string(),
             },
             Ok(_) if expiring(&request) && monotonic_ns() >= deadline_ns => LedgerReply::Expired,
-            Ok(ledger) => handle_ledger(ledger, &mut attestor, &revocations, request)
-                .unwrap_or_else(ledger_failure),
+            Ok(ledger) => {
+                match handle_ledger(ledger, &mut state, &mut attestor, &revocations, request) {
+                    Ok(reply) => reply,
+                    Err(error) if sync_failure(&error) => {
+                        // Latch first in memory, then durably beside the ledger, so no
+                        // later L serves forward effects either (RTC-R2-01). A fault
+                        // commit that failed or is uncertain also ends this L (RTC-14).
+                        state.latched = true;
+                        state.failstop = true;
+                        let _ = compaction::write_failstop(&directory_config, true);
+                        exit_after = fault_commit;
+                        LedgerReply::SyncFailed {
+                            reason: error.to_string(),
+                        }
+                    }
+                    Err(error) => ledger_failure(error),
+                }
+            }
         };
         fault_point("L.reply");
-        if send_ledger_reply(&mut endpoint, id, &reply).is_err() {
+        if send_ledger_reply(&mut endpoint, id, &reply).is_err() || exit_after {
             return;
         }
     }
@@ -1471,6 +1676,7 @@ pub fn ledger_request_expires(request: &LedgerRequest) -> bool {
         LedgerRequest::Admit { .. }
             | LedgerRequest::Fence(_)
             | LedgerRequest::Attach { .. }
+            | LedgerRequest::IssueAndSnapshot { .. }
             | LedgerRequest::RecordWorker { .. }
             | LedgerRequest::AdvancePhase { .. }
     )
@@ -1631,6 +1837,7 @@ fn preflight_job(
     })?;
     Ok(PreparedReply {
         node_id: config.node_id,
+        allocation_id: allocation,
         profile: profile_name,
         manifest_sha256: profile.manifest_sha256,
         plan_version: config::PLAN_VERSION,

@@ -70,6 +70,34 @@ enum Command {
         #[arg(long, default_value = DEFAULT_POLICY)]
         policy: PathBuf,
     },
+    /// Root-only, helper and every daemon stopped (B7, design 16.7): walks every enrolled
+    /// instance's owned resources against the ledger and reads each daemon database
+    /// read-only for its highest verified token. Writes a new report; destroys nothing.
+    OfflineInventory {
+        /// `<instance>=<path>` for every enrolled instance's kilnd.db.
+        #[arg(long = "daemon-db", required = true)]
+        daemon_db: Vec<String>,
+        /// Where to write the report (new, mode 0600, in a root-owned directory).
+        #[arg(long)]
+        report: PathBuf,
+        #[arg(long, default_value = DEFAULT_POLICY)]
+        policy: PathBuf,
+    },
+    /// Root-only, helper stopped (B7 RTC-14): deletes the node's rollback faults after an
+    /// explained, current offline inventory, raising each issue pointer past the daemons'
+    /// verified tokens. Nothing else ever deletes a fault.
+    ClearNodeFaults {
+        #[arg(long)]
+        report: PathBuf,
+        #[arg(long, default_value = DEFAULT_POLICY)]
+        policy: PathBuf,
+    },
+    /// Root-only, helper stopped: per-instance issue pointers, watermarks, retained rows
+    /// and the last compaction, as JSON.
+    LedgerStats {
+        #[arg(long, default_value = DEFAULT_POLICY)]
+        policy: PathBuf,
+    },
     /// Root-only, helper stopped: puts back the images that `enrollments` printed earlier.
     /// Refused unless the file names exactly the instances enrolled, unchanged.
     RestoreEnrollments {
@@ -236,6 +264,34 @@ fn root_command(command: &Command) -> Result<String> {
                 .map_err(anyhow::Error::msg)
                 .context("refresh enrollments")
         }
+        Command::OfflineInventory {
+            daemon_db,
+            report,
+            policy,
+        } => {
+            let mut databases = std::collections::BTreeMap::new();
+            for entry in daemon_db {
+                let (instance, path) = entry
+                    .split_once('=')
+                    .context("--daemon-db takes <instance>=<path>")?;
+                let instance = kilnd::model::Id128::parse(instance)
+                    .map_err(|_| anyhow::anyhow!("--daemon-db: a 32-digit instance ID"))?;
+                if databases.insert(instance, PathBuf::from(path)).is_some() {
+                    bail!("--daemon-db names {instance} twice");
+                }
+            }
+            fc::offline_inventory(&policy_at(policy)?, &databases, report)
+                .map_err(anyhow::Error::msg)
+                .context("offline inventory")
+        }
+        Command::ClearNodeFaults { report, policy } => {
+            fc::clear_node_faults(&policy_at(policy)?, report)
+                .map_err(anyhow::Error::msg)
+                .context("clear node faults")
+        }
+        Command::LedgerStats { policy } => fc::ledger_stats(&policy_at(policy)?)
+            .map_err(anyhow::Error::msg)
+            .context("ledger statistics"),
         Command::RestoreEnrollments { snapshot, policy } => {
             let file = std::fs::File::open(snapshot).context("open the snapshot")?;
             let mut text = Vec::new();

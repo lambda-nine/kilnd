@@ -140,6 +140,10 @@ impl Id128 {
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
 }
 
 impl fmt::Display for Id128 {
@@ -182,6 +186,10 @@ impl Digest {
 
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 

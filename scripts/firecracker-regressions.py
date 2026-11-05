@@ -41,5 +41,23 @@ SCENARIOS = [
     'b6_linux_root_attack_quarantine_stays_deletable_and_unknown_is_honest',
 ]
 
+# B7 attack regressions (design 16.6), in crates/kilnd/src/helper/firecracker/tests/
+# compaction.rs, through the real H, L, listener and adapter.
+B7_SCENARIOS = [
+    'b7_rtc3_forged_foreign_and_seq_zero_tokens_never_reach_a_gate_or_l',
+    'b7_rtc3_a_valid_tag_at_the_pointer_reaches_l_and_is_not_issued_across_restarts',
+    'b7_rtc8_real_wire_digests_after_compaction_and_a_helper_restart',
+    'b7_rtc14_spoofed_highest_tokens_fail_only_their_own_attachment',
+    'b7_rtc14_a_real_rollback_latches_every_forward_effect_until_the_offline_clear',
+    'b7_rtc_r2_03_h_latches_before_the_commit_and_queued_work_starts_nothing',
+    'b7_rtc_r2_01_an_uncertain_fault_commit_fails_stop_across_every_restart',
+    'b7_rtc13_a_five_lease_flood_keeps_checkpoints_bounded_and_the_tail_matures',
+    'b7_rtc12_a_never_admitted_flood_stops_at_the_floor_and_refills_after_a_lease',
+    'b7_rtc17_an_instance_enrolled_beside_a_borrower_finds_its_share_at_once',
+    'b7_rtc18_compaction_has_its_own_lane_and_a_full_batch_stays_under_100_ms',
+    'b7_rtc18_a_busy_normal_lane_from_two_instances_never_starves_a_third_instances_refill',
+]
+
 if __name__ == '__main__':
-    sys.exit(run('Phase 1b B6 attack regressions', 'b6_linux_root_attack_', SCENARIOS))
+    sys.exit(run('Phase 1b B6 and B7 attack regressions', 'b6_linux_root_attack_ and b7_rtc',
+                 SCENARIOS + B7_SCENARIOS))

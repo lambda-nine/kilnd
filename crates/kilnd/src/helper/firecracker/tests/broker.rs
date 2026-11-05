@@ -32,6 +32,7 @@ async fn inspect_reply(
         Some(epoch_of(runtime).await),
         FirecrackerOperation::Inspect {
             allocation_id: context.allocation_id,
+            plan_digest: super::lifecycle::ledger_digest(&real.fixture, context.allocation_id),
         },
         wire_deadline(5),
         5_000,
@@ -1370,4 +1371,153 @@ impl Drop for DirGuard {
 }
 fn scopeguard_dir(path: PathBuf) -> DirGuard {
     DirGuard(path)
+}
+
+/// B7 on the real chain (design 16.6, `b7_linux_root_compaction_cycles`): real sessions
+/// (boot to READY, one execution, Remove to ABSENT) against a 64-entry fence allowance,
+/// `max_enrolled_instances` 1 (so the one instance's share is all 47 admitted entries)
+/// and a 3-minute lease on the real boot clock. 300 sessions cross the old count limit
+/// about five times and many compaction cycles; retained rows never exceed the share,
+/// and every session's rows are eventually compacted. `KILND_B7_CYCLES` overrides the
+/// count for a shorter run.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs root, KVM and the B4 artifacts: run scripts/b4-vm-tests.sh"]
+async fn b7_linux_root_compaction_cycles() {
+    use super::super::journal::{CompactionPolicy, FENCE_ENTRY_BOUND};
+    let sessions: usize = std::env::var("KILND_B7_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let real = Arc::new(
+        Real::new(NodeOptions {
+            fence_allowance_bytes: Some(64 * FENCE_ENTRY_BOUND),
+            max_enrolled: 1,
+            compaction: CompactionPolicy {
+                lease_ms: 180_000,
+                pass_ms: 30_000,
+            },
+            compaction_tick_ms: 1_000,
+            ..NodeOptions::default()
+        })
+        .await,
+    );
+    let instance = Id128::random();
+    let runtime = real.fixture.runtime(instance, instance);
+    let started = std::time::Instant::now();
+    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut lanes = Vec::new();
+    for lane in 0..3usize {
+        let (real, runtime, done, refused, peak) = (
+            real.clone(),
+            runtime.clone(),
+            done.clone(),
+            refused.clone(),
+            peak.clone(),
+        );
+        lanes.push(tokio::spawn(async move {
+            loop {
+                if done.load(std::sync::atomic::Ordering::SeqCst) >= sessions {
+                    return;
+                }
+                // Headroom fills to the share while a lease matures: an honest daemon
+                // waits and tries again. A full preparation slot is the same.
+                let plan = match runtime
+                    .prepare(&prep(instance), &spec(), deadline(20), &no_cancel())
+                    .await
+                {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        let text = error.to_string();
+                        assert!(
+                            text.contains("headroom") || text.contains("preparation slot"),
+                            "lane {lane}: {text}"
+                        );
+                        refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+                let context = CreateContext {
+                    instance_id: instance,
+                    allocation_id: plan.allocation_id().unwrap(),
+                    sandbox_id: {
+                        let document: Value = serde_json::from_slice(plan.backend_plan()).unwrap();
+                        document["substitutions"]["sandbox_id"].as_str().unwrap().into()
+                    },
+                };
+                match raw_create(&real.fixture, &context, epoch_of(&runtime).await, &plan).await {
+                    CreateReply::Accepted { .. } => {}
+                    other => {
+                        // A capacity race between lanes is a post-C1 refusal: fenced.
+                        assert_eq!(class_of(&other), AmbiguousClass::Capacity, "{other:?}");
+                        runtime
+                            .fence_absent(&context, &plan.plan_digest(), deadline(30), &no_cancel())
+                            .await
+                            .unwrap();
+                        refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        continue;
+                    }
+                }
+                let (boot, _) = wait_ready(&real, &runtime, &context).await;
+                let ran = exec(&real, &runtime, &context, &boot, &["/bin/echo", "cycle"], vec![]).await;
+                assert_eq!(ran.stdout, b"cycle\n", "{:?}", ran.reply);
+                let mut reply = super::lifecycle::remove(&real, &runtime, &context).await;
+                for _ in 0..5 {
+                    if matches!(reply, FenceReply::Absent { .. }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    reply = super::lifecycle::remove(&real, &runtime, &context).await;
+                }
+                assert!(matches!(reply, FenceReply::Absent { .. }), "{reply:?}");
+                let snapshot = runtime.node_accounting(deadline(5), &no_cancel()).await.unwrap();
+                let tokens = snapshot.tokens.unwrap();
+                assert!(tokens.retained_admitted <= snapshot.share, "{tokens:?}");
+                peak.fetch_max(tokens.retained_admitted, std::sync::atomic::Ordering::SeqCst);
+                let finished = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if finished % 25 == 0 {
+                    eprintln!(
+                        "B7 real chain: {finished} sessions, W {} of {}, retained {} in {:?}",
+                        tokens.watermark,
+                        tokens.issue_next,
+                        tokens.retained_admitted,
+                        started.elapsed()
+                    );
+                }
+            }
+        }));
+    }
+    for lane in lanes {
+        lane.await.unwrap();
+    }
+    let tokens = runtime
+        .node_accounting(deadline(5), &no_cancel())
+        .await
+        .unwrap()
+        .tokens
+        .unwrap();
+    let entries = 64;
+    assert!(done.load(std::sync::atomic::Ordering::SeqCst) >= sessions);
+    assert!(tokens.issue_next as usize > sessions);
+    assert!(tokens.watermark > 1, "compaction cycled: {tokens:?}");
+    let compactions: i64 = real.fixture.count("SELECT COUNT(*) FROM compaction_log");
+    eprintln!(
+        "B7 evidence: {} real sessions ({}x the {entries}-entry allowance) in {:?}; {} refusals retried; retained peak {} of 47; W {} of {}; {compactions} compaction records kept",
+        sessions,
+        sessions / entries,
+        started.elapsed(),
+        refused.load(std::sync::atomic::Ordering::SeqCst),
+        peak.load(std::sync::atomic::Ordering::SeqCst),
+        tokens.watermark,
+        tokens.issue_next
+    );
+    eprintln!(
+        "B6 matrix: {}",
+        json!({"scenario": "b7_linux_root_compaction_cycles", "passed": true, "outcome": {
+            "sessions": sessions, "retained_peak": peak.load(std::sync::atomic::Ordering::SeqCst),
+            "watermark": tokens.watermark, "issue_next": tokens.issue_next
+        }})
+    );
 }

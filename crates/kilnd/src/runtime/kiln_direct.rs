@@ -14,8 +14,8 @@ use super::kiln_protocol as protocol;
 use super::{
     AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendInventory, BackendSandbox,
     CreateContext, CreateFailure, CreatedSandbox, ExecOutcome, ExecSpec, ExecutionContext,
-    LegacyAbsence, LegacyProof, PreparedCreate, Runtime, RuntimeCapabilities, RuntimeError,
-    RuntimeReceipt,
+    LegacyAbsence, LegacyProof, PrepareContext, PreparedCreate, RemoveTarget, Runtime,
+    RuntimeCapabilities, RuntimeError, RuntimeReceipt,
 };
 use crate::model::{Digest, Network, SandboxSpec};
 use crate::process::{self, Finish};
@@ -263,7 +263,7 @@ impl Runtime for DirectKilnRuntime {
 
     async fn prepare(
         &self,
-        _context: &CreateContext,
+        _context: &PrepareContext,
         spec: &SandboxSpec,
         _deadline: Instant,
         _cancel: &CancellationToken,
@@ -318,10 +318,12 @@ impl Runtime for DirectKilnRuntime {
 
     async fn remove(
         &self,
-        id: &str,
+        target: RemoveTarget<'_>,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<AbsenceReceipt, RuntimeError> {
+        // B7: a fenced binding is refused before any kiln call.
+        let id = target.legacy()?;
         self.remove_until(id, deadline, cancel).await?;
         Ok(AbsenceReceipt::Legacy(LegacyAbsence {
             backend_id: id.into(),
@@ -339,10 +341,13 @@ impl Runtime for DirectKilnRuntime {
 
     async fn gc(
         &self,
-        ids: &[String],
+        targets: &[RemoveTarget<'_>],
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
+        // B7: one fenced binding refuses the whole call before any kiln call.
+        let ids = super::legacy_targets(targets)?;
+        let ids = ids.as_slice();
         Ok(self
             .gc_until(ids, deadline, cancel)
             .await?
@@ -596,10 +601,14 @@ mod tests {
             allocation_id: crate::model::Id128::random(),
             sandbox_id: crate::model::new_id("sb"),
         };
+        let prepare_context = PrepareContext {
+            instance_id: context.instance_id,
+            sandbox_id: context.sandbox_id.clone(),
+        };
         let mut requested = spec(Network::Full);
         requested.labels.insert("k".into(), "v".into());
         let prepared = runtime
-            .prepare(&context, &requested, soon, &cancel)
+            .prepare(&prepare_context, &requested, soon, &cancel)
             .await
             .unwrap();
         assert!(!trace.exists(), "prepare must not reach the backend");
@@ -647,7 +656,9 @@ mod tests {
 
         // A strict removal is a legacy receipt; its bare NotFound stays NotFound,
         // so nothing downstream can mistake it for allocation-level proof.
-        let removed = runtime.remove("abcd", soon, &cancel).await;
+        let removed = runtime
+            .remove(RemoveTarget::Legacy { backend_id: "abcd" }, soon, &cancel)
+            .await;
         let expected = AbsenceReceipt::Legacy(LegacyAbsence {
             backend_id: "abcd".into(),
             proof: LegacyProof::StrictRemoval,

@@ -13,6 +13,40 @@ use std::os::unix::fs::symlink;
 
 const MIB: u64 = 1024 * 1024;
 
+thread_local! {
+    /// B7: the token key of the ledger this test thread provisioned last, read back
+    /// from its file, so fixtures can compute helper-issued tokens the way L does.
+    static TEST_KEY: std::cell::RefCell<Option<TokenKey>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Reads K straight from a provisioned ledger file (tests only).
+pub(in crate::helper::firecracker) fn key_from_file(config: &LedgerConfig) -> TokenKey {
+    let conn = Connection::open(config.directory.join(LEDGER_DB)).unwrap();
+    let key: Vec<u8> = conn
+        .query_row("SELECT key FROM token_key WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    TokenKey::from_parts(config.node_id, key.try_into().unwrap())
+}
+
+/// The token L would issue for `seq` in `instance` under this thread's test ledger.
+pub(in crate::helper::firecracker) fn token(instance: Id128, seq: u64) -> Id128 {
+    TEST_KEY.with(|key| key.borrow().as_ref().expect("a provisioned test ledger").issue(instance, seq))
+}
+
+/// Raises an instance's exact pointer to at least `next`, as that many issuances would.
+pub(in crate::helper::firecracker) fn issue_through(ledger: &Ledger, instance: Id128, next: u64) {
+    ledger
+        .connection()
+        .execute(
+            "UPDATE instance_tokens SET issue_next = MAX(issue_next, ?2) WHERE instance_id = ?1",
+            params![instance.to_string(), next as i64],
+        )
+        .unwrap();
+}
+
+/// The pointer every fixture instance is raised to, so `request(i)`'s tokens are issued.
+pub(in crate::helper::firecracker) const ISSUED_THROUGH: u64 = 1 << 16;
+
 pub(in crate::helper::firecracker) struct TempLedger {
     _temp: tempfile::TempDir,
     pub root: PathBuf,
@@ -33,8 +67,11 @@ pub(in crate::helper::firecracker) fn temp_ledger(ceilings: NodeCeilings) -> Tem
         ceilings,
         shared: SharedReserve::default(),
         max_enrolled: DEFAULT_MAX_ENROLLED,
+        compaction: CompactionPolicy::default(),
     };
     Ledger::provision(&config).unwrap();
+    let key = key_from_file(&config);
+    TEST_KEY.with(|slot| *slot.borrow_mut() = Some(key));
     TempLedger {
         _temp: temp,
         root,
@@ -79,8 +116,11 @@ fn enroll(ledger: &mut Ledger, instance: Id128) {
 fn attached(config: &LedgerConfig) -> Ledger {
     let mut ledger = Ledger::open(config.clone()).unwrap();
     enroll(&mut ledger, instance());
+    issue_through(&ledger, instance(), ISSUED_THROUGH);
     assert!(matches!(
-        ledger.attach_instance(instance(), database()).unwrap(),
+        ledger
+            .attach_instance(instance(), database(), None, false)
+            .unwrap(),
         AttachOutcome::Bound { .. }
     ));
     ledger
@@ -97,8 +137,9 @@ fn reservation() -> ResourceReservation {
     }
 }
 
+/// `index`'s token is seq `index + 1`, issued once `issue_through` has run.
 pub(in crate::helper::firecracker) fn request(index: u8) -> AdmitRequest {
-    let allocation = Id128::from_bytes([index; 16]);
+    let allocation = token(instance(), u64::from(index) + 1);
     let plan = format!("plan-{index}").into_bytes();
     AdmitRequest {
         instance_id: instance(),
@@ -139,6 +180,32 @@ fn accepted(outcome: AdmitOutcome) -> (u64, i64, bool) {
 
 fn fence_request(index: u8) -> FenceRequest {
     let admitted = request(index);
+    FenceRequest {
+        instance_id: admitted.instance_id,
+        allocation_id: admitted.allocation_id,
+        sandbox_id: admitted.sandbox_id,
+        plan_digest: admitted.plan_digest,
+        observations: "permits=settled;namespace=absent".into(),
+    }
+}
+
+/// B7: `request(index)` in another instance, under that instance's own issued token
+/// (call `issue_through` for it first). Tokens are bound to their instance, so the
+/// same seq there is a different token.
+fn request_in(owner: Id128, index: u8) -> AdmitRequest {
+    let mut admitted = request(index);
+    admitted.instance_id = owner;
+    admitted.allocation_id = token(owner, u64::from(index) + 1);
+    admitted.stop_authority = StopAuthority::standard(format!(
+        "kilnd-firecracker/x/fc-{}",
+        admitted.allocation_id
+    ));
+    admitted
+}
+
+/// `fence_request(index)` for `request_in(owner, index)`.
+fn fence_request_in(owner: Id128, index: u8) -> FenceRequest {
+    let admitted = request_in(owner, index);
     FenceRequest {
         instance_id: admitted.instance_id,
         allocation_id: admitted.allocation_id,
@@ -398,7 +465,7 @@ fn exit6_replay_after_commit_and_reply_loss_returns_the_identical_bytes() {
         other => panic!("{other:?}"),
     }
     // And its claim and identities stayed released.
-    let snapshot = reopened.accounting().unwrap();
+    let snapshot = reopened.accounting(None).unwrap();
     assert_eq!(snapshot.claimed, ClaimTotals::default());
     assert!(reopened.claimed_identities().unwrap().uids.is_empty());
     assert_eq!(snapshot.retired_tokens, 1);
@@ -412,13 +479,13 @@ fn exit6_a_failed_commit_leaves_no_receipt_and_the_claim_held() {
     ledger
         .settle_unstarted(instance(), request(1).allocation_id)
         .unwrap();
-    let before = ledger.accounting().unwrap();
+    let before = ledger.accounting(None).unwrap();
     ledger.fail_next_commit();
     assert!(matches!(
         ledger.commit_fence(&fence_request(1)),
         Err(LedgerError::CommitFailed)
     ));
-    assert_eq!(ledger.accounting().unwrap().claimed, before.claimed);
+    assert_eq!(ledger.accounting(None).unwrap().claimed, before.claimed);
     assert!(matches!(
         ledger
             .lookup_token(
@@ -499,7 +566,7 @@ fn exit6_unsettled_workers_and_conflicts_forbid_the_fence() {
         FenceOutcome::Conflict { .. }
     ));
     // Nothing above released anything.
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 1);
 }
 
 #[test]
@@ -563,14 +630,14 @@ fn exit6_lowered_limits_deny_new_work_and_discount_nothing() {
         for index in 1..=3u8 {
             accepted(ledger.admit_intent(&request(index)).unwrap());
         }
-        ledger.accounting().unwrap().claimed
+        ledger.accounting(None).unwrap().claimed
     };
     assert_eq!(claimed.slots, 3);
     let mut lowered = fixture.config.clone();
     lowered.ceilings.slots = 1;
     lowered.ceilings.memory_bytes = 1024 * MIB;
     let mut ledger = Ledger::open(lowered).unwrap();
-    let snapshot = ledger.accounting().unwrap();
+    let snapshot = ledger.accounting(None).unwrap();
     assert_eq!(
         snapshot.claimed, claimed,
         "existing commitments are untouched"
@@ -585,41 +652,50 @@ fn exit6_lowered_limits_deny_new_work_and_discount_nothing() {
         .settle_unstarted(instance(), request(1).allocation_id)
         .unwrap();
     absent(ledger.commit_fence(&fence_request(1)).unwrap());
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 2);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 2);
 }
 
 #[test]
 fn exit6_fence_allowance_stops_new_tokens_before_accepted_ones_cannot_fence() {
     let fixture = temp_ledger(unrestricted());
     let mut tight = fixture.config.clone();
-    tight.shared.fence_allowance_bytes = (PRE_INTENT_TOKEN_MARGIN + 2) * FENCE_ENTRY_BOUND;
-    let mut ledger = Ledger::open(tight).unwrap();
+    tight.shared.fence_allowance_bytes = 16 * FENCE_ENTRY_BOUND;
+    let mut ledger = Ledger::open(tight.clone()).unwrap();
     enroll(&mut ledger, instance());
+    issue_through(&ledger, instance(), ISSUED_THROUGH);
     assert!(matches!(
-        ledger.attach_instance(instance(), database()).unwrap(),
+        ledger.attach_instance(instance(), database(), None, false).unwrap(),
         AttachOutcome::Bound { .. }
     ));
-    accepted(ledger.admit_intent(&request(1)).unwrap());
-    assert!(ledger.fence_headroom().unwrap());
-    accepted(ledger.admit_intent(&request(2)).unwrap());
-    assert!(!ledger.fence_headroom().unwrap());
+    // B7 (RTC-17): 16 entries, a pool of 4 and one spare leave E = 11; 8 policy slots
+    // give a share of 1, and one instance may also borrow the 3-entry remainder.
+    let slots = u64::from(tight.max_enrolled);
+    let entries = 16 - 16 / 4 - 1;
+    let fits = entries / slots + entries % slots;
+    assert_eq!(fits, 4);
+    for index in 1..=fits as u8 {
+        assert!(ledger.admitted_headroom(instance()).unwrap(), "{index}");
+        accepted(ledger.admit_intent(&request(index)).unwrap());
+    }
+    assert!(!ledger.admitted_headroom(instance()).unwrap());
+    let refused = fits as u8 + 1;
     assert_eq!(
-        ledger.admit_intent(&request(3)).unwrap(),
+        ledger.admit_intent(&request(refused)).unwrap(),
         AdmitOutcome::Capacity {
             dimension: Dimension::LedgerSpace
         }
     );
     // Every token already accepted can still reach its permanent fence.
-    for index in [1u8, 2] {
+    for index in 1..=fits as u8 {
         ledger
             .settle_unstarted(instance(), request(index).allocation_id)
             .unwrap();
         let (_, replay) = absent(ledger.commit_fence(&fence_request(index)).unwrap());
         assert!(!replay);
     }
-    // Fences are permanent, so their space is not reusable: still no new token.
+    // Retained fences keep their space until compaction passes them: still no new token.
     assert_eq!(
-        ledger.admit_intent(&request(3)).unwrap(),
+        ledger.admit_intent(&request(refused)).unwrap(),
         AdmitOutcome::Capacity {
             dimension: Dimension::LedgerSpace
         }
@@ -674,7 +750,7 @@ fn exit3_each_dimension_exhausts_independently_with_checked_arithmetic() {
             AdmitOutcome::Capacity { dimension },
             "{name} must be the refusing dimension"
         );
-        let snapshot = ledger.accounting().unwrap();
+        let snapshot = ledger.accounting(None).unwrap();
         assert_eq!(snapshot.claimed.slots, 1, "{name}");
         assert!(!snapshot.over_committed, "{name}");
         // Rejection left no partial row behind.
@@ -787,7 +863,7 @@ fn exit2_a_revocation_seen_at_the_commit_point_leaves_no_row_or_claim() {
             .unwrap(),
         AdmitOutcome::Revoked
     );
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 0);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 0);
     assert!(ledger.claimed_identities().unwrap().uids.is_empty());
     assert!(matches!(
         ledger
@@ -822,7 +898,7 @@ fn exit3_allocation_and_sandbox_are_unique_within_an_instance_and_nowhere_else()
     enroll(&mut ledger, other);
     assert!(matches!(
         ledger
-            .attach_instance(other, Id128::from_bytes([0x55; 16]))
+            .attach_instance(other, Id128::from_bytes([0x55; 16]), None, false)
             .unwrap(),
         AttachOutcome::Bound { .. }
     ));
@@ -833,7 +909,7 @@ fn exit3_allocation_and_sandbox_are_unique_within_an_instance_and_nowhere_else()
         accepted(ledger.admit_intent(&request(1)).unwrap()),
         (generation, worker, true)
     );
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 1);
     // Same allocation, another plan or another sandbox, in this instance.
     let mut replanned = request(1);
     replanned.plan = b"other".to_vec();
@@ -855,23 +931,41 @@ fn exit3_allocation_and_sandbox_are_unique_within_an_instance_and_nowhere_else()
         AdmitOutcome::Conflict { .. }
     ));
     // An instance nobody attached cannot hold capacity.
-    let mut stranger = request(3);
-    stranger.instance_id = Id128::from_bytes([0x66; 16]);
+    // B7: a never-enrolled instance has no issue pointer, so nothing verifies there;
+    // an enrolled one that never attached still answers InstanceMismatch.
+    let stranger = Id128::from_bytes([0x66; 16]);
+    let mut unenrolled = request(3);
+    unenrolled.instance_id = stranger;
+    assert!(matches!(
+        ledger.admit_intent(&unenrolled).unwrap(),
+        AdmitOutcome::Conflict { .. }
+    ));
+    enroll(&mut ledger, stranger);
+    issue_through(&ledger, stranger, ISSUED_THROUGH);
     assert_eq!(
-        ledger.admit_intent(&stranger).unwrap(),
+        ledger.admit_intent(&request_in(stranger, 3)).unwrap(),
         AdmitOutcome::InstanceMismatch
     );
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
-    // The same allocation and sandbox in another instance are another token entirely.
-    let mut foreign = request(1);
-    foreign.instance_id = other;
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 1);
+    // The same seq and sandbox in another instance are another token entirely.
+    // B7: a copy of this instance's token does not verify there and changes nothing.
+    issue_through(&ledger, other, ISSUED_THROUGH);
+    let mut copied = request(1);
+    copied.instance_id = other;
+    copied.leases = sample_leases(9);
+    assert!(matches!(
+        ledger.admit_intent(&copied).unwrap(),
+        AdmitOutcome::Conflict { .. }
+    ));
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 1);
+    let mut foreign = request_in(other, 1);
     foreign.leases = sample_leases(9);
+    assert_eq!(foreign.sandbox_id, request(1).sandbox_id);
     let (_, _, replay) = accepted(ledger.admit_intent(&foreign).unwrap());
     assert!(!replay);
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 2);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 2);
     // Host identities really are one namespace, so those alone still collide.
-    let mut same_lease = request(4);
-    same_lease.instance_id = other;
+    let mut same_lease = request_in(other, 4);
     same_lease.leases = sample_leases(9);
     assert!(matches!(
         ledger.admit_intent(&same_lease).unwrap(),
@@ -887,14 +981,32 @@ fn b3r_01_a_fence_from_another_instance_never_reaches_a_token() {
         let mut ledger = attached(&fixture.config);
         enroll(&mut ledger, attacker);
         ledger
-            .attach_instance(attacker, Id128::from_bytes([0x55; 16]))
+            .attach_instance(attacker, Id128::from_bytes([0x55; 16]), None, false)
             .unwrap();
-        // The attacker copied the victim's token before C2, and its namespace honestly
-        // has nothing by that name, so its own fence commits.
+        issue_through(&ledger, attacker, ISSUED_THROUGH);
+        // The attacker copied the victim's token before C2.
+        // B7: it does not verify in the attacker's instance, so the fence is refused
+        // and writes nothing at all: no row, no generation, no quota spent.
         let copied = request(1);
         let mut aimed = fence_request(1);
         aimed.instance_id = attacker;
-        let FenceOutcome::Absent { receipt, .. } = ledger.commit_fence(&aimed).unwrap() else {
+        let generation = ledger.generation().unwrap();
+        let changes = ledger.connection().total_changes();
+        assert!(matches!(
+            ledger.commit_fence(&aimed).unwrap(),
+            FenceOutcome::Conflict { .. }
+        ));
+        assert_eq!(ledger.connection().total_changes(), changes);
+        assert_eq!(ledger.generation().unwrap(), generation);
+        assert_eq!(
+            never_admitted_fences(ledger.connection(), attacker).unwrap(),
+            0
+        );
+        // The attacker's own token with the same seq is another token: its namespace
+        // honestly has nothing by that name, so that fence commits, in its namespace.
+        let own = fence_request_in(attacker, 1);
+        assert_ne!(own.allocation_id, copied.allocation_id);
+        let FenceOutcome::Absent { receipt, .. } = ledger.commit_fence(&own).unwrap() else {
             panic!("the attacker's namespace is absent");
         };
         let receipt = FencedAbsence::decode(&receipt).unwrap();
@@ -907,7 +1019,9 @@ fn b3r_01_a_fence_from_another_instance_never_reaches_a_token() {
             TokenLookup::Unknown
         );
         assert_eq!(
-            ledger.inspect(instance(), copied.allocation_id).unwrap(),
+            ledger
+                .inspect(instance(), copied.allocation_id, &copied.plan_digest)
+                .unwrap(),
             TokenLookup::Unknown
         );
         // That is a permanent row, and it still means nothing to the victim's token.
@@ -917,7 +1031,7 @@ fn b3r_01_a_fence_from_another_instance_never_reaches_a_token() {
     let copied = request(1);
     let (_, worker, replay) = accepted(ledger.admit_intent(&copied).unwrap());
     assert!(!replay);
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 1);
     assert!(matches!(
         ledger.commit_fence(&fence_request(1)).unwrap(),
         FenceOutcome::Unsettled { workers: 1 }
@@ -931,7 +1045,7 @@ fn b3r_01_a_fence_from_another_instance_never_reaches_a_token() {
     let receipt = FencedAbsence::decode(&receipt).unwrap();
     assert_eq!(receipt.instance_id(), instance());
     assert_eq!(receipt.allocation_id(), copied.allocation_id);
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 0);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 0);
     // The quota the attacker spent is its own.
     assert_eq!(
         never_admitted_fences(ledger.connection(), attacker).unwrap(),
@@ -950,22 +1064,29 @@ fn b3r_01_every_row_a_claim_or_fence_writes_names_its_instance() {
     let mut ledger = attached(&fixture.config);
     enroll(&mut ledger, other);
     ledger
-        .attach_instance(other, Id128::from_bytes([0x55; 16]))
+        .attach_instance(other, Id128::from_bytes([0x55; 16]), None, false)
         .unwrap();
     let mine = request(1);
     let (generation, worker, _) = accepted(ledger.admit_intent(&mine).unwrap());
-    let mut theirs = request(1);
-    theirs.instance_id = other;
+    // B7: the other instance's token for the same seq is its own, not a copy.
+    issue_through(&ledger, other, ISSUED_THROUGH);
+    let mut theirs = request_in(other, 1);
     theirs.leases = sample_leases(9);
     let (their_generation, their_worker, _) = accepted(ledger.admit_intent(&theirs).unwrap());
     // Advancing, stopping or settling one leaves the other's row exactly as it was.
     ledger
-        .advance_phase(other, mine.allocation_id, their_generation, "preparing")
+        .advance_phase(other, theirs.allocation_id, their_generation, "preparing")
         .unwrap();
     assert!(matches!(
         ledger.advance_phase(instance(), mine.allocation_id, their_generation, "stopped"),
         Err(LedgerError::StaleGeneration)
     ));
+    // Naming the victim's token from the other namespace reaches no row either.
+    assert!(matches!(
+        ledger.advance_phase(other, mine.allocation_id, generation, "stopped"),
+        Err(LedgerError::StaleGeneration)
+    ));
+    ledger.settle_unstarted(other, theirs.allocation_id).unwrap();
     ledger.settle_unstarted(other, mine.allocation_id).unwrap();
     let lookup = ledger
         .lookup_token(instance(), mine.allocation_id, &mine.plan_digest)
@@ -985,13 +1106,12 @@ fn b3r_01_every_row_a_claim_or_fence_writes_names_its_instance() {
         "the other instance settled only its own"
     );
     ledger.settle_worker(their_worker, "exit:0").unwrap();
-    let mut their_fence = fence_request(1);
-    their_fence.instance_id = other;
+    let their_fence = fence_request_in(other, 1);
     assert!(matches!(
         ledger.commit_fence(&their_fence).unwrap(),
         FenceOutcome::Absent { .. }
     ));
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 1);
     let conn = ledger.connection();
     let held: i64 = conn
         .query_row(
@@ -1208,19 +1328,19 @@ fn exit3_a_different_database_cannot_rebind_a_namespace_or_clear_its_claims() {
     let mut ledger = Ledger::open(fixture.config.clone()).unwrap();
     let stale = Id128::from_bytes([0x88; 16]);
     assert!(matches!(
-        ledger.attach_instance(instance(), stale).unwrap(),
+        ledger.attach_instance(instance(), stale, None, false).unwrap(),
         AttachOutcome::DatabaseMismatch { .. }
     ));
     // The binding did not move, and the same mismatch reports again.
     assert!(matches!(
-        ledger.attach_instance(instance(), stale).unwrap(),
+        ledger.attach_instance(instance(), stale, None, false).unwrap(),
         AttachOutcome::DatabaseMismatch { .. }
     ));
     assert!(matches!(
-        ledger.attach_instance(instance(), database()).unwrap(),
+        ledger.attach_instance(instance(), database(), None, false).unwrap(),
         AttachOutcome::Bound { .. }
     ));
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 1);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 1);
 }
 
 #[test]
@@ -1234,7 +1354,7 @@ fn exit3_shared_reserve_counts_once_and_three_of_four_fit_the_default_vector() {
         ledger.admit_intent(&request(4)).unwrap(),
         AdmitOutcome::Capacity { .. }
     ));
-    let snapshot = ledger.accounting().unwrap();
+    let snapshot = ledger.accounting(None).unwrap();
     assert_eq!(snapshot.committed.memory_bytes, 3 * 896 * MIB + 128 * MIB);
     assert_eq!(snapshot.committed.host_cpu_millis, 3500);
     assert_eq!(snapshot.committed.host_pids, 3 * 32 + 32);
@@ -1274,7 +1394,7 @@ fn exit6_restart_replays_every_unreleased_claim_worker_and_lease() {
     assert_eq!(record.host_boot_id.as_deref(), Some("boot-a"));
     assert_eq!(replay.executable_leases.len(), 4);
     assert!(ledger.executable_leased(&sample_vector()[0]).unwrap());
-    assert_eq!(ledger.accounting().unwrap().claimed.slots, 2);
+    assert_eq!(ledger.accounting(None).unwrap().claimed.slots, 2);
 }
 
 #[test]
@@ -1698,7 +1818,7 @@ fn b3_01_attach_authenticates_nothing_and_refuses_an_unenrolled_instance() {
     let fixture = temp_ledger(unrestricted());
     let mut ledger = Ledger::open(fixture.config.clone()).unwrap();
     assert_eq!(
-        ledger.attach_instance(instance(), database()).unwrap(),
+        ledger.attach_instance(instance(), database(), None, false).unwrap(),
         AttachOutcome::NotEnrolled
     );
     assert_eq!(ledger.enrollment(instance()).unwrap(), None);
@@ -1716,12 +1836,12 @@ fn b3_01_attach_authenticates_nothing_and_refuses_an_unenrolled_instance() {
     );
     // Enrollment names no database: the first attested attachment records one.
     assert!(matches!(
-        ledger.attach_instance(instance(), database()).unwrap(),
+        ledger.attach_instance(instance(), database(), None, false).unwrap(),
         AttachOutcome::Bound { .. }
     ));
     let copied = Id128::from_bytes([0x99; 16]);
     assert!(matches!(
-        ledger.attach_instance(instance(), copied).unwrap(),
+        ledger.attach_instance(instance(), copied, None, false).unwrap(),
         AttachOutcome::DatabaseMismatch { .. }
     ));
 }
@@ -1755,7 +1875,7 @@ fn b3_02_enrollment_is_bounded_and_one_unit_serves_one_instance() {
         EnrollOutcome::UnitTaken
     );
     // An upgrade re-enrolls the new image, at the limit, and the binding is unaffected.
-    ledger.attach_instance(id(0), database()).unwrap();
+    ledger.attach_instance(id(0), database(), None, false).unwrap();
     let mut upgraded = enrollment_of(id(0));
     upgraded.executable.st_ino = 99;
     assert!(matches!(
@@ -1767,7 +1887,7 @@ fn b3_02_enrollment_is_bounded_and_one_unit_serves_one_instance() {
         99
     );
     assert!(matches!(
-        ledger.attach_instance(id(0), database()).unwrap(),
+        ledger.attach_instance(id(0), database(), None, false).unwrap(),
         AttachOutcome::Bound { .. }
     ));
     // A lowered limit removes nothing and still lets existing rows re-enroll.
@@ -1782,30 +1902,30 @@ fn b3_02_enrollment_is_bounded_and_one_unit_serves_one_instance() {
 fn b3_02_attach_writes_only_its_own_row_once_and_respects_the_fence_floor() {
     let fixture = temp_ledger(unrestricted());
     let mut tight = fixture.config.clone();
-    tight.shared.fence_allowance_bytes = (PRE_INTENT_TOKEN_MARGIN + 2) * FENCE_ENTRY_BOUND;
+    tight.shared.fence_allowance_bytes = 16 * FENCE_ENTRY_BOUND;
     let mut ledger = Ledger::open(tight).unwrap();
     enroll(&mut ledger, instance());
     let other = Id128::from_bytes([0x44; 16]);
     enroll(&mut ledger, other);
     assert!(matches!(
-        ledger.attach_instance(instance(), database()).unwrap(),
+        ledger.attach_instance(instance(), database(), None, false).unwrap(),
         AttachOutcome::Bound { .. }
     ));
     let generation = ledger.generation().unwrap();
     let changes = ledger.connection().total_changes();
     for _ in 0..100 {
         assert!(matches!(
-            ledger.attach_instance(instance(), database()).unwrap(),
+            ledger.attach_instance(instance(), database(), None, false).unwrap(),
             AttachOutcome::Bound { .. }
         ));
         assert!(matches!(
             ledger
-                .attach_instance(instance(), Id128::from_bytes([0x99; 16]))
+                .attach_instance(instance(), Id128::from_bytes([0x99; 16]), None, false)
                 .unwrap(),
             AttachOutcome::DatabaseMismatch { .. }
         ));
         assert_eq!(
-            ledger.attach_instance(Id128::random(), database()).unwrap(),
+            ledger.attach_instance(Id128::random(), database(), None, false).unwrap(),
             AttachOutcome::NotEnrolled
         );
     }
@@ -1815,33 +1935,52 @@ fn b3_02_attach_writes_only_its_own_row_once_and_respects_the_fence_floor() {
         "a reattachment and a refusal write nothing"
     );
     assert_eq!(ledger.generation().unwrap(), generation);
-    // Accepted tokens have used the headroom: a new binding must not take what's left.
-    accepted(ledger.admit_intent(&request(1)).unwrap());
-    accepted(ledger.admit_intent(&request(2)).unwrap());
-    assert!(!ledger.fence_headroom().unwrap());
-    assert_eq!(
+    // Accepted tokens have used this instance's headroom, its share and the remainder.
+    issue_through(&ledger, instance(), ISSUED_THROUGH);
+    let mut index = 1u8;
+    while ledger.admitted_headroom(instance()).unwrap() {
+        accepted(ledger.admit_intent(&request(index)).unwrap());
+        index += 1;
+    }
+    assert_eq!(index - 1, 4, "a share of 1 and the 3-entry remainder");
+    // B7 (RTC-17): enrollment reserved the other slot's share, so its first binding
+    // is not refused and it can still admit; enrolling past the policy maximum, which
+    // would shrink every share under the rows already held, is what's refused.
+    assert!(matches!(
         ledger
-            .attach_instance(other, Id128::from_bytes([0x55; 16]))
+            .attach_instance(other, Id128::from_bytes([0x55; 16]), None, false)
             .unwrap(),
-        AttachOutcome::NoSpace
-    );
+        AttachOutcome::Bound { .. }
+    ));
+    assert!(ledger.admitted_headroom(other).unwrap());
+    for byte in 0x60..0x66 {
+        enroll(&mut ledger, Id128::from_bytes([byte; 16]));
+    }
+    let generation = ledger.generation().unwrap();
     assert_eq!(
         ledger
             .enroll_instance(&enrollment_of(Id128::random()), MAX_ENROLLED_HARD)
             .unwrap(),
         EnrollOutcome::NoSpace
     );
+    assert_eq!(ledger.generation().unwrap(), generation, "the refusal wrote nothing");
+    assert_eq!(ledger.replay().unwrap().enrolled.len(), 8);
     // The instance already bound keeps working at the floor: it needs no write.
     assert!(matches!(
-        ledger.attach_instance(instance(), database()).unwrap(),
+        ledger.attach_instance(instance(), database(), None, false).unwrap(),
         AttachOutcome::Bound { .. }
     ));
 }
 
+/// B7: an issued token the ledger never admitted, each with its own seq below
+/// `ISSUED_THROUGH` and above every `request(i)`'s.
 fn never_admitted_request(instance: Id128) -> FenceRequest {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(40_000);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(seq < ISSUED_THROUGH);
     FenceRequest {
         instance_id: instance,
-        allocation_id: Id128::random(),
+        allocation_id: token(instance, seq),
         sandbox_id: crate::model::new_id("sb"),
         plan_digest: Digest::of(b"never admitted"),
         observations: "permits=settled;namespace=absent".into(),
@@ -1851,7 +1990,8 @@ fn never_admitted_request(instance: Id128) -> FenceRequest {
 #[test]
 fn b3_02_never_admitted_fence_quotas_sum_within_the_allowance_and_reserve_their_space() {
     let allowance = SharedReserve::default().fence_allowance_bytes;
-    assert_eq!(allowance, 64 * MIB);
+    // B7: the default allowance is 128 MiB.
+    assert_eq!(allowance, 128 * MIB);
     for limit in [1, 2, DEFAULT_MAX_ENROLLED, MAX_ENROLLED_HARD] {
         let fixture = temp_ledger(unrestricted());
         let mut config = fixture.config.clone();
@@ -1866,7 +2006,7 @@ fn b3_02_never_admitted_fence_quotas_sum_within_the_allowance_and_reserve_their_
         // Admission reserves the whole pool, used or not, so the pool and every
         // admitted token's entry together can never exceed the allowance.
         assert!(never_admitted_pool(&config) * FENCE_ENTRY_BOUND <= allowance);
-        assert!(ledger.fence_headroom().unwrap());
+        assert!(ledger.admitted_headroom(instance()).unwrap());
     }
     // A policy lowered under its existing rows shrinks shares; it can't inflate the sum.
     let fixture = temp_ledger(unrestricted());
@@ -1879,9 +2019,9 @@ fn b3_02_never_admitted_fence_quotas_sum_within_the_allowance_and_reserve_their_
     }
     let shared = never_admitted_quota(ledger.connection(), &config).unwrap();
     assert_eq!(shared, solo / 4);
-    // An allowance smaller than the pool's floor still caps it.
+    // B7: the pool is a quarter of any allowance's entries, with no floor.
     config.shared.fence_allowance_bytes = 100 * FENCE_ENTRY_BOUND;
-    assert_eq!(never_admitted_pool(&config), 100);
+    assert_eq!(never_admitted_pool(&config), 25);
 }
 
 #[test]
@@ -1891,12 +2031,18 @@ fn b3_02_never_admitted_fences_stop_at_the_quota_and_admitted_ones_never_do() {
     config.max_enrolled = MAX_ENROLLED_HARD;
     let mut ledger = Ledger::open(config.clone()).unwrap();
     enroll(&mut ledger, instance());
-    ledger.attach_instance(instance(), database()).unwrap();
+    issue_through(&ledger, instance(), ISSUED_THROUGH);
+    ledger.attach_instance(instance(), database(), None, false).unwrap();
     let other = Id128::from_bytes([0x44; 16]);
     enroll(&mut ledger, other);
+    issue_through(&ledger, other, ISSUED_THROUGH);
     accepted(ledger.admit_intent(&request(1)).unwrap());
     let quota = never_admitted_quota(ledger.connection(), &config).unwrap();
-    assert_eq!(quota, 4096 / u64::from(MAX_ENROLLED_HARD));
+    // B7: the pool is a quarter of the default allowance's entries, with no floor.
+    assert_eq!(
+        quota,
+        128 * MIB / FENCE_ENTRY_BOUND / 4 / u64::from(MAX_ENROLLED_HARD)
+    );
     for used in 0..quota {
         assert!(ledger.never_admitted_fence_allowed(instance()).unwrap());
         // New tokens stop early, with a quarter left for tokens already charged at C1.

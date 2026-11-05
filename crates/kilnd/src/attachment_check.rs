@@ -18,6 +18,7 @@ pub async fn run(state_dir: &Path, helper_socket: PathBuf, hold: bool) -> Result
     let identity = store.identity()?;
     let runtime =
         FirecrackerRuntime::new(helper_socket, identity.instance_id, identity.database_uuid);
+    runtime.record_token(store.highest_fenced_token(identity.instance_id)?);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let node = runtime
         .prove_attachment(deadline)

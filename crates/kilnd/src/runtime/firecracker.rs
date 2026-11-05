@@ -13,19 +13,20 @@
 use super::{
     AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendInventory, BackendRecord,
     BackendStatus, CreateContext, CreateFailure, CreatedSandbox, EvidenceRegime, ExecOutcome,
-    ExecSpec, ExecutionContext, FencedAbsence, PreparedCreate, ReadyReceipt, Runtime,
-    RuntimeCapabilities, RuntimeError, RuntimeReceipt,
+    ExecSpec, ExecutionContext, FencedAbsence, PrepareContext, PreparedCreate, ReadyReceipt,
+    RemoveTarget, Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt,
 };
+use crate::helper::firecracker::token;
 use crate::firecracker::{canonical, offline_768_v1_reservation, strict_json};
 use crate::helper::firecracker::journal::AccountingSnapshot;
 use crate::helper::protocol::{
     AccountingReply, AmbiguousClass, CreateReply, FIRECRACKER_GROUP_VERSION, FenceReply,
-    FirecrackerOperation, FirecrackerRequest, FirecrackerResponse, GcOutcome, GroupError,
-    GroupErrorKind, InspectReply, ListStatus, MAX_FIRECRACKER_GC_IDS, PreparedReply, ValidateReply,
+    FirecrackerOperation, FirecrackerRequest, FirecrackerResponse, GcOutcome, GcTarget,
+    GroupError, GroupErrorKind, InspectReply, ListStatus, MAX_FIRECRACKER_GC_IDS, PreparedReply, ValidateReply,
     WireBytes,
 };
 use crate::helper::{AttachedConnection, Client};
-use crate::model::{Digest, Id128, Network, SandboxSpec};
+use crate::model::{AllocationBinding, Digest, Id128, Network, SandboxSpec};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -60,6 +61,13 @@ pub struct FirecrackerRuntime {
     attachment: tokio::sync::Mutex<Option<Attachment>>,
     node_id: Mutex<Option<Id128>>,
     sessions: Mutex<HashMap<Id128, Session>>,
+    /// B7 RTC-14: the highest complete token this daemon has recorded, reported at every
+    /// attachment. Seeded from the Store at startup and raised by every verified prepare.
+    highest_token: Mutex<Option<Id128>>,
+    /// B7: each allocation's Store plan digest, learned from the Store-bound calls
+    /// (create, inspect, fence, remove), so a later Validate or Exec can read its boot
+    /// with the digest Inspect requires. Never a source of release evidence.
+    digests: Mutex<HashMap<Id128, Digest>>,
 }
 
 fn group_failure(error: GroupError) -> RuntimeError {
@@ -73,18 +81,49 @@ fn group_failure(error: GroupError) -> RuntimeError {
     }
 }
 
+/// B7: L's NotIssued and the latch are reported as Incompatible; every other class is
+/// an ordinary backend error. Either way the allocation stays charged.
+fn ambiguous_error(class: AmbiguousClass, message: String) -> RuntimeError {
+    match class {
+        AmbiguousClass::NotIssued | AmbiguousClass::Latched => RuntimeError::Incompatible(message),
+        _ => RuntimeError::Backend(message),
+    }
+}
+
+/// B7 (section 9.1): a fenced binding must name this attachment's node and instance.
+fn check_binding(
+    binding: &AllocationBinding,
+    node: Id128,
+    instance: Id128,
+) -> Result<(), RuntimeError> {
+    if binding.node_id != node || binding.instance_id != instance {
+        return Err(RuntimeError::Incompatible(format!(
+            "allocation {} belongs to another node or instance",
+            binding.allocation_id
+        )));
+    }
+    Ok(())
+}
+
 fn unexpected() -> RuntimeError {
     RuntimeError::Backend("unexpected Firecracker helper response".into())
 }
 
 /// Every prepared field is reconstructed from verified bytes; nothing is believed
 /// because the helper said it. A fixture schema or any mismatched field fails here.
+/// B7 (section 9.1): the token is the helper's, so it is checked here, tag-free: 32 hex
+/// digits with seq in range, named by the plan's substitutions, for this instance. The
+/// tag itself only the helper can check.
 fn verify_prepared(
-    context: &CreateContext,
+    context: &PrepareContext,
     spec: &SandboxSpec,
     reply: PreparedReply,
 ) -> Result<PreparedCreate, RuntimeError> {
     let invalid = |why: &str| RuntimeError::Backend(format!("prepared plan refused: {why}"));
+    let token = reply.allocation_id;
+    if !token::shape_ok(token) {
+        return Err(invalid("the issued token has no valid sequence"));
+    }
     if reply.plan_version != crate::helper::firecracker::config::PLAN_VERSION {
         return Err(invalid("plan version"));
     }
@@ -103,7 +142,7 @@ fn verify_prepared(
     }
     let substitutions = &document["substitutions"];
     if substitutions["instance_id"] != context.instance_id.to_string()
-        || substitutions["allocation_id"] != context.allocation_id.to_string()
+        || substitutions["allocation_id"] != token.to_string()
         || substitutions["sandbox_id"] != context.sandbox_id.as_str()
     {
         return Err(invalid("plan does not bind this token"));
@@ -125,6 +164,7 @@ fn verify_prepared(
         &reply.profile,
         reply.manifest_sha256,
         reply.node_id,
+        token,
     )?;
     if prepared.host_spec_sha256() != reply.host_spec_sha256
         || prepared.guest_exec_spec_sha256() != reply.guest_exec_spec_sha256
@@ -137,7 +177,7 @@ fn verify_prepared(
 
 #[cfg(test)]
 pub(crate) fn test_verify_prepared(
-    context: &CreateContext,
+    context: &PrepareContext,
     spec: &SandboxSpec,
     reply: PreparedReply,
 ) -> Result<PreparedCreate, RuntimeError> {
@@ -207,7 +247,34 @@ impl FirecrackerRuntime {
             attachment: tokio::sync::Mutex::new(None),
             node_id: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            highest_token: Mutex::new(None),
+            digests: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn learn_digest(&self, allocation: Id128, digest: Digest) {
+        self.digests.lock().unwrap().insert(allocation, digest);
+    }
+
+    /// B7 RTC-14: raises the reported highest token to `token` if its sequence is
+    /// higher. The daemon seeds it from its Store (`Store::highest_fenced_token`).
+    pub fn record_token(&self, token: Option<Id128>) {
+        let Some(token) = token else { return };
+        let mut highest = self.highest_token.lock().unwrap();
+        if highest.is_none_or(|current| token::seq_of(token) > token::seq_of(current)) {
+            *highest = Some(token);
+        }
+    }
+
+    /// The reported highest token, for tests.
+    #[cfg(test)]
+    pub(crate) fn test_highest_token(&self) -> Option<Id128> {
+        *self.highest_token.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_database(&self) -> Id128 {
+        self.database_uuid
     }
 
     /// For tests that run the helper unprivileged, with the real peer check.
@@ -257,6 +324,7 @@ impl FirecrackerRuntime {
         if let Some(existing) = attachment.as_ref() {
             return Ok(existing.epoch);
         }
+        let highest_token = *self.highest_token.lock().unwrap();
         let (response, connection) = self
             .client
             .attach(
@@ -266,6 +334,7 @@ impl FirecrackerRuntime {
                     connection_epoch: None,
                     operation: FirecrackerOperation::AttachInstance {
                         database_uuid: self.database_uuid,
+                        highest_token,
                     },
                 },
                 deadline,
@@ -352,6 +421,7 @@ impl FirecrackerRuntime {
     async fn inspect_raw(
         &self,
         allocation: Id128,
+        plan_digest: Digest,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<InspectReply, RuntimeError> {
@@ -360,6 +430,7 @@ impl FirecrackerRuntime {
             .call(
                 FirecrackerOperation::Inspect {
                     allocation_id: allocation,
+                    plan_digest,
                 },
                 deadline,
                 cancel,
@@ -405,7 +476,12 @@ impl FirecrackerRuntime {
         if let Some(session) = self.sessions.lock().unwrap().get(&allocation).cloned() {
             return Ok(session);
         }
-        match self.inspect_raw(allocation, deadline, cancel).await? {
+        let Some(digest) = self.digests.lock().unwrap().get(&allocation).copied() else {
+            return Err(RuntimeError::Backend(format!(
+                "allocation {allocation} has no known binding yet; reconciliation reads it"
+            )));
+        };
+        match self.inspect_raw(allocation, digest, deadline, cancel).await? {
             InspectReply::PresentReady {
                 boot_id, inner_id, ..
             } => Ok(Session { boot_id, inner_id }),
@@ -449,7 +525,7 @@ impl FirecrackerRuntime {
                 .into());
             }
             match self
-                .inspect_raw(context.allocation_id, deadline, cancel)
+                .inspect_raw(context.allocation_id, plan_digest, deadline, cancel)
                 .await
             {
                 Ok(InspectReply::PresentReady {
@@ -514,6 +590,7 @@ impl FirecrackerRuntime {
     async fn remove_allocation(
         &self,
         allocation: Id128,
+        plan_digest: Digest,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<FencedAbsence, RuntimeError> {
@@ -521,6 +598,7 @@ impl FirecrackerRuntime {
             .call(
                 FirecrackerOperation::Remove {
                     allocation_id: allocation,
+                    plan_digest,
                 },
                 deadline,
                 cancel,
@@ -532,9 +610,10 @@ impl FirecrackerRuntime {
                 decode_removal(&receipt.0, self.instance_id, allocation)
             }
             FirecrackerResponse::Remove(FenceReply::Ambiguous { class, message }) => {
-                Err(RuntimeError::Backend(format!(
-                    "allocation {allocation} stays charged ({class:?}): {message}"
-                )))
+                Err(ambiguous_error(
+                    class,
+                    format!("allocation {allocation} stays charged ({class:?}): {message}"),
+                ))
             }
             FirecrackerResponse::Error(error) => Err(group_failure(error)),
             _ => Err(unexpected()),
@@ -609,20 +688,26 @@ impl Runtime for FirecrackerRuntime {
                 host_pids: committed.host_pids,
             },
             over_committed: snapshot.over_committed,
+            node_fault: snapshot.node_fault,
+            degraded: snapshot.degraded,
         }))
     }
 
     async fn prepare(
         &self,
-        context: &CreateContext,
+        context: &PrepareContext,
         spec: &SandboxSpec,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<PreparedCreate, RuntimeError> {
+        if context.instance_id != self.instance_id {
+            return Err(RuntimeError::Incompatible(
+                "preparation names another instance".into(),
+            ));
+        }
         match self
             .call(
                 FirecrackerOperation::Preflight {
-                    allocation_id: context.allocation_id,
                     sandbox_id: context.sandbox_id.clone(),
                     profile: "offline-768-v1".into(),
                     spec: spec.clone(),
@@ -632,7 +717,14 @@ impl Runtime for FirecrackerRuntime {
             )
             .await?
         {
-            FirecrackerResponse::Prepared(reply) => verify_prepared(context, spec, *reply),
+            FirecrackerResponse::Prepared(reply) => {
+                let prepared = verify_prepared(context, spec, *reply)?;
+                self.record_token(prepared.allocation_id());
+                if let Some(token) = prepared.allocation_id() {
+                    self.learn_digest(token, prepared.plan_digest());
+                }
+                Ok(prepared)
+            }
             FirecrackerResponse::Error(error) => Err(group_failure(error)),
             _ => Err(unexpected()),
         }
@@ -673,8 +765,7 @@ impl Runtime for FirecrackerRuntime {
                 self.wait_ready(context, prepared, deadline, cancel).await
             }
             FirecrackerResponse::Create(CreateReply::Ambiguous { class, message }) => {
-                let error =
-                    RuntimeError::Backend(format!("create rejected ({class:?}): {message}"));
+                let error = ambiguous_error(class, format!("create rejected ({class:?}): {message}"));
                 Err(if class == AmbiguousClass::Capacity {
                     CreateFailure::exhausted(error)
                 } else {
@@ -693,8 +784,9 @@ impl Runtime for FirecrackerRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<AllocationObservation, RuntimeError> {
+        self.learn_digest(context.allocation_id, *prepared_digest);
         match self
-            .inspect_raw(context.allocation_id, deadline, cancel)
+            .inspect_raw(context.allocation_id, *prepared_digest, deadline, cancel)
             .await?
         {
             // The helper's READY: idle on the journaled boot, no execution in flight.
@@ -743,8 +835,9 @@ impl Runtime for FirecrackerRuntime {
         // Its FenceAbsent would close the token's gate and still refuse while resources
         // exist. A retired token answers with its fence either way. Only a token with no
         // journal record falls through to FenceAbsent, which fences it never-admitted.
+        self.learn_digest(context.allocation_id, *prepared_digest);
         match self
-            .remove_allocation(context.allocation_id, deadline, cancel)
+            .remove_allocation(context.allocation_id, *prepared_digest, deadline, cancel)
             .await
         {
             Ok(receipt) if &receipt.plan_digest() == prepared_digest => {
@@ -778,7 +871,7 @@ impl Runtime for FirecrackerRuntime {
                 AbsenceReceipt::Fenced(decode_fence(&receipt.0, context, prepared_digest)?),
             ),
             FirecrackerResponse::Fence(FenceReply::Ambiguous { class, message }) => Err(
-                RuntimeError::Backend(format!("allocation stays charged ({class:?}): {message}")),
+                ambiguous_error(class, format!("allocation stays charged ({class:?}): {message}")),
             ),
             FirecrackerResponse::Error(error) => Err(group_failure(error)),
             _ => Err(unexpected()),
@@ -898,14 +991,21 @@ impl Runtime for FirecrackerRuntime {
         outcome
     }
 
+    /// B7 (section 9.1): `Legacy` is reachable here (a historical kiln row's Delete,
+    /// compensation, reconciliation Gc) and is refused before any wire call. A fenced
+    /// binding must be this attachment's node and instance; the helper acts only on the
+    /// journaled resources of the row whose digest it names.
     async fn remove(
         &self,
-        id: &str,
+        target: RemoveTarget<'_>,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<AbsenceReceipt, RuntimeError> {
-        let allocation = allocation_of(id)?;
-        self.remove_allocation(allocation, deadline, cancel)
+        let binding = target.fenced()?;
+        self.epoch(deadline).await?;
+        check_binding(binding, self.attached_node()?, self.instance_id)?;
+        self.learn_digest(binding.allocation_id, binding.plan_digest);
+        self.remove_allocation(binding.allocation_id, binding.plan_digest, deadline, cancel)
             .await
             .map(AbsenceReceipt::Fenced)
     }
@@ -946,32 +1046,51 @@ impl Runtime for FirecrackerRuntime {
         }
     }
 
+    /// B7: the whole vector is checked before the first wire frame (no `Legacy`, no
+    /// foreign binding, no duplicate, the length bound), so one bad target refuses the
+    /// call with nothing sent.
     async fn gc(
         &self,
-        ids: &[String],
+        targets: &[RemoveTarget<'_>],
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
-        if ids.is_empty() {
+        if targets.is_empty() {
             return Ok(Vec::new());
         }
-        if ids.len() > MAX_FIRECRACKER_GC_IDS {
+        if targets.len() > MAX_FIRECRACKER_GC_IDS {
             return Err(RuntimeError::Backend(format!(
                 "at most {MAX_FIRECRACKER_GC_IDS} allocations per collection"
             )));
         }
-        let mut allocations = Vec::with_capacity(ids.len());
-        for id in ids {
-            let allocation = allocation_of(id)?;
-            if allocations.contains(&allocation) {
-                return Err(RuntimeError::Backend(format!("{id} is named twice")));
-            }
-            allocations.push(allocation);
+        let mut bindings = Vec::with_capacity(targets.len());
+        for target in targets {
+            bindings.push(target.fenced()?);
         }
+        self.epoch(deadline).await?;
+        let node = self.attached_node()?;
+        let mut wire = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            check_binding(binding, node, self.instance_id)?;
+            if wire
+                .iter()
+                .any(|t: &GcTarget| t.allocation_id == binding.allocation_id)
+            {
+                return Err(RuntimeError::Incompatible(format!(
+                    "allocation {} is named twice",
+                    binding.allocation_id
+                )));
+            }
+            wire.push(GcTarget {
+                allocation_id: binding.allocation_id,
+                plan_digest: binding.plan_digest,
+            });
+        }
+        let allocations: Vec<Id128> = wire.iter().map(|t| t.allocation_id).collect();
         let results = match self
             .call(
                 FirecrackerOperation::Gc {
-                    allocation_ids: allocations.clone(),
+                    targets: wire.clone(),
                 },
                 deadline,
                 cancel,

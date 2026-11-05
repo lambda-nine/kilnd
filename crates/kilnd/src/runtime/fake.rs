@@ -23,8 +23,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendInventory, BackendRecord,
     BackendStatus, CreateContext, CreateFailure, CreatedSandbox, ExecFinish, ExecOutcome, ExecSpec,
-    ExecutionContext, FencedAbsence, LegacyAbsence, LegacyProof, PreparedCreate, ReadyReceipt,
-    Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt, legacy_exec_evidence,
+    ExecutionContext, FencedAbsence, LegacyAbsence, LegacyProof, PrepareContext, PreparedCreate,
+    ReadyReceipt, RemoveTarget, Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt, legacy_exec_evidence,
 };
 use crate::model::{
     Captured, CleanupEvidence, CommandStatus, Digest, Id128, Network, RuntimeDiagnostic,
@@ -158,6 +158,8 @@ pub struct FakeFenced {
     /// recheck stands between it and an allocation.
     pub prepare_ignores_cancel: bool,
     pub prepare_calls: u32,
+    /// B7: tokens the fake authority has issued (its exact pointer, less one).
+    pub issued: u64,
     /// Holds the next create calls, in order, before their fence lookup.
     pub queued_create_gates: VecDeque<FakeGate>,
     pub rejection: Option<FakeRejection>,
@@ -200,6 +202,9 @@ pub struct FakeState {
     pub removed: Vec<String>,
     /// Removal attempts, including failed ones.
     pub remove_attempts: Vec<String>,
+    /// B7: every `remove` target as `legacy:<backend id>` or `fenced:<allocation>`,
+    /// including the ones a regime refused before acting.
+    pub remove_targets: Vec<String>,
     /// Commands whose backend execution was entered, in order.
     pub exec_calls: Vec<Vec<String>>,
     pub exec_deadlines: Vec<tokio::time::Instant>,
@@ -732,7 +737,7 @@ impl Runtime for FakeRuntime {
         _deadline: tokio::time::Instant,
         _cancel: &CancellationToken,
     ) -> Result<Option<super::NodeTotals>, RuntimeError> {
-        match self.state().node_totals {
+        match self.state().node_totals.clone() {
             Some(totals) => Ok(Some(totals)),
             None => Err(RuntimeError::Backend("node authority unavailable".into())),
         }
@@ -774,23 +779,29 @@ impl Runtime for FakeRuntime {
 
     async fn prepare(
         &self,
-        _context: &CreateContext,
+        _context: &PrepareContext,
         spec: &SandboxSpec,
         deadline: tokio::time::Instant,
         cancel: &CancellationToken,
     ) -> Result<PreparedCreate, RuntimeError> {
-        let (node_id, gate, fail, panics, ignores_cancel) = {
+        let (node_id, gate, fail, panics, ignores_cancel, token) = {
             let mut state = self.state();
             if state.mode == FakeEvidenceMode::Legacy {
                 return Ok(PreparedCreate::legacy(spec.clone(), "fake"));
             }
             state.fenced.prepare_calls += 1;
+            // B7: the fake authority issues the token, as the helper does: a sequence
+            // followed by a tag, never a daemon-minted ID.
+            state.fenced.issued += 1;
+            let mut bytes = *Id128::random().as_bytes();
+            bytes[..8].copy_from_slice(&state.fenced.issued.to_be_bytes());
             (
                 Self::fenced_node(&state),
                 state.fenced.prepare_gate.take(),
                 state.fenced.fail_prepare.clone(),
                 state.fenced.prepare_panics,
                 state.fenced.prepare_ignores_cancel,
+                Id128::from_bytes(bytes),
             )
         };
         if let Some(gate) = gate {
@@ -825,6 +836,7 @@ impl Runtime for FakeRuntime {
             "offline-768-v1",
             Digest::of(b"fake approved bundle"),
             node_id,
+            token,
         )
     }
 
@@ -1154,13 +1166,22 @@ impl Runtime for FakeRuntime {
 
     async fn remove(
         &self,
-        id: &str,
+        target: RemoveTarget<'_>,
         _deadline: tokio::time::Instant,
         _cancel: &CancellationToken,
     ) -> Result<AbsenceReceipt, RuntimeError> {
+        self.state().remove_targets.push(match target {
+            RemoveTarget::Legacy { backend_id } => format!("legacy:{backend_id}"),
+            RemoveTarget::Fenced { binding } => format!("fenced:{}", binding.allocation_id),
+        });
+        // B7: each regime accepts only its own target, refused before anything happens.
         if self.state().mode == FakeEvidenceMode::Fenced {
-            return self.remove_fenced(id).await;
+            let binding = target.fenced()?;
+            return self
+                .remove_fenced(&format!("fc-{}", binding.allocation_id))
+                .await;
         }
+        let id = target.legacy()?;
         let gate = {
             let mut s = self.state();
             s.remove_attempts.push(id.to_string());
@@ -1225,12 +1246,22 @@ impl Runtime for FakeRuntime {
 
     async fn gc(
         &self,
-        ids: &[String],
+        targets: &[RemoveTarget<'_>],
         _deadline: tokio::time::Instant,
         _cancel: &CancellationToken,
     ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
         let mut guard = self.state();
         let s = &mut *guard;
+        // B7: all or nothing: one target of the other regime refuses the whole call.
+        let ids: Vec<String> = if s.mode == FakeEvidenceMode::Fenced {
+            targets
+                .iter()
+                .map(|t| t.fenced().map(|b| format!("fc-{}", b.allocation_id)))
+                .collect::<Result<_, _>>()?
+        } else {
+            super::legacy_targets(targets)?
+        };
+        let ids = ids.as_slice();
         if s.unavailable {
             return Err(RuntimeError::Backend("fake backend unavailable".into()));
         }

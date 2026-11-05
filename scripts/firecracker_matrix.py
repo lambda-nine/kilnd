@@ -2,7 +2,7 @@
 firecracker-crash-matrix.py). Run in the kiln Lima VM as your user, under the shared VM
 lock, with the inputs scripts/b4-vm-tests.sh documents. It runs the named privileged
 tests through b4-vm-tests.sh (which builds, installs the test helper image and the
-daemon, and always runs scripts/b4-vm-cleanup.py), collects each test's `B6 matrix:` line
+daemon, and always runs scripts/b4-vm-cleanup.py), collects each test's `B6 matrix:` (or B7) line
 and libtest result, and writes matrix.json and matrix.md. It fails if any expected
 scenario is missing, failed or produced no matrix line. Nothing here touches the installed
 kilnd, its database or production paths."""
@@ -64,7 +64,7 @@ def run(title, prefix, scenarios, argv=None):
             passed = (proc.returncode == 0
                       and re.search(r'^test result: ok\. 1 passed', proc.stdout, re.M)
                       is not None)
-            lines = [json.loads(m) for m in re.findall(r'^B6 matrix: (\{.*\})$', proc.stdout,
+            lines = [json.loads(m) for m in re.findall(r'^B[67] matrix: (\{.*\})$', proc.stdout,
                                                          re.M)]
             results[name] = {
                 'passed': passed and len(lines) == 1,

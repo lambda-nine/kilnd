@@ -1109,6 +1109,25 @@ impl Store {
         })
     }
 
+    /// B7 RTC-14: the complete allocation token with the highest sequence among this
+    /// instance's fenced rows and its permanent release evidence, or none. A token's hex
+    /// prefix is its big-endian sequence, so the text maximum is the sequence maximum.
+    /// It is rollback evidence for the helper, which verifies its tag; never authority.
+    pub fn highest_fenced_token(&self, instance: Id128) -> Result<Option<Id128>> {
+        let highest: Option<String> = self.conn().query_row(
+            "SELECT MAX(allocation_id) FROM (
+                SELECT allocation_id FROM sandboxes
+                 WHERE accounting_kind = 'fenced' AND instance_id = ?1
+                UNION ALL
+                SELECT allocation_id FROM release_evidence WHERE instance_id = ?1)",
+            [instance.to_string()],
+            |row| row.get(0),
+        )?;
+        highest
+            .map(|text| Id128::parse(&text).map_err(anyhow::Error::msg))
+            .transpose()
+    }
+
     pub fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

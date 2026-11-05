@@ -23,6 +23,7 @@ use crate::model::{
 use crate::runtime::{
     AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendRecord, BackendStatus,
     CreateContext, CreateFailure, CreatedSandbox, EvidenceRegime, ExecFinish, ExecOutcome,
+    PrepareContext, RemoveTarget,
     ExecSpec, ExecutionContext, FencedAbsence, MAX_BACKEND_PLAN_BYTES, NodeTotals, PreparedCreate,
     Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt,
 };
@@ -467,9 +468,15 @@ impl<R: Runtime> Manager<R> {
         let gc_removed = if stale_owned.is_empty() {
             Vec::new()
         } else {
+            // Only legacy rows reach Gc (fenced rows recover by exact token), and each
+            // target is the Store's own: never List inventory or a cache.
+            let targets: Vec<RemoveTarget<'_>> = stale_owned
+                .iter()
+                .map(|backend_id| RemoveTarget::Legacy { backend_id })
+                .collect();
             let receipts = self
                 .runtime
-                .gc(&stale_owned, Instant::now() + LIST_TIMEOUT, &cancel)
+                .gc(&targets, Instant::now() + LIST_TIMEOUT, &cancel)
                 .await
                 .map_err(backend)?;
             let requested: HashSet<_> = stale_owned.iter().cloned().collect();
@@ -998,7 +1005,7 @@ impl<R: Runtime> Manager<R> {
             | AllocationObservation::StoppedWithResources { .. } => self
                 .runtime
                 .remove(
-                    &binding.backend_id(),
+                    RemoveTarget::Fenced { binding },
                     Instant::now() + REMOVE_TIMEOUT,
                     &cancel,
                 )
@@ -1058,7 +1065,7 @@ impl<R: Runtime> Manager<R> {
         match self
             .runtime
             .remove(
-                backend_id,
+                RemoveTarget::Legacy { backend_id },
                 Instant::now() + REMOVE_TIMEOUT,
                 &CancellationToken::new(),
             )
@@ -1293,6 +1300,21 @@ impl<R: Runtime> Manager<R> {
                         "node commitments exceed its ceilings (lowered?); the node admits nothing new",
                     );
                 }
+                if let Some(kind) = &totals.node_fault {
+                    serving = false;
+                    if !detail.is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str(&format!(
+                        "node fault ({kind}): every forward effect is latched node-wide until root's offline inventory and clear-node-faults"
+                    ));
+                }
+                if let Some(reason) = &totals.degraded {
+                    if !detail.is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str(&format!("node ledger degraded: {reason}"));
+                }
                 limits = totals.limits;
                 reserved = totals.reserved;
                 NodeAccountingStatus::Authoritative {
@@ -1314,6 +1336,25 @@ impl<R: Runtime> Manager<R> {
                 NodeAccountingStatus::Unavailable
             }
         };
+        // B7 (design 16.6): under a node-authority backend, rows of another backend
+        // never drain; Health says how many are still charged.
+        if capabilities.accounting == AccountingAuthority::Node {
+            let foreign = self
+                .store
+                .sandboxes(true)?
+                .iter()
+                .filter(|s| s.backend != self.runtime.name() && s.is_charged())
+                .count();
+            if foreign != 0 {
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&format!(
+                    "{foreign} charged row(s) of another backend cannot drain under {}: delete them with that backend selected",
+                    self.runtime.name()
+                ));
+            }
+        }
         if self.admission_blocked.load(Ordering::Relaxed) {
             serving = false;
             if !detail.is_empty() {
@@ -1389,17 +1430,35 @@ impl<R: Runtime> Manager<R> {
             ));
         }
         let spec = self.resolve_spec(req)?;
-        let context = CreateContext {
+        // Design 9.1 (B7): preparation names no allocation. A fenced backend's
+        // authority issues the token inside its preflight (RTC-2).
+        let prepare_context = PrepareContext {
             instance_id: self.store.identity()?.instance_id,
-            allocation_id: Id128::random(),
             sandbox_id: new_id("sb"),
         };
         // C0: read-only preflight. A rejection here leaves no row and no charge.
-        let prepared = self.prepare_create(&context, &spec).await;
+        let prepared = self.prepare_create(&prepare_context, &spec).await;
         // Serving may have ended during that await. An operation tracked since
         // create_owned still refuses here, before any reservation or allocation.
         self.check_serving()?;
         let prepared = prepared?;
+        // Built after preparation and before C1: the helper's token for a fenced plan,
+        // or for kiln a legacy random ID that records no allocation. The manager never
+        // invents a fenced token, and a plan whose token contradicts its regime stops here.
+        let allocation_id = match (prepared.regime(), prepared.allocation_id()) {
+            (EvidenceRegime::AbsenceFenced { .. }, Some(token)) => token,
+            (EvidenceRegime::LegacyLocal, None) => Id128::random(),
+            _ => {
+                return Err(Error::Backend(
+                    "the backend's plan and its allocation token disagree".into(),
+                ));
+            }
+        };
+        let context = CreateContext {
+            instance_id: prepare_context.instance_id,
+            allocation_id,
+            sandbox_id: prepare_context.sandbox_id,
+        };
         let binding = prepared.binding(&context);
         let now = now_ms();
         let sandbox = Sandbox {
@@ -1540,7 +1599,7 @@ impl<R: Runtime> Manager<R> {
     /// the result must commit to the exact spec this daemon resolved.
     async fn prepare_create(
         self: &Arc<Self>,
-        context: &CreateContext,
+        context: &PrepareContext,
         spec: &SandboxSpec,
     ) -> Result<PreparedCreate> {
         let task = {

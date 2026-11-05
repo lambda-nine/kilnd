@@ -6,6 +6,7 @@
 //! say READY: that needs B5's broker, and production profiles stay refused until B7.
 pub mod broker;
 pub mod cgroup;
+pub mod compaction;
 pub mod config;
 pub mod console;
 pub mod exec;
@@ -16,10 +17,12 @@ pub mod journal;
 mod lifecycle;
 pub mod manifest;
 pub mod monitor;
+pub mod offline;
 pub mod peer;
 pub mod proven;
 pub mod storage;
 pub mod supervisor;
+pub mod token;
 pub mod workers;
 
 use self::config::{MAX_ENROLLED_HARD, NodePolicy, ProfileCatalog};
@@ -460,6 +463,9 @@ struct WorkerSlot {
     exit: Option<String>,
     /// A single replacement is underway; it never runs beside its predecessor.
     replacing: bool,
+    /// B7 RTC-3: the ledger slot's K, sent by this very L over this channel and
+    /// published with it in one swap. Every other slot has none.
+    key: Option<token::TokenKey>,
 }
 
 impl WorkerSlot {
@@ -472,8 +478,21 @@ impl WorkerSlot {
             worker_id: None,
             exit: None,
             replacing: false,
+            key: None,
         }
     }
+}
+
+/// B7 RTC-14's in-memory latch in H. Once set it stays set for this process's life.
+#[derive(Default)]
+struct NodeLatch {
+    /// The fault kind, the only thing other instances are told.
+    kind: Option<String>,
+    /// The instance whose verified token detected a rollback.
+    detector: Option<Id128>,
+    /// A fault L reported but has not confirmed durable: every replacement L commits it
+    /// before it serves anything.
+    pending: Option<(Id128, Id128, u64)>,
 }
 
 /// The fixed infrastructure slots.
@@ -584,6 +603,14 @@ pub struct Node {
     next_authority: AtomicU64,
     generation_hint: AtomicU64,
     stop: CancellationToken,
+    /// B7 RTC-14: checked before any gate, L write or host action of forward work.
+    latched: std::sync::atomic::AtomicBool,
+    latch: Mutex<NodeLatch>,
+    /// B7: the last compaction stuck token, for Health.
+    compaction_fault: Mutex<Option<String>>,
+    /// Test instrumentation: L calls made and tokens refused by the tag check.
+    ledger_calls: AtomicU64,
+    tag_refusals: AtomicU64,
 }
 
 fn call_class(error: CallError) -> AmbiguousClass {
@@ -643,6 +670,7 @@ fn spawn_ledger_slot(
         workers::LEDGER_QUEUE_NORMAL,
         workers::LEDGER_QUEUE_RESERVED,
         workers::LEDGER_QUEUE_ATTACH,
+        workers::LEDGER_QUEUE_COMPACTION,
     )?;
     Ok(WorkerSlot::new(pid, channel))
 }
@@ -830,9 +858,15 @@ impl Node {
             next_authority: AtomicU64::new(1),
             generation_hint: AtomicU64::new(0),
             stop: CancellationToken::new(),
+            latched: std::sync::atomic::AtomicBool::new(false),
+            latch: Mutex::default(),
+            compaction_fault: Mutex::new(None),
+            ledger_calls: AtomicU64::new(0),
+            tag_refusals: AtomicU64::new(0),
         });
         tokio::spawn(Self::monitor_events(Arc::downgrade(&node), monitor_events));
         tokio::spawn(Self::supervise(Arc::downgrade(&node)));
+        tokio::spawn(Self::compactor(Arc::downgrade(&node)));
         drop(directory);
         if let Err(reason) = node.replay_at_startup().await {
             node.abandon_startup().await;
@@ -883,6 +917,18 @@ impl Node {
             Ok(LedgerReply::Replay(snapshot)) => {
                 self.generation_hint
                     .store(snapshot.generation, Ordering::Relaxed);
+                // A durable fault or the fail-stop marker latches H before it serves.
+                if let Some(kind) = snapshot.node_faults.first() {
+                    self.set_latch(kind, None, None);
+                }
+                // K comes over this private channel before any tag can be checked.
+                match self.fetch_key(&channel).await {
+                    Ok(key) => self.ledger.lock().unwrap().key = Some(key),
+                    Err(reason) => {
+                        *self.ledger_fault.lock().unwrap() = Some(reason);
+                        return Ok(());
+                    }
+                }
                 if let Err(reason) = self.load_shares(&snapshot.enrolled) {
                     // Refused whole. Nothing can attach, and kiln goes on being served.
                     *self.ledger_fault.lock().unwrap() = Some(reason);
@@ -1214,14 +1260,186 @@ impl Node {
             .await
     }
 
+    /// B7 RTC-14: from here every forward effect is refused node-wide, for the rest of
+    /// this process's life. `pending` is a fault not yet known durable.
+    fn set_latch(&self, kind: &str, detector: Option<Id128>, pending: Option<(Id128, Id128, u64)>) {
+        let mut latch = self.latch.lock().unwrap();
+        latch.kind.get_or_insert_with(|| kind.to_string());
+        if detector.is_some() {
+            latch.detector = detector;
+        }
+        if pending.is_some() {
+            latch.pending = pending;
+        }
+        self.latched.store(true, Ordering::SeqCst);
+    }
+
+    fn is_latched(&self) -> bool {
+        self.latched.load(Ordering::SeqCst)
+    }
+
+    /// The refusal every forward effect gets under the latch: no gate, no L write and
+    /// no host action (section 8.3's ledger-loss rule).
+    fn latch_refusal(&self) -> FirecrackerResponse {
+        let kind = self.latch.lock().unwrap().kind.clone();
+        group_error(
+            GroupErrorKind::Unavailable,
+            format!(
+                "forward effects are latched node-wide ({}): root must run the offline \
+                 inventory and clear-node-faults",
+                kind.unwrap_or_else(|| "fault".into())
+            ),
+        )
+    }
+
+    /// K, from this L over its own private channel (RTC-3).
+    async fn fetch_key(&self, channel: &Channel) -> Result<token::TokenKey, String> {
+        let reply = tokio::time::timeout(
+            REPLACEMENT_LEDGER_REPLY,
+            channel.call::<LedgerReply>(Lane::Reserved, &LedgerRequest::TokenKey, u64::MAX),
+        )
+        .await;
+        match reply {
+            Ok(Ok(LedgerReply::TokenKey(transfer))) => transfer
+                .into_key()
+                .filter(|key| key.node_id() == self.config.node_id)
+                .ok_or_else(|| "the ledger sent no valid token key".into()),
+            Ok(Ok(LedgerReply::Unavailable { reason } | LedgerReply::Failed { reason })) => {
+                Err(reason)
+            }
+            _ => Err("the ledger did not send its token key".into()),
+        }
+    }
+
+    /// A replacement L's handover before H publishes it (design 16.6, "H and L
+    /// replacement"): any pending RTC-14 fault is committed first, then K comes over the
+    /// new channel. Only both together, with the channel, are published.
+    async fn handover_ledger(&self, channel: &Channel) -> Result<token::TokenKey, String> {
+        let pending = self.latch.lock().unwrap().pending;
+        if let Some((instance, token, issue_next)) = pending {
+            let committed = tokio::time::timeout(
+                REPLACEMENT_LEDGER_REPLY,
+                channel.call::<LedgerReply>(
+                    Lane::Reserved,
+                    &LedgerRequest::CommitFault {
+                        instance,
+                        token,
+                        issue_next,
+                    },
+                    u64::MAX,
+                ),
+            )
+            .await;
+            match committed {
+                Ok(Ok(LedgerReply::FaultCommitted { .. })) => {
+                    self.latch.lock().unwrap().pending = None;
+                }
+                _ => return Err("it could not commit the pending rollback fault".into()),
+            }
+        }
+        self.fetch_key(channel).await
+    }
+
+    /// RTC-3's H check, before any gate, quota or L call: a constant-time tag check in
+    /// the caller's authenticated instance. No key yet means the ledger is unavailable,
+    /// which is not a verdict on the token.
+    fn check_token(&self, instance: Id128, token: Id128) -> Result<u64, Box<FirecrackerResponse>> {
+        let slot = self.ledger.lock().unwrap();
+        let Some(key) = slot.key.as_ref() else {
+            return Err(Box::new(group_error(
+                GroupErrorKind::Unavailable,
+                "the node ledger's token key is not available",
+            )));
+        };
+        key.verify(instance, token).ok_or_else(|| {
+            self.tag_refusals.fetch_add(1, Ordering::Relaxed);
+            Box::new(group_error(
+                GroupErrorKind::Incompatible,
+                "this allocation token was not issued to this instance",
+            ))
+        })
+    }
+
+    /// B7 RTC-18: one compaction pass at a time on the compaction lane, each instance in
+    /// round-robin order, the next batch only after the previous reply. L decides from its
+    /// boot clock whether a checkpoint or an advance is due; H only keeps passes coming.
+    async fn compactor(node: std::sync::Weak<Self>) {
+        let tick = match node.upgrade() {
+            Some(node) => node.config.timings.compaction_tick,
+            None => return,
+        };
+        loop {
+            tokio::time::sleep(tick).await;
+            let Some(node) = node.upgrade() else { return };
+            if node.stop.is_cancelled() {
+                return;
+            }
+            let instances: Vec<Id128> = {
+                let shares = node.shares.lock().unwrap();
+                match shares.as_ref() {
+                    Some(shares) => {
+                        let mut ids: Vec<_> = shares.by_instance.keys().copied().collect();
+                        ids.sort();
+                        ids
+                    }
+                    None => continue,
+                }
+            };
+            for instance in instances {
+                // A due instance keeps its turn while its batches come back full.
+                for _ in 0..64 {
+                    if node.stop.is_cancelled() {
+                        return;
+                    }
+                    let reply = node
+                        .ledger_call(
+                            Lane::Compaction,
+                            &LedgerRequest::Compact {
+                                instance,
+                                max_tokens: journal::COMPACTION_BATCH,
+                            },
+                            u64::MAX,
+                        )
+                        .await;
+                    match reply {
+                        Ok(LedgerReply::Compacted(reply)) => {
+                            *node.compaction_fault.lock().unwrap() =
+                                reply.batch.stuck.first().map(|token| {
+                                    format!("fenced token {token} cannot be compacted")
+                                });
+                            if !reply.more {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
     async fn ledger_call(
         &self,
         lane: Lane,
         request: &LedgerRequest,
         deadline_ns: u64,
     ) -> Result<LedgerReply, CallError> {
+        // The compactor's own passes are not request work; the counter is for proving
+        // that a refused request made no L call at all.
+        if lane != Lane::Compaction {
+            self.ledger_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let channel = self.ledger_channel();
         let reply = channel.call(lane, request, deadline_ns).await;
+        // RTC-R2-01: a failed commit latched L and wrote the fail-stop marker. H latches
+        // too, and the caller sees an ordinary failure that proves nothing.
+        let reply = match reply {
+            Ok(LedgerReply::SyncFailed { reason }) => {
+                self.set_latch("fail_stop", None, None);
+                Ok(LedgerReply::Failed { reason })
+            }
+            other => other,
+        };
         if let Ok(LedgerReply::Oversized { bytes }) = &reply {
             // L stayed up and refused the answer; whatever asked treats it as Unknown
             // and stays charged (B5-01). Health says so until the helper restarts.
@@ -1703,7 +1921,20 @@ impl Node {
         let (prior, evidence) = self.with_slot(kind, |slot| (slot.worker_id, slot.exit.clone()));
         let evidence = evidence.unwrap_or_else(|| "exited".into());
         let Some(image) = self.config.helper_image else {
-            let spawned = self.spawn_slot(kind).map_err(|_| ())?;
+            let mut spawned = self.spawn_slot(kind).map_err(|_| ())?;
+            if kind == SlotKind::Ledger {
+                let channel = spawned.worker().channel.clone();
+                match self.handover_ledger(&channel).await {
+                    Ok(key) => spawned.worker_mut().key = Some(key),
+                    Err(reason) => {
+                        channel.close();
+                        self.discarded.lock().unwrap().push(spawned.worker().pid);
+                        *self.ledger_replacement_fault.lock().unwrap() =
+                            Some(format!("the ledger was not replaced: {reason}"));
+                        return Err(());
+                    }
+                }
+            }
             self.publish_slot(kind, spawned);
             return Ok(());
         };
@@ -1784,12 +2015,23 @@ impl Node {
         })?;
         let channel = spawned.worker().channel.clone();
         let pid = spawned.worker().pid;
-        match self
+        let journaled = match self
             .journal_replacement_ledger(&channel, pid, prior, evidence, spec)
             .await
         {
             Ok(worker_id) => {
+                #[cfg(test)]
+                workers::faults::hold("H.ledger.before_publish").await;
+                self.handover_ledger(&channel)
+                    .await
+                    .map(|key| (worker_id, key))
+            }
+            Err(reason) => Err(reason),
+        };
+        match journaled {
+            Ok((worker_id, key)) => {
                 spawned.worker_mut().worker_id = Some(worker_id);
+                spawned.worker_mut().key = Some(key);
                 self.publish_slot(SlotKind::Ledger, spawned);
                 *self.ledger_replacement_fault.lock().unwrap() = None;
                 *self.ledger_retry_at.lock().unwrap() = None;
@@ -1930,15 +2172,55 @@ impl Node {
     ) -> FirecrackerResponse {
         let instance = request.instance_id;
         let epoch = request.connection_epoch;
-        if let FirecrackerOperation::AttachInstance { database_uuid } = request.operation {
+        if let FirecrackerOperation::AttachInstance {
+            database_uuid,
+            highest_token,
+        } = request.operation
+        {
             return self
-                .attach(instance, database_uuid, peer, pin, deadline)
+                .attach(instance, database_uuid, highest_token, peer, pin, deadline)
                 .await;
         }
         let peer = PeerCredentials {
             uid: self.observed_uid(peer, instance),
             ..peer
         };
+        // B7 RTC-3: every token a request names is tag-checked in the caller's instance
+        // before any gate, quota or L call (a Gc's whole vector, all or nothing). Only
+        // the instance's live holder gets even this answer.
+        let tokens: Vec<Id128> = match &request.operation {
+            FirecrackerOperation::Create { allocation_id, .. }
+            | FirecrackerOperation::FenceAbsent { allocation_id, .. }
+            | FirecrackerOperation::Stop { allocation_id, .. }
+            | FirecrackerOperation::Remove { allocation_id, .. }
+            | FirecrackerOperation::Inspect { allocation_id, .. }
+            | FirecrackerOperation::Validate { allocation_id, .. }
+            | FirecrackerOperation::Exec { allocation_id, .. } => vec![*allocation_id],
+            FirecrackerOperation::Gc { targets } => {
+                targets.iter().map(|t| t.allocation_id).collect()
+            }
+            _ => Vec::new(),
+        };
+        if !tokens.is_empty() && self.is_holder(instance, peer) {
+            for token in &tokens {
+                if let Err(refusal) = self.check_token(instance, *token) {
+                    return *refusal;
+                }
+            }
+        }
+        // B7 RTC-14: under the latch, work that starts anything is refused before any
+        // gate, L write or host action. Cleanup and reads stay.
+        if self.is_latched()
+            && matches!(
+                request.operation,
+                FirecrackerOperation::Preflight { .. }
+                    | FirecrackerOperation::Create { .. }
+                    | FirecrackerOperation::Validate { .. }
+                    | FirecrackerOperation::Exec { .. }
+            )
+        {
+            return self.latch_refusal();
+        }
         match request.operation {
             FirecrackerOperation::AttachInstance { .. } => unreachable!("handled above"),
             FirecrackerOperation::Create {
@@ -2050,7 +2332,10 @@ impl Node {
                     .await;
                 FirecrackerResponse::Stop(reply)
             }
-            FirecrackerOperation::Remove { allocation_id } => {
+            FirecrackerOperation::Remove {
+                allocation_id,
+                plan_digest,
+            } => {
                 let (Some(share), true) = (self.share(instance), self.is_holder(instance, peer))
                 else {
                     return FirecrackerResponse::Remove(ambiguous_fence(
@@ -2064,6 +2349,7 @@ impl Node {
                     epoch,
                     peer,
                     allocation: allocation_id,
+                    plan_digest,
                     deadline,
                 };
                 let reply = self
@@ -2078,7 +2364,7 @@ impl Node {
                     .await;
                 FirecrackerResponse::Remove(reply)
             }
-            FirecrackerOperation::Gc { allocation_ids } => {
+            FirecrackerOperation::Gc { targets } => {
                 let (Some(share), true) = (self.share(instance), self.is_holder(instance, peer))
                 else {
                     return group_error(
@@ -2093,13 +2379,13 @@ impl Node {
                     );
                 }
                 let node = self.clone();
-                let anchor = allocation_ids
+                let anchor = targets
                     .first()
-                    .copied()
+                    .map(|t| t.allocation_id)
                     .unwrap_or_else(Id128::random);
                 let reply = self
                     .run_detached(&share, deadline, cancel, anchor, Vec::new(), move || {
-                        node.gc_flow(instance, epoch, peer, allocation_ids, deadline)
+                        node.gc_flow(instance, epoch, peer, targets, deadline)
                     })
                     .await;
                 FirecrackerResponse::Gc(reply)
@@ -2193,26 +2479,24 @@ impl Node {
                 }
                 let response = async {
                     match operation {
-                        FirecrackerOperation::Capabilities => self.capabilities(),
-                        FirecrackerOperation::Accounting => self.accounting(deadline).await,
+                        FirecrackerOperation::Capabilities => self.capabilities(instance),
+                        FirecrackerOperation::Accounting => {
+                            self.accounting(instance, deadline).await
+                        }
                         FirecrackerOperation::Preflight {
-                            allocation_id,
                             sandbox_id,
                             profile,
                             spec,
                         } => {
-                            self.preflight(
-                                instance,
-                                allocation_id,
-                                sandbox_id,
-                                profile,
-                                spec,
-                                deadline,
-                            )
-                            .await
+                            self.preflight(instance, sandbox_id, profile, spec, deadline)
+                                .await
                         }
-                        FirecrackerOperation::Inspect { allocation_id } => {
-                            self.inspect(instance, allocation_id, deadline).await
+                        FirecrackerOperation::Inspect {
+                            allocation_id,
+                            plan_digest,
+                        } => {
+                            self.inspect(instance, allocation_id, plan_digest, deadline)
+                                .await
                         }
                         FirecrackerOperation::List => {
                             // Holds a whole normal operation open for the budget tests.
@@ -2281,6 +2565,7 @@ impl Node {
         self: &Arc<Self>,
         instance: Id128,
         database_uuid: Id128,
+        highest_token: Option<Id128>,
         peer: PeerCredentials,
         pin: Option<PeerPin>,
         deadline: WireDeadline,
@@ -2343,6 +2628,14 @@ impl Node {
                 "another live holder has this instance",
             );
         }
+        // B7 RTC-14: the report is checked exactly as RTC-3 checks any token, in this
+        // account's own instance. A malformed, foreign or bit-flipped report fails this
+        // attachment alone, with no L call, latch or write.
+        if let Some(token) = highest_token
+            && let Err(refusal) = self.check_token(instance, token)
+        {
+            return *refusal;
+        }
         let reply = tokio::time::timeout_at(
             deadline.instant,
             self.ledger_call(
@@ -2351,12 +2644,16 @@ impl Node {
                     instance,
                     database_uuid,
                     peer_pid,
+                    highest_token,
                 },
                 deadline.ns,
             ),
         )
         .await;
         let (outcome, peer_start) = match reply {
+            Ok(Ok(LedgerReply::FaultPending { token, issue_next })) => {
+                return self.rollback_detected(instance, token, issue_next).await;
+            }
             Ok(Ok(LedgerReply::Attached {
                 outcome,
                 peer_start,
@@ -2393,11 +2690,15 @@ impl Node {
                     "this instance is not enrolled",
                 );
             }
-            AttachOutcome::NoSpace => {
+            AttachOutcome::Malformed => {
                 return group_error(
-                    GroupErrorKind::ResourceExhausted,
-                    "the ledger has no room for a first attachment",
+                    GroupErrorKind::Incompatible,
+                    "the reported highest token was not issued to this instance",
                 );
+            }
+            AttachOutcome::Latched => return self.latch_refusal(),
+            AttachOutcome::RollbackDetected { token, issue_next } => {
+                return self.rollback_detected(instance, token, issue_next).await;
             }
         };
         {
@@ -2439,6 +2740,40 @@ impl Node {
             connection_epoch: epoch,
             admission_open,
         }
+    }
+
+    /// B7 RTC-14 and RTC-R2-03: L has latched and written nothing. H latches here, in
+    /// memory and atomically, and only then asks L to commit the fault. If the commit
+    /// fails or its outcome is unknown, the fault stays pending: every replacement L
+    /// commits it before serving, and the latch stays for this process's life.
+    async fn rollback_detected(
+        self: &Arc<Self>,
+        instance: Id128,
+        token: Id128,
+        issue_next: u64,
+    ) -> FirecrackerResponse {
+        tracing::error!(%instance, %token, issue_next, "rollback detected: the node ledger is behind a verified token");
+        self.set_latch("rollback", Some(instance), Some((instance, token, issue_next)));
+        #[cfg(test)]
+        workers::faults::hold("H.fault.latched_before_commit").await;
+        let committed = self
+            .ledger_call(
+                Lane::Reserved,
+                &LedgerRequest::CommitFault {
+                    instance,
+                    token,
+                    issue_next,
+                },
+                u64::MAX,
+            )
+            .await;
+        if matches!(committed, Ok(LedgerReply::FaultCommitted { .. })) {
+            self.latch.lock().unwrap().pending = None;
+        }
+        group_error(
+            GroupErrorKind::Incompatible,
+            "the reported token is ahead of the node ledger: a rollback is latched node-wide",
+        )
     }
 
     fn holder_alive(&self, instance: Id128) -> bool {
@@ -2485,7 +2820,7 @@ impl Node {
     }
 
     /// Cached: no worker is asked. It answers while every worker is stuck.
-    fn capabilities(&self) -> FirecrackerResponse {
+    fn capabilities(&self, instance: Id128) -> FirecrackerResponse {
         let stale = self.stale_workers.lock().unwrap().clone();
         let monitor = if self.monitor_healthy() {
             WorkerHealth::Healthy
@@ -2521,6 +2856,17 @@ impl Node {
                 .filter(|entry| entry.exit.is_none())
                 .count() as u64,
             ledger_fault,
+            node_fault: {
+                let latch = self.latch.lock().unwrap();
+                latch.kind.as_ref().map(|kind| {
+                    if latch.detector == Some(instance) {
+                        format!("{kind}: detected by this instance's verified token")
+                    } else {
+                        kind.clone()
+                    }
+                })
+            },
+            compaction_fault: self.compaction_fault.lock().unwrap().clone(),
         };
         FirecrackerResponse::Capabilities(CapabilitiesReply {
             group_version: FIRECRACKER_GROUP_VERSION,
@@ -2538,10 +2884,16 @@ impl Node {
         })
     }
 
-    async fn accounting(&self, deadline: WireDeadline) -> FirecrackerResponse {
+    async fn accounting(&self, instance: Id128, deadline: WireDeadline) -> FirecrackerResponse {
         let reply = tokio::time::timeout_at(
             deadline.instant,
-            self.ledger_call(Lane::Reserved, &LedgerRequest::Accounting, deadline.ns),
+            self.ledger_call(
+                Lane::Reserved,
+                &LedgerRequest::Accounting {
+                    instance: Some(instance),
+                },
+                deadline.ns,
+            ),
         )
         .await;
         FirecrackerResponse::Accounting(match reply {
@@ -2555,10 +2907,13 @@ impl Node {
         })
     }
 
+    /// B7 RTC-2 and RTC-4: the helper issues the token. L commits the exact pointer and
+    /// the identity snapshot in one transaction; P then binds the token into the plan.
+    /// Once committed the seq may be abandoned (a refusal from P, a lost reply), never
+    /// reused.
     async fn preflight(
         self: &Arc<Self>,
         instance: Id128,
-        allocation: Id128,
         sandbox_id: String,
         profile: String,
         spec: SandboxSpec,
@@ -2576,35 +2931,55 @@ impl Node {
         if deadline.expired() {
             return group_error(GroupErrorKind::Unavailable, "preflight deadline expired");
         }
-        let snapshot = self
+        // Take the preparation slot before issuing, so a busy node refuses without
+        // consuming a seq. Preflight never waits for one.
+        let Some(lease) = self.try_prep_slot() else {
+            return group_error(
+                GroupErrorKind::ResourceExhausted,
+                "every preparation slot is in use",
+            );
+        };
+        #[cfg(test)]
+        workers::faults::hold("H.preflight.before_issue").await;
+        if self.is_latched() {
+            return self.latch_refusal();
+        }
+        let issued = self
             .ledger_call(
                 Lane::Normal,
-                &LedgerRequest::PreflightSnapshot {
-                    instance,
-                    allocation,
-                },
+                &LedgerRequest::IssueAndSnapshot { instance },
                 deadline.ns,
             )
             .await;
-        let claimed = match snapshot {
-            Ok(LedgerReply::PreflightSnapshot {
-                claimed,
-                retired_or_active,
-                headroom,
-            }) => {
-                if retired_or_active {
-                    return group_error(
-                        GroupErrorKind::OwnershipConflict,
-                        "this allocation token was already used",
-                    );
-                }
-                if !headroom {
-                    return group_error(
+        let (allocation, claimed) = match issued {
+            Ok(LedgerReply::Issued(journal::IssueOutcome::Issued { token, claimed })) => {
+                (token, claimed)
+            }
+            Ok(LedgerReply::Issued(journal::IssueOutcome::Refused { refusal })) => {
+                use journal::IssueRefusal;
+                return match refusal {
+                    IssueRefusal::Latched => self.latch_refusal(),
+                    IssueRefusal::Headroom => group_error(
                         GroupErrorKind::ResourceExhausted,
-                        "no fence headroom is left for another token",
-                    );
-                }
-                claimed
+                        "no admitted headroom is left for this instance",
+                    ),
+                    IssueRefusal::NeverAdmittedFloor => group_error(
+                        GroupErrorKind::ResourceExhausted,
+                        "this instance's never-admitted fences fill its window quota",
+                    ),
+                    IssueRefusal::Exhausted => group_error(
+                        GroupErrorKind::ResourceExhausted,
+                        "this instance's issue sequence is exhausted",
+                    ),
+                    IssueRefusal::LedgerSpace => group_error(
+                        GroupErrorKind::ResourceExhausted,
+                        "the node ledger is past its share of the reservation",
+                    ),
+                    IssueRefusal::NotEnrolled => group_error(
+                        GroupErrorKind::Unauthorized,
+                        "this instance is not enrolled",
+                    ),
+                };
             }
             Ok(LedgerReply::Unavailable { reason } | LedgerReply::Failed { reason }) => {
                 return group_error(GroupErrorKind::Unavailable, reason);
@@ -2614,8 +2989,11 @@ impl Node {
             }
             _ => return group_error(GroupErrorKind::Unavailable, "ledger did not answer"),
         };
+        #[cfg(test)]
+        workers::faults::hold("H.preflight.after_l_reply_before_public").await;
         match self
-            .prep_call(
+            .prep_with(
+                lease,
                 PrepRequest::Preflight {
                     instance,
                     allocation,
@@ -2628,7 +3006,16 @@ impl Node {
             )
             .await
         {
-            Ok(PrepReply::Prepared(prepared)) => FirecrackerResponse::Prepared(prepared),
+            Ok(PrepReply::Prepared(prepared)) if prepared.allocation_id == allocation => {
+                if workers::fault_enabled("H.preflight.drop_public_reply") {
+                    return group_error(GroupErrorKind::Unavailable, "injected lost reply");
+                }
+                FirecrackerResponse::Prepared(prepared)
+            }
+            Ok(PrepReply::Prepared(_)) => group_error(
+                GroupErrorKind::Unavailable,
+                "preparation bound another token",
+            ),
             Ok(PrepReply::Refused { reason }) => group_error(GroupErrorKind::Incompatible, reason),
             Err(CallError::Full) => group_error(
                 GroupErrorKind::ResourceExhausted,
@@ -2694,6 +3081,27 @@ impl Node {
                     phase,
                     replay: true,
                 };
+            }
+            // B7 RTC-8: absent forever. No gate is closed or retained (RTC-15).
+            Ok(LedgerReply::Lookup(TokenLookup::Compacted { receipt })) => {
+                gate.mark_durable();
+                return CreateReply::Absent {
+                    receipt: WireBytes(receipt),
+                };
+            }
+            Ok(LedgerReply::Lookup(TokenLookup::NotIssued)) => {
+                gate.mark_durable();
+                return ambiguous_create(
+                    AmbiguousClass::NotIssued,
+                    "this token was never issued by this node ledger",
+                );
+            }
+            Ok(LedgerReply::Lookup(TokenLookup::Malformed)) => {
+                gate.mark_durable();
+                return ambiguous_create(
+                    AmbiguousClass::Conflict,
+                    "this token does not verify in this instance",
+                );
             }
             Ok(LedgerReply::Lookup(TokenLookup::Unknown)) => {}
             Ok(LedgerReply::Unavailable { reason } | LedgerReply::Failed { reason }) => {
@@ -2820,6 +3228,8 @@ impl Node {
             .iter()
             .map(|name| name.to_string())
             .collect();
+        #[cfg(test)]
+        workers::faults::hold("H.create.before_admit").await;
         let plan_generation_request =
             admit_request(&token, *revalidated, &cgroup, &allowed_names, image);
         let expected = plan_generation_request.executables.clone();
@@ -2852,10 +3262,18 @@ impl Node {
                 }
                 // The commit may have raced a revocation, or its reply a deadline. Either
                 // way the claim is durable, and held for an exact fence: nothing starts.
+                #[cfg(test)]
+                workers::faults::hold("H.create.before_effects").await;
                 let refused = if !self.revocations.is_current(&authority) {
                     Some((
                         AmbiguousClass::OldEpoch,
                         "the attachment was replaced as this committed",
+                    ))
+                } else if self.is_latched() {
+                    // RTC-R2-03: the latch linearized before any host effect began.
+                    Some((
+                        AmbiguousClass::Latched,
+                        "forward effects are latched node-wide; nothing starts",
                     ))
                 } else if token.deadline.expired() {
                     Some((
@@ -3348,6 +3766,27 @@ impl Node {
             }
             Ok(LedgerReply::Lookup(TokenLookup::Active { .. })) => gate.mark_durable(),
             Ok(LedgerReply::Lookup(TokenLookup::Unknown)) => never_admitted = true,
+            // B7 RTC-8: a synthesized receipt for this request's digest; nothing acts.
+            Ok(LedgerReply::Lookup(TokenLookup::Compacted { receipt })) => {
+                gate.mark_durable();
+                return FenceReply::Absent {
+                    receipt: WireBytes(receipt),
+                };
+            }
+            Ok(LedgerReply::Lookup(TokenLookup::NotIssued)) => {
+                gate.mark_durable();
+                return ambiguous_fence(
+                    AmbiguousClass::NotIssued,
+                    "this token was never issued by this node ledger",
+                );
+            }
+            Ok(LedgerReply::Lookup(TokenLookup::Malformed)) => {
+                gate.mark_durable();
+                return ambiguous_fence(
+                    AmbiguousClass::Conflict,
+                    "this token does not verify in this instance",
+                );
+            }
             Ok(LedgerReply::Unavailable { reason } | LedgerReply::Failed { reason }) => {
                 return ambiguous_fence(AmbiguousClass::LedgerUnavailable, reason);
             }
@@ -3616,6 +4055,7 @@ impl Node {
         &self,
         instance: Id128,
         allocation: Id128,
+        plan_digest: Digest,
         deadline: WireDeadline,
     ) -> FirecrackerResponse {
         let reply = self
@@ -3624,16 +4064,23 @@ impl Node {
                 &LedgerRequest::Inspect {
                     instance,
                     allocation,
+                    plan_digest,
                 },
                 deadline.ns,
             )
             .await;
         FirecrackerResponse::Inspect(match reply {
-            Ok(LedgerReply::Lookup(TokenLookup::Fenced { receipt })) => {
-                InspectReply::AbsentFenced {
-                    receipt: WireBytes(receipt),
-                }
-            }
+            Ok(LedgerReply::Lookup(
+                TokenLookup::Fenced { receipt } | TokenLookup::Compacted { receipt },
+            )) => InspectReply::AbsentFenced {
+                receipt: WireBytes(receipt),
+            },
+            Ok(LedgerReply::Lookup(TokenLookup::NotIssued)) => InspectReply::Incompatible {
+                message: "this token was never issued by this node ledger".into(),
+            },
+            Ok(LedgerReply::Lookup(TokenLookup::Malformed)) => InspectReply::Incompatible {
+                message: "this token does not verify in this instance".into(),
+            },
             Ok(LedgerReply::Lookup(TokenLookup::Conflict { reason })) => {
                 InspectReply::Incompatible { message: reason }
             }
@@ -3788,6 +4235,12 @@ impl Node {
             "detached_available": self.shares.lock().unwrap().iter().flat_map(|shares| shares.by_instance.values()).map(|share| share.detached.available_permits()).sum::<usize>(),
             "removing": self.removing.lock().unwrap().len(),
             "peer_starts": self.attachments.lock().unwrap().values().map(|a| a.peer_start).collect::<Vec<_>>(),
+            // B7 instrumentation: every call to L, tokens H refused by their tag, and
+            // the RTC-14 latch.
+            "ledger_calls": self.ledger_calls.load(Ordering::Relaxed),
+            "tag_refusals": self.tag_refusals.load(Ordering::Relaxed),
+            "latched": self.is_latched(),
+            "pending_fault": self.latch.lock().unwrap().pending.is_some(),
         })
     }
 }
@@ -3954,15 +4407,19 @@ pub fn production_config(policy: NodePolicy, helper_uid: u32) -> NodeConfig {
             policy: walk.clone(),
             node_id: policy.node_id,
             ceilings: policy.ceilings,
-            shared: config::SharedReserve::default(),
+            shared: policy.shared,
             max_enrolled: policy.max_enrolled_instances,
+            compaction: policy.compaction,
         },
         ranges: policy.identity_ranges,
         profiles,
         walk,
         gate: ManifestGate::ProductionDisabled,
         observation: ObservationBackend::Real,
-        timings: Timings::default(),
+        timings: Timings {
+            compaction_tick: Duration::from_millis((policy.compaction.pass_ms / 4).max(250)),
+            ..Timings::default()
+        },
         helper_image,
         helper_uid,
         max_enrolled: policy.max_enrolled_instances,
@@ -3997,9 +4454,42 @@ fn root_ledger_config(policy: &NodePolicy) -> LedgerConfig {
         policy: WalkPolicy::production(),
         node_id: policy.node_id,
         ceilings: policy.ceilings,
-        shared: config::SharedReserve::default(),
+        shared: policy.shared,
         max_enrolled: policy.max_enrolled_instances,
+        compaction: policy.compaction,
     }
+}
+
+/// B7: root's mandatory offline inventory (design 16.6, 16.7), over the real owned
+/// namespaces. It reports and destroys nothing.
+pub fn offline_inventory(
+    policy: &NodePolicy,
+    daemon_databases: &std::collections::BTreeMap<Id128, std::path::PathBuf>,
+    report: &Path,
+) -> Result<String, String> {
+    let report = offline::offline_inventory(
+        &root_ledger_config(policy),
+        &ObservationBackend::Real,
+        daemon_databases,
+        report,
+    )?;
+    Ok(format!(
+        "verdict {}: {} unexplained, {} faults, ledger generation {}",
+        report.verdict,
+        report.unexplained.len(),
+        report.faults.len(),
+        report.ledger_generation
+    ))
+}
+
+/// B7: root's offline RTC-14 fault clear, from an explained, current inventory report.
+pub fn clear_node_faults(policy: &NodePolicy, report: &Path) -> Result<String, String> {
+    offline::clear_node_faults(&root_ledger_config(policy), report)
+}
+
+/// B7: read-only per-instance token statistics.
+pub fn ledger_stats(policy: &NodePolicy) -> Result<String, String> {
+    offline::ledger_stats(&root_ledger_config(policy))
 }
 
 /// Runs one root command on the ledger under the node lock, which only a stopped helper

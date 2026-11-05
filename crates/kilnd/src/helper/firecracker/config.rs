@@ -73,7 +73,8 @@ impl Default for SharedReserve {
             host_pids: 32,
             disk_bytes: 512 * MIB,
             store_bytes: 1024 * MIB,
-            fence_allowance_bytes: 64 * MIB,
+            // B7 (design 16.4): 8,192 entries at the measured 16 KiB per token.
+            fence_allowance_bytes: 128 * MIB,
         }
     }
 }
@@ -110,6 +111,10 @@ pub struct NodePolicy {
     pub max_enrolled_instances: u32,
     pub identity_ranges: IdentityRanges,
     pub profiles: Vec<ProfileCatalog>,
+    /// B7: the shared reserve, whose fence allowance root may lower for a test node.
+    pub shared: SharedReserve,
+    /// B7: compaction lease and pass (design 16.4), root policy only.
+    pub compaction: super::journal::CompactionPolicy,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +137,15 @@ struct WirePolicy {
     gid_range: WireRange,
     cid_range: WireRange,
     profiles: Vec<ProfileCatalog>,
+    /// B7: optional, root only. A whole number of 16 KiB entries, at least 16, at most
+    /// the default 128 MiB.
+    #[serde(default)]
+    fence_allowance_bytes: Option<u64>,
+    /// B7: optional, root only; defaults 900 and 60 seconds.
+    #[serde(default)]
+    compaction_lease_seconds: Option<u64>,
+    #[serde(default)]
+    compaction_pass_seconds: Option<u64>,
 }
 
 /// Valid profile names are `[a-z0-9-]`, 1 to 64 bytes.
@@ -176,7 +190,43 @@ pub fn parse_policy(raw: &[u8], service_uid: u32) -> Result<NodePolicy, String> 
     if !wire.ledger_dir.is_absolute() {
         return Err("ledger directory must be absolute".into());
     }
-    validate_ceilings(&wire.ceilings, &SharedReserve::default())?;
+    let mut shared = SharedReserve::default();
+    if let Some(bytes) = wire.fence_allowance_bytes {
+        let entry = super::journal::FENCE_ENTRY_BOUND;
+        if bytes % entry != 0 || bytes < 16 * entry || bytes > shared.fence_allowance_bytes {
+            return Err(format!(
+                "fence_allowance_bytes must be a multiple of {entry}, from 16 entries to {}",
+                shared.fence_allowance_bytes
+            ));
+        }
+        // Every policy slot needs at least one never-admitted fence in its window, or
+        // Preflight's issuance floor could never issue a token (RTC-12).
+        if bytes / entry / 4 < u64::from(wire.max_enrolled_instances.max(1)) {
+            return Err(format!(
+                "fence_allowance_bytes must hold at least {} entries for {} instances",
+                4 * wire.max_enrolled_instances.max(1),
+                wire.max_enrolled_instances
+            ));
+        }
+        shared.fence_allowance_bytes = bytes;
+    }
+    let mut compaction = super::journal::CompactionPolicy::default();
+    if let Some(seconds) = wire.compaction_lease_seconds {
+        compaction.lease_ms = seconds.saturating_mul(1000);
+    }
+    if let Some(seconds) = wire.compaction_pass_seconds {
+        compaction.pass_ms = seconds.saturating_mul(1000);
+    }
+    if compaction.pass_ms < 1000
+        || compaction.lease_ms < 2 * compaction.pass_ms
+        || compaction.lease_ms > 86_400_000
+        || compaction.checkpoint_bound() > 1442
+    {
+        return Err("compaction lease must be at least two passes of at least 1 s, and at \
+                    most a day"
+            .into());
+    }
+    validate_ceilings(&wire.ceilings, &shared)?;
     if wire.max_enrolled_instances == 0 || wire.max_enrolled_instances > MAX_ENROLLED_HARD {
         return Err(format!(
             "max_enrolled_instances must be between 1 and {MAX_ENROLLED_HARD}"
@@ -189,6 +239,8 @@ pub fn parse_policy(raw: &[u8], service_uid: u32) -> Result<NodePolicy, String> 
         max_enrolled_instances: wire.max_enrolled_instances,
         identity_ranges: ranges,
         profiles: wire.profiles,
+        shared,
+        compaction,
     })
 }
 
@@ -732,6 +784,55 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn b7_policy_sets_the_allowance_and_compaction_timing_within_bounds() {
+        use crate::helper::firecracker::journal::{CompactionPolicy, FENCE_ENTRY_BOUND};
+        let good = json!({
+            "schema": POLICY_SCHEMA,
+            "node_id": "11".repeat(16),
+            "ledger_dir": DEFAULT_LEDGER_DIR,
+            "ceilings": NodeCeilings::default(),
+            "max_enrolled_instances": 1,
+            "uid_range": {"first": 300000, "last": 365535},
+            "gid_range": {"first": 300000, "last": 365535},
+            "cid_range": {"first": 3, "last": 65535},
+            "profiles": [],
+        });
+        let parse = |value: &Value| parse_policy(&canonical(value).unwrap(), 999);
+        let defaults = parse(&good).unwrap();
+        assert_eq!(defaults.shared, SharedReserve::default());
+        assert_eq!(defaults.compaction, CompactionPolicy::default());
+        assert_eq!(defaults.compaction.checkpoint_bound(), 17);
+        // The real-chain test policy: 64 entries, a 3-minute lease.
+        let mut test = good.clone();
+        test["fence_allowance_bytes"] = json!(64 * FENCE_ENTRY_BOUND);
+        test["compaction_lease_seconds"] = json!(180);
+        test["compaction_pass_seconds"] = json!(30);
+        let policy = parse(&test).unwrap();
+        assert_eq!(policy.shared.fence_allowance_bytes, 64 * FENCE_ENTRY_BOUND);
+        assert_eq!(policy.compaction.lease_ms, 180_000);
+        assert_eq!(policy.compaction.checkpoint_bound(), 8);
+        for (name, field, value) in [
+            ("not whole entries", "fence_allowance_bytes", json!(64 * FENCE_ENTRY_BOUND + 1)),
+            ("too few entries", "fence_allowance_bytes", json!(8 * FENCE_ENTRY_BOUND)),
+            ("above the default", "fence_allowance_bytes", json!(256 * MIB)),
+            ("pass under a second", "compaction_pass_seconds", json!(0)),
+            ("lease under two passes", "compaction_lease_seconds", json!(90)),
+            ("lease over a day", "compaction_lease_seconds", json!(86_401)),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value;
+            assert!(parse(&bad).is_err(), "{name}");
+        }
+        // Every slot needs a never-admitted window: 16 entries cannot serve 8 instances.
+        let mut thin = good.clone();
+        thin["max_enrolled_instances"] = json!(8);
+        thin["fence_allowance_bytes"] = json!(16 * FENCE_ENTRY_BOUND);
+        assert!(parse(&thin).is_err());
+        thin["fence_allowance_bytes"] = json!(32 * FENCE_ENTRY_BOUND);
+        assert!(parse(&thin).is_ok());
+    }
+
+    #[test]
     fn default_ceilings_and_reserve_match_the_frozen_contract() {
         let contract = crate::firecracker::contract();
         let shared = SharedReserve::default();
@@ -752,10 +853,16 @@ pub(super) mod tests {
             contract["shared"]["store_bytes"].as_u64(),
             Some(shared.store_bytes)
         );
+        // B7 (design 16.4) doubled the helper's fence allowance to 128 MiB, inside the
+        // same 512 MiB shared disk reserve. The frozen B1 launch contract still records
+        // the B1 value: it is pinned into every guest bundle by `contract_sha256`, and the
+        // allowance is helper-only ledger accounting that no guest or plan consumes.
         assert_eq!(
             contract["shared"]["fence_allowance_bytes"].as_u64(),
-            Some(shared.fence_allowance_bytes)
+            Some(64 * MIB)
         );
+        assert_eq!(shared.fence_allowance_bytes, 128 * MIB);
+        assert!(shared.fence_allowance_bytes < shared.disk_bytes);
         assert!(validate_ceilings(&NodeCeilings::default(), &shared).is_ok());
     }
 }

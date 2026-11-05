@@ -124,8 +124,7 @@ fn peer_fixture_child() {
             fence: None,
         };
         if plan.create {
-            let context = token(plan.instance);
-            let prepared = prepared(&peer, &context).await;
+            let (context, prepared) = issued(&peer, plan.instance).await;
             let create = create_operation(&context, &prepared);
             let epoch = attach.clone().unwrap();
             let reply = raw_call_at(&plan.root, plan.instance, epoch, create.clone()).await;
@@ -479,12 +478,20 @@ async fn takeover_scenario(evidence: PeerEvidence) {
     let stolen = *held.attach.as_ref().expect("the enrolled unit attaches");
     let create = held.create.clone().unwrap();
     let fence = held.fence_request.clone().unwrap();
-    let FirecrackerOperation::Create { allocation_id, .. } = &create else {
+    let FirecrackerOperation::Create {
+        allocation_id,
+        plan_digest,
+        ..
+    } = &create
+    else {
         unreachable!();
     };
-    let allocation_id = *allocation_id;
+    let (allocation_id, plan_digest) = (*allocation_id, *plan_digest);
     let attempts = vec![
-        FirecrackerOperation::Inspect { allocation_id },
+        FirecrackerOperation::Inspect {
+            allocation_id,
+            plan_digest,
+        },
         FirecrackerOperation::List,
         create.clone(),
         fence.clone(),
@@ -1670,9 +1677,81 @@ async fn b3_02_attach_churn_cannot_grow_the_root_ledger() {
 }
 
 /// A malformed Create: well-framed, and the plan is bound to a different token.
-async fn poison(fixture: &Fixture, instance: Id128, epoch: Id128, plan: &PreparedCreate) {
-    let reply = raw_create(fixture, &token(instance), epoch, plan).await;
+/// B7: the token is a real issued one, so the Create passes H's tag check and is
+/// rejected only by the plan's binding, closing that token's gate.
+async fn poison(
+    fixture: &Fixture,
+    runtime: &FirecrackerRuntime,
+    instance: Id128,
+    epoch: Id128,
+    plan: &PreparedCreate,
+) {
+    let (target, _) = issued(runtime, instance).await;
+    let reply = raw_create(fixture, &target, epoch, plan).await;
     assert_eq!(class_of(&reply), AmbiguousClass::CatalogMismatch);
+}
+
+/// B7 (RTC-3, RTC-15): what a tag refusal must leave alone, read before it.
+struct TagCensus {
+    ledger_calls: Value,
+    refusals: u64,
+    closed: Value,
+    open: Value,
+    rows: i64,
+}
+
+fn ledger_rows(fixture: &Fixture) -> i64 {
+    fixture.count("SELECT COUNT(*) FROM allocations")
+        + fixture.count("SELECT COUNT(*) FROM retired_tokens")
+}
+
+async fn tag_census(fixture: &Fixture) -> TagCensus {
+    let census = fixture.census().await;
+    TagCensus {
+        ledger_calls: census["ledger_calls"].clone(),
+        refusals: census["tag_refusals"].as_u64().unwrap(),
+        closed: census["closed_gates"].clone(),
+        open: census["open_gates"].clone(),
+        rows: ledger_rows(fixture),
+    }
+}
+
+impl TagCensus {
+    /// `refused` more tokens failed H's tag check, and nothing else moved: no L call,
+    /// no gate, no ledger row.
+    async fn assert_only_refused(&self, fixture: &Fixture, refused: u64) {
+        let census = fixture.census().await;
+        assert_eq!(census["ledger_calls"], self.ledger_calls, "no L call: {census}");
+        assert_eq!(census["tag_refusals"].as_u64().unwrap(), self.refusals + refused);
+        assert_eq!(census["closed_gates"], self.closed, "no gate retained: {census}");
+        assert_eq!(census["open_gates"], self.open, "no gate open: {census}");
+        assert_eq!(ledger_rows(fixture), self.rows, "no ledger row");
+    }
+}
+
+fn tag_refused(response: &FirecrackerResponse) -> bool {
+    matches!(
+        response,
+        FirecrackerResponse::Error(GroupError {
+            kind: GroupErrorKind::Incompatible,
+            ..
+        })
+    )
+}
+
+/// One raw request that H must refuse by its tag check alone.
+async fn refused_by_tag(
+    fixture: &Fixture,
+    instance: Id128,
+    epoch: Id128,
+    operation: FirecrackerOperation,
+) {
+    let before = tag_census(fixture).await;
+    let reply = raw_call(fixture, instance, Some(epoch), operation, wire_deadline(5), 5_000)
+        .await
+        .unwrap();
+    assert!(tag_refused(&reply), "{reply:?}");
+    before.assert_only_refused(fixture, 1).await;
 }
 
 #[tokio::test]
@@ -1680,22 +1759,40 @@ async fn b3_03_rejected_creates_cannot_block_another_instances_create_or_fence()
     let fixture = Fixture::new(NodeOptions::default()).await;
     let attacker_id = Id128::random();
     let attacker = fixture.runtime(attacker_id, Id128::random());
-    let seed = token(attacker_id);
-    let plan = prepared(&attacker, &seed).await;
+    let (seed, plan) = issued(&attacker, attacker_id).await;
     let epoch = epoch_of(&attacker).await;
+    // B7: random IDs (checked while no allocation is live) no longer reach a gate at all: H refuses them by their tag.
+    let before = tag_census(&fixture).await;
+    for _ in 0..super::super::MAX_TOKEN_GATES {
+        let reply = raw_call(
+            &fixture,
+            attacker_id,
+            Some(epoch),
+            create_operation(&token(attacker_id), &plan),
+            wire_deadline(5),
+            5_000,
+        )
+        .await
+        .unwrap();
+        assert!(tag_refused(&reply), "{reply:?}");
+    }
+    before
+        .assert_only_refused(&fixture, super::super::MAX_TOKEN_GATES as u64)
+        .await;
     let victim_id = Id128::random();
     let victim = fixture.runtime(victim_id, Id128::random());
     // A token that really reached the ledger before the attack began.
-    let owned = token(victim_id);
-    let owned_plan = prepared(&victim, &owned).await;
+    let (owned, owned_plan) = issued(&victim, victim_id).await;
     create_accepted(&fixture, &victim, &owned, &owned_plan).await;
 
-    for _ in 0..super::super::MAX_TOKEN_GATES {
-        poison(&fixture, attacker_id, epoch, &plan).await;
+    // B7: so the flood that can fill gates is of issued tokens, past the share.
+    let quota = super::super::MAX_TOKEN_GATES / DEFAULT_MAX_ENROLLED as usize;
+    for _ in 0..quota + 16 {
+        poison(&fixture, &attacker, attacker_id, epoch, &plan).await;
     }
     // Memory stayed within one instance's share, and none of it stayed open.
     let census = fixture.census().await;
-    let quota = super::super::MAX_TOKEN_GATES / DEFAULT_MAX_ENROLLED as usize;
+    assert_eq!(census["closed_gates"], quota, "{census}");
     assert!(
         census["closed_gates"].as_u64().unwrap() as usize <= quota,
         "{census}"
@@ -1703,8 +1800,7 @@ async fn b3_03_rejected_creates_cannot_block_another_instances_create_or_fence()
     assert_eq!(census["open_gates"], 0, "{census}");
 
     // The victim admits a new Create, and fences a token only its own C1 knows about.
-    let fresh = token(victim_id);
-    let fresh_plan = prepared(&victim, &fresh).await;
+    let (fresh, fresh_plan) = issued(&victim, victim_id).await;
     assert!(
         matches!(
             raw_create(&fixture, &fresh, epoch_of(&victim).await, &fresh_plan).await,
@@ -1712,8 +1808,7 @@ async fn b3_03_rejected_creates_cannot_block_another_instances_create_or_fence()
         ),
         "the victim's Create is refused"
     );
-    let reconciled = token(victim_id);
-    let reconciled_plan = prepared(&victim, &reconciled).await;
+    let (reconciled, reconciled_plan) = issued(&victim, victim_id).await;
     fenced(
         victim
             .fence_absent(
@@ -1749,21 +1844,24 @@ async fn b3_03_a_token_id_from_another_instance_touches_only_its_senders_gates()
     let fixture = Fixture::new(NodeOptions::default()).await;
     let attacker_id = Id128::random();
     let attacker = fixture.runtime(attacker_id, Id128::random());
-    let seed = token(attacker_id);
-    let plan = prepared(&attacker, &seed).await;
+    let (seed, plan) = issued(&attacker, attacker_id).await;
     let epoch = epoch_of(&attacker).await;
     let victim_id = Id128::random();
     let victim = fixture.runtime(victim_id, Id128::random());
-    let context = token(victim_id);
-    let victim_plan = prepared(&victim, &context).await;
+    let (context, victim_plan) = issued(&victim, victim_id).await;
     // Copied from the victim's database, then rejected in the attacker's name.
+    // B7: rejected by H's tag check, before any gate (the sender's or the victim's) or
+    // L call; the attacker's own token still works too.
     let aimed = CreateContext {
         instance_id: attacker_id,
         allocation_id: context.allocation_id,
         sandbox_id: context.sandbox_id.clone(),
     };
-    let reply = raw_create(&fixture, &aimed, epoch, &plan).await;
-    assert_eq!(class_of(&reply), AmbiguousClass::CatalogMismatch);
+    refused_by_tag(&fixture, attacker_id, epoch, create_operation(&aimed, &plan)).await;
+    assert!(matches!(
+        raw_create(&fixture, &seed, epoch, &plan).await,
+        CreateReply::Accepted { replay: false, .. }
+    ));
     assert!(matches!(
         raw_create(&fixture, &context, epoch_of(&victim).await, &victim_plan).await,
         CreateReply::Accepted { replay: false, .. }
@@ -1779,26 +1877,28 @@ async fn b3r_01_a_copied_token_prefenced_by_another_instance_stays_the_victims()
     let victim_id = Id128::random();
     let victim = fixture.runtime(victim_id, Id128::random());
     // The victim has finished C0, and C1 holds this exact binding.
-    let victim_context = token(victim_id);
-    let victim_plan = prepared(&victim, &victim_context).await;
-    // The attacker retires the copied ID in its own namespace, which is all it can do.
+    let (victim_context, victim_plan) = issued(&victim, victim_id).await;
+    // The attacker tries to retire the copied ID in its own namespace.
+    // B7: the copy does not verify there, so H refuses it before any gate or L call,
+    // and not even the attacker's own namespace gets a row.
     let aimed = CreateContext {
         instance_id: attacker_id,
         allocation_id: victim_context.allocation_id,
         sandbox_id: victim_context.sandbox_id.clone(),
     };
-    let receipt = fenced(
-        attacker
-            .fence_absent(
-                &aimed,
-                &victim_plan.plan_digest(),
-                deadline(20),
-                &no_cancel(),
-            )
-            .await
-            .unwrap(),
-    );
-    assert_eq!(receipt.instance_id(), attacker_id);
+    let before = tag_census(&fixture).await;
+    let refused = attacker
+        .fence_absent(
+            &aimed,
+            &victim_plan.plan_digest(),
+            deadline(20),
+            &no_cancel(),
+        )
+        .await;
+    assert!(matches!(refused, Err(RuntimeError::Incompatible(_))), "{refused:?}");
+    // The adapter's Remove, then its FenceAbsent: both refused by the tag.
+    before.assert_only_refused(&fixture, 2).await;
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM retired_tokens"), 0);
     // A helper restart changes nothing about whose token this is.
     fixture.kill_helper().await;
     fixture.start().await;
@@ -1847,24 +1947,26 @@ async fn b3r_01_a_fence_with_no_create_also_stays_with_the_victim() {
     let attacker = fixture.runtime(attacker_id, Id128::random());
     let victim_id = Id128::random();
     let victim = fixture.runtime(victim_id, Id128::random());
-    let victim_context = token(victim_id);
-    let victim_plan = prepared(&victim, &victim_context).await;
+    let (victim_context, victim_plan) = issued(&victim, victim_id).await;
     let aimed = CreateContext {
         instance_id: attacker_id,
         allocation_id: victim_context.allocation_id,
         sandbox_id: victim_context.sandbox_id.clone(),
     };
-    fenced(
-        attacker
-            .fence_absent(
-                &aimed,
-                &victim_plan.plan_digest(),
-                deadline(20),
-                &no_cancel(),
-            )
-            .await
-            .unwrap(),
-    );
+    // B7: the copied token is refused by H's tag check: no gate, L call or row.
+    epoch_of(&attacker).await;
+    let before = tag_census(&fixture).await;
+    let refused = attacker
+        .fence_absent(
+            &aimed,
+            &victim_plan.plan_digest(),
+            deadline(20),
+            &no_cancel(),
+        )
+        .await;
+    assert!(matches!(refused, Err(RuntimeError::Incompatible(_))), "{refused:?}");
+    // The adapter's Remove, then its FenceAbsent: both refused by the tag.
+    before.assert_only_refused(&fixture, 2).await;
     // The victim's recovery path: its own exact fence, with no Create at all.
     let receipt = fenced(
         victim
@@ -1878,10 +1980,11 @@ async fn b3r_01_a_fence_with_no_create_also_stays_with_the_victim() {
             .unwrap(),
     );
     assert_eq!(receipt.instance_id(), victim_id);
+    // B7: only the victim's namespace holds a row for its token.
     assert_eq!(
         fixture.count("SELECT COUNT(*) FROM retired_tokens"),
-        2,
-        "one per namespace, and neither conflicts"
+        1,
+        "only the victim's, and it does not conflict"
     );
 }
 
@@ -1892,17 +1995,25 @@ async fn b3r_01_a_claim_on_a_copied_token_shares_no_name_with_the_victim() {
     let attacker = fixture.runtime(attacker_id, Id128::random());
     let victim_id = Id128::random();
     let victim = fixture.runtime(victim_id, Id128::random());
-    let victim_context = token(victim_id);
-    let victim_plan = prepared(&victim, &victim_context).await;
+    let (victim_context, victim_plan) = issued(&victim, victim_id).await;
     // The attacker claims first, with the victim's allocation and sandbox IDs.
-    let aimed = CreateContext {
+    // B7: the copied allocation ID is refused by H's tag check, so the most it can claim
+    // is its own issued token under the victim's sandbox ID.
+    let copied = CreateContext {
         instance_id: attacker_id,
         allocation_id: victim_context.allocation_id,
         sandbox_id: victim_context.sandbox_id.clone(),
     };
-    let aimed_plan = prepared(&attacker, &aimed).await;
+    let aimed_plan = prepared(&attacker, &copied).await;
+    let epoch = epoch_of(&attacker).await;
+    refused_by_tag(&fixture, attacker_id, epoch, create_operation(&copied, &aimed_plan)).await;
+    let aimed = CreateContext {
+        allocation_id: aimed_plan.allocation_id().unwrap(),
+        ..copied
+    };
+    assert_ne!(aimed.allocation_id, victim_context.allocation_id);
     assert!(matches!(
-        raw_create(&fixture, &aimed, epoch_of(&attacker).await, &aimed_plan).await,
+        raw_create(&fixture, &aimed, epoch, &aimed_plan).await,
         CreateReply::Accepted { replay: false, .. }
     ));
     assert!(matches!(
@@ -1915,17 +2026,25 @@ async fn b3r_01_a_claim_on_a_copied_token_shares_no_name_with_the_victim() {
         .await,
         CreateReply::Accepted { replay: false, .. }
     ));
-    // Node-global host names differ, though each plan binds the same allocation ID.
+    // Node-global host names differ, though each plan binds the same sandbox ID.
     let launch = |plan: &PreparedCreate| -> Value {
         crate::firecracker::strict_json(plan.backend_plan()).unwrap()["launch"].clone()
     };
     let (theirs, mine) = (launch(&aimed_plan), launch(&victim_plan));
     assert_ne!(theirs["jail_root"], mine["jail_root"]);
     assert_ne!(theirs["jailer_argv"], mine["jailer_argv"]);
+    // B7: the victim's token has a row only in the victim's namespace.
     assert_eq!(
         fixture.count(&format!(
             "SELECT COUNT(*) FROM allocations WHERE allocation_id = '{}'",
             victim_context.allocation_id
+        )),
+        1
+    );
+    assert_eq!(
+        fixture.count(&format!(
+            "SELECT COUNT(*) FROM allocations WHERE sandbox_id = '{}'",
+            victim_context.sandbox_id
         )),
         2
     );
@@ -2016,13 +2135,15 @@ async fn b3r_01_real_manager_paused_after_c1_keeps_an_exact_path_past_a_prefence
         allocation_id: binding.allocation_id,
         sandbox_id: row.id.clone(),
     };
-    let receipt = fenced(
-        attacker
-            .fence_absent(&aimed, &binding.plan_digest, deadline(20), &no_cancel())
-            .await
-            .unwrap(),
-    );
-    assert_eq!(receipt.instance_id(), attacker_id);
+    // B7: the pre-fence on the copied token is refused by H's tag check: no L call,
+    // no gate and no row, in either namespace.
+    let before = tag_census(&fixture).await;
+    let refused = attacker
+        .fence_absent(&aimed, &binding.plan_digest, deadline(20), &no_cancel())
+        .await;
+    assert!(matches!(refused, Err(RuntimeError::Incompatible(_))), "{refused:?}");
+    // The adapter's Remove, then its FenceAbsent: both refused by the tag.
+    before.assert_only_refused(&fixture, 2).await;
     fixture.clear(&format!("{window}.hold"));
     // The victim's Create reaches its own C2: the attacker's row is no obstacle.
     let _ = creating.await.unwrap();
@@ -2077,11 +2198,9 @@ async fn b3_03_ledger_owned_tokens_answer_with_a_full_table_and_charged_gates_st
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let active = token(instance);
-    let active_plan = prepared(&runtime, &active).await;
+    let (active, active_plan) = issued(&runtime, instance).await;
     create_accepted(&fixture, &runtime, &active, &active_plan).await;
-    let retired = token(instance);
-    let retired_plan = prepared(&runtime, &retired).await;
+    let (retired, retired_plan) = issued(&runtime, instance).await;
     let receipt = fenced(
         runtime
             .fence_absent(
@@ -2096,23 +2215,30 @@ async fn b3_03_ledger_owned_tokens_answer_with_a_full_table_and_charged_gates_st
     let epoch = epoch_of(&runtime).await;
     let quota = super::super::MAX_TOKEN_GATES / DEFAULT_MAX_ENROLLED as usize;
     // Every one of these could be a real charged token.
-    let first = token(instance);
-    let first_plan = prepared(&runtime, &first).await;
+    let (first, first_plan) = issued(&runtime, instance).await;
     expire(&fixture, &first, epoch, &first_plan).await;
+    // B7: each an issued token, since a random one never reaches a gate.
     for _ in 1..quota {
-        expire(&fixture, &token(instance), epoch, &first_plan).await;
+        let (charged, _) = issued(&runtime, instance).await;
+        expire(&fixture, &charged, epoch, &first_plan).await;
     }
     assert_eq!(fixture.census().await["closed_gates"], quota);
 
     // A new token gets no work: it could not be closed if it were rejected.
-    let refused = token(instance);
-    let refused_plan = prepared(&runtime, &refused).await;
+    let (refused, refused_plan) = issued(&runtime, instance).await;
     let reply = raw_create(&fixture, &refused, epoch, &refused_plan).await;
     assert_eq!(class_of(&reply), AmbiguousClass::WorkerExhausted);
     assert_eq!(fixture.census().await["closed_gates"], quota);
     // Malformed requests can't push out a charged token's gate either.
-    let reply = raw_create(&fixture, &token(instance), epoch, &first_plan).await;
-    assert_eq!(class_of(&reply), AmbiguousClass::WorkerExhausted);
+    // B7: they are refused by H's tag check and never reach the table at all.
+    refused_by_tag(
+        &fixture,
+        instance,
+        epoch,
+        create_operation(&token(instance), &first_plan),
+    )
+    .await;
+    assert_eq!(fixture.census().await["closed_gates"], quota);
     let reply = raw_create(&fixture, &first, epoch, &first_plan).await;
     assert_eq!(class_of(&reply), AmbiguousClass::GateClosed);
 
@@ -2174,8 +2300,7 @@ async fn b3_03_ledger_owned_tokens_answer_with_a_full_table_and_charged_gates_st
             .unwrap(),
     );
     // Fencing one charged token freed its entry, so new work is admitted again.
-    let next = token(instance);
-    let next_plan = prepared(&runtime, &next).await;
+    let (next, next_plan) = issued(&runtime, instance).await;
     assert!(matches!(
         raw_create(&fixture, &next, epoch, &next_plan).await,
         CreateReply::Accepted { replay: false, .. }
@@ -2208,11 +2333,15 @@ fn runtime_database(fixture: &Fixture, instance: Id128) -> Id128 {
     Id128::parse(&text).unwrap()
 }
 
-/// One never-admitted fence: a fresh random ID the helper has never seen.
-async fn random_fence(runtime: Arc<FirecrackerRuntime>, instance: Id128) -> Result<(), String> {
+/// One never-admitted fence. B7: of an issued token that never reached C2 (a random
+/// ID is refused by H's tag check and spends no quota), under some digest of its own.
+async fn random_fence(
+    runtime: Arc<FirecrackerRuntime>,
+    context: CreateContext,
+) -> Result<(), String> {
     runtime
         .fence_absent(
-            &token(instance),
+            &context,
             &Digest::of(Id128::random().to_string().as_bytes()),
             deadline(20),
             &no_cancel(),
@@ -2224,10 +2353,21 @@ async fn random_fence(runtime: Arc<FirecrackerRuntime>, instance: Id128) -> Resu
         .map_err(|error| error.to_string())
 }
 
+/// `count` tokens issued to `instance` and never created.
+async fn issue_many(runtime: &FirecrackerRuntime, instance: Id128, count: usize) -> Vec<CreateContext> {
+    let mut tokens = Vec::with_capacity(count);
+    for _ in 0..count {
+        tokens.push(issued(runtime, instance).await.0);
+    }
+    tokens
+}
+
 #[tokio::test]
 async fn b3_02_a_random_id_fence_flood_stops_at_its_quota_and_spares_other_instances() {
-    // A share small enough to reach quickly: 4096 entries across 32 possible instances.
-    let quota = 128;
+    // A share small enough to reach quickly: the pool across 32 possible instances.
+    // B7: a quarter of the default allowance's entries, with no floor.
+    let pool = SharedReserve::default().fence_allowance_bytes / super::super::journal::FENCE_ENTRY_BOUND / 4;
+    let quota = (pool / 32) as i64;
     let fixture = Fixture::new(NodeOptions {
         max_enrolled: 32,
         ..NodeOptions::default()
@@ -2235,43 +2375,61 @@ async fn b3_02_a_random_id_fence_flood_stops_at_its_quota_and_spares_other_insta
     .await;
     let hostile_id = Id128::random();
     let hostile = fixture.runtime(hostile_id, Id128::random());
+    // B7: random IDs are refused by H's tag check and spend nothing (checked while no
+    // allocation is live, so no other L call can interleave); each is the adapter's
+    // Remove and then its FenceAbsent.
+    epoch_of(&hostile).await;
+    let before = tag_census(&fixture).await;
+    for _ in 0..20 {
+        let error = random_fence(hostile.clone(), token(hostile_id)).await.unwrap_err();
+        assert!(error.contains("not issued to this instance"), "{error}");
+    }
+    before.assert_only_refused(&fixture, 40).await;
     let victim_id = Id128::random();
     let victim = fixture.runtime(victim_id, Id128::random());
     // Real work on each side, plus a token prepared now and admitted only at the quota.
-    let admitted = token(hostile_id);
-    let admitted_plan = prepared(&hostile, &admitted).await;
+    let (admitted, admitted_plan) = issued(&hostile, hostile_id).await;
     create_accepted(&fixture, &hostile, &admitted, &admitted_plan).await;
-    let late = token(hostile_id);
-    let late_plan = prepared(&hostile, &late).await;
-    let owned = token(victim_id);
-    let owned_plan = prepared(&victim, &owned).await;
+    let (late, late_plan) = issued(&hostile, hostile_id).await;
+    let (owned, owned_plan) = issued(&victim, victim_id).await;
     create_accepted(&fixture, &victim, &owned, &owned_plan).await;
+
+    // B7: so the flood is of issued tokens that never reach C2. Preflight stops issuing
+    // at a quarter below the quota, so the hostile daemon draws them all first.
+    let mut flood: std::collections::VecDeque<_> =
+        issue_many(&hostile, hostile_id, quota as usize + 24).await.into();
 
     let hostile_rows =
         format!("SELECT COUNT(*) FROM retired_tokens WHERE instance_id = '{hostile_id}'");
     // The flood, in parallel, until the helper starts refusing it by quota. Some attempts
-    // can find both P slots busy; those just don't count.
+    // can find no fresh observation while the others hold the workers; those don't
+    // count, and their token goes back for another try.
     let mut exhausted = false;
-    for _ in 0..200 {
+    while !exhausted {
         let mut batch = Vec::new();
         for _ in 0..4 {
-            batch.push(tokio::spawn(random_fence(hostile.clone(), hostile_id)));
+            let context = flood.pop_front().expect("the flood was never refused");
+            let hostile = hostile.clone();
+            batch.push(tokio::spawn(async move {
+                let result = random_fence(hostile, context.clone()).await;
+                (context, result)
+            }));
         }
         for attempt in batch {
-            if let Err(error) = attempt.await.unwrap() {
-                exhausted |= error.contains("ResourceExhausted");
+            match attempt.await.unwrap() {
+                (_, Ok(())) => {}
+                (_, Err(error)) if error.contains("ResourceExhausted") => exhausted = true,
+                (context, Err(_)) => flood.push_back(context),
             }
-        }
-        if exhausted {
-            break;
         }
     }
     assert!(exhausted, "the flood was never refused");
     assert_eq!(fixture.count(&hostile_rows), quota, "exactly the quota");
     // More of it writes no row at all.
     let generation = fixture.count("SELECT value FROM generation_counter");
-    for _ in 0..20 {
-        let error = random_fence(hostile.clone(), hostile_id).await.unwrap_err();
+    let spare = flood.pop_front().unwrap();
+    for context in flood {
+        let error = random_fence(hostile.clone(), context).await.unwrap_err();
         assert!(error.contains("ResourceExhausted"), "{error}");
         assert!(error.contains("stays charged"), "{error}");
     }
@@ -2288,11 +2446,10 @@ async fn b3_02_a_random_id_fence_flood_stops_at_its_quota_and_spares_other_insta
 
     // The victim is untouched: its never-admitted fences under its own quota, a new
     // Preflight and Create, and the token the ledger already owns.
-    for _ in 0..8 {
-        random_fence(victim.clone(), victim_id).await.unwrap();
+    for context in issue_many(&victim, victim_id, 8).await {
+        random_fence(victim.clone(), context).await.unwrap();
     }
-    let fresh = token(victim_id);
-    let fresh_plan = prepared(&victim, &fresh).await;
+    let (fresh, fresh_plan) = issued(&victim, victim_id).await;
     create_accepted(&fixture, &victim, &fresh, &fresh_plan).await;
     for (context, plan) in [(&owned, &owned_plan), (&fresh, &fresh_plan)] {
         fenced(
@@ -2305,11 +2462,12 @@ async fn b3_02_a_random_id_fence_flood_stops_at_its_quota_and_spares_other_insta
 
     // At its quota the hostile instance gets no new token, and the tokens the ledger
     // admitted still fence, including one admitted after the quota ran out.
+    // B7: the refusal is RTC-12's issuance floor.
     let refused = hostile
-        .prepare(&token(hostile_id), &spec(), deadline(5), &no_cancel())
+        .prepare(&prep(hostile_id), &spec(), deadline(5), &no_cancel())
         .await
         .unwrap_err();
-    assert!(refused.to_string().contains("headroom"), "{refused}");
+    assert!(refused.to_string().contains("window quota"), "{refused}");
     create_accepted(&fixture, &hostile, &late, &late_plan).await;
     for (context, plan) in [(&admitted, &admitted_plan), (&late, &late_plan)] {
         fenced(
@@ -2324,7 +2482,7 @@ async fn b3_02_a_random_id_fence_flood_stops_at_its_quota_and_spares_other_insta
     fixture.kill_helper().await;
     fixture.start().await;
     let renewed = fixture.runtime(hostile_id, runtime_database(&fixture, hostile_id));
-    let error = random_fence(renewed, hostile_id).await.unwrap_err();
+    let error = random_fence(renewed, spare).await.unwrap_err();
     assert!(error.contains("ResourceExhausted"), "{error}");
     assert_eq!(fixture.count(&hostile_rows), quota + 2);
 }

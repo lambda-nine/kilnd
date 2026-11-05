@@ -341,6 +341,20 @@ use rusqlite::params;
 use std::collections::BTreeMap;
 
 /// One accepted real Create, by a fresh attached instance.
+/// B7: the plan digest the ledger binds to a token, as a daemon's Store would hold it,
+/// for the digest Inspect, Remove and Gc now carry.
+pub(super) fn ledger_digest(fixture: &Fixture, allocation: Id128) -> Digest {
+    let text: String = fixture.read(|v| {
+        v.query_row(
+            "SELECT plan_digest FROM allocations WHERE allocation_id = ?1
+             UNION ALL SELECT plan_digest FROM retired_tokens WHERE allocation_id = ?1 LIMIT 1",
+            [allocation.to_string()],
+            |r| r.get(0),
+        )
+    });
+    Digest::parse(&text).unwrap()
+}
+
 pub(super) async fn create(
     real: &Real,
 ) -> (Arc<FirecrackerRuntime>, CreateContext, PreparedCreate) {
@@ -348,8 +362,7 @@ pub(super) async fn create(
     // The database UUID is the instance ID, so a client after a helper restart can
     // present the same one.
     let runtime = real.fixture.runtime(instance, instance);
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     create_accepted(&real.fixture, &runtime, &context, &plan).await;
     (runtime, context, plan)
 }
@@ -365,6 +378,7 @@ pub(super) async fn remove(
         Some(epoch_of(runtime).await),
         FirecrackerOperation::Remove {
             allocation_id: context.allocation_id,
+            plan_digest: ledger_digest(&real.fixture, context.allocation_id),
         },
         wire_deadline(60),
         60_000,
@@ -551,6 +565,7 @@ async fn inspect(
         Some(epoch_of(runtime).await),
         FirecrackerOperation::Inspect {
             allocation_id: context.allocation_id,
+            plan_digest: ledger_digest(&real.fixture, context.allocation_id),
         },
         wire_deadline(seconds),
         (seconds * 1000) as u32,
@@ -1533,7 +1548,7 @@ async fn b4_linux_root_stalled_classes_and_full_pools_keep_capabilities_inspect_
         let instance = Id128::random();
         let runtime = real.fixture.runtime(instance, Id128::random());
         epoch_of(&runtime).await;
-        let context = token(instance);
+        let context = prep(instance);
         let task_runtime = runtime.clone();
         stuck.push(tokio::spawn(async move {
             task_runtime
@@ -1547,7 +1562,7 @@ async fn b4_linux_root_stalled_classes_and_full_pools_keep_capabilities_inspect_
     let third = real.fixture.runtime(instance, Id128::random());
     let began = std::time::Instant::now();
     let refused = third
-        .prepare(&token(instance), &spec(), deadline(10), &no_cancel())
+        .prepare(&prep(instance), &spec(), deadline(10), &no_cancel())
         .await;
     assert!(refused.is_err(), "a third preparation needs a P slot");
     assert!(
@@ -1584,6 +1599,7 @@ async fn b4_linux_root_stalled_classes_and_full_pools_keep_capabilities_inspect_
         Some(epoch_of(&runtime).await),
         FirecrackerOperation::Inspect {
             allocation_id: context.allocation_id,
+            plan_digest: ledger_digest(&real.fixture, context.allocation_id),
         },
         wire_deadline(3),
         3_000,
@@ -2313,7 +2329,7 @@ async fn b4_linux_root_kr05_replacement_races_run_only_the_retained_inodes() {
         let instance = Id128::random();
         let fresh = real.fixture.runtime(instance, Id128::random());
         let error = fresh
-            .prepare(&token(instance), &spec(), deadline(10), &no_cancel())
+            .prepare(&prep(instance), &spec(), deadline(10), &no_cancel())
             .await;
         assert!(
             error.is_err(),
@@ -2374,11 +2390,9 @@ async fn b4_linux_root_scoped_gc_removes_only_proven_dead_allocations() {
     let real = Real::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = real.fixture.runtime(instance, instance);
-    let live = token(instance);
-    let live_plan = prepared(&runtime, &live).await;
+    let (live, live_plan) = issued(&runtime, instance).await;
     create_accepted(&real.fixture, &runtime, &live, &live_plan).await;
-    let dead = token(instance);
-    let dead_plan = prepared(&runtime, &dead).await;
+    let (dead, dead_plan) = issued(&runtime, instance).await;
     create_accepted(&real.fixture, &runtime, &dead, &dead_plan).await;
     real.wait_phase(live.allocation_id, "booting").await;
     real.wait_phase(dead.allocation_id, "booting").await;
@@ -2392,18 +2406,50 @@ async fn b4_linux_root_scoped_gc_removes_only_proven_dead_allocations() {
     // Another instance's allocation, named by ID in this instance's request.
     let (other_runtime, other, _) = create(&real).await;
     real.wait_phase(other.allocation_id, "booting").await;
+    // B7: a vector naming an unknown random ID or another instance's token is refused
+    // whole by H's tag check, before any lookup, with nothing collected.
+    let target = |context: &CreateContext, plan: &PreparedCreate| GcTarget {
+        allocation_id: context.allocation_id,
+        plan_digest: plan.plan_digest(),
+    };
+    for stray in [Id128::random(), other.allocation_id] {
+        let reply = raw_call(
+            &real.fixture,
+            instance,
+            Some(epoch_of(&runtime).await),
+            FirecrackerOperation::Gc {
+                targets: vec![
+                    target(&live, &live_plan),
+                    target(&dead, &dead_plan),
+                    GcTarget {
+                        allocation_id: stray,
+                        plan_digest: dead_plan.plan_digest(),
+                    },
+                ],
+            },
+            wire_deadline(30),
+            30_000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                &reply,
+                FirecrackerResponse::Error(GroupError {
+                    kind: GroupErrorKind::Incompatible,
+                    ..
+                })
+            ),
+            "{reply:?}"
+        );
+    }
     let unknown = Id128::random();
     let reply = raw_call(
         &real.fixture,
         instance,
         Some(epoch_of(&runtime).await),
         FirecrackerOperation::Gc {
-            allocation_ids: vec![
-                live.allocation_id,
-                dead.allocation_id,
-                unknown,
-                other.allocation_id,
-            ],
+            targets: vec![target(&live, &live_plan), target(&dead, &dead_plan)],
         },
         wire_deadline(30),
         30_000,
@@ -2430,11 +2476,8 @@ async fn b4_linux_root_scoped_gc_removes_only_proven_dead_allocations() {
         outcome(dead.allocation_id),
         GcOutcome::Removed { .. }
     ));
-    assert!(matches!(outcome(unknown), GcOutcome::Skipped { .. }));
-    assert!(matches!(
-        outcome(other.allocation_id),
-        GcOutcome::Skipped { .. }
-    ));
+    assert!(results.iter().all(|r| r.allocation_id != unknown));
+    assert!(results.iter().all(|r| r.allocation_id != other.allocation_id));
     assert_eq!(
         host_leftovers(&real, &dead, Some(dead_vmm)),
         Vec::<String>::new()
@@ -2452,9 +2495,7 @@ async fn b4_linux_root_scoped_gc_removes_only_proven_dead_allocations() {
         &real.fixture,
         instance,
         Some(epoch_of(&runtime).await),
-        FirecrackerOperation::Gc {
-            allocation_ids: vec![],
-        },
+        FirecrackerOperation::Gc { targets: vec![] },
         wire_deadline(5),
         5_000,
     )

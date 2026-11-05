@@ -90,7 +90,7 @@ sudo setpriv --bounding-set="$caps" --inh-caps=-all \
     KILND_B5_KILL_INNER_GUEST="${KILND_B5_KILL_INNER_GUEST:-}" \
     KILND_B5_CONSOLE_FLOOD_GUEST="${KILND_B5_CONSOLE_FLOOD_GUEST:-}" \
     KILND_B6_BIN="$work/bin" KILND_B6_EVIDENCE="${B6_EVIDENCE:-}" \
-    "$work/kilnd-lib-tests" --ignored --test-threads=1 --nocapture "$filter"
+    "$work/kilnd-lib-tests" --include-ignored --test-threads=1 --nocapture "$filter"
 sudo setpriv --bounding-set="$caps" --inh-caps=-all \
     env RUST_BACKTRACE=${RUST_BACKTRACE:-1} \
-    "$work/kilnd-exec-core-tests" --ignored --test-threads=1 --nocapture "$filter"
+    "$work/kilnd-exec-core-tests" --include-ignored --test-threads=1 --nocapture "$filter"

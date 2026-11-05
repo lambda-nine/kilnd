@@ -18,7 +18,7 @@ use kilnd::model::{
     CommandStatus, CreateCertainty, ExecutionState, Network, RuntimeErrorKind, RuntimeStage,
     SandboxState,
 };
-use kilnd::runtime::Runtime;
+use kilnd::runtime::{RemoveTarget, Runtime};
 use kilnd::runtime::kiln_direct::DirectKilnRuntime as KilnRuntime;
 use kilnd::store::Store;
 
@@ -472,7 +472,9 @@ async fn a_sandbox_killed_behind_kilnds_back_is_lost_after_reconcile() {
     // Remove it with kiln directly, as an operator or a reboot would.
     m.runtime()
         .remove(
-            s.backend_id.as_ref().unwrap(),
+            RemoveTarget::Legacy {
+                backend_id: s.backend_id.as_ref().unwrap(),
+            },
             tokio::time::Instant::now() + Duration::from_secs(120),
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -1118,7 +1120,9 @@ async fn real_kiln_post_allocation_failure_stays_charged_across_restart() {
     // An operator's own cleanup is no evidence kilnd can use either.
     kiln()
         .remove(
-            &backend_id,
+            RemoveTarget::Legacy {
+                backend_id: &backend_id,
+            },
             tokio::time::Instant::now() + Duration::from_secs(120),
             &tokio_util::sync::CancellationToken::new(),
         )

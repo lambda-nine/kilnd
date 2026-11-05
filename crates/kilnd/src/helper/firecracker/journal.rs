@@ -6,6 +6,7 @@ use super::config::{NodeCeilings, SharedReserve, validate_ceilings};
 use super::executable::{ExecutableIdentity, ProtectedDir, Role, WalkPolicy, walk_directory};
 use super::identity::{ClaimedIdentities, IdentityLeases, LeaseKind};
 use super::peer::{EnrolledExecutable, Enrollment};
+use super::token::{self, TokenKey};
 use crate::model::{Digest, Id128, ResourceReservation, now_ms};
 use crate::runtime::FencedAbsence;
 use rusqlite::{
@@ -21,15 +22,27 @@ use std::path::{Path, PathBuf};
 pub const LEDGER_DB: &str = "node.db";
 pub const LEDGER_LOCK: &str = "node.lock";
 const APPLICATION_ID: i64 = 0x4b46_4331; // "KFC1"
-const SCHEMA_VERSION: i64 = 1;
-/// The most space one retired token can need, across all its rows.
-pub const FENCE_ENTRY_BOUND: u64 = 4096;
-/// Headroom kept for tokens the helper has not seen yet: a daemon may hold a C1 row
-/// that never reached L. Admission stops before fencing them would not fit.
-pub const PRE_INTENT_TOKEN_MARGIN: u64 = 1024;
-/// A quarter of the fence allowance is set aside for tokens that never reach admission,
-/// divided equally among possible instances. Admission stops before it needs that share.
+const SCHEMA_VERSION: i64 = 2;
+/// The most space one retained token can need across all its rows. B7 measures the
+/// worst case (`b7_fence_entry_bound_is_the_measured_worst_case`: every bounded
+/// per-allocation family at its cap, every field at its widest) at about 18.0 KB, above
+/// the design's 16 KiB estimate, against about 9.8 KB for a typical session; the bound
+/// is that measurement rounded up to the next 4 KiB.
+pub const FENCE_ENTRY_BOUND: u64 = 20 * 1024;
+/// A quarter of the fence allowance's entries is set aside for tokens that never reach
+/// admission, divided equally among possible instances (RTC-12).
 const NEVER_ADMITTED_SHARE: u64 = 4;
+/// B7 defaults (design 16.4), all root policy: a token's lease before W may pass it, one
+/// compaction pass per instance, and at most this many tokens per delete transaction.
+pub const DEFAULT_COMPACTION_LEASE_MS: u64 = 15 * 60 * 1000;
+pub const DEFAULT_COMPACTION_PASS_MS: u64 = 60 * 1000;
+/// RTC-18 caps one delete transaction at 100 ms. A full 256-token batch of admitted
+/// sessions measured 310 to 580 ms on mini-one (FULL sync, every trigger), and 32 tokens
+/// about 40 ms idle but up to 195 ms on a loaded host, so B7 lowers the batch to 16 as
+/// the rule requires (`b7_rtc18_..._stays_under_100_ms` measures it).
+pub const COMPACTION_BATCH: u64 = 16;
+/// The newest compaction records kept per instance.
+pub const COMPACTION_LOG_KEPT: i64 = 64;
 /// A complete inventory is bounded to this many active allocations.
 pub const MAX_ACTIVE_LISTED: usize = 1024;
 /// B5-01's per-allocation retention: the stop reasons and settled worker rows kept.
@@ -79,10 +92,14 @@ CREATE TABLE allocations (
          'stop_intent','stopped','cleaning','quarantined','absent')),
     created_generation INTEGER NOT NULL CHECK (created_generation >= 1),
     updated_generation INTEGER NOT NULL CHECK (updated_generation >= created_generation),
+    -- B7 (RTC-1): the helper-issued sequence the token's hex prefix names.
+    issue_seq INTEGER NOT NULL CHECK (issue_seq BETWEEN 1 AND 9223372036854775806
+        AND substr(allocation_id, 1, 16) = printf('%016x', issue_seq)),
     PRIMARY KEY (instance_id, allocation_id),
     UNIQUE (instance_id, sandbox_id),
     UNIQUE (instance_id, backend_id)
 ) STRICT;
+CREATE INDEX allocations_issue_seq ON allocations(instance_id, issue_seq);
 CREATE TABLE allocation_plans (
     instance_id TEXT NOT NULL,
     allocation_id TEXT NOT NULL,
@@ -173,8 +190,11 @@ CREATE TABLE retired_tokens (
     receipt_id TEXT NOT NULL UNIQUE,
     helper_generation INTEGER NOT NULL UNIQUE CHECK (helper_generation >= 1),
     receipt BLOB NOT NULL,
+    issue_seq INTEGER NOT NULL CHECK (issue_seq BETWEEN 1 AND 9223372036854775806
+        AND substr(allocation_id, 1, 16) = printf('%016x', issue_seq)),
     PRIMARY KEY (instance_id, allocation_id)
 ) STRICT;
+CREATE INDEX retired_tokens_issue_seq ON retired_tokens(instance_id, issue_seq);
 CREATE TABLE stop_events (
     id INTEGER PRIMARY KEY,
     instance_id TEXT NOT NULL,
@@ -196,6 +216,50 @@ CREATE TABLE resource_events (
     detail TEXT NOT NULL,
     generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
     FOREIGN KEY (instance_id, allocation_id) REFERENCES allocations(instance_id, allocation_id)
+) STRICT;
+-- B7 (design 16.6): the node's token key, written once at provisioning.
+CREATE TABLE token_key (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    key BLOB NOT NULL CHECK (length(key) = 32),
+    key_check BLOB NOT NULL CHECK (length(key_check) = 16),
+    created_generation INTEGER NOT NULL CHECK (created_generation >= 1)
+) STRICT;
+-- Each instance's exact exclusive issue pointer, its watermark W and W's generation G_W,
+-- and the trigger-kept count of its retained allocation rows (RTC-4, RTC-5, RTC-17).
+CREATE TABLE instance_tokens (
+    instance_id TEXT PRIMARY KEY REFERENCES instances(instance_id),
+    issue_next INTEGER NOT NULL CHECK (issue_next >= 1 AND issue_next <= 9223372036854775807),
+    watermark INTEGER NOT NULL CHECK (watermark >= 1),
+    watermark_generation INTEGER NOT NULL CHECK (watermark_generation >= 1),
+    retained_admitted INTEGER NOT NULL CHECK (retained_admitted >= 0),
+    CHECK (watermark <= issue_next)
+) STRICT;
+CREATE TABLE compaction_log (
+    id INTEGER PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES instances(instance_id),
+    from_w INTEGER NOT NULL CHECK (from_w >= 1),
+    to_w INTEGER NOT NULL CHECK (to_w >= from_w),
+    generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
+    tokens_deleted INTEGER NOT NULL CHECK (tokens_deleted >= 0),
+    rows_deleted INTEGER NOT NULL CHECK (rows_deleted >= 0)
+) STRICT;
+-- RTC-14: insert-only durable faults. Only the root offline clear deletes them.
+CREATE TABLE node_faults (
+    id INTEGER PRIMARY KEY,
+    generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
+    kind TEXT NOT NULL CHECK (kind IN ('rollback')),
+    instance_id TEXT NOT NULL REFERENCES instances(instance_id),
+    token TEXT NOT NULL,
+    issue_next_seen INTEGER NOT NULL CHECK (issue_next_seen >= 1),
+    detail TEXT NOT NULL,
+    UNIQUE (kind, instance_id, token)
+) STRICT;
+CREATE TABLE node_fault_clears (
+    id INTEGER PRIMARY KEY,
+    generation INTEGER NOT NULL UNIQUE CHECK (generation >= 1),
+    cleared_through_generation INTEGER NOT NULL CHECK (cleared_through_generation >= 0),
+    inventory_sha256 TEXT NOT NULL,
+    raised_pointers TEXT NOT NULL
 ) STRICT;
 
 -- Collision guards run before any conflict algorithm can implicitly delete a row.
@@ -259,6 +323,7 @@ WHEN NEW.rowid IS NOT OLD.rowid OR NEW.allocation_id IS NOT OLD.allocation_id
     OR NEW.guest_exec_spec_sha256 IS NOT OLD.guest_exec_spec_sha256
     OR NEW.work_uuid IS NOT OLD.work_uuid OR NEW.stop_authority IS NOT OLD.stop_authority
     OR NEW.created_generation IS NOT OLD.created_generation
+    OR NEW.issue_seq IS NOT OLD.issue_seq
 BEGIN SELECT RAISE(ABORT, 'allocation identity is immutable'); END;
 CREATE TRIGGER allocations_generation_compare BEFORE UPDATE ON allocations
 WHEN NEW.updated_generation <= OLD.updated_generation
@@ -271,8 +336,24 @@ WHEN NEW.phase = 'absent' AND EXISTS (SELECT 1 FROM capacity_claims
     WHERE instance_id = NEW.instance_id AND allocation_id = NEW.allocation_id
     AND released_generation IS NULL)
 BEGIN SELECT RAISE(ABORT, 'absence requires its claim release'); END;
+-- B7 RTC-7: C2 commits INTENT only for W <= seq < issue_next.
+CREATE TRIGGER allocations_issued_above_watermark BEFORE INSERT ON allocations
+WHEN NOT EXISTS (SELECT 1 FROM instance_tokens t WHERE t.instance_id = NEW.instance_id
+    AND NEW.issue_seq >= t.watermark AND NEW.issue_seq < t.issue_next)
+BEGIN SELECT RAISE(ABORT, 'an allocation must be issued and at or above its watermark'); END;
+CREATE TRIGGER allocations_count_insert AFTER INSERT ON allocations
+BEGIN UPDATE instance_tokens SET retained_admitted = retained_admitted + 1
+    WHERE instance_id = NEW.instance_id; END;
+CREATE TRIGGER allocations_count_delete AFTER DELETE ON allocations
+BEGIN UPDATE instance_tokens SET retained_admitted = retained_admitted - 1
+    WHERE instance_id = OLD.instance_id; END;
+-- B7 RTC-10: an allocation record goes only once absent and compactable.
 CREATE TRIGGER allocations_no_delete BEFORE DELETE ON allocations
-BEGIN SELECT RAISE(ABORT, 'an allocation record is permanent'); END;
+WHEN NOT (OLD.phase = 'absent' AND EXISTS (SELECT 1 FROM retired_tokens r
+    JOIN instance_tokens t ON t.instance_id = r.instance_id
+    WHERE r.instance_id = OLD.instance_id AND r.allocation_id = OLD.allocation_id
+      AND r.issue_seq < t.watermark AND r.helper_generation < t.watermark_generation))
+BEGIN SELECT RAISE(ABORT, 'an allocation record is permanent until compactable'); END;
 
 CREATE TRIGGER allocation_plans_no_replace BEFORE INSERT ON allocation_plans
 WHEN EXISTS (SELECT 1 FROM allocation_plans WHERE rowid = NEW.rowid
@@ -300,7 +381,13 @@ WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
     OR OLD.released_generation IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'a capacity claim only changes by its one release'); END;
 CREATE TRIGGER capacity_claims_no_delete BEFORE DELETE ON capacity_claims
-BEGIN SELECT RAISE(ABORT, 'a capacity claim is permanent'); END;
+WHEN NOT (OLD.released_generation IS NOT NULL AND EXISTS (SELECT 1 FROM allocations a
+        JOIN retired_tokens r ON r.instance_id = a.instance_id AND r.allocation_id = a.allocation_id
+        JOIN instance_tokens t ON t.instance_id = r.instance_id
+        WHERE a.instance_id = OLD.instance_id AND a.allocation_id = OLD.allocation_id
+          AND a.phase = 'absent' AND r.issue_seq < t.watermark
+          AND r.helper_generation < t.watermark_generation))
+BEGIN SELECT RAISE(ABORT, 'a capacity claim is permanent until compactable'); END;
 
 CREATE TRIGGER identity_leases_no_replace BEFORE INSERT ON identity_leases
 WHEN EXISTS (SELECT 1 FROM identity_leases WHERE rowid = NEW.rowid
@@ -315,7 +402,13 @@ WHEN NEW.rowid IS NOT OLD.rowid OR NEW.namespace IS NOT OLD.namespace OR NEW.kin
     OR OLD.released_generation IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'an identity lease only changes by its one release'); END;
 CREATE TRIGGER identity_leases_no_delete BEFORE DELETE ON identity_leases
-BEGIN SELECT RAISE(ABORT, 'an identity lease is permanent'); END;
+WHEN NOT (OLD.released_generation IS NOT NULL AND EXISTS (SELECT 1 FROM allocations a
+        JOIN retired_tokens r ON r.instance_id = a.instance_id AND r.allocation_id = a.allocation_id
+        JOIN instance_tokens t ON t.instance_id = r.instance_id
+        WHERE a.instance_id = OLD.instance_id AND a.allocation_id = OLD.allocation_id
+          AND a.phase = 'absent' AND r.issue_seq < t.watermark
+          AND r.helper_generation < t.watermark_generation))
+BEGIN SELECT RAISE(ABORT, 'an identity lease is permanent until compactable'); END;
 
 CREATE TRIGGER executable_leases_no_replace BEFORE INSERT ON executable_leases
 WHEN EXISTS (SELECT 1 FROM executable_leases WHERE rowid = NEW.rowid
@@ -332,7 +425,13 @@ WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
     OR OLD.released_generation IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'an executable lease is immutable'); END;
 CREATE TRIGGER executable_leases_no_delete BEFORE DELETE ON executable_leases
-BEGIN SELECT RAISE(ABORT, 'an executable lease is permanent'); END;
+WHEN NOT (OLD.released_generation IS NOT NULL AND EXISTS (SELECT 1 FROM allocations a
+        JOIN retired_tokens r ON r.instance_id = a.instance_id AND r.allocation_id = a.allocation_id
+        JOIN instance_tokens t ON t.instance_id = r.instance_id
+        WHERE a.instance_id = OLD.instance_id AND a.allocation_id = OLD.allocation_id
+          AND a.phase = 'absent' AND r.issue_seq < t.watermark
+          AND r.helper_generation < t.watermark_generation))
+BEGIN SELECT RAISE(ABORT, 'an executable lease is permanent until compactable'); END;
 
 CREATE TRIGGER worker_intents_no_replace BEFORE INSERT ON worker_intents
 WHEN EXISTS (SELECT 1 FROM worker_intents WHERE rowid = NEW.rowid
@@ -351,12 +450,19 @@ WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
     OR OLD.settled_generation IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'a worker record is immutable once identified or settled'); END;
 -- B5-01: an allocation's settled worker rows are compacted to its newest eight settled
--- rows of the same mode; an unsettled or node-level row is permanent.
+-- rows of the same mode; an unsettled or node-level row is permanent. B7 RTC-10: a
+-- compactable token's settled rows go with it.
 CREATE TRIGGER worker_intents_no_delete BEFORE DELETE ON worker_intents
 WHEN NOT (OLD.allocation_id IS NOT NULL AND OLD.settled_generation IS NOT NULL
-    AND (SELECT COUNT(*) FROM worker_intents w WHERE w.instance_id = OLD.instance_id
+    AND ((SELECT COUNT(*) FROM worker_intents w WHERE w.instance_id = OLD.instance_id
         AND w.allocation_id = OLD.allocation_id AND w.mode = OLD.mode
-        AND w.settled_generation IS NOT NULL AND w.id > OLD.id) >= 8)
+        AND w.settled_generation IS NOT NULL AND w.id > OLD.id) >= 8
+      OR EXISTS (SELECT 1 FROM allocations a
+        JOIN retired_tokens r ON r.instance_id = a.instance_id AND r.allocation_id = a.allocation_id
+        JOIN instance_tokens t ON t.instance_id = r.instance_id
+        WHERE a.instance_id = OLD.instance_id AND a.allocation_id = OLD.allocation_id
+          AND a.phase = 'absent' AND r.issue_seq < t.watermark
+          AND r.helper_generation < t.watermark_generation)))
 BEGIN SELECT RAISE(ABORT, 'a worker record is permanent'); END;
 
 CREATE TRIGGER retired_tokens_no_replace BEFORE INSERT ON retired_tokens
@@ -370,8 +476,21 @@ WHEN EXISTS (SELECT 1 FROM capacity_claims WHERE instance_id = NEW.instance_id
 BEGIN SELECT RAISE(ABORT, 'a fence cannot coexist with a held claim'); END;
 CREATE TRIGGER retired_tokens_no_update BEFORE UPDATE ON retired_tokens
 BEGIN SELECT RAISE(ABORT, 'a fence is immutable'); END;
+-- B7 RTC-7: a fence row is written only for an issued token, and below W only for one
+-- with an allocation row (a pinned allocation reaching ABSENT).
+CREATE TRIGGER retired_tokens_issued BEFORE INSERT ON retired_tokens
+WHEN NOT EXISTS (SELECT 1 FROM instance_tokens t WHERE t.instance_id = NEW.instance_id
+    AND NEW.issue_seq < t.issue_next AND (NEW.issue_seq >= t.watermark
+        OR EXISTS (SELECT 1 FROM allocations a WHERE a.instance_id = NEW.instance_id
+                   AND a.allocation_id = NEW.allocation_id)))
+BEGIN SELECT RAISE(ABORT, 'a fence needs an issued token, and below W its allocation'); END;
+-- B7 RTC-10: the fence row goes last, below W, behind G_W, with no allocation left.
 CREATE TRIGGER retired_tokens_no_delete BEFORE DELETE ON retired_tokens
-BEGIN SELECT RAISE(ABORT, 'a fence is permanent'); END;
+WHEN NOT (NOT EXISTS (SELECT 1 FROM allocations a WHERE a.instance_id = OLD.instance_id
+        AND a.allocation_id = OLD.allocation_id)
+    AND EXISTS (SELECT 1 FROM instance_tokens t WHERE t.instance_id = OLD.instance_id
+        AND OLD.issue_seq < t.watermark AND OLD.helper_generation < t.watermark_generation))
+BEGIN SELECT RAISE(ABORT, 'a fence is permanent until compactable'); END;
 
 CREATE TRIGGER stop_events_no_replace BEFORE INSERT ON stop_events
 WHEN EXISTS (SELECT 1 FROM stop_events WHERE rowid = NEW.rowid OR generation = NEW.generation)
@@ -379,7 +498,13 @@ BEGIN SELECT RAISE(ABORT, 'a stop event cannot be replaced'); END;
 CREATE TRIGGER stop_events_no_update BEFORE UPDATE ON stop_events
 BEGIN SELECT RAISE(ABORT, 'a stop event is immutable'); END;
 CREATE TRIGGER stop_events_no_delete BEFORE DELETE ON stop_events
-BEGIN SELECT RAISE(ABORT, 'a stop event is permanent'); END;
+WHEN NOT EXISTS (SELECT 1 FROM allocations a
+        JOIN retired_tokens r ON r.instance_id = a.instance_id AND r.allocation_id = a.allocation_id
+        JOIN instance_tokens t ON t.instance_id = r.instance_id
+        WHERE a.instance_id = OLD.instance_id AND a.allocation_id = OLD.allocation_id
+          AND a.phase = 'absent' AND r.issue_seq < t.watermark
+          AND r.helper_generation < t.watermark_generation)
+BEGIN SELECT RAISE(ABORT, 'a stop event is permanent until compactable'); END;
 
 CREATE TRIGGER resource_events_no_replace BEFORE INSERT ON resource_events
 WHEN EXISTS (SELECT 1 FROM resource_events WHERE rowid = NEW.rowid OR generation = NEW.generation)
@@ -393,14 +518,92 @@ BEGIN SELECT RAISE(ABORT, 'a resource event is immutable'); END;
 -- B5-01: execution evidence is compacted, nothing else. An `exec` or `exec_history` row
 -- may go only once a newer `exec_history` row of the same allocation holds its summary.
 CREATE TRIGGER resource_events_no_delete BEFORE DELETE ON resource_events
-WHEN NOT (OLD.kind IN ('exec','exec_history') AND EXISTS (SELECT 1 FROM resource_events r
+WHEN NOT ((OLD.kind IN ('exec','exec_history') AND EXISTS (SELECT 1 FROM resource_events r
     WHERE r.instance_id = OLD.instance_id AND r.allocation_id = OLD.allocation_id
       AND r.kind = 'exec_history' AND r.generation > OLD.generation))
+    OR EXISTS (SELECT 1 FROM allocations a
+        JOIN retired_tokens r ON r.instance_id = a.instance_id AND r.allocation_id = a.allocation_id
+        JOIN instance_tokens t ON t.instance_id = r.instance_id
+        WHERE a.instance_id = OLD.instance_id AND a.allocation_id = OLD.allocation_id
+          AND a.phase = 'absent' AND r.issue_seq < t.watermark
+          AND r.helper_generation < t.watermark_generation))
 BEGIN SELECT RAISE(ABORT, 'a resource event is permanent'); END;
+
+CREATE TRIGGER token_key_no_replace BEFORE INSERT ON token_key
+WHEN EXISTS (SELECT 1 FROM token_key)
+BEGIN SELECT RAISE(ABORT, 'the token key is written once'); END;
+CREATE TRIGGER token_key_no_update BEFORE UPDATE ON token_key
+BEGIN SELECT RAISE(ABORT, 'the token key is immutable'); END;
+CREATE TRIGGER token_key_no_delete BEFORE DELETE ON token_key
+BEGIN SELECT RAISE(ABORT, 'the token key is permanent'); END;
+
+CREATE TRIGGER instance_tokens_no_replace BEFORE INSERT ON instance_tokens
+WHEN EXISTS (SELECT 1 FROM instance_tokens WHERE rowid = NEW.rowid
+    OR instance_id = NEW.instance_id)
+    OR NEW.issue_next != 1 OR NEW.watermark != 1
+    OR NEW.retained_admitted != (SELECT COUNT(*) FROM allocations
+        WHERE instance_id = NEW.instance_id)
+BEGIN SELECT RAISE(ABORT, 'an instance token row is written once, at enrollment'); END;
+-- RTC-4/RTC-5: the pointer and W only increase, W only with a fresh G_W, and the
+-- retained count always equals the instance's allocation rows.
+CREATE TRIGGER instance_tokens_monotonic BEFORE UPDATE ON instance_tokens
+WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
+    OR NEW.issue_next < OLD.issue_next OR NEW.watermark < OLD.watermark
+    OR NEW.watermark_generation < OLD.watermark_generation
+    OR (NEW.watermark != OLD.watermark
+        AND NEW.watermark_generation <= OLD.watermark_generation)
+BEGIN SELECT RAISE(ABORT, 'issue pointers and watermarks only increase'); END;
+CREATE TRIGGER instance_tokens_counted BEFORE UPDATE ON instance_tokens
+WHEN NEW.retained_admitted != (SELECT COUNT(*) FROM allocations
+    WHERE instance_id = NEW.instance_id)
+BEGIN SELECT RAISE(ABORT, 'the retained count must equal the allocation rows'); END;
+CREATE TRIGGER instance_tokens_no_delete BEFORE DELETE ON instance_tokens
+BEGIN SELECT RAISE(ABORT, 'an instance token row is permanent'); END;
+
+CREATE TRIGGER compaction_log_no_replace BEFORE INSERT ON compaction_log
+WHEN EXISTS (SELECT 1 FROM compaction_log WHERE rowid = NEW.rowid
+    OR generation = NEW.generation)
+BEGIN SELECT RAISE(ABORT, 'a compaction record cannot be replaced'); END;
+CREATE TRIGGER compaction_log_counts_only BEFORE UPDATE ON compaction_log
+WHEN NEW.rowid IS NOT OLD.rowid OR NEW.instance_id IS NOT OLD.instance_id
+    OR NEW.from_w IS NOT OLD.from_w OR NEW.to_w IS NOT OLD.to_w
+    OR NEW.generation IS NOT OLD.generation
+    OR NEW.tokens_deleted < OLD.tokens_deleted OR NEW.rows_deleted < OLD.rows_deleted
+BEGIN SELECT RAISE(ABORT, 'a compaction record only adds counts'); END;
+CREATE TRIGGER compaction_log_newest_kept BEFORE DELETE ON compaction_log
+WHEN (SELECT COUNT(*) FROM compaction_log c WHERE c.instance_id = OLD.instance_id
+    AND c.generation > OLD.generation) < 64
+BEGIN SELECT RAISE(ABORT, 'the newest 64 compaction records are kept'); END;
+
+CREATE TRIGGER node_faults_no_replace BEFORE INSERT ON node_faults
+WHEN EXISTS (SELECT 1 FROM node_faults WHERE rowid = NEW.rowid
+    OR generation = NEW.generation
+    OR (kind = NEW.kind AND instance_id = NEW.instance_id AND token = NEW.token))
+BEGIN SELECT RAISE(ABORT, 'a node fault cannot be replaced'); END;
+CREATE TRIGGER node_faults_no_update BEFORE UPDATE ON node_faults
+BEGIN SELECT RAISE(ABORT, 'a node fault is immutable'); END;
+-- RTC-14: deleted only in the offline clear's own transaction, under its clear row.
+CREATE TRIGGER node_faults_cleared_only BEFORE DELETE ON node_faults
+WHEN NOT EXISTS (SELECT 1 FROM node_fault_clears c
+    WHERE c.generation = (SELECT value FROM generation_counter WHERE id = 1)
+      AND c.cleared_through_generation >= OLD.generation)
+BEGIN SELECT RAISE(ABORT, 'a node fault is cleared only by the offline clear'); END;
+
+-- Written only by the root offline clear: its connection alone registers the function.
+CREATE TRIGGER node_fault_clears_offline_only BEFORE INSERT ON node_fault_clears
+WHEN EXISTS (SELECT 1 FROM node_fault_clears WHERE rowid = NEW.rowid
+    OR generation = NEW.generation)
+    OR NEW.generation != (SELECT value FROM generation_counter WHERE id = 1)
+    OR kilnd_offline_fault_clear() IS NOT 1
+BEGIN SELECT RAISE(ABORT, 'a fault clear is written only by the offline clear'); END;
+CREATE TRIGGER node_fault_clears_no_update BEFORE UPDATE ON node_fault_clears
+BEGIN SELECT RAISE(ABORT, 'a fault clear is immutable'); END;
+CREATE TRIGGER node_fault_clears_no_delete BEFORE DELETE ON node_fault_clears
+BEGIN SELECT RAISE(ABORT, 'a fault clear is permanent'); END;
 ";
 
 /// Every table with its write-guard surface, for the guard matrix.
-pub const GUARDED_TABLES: [&str; 12] = [
+pub const GUARDED_TABLES: [&str; 17] = [
     "node_identity",
     "generation_counter",
     "instances",
@@ -413,6 +616,11 @@ pub const GUARDED_TABLES: [&str; 12] = [
     "retired_tokens",
     "stop_events",
     "resource_events",
+    "token_key",
+    "instance_tokens",
+    "compaction_log",
+    "node_faults",
+    "node_fault_clears",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -439,6 +647,8 @@ pub enum LedgerError {
     NoSuchAllocation,
     #[error("durable commit failed")]
     CommitFailed,
+    #[error("durable commit failed: {0}")]
+    SyncFailed(String),
 }
 
 /// Each exhaustible dimension, named so tests prove which limit refused.
@@ -612,6 +822,15 @@ pub enum TokenLookup {
     Fenced {
         receipt: Vec<u8>,
     },
+    /// B7 RTC-8: below W with no rows, so absent forever. The receipt is synthesized
+    /// for the caller's plan digest and generation G_W; nothing was written.
+    Compacted {
+        receipt: Vec<u8>,
+    },
+    /// The tag does not verify in this instance, or seq is 0 (RTC-3).
+    Malformed,
+    /// A valid tag at or above the durable issue pointer: never issued (RTC-3).
+    NotIssued,
     Conflict {
         reason: String,
     },
@@ -671,14 +890,19 @@ pub enum FenceOutcome {
 pub enum AttachOutcome {
     /// First binding, or the same database again.
     Bound { node_id: Id128, generation: u64 },
+    /// B7 RTC-14: the reported highest token does not verify in this instance. This
+    /// attachment alone fails; nothing was written.
+    Malformed,
+    /// B7 RTC-14: a verified token at or above the issue pointer. Nothing was written
+    /// yet: L latches, H latches, and only then is the fault committed.
+    RollbackDetected { token: Id128, issue_next: u64 },
+    /// B7 RTC-14: the node's forward effects are latched; a first binding is one.
+    Latched,
     /// Another database once owned this namespace: claims survive and admission is
     /// blocked until an operator resolves it. The binding itself never changes.
     DatabaseMismatch { node_id: Id128, generation: u64 },
     /// Root never enrolled this instance. Nothing was written.
     NotEnrolled,
-    /// A first binding would write past the fence floor. Nothing was written, and an
-    /// instance already bound attaches with no write at all, so it is unaffected.
-    NoSpace,
 }
 
 /// Root's enrollment command, in one transaction. Only root reaches this: the helper
@@ -706,6 +930,84 @@ pub enum EnrollOutcome {
     NoSpace,
 }
 
+/// B7: Preflight's issuance transaction (RTC-4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum IssueOutcome {
+    /// The pointer durably passed `token`'s seq before this answer existed.
+    Issued {
+        token: Id128,
+        claimed: ClaimedIdentities,
+    },
+    /// Nothing was written and no seq was consumed.
+    Refused { refusal: IssueRefusal },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueRefusal {
+    /// RTC-17: no admitted headroom for this instance.
+    Headroom,
+    /// RTC-12: the never-admitted issuance floor for this window.
+    NeverAdmittedFloor,
+    /// RTC-4: the pointer is at 2^63 − 1 and never wraps.
+    Exhausted,
+    /// RTC-14: forward effects are latched node-wide.
+    Latched,
+    /// The ledger's live size is past its share of the reservation.
+    LedgerSpace,
+    NotEnrolled,
+}
+
+/// What one instance's token pointers read now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenPointers {
+    pub issue_next: u64,
+    pub watermark: u64,
+    pub watermark_generation: u64,
+    pub retained_admitted: u64,
+}
+
+/// One delete transaction's result (RTC-10, RTC-11).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactBatch {
+    pub tokens_deleted: u64,
+    pub rows_deleted: u64,
+    /// Fenced tokens below W whose allocation is not compactable: never deleted, named
+    /// in Health. Only a corrupt ledger can have one.
+    pub stuck: Vec<Id128>,
+    /// Compactable rows remain after this batch.
+    pub more: bool,
+}
+
+/// A watermark transaction's result (RTC-5, RTC-9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Advance {
+    pub from: u64,
+    pub to: u64,
+    pub generation: u64,
+}
+
+/// RTC-16: the caller's own instance, never another's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenAccounting {
+    pub issue_next: u64,
+    pub watermark: u64,
+    pub watermark_generation: u64,
+    pub retained_admitted: u64,
+    pub retained_never_admitted: u64,
+    pub reserved_share: u64,
+    pub pinned_below_watermark: u64,
+    /// L's in-memory watermark checkpoints for this instance (RTC-13).
+    pub checkpoints: u64,
+    /// How long the oldest issuance not yet below W has waited, by L's boot clock.
+    pub compaction_lag_ms: u64,
+}
+
 /// Node totals; no other instance's session identities appear here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -720,6 +1022,20 @@ pub struct AccountingSnapshot {
     pub over_committed: bool,
     pub retired_tokens: u64,
     pub ledger_bytes: u64,
+    /// B7 RTC-16: the caller's own instance, filled when the request names one.
+    pub tokens: Option<TokenAccounting>,
+    pub retained_admitted_total: u64,
+    pub retained_never_admitted_total: u64,
+    /// RTC-17's E and the per-slot share it reserves.
+    pub admitted_entries: u64,
+    pub share: u64,
+    /// Entries by which retained rows exceed the reserved shares after a policy change.
+    pub share_shortfall: u64,
+    /// A durable or in-memory RTC-14 latch, by kind only.
+    pub node_fault: Option<String>,
+    /// Retained headroom below 25%, compaction lag past two leases, a stuck token or a
+    /// share shortfall: Health degrades with this reason.
+    pub degraded: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -780,6 +1096,8 @@ pub struct EnrolledAccount {
 #[serde(deny_unknown_fields)]
 pub struct ReplaySnapshot {
     pub generation: u64,
+    /// B7 RTC-14: durable fault kinds, which latch H at once.
+    pub node_faults: Vec<String>,
     pub enrolled: Vec<EnrolledAccount>,
     pub active_allocations: Vec<InventoryRecord>,
     pub unsettled_workers: Vec<WorkerRecord>,
@@ -797,11 +1115,39 @@ pub struct LedgerConfig {
     pub shared: SharedReserve,
     /// Root policy's enrollment limit, which sizes each instance's share of the allowance.
     pub max_enrolled: u32,
+    /// B7: L's checkpoint and lease timing. The ledger itself never reads a clock.
+    pub compaction: CompactionPolicy,
+}
+
+/// B7 compaction timing, root policy only (design 16.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionPolicy {
+    pub lease_ms: u64,
+    pub pass_ms: u64,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            lease_ms: DEFAULT_COMPACTION_LEASE_MS,
+            pass_ms: DEFAULT_COMPACTION_PASS_MS,
+        }
+    }
+}
+
+impl CompactionPolicy {
+    /// RTC-13: LEASE / PASS + 2 checkpoints per instance (17 at the defaults).
+    pub fn checkpoint_bound(&self) -> usize {
+        (self.lease_ms / self.pass_ms.max(1)) as usize + 2
+    }
 }
 
 pub struct Ledger {
     conn: Connection,
     config: LedgerConfig,
+    /// K, read and checked at open (RTC-1). Never regenerated here.
+    key: TokenKey,
     _directory: ProtectedDir,
     /// Only tests can set this: it models a failed durable commit.
     fail_next_commit: std::cell::Cell<bool>,
@@ -812,8 +1158,8 @@ fn commit_tx(tx: Transaction<'_>, fail: &std::cell::Cell<bool>) -> Result<(), Le
         drop(tx);
         return Err(LedgerError::CommitFailed);
     }
-    tx.commit()?;
-    Ok(())
+    tx.commit()
+        .map_err(|error| LedgerError::SyncFailed(error.to_string()))
 }
 
 /// Inspects an entry without opening it. Closing any descriptor for a file drops all
@@ -968,13 +1314,90 @@ fn next_generation(tx: &Transaction<'_>) -> Result<u64, LedgerError> {
     unsigned(next)
 }
 
-/// Allowance entries set aside for all instances' never-admitted fences together. Never
-/// more than the allowance, and at least the margin for tokens L hasn't seen yet.
+/// Every entry the fence allowance holds at the measured per-token bound.
+fn allowance_entries(config: &LedgerConfig) -> u64 {
+    config.shared.fence_allowance_bytes / FENCE_ENTRY_BOUND
+}
+
+/// Allowance entries set aside for all instances' never-admitted fences together: a
+/// quarter of the allowance (2,048 of 8,192 at the default 128 MiB).
 fn never_admitted_pool(config: &LedgerConfig) -> u64 {
-    let tokens = config.shared.fence_allowance_bytes / FENCE_ENTRY_BOUND;
-    (tokens / NEVER_ADMITTED_SHARE)
-        .max(PRE_INTENT_TOKEN_MARGIN)
-        .min(tokens)
+    allowance_entries(config) / NEVER_ADMITTED_SHARE
+}
+
+/// RTC-17's E: the admitted entries, less the never-admitted pool, less one.
+fn admitted_entries(config: &LedgerConfig) -> u64 {
+    allowance_entries(config)
+        .saturating_sub(never_admitted_pool(config))
+        .saturating_sub(1)
+}
+
+/// RTC-17's slot arithmetic over one snapshot of the retained counters.
+struct Shares {
+    entries: u64,
+    slots: u64,
+    share: u64,
+    enrolled: u64,
+    retained: Vec<(String, u64)>,
+}
+
+impl Shares {
+    fn read(conn: &Connection, config: &LedgerConfig) -> Result<Self, LedgerError> {
+        let mut statement =
+            conn.prepare_cached("SELECT instance_id, retained_admitted FROM instance_tokens")?;
+        let mut rows = statement.query([])?;
+        let mut retained = Vec::new();
+        while let Some(row) = rows.next()? {
+            retained.push((row.get::<_, String>(0)?, unsigned(row.get(1)?)?));
+        }
+        let enrolled = retained.len() as u64;
+        let slots = enrolled.max(u64::from(config.max_enrolled)).max(1);
+        let entries = admitted_entries(config);
+        Ok(Self {
+            entries,
+            slots,
+            share: entries / slots,
+            enrolled,
+            retained,
+        })
+    }
+
+    fn total(&self) -> u64 {
+        self.retained.iter().map(|(_, r)| *r).sum()
+    }
+
+    fn of(&self, instance: &str) -> u64 {
+        self.retained
+            .iter()
+            .find(|(id, _)| id == instance)
+            .map_or(0, |(_, r)| *r)
+    }
+
+    /// RTC-17: an instance below its share always fits; above it, only while free − 1
+    /// still covers every other slot's unused share, enrolled or not.
+    fn admits(&self, instance: &str) -> bool {
+        let free = self.entries.saturating_sub(self.total());
+        let reserve: u64 = self
+            .retained
+            .iter()
+            .filter(|(id, _)| id != instance)
+            .map(|(_, r)| self.share.saturating_sub(*r))
+            .sum::<u64>()
+            + self.slots.saturating_sub(self.enrolled) * self.share;
+        free >= 1 && (self.of(instance) < self.share || free > reserve)
+    }
+
+    /// Σ max(retained, share) over every slot, less E: positive only after a policy
+    /// change shrank the share under existing rows.
+    fn shortfall(&self) -> u64 {
+        let held: u64 = self
+            .retained
+            .iter()
+            .map(|(_, r)| (*r).max(self.share))
+            .sum::<u64>()
+            + self.slots.saturating_sub(self.enrolled) * self.share;
+        held.saturating_sub(self.entries)
+    }
 }
 
 /// One instance's share. A lowered policy can leave more rows than its limit, so the
@@ -989,7 +1412,8 @@ fn never_admitted_quota(conn: &Connection, config: &LedgerConfig) -> Result<u64,
     Ok(never_admitted_pool(config) / capacity)
 }
 
-/// Permanent fences this instance holds for tokens with no admission record.
+/// Retained fences this instance holds for tokens with no admission record (RTC-12:
+/// compacted ones no longer count).
 fn never_admitted_fences(conn: &Connection, instance: Id128) -> Result<u64, LedgerError> {
     let used: i64 = conn
         .prepare_cached(
@@ -1019,6 +1443,144 @@ fn claim_totals(conn: &Connection) -> Result<ClaimTotals, LedgerError> {
         })?;
     }
     Ok(totals)
+}
+
+fn generation_of(conn: &Connection) -> Result<u64, LedgerError> {
+    let value: i64 = conn
+        .prepare_cached("SELECT value FROM generation_counter WHERE id = 1")?
+        .query_row([], |r| r.get(0))?;
+    unsigned(value)
+}
+
+/// RTC-1/RTC-16: K is present, exactly 32 bytes, and its check value verifies for
+/// this node. A missing, truncated or substituted key fails the open audit.
+fn audit_token_key(conn: &Connection, node_id: Id128) -> Result<TokenKey, LedgerError> {
+    let row: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT key, key_check FROM token_key WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((key, check)) = row else {
+        return Err(LedgerError::Corrupt("the token key is missing".into()));
+    };
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| LedgerError::Corrupt("the token key has the wrong length".into()))?;
+    let key = TokenKey::from_parts(node_id, key);
+    if !key.check_matches(&check) {
+        return Err(LedgerError::Corrupt(
+            "the token key does not match its check value".into(),
+        ));
+    }
+    Ok(key)
+}
+
+/// RTC-16's token checks: one pointer row per instance, every stored seq's prefix and
+/// tag, W <= pointer, every seq below its pointer, no absent allocation below W without
+/// its fence, every retained counter equal to its rows, and no fault row the clears
+/// already cover.
+fn audit_tokens(conn: &Connection, key: &TokenKey) -> Result<(), LedgerError> {
+    let unpaired: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM instances i WHERE NOT EXISTS
+                    (SELECT 1 FROM instance_tokens t WHERE t.instance_id = i.instance_id))
+              + (SELECT COUNT(*) FROM instance_tokens t WHERE NOT EXISTS
+                    (SELECT 1 FROM instances i WHERE i.instance_id = t.instance_id))",
+        [],
+        |r| r.get(0),
+    )?;
+    if unpaired != 0 {
+        return Err(LedgerError::Corrupt(
+            "an instance has no token pointers, or pointers have no instance".into(),
+        ));
+    }
+    let broken: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM instance_tokens WHERE watermark > issue_next)
+              + (SELECT COUNT(*) FROM allocations a JOIN instance_tokens t USING (instance_id)
+                 WHERE a.issue_seq >= t.issue_next)
+              + (SELECT COUNT(*) FROM retired_tokens r JOIN instance_tokens t USING (instance_id)
+                 WHERE r.issue_seq >= t.issue_next)
+              + (SELECT COUNT(*) FROM allocations a JOIN instance_tokens t USING (instance_id)
+                 WHERE a.issue_seq < t.watermark AND a.phase = 'absent' AND NOT EXISTS
+                    (SELECT 1 FROM retired_tokens r WHERE r.instance_id = a.instance_id
+                     AND r.allocation_id = a.allocation_id))
+              + (SELECT COUNT(*) FROM instance_tokens t WHERE t.retained_admitted !=
+                    (SELECT COUNT(*) FROM allocations a WHERE a.instance_id = t.instance_id))
+              + (SELECT COUNT(*) FROM node_faults f WHERE f.generation <=
+                    (SELECT COALESCE(MAX(cleared_through_generation), 0) FROM node_fault_clears))",
+        [],
+        |r| r.get(0),
+    )?;
+    if broken != 0 {
+        return Err(LedgerError::Corrupt(
+            "token pointers, sequences, counters or fault clears are inconsistent".into(),
+        ));
+    }
+    for table in ["allocations", "retired_tokens"] {
+        let mut statement =
+            conn.prepare(&format!("SELECT instance_id, allocation_id, issue_seq FROM {table}"))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let instance = parse_id(row.get(0)?)?;
+            let allocation = parse_id(row.get(1)?)?;
+            let seq = unsigned(row.get(2)?)?;
+            if key.verify(instance, allocation) != Some(seq) {
+                return Err(LedgerError::Corrupt(format!(
+                    "a stored token's tag does not verify ({table})"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pointers_on(conn: &Connection, instance: Id128) -> Result<Option<TokenPointers>, LedgerError> {
+    let row: Option<(i64, i64, i64, i64)> = conn
+        .prepare_cached(
+            "SELECT issue_next, watermark, watermark_generation, retained_admitted
+             FROM instance_tokens WHERE instance_id = ?1",
+        )?
+        .query_row([instance.to_string()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .optional()?;
+    row.map(|(issue_next, watermark, generation, retained)| {
+        Ok(TokenPointers {
+            issue_next: unsigned(issue_next)?,
+            watermark: unsigned(watermark)?,
+            watermark_generation: unsigned(generation)?,
+            retained_admitted: unsigned(retained)?,
+        })
+    })
+    .transpose()
+}
+
+/// RTC-8's synthesized `AbsentFenced`: generation G_W, a receipt ID derived from every
+/// input, the caller's own plan digest and no other source. It writes nothing.
+fn compacted_receipt(
+    node: Id128,
+    instance: Id128,
+    allocation: Id128,
+    plan_digest: &Digest,
+    seq: u64,
+    pointers: &TokenPointers,
+) -> Result<Vec<u8>, LedgerError> {
+    let generation = pointers.watermark_generation;
+    FencedAbsence::new(
+        token::compacted_receipt_id(node, instance, allocation, plan_digest, generation),
+        node,
+        instance,
+        allocation,
+        *plan_digest,
+        generation,
+        format!(
+            "compacted;watermark={};issue_seq={seq}",
+            pointers.watermark
+        ),
+    )
+    .and_then(|receipt| receipt.encode())
+    .map_err(|e| LedgerError::Config(e.to_string()))
 }
 
 impl Ledger {
@@ -1071,6 +1633,14 @@ impl Ledger {
             "INSERT INTO generation_counter (id, value) VALUES (1, 1)",
             [],
         )?;
+        // RTC-1: K from the kernel's CSPRNG, with its check value, in this same
+        // transaction. Nothing else ever writes it, and open never makes another.
+        let key = TokenKey::generate(config.node_id)?;
+        tx.execute(
+            "INSERT INTO token_key (id, key, key_check, created_generation) VALUES (1, ?1, ?2, 1)",
+            params![&key.secret_bytes()[..], &key.check_value()[..]],
+        )?;
+        crate::helper::firecracker::workers::fault_point("ledger.provision.before_commit");
         tx.commit()?;
         drop(conn);
         created.sync_all()?;
@@ -1097,21 +1667,28 @@ impl Ledger {
         .map_err(|e| LedgerError::Corrupt(e.to_string()))?;
         configure(&conn).map_err(corrupt)?;
         check_ledger_files(directory.file(), owner)?;
-        let ledger = Self {
+        let key = Self::audit(&conn, &config).map_err(corrupt)?;
+        Ok(Self {
             conn,
             config,
+            key,
             _directory: directory,
             fail_next_commit: std::cell::Cell::new(false),
-        };
-        ledger.audit().map_err(corrupt)?;
-        Ok(ledger)
+        })
     }
 
-    /// Integrity plus semantic checks, inside one read snapshot.
-    fn audit(&self) -> Result<(), LedgerError> {
-        let conn = &self.conn;
+    /// Integrity plus semantic checks, inside one read snapshot. Returns K once its
+    /// presence, length and check value are proven (RTC-16).
+    fn audit(conn: &Connection, config: &LedgerConfig) -> Result<TokenKey, LedgerError> {
         let application: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if application == APPLICATION_ID && version == 1 {
+            return Err(LedgerError::Corrupt(
+                "this is a schema 1 node ledger, which B7 replaced: settle every Firecracker \
+                 session and re-provision it"
+                    .into(),
+            ));
+        }
         if application != APPLICATION_ID || version != SCHEMA_VERSION {
             return Err(LedgerError::Corrupt("not this ledger format".into()));
         }
@@ -1126,13 +1703,14 @@ impl Ledger {
             conn.query_row("SELECT node_id FROM node_identity WHERE id = 1", [], |r| {
                 r.get(0)
             })?;
-        if node != self.config.node_id.to_string() {
+        if node != config.node_id.to_string() {
             return Err(LedgerError::Corrupt(format!(
                 "ledger belongs to node {node}"
             )));
         }
         audit_accounts(conn)?;
-        let generation = self.generation()?;
+        let key = audit_token_key(conn, config.node_id)?;
+        let generation = generation_of(conn)?;
         // Every stored generation must be behind the counter: a rolled-back counter
         // could otherwise reissue a receipt generation.
         let highest: i64 = conn.query_row(
@@ -1141,6 +1719,11 @@ impl Ledger {
                 UNION ALL SELECT MAX(helper_generation) FROM retired_tokens
                 UNION ALL SELECT MAX(operation_generation) FROM worker_intents
                 UNION ALL SELECT MAX(generation) FROM stop_events
+                UNION ALL SELECT MAX(watermark_generation) FROM instance_tokens
+                UNION ALL SELECT MAX(generation) FROM compaction_log
+                UNION ALL SELECT MAX(generation) FROM node_faults
+                UNION ALL SELECT MAX(generation) FROM node_fault_clears
+                UNION ALL SELECT MAX(created_generation) FROM token_key
                 UNION ALL SELECT 1)",
             [],
             |r| r.get(0),
@@ -1160,7 +1743,7 @@ impl Ledger {
             let receipt: Vec<u8> = row.get(5)?;
             let decoded = FencedAbsence::decode(&receipt)
                 .map_err(|e| LedgerError::Corrupt(format!("retired token receipt: {e}")))?;
-            if decoded.node_id() != self.config.node_id
+            if decoded.node_id() != config.node_id
                 || decoded.allocation_id() != parse_id(row.get(0)?)?
                 || decoded.instance_id() != parse_id(row.get(1)?)?
                 || decoded.plan_digest() != parse_sha(row.get(2)?)?
@@ -1205,19 +1788,21 @@ impl Ledger {
             }
         }
         claim_totals(conn)?;
-        Ok(())
+        audit_tokens(conn, &key)?;
+        Ok(key)
     }
 
     pub fn node_id(&self) -> Id128 {
         self.config.node_id
     }
 
+    /// K, for L to hand to H over their private channel (RTC-3) and nothing else.
+    pub fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
+
     pub fn generation(&self) -> Result<u64, LedgerError> {
-        let value: i64 = self
-            .conn
-            .prepare_cached("SELECT value FROM generation_counter WHERE id = 1")?
-            .query_row([], |r| r.get(0))?;
-        unsigned(value)
+        generation_of(&self.conn)
     }
 
     #[cfg(test)]
@@ -1239,7 +1824,6 @@ impl Ledger {
         enrollment: &Enrollment,
         limit: u32,
     ) -> Result<EnrollOutcome, LedgerError> {
-        let has_headroom = self.fence_headroom()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1282,9 +1866,6 @@ impl Ledger {
             if unsigned(total)? >= u64::from(limit) {
                 return Ok(EnrollOutcome::LimitReached { limit });
             }
-            if !has_headroom {
-                return Ok(EnrollOutcome::NoSpace);
-            }
             let generation = next_generation(&tx)?;
             tx.prepare_cached(
                 "INSERT INTO instances (instance_id, unit, cgroup, uid, gid, exe_st_dev, exe_st_ino,
@@ -1303,6 +1884,18 @@ impl Ledger {
                 image.sha256.to_string(),
                 signed(generation, "generation")?
             ])?;
+            // B7: the instance's exact pointer starts at 1, W at 1 under this generation.
+            tx.prepare_cached(
+                "INSERT INTO instance_tokens (instance_id, issue_next, watermark,
+                    watermark_generation, retained_admitted) VALUES (?1, 1, 1, ?2, 0)",
+            )?
+            .execute(params![instance, signed(generation, "generation")?])?;
+            // RTC-17: within the policy maximum this only gives a reserved slot an owner.
+            // Past it, the slots grow and the share shrinks; refuse if that leaves any
+            // slot short of its share.
+            if Shares::read(&tx, &self.config)?.shortfall() != 0 {
+                return Ok(EnrollOutcome::NoSpace);
+            }
             EnrollOutcome::Enrolled { generation }
         } else {
             let generation = next_generation(&tx)?;
@@ -1445,10 +2038,18 @@ impl Ledger {
     /// authorizes nothing. The first attachment records it on the instance's own row,
     /// which is the one write attach can make; every later one writes nothing. A
     /// mismatch is reported and never overwrites: claims stay with that namespace.
+    ///
+    /// B7 RTC-14: `highest_token` is the daemon's highest recorded complete token. Its
+    /// tag is checked in this instance before its seq means anything; only a verified
+    /// token at or above the issue pointer is rollback evidence, and that is answered
+    /// before any write, so L and H can latch before the fault commits. `latched` is
+    /// L's in-memory latch; a first binding is refused under it or any fault row.
     pub fn attach_instance(
         &mut self,
         instance: Id128,
         database_uuid: Id128,
+        highest_token: Option<Id128>,
+        latched: bool,
     ) -> Result<AttachOutcome, LedgerError> {
         let node_id = self.config.node_id;
         let bound: Option<Option<String>> = self
@@ -1459,6 +2060,15 @@ impl Ledger {
         let Some(bound) = bound else {
             return Ok(AttachOutcome::NotEnrolled);
         };
+        if let Some(token) = highest_token {
+            let Some(seq) = self.key.verify(instance, token) else {
+                return Ok(AttachOutcome::Malformed);
+            };
+            let issue_next = self.pointers(instance)?.issue_next;
+            if seq >= issue_next {
+                return Ok(AttachOutcome::RollbackDetected { token, issue_next });
+            }
+        }
         match bound {
             Some(existing) if existing == database_uuid.to_string() => Ok(AttachOutcome::Bound {
                 node_id,
@@ -1469,8 +2079,8 @@ impl Ledger {
                 generation: self.generation()?,
             }),
             None => {
-                if !self.fence_headroom()? {
-                    return Ok(AttachOutcome::NoSpace);
+                if latched || self.durable_faults()? != 0 {
+                    return Ok(AttachOutcome::Latched);
                 }
                 let tx = self
                     .conn
@@ -1492,12 +2102,27 @@ impl Ledger {
     /// Everything here is keyed by (instance, allocation): the caller's authenticated
     /// instance is the only namespace a token resolves in. Another instance's row with
     /// the same allocation ID is a different token, and this cannot see it.
+    ///
+    /// B7 (RTC-3, RTC-6): L classifies here, inside the transaction that reads the
+    /// token. The tag first (Malformed), then the durable pointer (NotIssued), then the
+    /// rows, which always outrank W, then below W (Compacted, synthesized for the
+    /// caller's digest), and only then Unknown.
     fn lookup_on(
         conn: &Connection,
+        tokens: &TokenKey,
         instance: Id128,
         allocation: Id128,
         plan_digest: &Digest,
     ) -> Result<TokenLookup, LedgerError> {
+        let Some(seq) = tokens.verify(instance, allocation) else {
+            return Ok(TokenLookup::Malformed);
+        };
+        let Some(pointers) = pointers_on(conn, instance)? else {
+            return Ok(TokenLookup::Malformed);
+        };
+        if seq >= pointers.issue_next {
+            return Ok(TokenLookup::NotIssued);
+        }
         let (owner, token) = (instance.to_string(), allocation.to_string());
         let key = [&owner, &token];
         let fence = conn
@@ -1531,6 +2156,18 @@ impl Ledger {
             })
             .optional()?;
         let Some((digest, phase, generation)) = active else {
+            if seq < pointers.watermark {
+                return Ok(TokenLookup::Compacted {
+                    receipt: compacted_receipt(
+                        tokens.node_id(),
+                        instance,
+                        allocation,
+                        plan_digest,
+                        seq,
+                        &pointers,
+                    )?,
+                });
+            }
             return Ok(TokenLookup::Unknown);
         };
         if digest != plan_digest.to_string() {
@@ -1566,26 +2203,33 @@ impl Ledger {
         allocation: Id128,
         plan_digest: &Digest,
     ) -> Result<TokenLookup, LedgerError> {
-        Self::lookup_on(&self.conn, instance, allocation, plan_digest)
+        Self::lookup_on(&self.conn, &self.key, instance, allocation, plan_digest)
     }
 
-    /// Inspect's allocation-only lookup, under exact namespace privacy.
-    pub fn inspect(&self, instance: Id128, allocation: Id128) -> Result<TokenLookup, LedgerError> {
-        let digest: Option<String> = self
+    /// Inspect, Remove and Gc's lookup (group schema 2): the request carries the plan
+    /// digest from the daemon Store's immutable binding. Rows answer when it matches and
+    /// Conflict when it does not; a compacted token gets a receipt for that digest.
+    pub fn inspect(
+        &self,
+        instance: Id128,
+        allocation: Id128,
+        plan_digest: &Digest,
+    ) -> Result<TokenLookup, LedgerError> {
+        Self::lookup_on(&self.conn, &self.key, instance, allocation, plan_digest)
+    }
+
+    /// One instance's pointers, as committed.
+    pub fn pointers(&self, instance: Id128) -> Result<TokenPointers, LedgerError> {
+        pointers_on(&self.conn, instance)?.ok_or(LedgerError::NoSuchAllocation)
+    }
+
+    /// Durable RTC-14 fault rows. Any one latches every forward effect node-wide.
+    pub fn durable_faults(&self) -> Result<u64, LedgerError> {
+        let count: i64 = self
             .conn
-            .prepare_cached(
-                "SELECT plan_digest FROM retired_tokens WHERE instance_id = ?1 AND allocation_id = ?2
-                 UNION ALL
-                 SELECT plan_digest FROM allocations WHERE instance_id = ?1 AND allocation_id = ?2
-                 LIMIT 1",
-            )?
-            .query_row([instance.to_string(), allocation.to_string()], |r| r.get(0))
-            .optional()?;
-        match digest {
-            // Another namespace's token and a never-seen one are indistinguishable.
-            None => Ok(TokenLookup::Unknown),
-            Some(digest) => Self::lookup_on(&self.conn, instance, allocation, &parse_sha(digest)?),
-        }
+            .prepare_cached("SELECT COUNT(*) FROM node_faults")?
+            .query_row([], |r| r.get(0))?;
+        unsigned(count)
     }
 
     /// The set preflight avoids. Selecting from it reserves nothing.
@@ -1609,30 +2253,9 @@ impl Ledger {
         Ok(claimed)
     }
 
-    /// Whether one more token still fits, with every active token and the pre-intent
-    /// margin already counted. Permanent fences never give their space back.
-    pub fn fence_headroom(&self) -> Result<bool, LedgerError> {
-        // Every admitted token, active or retired, holds one entry. Never-admitted fences
-        // are reserved whole, up front, so no quota can eat what admitted tokens need.
-        let allocations: i64 = self
-            .conn
-            .prepare_cached("SELECT COUNT(*) FROM allocations")?
-            .query_row([], |r| r.get(0))?;
-        let never_admitted: i64 = self
-            .conn
-            .prepare_cached(
-                "SELECT COUNT(*) FROM retired_tokens r WHERE NOT EXISTS
-                    (SELECT 1 FROM allocations a WHERE a.instance_id = r.instance_id
-                        AND a.allocation_id = r.allocation_id)",
-            )?
-            .query_row([], |r| r.get(0))?;
-        let reserved = never_admitted_pool(&self.config).max(unsigned(never_admitted)?);
-        let needed = unsigned(allocations)?
-            .checked_add(reserved)
-            .and_then(|tokens| tokens.checked_add(1))
-            .and_then(|tokens| tokens.checked_mul(FENCE_ENTRY_BOUND))
-            .ok_or(LedgerError::Overflow("fence headroom"))?;
-        Ok(needed <= self.config.shared.fence_allowance_bytes)
+    /// RTC-17: whether this instance may take one more admitted entry now.
+    pub fn admitted_headroom(&self, instance: Id128) -> Result<bool, LedgerError> {
+        Ok(Shares::read(&self.conn, &self.config)?.admits(&instance.to_string()))
     }
 
     /// Whether this instance may still fence a token the ledger never admitted.
@@ -1649,16 +2272,105 @@ impl Ledger {
         Ok(used < quota - quota / 4)
     }
 
+    /// Live pages only, (page_count − freelist_count) × page_size: SQLite reuses the
+    /// pages compaction frees without shrinking the file (design 16.6).
     fn ledger_bytes(&self) -> Result<u64, LedgerError> {
         let pages: i64 = self
             .conn
             .pragma_query_value(None, "page_count", |r| r.get(0))?;
+        let free: i64 = self
+            .conn
+            .pragma_query_value(None, "freelist_count", |r| r.get(0))?;
         let size: i64 = self
             .conn
             .pragma_query_value(None, "page_size", |r| r.get(0))?;
         unsigned(pages)?
+            .saturating_sub(unsigned(free)?)
             .checked_mul(unsigned(size)?)
             .ok_or(LedgerError::Overflow("ledger size"))
+    }
+
+    fn over_ledger_space(&self) -> Result<bool, LedgerError> {
+        let shared = self.config.shared;
+        Ok(self.ledger_bytes()?
+            > shared
+                .disk_bytes
+                .saturating_sub(shared.fence_allowance_bytes))
+    }
+
+    /// B7 RTC-4: Preflight's one issuance transaction. It takes the identity snapshot,
+    /// checks headroom (RTC-17) and the never-admitted issuance floor (RTC-12), and
+    /// raises the exact pointer by one, committed before the token exists outside L.
+    /// A refusal writes nothing and consumes no seq. `latched` is L's RTC-14 latch.
+    pub fn issue_and_snapshot(
+        &mut self,
+        instance: Id128,
+        latched: bool,
+    ) -> Result<IssueOutcome, LedgerError> {
+        let refused = |refusal| Ok(IssueOutcome::Refused { refusal });
+        let over_space = self.over_ledger_space()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let faults: i64 = tx
+            .prepare_cached("SELECT COUNT(*) FROM node_faults")?
+            .query_row([], |r| r.get(0))?;
+        if latched || faults != 0 {
+            return refused(IssueRefusal::Latched);
+        }
+        let Some(pointers) = pointers_on(&tx, instance)? else {
+            return refused(IssueRefusal::NotEnrolled);
+        };
+        let seq = pointers.issue_next;
+        if seq > token::MAX_SEQ {
+            return refused(IssueRefusal::Exhausted);
+        }
+        if over_space {
+            return refused(IssueRefusal::LedgerSpace);
+        }
+        if !Shares::read(&tx, &self.config)?.admits(&instance.to_string()) {
+            return refused(IssueRefusal::Headroom);
+        }
+        let quota = never_admitted_quota(&tx, &self.config)?;
+        if never_admitted_fences(&tx, instance)? >= quota - quota / 4 {
+            return refused(IssueRefusal::NeverAdmittedFloor);
+        }
+        let mut claimed = ClaimedIdentities::default();
+        {
+            let mut statement = tx.prepare_cached(
+                "SELECT namespace, value FROM identity_leases WHERE released_generation IS NULL",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let namespace: String = row.get(0)?;
+                let value = u32::try_from(row.get::<_, i64>(1)?)
+                    .map_err(|_| LedgerError::Corrupt("identity value".into()))?;
+                match namespace.as_str() {
+                    "uid" => claimed.uids.insert(value),
+                    "gid" => claimed.gids.insert(value),
+                    "cid" => claimed.cids.insert(value),
+                    _ => return Err(LedgerError::Corrupt("identity namespace".into())),
+                };
+            }
+        }
+        let changed = tx
+            .prepare_cached(
+                "UPDATE instance_tokens SET issue_next = ?2 WHERE instance_id = ?1 AND issue_next = ?3",
+            )?
+            .execute(params![
+                instance.to_string(),
+                signed(seq + 1, "issue pointer")?,
+                signed(seq, "issue pointer")?
+            ])?;
+        if changed != 1 {
+            return Err(LedgerError::StaleGeneration);
+        }
+        crate::helper::firecracker::workers::fault_point("L.issue.before_commit");
+        commit_tx(tx, &self.fail_next_commit)?;
+        Ok(IssueOutcome::Issued {
+            token: self.key.issue(instance, seq),
+            claimed,
+        })
     }
 
     /// C2: full capacity vector, every identity, INTENT, names, stop authority and the
@@ -1678,20 +2390,32 @@ impl Ledger {
     ) -> Result<AdmitOutcome, LedgerError> {
         let ceilings = self.config.ceilings;
         let shared = self.config.shared;
-        let has_headroom = self.fence_headroom()?;
-        let ledger_bytes = self.ledger_bytes()?;
+        let over_space = self.over_ledger_space()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // The existing token comes first, before capacity and before any identity.
         match Self::lookup_on(
             &tx,
+            &self.key,
             request.instance_id,
             request.allocation_id,
             &request.plan_digest,
         )? {
             TokenLookup::Fenced { receipt } => return Ok(AdmitOutcome::Fenced { receipt }),
+            // RTC-7: W passed this rowless token first; it is absent forever.
+            TokenLookup::Compacted { receipt } => return Ok(AdmitOutcome::Fenced { receipt }),
             TokenLookup::Conflict { reason } => return Ok(AdmitOutcome::Conflict { reason }),
+            TokenLookup::Malformed => {
+                return Ok(AdmitOutcome::Conflict {
+                    reason: "the token does not verify in this instance".into(),
+                });
+            }
+            TokenLookup::NotIssued => {
+                return Ok(AdmitOutcome::Conflict {
+                    reason: "the token was never issued".into(),
+                });
+            }
             TokenLookup::Active {
                 generation, phase, ..
             } => {
@@ -1749,11 +2473,9 @@ impl Ledger {
                 reason: "sandbox ID is bound to another allocation".into(),
             });
         }
-        if !has_headroom
-            || ledger_bytes
-                > shared
-                    .disk_bytes
-                    .saturating_sub(shared.fence_allowance_bytes)
+        // RTC-17's recheck, inside this transaction: Preflight's was only early.
+        if over_space
+            || !Shares::read(&tx, &self.config)?.admits(&request.instance_id.to_string())
         {
             return Ok(AdmitOutcome::Capacity {
                 dimension: Dimension::LedgerSpace,
@@ -1793,8 +2515,8 @@ impl Ledger {
             "INSERT INTO allocations (allocation_id, instance_id, sandbox_id, backend_id,
                 plan_version, plan_digest, profile, manifest_sha256, host_spec_sha256,
                 guest_exec_spec_sha256, work_uuid, stop_authority, phase,
-                created_generation, updated_generation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'intent', ?13, ?13)",
+                created_generation, updated_generation, issue_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'intent', ?13, ?13, ?14)",
         )?
         .execute(params![
             allocation,
@@ -1811,6 +2533,7 @@ impl Ledger {
             serde_json::to_string(&request.stop_authority)
                 .map_err(|e| LedgerError::Config(e.to_string()))?,
             generation_i,
+            signed(token::seq_of(request.allocation_id), "issue seq")?,
         ])?;
         tx.prepare_cached(
             "INSERT INTO allocation_plans (instance_id, allocation_id, plan) VALUES (?1, ?2, ?3)",
@@ -2499,17 +3222,28 @@ impl Ledger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         match Self::lookup_on(
             &tx,
+            &self.key,
             request.instance_id,
             request.allocation_id,
             &request.plan_digest,
         )? {
-            TokenLookup::Fenced { receipt } => {
+            TokenLookup::Fenced { receipt } | TokenLookup::Compacted { receipt } => {
                 return Ok(FenceOutcome::Absent {
                     receipt,
                     replay: true,
                 });
             }
             TokenLookup::Conflict { reason } => return Ok(FenceOutcome::Conflict { reason }),
+            TokenLookup::Malformed => {
+                return Ok(FenceOutcome::Conflict {
+                    reason: "the token does not verify in this instance".into(),
+                });
+            }
+            TokenLookup::NotIssued => {
+                return Ok(FenceOutcome::Conflict {
+                    reason: "the token was never issued".into(),
+                });
+            }
             TokenLookup::Active {
                 unsettled_workers,
                 phase,
@@ -2593,7 +3327,8 @@ impl Ledger {
         .map_err(|e| LedgerError::Config(e.to_string()))?;
         tx.prepare_cached(
             "INSERT INTO retired_tokens (allocation_id, instance_id, sandbox_id, plan_digest,
-                receipt_id, helper_generation, receipt) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                receipt_id, helper_generation, receipt, issue_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?
         .execute(params![
             allocation,
@@ -2603,6 +3338,7 @@ impl Ledger {
             receipt_id.to_string(),
             generation_i,
             receipt,
+            signed(token::seq_of(request.allocation_id), "issue seq")?,
         ])?;
         tx.prepare_cached(
             "DELETE FROM allocation_plans WHERE instance_id = ?1 AND allocation_id = ?2",
@@ -2621,14 +3357,74 @@ impl Ledger {
         })
     }
 
-    /// Node totals with once-only shared reserves; no session identities.
-    pub fn accounting(&self) -> Result<AccountingSnapshot, LedgerError> {
+    /// Node totals with once-only shared reserves; no session identities. `instance`
+    /// is the authenticated caller: only its own token figures appear (RTC-16).
+    pub fn accounting(&self, instance: Option<Id128>) -> Result<AccountingSnapshot, LedgerError> {
         let claimed = claim_totals(&self.conn)?;
         let committed = claimed.with_shared(&self.config.shared)?;
         let retired: i64 = self
             .conn
             .prepare_cached("SELECT COUNT(*) FROM retired_tokens")?
             .query_row([], |r| r.get(0))?;
+        let never_admitted_total: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM retired_tokens r WHERE NOT EXISTS
+                    (SELECT 1 FROM allocations a WHERE a.instance_id = r.instance_id
+                        AND a.allocation_id = r.allocation_id)",
+            )?
+            .query_row([], |r| r.get(0))?;
+        let shares = Shares::read(&self.conn, &self.config)?;
+        let mut degraded = None;
+        let tokens = match instance.map(|i| (i, pointers_on(&self.conn, i))) {
+            Some((instance, pointers)) => match pointers? {
+                Some(pointers) => {
+                    let pinned: i64 = self
+                        .conn
+                        .prepare_cached(
+                            "SELECT COUNT(*) FROM allocations WHERE instance_id = ?1
+                               AND phase != 'absent' AND issue_seq < ?2",
+                        )?
+                        .query_row(
+                            params![
+                                instance.to_string(),
+                                signed(pointers.watermark, "watermark")?
+                            ],
+                            |r| r.get(0),
+                        )?;
+                    let ceiling = shares.share
+                        + shares
+                            .entries
+                            .saturating_sub(shares.slots.saturating_mul(shares.share));
+                    if pointers.retained_admitted.saturating_mul(4) > ceiling.saturating_mul(3) {
+                        degraded = Some(format!(
+                            "retained admitted rows {} of {ceiling}: under 25% headroom left",
+                            pointers.retained_admitted
+                        ));
+                    }
+                    Some(TokenAccounting {
+                        issue_next: pointers.issue_next,
+                        watermark: pointers.watermark,
+                        watermark_generation: pointers.watermark_generation,
+                        retained_admitted: pointers.retained_admitted,
+                        retained_never_admitted: never_admitted_fences(&self.conn, instance)?,
+                        reserved_share: shares.share,
+                        pinned_below_watermark: unsigned(pinned)?,
+                        checkpoints: 0,
+                        compaction_lag_ms: 0,
+                    })
+                }
+                None => None,
+            },
+            None => None,
+        };
+        let shortfall = shares.shortfall();
+        if shortfall != 0 {
+            degraded = Some(format!(
+                "a policy change left {shortfall} retained rows above the reserved shares"
+            ));
+        }
+        let node_fault = (self.durable_faults()? != 0).then(|| "rollback".to_string());
         Ok(AccountingSnapshot {
             node_id: self.config.node_id,
             generation: self.generation()?,
@@ -2639,6 +3435,14 @@ impl Ledger {
             over_committed: committed.exceeded(&self.config.ceilings).is_some(),
             retired_tokens: unsigned(retired)?,
             ledger_bytes: self.ledger_bytes()?,
+            tokens,
+            retained_admitted_total: shares.total(),
+            retained_never_admitted_total: unsigned(never_admitted_total)?,
+            admitted_entries: shares.entries,
+            share: shares.share,
+            share_shortfall: shortfall,
+            node_fault,
+            degraded,
         })
     }
 
@@ -2748,12 +3552,412 @@ impl Ledger {
                 installation_generation: unsigned(row.get(5)?)?,
             });
         }
+        let mut statement = self
+            .conn
+            .prepare("SELECT kind FROM node_faults ORDER BY generation")?;
+        let node_faults = statement
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(ReplaySnapshot {
             generation: self.generation()?,
+            node_faults,
             enrolled: self.enrolled_instances()?,
             active_allocations,
             unsettled_workers,
             executable_leases,
+        })
+    }
+
+    /// The newest compaction record of one instance, for `ledger-stats`.
+    pub fn last_compaction(&self, instance: Id128) -> Result<Option<serde_json::Value>, LedgerError> {
+        let row: Option<(i64, i64, i64, i64, i64)> = self
+            .conn
+            .prepare_cached(
+                "SELECT from_w, to_w, generation, tokens_deleted, rows_deleted FROM compaction_log
+                 WHERE instance_id = ?1 ORDER BY generation DESC LIMIT 1",
+            )?
+            .query_row([instance.to_string()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .optional()?;
+        Ok(row.map(|(from, to, generation, tokens, rows)| {
+            serde_json::json!({
+                "from_w": from, "to_w": to, "generation": generation,
+                "tokens_deleted": tokens, "rows_deleted": rows,
+            })
+        }))
+    }
+
+    /// Every enrolled instance, for the compactor and the offline commands.
+    pub fn instance_ids(&self) -> Result<Vec<Id128>, LedgerError> {
+        Ok(self
+            .enrolled_instances()?
+            .into_iter()
+            .map(|account| account.instance_id)
+            .collect())
+    }
+
+    /// B7 RTC-5 and RTC-9: raises W toward `target` (never past the pointer, never
+    /// down), with a fresh G_W, in its own FULL-sync transaction. With W unchanged it
+    /// still takes a fresh G_W when a pinned allocation was fenced at or after the last
+    /// one, so nothing is compacted until a synthesized receipt would be newer than every
+    /// generation the token was ever reported with. Nothing else writes W.
+    pub fn advance_watermark(
+        &mut self,
+        instance: Id128,
+        target: u64,
+    ) -> Result<Option<Advance>, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pointers = pointers_on(&tx, instance)?.ok_or(LedgerError::NoSuchAllocation)?;
+        let to = target.max(pointers.watermark).min(pointers.issue_next);
+        let late: i64 = tx
+            .prepare_cached(
+                "SELECT COUNT(*) FROM retired_tokens WHERE instance_id = ?1 AND issue_seq < ?2
+                   AND helper_generation >= ?3",
+            )?
+            .query_row(
+                params![
+                    instance.to_string(),
+                    signed(pointers.watermark, "watermark")?,
+                    signed(pointers.watermark_generation, "generation")?
+                ],
+                |r| r.get(0),
+            )?;
+        if to == pointers.watermark && late == 0 {
+            return Ok(None);
+        }
+        let generation = next_generation(&tx)?;
+        let changed = tx
+            .prepare_cached(
+                "UPDATE instance_tokens SET watermark = ?2, watermark_generation = ?3
+                 WHERE instance_id = ?1 AND watermark = ?4",
+            )?
+            .execute(params![
+                instance.to_string(),
+                signed(to, "watermark")?,
+                signed(generation, "generation")?,
+                signed(pointers.watermark, "watermark")?
+            ])?;
+        if changed != 1 {
+            return Err(LedgerError::StaleGeneration);
+        }
+        tx.prepare_cached(
+            "INSERT INTO compaction_log (instance_id, from_w, to_w, generation, tokens_deleted,
+                rows_deleted) VALUES (?1, ?2, ?3, ?4, 0, 0)",
+        )?
+        .execute(params![
+            instance.to_string(),
+            signed(pointers.watermark, "watermark")?,
+            signed(to, "watermark")?,
+            signed(generation, "generation")?
+        ])?;
+        tx.prepare_cached(
+            "DELETE FROM compaction_log WHERE instance_id = ?1 AND id NOT IN
+                (SELECT id FROM compaction_log WHERE instance_id = ?1
+                 ORDER BY generation DESC LIMIT ?2)",
+        )?
+        .execute(params![instance.to_string(), COMPACTION_LOG_KEPT])?;
+        crate::helper::firecracker::workers::fault_point("L.compact.advance.before_commit");
+        commit_tx(tx, &self.fail_next_commit)?;
+        crate::helper::firecracker::workers::fault_point("L.compact.advance.after_commit");
+        Ok(Some(Advance {
+            from: pointers.watermark,
+            to,
+            generation,
+        }))
+    }
+
+    /// B7 RTC-10 and RTC-11: deletes up to `max_tokens` compactable tokens' rows in one
+    /// FULL-sync transaction: children first, then the allocation, then the fence row.
+    /// Only tokens below W whose fence generation is below G_W and whose allocation, if
+    /// any, is absent with every claim, lease and worker released or settled; the
+    /// triggers enforce each condition again. Ledger SQL only: no host action.
+    pub fn compact_batch(
+        &mut self,
+        instance: Id128,
+        max_tokens: u64,
+    ) -> Result<CompactBatch, LedgerError> {
+        use crate::helper::firecracker::workers::{fault_enabled, fault_point};
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pointers = pointers_on(&tx, instance)?.ok_or(LedgerError::NoSuchAllocation)?;
+        let owner = instance.to_string();
+        let (w, g) = (
+            signed(pointers.watermark, "watermark")?,
+            signed(pointers.watermark_generation, "generation")?,
+        );
+        const COMPACTABLE: &str = "NOT EXISTS (SELECT 1 FROM allocations a
+                WHERE a.instance_id = r.instance_id AND a.allocation_id = r.allocation_id)
+            OR EXISTS (SELECT 1 FROM allocations a
+                WHERE a.instance_id = r.instance_id AND a.allocation_id = r.allocation_id
+                  AND a.phase = 'absent'
+                  AND NOT EXISTS (SELECT 1 FROM capacity_claims c WHERE c.instance_id = a.instance_id
+                      AND c.allocation_id = a.allocation_id AND c.released_generation IS NULL)
+                  AND NOT EXISTS (SELECT 1 FROM identity_leases l WHERE l.instance_id = a.instance_id
+                      AND l.allocation_id = a.allocation_id AND l.released_generation IS NULL)
+                  AND NOT EXISTS (SELECT 1 FROM executable_leases e WHERE e.instance_id = a.instance_id
+                      AND e.allocation_id = a.allocation_id AND e.released_generation IS NULL)
+                  AND NOT EXISTS (SELECT 1 FROM worker_intents w WHERE w.instance_id = a.instance_id
+                      AND w.allocation_id = a.allocation_id AND w.settled_generation IS NULL))";
+        let candidates: Vec<(String, bool)> = {
+            let mut statement = tx.prepare_cached(&format!(
+                "SELECT r.allocation_id, EXISTS (SELECT 1 FROM allocations a
+                        WHERE a.instance_id = r.instance_id AND a.allocation_id = r.allocation_id)
+                 FROM retired_tokens r
+                 WHERE r.instance_id = ?1 AND r.issue_seq < ?2 AND r.helper_generation < ?3
+                   AND ({COMPACTABLE})
+                 ORDER BY r.issue_seq LIMIT ?4"
+            ))?;
+            statement
+                .query_map(
+                    params![owner, w, g, signed(max_tokens, "batch")? + 1],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?
+                .collect::<Result<_, _>>()?
+        };
+        let more = candidates.len() as u64 > max_tokens;
+        let mut batch = CompactBatch {
+            more,
+            ..CompactBatch::default()
+        };
+        for (allocation, admitted) in candidates.into_iter().take(max_tokens as usize) {
+            let key = params![owner, allocation];
+            if admitted {
+                for family in [
+                    "resource_events",
+                    "stop_events",
+                    "worker_intents",
+                    "executable_leases",
+                    "identity_leases",
+                    "capacity_claims",
+                    "allocation_plans",
+                ] {
+                    batch.rows_deleted += tx
+                        .prepare_cached(&format!(
+                            "DELETE FROM {family} WHERE instance_id = ?1 AND allocation_id = ?2"
+                        ))?
+                        .execute(key)? as u64;
+                    fault_point(&format!("L.compact.delete.after_{family}"));
+                }
+                batch.rows_deleted += tx
+                    .prepare_cached(
+                        "DELETE FROM allocations WHERE instance_id = ?1 AND allocation_id = ?2",
+                    )?
+                    .execute(key)? as u64;
+                fault_point("L.compact.delete.after_allocation");
+            }
+            let fences = tx
+                .prepare_cached(
+                    "DELETE FROM retired_tokens WHERE instance_id = ?1 AND allocation_id = ?2",
+                )?
+                .execute(key)? as u64;
+            fault_point("L.compact.delete.after_fence");
+            batch.rows_deleted += fences;
+            batch.tokens_deleted += fences;
+        }
+        {
+            let mut statement = tx.prepare_cached(&format!(
+                "SELECT r.allocation_id FROM retired_tokens r
+                 WHERE r.instance_id = ?1 AND r.issue_seq < ?2 AND r.helper_generation < ?3
+                   AND NOT ({COMPACTABLE})
+                 ORDER BY r.issue_seq LIMIT 8"
+            ))?;
+            let stuck = statement
+                .query_map(params![owner, w, g], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            batch.stuck = stuck.into_iter().map(parse_id).collect::<Result<_, _>>()?;
+        }
+        if batch.tokens_deleted != 0 {
+            tx.prepare_cached(
+                "UPDATE compaction_log SET tokens_deleted = tokens_deleted + ?2,
+                    rows_deleted = rows_deleted + ?3
+                 WHERE id = (SELECT id FROM compaction_log WHERE instance_id = ?1
+                             ORDER BY generation DESC LIMIT 1)",
+            )?
+            .execute(params![
+                owner,
+                signed(batch.tokens_deleted, "tokens")?,
+                signed(batch.rows_deleted, "rows")?
+            ])?;
+        }
+        if fault_enabled("L.compact.sync_fail") {
+            drop(tx);
+            return Err(LedgerError::CommitFailed);
+        }
+        commit_tx(tx, &self.fail_next_commit)?;
+        Ok(batch)
+    }
+
+    /// B7 RTC-14: commits a rollback fault, idempotently keyed by instance and token, so
+    /// a replacement L replaying H's pending fault writes it at most once.
+    pub fn commit_fault(
+        &mut self,
+        instance: Id128,
+        token: Id128,
+        issue_next_seen: u64,
+    ) -> Result<u64, LedgerError> {
+        use crate::helper::firecracker::workers::{fault_enabled, fault_point};
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<i64> = tx
+            .prepare_cached(
+                "SELECT generation FROM node_faults
+                 WHERE kind = 'rollback' AND instance_id = ?1 AND token = ?2",
+            )?
+            .query_row([instance.to_string(), token.to_string()], |r| r.get(0))
+            .optional()?;
+        if let Some(generation) = existing {
+            return unsigned(generation);
+        }
+        let generation = next_generation(&tx)?;
+        tx.prepare_cached(
+            "INSERT INTO node_faults (generation, kind, instance_id, token, issue_next_seen, detail)
+             VALUES (?1, 'rollback', ?2, ?3, ?4, ?5)",
+        )?
+        .execute(params![
+            signed(generation, "generation")?,
+            instance.to_string(),
+            token.to_string(),
+            signed(issue_next_seen.max(1), "issue pointer")?,
+            "a verified token at or above the issue pointer: the ledger is behind",
+        ])?;
+        fault_point("L.fault.before_commit");
+        if fault_enabled("L.fault.sync_fail") {
+            drop(tx);
+            return Err(LedgerError::CommitFailed);
+        }
+        commit_tx(tx, &self.fail_next_commit)?;
+        Ok(generation)
+    }
+
+    /// Every durable fault, for the offline inventory: (generation, kind, instance, token).
+    pub fn faults(&self) -> Result<Vec<(u64, String, Id128, Id128)>, LedgerError> {
+        let mut statement = self.conn.prepare(
+            "SELECT generation, kind, instance_id, token FROM node_faults ORDER BY generation",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut faults = Vec::new();
+        while let Some(row) = rows.next()? {
+            faults.push((
+                unsigned(row.get(0)?)?,
+                row.get(1)?,
+                parse_id(row.get(2)?)?,
+                parse_id(row.get(3)?)?,
+            ));
+        }
+        Ok(faults)
+    }
+
+    /// B7 RTC-14's single exception to insert-only faults, for root's offline clear
+    /// (design 16.6). One FULL-sync transaction: nothing may have moved since the
+    /// inventory (`ledger_generation` and the fault set), each pointer is raised past
+    /// the daemon's highest verified token and never lowered, W is untouched, the clear
+    /// row is written, and only then can the trigger allow the fault rows' deletion.
+    pub fn clear_node_faults(
+        &mut self,
+        ledger_generation: u64,
+        fault_generations: &[u64],
+        highest: &[(Id128, Option<Id128>)],
+        inventory_sha256: Digest,
+    ) -> Result<ClearOutcome, LedgerError> {
+        use rusqlite::functions::FunctionFlags;
+        self.conn.create_scalar_function(
+            "kilnd_offline_fault_clear",
+            0,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS,
+            |_| Ok(1i64),
+        )?;
+        let outcome = self.clear_in_transaction(
+            ledger_generation,
+            fault_generations,
+            highest,
+            inventory_sha256,
+        );
+        let _ = self
+            .conn
+            .remove_function("kilnd_offline_fault_clear", 0);
+        outcome
+    }
+
+    fn clear_in_transaction(
+        &mut self,
+        ledger_generation: u64,
+        fault_generations: &[u64],
+        highest: &[(Id128, Option<Id128>)],
+        inventory_sha256: Digest,
+    ) -> Result<ClearOutcome, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if generation_of(&tx)? != ledger_generation {
+            return Ok(ClearOutcome::Stale);
+        }
+        let present: Vec<u64> = {
+            let mut statement =
+                tx.prepare("SELECT generation FROM node_faults ORDER BY generation")?;
+            statement
+                .query_map([], |r| r.get::<_, i64>(0))?
+                .map(|g| g.map_err(LedgerError::from).and_then(unsigned))
+                .collect::<Result<_, _>>()?
+        };
+        let mut named = fault_generations.to_vec();
+        named.sort_unstable();
+        if named != present {
+            return Ok(ClearOutcome::Stale);
+        }
+        let mut raised = Vec::new();
+        for (instance, token) in highest {
+            let pointers = pointers_on(&tx, *instance)?.ok_or(LedgerError::NoSuchAllocation)?;
+            let floor = match token {
+                None => 0,
+                Some(token) => match self.key.verify(*instance, *token) {
+                    Some(seq) => seq + 1,
+                    None => return Ok(ClearOutcome::Malformed { instance: *instance }),
+                },
+            };
+            let next = pointers.issue_next.max(floor);
+            if next > token::POINTER_CEILING {
+                return Ok(ClearOutcome::Malformed { instance: *instance });
+            }
+            if next != pointers.issue_next {
+                tx.prepare_cached(
+                    "UPDATE instance_tokens SET issue_next = ?2 WHERE instance_id = ?1",
+                )?
+                .execute(params![instance.to_string(), signed(next, "issue pointer")?])?;
+            }
+            raised.push(serde_json::json!({
+                "instance_id": instance.to_string(),
+                "from": pointers.issue_next,
+                "to": next,
+            }));
+        }
+        let generation = next_generation(&tx)?;
+        let through = present.last().copied().unwrap_or(0);
+        tx.execute(
+            "INSERT INTO node_fault_clears (generation, cleared_through_generation,
+                inventory_sha256, raised_pointers) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                signed(generation, "generation")?,
+                signed(through, "generation")?,
+                inventory_sha256.to_string(),
+                serde_json::Value::Array(raised.clone()).to_string(),
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM node_faults WHERE generation <= ?1",
+            [signed(through, "generation")?],
+        )?;
+        crate::helper::firecracker::workers::fault_point("clear.before_commit");
+        commit_tx(tx, &self.fail_next_commit)?;
+        crate::helper::firecracker::workers::fault_point("clear.after_commit");
+        Ok(ClearOutcome::Cleared {
+            generation,
+            cleared_through: through,
+            raised: serde_json::Value::Array(raised).to_string(),
         })
     }
 
@@ -2762,6 +3966,20 @@ impl Ledger {
     pub(super) fn connection(&self) -> &Connection {
         &self.conn
     }
+}
+
+/// The offline clear's result. Anything but `Cleared` changed nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClearOutcome {
+    Cleared {
+        generation: u64,
+        cleared_through: u64,
+        raised: String,
+    },
+    /// The ledger moved since the inventory: its generation or fault set differs.
+    Stale,
+    /// A reported highest token does not verify for its instance.
+    Malformed { instance: Id128 },
 }
 
 fn corrupt(error: LedgerError) -> LedgerError {
@@ -2778,3 +3996,6 @@ pub fn ledger_lock_path(directory: &Path) -> PathBuf {
 
 #[cfg(test)]
 pub(super) mod tests;
+
+#[cfg(test)]
+mod b7_tests;

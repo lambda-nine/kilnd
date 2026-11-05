@@ -291,6 +291,8 @@ async fn run(args: Args) -> Result<()> {
                 identity.instance_id,
                 identity.database_uuid,
             );
+            // B7 RTC-14: every attachment reports the highest token this database holds.
+            runtime.record_token(store.highest_fenced_token(identity.instance_id)?);
             serve_with(args, store, socket, runtime, limits).await
         }
     }

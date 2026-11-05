@@ -2,7 +2,8 @@
 use super::{
     AbsenceReceipt, AllocationObservation, BackendInventory, BackendSandbox, CreateContext,
     CreateFailure, CreatedSandbox, ExecOutcome, ExecSpec, ExecutionContext, LegacyAbsence,
-    LegacyProof, PreparedCreate, Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt,
+    LegacyProof, PrepareContext, PreparedCreate, RemoveTarget, Runtime, RuntimeCapabilities,
+    RuntimeError, RuntimeReceipt,
     kiln_direct::{KILN_PROFILE, legacy_capabilities, legacy_inventory, unsupported_token},
 };
 use crate::helper::{
@@ -83,7 +84,7 @@ impl Runtime for KilnRuntime {
     }
     async fn prepare(
         &self,
-        _context: &CreateContext,
+        _context: &PrepareContext,
         spec: &SandboxSpec,
         _deadline: Instant,
         _cancel: &CancellationToken,
@@ -149,10 +150,12 @@ impl Runtime for KilnRuntime {
     }
     async fn remove(
         &self,
-        id: &str,
+        target: RemoveTarget<'_>,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<AbsenceReceipt, RuntimeError> {
+        // B7: a fenced binding is refused before any kiln call.
+        let id = target.legacy()?;
         match self
             .call(KilnRequest::Rm { id: id.into() }, deadline, cancel)
             .await?
@@ -179,10 +182,13 @@ impl Runtime for KilnRuntime {
     }
     async fn gc(
         &self,
-        ids: &[String],
+        targets: &[RemoveTarget<'_>],
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
+        // B7: one fenced binding refuses the whole call before any kiln call.
+        let ids = super::legacy_targets(targets)?;
+        let ids = ids.as_slice();
         let mut removed = Vec::new();
         for chunk in ids.chunks(crate::helper::protocol::MAX_GC_IDS) {
             match self

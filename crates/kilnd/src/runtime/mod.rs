@@ -115,12 +115,63 @@ impl From<std::io::Error> for CreateFailure {
     }
 }
 
-/// Generated in memory before preparation, without inserting a row.
+/// Built before preparation (design 9.1, B7). Names no allocation: a Firecracker token
+/// does not exist until the helper issues it inside Preflight (RTC-2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareContext {
+    pub instance_id: Id128,
+    pub sandbox_id: String,
+}
+
+/// Built after preparation, before C1, and stored with the row: `allocation_id` is
+/// `prepared.allocation_id()` for a fenced plan, or a legacy random ID for kiln.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateContext {
     pub instance_id: Id128,
     pub allocation_id: Id128,
     pub sandbox_id: String,
+}
+
+impl<'a> RemoveTarget<'a> {
+    /// A legacy adapter's target, or `Incompatible` before any backend call.
+    pub fn legacy(self) -> Result<&'a str, RuntimeError> {
+        match self {
+            Self::Legacy { backend_id } => Ok(backend_id),
+            Self::Fenced { binding } => Err(RuntimeError::Incompatible(format!(
+                "a fenced allocation ({}) cannot be removed by a legacy backend",
+                binding.allocation_id
+            ))),
+        }
+    }
+
+    /// A fenced adapter's target, or `Incompatible` before any wire call.
+    pub fn fenced(self) -> Result<&'a AllocationBinding, RuntimeError> {
+        match self {
+            Self::Fenced { binding } => Ok(binding),
+            Self::Legacy { backend_id } => Err(RuntimeError::Incompatible(format!(
+                "legacy sandbox {backend_id} has no allocation binding; drain it under its own \
+                 backend"
+            ))),
+        }
+    }
+}
+
+/// Every target of a legacy `gc`, or the whole call refused with nothing done.
+pub fn legacy_targets(targets: &[RemoveTarget<'_>]) -> Result<Vec<String>, RuntimeError> {
+    targets
+        .iter()
+        .map(|target| target.legacy().map(str::to_string))
+        .collect()
+}
+
+/// What a removal names (design 9.1, B7): never a backend ID alone for a fenced
+/// allocation. The binding comes only from the daemon Store's row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoveTarget<'a> {
+    /// A kiln sandbox: its backend ID, released only through the legacy tag.
+    Legacy { backend_id: &'a str },
+    /// A fenced allocation: the daemon Store's immutable binding, read from its row.
+    Fenced { binding: &'a AllocationBinding },
 }
 
 /// Which release rule a prepared create commits its row to.
@@ -146,6 +197,8 @@ pub struct PreparedCreate {
     runtime_profile: String,
     runtime_artifact_digest: String,
     regime: EvidenceRegime,
+    /// Some(helper-issued token) iff AbsenceFenced.
+    allocation_id: Option<Id128>,
 }
 
 impl PreparedCreate {
@@ -164,11 +217,14 @@ impl PreparedCreate {
             runtime_profile: runtime_profile.into(),
             runtime_artifact_digest: String::new(),
             regime: EvidenceRegime::LegacyLocal,
+            allocation_id: None,
         }
     }
 
     /// An absence-fenced plan. B1's `SpecBinding` supplies both digests and
     /// applies the offline execution profile; the plan digest covers exact bytes.
+    /// `allocation_id` is the helper-issued token bound into the plan (B7, RTC-2).
+    #[allow(clippy::too_many_arguments)]
     pub fn fenced(
         spec: SandboxSpec,
         reservation: ResourceReservation,
@@ -177,6 +233,7 @@ impl PreparedCreate {
         runtime_profile: &str,
         runtime_artifact_digest: Digest,
         node_id: Id128,
+        allocation_id: Id128,
     ) -> Result<Self, RuntimeError> {
         if backend_plan.is_empty() || backend_plan.len() > MAX_BACKEND_PLAN_BYTES {
             return Err(RuntimeError::Backend(format!(
@@ -200,7 +257,14 @@ impl PreparedCreate {
             runtime_profile: runtime_profile.into(),
             runtime_artifact_digest: runtime_artifact_digest.to_string(),
             regime: EvidenceRegime::AbsenceFenced { node_id },
+            allocation_id: Some(allocation_id),
         })
+    }
+
+    /// The token the helper issued and bound into this plan's substitutions, verified
+    /// by the adapter for this instance; `None` for a legacy plan.
+    pub fn allocation_id(&self) -> Option<Id128> {
+        self.allocation_id
     }
 
     pub fn spec(&self) -> &SandboxSpec {
@@ -551,13 +615,17 @@ pub struct RuntimeCapabilities {
 
 /// Node-global totals read from a backend's own accounting authority (design 7.3).
 /// Limits are the node's ceilings; reservations include its once-only shared reserve.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeTotals {
     pub generation: u64,
     pub limits: crate::store::SandboxBudgets,
     pub reserved: crate::store::SandboxResources,
     /// A lowered ceiling never discounts commitments; it only stops admission.
     pub over_committed: bool,
+    /// B7 RTC-16: a latched node fault, by kind. Health fails while one is set.
+    pub node_fault: Option<String>,
+    /// B7 RTC-16: low retained headroom, compaction lag or a stuck token. Health says so.
+    pub degraded: Option<String>,
 }
 
 /// Futures are `Send` because tonic requires it of service handlers.
@@ -587,10 +655,11 @@ pub trait Runtime: Send + Sync + 'static {
     }
 
     /// Read-only preflight before any reservation: must allocate nothing.
-    /// Returning an error leaves no row and no charge.
+    /// Returning an error leaves no row and no charge. A fenced backend's plan names
+    /// the token its authority issued (`PreparedCreate::allocation_id`).
     fn prepare(
         &self,
-        context: &CreateContext,
+        context: &PrepareContext,
         spec: &SandboxSpec,
         deadline: Instant,
         cancel: &CancellationToken,
@@ -651,10 +720,11 @@ pub trait Runtime: Send + Sync + 'static {
         cancel: &CancellationToken,
     ) -> impl Future<Output = ExecOutcome> + Send;
 
-    /// Removes a sandbox and waits until its resources are released.
+    /// Removes a sandbox and waits until its resources are released. A backend refuses
+    /// the variant it does not own (`Incompatible`) before doing anything.
     fn remove(
         &self,
-        id: &str,
+        target: RemoveTarget<'_>,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> impl Future<Output = Result<AbsenceReceipt, RuntimeError>> + Send;
@@ -669,18 +739,142 @@ pub trait Runtime: Send + Sync + 'static {
 
     /// Removes stale state only for the named backend sandboxes. An empty
     /// scope is a no-op. Must never touch a live or unlisted sandbox. Returns
-    /// one receipt per sandbox it removed.
+    /// one receipt per sandbox it removed. Validation is all-or-nothing.
     fn gc(
         &self,
-        ids: &[String],
+        targets: &[RemoveTarget<'_>],
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> impl Future<Output = Result<Vec<AbsenceReceipt>, RuntimeError>> + Send;
 }
 
+/// Design 9.1's compile-time contract (B7): every Runtime method with both
+/// `RemoveTarget` variants and `PreparedCreate::allocation_id()`, so any signature drift
+/// in any backend fails the build. Instantiated for every backend in the tests below.
+#[cfg(test)]
+#[allow(dead_code)]
+async fn runtime_contract<R: Runtime>(runtime: &R, binding: &AllocationBinding) {
+    let (deadline, cancel) = (Instant::now(), CancellationToken::new());
+    let prepare = PrepareContext {
+        instance_id: binding.instance_id,
+        sandbox_id: "sb-0000000000000001".into(),
+    };
+    let spec: SandboxSpec = serde_json::from_value(serde_json::json!({
+        "image": "alpine", "memory_bytes": 1, "cpu_millis": 1, "pids": 1, "disk_bytes": 1,
+        "network": "none", "read_only_root": false, "writable_paths": [], "labels": {}
+    }))
+    .unwrap();
+    let _: &'static str = runtime.name();
+    let _: RuntimeCapabilities = runtime.capabilities();
+    let _: Result<String, RuntimeError> = runtime.version(deadline, &cancel).await;
+    let _: Result<Option<NodeTotals>, RuntimeError> = runtime.node_totals(deadline, &cancel).await;
+    let prepared: Result<PreparedCreate, RuntimeError> =
+        runtime.prepare(&prepare, &spec, deadline, &cancel).await;
+    let Ok(prepared) = prepared else { return };
+    let token: Option<Id128> = prepared.allocation_id();
+    let context = CreateContext {
+        instance_id: prepare.instance_id,
+        allocation_id: token.unwrap_or_else(Id128::random),
+        sandbox_id: prepare.sandbox_id,
+    };
+    let _: Result<CreatedSandbox, CreateFailure> =
+        runtime.create(&context, &prepared, deadline, &cancel).await;
+    let digest = prepared.plan_digest();
+    let _: Result<AllocationObservation, RuntimeError> = runtime
+        .inspect_allocation(&context, &digest, deadline, &cancel)
+        .await;
+    let _: Result<AbsenceReceipt, RuntimeError> =
+        runtime.fence_absent(&context, &digest, deadline, &cancel).await;
+    let _: Result<(), RuntimeError> = runtime.validate_sandbox("x", deadline, &cancel).await;
+    let legacy = RemoveTarget::Legacy { backend_id: "x" };
+    let fenced = RemoveTarget::Fenced { binding };
+    let _: Result<AbsenceReceipt, RuntimeError> = runtime.remove(legacy, deadline, &cancel).await;
+    let _: Result<AbsenceReceipt, RuntimeError> = runtime.remove(fenced, deadline, &cancel).await;
+    let _: Result<BackendInventory, RuntimeError> = runtime.list(deadline, &cancel).await;
+    let _: Result<Vec<AbsenceReceipt>, RuntimeError> =
+        runtime.gc(&[legacy, fenced], deadline, &cancel).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Design 9.1 (B7): one generic contract, instantiated for every backend. A changed
+    /// signature in any of them fails to compile here.
+    #[test]
+    fn b7_runtime_contract_compiles_for_every_backend() {
+        fn instantiate<R: Runtime>() {
+            let _ = runtime_contract::<R>;
+        }
+        instantiate::<fake::FakeRuntime>();
+        instantiate::<kiln::KilnRuntime>();
+        instantiate::<kiln_direct::DirectKilnRuntime>();
+        instantiate::<firecracker::FirecrackerRuntime>();
+    }
+
+    /// The kiln adapters refuse `Fenced` before any kiln call; the fake models both
+    /// regimes, each refusing the other's target before anything happens.
+    #[tokio::test]
+    async fn b7_each_backend_refuses_the_removal_target_it_does_not_own() {
+        let binding = AllocationBinding {
+            node_id: Id128::random(),
+            instance_id: Id128::random(),
+            allocation_id: Id128::random(),
+            plan_version: 1,
+            plan_digest: Digest::of(b"plan"),
+            plan: vec![1],
+        };
+        let (deadline, cancel) = (
+            Instant::now() + std::time::Duration::from_secs(1),
+            CancellationToken::new(),
+        );
+        let fenced = RemoveTarget::Fenced { binding: &binding };
+        let legacy = RemoveTarget::Legacy { backend_id: "abcd" };
+        // A kiln adapter pointed at nothing: a Fenced target never gets that far.
+        let kiln = kiln::KilnRuntime::new("/nonexistent/kilnd-helper.sock".into());
+        assert!(matches!(
+            kiln.remove(fenced, deadline, &cancel).await,
+            Err(RuntimeError::Incompatible(_))
+        ));
+        assert!(matches!(
+            kiln.gc(&[legacy, fenced], deadline, &cancel).await,
+            Err(RuntimeError::Incompatible(_))
+        ));
+        let direct = kiln_direct::DirectKilnRuntime::new("/nonexistent/kiln".into());
+        assert!(matches!(
+            direct.remove(fenced, deadline, &cancel).await,
+            Err(RuntimeError::Incompatible(_))
+        ));
+        // Firecracker refuses Legacy before attaching: no socket exists to reach.
+        let firecracker = firecracker::FirecrackerRuntime::new(
+            "/nonexistent/kilnd-helper.sock".into(),
+            binding.instance_id,
+            Id128::random(),
+        );
+        assert!(matches!(
+            firecracker.remove(legacy, deadline, &cancel).await,
+            Err(RuntimeError::Incompatible(_))
+        ));
+        assert!(matches!(
+            firecracker.gc(&[fenced, legacy], deadline, &cancel).await,
+            Err(RuntimeError::Incompatible(_))
+        ));
+        // The fake, in each regime.
+        let fenced_fake = fake::FakeRuntime::fenced();
+        assert!(matches!(
+            fenced_fake.remove(legacy, deadline, &cancel).await,
+            Err(RuntimeError::Incompatible(_))
+        ));
+        let legacy_fake = fake::FakeRuntime::default();
+        assert!(matches!(
+            legacy_fake.remove(fenced, deadline, &cancel).await,
+            Err(RuntimeError::Incompatible(_))
+        ));
+        assert_eq!(
+            legacy_fake.state().remove_targets,
+            vec![format!("fenced:{}", binding.allocation_id)]
+        );
+    }
     use crate::model::Network;
 
     #[test]
@@ -718,7 +912,8 @@ mod tests {
         let node = Id128::random();
         let digest = Digest::of(b"bundle");
         let bad = |plan: Vec<u8>| {
-            PreparedCreate::fenced(spec(), reservation, 1, plan, "p", digest, node).unwrap_err()
+            PreparedCreate::fenced(spec(), reservation, 1, plan, "p", digest, node, node)
+                .unwrap_err()
         };
         assert!(bad(Vec::new()).to_string().contains("backend plan"));
         assert!(
@@ -734,8 +929,10 @@ mod tests {
             "p",
             digest,
             node,
+            Id128::from_bytes([1; 16]),
         )
         .unwrap();
+        assert_eq!(prepared.allocation_id(), Some(Id128::from_bytes([1; 16])));
         assert_eq!(
             (
                 prepared.host_spec_sha256(),
@@ -766,9 +963,11 @@ mod tests {
             "p",
             digest,
             node,
+            node,
         );
         assert!(matches!(refused, Err(RuntimeError::Incompatible(_))));
         let legacy = PreparedCreate::legacy(networked.clone(), "kiln");
+        assert_eq!(legacy.allocation_id(), None, "a legacy plan names no token");
         assert_eq!(
             legacy.reservation(),
             ResourceReservation::legacy_for_spec(&networked)

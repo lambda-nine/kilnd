@@ -55,10 +55,18 @@ fn context_of(row: &Sandbox) -> CreateContext {
     fenced_context(row, row.accounting.allocation.as_ref().unwrap())
 }
 
+/// B7 (design 9.1): what `prepare` takes. It names no allocation.
+fn prepare_context_of(row: &Sandbox) -> PrepareContext {
+    PrepareContext {
+        instance_id: row.accounting.allocation.as_ref().unwrap().instance_id,
+        sandbox_id: row.id.clone(),
+    }
+}
+
 async fn prepared_of(fake: &FakeRuntime, row: &Sandbox) -> PreparedCreate {
     let prepared = fake
         .prepare(
-            &context_of(row),
+            &prepare_context_of(row),
             &row.spec,
             deadline(),
             &CancellationToken::new(),
@@ -483,7 +491,7 @@ async fn a_retried_token_is_a_query_and_never_a_second_claim() {
     changed.labels.insert("k".into(), "v".into());
     let other = fake
         .prepare(
-            &context_of(&failed),
+            &prepare_context_of(&failed),
             &changed,
             deadline(),
             &CancellationToken::new(),
@@ -628,8 +636,14 @@ async fn not_found_listing_absence_and_legacy_proof_never_release_a_fenced_row()
         state.fenced.fence_unavailable = Some("ledger cannot sync".into());
     }
     assert!(matches!(
-        fake.remove(&backend_id, deadline(), &CancellationToken::new())
-            .await,
+        fake.remove(
+            RemoveTarget::Fenced {
+                binding: allocation
+            },
+            deadline(),
+            &CancellationToken::new()
+        )
+        .await,
         Err(RuntimeError::NotFound(_))
     ));
     assert!(
@@ -1506,6 +1520,13 @@ fn context_for_legacy() -> CreateContext {
     }
 }
 
+fn prepare_context_for(context: &CreateContext) -> PrepareContext {
+    PrepareContext {
+        instance_id: context.instance_id,
+        sandbox_id: context.sandbox_id.clone(),
+    }
+}
+
 #[tokio::test]
 async fn an_unexplained_allocation_blocks_admission_and_is_left_alone() {
     let (m, fake) = manager();
@@ -1660,10 +1681,16 @@ async fn fenced_gc_receipts_cover_only_named_stopped_allocations() {
             .unwrap()
             .phase = FakePhase::Stopped;
     }
+    let mut never = live.accounting.allocation.clone().unwrap();
+    never.allocation_id = Id128::from_bytes([0; 16]);
     let ids = [
-        live.backend_id.clone().unwrap(),
-        stopped.backend_id.clone().unwrap(),
-        "fc-00000000000000000000000000000000".to_string(),
+        RemoveTarget::Fenced {
+            binding: live.accounting.allocation.as_ref().unwrap(),
+        },
+        RemoveTarget::Fenced {
+            binding: stopped.accounting.allocation.as_ref().unwrap(),
+        },
+        RemoveTarget::Fenced { binding: &never },
     ];
     assert!(
         fake.gc(&[], deadline(), &CancellationToken::new())
@@ -1704,7 +1731,7 @@ async fn a_worker_released_after_a_fence_cannot_resurrect_its_allocation() {
     };
     let prepared = fake
         .prepare(
-            &prepared_context,
+            &prepare_context_for(&prepared_context),
             &spec,
             deadline(),
             &CancellationToken::new(),
@@ -1725,9 +1752,13 @@ async fn a_worker_released_after_a_fence_cannot_resurrect_its_allocation() {
     });
     gate.entered().await;
     let generation_before = fake.state().fenced.node_generation;
-    let backend_id = format!("fc-{}", prepared_context.allocation_id);
+    let binding = prepared.binding(&prepared_context).unwrap();
     let AbsenceReceipt::Fenced(receipt) = fake
-        .remove(&backend_id, deadline(), &CancellationToken::new())
+        .remove(
+            RemoveTarget::Fenced { binding: &binding },
+            deadline(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap()
     else {
@@ -2003,4 +2034,54 @@ async fn corrupt_release_degrades_health_and_blocks_admission_with_capacity_rema
     assert_eq!(health.node_resources.reserved.sandboxes, 1);
     assert!(m.create(CreateRequest::default()).await.is_err());
     assert!(m.get(&sandbox.id, 0).unwrap().0.is_charged());
+}
+
+/// B7 (design 9.1, 16.6): a historical kiln row under a fenced backend. Its Delete
+/// reaches `remove(Legacy)`, which the fenced backend refuses before acting, so the row
+/// stays DELETING and charged with the refusal as its reason, reconciliation neither
+/// collects nor loses it, and Health names the count.
+#[tokio::test]
+async fn b7_a_historical_kiln_row_stays_deleting_and_charged_under_a_fenced_backend() {
+    let (m, fake) = manager();
+    let session = m.create(CreateRequest::default()).await.unwrap();
+    let now = now_ms();
+    let historical = Sandbox {
+        id: new_id("sb"),
+        state: SandboxState::Ready,
+        spec: session.spec.clone(),
+        backend: "kiln".into(),
+        backend_id: Some("kiln-historical".into()),
+        created_at_ms: now,
+        updated_at_ms: now,
+        deleted_at_ms: None,
+        failure_reason: None,
+        create_certainty: CreateCertainty::AllocationAmbiguous,
+        owner_uid: 0,
+        accounting: SandboxAccounting::legacy(&session.spec, ""),
+    };
+    m.store.insert_sandbox(&historical).unwrap();
+    let error = m.delete(&historical.id).await.unwrap_err();
+    assert!(error.to_string().contains("drain"), "{error}");
+    let (row, _) = m.get(&historical.id, 0).unwrap();
+    assert_eq!(row.state, SandboxState::Deleting);
+    assert!(row.is_charged());
+    {
+        let state = fake.state();
+        assert_eq!(state.remove_targets, vec!["legacy:kiln-historical".to_string()]);
+        assert!(
+            !state.remove_attempts.iter().any(|id| id.contains("historical")),
+            "refused before the backend acted"
+        );
+    }
+    // Reconciliation skips another backend's rows: no Gc, no LOST, still charged.
+    m.reconcile().await.unwrap();
+    let (row, _) = m.get(&historical.id, 0).unwrap();
+    assert_eq!(row.state, SandboxState::Deleting);
+    assert!(fake.state().gc_requests.iter().all(|ids| !ids.iter().any(|id| id.contains("historical"))));
+    let health = m.health().await.unwrap();
+    assert!(
+        health.detail.contains("1 charged row(s) of another backend"),
+        "{}",
+        health.detail
+    );
 }

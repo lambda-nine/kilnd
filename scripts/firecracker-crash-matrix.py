@@ -28,6 +28,15 @@ recovery.rs, run alone with a clean host before and after:
                                   daemon is never given the slot
   database lost                   the replacement instance is refused; the node ledger
                                   never discounts the lost daemon
+
+B7 adds retired-token compaction's crash points (design 16.6), each a b7_crash_ test in
+crates/kilnd/src/helper/firecracker/tests/compaction.rs through the real H, L, listener and
+adapter with fake host effects and a FULL-sync ledger: the four issuance boundaries and a
+refusal after issuance, L replaced while H lives, H process death, the watermark advance,
+the G_W refresh, every delete-batch boundary, non-compactable rows, Create and Remove
+racing compaction, a restored stale daemon database, a restart at the checkpoint bound,
+the rollback fault commit at every boundary, and the offline clear. They run on macOS and
+in CI as well.
 """
 import os
 import sys
@@ -50,5 +59,26 @@ SCENARIOS = [
     'b6_linux_root_crash_lost_db_never_discounts_the_node_claim',
 ]
 
+B7_SCENARIOS = [
+    'b7_crash_issuance_before_commit_issues_nothing',
+    'b7_crash_issuance_committed_before_the_private_reply_is_abandoned',
+    'b7_crash_issuance_private_reply_before_the_public_reply_is_abandoned',
+    'b7_crash_issuance_public_reply_before_c1_is_never_presented_again',
+    'b7_crash_issuance_then_a_preparation_refusal_consumes_one_seq_and_no_quota',
+    'b7_crash_ledger_replaced_while_h_lives_serves_nothing_before_publication',
+    'b7_crash_h_process_death_ends_l_and_a_restart_reuses_no_seq',
+    'b7_crash_watermark_advance_before_and_after_its_commit',
+    'b7_crash_g_w_refresh_for_a_late_pinned_fence_before_and_after_its_commit',
+    'b7_crash_delete_batch_rolls_back_whole_at_every_boundary',
+    'b7_crash_non_compactable_allocations_below_w_are_never_deleted',
+    'b7_crash_a_create_racing_compaction_is_fenced_or_pinned_by_commit_order',
+    'b7_crash_a_remove_racing_compaction_keeps_its_rows_and_its_own_receipt',
+    'b7_crash_a_restored_stale_daemon_db_after_compaction_releases_by_synthesized_receipts',
+    'b7_crash_a_helper_restart_resets_checkpoints_to_one_restart_point',
+    'b7_crash_rollback_fault_commit_at_every_boundary_keeps_forward_effects_refused',
+    'b7_crash_the_offline_clear_killed_before_or_after_its_commit',
+]
+
 if __name__ == '__main__':
-    sys.exit(run('Phase 1b B6 global-ledger crash matrix', 'b6_linux_root_crash_', SCENARIOS))
+    sys.exit(run('Phase 1b B6 and B7 global-ledger crash matrix', 'b6_linux_root_crash_ and b7_crash_',
+                 SCENARIOS + B7_SCENARIOS))

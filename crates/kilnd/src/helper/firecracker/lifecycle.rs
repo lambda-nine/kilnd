@@ -27,6 +27,8 @@ pub(super) struct RemoveToken {
     pub epoch: Option<Id128>,
     pub peer: PeerCredentials,
     pub allocation: Id128,
+    /// B7: the daemon Store's immutable plan digest for this token.
+    pub plan_digest: crate::model::Digest,
     pub deadline: WireDeadline,
 }
 
@@ -553,24 +555,41 @@ impl Node {
     async fn remove_inner(self: Arc<Self>, token: &RemoveToken) -> FenceReply {
         let key = token.key();
         let state = match self.allocation_state(key, token.deadline).await {
+            // B7 RTC-6: rows win, and evidence for one plan never releases another's.
+            Ok(Some(state)) if state.plan_digest != token.plan_digest => {
+                return ambiguous_fence(
+                    AmbiguousClass::Conflict,
+                    "token is active with a different plan",
+                );
+            }
             Ok(Some(state)) => state,
             Ok(None) => {
-                // A retired token answers with its fence; anything else is unknown here.
+                // A retired token answers with its fence, a compacted one with a receipt
+                // synthesized for this digest (RTC-8); anything else is unknown here, and
+                // Remove never acts on a token with no rows.
                 let lookup = self
                     .bounded_ledger(
                         &LedgerRequest::Inspect {
                             instance: key.instance,
                             allocation: key.allocation,
+                            plan_digest: token.plan_digest,
                         },
                         token.deadline,
                     )
                     .await;
                 return match lookup {
-                    Ok(LedgerReply::Lookup(TokenLookup::Fenced { receipt })) => {
-                        FenceReply::Absent {
-                            receipt: WireBytes(receipt),
-                        }
+                    Ok(LedgerReply::Lookup(
+                        TokenLookup::Fenced { receipt } | TokenLookup::Compacted { receipt },
+                    )) => FenceReply::Absent {
+                        receipt: WireBytes(receipt),
+                    },
+                    Ok(LedgerReply::Lookup(TokenLookup::Conflict { reason })) => {
+                        ambiguous_fence(AmbiguousClass::Conflict, reason)
                     }
+                    Ok(LedgerReply::Lookup(TokenLookup::NotIssued)) => ambiguous_fence(
+                        AmbiguousClass::NotIssued,
+                        "this token was never issued by this node ledger",
+                    ),
                     _ => ambiguous_fence(
                         AmbiguousClass::Conflict,
                         "no journal record: only FenceAbsent can fence an unknown token",
@@ -853,11 +872,12 @@ impl Node {
         instance: Id128,
         epoch: Option<Id128>,
         peer: PeerCredentials,
-        allocations: Vec<Id128>,
+        targets: Vec<crate::helper::protocol::GcTarget>,
         deadline: WireDeadline,
     ) -> Vec<GcResult> {
         let mut results = Vec::new();
-        for allocation in allocations {
+        for target in targets {
+            let allocation = target.allocation_id;
             let key = AllocationKey {
                 instance,
                 allocation,
@@ -872,8 +892,38 @@ impl Node {
                 continue;
             }
             let outcome = match self.allocation_state(key, deadline).await {
-                Ok(None) => GcOutcome::Skipped {
-                    reason: "not an active allocation of this instance".into(),
+                // B7 RTC-8: a rowless token is answered as Remove would answer it: a
+                // retired one by its fence, a compacted one by a receipt synthesized for
+                // this target's digest. Nothing acts on it.
+                Ok(None) => match self
+                    .bounded_ledger(
+                        &LedgerRequest::Inspect {
+                            instance,
+                            allocation,
+                            plan_digest: target.plan_digest,
+                        },
+                        deadline,
+                    )
+                    .await
+                {
+                    Ok(LedgerReply::Lookup(
+                        TokenLookup::Fenced { receipt } | TokenLookup::Compacted { receipt },
+                    )) => GcOutcome::Removed {
+                        receipt: WireBytes(receipt),
+                    },
+                    Ok(LedgerReply::Lookup(TokenLookup::Conflict { reason })) => {
+                        GcOutcome::Failed {
+                            class: AmbiguousClass::Conflict,
+                            message: reason,
+                        }
+                    }
+                    _ => GcOutcome::Skipped {
+                        reason: "not an active allocation of this instance".into(),
+                    },
+                },
+                Ok(Some(state)) if state.plan_digest != target.plan_digest => GcOutcome::Failed {
+                    class: AmbiguousClass::Conflict,
+                    message: "token is active with a different plan".into(),
                 },
                 Err(reason) => GcOutcome::Failed {
                     class: AmbiguousClass::LedgerUnavailable,
@@ -894,6 +944,7 @@ impl Node {
                             epoch,
                             peer,
                             allocation,
+                            plan_digest: target.plan_digest,
                             deadline,
                         };
                         match self.clone().remove_flow(token).await {
@@ -937,6 +988,11 @@ impl Node {
     /// reads only memory: the stop fence, S's exit, V's known exit and both monitors'
     /// health.
     pub(super) fn reusable_dispatch(&self, key: AllocationKey) -> bool {
+        // B7 RTC-14 and RTC-R2-03: once the latch linearizes, no Validate or Exec frame
+        // goes to a guest, whenever the request was queued.
+        if self.is_latched() {
+            return false;
+        }
         let healthy = self.monitor_healthy();
         self.supervisors
             .lock()

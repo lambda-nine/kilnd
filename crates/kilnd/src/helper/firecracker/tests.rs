@@ -11,7 +11,7 @@ use super::executable::tests::{all_pins, fixture_bytes, pin_of};
 use super::executable::{self, Role, WalkPolicy};
 use super::identity::IdentityRanges;
 use super::inventory::{ObservationBackend, fake};
-use super::journal::{Ledger, LedgerConfig};
+use super::journal::{CompactionPolicy, Ledger, LedgerConfig};
 use super::manifest::ManifestGate;
 use super::peer::{TestPeers, fixture_digest};
 use super::workers::{FakeEffect, NodeConfig, TestInjection, Timings, faults};
@@ -27,7 +27,7 @@ use crate::model::{
 use crate::runtime::firecracker::FirecrackerRuntime;
 use crate::runtime::{
     AbsenceReceipt, AllocationObservation, BackendStatus, CreateContext, FencedAbsence,
-    PreparedCreate, Runtime, RuntimeError,
+    PrepareContext, PreparedCreate, RemoveTarget, Runtime, RuntimeError,
 };
 use crate::store::{ReserveSandbox, SandboxBudgets, Store};
 use serde::{Deserialize, Serialize};
@@ -74,6 +74,15 @@ struct NodeOptions {
     /// kilnd binary enrolled by root.
     #[serde(default)]
     hash_peers: bool,
+    /// B7: L's compaction lease and pass on its (injectable) boot clock, and H's tick.
+    #[serde(default)]
+    compaction: CompactionPolicy,
+    #[serde(default = "default_compaction_tick_ms")]
+    compaction_tick_ms: u64,
+}
+
+fn default_compaction_tick_ms() -> u64 {
+    50
 }
 
 /// Where a fixture helper reads an attaching peer's cgroup and account. The start time,
@@ -105,6 +114,8 @@ impl Default for NodeOptions {
             uid: None,
             gid: None,
             hash_peers: false,
+            compaction: CompactionPolicy::default(),
+            compaction_tick_ms: default_compaction_tick_ms(),
         }
     }
 }
@@ -133,6 +144,7 @@ fn ledger_config(config: &ChildConfig) -> LedgerConfig {
         ceilings: config.options.ceilings,
         shared,
         max_enrolled: config.options.max_enrolled,
+        compaction: config.options.compaction,
     }
 }
 
@@ -209,6 +221,7 @@ fn node_fixture_child() {
                 heartbeat: Duration::from_millis(100),
                 heartbeat_timeout: Duration::from_millis(config.options.heartbeat_timeout_ms),
                 startup_journal: Duration::from_millis(config.options.startup_journal_ms),
+                compaction_tick: Duration::from_millis(config.options.compaction_tick_ms),
             },
             helper_image,
             // SAFETY: geteuid has no preconditions.
@@ -730,6 +743,7 @@ fn spec() -> SandboxSpec {
     }
 }
 
+/// A random, never-issued token in the old format: Malformed everywhere under B7.
 fn token(instance: Id128) -> CreateContext {
     CreateContext {
         instance_id: instance,
@@ -738,9 +752,46 @@ fn token(instance: Id128) -> CreateContext {
     }
 }
 
+/// B7 (design 9.1): what `prepare` takes; it names no allocation.
+fn prep(instance: Id128) -> PrepareContext {
+    PrepareContext {
+        instance_id: instance,
+        sandbox_id: new_id("sb"),
+    }
+}
+
+/// B7: a Preflight through the real adapter, and the create context built from the
+/// helper-issued token, as the manager builds it before C1.
+async fn issued(runtime: &FirecrackerRuntime, instance: Id128) -> (CreateContext, PreparedCreate) {
+    let context = prep(instance);
+    let plan = runtime
+        .prepare(&context, &spec(), deadline(10), &no_cancel())
+        .await
+        .unwrap();
+    let token = plan.allocation_id().expect("a fenced plan names its token");
+    (
+        CreateContext {
+            instance_id: instance,
+            allocation_id: token,
+            sandbox_id: context.sandbox_id,
+        },
+        plan,
+    )
+}
+
+/// A plan prepared for `context`'s instance and sandbox. Its token is the helper's own,
+/// which differs from `context`'s: only tests of a mismatched binding use this.
 async fn prepared(runtime: &FirecrackerRuntime, context: &CreateContext) -> PreparedCreate {
     runtime
-        .prepare(context, &spec(), deadline(10), &no_cancel())
+        .prepare(
+            &PrepareContext {
+                instance_id: context.instance_id,
+                sandbox_id: context.sandbox_id.clone(),
+            },
+            &spec(),
+            deadline(10),
+            &no_cancel(),
+        )
         .await
         .unwrap()
 }
@@ -948,8 +999,7 @@ async fn trigger(
         Class::Collision | Class::Capacity => {
             // Prepared before the holder's claim, so its plan really names what the
             // holder takes; the helper must refuse rather than substitute.
-            let holder = token(context.instance_id);
-            let holder_plan = prepared(runtime, &holder).await;
+            let (holder, holder_plan) = issued(runtime, context.instance_id).await;
             create_accepted(fixture, runtime, &holder, &holder_plan).await;
             cause.holder = Some((holder, holder_plan));
             raw_create(fixture, context, epoch, plan).await
@@ -1130,8 +1180,7 @@ async fn post_c1_race(class: Class) {
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
     let store = Store::open_in_memory().unwrap();
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let digest = plan.plan_digest();
     let row = c1_row(&store, &context, &plan);
     assert_eq!(charged(&store), 1, "C1 charged it");
@@ -1345,8 +1394,10 @@ async fn exit2_old_epoch_revoked_during_revalidate_cannot_cross_c2() {
     let instance = Id128::random();
     let database = Id128::random();
     let runtime = fixture.runtime(instance, database);
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
+    // B7: a second issued token for the closed-epoch request below; a random one
+    // would be refused by H's tag check before admission is even considered.
+    let (spare, spare_plan) = issued(&runtime, instance).await;
     let epoch = epoch_of(&runtime).await;
     fixture.fault("P.revalidate.stall");
     let creating = {
@@ -1364,7 +1415,7 @@ async fn exit2_old_epoch_revoked_during_revalidate_cannot_cross_c2() {
     assert!(fixture.census().await["supervisors"][context.allocation_id.to_string()].is_null());
     assert!(!fixture.fake_dir(&context).exists());
     // A request sent under that closed attachment's own epoch is refused as well.
-    let reply = raw_create(&fixture, &token(instance), epoch_of(&restored).await, &plan).await;
+    let reply = raw_create(&fixture, &spare, epoch_of(&restored).await, &spare_plan).await;
     assert_eq!(class_of(&reply), AmbiguousClass::AdmissionBlocked);
     // The real owner comes back, and the rejected token is still its to fence.
     restored.test_reattach().await;
@@ -1391,8 +1442,7 @@ async fn exit2_old_epoch_revoked_while_queued_in_the_ledger_cannot_cross_c2() {
         let instance = Id128::random();
         let database = Id128::random();
         let runtime = fixture.runtime(instance, database);
-        let context = token(instance);
-        let plan = prepared(&runtime, &context).await;
+        let (context, plan) = issued(&runtime, instance).await;
         let epoch = epoch_of(&runtime).await;
         fixture.fault(&format!("{stall}.stall"));
         let creating = {
@@ -1436,8 +1486,7 @@ async fn exit2_old_epoch_revoked_as_c2_commits_holds_the_claim_with_no_effects()
     let instance = Id128::random();
     let database = Id128::random();
     let runtime = fixture.runtime(instance, database);
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let epoch = epoch_of(&runtime).await;
     // The commit already happened, so only H's recheck stands between it and an S.
     fixture.fault("L.admit.after_commit.stall");
@@ -1479,8 +1528,7 @@ async fn exit2_real_manager_publishes_charged_failure_and_only_a_fence_releases_
     // Another namespace holds the node's only slot.
     let other = Id128::random();
     let holder_runtime = fixture.runtime(other, Id128::random());
-    let holder = token(other);
-    let holder_plan = prepared(&holder_runtime, &holder).await;
+    let (holder, holder_plan) = issued(&holder_runtime, other).await;
     create_accepted(&fixture, &holder_runtime, &holder, &holder_plan).await;
 
     let store = Store::open_in_memory().unwrap();
@@ -1542,8 +1590,7 @@ async fn exit2_a_queued_fence_cannot_release_while_a_create_holds_the_token() {
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     fixture.fault("L.admit.stall");
     let epoch = epoch_of(&runtime).await;
     let creating = {
@@ -1594,8 +1641,7 @@ async fn exit3_race_of_four_across_two_instances_gives_three_intents_and_one_abs
     let mut tokens = Vec::new();
     for index in 0..4usize {
         let runtime = runtimes[index % 2].clone();
-        let context = token(runtime_instance(index, first, second));
-        let plan = prepared(&runtime, &context).await;
+        let (context, plan) = issued(&runtime, runtime_instance(index, first, second)).await;
         tokens.push((runtime, context, plan));
     }
     let root = fixture.root.clone();
@@ -1719,8 +1765,7 @@ async fn exit3_one_live_holder_per_namespace_and_epochs_die_with_their_holder() 
             ..
         })
     ));
-    let context = token(instance);
-    let plan = prepared(&holder, &context).await;
+    let (context, plan) = issued(&holder, instance).await;
     create_accepted(&fixture, &holder, &context, &plan).await;
     // Detach invalidates the epoch; ledger-owned work and its claim remain.
     holder.test_reattach().await;
@@ -1765,8 +1810,7 @@ async fn exit3_helper_restart_invalidates_epochs_and_replays_every_claim() {
     let instance = Id128::random();
     let database = Id128::random();
     let runtime = fixture.runtime(instance, database);
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let generation = create_accepted(&fixture, &runtime, &context, &plan).await;
     let epoch = epoch_of(&runtime).await;
     fixture.kill_helper().await;
@@ -1842,8 +1886,9 @@ async fn exit3_stale_or_restored_database_blocks_admission_and_leaves_claims() {
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
+    // B7: an issued token the restored database could not have prepared itself.
+    let (new_token, new_plan) = issued(&runtime, instance).await;
     create_accepted(&fixture, &runtime, &context, &plan).await;
     runtime.test_reattach().await;
     // The same namespace comes back claiming a new database: lost, restored or stale.
@@ -1855,7 +1900,7 @@ async fn exit3_stale_or_restored_database_blocks_admission_and_leaves_claims() {
         "a lost DB discounts nothing"
     );
     let error = restored
-        .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+        .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
         .await
         .unwrap_err();
     assert!(error.to_string().contains("another database"), "{error}");
@@ -1868,8 +1913,7 @@ async fn exit3_stale_or_restored_database_blocks_admission_and_leaves_claims() {
     );
     let reply = raw_create(&fixture, &context, epoch_of(&restored).await, &plan).await;
     assert!(matches!(reply, CreateReply::Accepted { replay: true, .. }));
-    let new_token = token(instance);
-    let reply = raw_create(&fixture, &new_token, epoch_of(&restored).await, &plan).await;
+    let reply = raw_create(&fixture, &new_token, epoch_of(&restored).await, &new_plan).await;
     assert_eq!(class_of(&reply), AmbiguousClass::AdmissionBlocked);
     assert_eq!(fixture.active_allocations(), 1);
     assert_eq!(fixture.count("SELECT COUNT(*) FROM retired_tokens"), 0);
@@ -1917,8 +1961,7 @@ async fn exit4_ledger_sync_stall_leaves_h_responsive_and_every_durable_answer_ho
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let before = fixture.census().await;
     let epoch = epoch_of(&runtime).await;
     fixture.fault("L.admit.before_commit.stall");
@@ -1992,11 +2035,13 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
+    // B7: Inspect below needs an issued token, and issuing one needs a Preflight.
+    let (context, _) = issued(&runtime, instance).await;
     let before = fixture.census().await;
     fixture.fault("P.preflight.stall");
     let mut stuck = Vec::new();
     for _ in 0..2 {
-        let (runtime, context) = (runtime.clone(), token(instance));
+        let (runtime, context) = (runtime.clone(), prep(instance));
         stuck.push(tokio::spawn(async move {
             runtime
                 .prepare(
@@ -2013,7 +2058,7 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
     // Both slots are busy: a third is refused at once, not queued or given a third P.
     let began = std::time::Instant::now();
     let error = runtime
-        .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+        .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
         .await
         .unwrap_err();
     assert!(began.elapsed() < Duration::from_millis(500));
@@ -2026,7 +2071,7 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
         assert!(handle.await.unwrap().is_err());
     }
     let error = runtime
-        .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+        .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
         .await
         .unwrap_err();
     assert!(error.to_string().contains("preparation slot"), "{error}");
@@ -2038,7 +2083,6 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
     // A recovery operation doesn't take a slot it has no claim on: K is untouched.
     assert_eq!(during["recovery"], before["recovery"]);
     // Inspect still answers because it needs no P.
-    let context = token(instance);
     assert!(matches!(
         runtime
             .inspect_allocation(&context, &Digest::of(b"none"), deadline(5), &no_cancel())
@@ -2054,7 +2098,7 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
     let mut progressed = false;
     for _ in 0..200 {
         if runtime
-            .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+            .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
             .await
             .is_ok()
         {
@@ -2077,8 +2121,7 @@ async fn exit4_stuck_supervisor_keeps_its_permit_and_no_receipt_escapes_until_it
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     fixture.fault("S.effect.work.xfs.stall");
     let (supervisor_pid, vm) = started_vm(&fixture, &runtime, &context, &plan).await;
     fixture.wait_reached("S.effect.work.xfs").await;
@@ -2216,8 +2259,7 @@ async fn exit4_emergency_stop_runs_with_ledger_blocked_and_no_durable_claim_esca
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let (supervisor, vm) = started_vm(&fixture, &runtime, &context, &plan).await;
     let key = context.allocation_id.to_string();
     let before = fixture.census().await;
@@ -2312,8 +2354,7 @@ async fn exit4_stalled_monitor_denies_admission_and_contains_through_k_without_r
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let (_, vm) = started_vm(&fixture, &runtime, &context, &plan).await;
     let census = fixture.census().await;
     let monitor = census["monitor"].as_i64().unwrap();
@@ -2324,8 +2365,7 @@ async fn exit4_stalled_monitor_denies_admission_and_contains_through_k_without_r
     assert_eq!(stalled(&reply, |h| h.monitor), WorkerHealth::Stalled);
     assert_eq!(fixture.census().await["monitor"].as_i64().unwrap(), monitor);
     // New work is refused for as long as supervision is absent.
-    let next = token(instance);
-    let next_plan = prepared(&runtime, &next).await;
+    let (next, next_plan) = issued(&runtime, instance).await;
     let reply = raw_create(&fixture, &next, epoch_of(&runtime).await, &next_plan).await;
     assert_eq!(class_of(&reply), AmbiguousClass::MonitorUnavailable);
     assert_eq!(fixture.active_allocations(), 1);
@@ -2364,8 +2404,7 @@ async fn exit4_recovery_slots_are_independent_fixed_and_a_stuck_slot_is_not_repl
         .iter()
         .map(|pid| pid.as_i64().unwrap())
         .collect();
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let (supervisor, vm) = started_vm(&fixture, &runtime, &context, &plan).await;
     // One stuck K: the other fixed slot still contains.
     signal(recovery[0], libc::SIGSTOP);
@@ -2379,8 +2418,7 @@ async fn exit4_recovery_slots_are_independent_fixed_and_a_stuck_slot_is_not_repl
     signal(recovery[0], libc::SIGCONT);
     // Both stuck: no third K exists, H still answers, and containment is reported as
     // unfinished rather than successful, until those exact processes return.
-    let second = token(instance);
-    let second_plan = prepared(&runtime, &second).await;
+    let (second, second_plan) = issued(&runtime, instance).await;
     let (supervisor, vm) = started_vm(&fixture, &runtime, &second, &second_plan).await;
     signal(recovery[0], libc::SIGSTOP);
     signal(recovery[1], libc::SIGSTOP);
@@ -2420,8 +2458,7 @@ async fn exit4_stalled_helper_fails_closed_in_supervisor_and_monitor() {
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let (supervisor, vm) = started_vm(&fixture, &runtime, &context, &plan).await;
     // A live-but-stopped H is not supervision: S and M both act on its silence.
     let helper = fixture.helper_pid() as i64;
@@ -2458,8 +2495,7 @@ async fn exit4_helper_death_stops_owned_work_and_restart_keeps_the_charge() {
     let instance = Id128::random();
     let database = Id128::random();
     let runtime = fixture.runtime(instance, database);
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let (supervisor, vm) = started_vm(&fixture, &runtime, &context, &plan).await;
     let census = fixture.census().await;
     let ledger = census["ledger"].as_i64().unwrap();
@@ -2534,6 +2570,7 @@ async fn exit4_monitor_requests_a_stale_supervisors_stop_without_help_from_h() {
         tick: Duration::from_millis(20),
         heartbeat: Duration::from_millis(50),
         heartbeat_timeout: Duration::from_millis(400),
+        compaction_tick: Duration::from_secs(60),
     };
     let keep = [
         child.as_raw_fd(),
@@ -2632,8 +2669,7 @@ async fn exit4_monitor_exit_fences_before_replacement() {
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let (_, vm) = started_vm(&fixture, &runtime, &context, &plan).await;
     let key = context.allocation_id.to_string();
     let monitor = fixture.census().await["monitor"].as_i64().unwrap();
@@ -2689,8 +2725,7 @@ async fn exit4_monitor_exit_fences_before_replacement() {
         1
     );
     // New work gets real supervision from the replacement: a fresh boot has its watch.
-    let next = token(instance);
-    let next_plan = prepared(&runtime, &next).await;
+    let (next, next_plan) = issued(&runtime, instance).await;
     let (next_supervisor, next_vm) = started_vm(&fixture, &runtime, &next, &next_plan).await;
     signal(next_supervisor, libc::SIGKILL);
     wait_until("the new M's containment", || !alive(next_vm)).await;
@@ -2798,8 +2833,7 @@ async fn three_stopped_supervisors(
     let mut supervisors = Vec::new();
     let mut vms = Vec::new();
     for _ in 0..3 {
-        let context = token(instance);
-        let plan = prepared(runtime, &context).await;
+        let (context, plan) = issued(runtime, instance).await;
         let (supervisor, vm) = started_vm(fixture, runtime, &context, &plan).await;
         supervisors.push(supervisor);
         vms.push(vm);
@@ -2925,8 +2959,7 @@ async fn exit4_waiter_disconnect_leaves_accepted_work_owned_and_charged() {
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let cancel = no_cancel();
     fixture.fault("L.admit.stall");
     let waiter = {
@@ -3012,8 +3045,7 @@ async fn exit5_installed_replacement_after_preflight_refuses_create_with_zero_ef
         let fixture = Fixture::new(NodeOptions::default()).await;
         let instance = Id128::random();
         let runtime = fixture.runtime(instance, Id128::random());
-        let context = token(instance);
-        let plan = prepared(&runtime, &context).await;
+        let (context, plan) = issued(&runtime, instance).await;
         // The same bytes at a new inode: digest and argv would all still match.
         let object = fixture
             .root
@@ -3062,7 +3094,7 @@ async fn exit5_installed_replacement_before_preflight_is_a_c0_refusal_for_every_
         std::fs::copy(&parked, &object).unwrap();
         std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o555)).unwrap();
         let error = runtime
-            .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+            .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
             .await
             .unwrap_err();
         assert!(
@@ -3091,8 +3123,7 @@ async fn exit5_source_tree_swap_after_preflight_changes_nothing() {
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     std::fs::rename(
         fixture.root.join("source"),
         fixture.root.join("source-moved"),
@@ -3110,8 +3141,7 @@ async fn exit5_journal_records_expected_and_actual_tuples_for_dispatch_and_worke
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     create_accepted(&fixture, &runtime, &context, &plan).await;
     wait_until("S to record what ran", || {
         fixture.count(
@@ -3189,8 +3219,7 @@ async fn exit5_descriptor_reuse_at_dispatch_refuses_and_keeps_the_charge() {
         let fixture = Fixture::new(NodeOptions::default()).await;
         let instance = Id128::random();
         let runtime = fixture.runtime(instance, Id128::random());
-        let context = token(instance);
-        let plan = prepared(&runtime, &context).await;
+        let (context, plan) = issued(&runtime, instance).await;
         fixture.fault(&format!("S.reuse_fd.{}", role.as_str()));
         create_accepted(&fixture, &runtime, &context, &plan).await;
         // S refuses, with no alternate object tried, and that fences the allocation.
@@ -3231,8 +3260,7 @@ async fn exit5_restart_generation_recovery_refuses_a_replacement_inode_and_accep
     let instance = Id128::random();
     let database = Id128::random();
     let runtime = fixture.runtime(instance, database);
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     create_accepted(&fixture, &runtime, &context, &plan).await;
     fixture.kill_helper().await;
     let role = Role::Firecracker;
@@ -3256,7 +3284,7 @@ async fn exit5_restart_generation_recovery_refuses_a_replacement_inode_and_accep
         .expect("generation fault");
     assert!(fault.contains("firecracker"), "{fault}");
     let error = restarted
-        .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+        .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
         .await
         .unwrap_err();
     assert!(error.to_string().contains("reopened"), "{error}");
@@ -3300,8 +3328,7 @@ async fn exit6_fence_reply_loss_replays_the_same_bytes_after_helper_restart() {
     let instance = Id128::random();
     let database = Id128::random();
     let runtime = fixture.runtime(instance, database);
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     create_accepted(&fixture, &runtime, &context, &plan).await;
     // The commit lands; L stalls before replying; the waiter gets no receipt.
     fixture.fault("L.fence.after_commit.stall");
@@ -3339,12 +3366,15 @@ async fn exit6_fence_reply_loss_replays_the_same_bytes_after_helper_restart() {
     );
     let reply = raw_create(&fixture, &context, epoch_of(&renewed).await, &plan).await;
     assert_eq!(receipt_of(&reply), durable);
-    // A token used by a fence can never preflight again.
-    let error = renewed
-        .prepare(&context, &spec(), deadline(5), &no_cancel())
+    // B7: Preflight takes no token; the next one issues a later sequence, never this.
+    let next = renewed
+        .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("already used"), "{error}");
+        .unwrap();
+    assert!(
+        super::token::seq_of(next.allocation_id().unwrap())
+            > super::token::seq_of(context.allocation_id)
+    );
 }
 
 #[tokio::test]
@@ -3352,8 +3382,7 @@ async fn exit6_sync_failure_keeps_every_charge_and_a_retry_completes() {
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     create_accepted(&fixture, &runtime, &context, &plan).await;
     fixture.fault("L.fence.sync_fail");
     let error = runtime
@@ -3382,8 +3411,7 @@ async fn exit6_a_missing_or_corrupt_ledger_is_unavailable_never_an_empty_answer(
     let instance = Id128::random();
     let database = Id128::random();
     let runtime = fixture.runtime(instance, database);
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     create_accepted(&fixture, &runtime, &context, &plan).await;
     fixture.kill_helper().await;
     let db = fixture.root.join("ledger/node.db");
@@ -3431,8 +3459,7 @@ async fn exit6_lowered_policy_limits_on_restart_deny_admission_and_keep_claims()
     let instance = Id128::random();
     let database = Id128::random();
     let runtime = fixture.runtime(instance, database);
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     create_accepted(&fixture, &runtime, &context, &plan).await;
     fixture.kill_helper().await;
     // The root policy now lowers the node below this claim's size.
@@ -3454,8 +3481,7 @@ async fn exit6_lowered_policy_limits_on_restart_deny_admission_and_keep_claims()
         "a lower limit discounts nothing"
     );
     assert!(totals.over_committed);
-    let next = token(instance);
-    let next_plan = prepared(&renewed, &next).await;
+    let (next, next_plan) = issued(&renewed, instance).await;
     let reply = raw_create(&fixture, &next, epoch_of(&renewed).await, &next_plan).await;
     assert_eq!(class_of(&reply), AmbiguousClass::Capacity);
     assert_eq!(fixture.active_allocations(), 1);
@@ -3482,7 +3508,7 @@ async fn exit1_c0_rejection_creates_zero_session_resources() {
         refused(|s| s.memory_bytes = 512 * MIB + 1),
         refused(|s| s.cpu_millis = 1001),
     ] {
-        let context = token(instance);
+        let context = prep(instance);
         let error = runtime
             .prepare(&context, &bad, deadline(5), &no_cancel())
             .await
@@ -3496,7 +3522,6 @@ async fn exit1_c0_rejection_creates_zero_session_resources() {
         instance,
         Some(epoch_of(&runtime).await),
         FirecrackerOperation::Preflight {
-            allocation_id: context.allocation_id,
             sandbox_id: context.sandbox_id.clone(),
             profile: "other-profile".into(),
             spec: spec(),
@@ -3520,7 +3545,7 @@ async fn exit1_c0_rejection_creates_zero_session_resources() {
     std::fs::write(&artifact, b"other").unwrap();
     assert!(
         runtime
-            .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+            .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
             .await
             .is_err()
     );
@@ -3529,14 +3554,14 @@ async fn exit1_c0_rejection_creates_zero_session_resources() {
     std::fs::write(fixture.root.join("bundle/extra"), b"x").unwrap();
     assert!(
         runtime
-            .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+            .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
             .await
             .is_err()
     );
     std::fs::remove_file(fixture.root.join("bundle/extra")).unwrap();
     assert!(
         runtime
-            .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+            .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
             .await
             .is_ok()
     );
@@ -3573,8 +3598,7 @@ async fn exit1_plan_substitution_is_refused_at_create_by_recomputation() {
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
     let epoch = epoch_of(&runtime).await;
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let document = crate::firecracker::strict_json(plan.backend_plan()).unwrap();
     let attacks: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
         (
@@ -3620,7 +3644,9 @@ async fn exit1_plan_substitution_is_refused_at_create_by_recomputation() {
         ),
     ];
     for (name, attack) in attacks {
-        let target = token(instance);
+        // B7: each attack under an issued token of its own; a random one would stop
+        // at H's tag check and never reach the recomputation.
+        let (target, _) = issued(&runtime, instance).await;
         let mut mutated = document.clone();
         attack(&mut mutated);
         let raw = crate::firecracker::canonical(&mutated).unwrap();
@@ -3647,7 +3673,7 @@ async fn exit1_plan_substitution_is_refused_at_create_by_recomputation() {
         }
     }
     // Bytes that do not hash to their digest reach P, which H trusts for that check.
-    let target = token(instance);
+    let (target, _) = issued(&runtime, instance).await;
     let reply = raw_call(
         &fixture,
         instance,
@@ -3670,7 +3696,7 @@ async fn exit1_plan_substitution_is_refused_at_create_by_recomputation() {
         other => panic!("{other:?}"),
     }
     // The exact plan under another token's identity is the same as a substitution.
-    let elsewhere = token(instance);
+    let (elsewhere, _) = issued(&runtime, instance).await;
     let reply = raw_create(&fixture, &elsewhere, epoch, &plan).await;
     assert_eq!(class_of(&reply), AmbiguousClass::CatalogMismatch);
     // A fixture plan never verifies, even with its own correct digest.
@@ -3679,7 +3705,7 @@ async fn exit1_plan_substitution_is_refused_at_create_by_recomputation() {
         "/tests/fixtures/firecracker/plan.json"
     );
     let fixture_plan = std::fs::read(path).unwrap();
-    let target = token(instance);
+    let (target, _) = issued(&runtime, instance).await;
     let reply = raw_call(
         &fixture,
         instance,
@@ -3712,8 +3738,7 @@ async fn exit1_toctou_manifest_or_artifact_change_after_preflight_is_refused() {
         let fixture = Fixture::new(NodeOptions::default()).await;
         let instance = Id128::random();
         let runtime = fixture.runtime(instance, Id128::random());
-        let context = token(instance);
-        let plan = prepared(&runtime, &context).await;
+        let (context, plan) = issued(&runtime, instance).await;
         let path = fixture.root.join("bundle").join(target);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let original = std::fs::read(&path).unwrap();
@@ -3776,61 +3801,78 @@ async fn exit1_framing_refuses_noncanonical_group_frames_and_every_caller_descri
         .unwrap()
     };
     let epoch_text = json!(epoch.to_string());
+    let digest_text = Digest::of(b"plan").to_string();
+    // B7: group schema 2. Every frame below is the current schema with exactly one
+    // defect: Preflight names no allocation, and Inspect carries its plan digest.
     for body in [
         // Unknown fields and verbs, at every level.
         group(
             json!({"exec_raw": {"argv": ["/bin/sh"]}}),
-            json!(1),
+            json!(FIRECRACKER_GROUP_VERSION),
             epoch_text.clone(),
         ),
         group(
-            json!({"inspect": {"allocation_id": "00".repeat(16), "path": "/etc"}}),
-            json!(1),
+            json!({"inspect": {
+                "allocation_id": "00".repeat(16),
+                "plan_digest": digest_text,
+                "path": "/etc",
+            }}),
+            json!(FIRECRACKER_GROUP_VERSION),
             epoch_text.clone(),
         ),
         group(
             json!({"accounting": {"fixture": true}}),
-            json!(1),
+            json!(FIRECRACKER_GROUP_VERSION),
             epoch_text.clone(),
         ),
         // Wrong group schema, missing or misplaced epoch.
-        group(json!("accounting"), json!(2), epoch_text.clone()),
-        group(json!("accounting"), json!(1), Value::Null),
+        group(json!("accounting"), json!(1), epoch_text.clone()),
         group(
-            json!({"attach_instance": {"database_uuid": "00".repeat(16)}}),
-            json!(1),
+            json!("accounting"),
+            json!(FIRECRACKER_GROUP_VERSION + 1),
+            epoch_text.clone(),
+        ),
+        group(
+            json!("accounting"),
+            json!(FIRECRACKER_GROUP_VERSION),
+            Value::Null,
+        ),
+        group(
+            json!({"attach_instance": {
+                "database_uuid": "00".repeat(16),
+                "highest_token": null,
+            }}),
+            json!(FIRECRACKER_GROUP_VERSION),
             epoch_text.clone(),
         ),
         // A bad typed ID and uppercase hex.
         group(
-            json!({"inspect": {"allocation_id": "not-hex"}}),
-            json!(1),
+            json!({"inspect": {"allocation_id": "not-hex", "plan_digest": digest_text}}),
+            json!(FIRECRACKER_GROUP_VERSION),
             epoch_text.clone(),
         ),
         group(
-            json!({"inspect": {"allocation_id": "AB".repeat(16)}}),
-            json!(1),
+            json!({"inspect": {"allocation_id": "AB".repeat(16), "plan_digest": digest_text}}),
+            json!(FIRECRACKER_GROUP_VERSION),
             epoch_text.clone(),
         ),
         // A bad sandbox ID or path-shaped profile.
         group(
             json!({"preflight": {
-                "allocation_id": context.allocation_id.to_string(),
                 "sandbox_id": "../sb",
                 "profile": PROFILE,
                 "spec": serde_json::to_value(spec()).unwrap(),
             }}),
-            json!(1),
+            json!(FIRECRACKER_GROUP_VERSION),
             epoch_text.clone(),
         ),
         group(
             json!({"preflight": {
-                "allocation_id": context.allocation_id.to_string(),
                 "sandbox_id": context.sandbox_id,
                 "profile": "/etc/passwd",
                 "spec": serde_json::to_value(spec()).unwrap(),
             }}),
-            json!(1),
+            json!(FIRECRACKER_GROUP_VERSION),
             epoch_text.clone(),
         ),
         // Plan bytes that are not lowercase hex.
@@ -3841,7 +3883,7 @@ async fn exit1_framing_refuses_noncanonical_group_frames_and_every_caller_descri
                 "plan": "AA",
                 "plan_digest": Digest::of(&[0xaa]).to_string(),
             }}),
-            json!(1),
+            json!(FIRECRACKER_GROUP_VERSION),
             epoch_text.clone(),
         ),
     ] {
@@ -3858,7 +3900,6 @@ async fn exit1_framing_refuses_noncanonical_group_frames_and_every_caller_descri
                 instance_id: instance,
                 connection_epoch: Some(epoch),
                 operation: FirecrackerOperation::Preflight {
-                    allocation_id: context.allocation_id,
                     sandbox_id: context.sandbox_id.clone(),
                     profile: PROFILE.into(),
                     spec: spec(),
@@ -3935,7 +3976,6 @@ async fn exit1_absolute_wire_deadlines_are_never_replaced_by_a_fresh_budget() {
         instance,
         Some(epoch_of(&runtime).await),
         FirecrackerOperation::Preflight {
-            allocation_id: context.allocation_id,
             sandbox_id: context.sandbox_id.clone(),
             profile: PROFILE.into(),
             spec: spec(),
@@ -3981,7 +4021,7 @@ async fn exit1_absolute_wire_deadlines_are_never_replaced_by_a_fresh_budget() {
     let began = std::time::Instant::now();
     let error = runtime
         .prepare(
-            &token(instance),
+            &prep(instance),
             &spec(),
             Instant::now() + Duration::from_millis(300),
             &no_cancel(),
@@ -4001,8 +4041,7 @@ async fn exit1_absolute_wire_deadlines_end_start_authority_after_c2() {
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     // The claim commits, and L holds the reply past the 300 ms deadline.
     fixture.fault("L.admit.after_commit.stall");
     let reply = raw_call(
@@ -4077,8 +4116,7 @@ async fn exit1_absolute_wire_deadlines_end_forward_effects_inside_s() {
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     fixture.fault("S.effect.work.xfs.stall");
     let reply = raw_call(
         &fixture,
@@ -4118,8 +4156,7 @@ async fn exit1_a_start_that_expires_in_c3_opens_no_gate() {
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     // M acknowledges nothing, so C3's first handoff uses up the original deadline.
     let monitor = fixture.census().await["monitor"].as_i64().unwrap();
     signal(monitor, libc::SIGSTOP);
@@ -4160,6 +4197,9 @@ async fn exit1_a_full_operation_budget_keeps_four_slots_for_recovery_only() {
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
     let epoch = epoch_of(&runtime).await;
+    // B7: an issued, rowless token, so each Inspect below really reaches L (a random
+    // one would be refused by H's tag check without using any slot).
+    let (probe, probe_plan) = issued(&runtime, instance).await;
     // Sixty-four silent connections, replaced as each hits its two-second framing bound.
     // These occupy framing capacity only: nothing has classified them as an operation.
     let socket = fixture.root.join("helper.sock");
@@ -4187,7 +4227,8 @@ async fn exit1_a_full_operation_budget_keeps_four_slots_for_recovery_only() {
             instance,
             Some(epoch),
             FirecrackerOperation::Inspect {
-                allocation_id: Id128::random(),
+                allocation_id: probe.allocation_id,
+                plan_digest: probe_plan.plan_digest(),
             },
             wire_deadline(5),
             5_000,
@@ -4278,7 +4319,8 @@ async fn exit1_a_full_operation_budget_keeps_four_slots_for_recovery_only() {
             instance,
             Some(epoch),
             FirecrackerOperation::Inspect {
-                allocation_id: Id128::random(),
+                allocation_id: probe.allocation_id,
+                plan_digest: probe_plan.plan_digest(),
             },
             wire_deadline(5),
             5_000,
@@ -4333,7 +4375,6 @@ async fn exit1_prepared_wire_is_reconstructed_and_verified_field_by_field() {
         instance,
         Some(epoch_of(&runtime).await),
         FirecrackerOperation::Preflight {
-            allocation_id: context.allocation_id,
             sandbox_id: context.sandbox_id.clone(),
             profile: PROFILE.into(),
             spec: spec(),
@@ -4348,7 +4389,12 @@ async fn exit1_prepared_wire_is_reconstructed_and_verified_field_by_field() {
         other => panic!("{other:?}"),
     };
     use crate::runtime::firecracker::test_verify_prepared as verify;
+    let context = PrepareContext {
+        instance_id: context.instance_id,
+        sandbox_id: context.sandbox_id.clone(),
+    };
     let accepted = verify(&context, &spec(), reply.clone()).unwrap();
+    assert_eq!(accepted.allocation_id(), Some(reply.allocation_id));
     assert_eq!(accepted.plan_digest(), reply.plan_digest);
     assert_eq!(accepted.reservation().memory_bytes, 896 * MIB);
     assert_eq!(
@@ -4367,6 +4413,12 @@ async fn exit1_prepared_wire_is_reconstructed_and_verified_field_by_field() {
             Box::new(|r| r.manifest_sha256 = Digest::of(b"x")),
         ),
         ("node", Box::new(|r| r.node_id = Id128::random())),
+        // B7: the reply's token must be the one the substitutions name, with a seq.
+        ("token", Box::new(|r| r.allocation_id = Id128::random())),
+        (
+            "token seq 0",
+            Box::new(|r| r.allocation_id = Id128::from_bytes([0; 16])),
+        ),
         (
             "host digest",
             Box::new(|r| r.host_spec_sha256 = Digest::of(b"x")),
@@ -4404,8 +4456,9 @@ async fn exit1_prepared_wire_is_reconstructed_and_verified_field_by_field() {
             "{name} was accepted"
         );
     }
-    // The right plan for the wrong token or spec.
-    assert!(verify(&token(instance), &spec(), reply.clone()).is_err());
+    // The right plan for the wrong instance, sandbox or spec.
+    assert!(verify(&prep(instance), &spec(), reply.clone()).is_err());
+    assert!(verify(&prep(Id128::random()), &spec(), reply.clone()).is_err());
     let mut other_spec = spec();
     other_spec.labels.insert("a".into(), "b".into());
     assert!(verify(&context, &other_spec, reply).is_err());
@@ -4415,10 +4468,21 @@ async fn exit1_prepared_wire_is_reconstructed_and_verified_field_by_field() {
 fn exit1_group_wire_bytes_are_strict_and_bounded() {
     // Fixed-size digests and IDs, lowercase only, and an exact byte-field form.
     let request: FirecrackerOperation = serde_json::from_value(json!({"inspect": {
-        "allocation_id": "ab".repeat(16)
+        "allocation_id": "ab".repeat(16),
+        "plan_digest": Digest::of(b"plan").to_string(),
     }}))
     .unwrap();
     assert!(matches!(request, FirecrackerOperation::Inspect { .. }));
+    // B7 (group schema 2): Inspect and Remove require the Store's plan digest.
+    for verb in ["inspect", "remove"] {
+        assert!(
+            serde_json::from_value::<FirecrackerOperation>(json!({verb: {
+                "allocation_id": "ab".repeat(16)
+            }}))
+            .is_err(),
+            "{verb}"
+        );
+    }
     for bad in ["", "AB", "abc", "zz"] {
         assert!(serde_json::from_value::<PlanBytes>(json!(bad)).is_err() || bad.is_empty());
     }
@@ -4431,11 +4495,12 @@ fn exit1_group_wire_bytes_are_strict_and_bounded() {
     assert_eq!(serde_json::to_value(&bytes).unwrap(), json!("00ff"));
     // No field in the group can carry a descriptor, path, UID, CID, PID, command or env.
     let names = serde_json::to_string(&FirecrackerRequest {
-        group_version: 1,
+        group_version: FIRECRACKER_GROUP_VERSION,
         instance_id: Id128::from_bytes([1; 16]),
         connection_epoch: None,
         operation: FirecrackerOperation::AttachInstance {
             database_uuid: Id128::from_bytes([2; 16]),
+            highest_token: Some(Id128::from_bytes([3; 16])),
         },
     })
     .unwrap();
@@ -4605,6 +4670,7 @@ async fn exit1_legacy_kiln_still_runs_with_the_group_enabled_and_disabled_by_def
         FirecrackerOperation::List,
         FirecrackerOperation::Inspect {
             allocation_id: Id128::random(),
+            plan_digest: Digest::of(b"plan"),
         },
     ] {
         assert!(matches!(
@@ -4654,8 +4720,7 @@ async fn exit1_preflight_or_listing_needs_no_session_side_effect_and_no_ready_ex
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     // Fake effects never reach READY, so from the caller's side this Create can only end
     // ambiguous and charged at its deadline (B6: create follows Inspect to READY).
     let failure = runtime
@@ -4690,6 +4755,8 @@ async fn exit1_preflight_or_listing_needs_no_session_side_effect_and_no_ready_ex
     let other = fixture.runtime(Id128::random(), Id128::random());
     let listed = other.list(deadline(5), &no_cancel()).await.unwrap();
     assert!(listed.records.is_empty());
+    // B7 (RTC-3): another namespace's token does not verify there, so H refuses it
+    // before any gate or ledger read, and the refusal says nothing about the token.
     let foreign = other
         .inspect_allocation(
             &CreateContext {
@@ -4700,11 +4767,10 @@ async fn exit1_preflight_or_listing_needs_no_session_side_effect_and_no_ready_ex
             deadline(5),
             &no_cancel(),
         )
-        .await
-        .unwrap();
+        .await;
     assert!(
-        matches!(foreign, AllocationObservation::Unknown { .. }),
-        "another namespace's token must look unknown: {foreign:?}"
+        matches!(foreign, Err(RuntimeError::Incompatible(_))),
+        "another namespace's token must be refused: {foreign:?}"
     );
     // Node totals do count it, without naming it.
     let totals = serde_json::to_string(&node_totals(&other).await).unwrap();
@@ -4718,6 +4784,7 @@ async fn exit1_preflight_or_listing_needs_no_session_side_effect_and_no_ready_ex
         Some(epoch_of(&runtime).await),
         FirecrackerOperation::Inspect {
             allocation_id: context.allocation_id,
+            plan_digest: plan.plan_digest(),
         },
         wire_deadline(5),
         5_000,
@@ -4753,8 +4820,15 @@ async fn exit1_preflight_or_listing_needs_no_session_side_effect_and_no_ready_ex
             .await,
         Err(RuntimeError::Incompatible(_))
     ));
+    // B7 (design 9.1): a legacy target never reaches the Firecracker wire.
     assert!(matches!(
-        runtime.remove("fc-x", deadline(1), &no_cancel()).await,
+        runtime
+            .remove(
+                RemoveTarget::Legacy { backend_id: "fc-x" },
+                deadline(1),
+                &no_cancel()
+            )
+            .await,
         Err(RuntimeError::Incompatible(_))
     ));
     assert!(
@@ -4766,7 +4840,11 @@ async fn exit1_preflight_or_listing_needs_no_session_side_effect_and_no_ready_ex
     );
     assert!(
         runtime
-            .gc(&["fc-x".into()], deadline(1), &no_cancel())
+            .gc(
+                &[RemoveTarget::Legacy { backend_id: "fc-x" }],
+                deadline(1),
+                &no_cancel()
+            )
             .await
             .is_err()
     );
@@ -4874,8 +4952,7 @@ async fn b5_r1_a_stalled_ledger_fence_gives_back_its_detached_slot() {
     let fixture = Fixture::new(NodeOptions::default()).await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let context = token(instance);
-    let plan = prepared(&runtime, &context).await;
+    let (context, plan) = issued(&runtime, instance).await;
     let epoch = epoch_of(&runtime).await;
     let fence = || FirecrackerOperation::FenceAbsent {
         allocation_id: context.allocation_id,
@@ -4959,29 +5036,43 @@ async fn b5_r1_a_stalled_ledger_fence_gives_back_its_detached_slot() {
 
 #[tokio::test]
 async fn exit6_tight_fence_allowance_stops_new_tokens_end_to_end() {
-    let allowance =
-        (super::journal::PRE_INTENT_TOKEN_MARGIN + 2) * super::journal::FENCE_ENTRY_BOUND;
+    let allowance = 16 * super::journal::FENCE_ENTRY_BOUND;
+    // B7 (RTC-12, RTC-17): at 8 slots a 16-entry pool of 4 gives every instance a
+    // never-admitted quota of 0, so nothing could be issued at all; 4 slots give a
+    // quota of 1, and E = 11 gives a share of 2 plus a 3-entry remainder to borrow.
     let fixture = Fixture::new(NodeOptions {
         fence_allowance_bytes: Some(allowance),
+        max_enrolled: 4,
+        // Room for every admitted entry, so the ledger's headroom is what refuses.
+        ceilings: NodeCeilings {
+            slots: 64,
+            memory_bytes: 1 << 50,
+            disk_bytes: 1 << 50,
+            host_cpu_millis: 1 << 40,
+            virtual_cpu_slots: 1 << 20,
+            pids: 1 << 30,
+            host_pids: 1 << 30,
+        },
         ..NodeOptions::default()
     })
     .await;
     let instance = Id128::random();
     let runtime = fixture.runtime(instance, Id128::random());
-    let first = token(instance);
-    let first_plan = prepared(&runtime, &first).await;
-    create_accepted(&fixture, &runtime, &first, &first_plan).await;
-    let second = token(instance);
-    let second_plan = prepared(&runtime, &second).await;
-    create_accepted(&fixture, &runtime, &second, &second_plan).await;
-    // A third token is refused at C0, before it could ever need a fence.
+    let fits = 11 / 4 + 11 % 4;
+    let mut accepted = Vec::new();
+    for _ in 0..fits {
+        let (context, plan) = issued(&runtime, instance).await;
+        create_accepted(&fixture, &runtime, &context, &plan).await;
+        accepted.push((context, plan));
+    }
+    // The next token is refused at C0, before it could ever need a fence.
     let error = runtime
-        .prepare(&token(instance), &spec(), deadline(5), &no_cancel())
+        .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
         .await
         .unwrap_err();
     assert!(error.to_string().contains("headroom"), "{error}");
     // Those accepted ones can still fence.
-    for (context, plan) in [(&first, &first_plan), (&second, &second_plan)] {
+    for (context, plan) in &accepted {
         fenced(
             runtime
                 .fence_absent(context, &plan.plan_digest(), deadline(10), &no_cancel())
@@ -5053,6 +5144,7 @@ fn fixture_child_does_nothing_without_its_environment() {
 
 #[cfg(target_os = "linux")]
 mod broker;
+mod compaction;
 mod control_plane;
 #[cfg(target_os = "linux")]
 mod lifecycle;
