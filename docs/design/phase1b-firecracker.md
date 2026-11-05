@@ -3946,6 +3946,77 @@ backstop) and case 9, `path-module-sink.sh`'s exact vendored package (refused on
 module under `tests/`, reached only by its `#[path]`, refused; a `#[path]` outside the
 package root refused as unscannable).
 
+### Recheck 3 corrections evidence
+
+Branch `phase1b/b7-integrated`: merge `9f63aae`, `c5cc5f5` (the stray bytecode),
+`a3b3acc` (the recheck 3 corrections and regression cases), `2c5a2db` (the merge's
+Linux-only fix), `8f7ff79` (this documentation, first pass), `f5c6327` (B3R-01's root
+test) and `12491ac` (the CI job's time limit). Logs:
+`reviews/2026-11-05-b7-integration/`.
+
+- *macOS, the gate.* `proven::tests::dependency_gate`: 23 passed and 1 ignored
+  (`regression_fixture_gate`), `the_dependency_gate_holds` included: two profiles, 144
+  reviewed packages (74 `pure-computation`, 12 `compile-time`, 58 with their own
+  justification) and 37 scoped exceptions on 30 packages.
+  `scripts/dependency-gate-review.py` reports `144 locked packages, 0 to review`.
+- *macOS and Linux, clippy.* `scripts/build.sh [+1.99.0] PROFILE clippy --all-targets`
+  (`build.sh`'s fixed `-D warnings -D clippy::disallowed_methods`) on Rust 1.88 and 1.99,
+  both profiles, on macOS and in the VM: clean. `git diff --check` and
+  `scripts/kilnd-maintenance-tests.py` pass.
+- *macOS, the full suites.* `scripts/build.sh +1.88.0 PROFILE test --no-fail-fast`, both
+  profiles, at `12491ac` on a quiet machine: every test binary passed (795 passed, 15
+  ignored; the kilnd library 619 passed, 6 ignored). An earlier pair of runs, made while
+  the VM suites and the regression script loaded the Mac, failed only timing-bound tests
+  that also fail under load on the parent branches: `kiln_direct` (up to 12),
+  `wide_objects_check_in_well_under_quadratic_time`,
+  `invalid_exec_claims_fail_cleanup_and_quarantine_end_to_end` and two `helper::tests`
+  deadline tests.
+- *`scripts/dependency-gate-regressions.sh 1.88.0 1.99.0`* (macOS, at `f5c6327`): all
+  passed, 91 outcomes. Every earlier case held its result; the new ones: `RUSTFLAGS`,
+  `CARGO_BUILD_RUSTFLAGS` and the Clippy tail refused by `build.sh` on both toolchains;
+  a Cargo config file's `build.rustflags`, `target.'cfg(all())'` table and
+  `rustc-wrapper` overridden, the `ambient-poc` test not compiled; a raw cargo build with
+  the `RUSTFLAGS` refused by the build scripts' backstop; `path-module-wrapper` refused on
+  `hidden.rs`'s `set_len`, alias and impl with Clippy accepting the workspace, refused
+  again with the module under `tests/`, and refused as unscannable with a `#[path]`
+  outside its root.
+- *CI.* Run 42092695860 on `12491ac`: `check`, `feature` and `gate-regressions` green;
+  `gate-regressions` ran the same 91 outcomes on Linux in 52 minutes. Run 42085264270 on
+  `f5c6327` passed `check` and `feature` but hit the job's old 45-minute limit in case 9
+  (cases 1 to 7 alone took 40 minutes on that runner), hence `12491ac`.
+- *The VM* (Lima `kiln`, everything built through `build.sh`, at `f5c6327`; the release
+  build was installed by `scripts/install.sh` after a byte copy of `/var/lib/kilnd/` taken
+  with kilnd stopped):
+  - `scripts/integration-test.sh`: passed (admission stress, the kiln integration
+    tests and the `b3r_` root tests). The first run, at `2c5a2db`, failed
+    `b3r_01_linux_root_a_prefence_from_a_real_second_account_stays_its_own`, which still
+    expected the pre-B7 fence in the attacker's own namespace; under RTC-3 H refuses the
+    copied token at its tag check (`f5c6327`).
+  - `scripts/b4-vm-tests.sh`: 32 passed (and the direct-kiln core's 1).
+  - `scripts/firecracker-crash-matrix.py`: 31/31.
+  - `scripts/firecracker-regressions.py`: 26/26, the whole session (E2E) and milestone
+    1's R2 (`b7_rtc_r2_01`, `b7_rtc_r2_03`) and R3 (`b7_rtc14_linux_root_*`) included. In
+    the full run `b7_linux_root_attack_hostile_public_caller…` failed only because the
+    run's VM-local checkout sat in a home directory `nobody` cannot traverse, and the
+    script re-executes itself as `nobody`; rerun alone with the directory traversable, it
+    passed.
+  - B5: `scripts/b5-test-guest.sh` built both test guests and
+    `scripts/b4-vm-tests.sh b5_linux_root` passed 8.
+  - `scripts/deployment-regressions.py` between the install build and a second
+    `build.sh` release build (line tables on, so different bytes; `build.sh` refuses the
+    old `RUSTFLAGS='-C metadata=…'`): 69 PASS. `--reboot-arm graceful`, a real guest
+    reboot, then `--reboot-verify`: same images, enrollments, units and state.
+
+  A station restart hard-stopped the VM in the first full run's crash matrix (after `b4`
+  had passed), and the second run filled the VM's disk with a second set of build caches
+  (`b4` and the crash matrix failed with `ENOSPC`, and one `userdel` could not rewrite
+  `/etc/group`; `scripts/b4-vm-cleanup.py` then removed the leftover account). The run
+  above is the third, from the start, on the VM's shared caches. Afterwards the VM was
+  put back: main `1c107f9`'s `install.sh` rebuilt byte-identical binaries, and
+  `/var/lib/kilnd/` was restored from the copy (`cmp` identical, file for file); all three
+  services active, and helper state, instances, accounts, loops, mounts, cgroups and
+  processes match the pre-run state.
+
 ## B7 milestones 1 and 2 integrated (November 5, 2026)
 
 Branch `phase1b/b7-integrated` merges milestone 2 (`phase1b/b7-hardening`, `0c4bdd5`)

@@ -3130,7 +3130,7 @@ fn supported_builds_use_the_build_entry_point() {
     // raw mentions, so a new one anywhere fails until it is looked at.
     const RECORDS: [(&str, usize); 2] = [
         ("CHANGELOG.md", 2),
-        ("docs/design/phase1b-firecracker.md", 30),
+        ("docs/design/phase1b-firecracker.md", 31),
     ];
     let root = workspace_root();
     let mut files = Vec::new();
