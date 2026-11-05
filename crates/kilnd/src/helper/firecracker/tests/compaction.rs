@@ -1495,7 +1495,7 @@ async fn lifetime(sessions_per_instance: u32, refusals_per_instance: u32, window
 // prints one matrix line. They run on macOS and in CI too.
 
 /// One scenario's outcome, for the crash matrix.
-fn b7_matrix(scenario: &str, outcome: Value) {
+pub(super) fn b7_matrix(scenario: &str, outcome: Value) {
     eprintln!(
         "B7 matrix: {}",
         json!({"scenario": scenario, "passed": true, "outcome": outcome})
@@ -2589,7 +2589,12 @@ fn b7_scenario_names_match_the_scripts() {
     let crash = include_str!("../../../../../../scripts/firecracker-crash-matrix.py");
     let attacks = include_str!("../../../../../../scripts/firecracker-regressions.py");
     // B7 milestone 2's real-chain hostile public caller lives with B6's attacks.
-    let source = [include_str!("compaction.rs"), include_str!("recovery.rs")].concat();
+    let source = [
+        include_str!("compaction.rs"),
+        include_str!("recovery.rs"),
+        include_str!("broker.rs"),
+    ]
+    .concat();
     let mut names = Vec::new();
     for line in source.lines() {
         if let Some(name) = line
@@ -2722,6 +2727,212 @@ async fn b7_crash_a_timed_out_benign_answer_holds_forward_effects_only_until_it_
     );
 }
 
+/// The census until `ready` holds of it, for at most ten seconds.
+pub(super) async fn census_until(fixture: &Fixture, what: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..2_000 {
+        let census = fixture.census().await;
+        if ready(&census) {
+            return census;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("{what}: {}", fixture.census().await);
+}
+
+/// Integrated recheck HIGH-2's setup: a Create waits at its final `OpenGate` boundary
+/// (deadline `create_seconds`); a FenceAbsent's answer is lost while L is inside it
+/// (`fault`: the fail-stop marker written and `SyncFailed` stalled, or a benign stall);
+/// L is killed before answering, and its replacement is held after journaling itself,
+/// before Handover. Returns the Create, the queued context and the dead L's pid.
+async fn l_death_before_a_lost_answer(
+    fixture: &Fixture,
+    runtime: &FirecrackerRuntime,
+    instance: Id128,
+    fault: bool,
+    create_seconds: u64,
+) -> (tokio::task::JoinHandle<Response>, CreateContext, i64) {
+    let (queued, queued_plan) = issued(runtime, instance).await;
+    let (fenced, fenced_plan) = issued(runtime, instance).await;
+    if fault {
+        create_accepted(fixture, runtime, &fenced, &fenced_plan).await;
+    }
+    let epoch = epoch_of(runtime).await;
+    fixture.fault("H.create.before_open_gate.hold");
+    let create = spawn_raw_create_within(
+        fixture,
+        instance,
+        epoch,
+        &queued,
+        &queued_plan,
+        create_seconds,
+    );
+    fixture.wait_reached("H.create.before_open_gate").await;
+    if fault {
+        fixture.fault("L.fence.sync_fail");
+        fixture.fault("L.sync_failed_reply.stall");
+    } else {
+        fixture.fault("L.fence.stall");
+    }
+    let fence = spawn_raw_fence(fixture, instance, epoch, &fenced, &fenced_plan, 2);
+    fixture
+        .wait_reached(if fault { "L.sync_failed_reply" } else { "L.fence" })
+        .await;
+    let marker = fixture
+        .root
+        .join("ledger")
+        .join(super::super::compaction::FAILSTOP_MARKER);
+    assert_eq!(
+        std::fs::read(&marker).is_ok_and(|m| m.starts_with(b"latched")),
+        fault,
+        "the fail-stop marker is written exactly when the fence faulted"
+    );
+    let old_l = fixture.census().await["ledger"].as_i64().unwrap();
+    let reply = fence.await.unwrap().unwrap();
+    assert!(matches!(reply, FirecrackerResponse::Fence(FenceReply::Ambiguous { .. })), "{reply:?}");
+    assert_eq!(fixture.census().await["lost_answers"], json!(1));
+    // L dies before answering; its replacement journals itself and is held there,
+    // before Handover imports anything.
+    fixture.fault("H.ledger.before_publish.hold");
+    signal(old_l, libc::SIGKILL);
+    for name in ["L.sync_failed_reply.stall", "L.fence.sync_fail", "L.fence.stall"] {
+        fixture.clear(name);
+    }
+    fixture.wait_reached("H.ledger.before_publish").await;
+    let census = fixture.census().await;
+    assert_eq!(census["lost_answers"], json!(1), "the hold was transferred, not released: {census}");
+    assert_eq!(census["transferred_holds"], json!(1), "{census}");
+    assert_eq!(census["latched"], json!(false), "Handover has imported nothing yet: {census}");
+    (create, queued, old_l)
+}
+
+/// B7 integrated recheck HIGH-2 (`reviews/poc-b7-integrated/r1-ledger-death-gap.sh`,
+/// inverted into a regression): a fault-bearing FenceAbsent's answer is lost after L
+/// wrote the fail-stop marker, and L is killed before giving it. `Closed` no longer
+/// releases the hold: it moves to the replacement-generation barrier. With the
+/// replacement stalled before Handover, a Create already at its final boundary does not
+/// cross it; it is refused at its own deadline with no gate and no host effect. Only the
+/// replacement's Handover lifts the hold, after importing the durable latch, so H is
+/// then latched and stays so.
+#[tokio::test]
+async fn b7_crash_l_death_keeps_a_lost_fault_held_until_the_replacement_imports_the_latch() {
+    let mut options = compacting(POLICY);
+    options.compaction_tick_ms = 60_000;
+    let fixture = Fixture::new(options).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let (create, queued, old_l) =
+        l_death_before_a_lost_answer(&fixture, &runtime, instance, true, 12).await;
+
+    fixture.clear("H.create.before_open_gate.hold");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!create.is_finished(), "the Create waits at its final boundary");
+    assert!(!fixture.fake_dir(&queued).exists(), "nothing started during the hold");
+    let Response::Firecracker(FirecrackerResponse::Create(reply)) = create.await.unwrap() else {
+        panic!("not a create reply");
+    };
+    assert_eq!(class_of(&reply), AmbiguousClass::Latched, "{reply:?}");
+    assert!(!fixture.fake_dir(&queued).exists(), "no gate opened and no host effect");
+    let census = fixture.census().await;
+    assert_eq!(census["transferred_holds"], json!(1), "still held at the deadline: {census}");
+
+    fixture.clear("H.ledger.before_publish.hold");
+    let census = census_until(&fixture, "the replacement never imported the latch", |c| {
+        c["latched"] == json!(true) && c["transferred_holds"] == json!(0)
+    })
+    .await;
+    assert_eq!(census["latch_kind"], json!("fail_stop"), "{census}");
+    assert_eq!(census["lost_answers"], json!(0), "{census}");
+    assert_ne!(census["ledger"].as_i64(), Some(old_l), "a replacement L");
+    let refused = runtime.prepare(&prep(instance), &spec(), deadline(10), &no_cancel()).await;
+    assert!(refused.is_err(), "Preflight is refused under the latch: {refused:?}");
+    b7_matrix(
+        "B7 integrated recheck HIGH-2: lost fault, L death, replacement before Handover",
+        json!({"hold": "transferred to the replacement barrier", "queued_create": "held, then Latched at its deadline", "h_latched": "at Handover"}),
+    );
+}
+
+/// HIGH-2's control: the lost answer carries no fault. L is killed inside a benign
+/// FenceAbsent, its replacement is held before Handover and the Create waits at its
+/// final boundary. The replacement hands over with no latch, the transferred hold lifts
+/// and the waiting Create is accepted; a later Create is accepted too.
+#[tokio::test]
+async fn b7_crash_l_death_with_a_lost_benign_answer_lifts_the_hold_at_the_replacement_handover() {
+    let mut options = compacting(POLICY);
+    options.compaction_tick_ms = 60_000;
+    let fixture = Fixture::new(options).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let (create, _queued, old_l) =
+        l_death_before_a_lost_answer(&fixture, &runtime, instance, false, 25).await;
+
+    fixture.clear("H.create.before_open_gate.hold");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!create.is_finished(), "held at the replacement barrier, not refused");
+    fixture.clear("H.ledger.before_publish.hold");
+    let Response::Firecracker(FirecrackerResponse::Create(reply)) = create.await.unwrap() else {
+        panic!("not a create reply");
+    };
+    assert!(matches!(reply, CreateReply::Accepted { .. }), "{reply:?}");
+    let census = fixture.census().await;
+    assert_eq!(census["latched"], json!(false), "{census}");
+    assert_eq!(census["lost_answers"], json!(0), "{census}");
+    assert_eq!(census["transferred_holds"], json!(0), "{census}");
+    assert_ne!(census["ledger"].as_i64(), Some(old_l), "a replacement L");
+    let (later, later_plan) = issued_retrying(&runtime, instance).await;
+    create_accepted(&fixture, &runtime, &later, &later_plan).await;
+    b7_matrix(
+        "B7 integrated recheck HIGH-2: lost benign answer, L death",
+        json!({"hold": "until the replacement's Handover", "queued_create": "Accepted", "latched": false}),
+    );
+}
+
+/// HIGH-2 with a failed replacement: the replacement dies inside Handover, so nothing is
+/// imported. The transferred hold stays, the Create waiting at its final boundary is
+/// refused at its own deadline, and only a later replacement whose Handover succeeds
+/// lifts the hold, after latching H from the durable marker.
+#[tokio::test]
+async fn b7_crash_a_failed_replacement_handover_keeps_the_transferred_hold() {
+    let mut options = compacting(POLICY);
+    options.compaction_tick_ms = 60_000;
+    let fixture = Fixture::new(options).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let (create, queued, _old_l) =
+        l_death_before_a_lost_answer(&fixture, &runtime, instance, true, 10).await;
+
+    fixture.fault("L.handover.panic");
+    fixture.clear("H.ledger.before_publish.hold");
+    let census = census_until(&fixture, "the replacement's Handover never failed", |c| {
+        c["ledger_replacement_fault"]
+            .as_str()
+            .is_some_and(|f| f.contains("not replaced"))
+    })
+    .await;
+    assert_eq!(census["transferred_holds"], json!(1), "{census}");
+    assert_eq!(census["lost_answers"], json!(1), "{census}");
+    assert_eq!(census["latched"], json!(false), "{census}");
+
+    fixture.clear("H.create.before_open_gate.hold");
+    let Response::Firecracker(FirecrackerResponse::Create(reply)) = create.await.unwrap() else {
+        panic!("not a create reply");
+    };
+    assert_eq!(class_of(&reply), AmbiguousClass::Latched, "{reply:?}");
+    assert!(!fixture.fake_dir(&queued).exists(), "no gate opened and no host effect");
+    assert_eq!(fixture.census().await["transferred_holds"], json!(1));
+
+    fixture.clear("L.handover.panic");
+    let census = census_until(&fixture, "no replacement ever handed over", |c| {
+        c["latched"] == json!(true) && c["transferred_holds"] == json!(0)
+    })
+    .await;
+    assert_eq!(census["latch_kind"], json!("fail_stop"), "{census}");
+    assert_eq!(census["lost_answers"], json!(0), "{census}");
+    b7_matrix(
+        "B7 integrated recheck HIGH-2: replacement Handover fails",
+        json!({"hold": "kept until a Handover succeeds", "queued_create": "Latched at its deadline", "h_latched": "at the later Handover"}),
+    );
+}
+
 fn spawn_raw_create(
     fixture: &Fixture,
     instance: Id128,
@@ -2729,13 +2940,24 @@ fn spawn_raw_create(
     context: &CreateContext,
     plan: &PreparedCreate,
 ) -> tokio::task::JoinHandle<Response> {
+    spawn_raw_create_within(fixture, instance, epoch, context, plan, 25)
+}
+
+fn spawn_raw_create_within(
+    fixture: &Fixture,
+    instance: Id128,
+    epoch: Id128,
+    context: &CreateContext,
+    plan: &PreparedCreate,
+    seconds: u64,
+) -> tokio::task::JoinHandle<Response> {
     let socket = fixture.root.join("helper.sock");
     let operation = create_operation(context, plan);
     tokio::spawn(async move {
         let request = Request {
             version: VERSION,
-            timeout_ms: 25_000,
-            deadline_ns: wire_deadline(25),
+            timeout_ms: (seconds * 1_000) as u32,
+            deadline_ns: wire_deadline(seconds),
             operation: Operation::Firecracker(FirecrackerRequest {
                 group_version: FIRECRACKER_GROUP_VERSION,
                 instance_id: instance,
@@ -2751,7 +2973,7 @@ fn spawn_raw_create(
     })
 }
 
-fn spawn_raw_fence(
+pub(super) fn spawn_raw_fence(
     fixture: &Fixture,
     instance: Id128,
     epoch: Id128,

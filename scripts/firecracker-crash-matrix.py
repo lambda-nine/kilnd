@@ -36,7 +36,9 @@ refusal after issuance, L replaced while H lives, H process death, the watermark
 the G_W refresh, every delete-batch boundary, non-compactable rows, Create and Remove
 racing compaction, a restored stale daemon database, a restart at the checkpoint bound,
 the rollback fault commit at every boundary, the offline clear, and a lost SyncFailed
-followed by an L replacement (B7 M1 break-it finding 1). They run on macOS and
+followed by an L replacement (B7 M1 break-it finding 1), and the integrated recheck's
+HIGH-2 transferred hold: L dies before a lost answer, with the replacement held before
+its Handover, benign, or failing its Handover. They run on macOS and
 in CI as well.
 """
 import os
@@ -81,6 +83,10 @@ B7_SCENARIOS = [
     'b7_crash_a_lost_syncfailed_then_a_replaced_l_keeps_forward_effects_latched',
     'b7_crash_a_timed_out_syncfailed_latches_h_while_the_same_l_lives',
     'b7_crash_a_timed_out_benign_answer_holds_forward_effects_only_until_it_arrives',
+    'b7_crash_l_death_keeps_a_lost_fault_held_until_the_replacement_imports_the_latch',
+    'b7_crash_l_death_with_a_lost_benign_answer_lifts_the_hold_at_the_replacement_handover',
+    'b7_crash_a_failed_replacement_handover_keeps_the_transferred_hold',
+    'b7_linux_root_crash_exec_after_intent_waits_for_the_replacement_handover',
 ]
 
 if __name__ == '__main__':

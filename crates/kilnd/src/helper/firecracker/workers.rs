@@ -1571,10 +1571,14 @@ pub(super) fn handle_ledger(
                 },
             }
         }
-        LedgerRequest::Handover => LedgerReply::Handover {
-            latch: state.latch_state(ledger)?,
-            key: KeyTransfer::of(ledger.token_key()),
-        },
+        LedgerRequest::Handover => {
+            // Integrated recheck HIGH-2's failed-Handover case: a replacement that dies here.
+            fault_point("L.handover");
+            LedgerReply::Handover {
+                latch: state.latch_state(ledger)?,
+                key: KeyTransfer::of(ledger.token_key()),
+            }
+        }
         LedgerRequest::CommitFault {
             instance,
             token,

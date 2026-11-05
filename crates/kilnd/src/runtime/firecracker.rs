@@ -106,6 +106,7 @@ struct InFlight {
 /// claim, whichever way the call ended (an answer, an error, a deadline or a cancel).
 struct LearnClaim<'a> {
     cache: &'a Mutex<DigestCache>,
+    sessions: &'a Mutex<HashMap<Id128, Session>>,
     allocation: Id128,
 }
 
@@ -118,6 +119,28 @@ impl LearnClaim<'_> {
             .is_some_and(|claim| claim.forgotten)
         {
             cache.entries.insert(self.allocation, digest);
+        }
+    }
+
+    /// Integrated recheck MEDIUM-1: a READY answer's session, published under the same
+    /// terminal-aware claim as the digest. An answer delivered after a terminal one
+    /// (produced before it) brings back neither. The digest cache's lock is held across
+    /// the insert, as `forget_allocation` holds it across the removal, so the check and
+    /// the publication cannot straddle a terminal answer.
+    fn publish_session(&self, boot_id: &str, inner_id: &str) {
+        let cache = self.cache.lock().unwrap();
+        if !cache
+            .in_flight
+            .get(&self.allocation)
+            .is_some_and(|claim| claim.forgotten)
+        {
+            self.sessions.lock().unwrap().insert(
+                self.allocation,
+                Session {
+                    boot_id: boot_id.into(),
+                    inner_id: inner_id.into(),
+                },
+            );
         }
     }
 }
@@ -335,33 +358,42 @@ impl FirecrackerRuntime {
         claim.calls += 1;
         LearnClaim {
             cache: &self.digests,
+            sessions: &self.sessions,
             allocation,
         }
     }
 
     /// B7 recheck R3: reconciliation's recovery of the cap. A complete inventory names
-    /// every allocation of this instance the helper still holds; a digest known before it
-    /// was asked whose allocation it omits is retired or absent and is dropped, unless a
-    /// learning call held a claim on it at the start or still does.
-    fn drop_unlisted_digests(&self, before: &[Id128], listed: &[Id128]) {
+    /// every allocation of this instance the helper still holds; a digest or session
+    /// (integrated recheck MEDIUM-1) known before it was asked whose allocation it omits
+    /// is retired or absent and is dropped, unless a learning call held a claim on it at
+    /// the start or still does.
+    fn drop_unlisted(&self, before: &[Id128], listed: &[Id128]) {
         let mut cache = self.digests.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap();
         for allocation in before {
             if !listed.contains(allocation) && !cache.in_flight.contains_key(allocation) {
                 cache.entries.remove(allocation);
+                sessions.remove(allocation);
             }
         }
     }
 
-    /// The digests known now with no learning call in flight: the only ones a complete
-    /// inventory may drop.
-    fn settled_digests(&self) -> Vec<Id128> {
+    /// The allocations with a digest or a session known now and no learning call in
+    /// flight: the only ones a complete inventory may drop.
+    fn settled_allocations(&self) -> Vec<Id128> {
         let cache = self.digests.lock().unwrap();
-        cache
+        let sessions = self.sessions.lock().unwrap();
+        let mut settled: Vec<Id128> = cache
             .entries
             .keys()
+            .chain(sessions.keys())
             .filter(|allocation| !cache.in_flight.contains_key(allocation))
             .copied()
-            .collect()
+            .collect();
+        settled.sort_unstable();
+        settled.dedup();
+        settled
     }
 
     /// B7 RTC-14: raises the reported highest token to `token` if its sequence is
@@ -542,13 +574,16 @@ impl FirecrackerRuntime {
             .ok_or_else(|| RuntimeError::Backend("not attached to a node".into()))
     }
 
+    /// One Inspect. A READY answer's session is published only through `claim`, the
+    /// caller's terminal-aware claim on the allocation (integrated recheck MEDIUM-1).
     async fn inspect_raw(
         &self,
-        allocation: Id128,
+        claim: &LearnClaim<'_>,
         plan_digest: Digest,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<InspectReply, RuntimeError> {
+        let allocation = claim.allocation;
         let deadline = deadline.min(Instant::now() + INSPECT_BUDGET);
         match self
             .call(
@@ -566,23 +601,13 @@ impl FirecrackerRuntime {
                     boot_id, inner_id, ..
                 } = &reply
                 {
-                    self.remember(allocation, boot_id, inner_id);
+                    claim.publish_session(boot_id, inner_id);
                 }
                 Ok(reply)
             }
             FirecrackerResponse::Error(error) => Err(group_failure(error)),
             _ => Err(unexpected()),
         }
-    }
-
-    fn remember(&self, allocation: Id128, boot_id: &str, inner_id: &str) {
-        self.sessions.lock().unwrap().insert(
-            allocation,
-            Session {
-                boot_id: boot_id.into(),
-                inner_id: inner_id.into(),
-            },
-        );
     }
 
     /// The remembered boot is stale, but the allocation may be READY again: keep its
@@ -594,12 +619,13 @@ impl FirecrackerRuntime {
     /// The allocation reached a terminal answer: nothing will name it again, and a
     /// learning call begun before this answer cannot bring its digest back (recheck R3).
     fn forget_allocation(&self, allocation: Id128) {
-        self.sessions.lock().unwrap().remove(&allocation);
+        // The digest cache's lock first and across both, as `publish_session` takes them.
         let mut cache = self.digests.lock().unwrap();
         cache.entries.remove(&allocation);
         if let Some(claim) = cache.in_flight.get_mut(&allocation) {
             claim.forgotten = true;
         }
+        self.sessions.lock().unwrap().remove(&allocation);
     }
 
     /// The boot and inner sandbox to name. Missing after a daemon restart, it is read
@@ -613,12 +639,15 @@ impl FirecrackerRuntime {
         if let Some(session) = self.sessions.lock().unwrap().get(&allocation).cloned() {
             return Ok(session);
         }
+        // Claimed before the digest is read, so a terminal answer from here on keeps a
+        // READY answer from publishing the session (integrated recheck MEDIUM-1).
+        let claim = self.claim_learn(allocation);
         let Some(digest) = self.digests.lock().unwrap().entries.get(&allocation).copied() else {
             return Err(RuntimeError::Backend(format!(
                 "allocation {allocation} has no known binding yet; reconciliation reads it"
             )));
         };
-        match self.inspect_raw(allocation, digest, deadline, cancel).await? {
+        match self.inspect_raw(&claim, digest, deadline, cancel).await? {
             InspectReply::PresentReady {
                 boot_id, inner_id, ..
             } => Ok(Session { boot_id, inner_id }),
@@ -640,6 +669,7 @@ impl FirecrackerRuntime {
     /// Anything but READY is a charged failure the manager settles by exact token.
     async fn wait_ready(
         &self,
+        claim: &LearnClaim<'_>,
         context: &CreateContext,
         prepared: &PreparedCreate,
         deadline: Instant,
@@ -662,7 +692,7 @@ impl FirecrackerRuntime {
                 .into());
             }
             match self
-                .inspect_raw(context.allocation_id, plan_digest, deadline, cancel)
+                .inspect_raw(claim, plan_digest, deadline, cancel)
                 .await
             {
                 Ok(InspectReply::PresentReady {
@@ -884,7 +914,7 @@ impl Runtime for FirecrackerRuntime {
         let plan_digest = prepared.plan_digest();
         // The manager calls create only after C1: from here the allocation may exist.
         // The claim keeps reconciliation from dropping it before C2 is listed.
-        let _claim = self.claim_learn(context.allocation_id);
+        let claim = self.claim_learn(context.allocation_id);
         self.learn_digest(context.allocation_id, plan_digest);
         let response = self
             .call(
@@ -911,7 +941,7 @@ impl Runtime for FirecrackerRuntime {
             }
             // Accepted is a durable charge, not readiness: READY is S's to journal.
             FirecrackerResponse::Create(CreateReply::Accepted { .. }) => {
-                self.wait_ready(context, prepared, deadline, cancel).await
+                self.wait_ready(&claim, context, prepared, deadline, cancel).await
             }
             FirecrackerResponse::Create(CreateReply::Ambiguous { class, message }) => {
                 let error = ambiguous_error(class, format!("create rejected ({class:?}): {message}"));
@@ -935,7 +965,7 @@ impl Runtime for FirecrackerRuntime {
     ) -> Result<AllocationObservation, RuntimeError> {
         let claim = self.claim_learn(context.allocation_id);
         let reply = self
-            .inspect_raw(context.allocation_id, *prepared_digest, deadline, cancel)
+            .inspect_raw(&claim, *prepared_digest, deadline, cancel)
             .await?;
         // Only a non-terminal answer (re)learns the digest: how a restarted daemon
         // relearns its live allocations for Validate and Exec. A terminal answer that
@@ -1179,7 +1209,7 @@ impl Runtime for FirecrackerRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<BackendInventory, RuntimeError> {
-        let before = self.settled_digests();
+        let before = self.settled_allocations();
         match self
             .call(FirecrackerOperation::List, deadline, cancel)
             .await?
@@ -1190,7 +1220,7 @@ impl Runtime for FirecrackerRuntime {
                 if reply.complete {
                     let listed: Vec<Id128> =
                         reply.records.iter().map(|record| record.allocation_id).collect();
-                    self.drop_unlisted_digests(&before, &listed);
+                    self.drop_unlisted(&before, &listed);
                 }
                 Ok(BackendInventory {
                 generation: reply.generation,
@@ -1423,10 +1453,10 @@ mod tests {
             runtime.learn_digest(allocation, Digest::of(allocation.to_string().as_bytes()));
         }
         let claim = runtime.claim_learn(creating);
-        let before = runtime.settled_digests();
+        let before = runtime.settled_allocations();
         assert_eq!(before.len(), 2, "a claimed digest is never a candidate");
         runtime.learn_digest(later, Digest::of(b"later"));
-        runtime.drop_unlisted_digests(&before, &[live]);
+        runtime.drop_unlisted(&before, &[live]);
         let cache = runtime.digests.lock().unwrap();
         assert!(cache.entries.contains_key(&live));
         assert!(!cache.entries.contains_key(&retired), "the unlisted digest is dropped");
@@ -1435,5 +1465,59 @@ mod tests {
         drop(cache);
         drop(claim);
         assert!(runtime.digests.lock().unwrap().in_flight.is_empty(), "claims end with their calls");
+    }
+
+    /// Integrated recheck MEDIUM-1 (`reviews/poc-b7-integrated/r3-stale-session-
+    /// resurrection.sh`, inverted): for 32 allocations, an Inspect holds its claim, a
+    /// terminal Remove forgets the allocation, and only then is the already-produced READY
+    /// answer handled, publishing its session and learning its digest through the claim.
+    /// Neither comes back: no session and no digest survives.
+    #[test]
+    fn stale_ready_answers_after_terminal_answers_resurrect_no_session() {
+        let runtime = FirecrackerRuntime::new("/nonexistent".into(), Id128::random(), Id128::random());
+        for index in 0..32u8 {
+            let allocation = Id128::random();
+            let digest = Digest::of(&[index]);
+            runtime.learn_digest(allocation, digest);
+            let claim = runtime.claim_learn(allocation);
+            runtime.forget_allocation(allocation);
+            // inspect_raw's READY arm, then inspect_allocation's guarded learn.
+            claim.publish_session("stale-boot", "stale-inner");
+            claim.learn(digest);
+            drop(claim);
+        }
+        assert_eq!(runtime.digests.lock().unwrap().entries.len(), 0);
+        assert_eq!(runtime.sessions.lock().unwrap().len(), 0, "no stale session returns");
+        // A claim begun after the terminal answer publishes normally (a restarted daemon).
+        let allocation = Id128::random();
+        let claim = runtime.claim_learn(allocation);
+        claim.publish_session("boot", "inner");
+        drop(claim);
+        assert_eq!(runtime.sessions.lock().unwrap().len(), 1);
+    }
+
+    /// Integrated recheck MEDIUM-1's recovery: a complete inventory also drops the
+    /// sessions of allocations it does not name, never one a learning call holds a claim
+    /// on, nor one published after the inventory was asked.
+    #[test]
+    fn a_complete_inventory_drops_only_unclaimed_unlisted_sessions() {
+        let runtime = FirecrackerRuntime::new("/nonexistent".into(), Id128::random(), Id128::random());
+        let [live, retired, creating, later] = [(); 4].map(|_| Id128::random());
+        for allocation in [live, retired, creating] {
+            let claim = runtime.claim_learn(allocation);
+            claim.publish_session("boot", "inner");
+        }
+        let claim = runtime.claim_learn(creating);
+        let before = runtime.settled_allocations();
+        assert_eq!(before.len(), 2, "a claimed session is never a candidate");
+        runtime.claim_learn(later).publish_session("boot", "inner");
+        runtime.drop_unlisted(&before, &[live]);
+        let sessions = runtime.sessions.lock().unwrap();
+        assert!(sessions.contains_key(&live));
+        assert!(!sessions.contains_key(&retired), "the unlisted session is dropped");
+        assert!(sessions.contains_key(&creating));
+        assert!(sessions.contains_key(&later));
+        drop(sessions);
+        drop(claim);
     }
 }

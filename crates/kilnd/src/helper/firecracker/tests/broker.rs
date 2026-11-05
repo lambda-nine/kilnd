@@ -263,6 +263,92 @@ async fn removed_cleanly(real: &Real, runtime: &FirecrackerRuntime, context: &Cr
     assert!(left.is_empty(), "left behind: {left:?}");
 }
 
+/// B7 integrated recheck HIGH-2 on the real chain, Exec's final boundary: an Exec has
+/// written EXEC_INTENT and is held immediately before its last latch check. A
+/// fault-bearing FenceAbsent's answer is lost after L wrote the fail-stop marker, L is
+/// killed before giving it, and the replacement is held before Handover. Released, the
+/// Exec hands over no descriptors and dispatches nothing: the hold transferred from the
+/// dead L refuses it at its own deadline and the VM is retired. Only the replacement's
+/// Handover lifts the hold, after latching H from the durable marker.
+#[tokio::test]
+#[ignore = "needs root with the B4 launch capabilities: run scripts/firecracker-crash-matrix.py"]
+async fn b7_linux_root_crash_exec_after_intent_waits_for_the_replacement_handover() {
+    use super::compaction::{b7_matrix, census_until, spawn_raw_fence};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let real = Real::new(NodeOptions::default()).await;
+    let (runtime, context, _) = create(&real).await;
+    let (boot, _) = wait_ready(&real, &runtime, &context).await;
+    let instance = context.instance_id;
+    let (fenced, fenced_plan) = issued(&runtime, instance).await;
+    let epoch = epoch_of(&runtime).await;
+    let fixture = &real.fixture;
+    fixture.fault("H.exec.before_dispatch.hold");
+    let done = AtomicBool::new(false);
+    let exec = async {
+        let ran = exec_with(
+            &real,
+            &runtime,
+            &context,
+            &boot,
+            &["sh", "-c", "echo dispatched"],
+            Vec::new(),
+            MIB,
+            15,
+            None,
+        )
+        .await;
+        done.store(true, Ordering::SeqCst);
+        ran
+    };
+    let drive = async {
+        fixture.wait_reached("H.exec.before_dispatch").await;
+        fixture.fault("L.fence.sync_fail");
+        fixture.fault("L.sync_failed_reply.stall");
+        let fence = spawn_raw_fence(fixture, instance, epoch, &fenced, &fenced_plan, 2);
+        fixture.wait_reached("L.sync_failed_reply").await;
+        let reply = fence.await.unwrap().unwrap();
+        assert!(matches!(reply, FirecrackerResponse::Fence(FenceReply::Ambiguous { .. })), "{reply:?}");
+        let old_l = fixture.census().await["ledger"].as_i64().unwrap();
+        fixture.fault("H.ledger.before_publish.hold");
+        signal(old_l, libc::SIGKILL);
+        fixture.clear("L.sync_failed_reply.stall");
+        fixture.clear("L.fence.sync_fail");
+        fixture.wait_reached("H.ledger.before_publish").await;
+        let census = fixture.census().await;
+        assert_eq!(census["transferred_holds"], json!(1), "{census}");
+        assert_eq!(census["latched"], json!(false), "{census}");
+        fixture.clear("H.exec.before_dispatch.hold");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!done.load(Ordering::SeqCst), "the Exec waits at its final boundary");
+        while !done.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(fixture.census().await["transferred_holds"], json!(1));
+        fixture.clear("H.ledger.before_publish.hold");
+        census_until(fixture, "the replacement never imported the latch", |c| {
+            c["latched"] == json!(true) && c["transferred_holds"] == json!(0)
+        })
+        .await
+    };
+    let (ran, census) = tokio::join!(exec, drive);
+    let reply = ran.reply.expect("an Exec reply");
+    assert!(!reply.dispatched, "nothing dispatched: {reply:?}");
+    assert!(!reply.reusable, "{reply:?}");
+    assert!(
+        format!("{:?}", reply.finish).contains("latched node-wide after EXEC_INTENT"),
+        "{reply:?}"
+    );
+    assert!(ran.stdout.is_empty(), "the broker never ran it: {:?}", ran.stdout);
+    assert_eq!(census["latch_kind"], json!("fail_stop"), "{census}");
+    evidence("exec cleanup", format!("{:?}", reply.cleanup));
+    let removed = remove(&real, &runtime, &context).await;
+    evidence("remove under the latch", format!("{removed:?}"));
+    b7_matrix(
+        "B7 integrated recheck HIGH-2: Exec after EXEC_INTENT, L death, replacement before Handover",
+        json!({"exec": "refused at its deadline, not dispatched", "cleanup": format!("{:?}", reply.cleanup), "h_latched": "at Handover"}),
+    );
+}
+
 /// B5 exit: actual persistent execution through the real chain.
 #[tokio::test]
 #[ignore = "needs root with the B4 launch capabilities: run scripts/b4-vm-tests.sh"]

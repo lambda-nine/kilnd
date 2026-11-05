@@ -610,7 +610,14 @@ pub struct Node {
     /// may still answer. Each holds every forward effect fail-closed, exactly as the
     /// latch does, until its answer is consumed (`LostAnswers`).
     lost_answers: AtomicUsize,
-    lost_owner: Arc<LostAnswers>,
+    /// The node, for each fault-bearing call's [`LostAnswers`] owner.
+    lost_node: std::sync::Weak<Node>,
+    /// B7 integrated recheck HIGH-2: the holds of fault-bearing answers L died before
+    /// giving, until a replacement's Handover has imported its durable latch state.
+    transferred: Mutex<TransferredHolds>,
+    /// How many times the ledger slot has been published: the generation of the L that
+    /// a call made now reaches. Read and changed only under the ledger slot's lock.
+    ledger_generation: AtomicU64,
     /// B7: the last compaction stuck token, for Health.
     compaction_fault: Mutex<Option<String>>,
     /// Test instrumentation: L calls made and tokens refused by the tag check.
@@ -866,7 +873,9 @@ impl Node {
             latched: std::sync::atomic::AtomicBool::new(false),
             latch: Mutex::default(),
             lost_answers: AtomicUsize::new(0),
-            lost_owner: Arc::new(LostAnswers { node: me.clone() }),
+            lost_node: me.clone(),
+            transferred: Mutex::default(),
+            ledger_generation: AtomicU64::new(0),
             compaction_fault: Mutex::new(None),
             ledger_calls: AtomicU64::new(0),
             tag_refusals: AtomicU64::new(0),
@@ -1179,7 +1188,13 @@ impl Node {
     }
 
     fn ledger_channel(&self) -> Arc<Channel> {
-        self.ledger.lock().unwrap().channel.clone()
+        self.ledger_channel_at().0
+    }
+
+    /// The published L's channel and its generation, read together.
+    fn ledger_channel_at(&self) -> (Arc<Channel>, u64) {
+        let slot = self.ledger.lock().unwrap();
+        (slot.channel.clone(), self.ledger_generation.load(Ordering::SeqCst))
     }
 
     fn try_prep_slot(&self) -> Option<PrepLease> {
@@ -1296,7 +1311,9 @@ impl Node {
     /// latched once every outstanding lost answer has been consumed. L answers in order,
     /// so a hold normally lasts as long as L's queue; still held at `until`, the answer
     /// is treated as a fault (fail-closed). A client's own lapsed deadline therefore
-    /// delays other work for that long at most and never refuses it on its own.
+    /// delays other work for that long at most and never refuses it on its own. The count
+    /// includes holds transferred from a dead L (integrated recheck HIGH-2), which last
+    /// until a replacement's Handover has imported the durable latch.
     async fn latched_once_answered(&self, until: Instant) -> bool {
         loop {
             if self.is_latched_durably() {
@@ -1317,8 +1334,8 @@ impl Node {
     /// that asked has gone; an answer that cannot be read while L lives fails stop.
     fn import_lost_answer(&self, reply: Result<serde_json::Value, CallError>) {
         let Ok(value) = reply else {
-            // L is gone: its replacement's handover imports whatever it made durable,
-            // before anything can reach the new L.
+            // L is gone: its replacement's handover imports whatever it made durable.
+            // The hold is not released here but transferred (`transfer_hold`).
             return;
         };
         match serde_json::from_value::<LedgerReply>(value) {
@@ -1414,7 +1431,51 @@ impl Node {
                 _ => return Err("it could not commit the pending rollback fault".into()),
             }
         }
-        self.fetch_key(channel).await
+        let key = self.fetch_key(channel).await?;
+        // Integrated recheck HIGH-2: the latch is imported (`fetch_key`), so the holds
+        // transferred from every L this one replaces can lift now, and not before.
+        self.release_transferred_holds();
+        Ok(key)
+    }
+
+    /// Integrated recheck HIGH-2: a fault-bearing call to the L of `generation` ended
+    /// without its answer because that L is gone. Whatever it made durable (a fail-stop
+    /// marker, a fault row) only a replacement's Handover imports, so the call holds
+    /// forward effects until then: `counted` says whether it already holds one (a
+    /// parked lost answer), else it takes one now. If a replacement of that L has
+    /// already handed over, its import happened after this L's death and there is
+    /// nothing left to wait for.
+    fn transfer_hold(&self, generation: u64, counted: bool) {
+        let mut holds = self.transferred.lock().unwrap();
+        if generation < holds.handed_over_below {
+            if counted {
+                self.lost_answers.fetch_sub(1, Ordering::SeqCst);
+            }
+            return;
+        }
+        if !counted {
+            self.lost_answers.fetch_add(1, Ordering::SeqCst);
+        }
+        *holds.held.entry(generation).or_default() += 1;
+    }
+
+    /// After a successful Handover has imported the replacement's latch state, before
+    /// the replacement is published: every L up to the one in the slot is dead and
+    /// imported, so their transferred holds lift. A failed Handover never gets here.
+    fn release_transferred_holds(&self) {
+        let mut holds = self.transferred.lock().unwrap();
+        let replaced = self.ledger_generation.load(Ordering::SeqCst);
+        holds.handed_over_below = holds.handed_over_below.max(replaced + 1);
+        let below = holds.handed_over_below;
+        let kept = holds.held.split_off(&below);
+        let lifted: usize = std::mem::replace(&mut holds.held, kept).values().sum();
+        if lifted > 0 {
+            self.lost_answers.fetch_sub(lifted, Ordering::SeqCst);
+            tracing::warn!(
+                "{lifted} hold(s) transferred from a dead ledger lifted after the \
+                 replacement's handover imported its latch state"
+            );
+        }
     }
 
     /// RTC-3's H check, before any gate, quota or L call: a constant-time tag check in
@@ -1506,16 +1567,25 @@ impl Node {
         if lane != Lane::Compaction {
             self.ledger_calls.fetch_add(1, Ordering::Relaxed);
         }
-        let channel = self.ledger_channel();
+        let (channel, generation) = self.ledger_channel_at();
         // B7 recheck R1: if this future is dropped once the request is on its way (a
         // deadline, a cancellation), the channel hands the answer to `LostAnswers`
         // instead of discarding it, and forward effects are held until it arrives.
-        let owner = request
-            .fault_bearing()
-            .then(|| self.lost_owner.clone() as Arc<dyn workers::Orphan>);
+        let owner = request.fault_bearing().then(|| {
+            Arc::new(LostAnswers {
+                node: self.lost_node.clone(),
+                generation,
+            }) as Arc<dyn workers::Orphan>
+        });
         let raw = channel
             .call_owned::<serde_json::Value>(lane, request, deadline_ns, owner)
             .await;
+        // Integrated recheck HIGH-2: L died with this fault-bearing request unanswered
+        // (or before it could be sent): forward effects wait for its replacement's
+        // Handover, exactly as for a lost answer.
+        if matches!(raw, Err(CallError::Closed)) && request.fault_bearing() {
+            self.transfer_hold(generation, false);
+        }
         let reply = raw.and_then(|value| {
             serde_json::from_value::<LedgerReply>(value).map_err(|_| {
                 // L answered and lives, but H cannot read the answer: fail stop.
@@ -1559,6 +1629,17 @@ impl Node {
 /// and the hold on forward effects lasts exactly until then.
 struct LostAnswers {
     node: std::sync::Weak<Node>,
+    /// The generation of the L the request was sent to.
+    generation: u64,
+}
+
+/// Integrated recheck HIGH-2: holds transferred from dead L generations, keyed by the
+/// generation each request was sent to, and the generations a successful Handover has
+/// since imported (all below `handed_over_below`).
+#[derive(Default)]
+struct TransferredHolds {
+    held: std::collections::BTreeMap<u64, usize>,
+    handed_over_below: u64,
 }
 
 impl workers::Orphan for LostAnswers {
@@ -1570,6 +1651,13 @@ impl workers::Orphan for LostAnswers {
 
     fn answer(&self, reply: Result<serde_json::Value, CallError>, parked: bool) {
         if let Some(node) = self.node.upgrade() {
+            if matches!(reply, Err(CallError::Closed)) {
+                // Integrated recheck HIGH-2: L died first. Its durable state comes only
+                // with a replacement's Handover, so the hold moves to that barrier
+                // instead of lifting.
+                node.transfer_hold(self.generation, parked);
+                return;
+            }
             // Imported first, so a fault latches before the hold lifts.
             node.import_lost_answer(reply);
             if parked {
@@ -2028,7 +2116,11 @@ impl Node {
 
     fn publish_slot(self: &Arc<Self>, kind: SlotKind, spawned: Spawned) {
         match (kind, spawned) {
-            (SlotKind::Ledger, Spawned::Plain(slot)) => *self.ledger.lock().unwrap() = slot,
+            (SlotKind::Ledger, Spawned::Plain(slot)) => {
+                let mut published = self.ledger.lock().unwrap();
+                *published = slot;
+                self.ledger_generation.fetch_add(1, Ordering::SeqCst);
+            }
             (SlotKind::Prep(index), Spawned::Plain(slot)) => {
                 *self.prep[index].lock().unwrap() = slot;
             }
@@ -4390,6 +4482,8 @@ impl Node {
             "pending_fault": self.latch.lock().unwrap().pending.is_some(),
             "latch_kind": self.latch.lock().unwrap().kind.clone(),
             "lost_answers": self.lost_answers.load(Ordering::SeqCst),
+            "transferred_holds": self.transferred.lock().unwrap().held.values().sum::<usize>(),
+            "ledger_replacement_fault": self.ledger_replacement_fault.lock().unwrap().clone(),
         })
     }
 }

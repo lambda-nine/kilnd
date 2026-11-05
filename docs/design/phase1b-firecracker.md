@@ -5491,3 +5491,57 @@ both feature sets except `runtime::kiln_direct`'s fake-kiln timing tests and
 fail identically at the unchanged `d7f7b44`; clippy is clean on 1.88 and 1.99. The VM's
 mounted checkout was returned to main `1c107f9` and `/var/lib/kilnd` restored from its
 copy, every file `cmp`-identical (`kilnd.db` SHA-256 `ef02941f…`).
+
+### Integrated recheck: the transferred hold (November 5, 2026)
+
+Daybreak Blue's integrated recheck of `f4db5b5` (`reviews/2026-11-05-b7-integrated-recheck.md`,
+HIGH-2) found the gap R1 left at an L death. `LostAnswers` treated the dead worker's
+`Closed` as the end of a lost fault-bearing answer and lifted the hold, on the premise that
+the replacement's Handover would import whatever L had made durable. Between that `Closed`
+and the Handover, H was neither held nor latched: a Create waiting at its final boundary
+sent `OpenGate` and was accepted, and an Exec past EXEC_INTENT could hand over its
+descriptors and dispatch, before the replacement imported the fail-stop marker.
+
+**Correction: the replacement-generation barrier.** H counts the ledger slot's
+publications (`ledger_generation`, read with the channel under the slot's lock), and every
+fault-bearing call carries the generation of the L it was sent to. When such a call ends in
+`Closed`, whether its waiter was dropped and the answer parked (`LostAnswers` with
+`parked`), the waiter was dropped as `Closed` arrived, or the waiter itself received
+`Closed`, the hold is not lifted. It moves to a barrier keyed by that generation
+(`TransferredHolds`) and keeps counting in `lost_answers`, so `is_latched` and
+`latched_once_answered`, and with them every forward boundary (the request gate, Preflight,
+Create before `OpenGate`, Exec after EXEC_INTENT, S's records), see it. Only
+`handover_ledger` drains it: after the replacement's Handover reply has been imported (any
+pending fault committed first, then `fetch_key` latches H from L's `LatchState`), and before
+the channel is published, every hold of a generation up to the replaced one lifts. A
+`Closed` that arrives after a Handover already imported a later generation's state lifts at
+once, since that import followed this L's death. A failed Handover (the replacement dies,
+answers wrongly or misses `REPLACEMENT_LEDGER_REPLY`) or no replacement at all leaves the
+hold in place, so each waiting boundary refuses at its own deadline (`Latched` for Create;
+an undispatched, retired VM for Exec), and the next replacement whose Handover succeeds
+drains it. Health reports `transferred_holds` beside `lost_answers`.
+
+| Test | What it shows |
+|---|---|
+| `b7_crash_l_death_keeps_a_lost_fault_held_until_the_replacement_imports_the_latch` | The review's PoC inverted: a FenceAbsent's answer is lost after L wrote the marker, L is killed, the replacement is held before Handover. The hold is transferred (`lost_answers` 1, `transferred_holds` 1, unlatched); the queued Create waits at its final boundary and is refused `Latched` at its deadline with no gate and no effect; after the Handover H is latched `fail_stop`, the hold has lifted and Preflight is refused |
+| `b7_crash_l_death_with_a_lost_benign_answer_lifts_the_hold_at_the_replacement_handover` | The control: L killed inside a benign fence; the Create waits during the stall, the Handover imports no latch, the hold lifts, the Create and a later one are accepted |
+| `b7_crash_a_failed_replacement_handover_keeps_the_transferred_hold` | The replacement dies inside Handover (`L.handover.panic`): nothing imported, the hold stays, the Create is refused at its deadline; a later replacement's Handover latches H and lifts it |
+| `b7_linux_root_crash_exec_after_intent_waits_for_the_replacement_handover` | Real chain: an Exec held after EXEC_INTENT, the same L death; released, it hands over no descriptors and dispatches nothing (`dispatched: false`, empty output), refused at its deadline with the VM retired; after the Handover H is latched |
+
+All four are in `scripts/firecracker-crash-matrix.py`. With the old release (a transferred
+hold lifted at once), the first and third fail at the census after the replacement is held.
+
+**Stale sessions (integrated recheck MEDIUM-1).** R3's claim guarded only the digest:
+`inspect_raw` remembered a `PresentReady` session unconditionally, so an answer produced
+before a terminal Remove and delivered after it brought the session back (32 stale
+allocations left 32 sessions, and a complete List pruned none). The session is now
+published only through the caller's `LearnClaim` (`publish_session`), under the digest
+cache's lock and only if the claim was not forgotten; `forget_allocation` takes the same
+lock first and removes the session under it, so the check and the insert cannot straddle a
+terminal answer. Every `inspect_raw` caller holds a claim: Create's READY poll, the
+reconciliation Inspect and the session lookup before Validate and Exec (claimed before it
+reads the digest). A complete List now drops the sessions as well as the digests of
+allocations known before it was asked that it omits, never one a claim holds. Tests:
+`stale_ready_answers_after_terminal_answers_resurrect_no_session` (the PoC inverted, 32
+allocations, zero sessions and digests) and
+`a_complete_inventory_drops_only_unclaimed_unlisted_sessions`.
