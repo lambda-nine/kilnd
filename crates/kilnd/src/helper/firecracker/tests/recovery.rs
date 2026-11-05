@@ -452,6 +452,11 @@ async fn b6_linux_root_crash_capacity_commit_reply_lost_keeps_one_claim() {
         1,
         "the restarted helper replays the one claim"
     );
+    // The daemon learns its epoch is stale from the first call that reaches the new
+    // helper, then attaches anew. Health answers from its 5 s cache until then, so once
+    // the helper started faster than that (optimized dependencies, Nov 5) the Delete
+    // itself was that first call and failed. Let a fresh Health probe make it.
+    tokio::time::sleep(Duration::from_millis(5_500)).await;
     daemon.wait_serving(real).await;
     let removed = daemon.kilndctl(&mut transcript, &["rm", &id], None);
     assert_eq!(

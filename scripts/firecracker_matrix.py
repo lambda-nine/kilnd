@@ -2,7 +2,8 @@
 firecracker-crash-matrix.py). Run in the kiln Lima VM as your user, under the shared VM
 lock, with the inputs scripts/b4-vm-tests.sh documents. It runs the named privileged
 tests through b4-vm-tests.sh (which builds, installs the test helper image and the
-daemon, and always runs scripts/b4-vm-cleanup.py), collects each test's `B6 matrix:` (or B7) line
+daemon, and always runs scripts/b4-vm-cleanup.py), and B7's unprivileged fixture
+scenarios through cargo test as your user; collects each test's `B6 matrix:` (or B7) line
 and libtest result, and writes matrix.json and matrix.md. It fails if any expected
 scenario is missing, failed or produced no matrix line. Nothing here touches the installed
 kilnd, its database or production paths."""
@@ -24,6 +25,11 @@ MAX_UPTIME_MINUTES = 90
 def uptime_minutes():
     with open('/proc/uptime') as f:
         return float(f.read().split()[0]) / 60
+
+
+def is_fixture(name):
+    """B7's unprivileged scenarios (tests/compaction.rs), as opposed to the real chain."""
+    return name.startswith('b7_') and 'linux_root' not in name
 
 
 def run(title, prefix, scenarios, argv=None):
@@ -56,9 +62,19 @@ def run(title, prefix, scenarios, argv=None):
         for name in expected:
             env = dict(os.environ, B6_EVIDENCE=evidence)
             t0 = time.time()
-            proc = subprocess.run([os.path.join(HERE, 'b4-vm-tests.sh'), name], cwd=ROOT,
-                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True)
+            if is_fixture(name):
+                # B7's scenarios run the real H, L, listener and adapter with fake host
+                # effects, as your user: the fixture enrolls the test process's own
+                # account, and an instance account is never root.
+                env.setdefault('CARGO_TARGET_DIR',
+                               os.path.join(os.environ['HOME'], '.cache', 'kilnd-target'))
+                command = ['cargo', 'test', '--locked', '-p', 'kilnd', '--lib', '--',
+                           '--exact', f'helper::firecracker::tests::compaction::{name}',
+                           '--nocapture']
+            else:
+                command = [os.path.join(HERE, 'b4-vm-tests.sh'), name]
+            proc = subprocess.run(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
             log.write(f'===== {name} =====\n{proc.stdout}\n')
             log.flush()
             passed = (proc.returncode == 0
