@@ -366,6 +366,10 @@ async fn b7_rtc3_forged_foreign_and_seq_zero_tokens_never_reach_a_gate_or_l() {
     assert_eq!(fixture.count("SELECT COUNT(*) FROM retired_tokens"), 0);
     // The valid token itself still works afterwards.
     create_accepted(&fixture, &runtime_a, &context, &plan).await;
+    b7_matrix(
+        "RTC-3: forged, foreign and seq-0 tokens",
+        json!({"refused_by_h": refused, "ledger_calls": 0, "gates_retained": 0}),
+    );
 }
 
 #[tokio::test]
@@ -412,6 +416,10 @@ async fn b7_rtc3_a_valid_tag_at_the_pointer_reaches_l_and_is_not_issued_across_r
     // The exact pointer survived both restarts: the next issuance is `pointer`.
     let (next, _) = issued(&runtime, instance).await;
     assert_eq!(super::super::token::seq_of(next.allocation_id), pointer);
+    b7_matrix(
+        "RTC-3: a valid tag at the pointer is NotIssued across restarts",
+        json!({"pointer": pointer, "restarts": ["ledger", "helper"], "next_issued": pointer}),
+    );
 }
 
 #[tokio::test]
@@ -557,6 +565,10 @@ async fn b7_rtc8_real_wire_digests_after_compaction_and_a_helper_restart() {
             .unwrap(),
         AllocationObservation::Unknown { .. } | AllocationObservation::Present { .. }
     ));
+    b7_matrix(
+        "RTC-8: real-wire Inspect, Remove and Gc digests after compaction and a restart",
+        json!({"right_digest": "AbsentFenced", "wrong_digest": "Conflict", "active_untouched": true}),
+    );
 }
 
 #[tokio::test]
@@ -611,6 +623,10 @@ async fn b7_rtc14_spoofed_highest_tokens_fail_only_their_own_attachment() {
     honest.prove_attachment(deadline(5)).await.unwrap();
     let (next, _) = issued(&honest, a).await;
     assert!(super::super::token::seq_of(next.allocation_id) > super::super::token::seq_of(own.allocation_id));
+    b7_matrix(
+        "RTC-14: spoofed highest tokens fail only their own attachment",
+        json!({"spoofs_refused": true, "node_fault": null, "honest_reattach": "issues above its token"}),
+    );
 }
 
 const LEDGER_FILES: [&str; 3] = ["node.db", "node.db-wal", "node.db-shm"];
@@ -820,6 +836,10 @@ async fn b7_rtc14_a_real_rollback_latches_every_forward_effect_until_the_offline
     );
     assert_eq!(fixture.count("SELECT COUNT(*) FROM node_faults"), 0);
     assert_eq!(fixture.census().await["latched"], json!(false));
+    b7_matrix(
+        "RTC-14: a real rollback latches forward effects until the offline clear",
+        json!({"latched": "until offline-inventory and clear-node-faults", "after_clear": "issues above the recorded token"}),
+    );
 }
 
 /// Root's offline command once the stopped helper's L has let go of the node lock.
@@ -916,6 +936,10 @@ async fn b7_rtc_r2_03_h_latches_before_the_commit_and_queued_work_starts_nothing
             .await
             .unwrap(),
     );
+    b7_matrix(
+        "RTC-R2-03: H latches before the fault commit",
+        json!({"queued_create": "no supervisor released", "fence_under_latch": "Absent"}),
+    );
 }
 
 #[tokio::test]
@@ -973,6 +997,10 @@ async fn b7_rtc_r2_01_an_uncertain_fault_commit_fails_stop_across_every_restart(
             .fence_absent(&active, &active_plan.plan_digest(), deadline(20), &no_cancel())
             .await
             .unwrap(),
+    );
+    b7_matrix(
+        "RTC-R2-01: an uncertain fault commit fails stop across restarts",
+        json!({"forward_effects": "refused", "health": "node_fault", "cleanup": "drains"}),
     );
 }
 
@@ -1044,6 +1072,10 @@ async fn b7_rtc13_a_five_lease_flood_keeps_checkpoints_bounded_and_the_tail_matu
         assert_eq!(tokens.watermark, last);
         assert!(tokens.checkpoints <= bound);
     }
+    b7_matrix(
+        "RTC-13: a five-lease flood keeps checkpoints bounded",
+        json!({"checkpoint_bound": bound, "tail": "matures to issue_next"}),
+    );
 }
 
 #[tokio::test]
@@ -1096,6 +1128,10 @@ async fn b7_rtc12_a_never_admitted_flood_stops_at_the_floor_and_refills_after_a_
         .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
         .await
         .unwrap();
+    b7_matrix(
+        "RTC-12: a never-admitted flood stops at the floor",
+        json!({"quota": 16, "stopped_at": fenced_tokens, "refilled": "after one lease"}),
+    );
 }
 
 #[tokio::test]
@@ -1141,6 +1177,10 @@ async fn b7_rtc17_an_instance_enrolled_beside_a_borrower_finds_its_share_at_once
                 .unwrap(),
         );
     }
+    b7_matrix(
+        "RTC-17: an instance enrolled beside a borrower finds its share",
+        json!({"newcomer": "admitted at once", "borrower": "refused past its share"}),
+    );
 }
 
 #[tokio::test]
@@ -1249,6 +1289,10 @@ async fn b7_rtc18_compaction_has_its_own_lane_and_a_full_batch_stays_under_100_m
     // Four of five full batches under the cap, so one scheduling hiccup of a loaded
     // machine is not mistaken for a batch that is too large.
     assert!(durations[3] < Duration::from_millis(100), "{durations:?}");
+    b7_matrix(
+        "RTC-18: compaction's own lane, a full batch under 100 ms",
+        json!({"batch": COMPACTION_BATCH, "p50_ms": durations[2].as_secs_f64() * 1e3, "max_ms": durations[4].as_secs_f64() * 1e3}),
+    );
 }
 
 /// Preflight then FenceAbsent with no Create: the never-admitted fence a post-C1
@@ -2349,6 +2393,10 @@ async fn b7_rtc18_a_busy_normal_lane_from_two_instances_never_starves_a_third_in
     }
     assert_eq!(refilled_at, Some(0), "refilled in the first lease, beside {sessions} sessions");
     assert!(sessions >= 8, "the normal lane really was busy: {sessions}");
+    b7_matrix(
+        "RTC-18: a busy normal lane never starves another instance's refill",
+        json!({"refilled_in_lease": 0, "concurrent_sessions": sessions}),
+    );
 }
 
 /// The sandbox ID a prepared plan's substitutions name.
