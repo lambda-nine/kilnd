@@ -21,7 +21,8 @@ use kilnd::model::{
 use kilnd::runtime::fake::FakeRuntime;
 use kilnd::runtime::{
     AbsenceReceipt, AllocationObservation, BackendInventory, CreateContext, CreateFailure,
-    CreatedSandbox, ExecOutcome, ExecSpec, ExecutionContext, PreparedCreate, Runtime,
+    CreatedSandbox, ExecOutcome, ExecSpec, ExecutionContext, PrepareContext, PreparedCreate,
+    RemoveTarget, Runtime,
     RuntimeCapabilities, RuntimeError,
 };
 use kilnd::store::{ExecutionResult, Store};
@@ -72,7 +73,7 @@ impl Runtime for StressRuntime {
 
     async fn prepare(
         &self,
-        context: &CreateContext,
+        context: &PrepareContext,
         spec: &SandboxSpec,
         deadline: tokio::time::Instant,
         cancel: &CancellationToken,
@@ -135,11 +136,11 @@ impl Runtime for StressRuntime {
 
     async fn remove(
         &self,
-        id: &str,
+        target: RemoveTarget<'_>,
         deadline: tokio::time::Instant,
         cancel: &CancellationToken,
     ) -> Result<AbsenceReceipt, RuntimeError> {
-        self.inner.remove(id, deadline, cancel).await
+        self.inner.remove(target, deadline, cancel).await
     }
 
     async fn list(
@@ -152,11 +153,11 @@ impl Runtime for StressRuntime {
 
     async fn gc(
         &self,
-        ids: &[String],
+        targets: &[RemoveTarget<'_>],
         deadline: tokio::time::Instant,
         cancel: &CancellationToken,
     ) -> Result<Vec<AbsenceReceipt>, RuntimeError> {
-        self.inner.gc(ids, deadline, cancel).await
+        self.inner.gc(targets, deadline, cancel).await
     }
 }
 
