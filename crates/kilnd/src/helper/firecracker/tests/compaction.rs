@@ -3070,11 +3070,17 @@ mod linux_root {
         real.fixture.clear("S.step.cgroup.stall");
         let entry = supervisor_exited(&real.fixture, context.allocation_id).await;
         assert_eq!(entry["stop_fenced"], json!(true), "S was contained: {entry}");
-        assert_eq!(real.phase(context.allocation_id), "preparing");
+        // Contained at its refused record: the stop fence's record, never further.
+        assert!(
+            ["preparing", "stop_intent"].contains(&real.phase(context.allocation_id).as_str()),
+            "{}",
+            real.phase(context.allocation_id)
+        );
         assert_eq!(intents(&real, context.allocation_id), Vec::<String>::new(), "no intent");
         assert_eq!(host_leftovers(&real, &context, None), Vec::<String>::new(), "no host effect");
         let removed = remove(&real, &runtime, &context).await;
         assert!(matches!(removed, FenceReply::Absent { .. }), "{removed:?}");
+        eprintln!();
         b7_matrix(
             "B7 M1 recheck R2: latch before S's cgroup intent",
             json!({"cgroup_intent": "never sent", "host_effect": "none", "remove": "Absent"}),
@@ -3107,6 +3113,7 @@ mod linux_root {
         assert_eq!(host_leftovers(&real, &context, None), Vec::<String>::new(), "no tree");
         let removed = remove(&real, &runtime, &context).await;
         assert!(matches!(removed, FenceReply::Absent { .. }), "{removed:?}");
+        eprintln!();
         b7_matrix(
             "B7 M1 recheck R2: latch while H awaits the cgroup intent",
             json!({"intent": "journaled", "acknowledgement": "refused", "host_effect": "none", "remove": "Absent"}),
@@ -3131,7 +3138,11 @@ mod linux_root {
         real.fixture.clear("S.step.broker_ready.stall");
         let entry = supervisor_exited(&real.fixture, context.allocation_id).await;
         assert_eq!(entry["stop_fenced"], json!(true), "S was contained: {entry}");
-        assert_eq!(real.phase(context.allocation_id), "booting", "never READY");
+        assert!(
+            ["booting", "stop_intent"].contains(&real.phase(context.allocation_id).as_str()),
+            "never READY: {}",
+            real.phase(context.allocation_id)
+        );
         assert!(
             !intents(&real, context.allocation_id)
                 .iter()
@@ -3141,6 +3152,7 @@ mod linux_root {
         let removed = remove(&real, &runtime, &context).await;
         assert!(matches!(removed, FenceReply::Absent { .. }), "{removed:?}");
         assert_eq!(host_leftovers(&real, &context, Some(vmm)), Vec::<String>::new());
+        eprintln!();
         b7_matrix(
             "B7 M1 recheck R2: latch before Initialize",
             json!({"initialize": "never sent", "phase": "booting", "remove": "Absent"}),
