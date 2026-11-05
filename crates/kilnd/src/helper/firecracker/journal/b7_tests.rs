@@ -1645,3 +1645,170 @@ fn b7_fence_entry_bound_is_the_measured_worst_case() {
     assert!(per_token > 4096, "the old 4 KiB bound really was too small");
     let _ = MIB;
 }
+
+/// B7 M1 break-it finding 1: L enforces its own RTC-14 latch and RTC-R2-01 fail-stop
+/// marker at its forward-write boundary, whatever H believes. H's Admit carries a
+/// current authority, as an unlatched H would send it; L still refuses it and every other
+/// forward write, writes nothing, and keeps cleanup and reads. Its handover always
+/// carries the latch with K.
+#[test]
+fn rtc14_l_refuses_forward_writes_under_its_own_latch_whatever_h_believes() {
+    use crate::helper::firecracker::compaction::Compactor;
+    use crate::helper::firecracker::peer::PeerAttestor;
+    use crate::helper::firecracker::supervisor::ResourceRecord;
+    use crate::helper::firecracker::workers::{
+        AdmissionAuthority, LatchState, LedgerReply, LedgerRequest, LedgerState,
+        RevocationTable, handle_ledger,
+    };
+    let fixture = temp_ledger(unrestricted());
+    let mut ledger = fresh(&fixture.config);
+    let revocations = RevocationTable::new(4).unwrap();
+    revocations.publish(1, 7);
+    let authority = AdmissionAuthority {
+        slot: 1,
+        generation: 7,
+    };
+    let mut attestor = PeerAttestor::new();
+    let active = admitted(&mut ledger, instance(), 1);
+    let state_of = |ledger: &Ledger, latched: bool, failstop: bool| LedgerState {
+        latched,
+        failstop,
+        compactor: Compactor::start(fixture.config.compaction, Some(ledger), 0),
+        config: fixture.config.clone(),
+    };
+    let forward = |token: Id128, request: &AdmitRequest| {
+        vec![
+            LedgerRequest::Admit {
+                request: Box::new(request.clone()),
+                authority,
+            },
+            LedgerRequest::AdvancePhase {
+                instance: instance(),
+                allocation: active.allocation_id,
+                expected_generation: 1,
+                phase: "preparing".into(),
+            },
+            LedgerRequest::SetPhase {
+                instance: instance(),
+                allocation: active.allocation_id,
+                from: vec!["preparing".into()],
+                to: "spawn_intent".into(),
+            },
+            LedgerRequest::SetPhase {
+                instance: instance(),
+                allocation: active.allocation_id,
+                from: vec!["ready".into()],
+                to: "exec_intent".into(),
+            },
+            LedgerRequest::RecordResource {
+                instance: instance(),
+                allocation: active.allocation_id,
+                record: ResourceRecord::Exec {
+                    token: token.to_string(),
+                    execution_id: "ex-0123456789abcdef".into(),
+                    boot_id: "0f8e2c1a-1b2c-3d4e-5f60-718293a4b5c6".into(),
+                    state: "intent".into(),
+                },
+            },
+        ]
+    };
+    for (latched, failstop, kind) in [(true, false, "rollback"), (false, true, "fail_stop")] {
+        let token = issue(&mut ledger, instance());
+        let request = admit_request(instance(), token, 2);
+        let mut state = state_of(&ledger, latched, failstop);
+        let changes = ledger.connection().total_changes();
+        let generation = ledger.generation().unwrap();
+        for write in forward(token, &request) {
+            let label = format!("{write:?}");
+            let reply = handle_ledger(&mut ledger, &mut state, &mut attestor, &revocations, write)
+                .unwrap();
+            assert!(
+                matches!(&reply, LedgerReply::Latched { kind: k } if k == kind),
+                "{label}: {reply:?}"
+            );
+        }
+        assert_eq!(ledger.connection().total_changes(), changes, "nothing written");
+        assert_eq!(ledger.generation().unwrap(), generation);
+        assert_eq!(
+            count(&ledger, &format!("SELECT COUNT(*) FROM allocations WHERE allocation_id = '{token}'")),
+            0,
+            "no C2 claim"
+        );
+        // Preflight's issuance refuses in its own transaction under the same latch.
+        let issued = handle_ledger(
+            &mut ledger,
+            &mut state,
+            &mut attestor,
+            &revocations,
+            LedgerRequest::IssueAndSnapshot {
+                instance: instance(),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(issued, LedgerReply::Issued(IssueOutcome::Refused { .. })),
+            "{issued:?}"
+        );
+        // Reads and cleanup stay: Inspect, and the exact never-admitted fence.
+        let inspected = handle_ledger(
+            &mut ledger,
+            &mut state,
+            &mut attestor,
+            &revocations,
+            LedgerRequest::Inspect {
+                instance: instance(),
+                allocation: active.allocation_id,
+                plan_digest: active.plan_digest,
+            },
+        )
+        .unwrap();
+        assert!(matches!(inspected, LedgerReply::Lookup(_)), "{inspected:?}");
+        let fenced = handle_ledger(
+            &mut ledger,
+            &mut state,
+            &mut attestor,
+            &revocations,
+            LedgerRequest::Fence(Box::new(never_admitted(instance(), token))),
+        )
+        .unwrap();
+        assert!(
+            matches!(fenced, LedgerReply::Fence(FenceOutcome::Absent { .. })),
+            "{fenced:?}"
+        );
+        // The handover carries the latch with K, every time.
+        let handover =
+            handle_ledger(&mut ledger, &mut state, &mut attestor, &revocations, LedgerRequest::Handover)
+                .unwrap();
+        let LedgerReply::Handover { latch, .. } = handover else {
+            panic!("no handover: {handover:?}");
+        };
+        assert_eq!(
+            latch,
+            LatchState {
+                node_faults: vec![],
+                failstop,
+                latched
+            }
+        );
+        assert_eq!(latch.kind().as_deref(), Some(kind));
+    }
+    // The control: an unlatched L admits the same kind of request.
+    let token = issue(&mut ledger, instance());
+    let request = admit_request(instance(), token, 3);
+    let mut state = state_of(&ledger, false, false);
+    let reply = handle_ledger(
+        &mut ledger,
+        &mut state,
+        &mut attestor,
+        &revocations,
+        LedgerRequest::Admit {
+            request: Box::new(request),
+            authority,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(reply, LedgerReply::Admit(AdmitOutcome::Accepted { replay: false, .. })),
+        "{reply:?}"
+    );
+}

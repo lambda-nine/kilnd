@@ -1292,28 +1292,41 @@ impl Node {
         )
     }
 
-    /// K, from this L over its own private channel (RTC-3).
+    /// K, from this L over its own private channel (RTC-3), only ever together with L's
+    /// latch state (RTC-14). The latch is imported here, before K is returned, so a
+    /// caller that has K has already latched H if L was latched in any way: by a fault
+    /// row, by the fail-stop marker or in memory.
     async fn fetch_key(&self, channel: &Channel) -> Result<token::TokenKey, String> {
         let reply = tokio::time::timeout(
             REPLACEMENT_LEDGER_REPLY,
-            channel.call::<LedgerReply>(Lane::Reserved, &LedgerRequest::TokenKey, u64::MAX),
+            channel.call::<LedgerReply>(Lane::Reserved, &LedgerRequest::Handover, u64::MAX),
         )
         .await;
         match reply {
-            Ok(Ok(LedgerReply::TokenKey(transfer))) => transfer
-                .into_key()
-                .filter(|key| key.node_id() == self.config.node_id)
-                .ok_or_else(|| "the ledger sent no valid token key".into()),
+            Ok(Ok(LedgerReply::Handover { key, latch })) => {
+                let key = key
+                    .into_key()
+                    .filter(|key| key.node_id() == self.config.node_id)
+                    .ok_or_else(|| "the ledger sent no valid token key".to_string())?;
+                if let Some(kind) = latch.kind() {
+                    self.set_latch(&kind, None, None);
+                }
+                #[cfg(test)]
+                workers::faults::hold("H.ledger.latch_imported").await;
+                Ok(key)
+            }
             Ok(Ok(LedgerReply::Unavailable { reason } | LedgerReply::Failed { reason })) => {
                 Err(reason)
             }
-            _ => Err("the ledger did not send its token key".into()),
+            _ => Err("the ledger did not hand over its token key and latch".into()),
         }
     }
 
     /// A replacement L's handover before H publishes it (design 16.6, "H and L
-    /// replacement"): any pending RTC-14 fault is committed first, then K comes over the
-    /// new channel. Only both together, with the channel, are published.
+    /// replacement"): any pending RTC-14 fault is committed first, then K and L's latch
+    /// state come over the new channel and H imports the latch. Only then is the channel
+    /// published. A fail-stop marker written by an L that died before H saw its
+    /// `SyncFailed` therefore latches H here, before any forward effect can reach the new L.
     async fn handover_ledger(&self, channel: &Channel) -> Result<token::TokenKey, String> {
         let pending = self.latch.lock().unwrap().pending;
         if let Some((instance, token, issue_next)) = pending {
@@ -1437,6 +1450,14 @@ impl Node {
             Ok(LedgerReply::SyncFailed { reason }) => {
                 self.set_latch("fail_stop", None, None);
                 Ok(LedgerReply::Failed { reason })
+            }
+            // L refused a forward effect under its own latch, which H had not seen: H
+            // latches now, and the caller sees a refusal that wrote nothing.
+            Ok(LedgerReply::Latched { kind }) => {
+                self.set_latch(&kind, None, None);
+                Ok(LedgerReply::Failed {
+                    reason: format!("forward effects are latched node-wide ({kind})"),
+                })
             }
             other => other,
         };
@@ -3542,6 +3563,17 @@ impl Node {
             return Err(abort(
                 AmbiguousClass::MonitorUnavailable,
                 "supervision was lost during setup".into(),
+            ));
+        }
+        // B7 RTC-14: the node latch, last of all, immediately before S is released. A
+        // latch that linearized anywhere during C3 (supervisor setup, the preparation
+        // slot, the checks above) starts nothing.
+        #[cfg(test)]
+        workers::faults::hold("H.create.before_open_gate").await;
+        if self.is_latched() {
+            return Err(abort(
+                AmbiguousClass::Latched,
+                "forward effects were latched node-wide during setup; nothing starts".into(),
             ));
         }
         let opened = {

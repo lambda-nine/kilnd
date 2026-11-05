@@ -30,6 +30,12 @@ struct Scripted {
     ended: std::sync::atomic::AtomicBool,
     busy: StdMutex<Option<Id128>>,
     control: Arc<Semaphore>,
+    /// B7 RTC-14: the node latch as this host reports it.
+    latched: std::sync::atomic::AtomicBool,
+    /// Writes held open until the test releases them, then durable.
+    holds: StdMutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    /// How many times descriptors were handed to S.
+    handed: std::sync::atomic::AtomicUsize,
 }
 
 impl Scripted {
@@ -45,6 +51,9 @@ impl Scripted {
                 ended: Default::default(),
                 busy: StdMutex::default(),
                 control: Arc::new(Semaphore::new(1)),
+                latched: Default::default(),
+                holds: StdMutex::default(),
+                handed: Default::default(),
             }),
             rx,
         )
@@ -52,6 +61,16 @@ impl Scripted {
 
     fn on(&self, what: &str, write: Write) {
         self.writes.lock().unwrap().insert(what.into(), write);
+    }
+
+    /// Holds `what` open until the returned handle is notified; then it is durable.
+    fn hold(&self, what: &str) -> Arc<tokio::sync::Notify> {
+        let release = Arc::new(tokio::sync::Notify::new());
+        self.holds
+            .lock()
+            .unwrap()
+            .insert(what.into(), release.clone());
+        release
     }
 
     /// R's report for `job`, as S forwards it; a final one closes the waiter.
@@ -100,9 +119,13 @@ impl Host for Scripted {
             .get(&what)
             .copied()
             .unwrap_or(Write::Durable);
+        let held = self.holds.lock().unwrap().get(&what).cloned();
         self.journal.lock().unwrap().push(what);
         let _ = by;
         Box::pin(async move {
+            if let Some(release) = held {
+                release.notified().await;
+            }
             match write {
                 Write::Durable => Journaled::Durable,
                 Write::Refused => Journaled::Refused,
@@ -166,6 +189,7 @@ impl Host for Scripted {
     }
 
     fn hand_stdio(&self, _: u64, fds: &[RawFd]) -> bool {
+        self.handed.fetch_add(1, Ordering::SeqCst);
         fds.len() == 3
     }
 
@@ -175,6 +199,10 @@ impl Host for Scripted {
 
     fn contained(&self) -> Option<bool> {
         self.contained().then_some(true)
+    }
+
+    fn latched(&self) -> bool {
+        self.latched.load(Ordering::SeqCst)
     }
 }
 
@@ -642,4 +670,58 @@ async fn b6_an_unsupervised_session_is_refused_and_not_reusable() {
         .unwrap();
     assert!(reply.reusable && !reply.dispatched, "{reply:?}");
     assert!(commands.try_recv().is_err());
+}
+
+/// B7 RTC-14 (B7 M1 break-it finding 2): Exec rechecks the node latch after its
+/// EXEC_INTENT write and immediately before the descriptors and the broker Exec. Held
+/// at the write, latched, then released: nothing is dispatched and the VM, whose
+/// journal now says EXEC_INTENT, is retired rather than reused.
+#[tokio::test(start_paused = true)]
+async fn b7_rtc14_a_latch_during_exec_intent_dispatches_nothing_and_retires_the_vm() {
+    let (host, mut commands) = Scripted::new();
+    let release = host.hold("phase:exec_intent");
+    let waiter = CancellationToken::new();
+    let task = spawn_exec(&host, soon(60), &waiter);
+    while !host.journal().iter().any(|w| w == "phase:exec_intent") {
+        tokio::task::yield_now().await;
+    }
+    // The latch linearizes while EXEC_INTENT is held; then the write becomes durable.
+    host.latched.store(true, Ordering::SeqCst);
+    release.notify_one();
+    let reply = tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("the execution answered")
+        .unwrap();
+    assert!(!reply.dispatched && !reply.reusable, "{reply:?}");
+    assert!(matches!(reply.finish, WireFinishFc::Failed(_)), "{reply:?}");
+    assert_eq!(reply.cleanup, ExecCleanup::VmStopped, "{reply:?}");
+    assert!(host.contained(), "the VM was retired");
+    assert_eq!(host.handed.load(Ordering::SeqCst), 0, "no descriptor reached S");
+    assert!(commands.try_recv().is_err(), "no broker Exec was sent");
+    let journal = host.journal();
+    assert!(!journal.iter().any(|w| w == "record:busy" || w == "phase:busy"), "{journal:?}");
+}
+
+/// The control for the test above: unlatched, the recheck lets the execution hand its
+/// descriptors over once and run to a reusable result.
+#[tokio::test(start_paused = true)]
+async fn b7_rtc14_an_unlatched_exec_still_dispatches_after_the_recheck() {
+    let (host, mut commands) = Scripted::new();
+    let waiter = CancellationToken::new();
+    let task = spawn_exec(&host, soon(60), &waiter);
+    let job = exec_job(&commands.recv().await.unwrap());
+    assert_eq!(host.handed.load(Ordering::SeqCst), 1);
+    host.report(RelayReport::Accepted {
+        job,
+        token: wire(Id128::from_bytes([9; 16])),
+    });
+    host.report(RelayReport::Executed {
+        job,
+        result: result(Id128::from_bytes([9; 16]), INNER, 0),
+        delivered: true,
+        stdout_delivered: 0,
+        stderr_delivered: 0,
+    });
+    let reply = task.await.unwrap();
+    assert!(reply.dispatched && reply.reusable, "{reply:?}");
 }

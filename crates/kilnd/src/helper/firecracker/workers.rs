@@ -1047,8 +1047,10 @@ pub enum LedgerRequest {
     IssueAndSnapshot {
         instance: Id128,
     },
-    /// B7 RTC-3: K, over this private channel only, before H checks any tag.
-    TokenKey,
+    /// B7 RTC-3 and RTC-14: K, over this private channel only, before H checks any tag,
+    /// always together with L's latch state. H imports the latch before it publishes the
+    /// channel, so no channel is ever served whose handover omitted it.
+    Handover,
     /// B7 RTC-14: H has latched; commit the pending fault (idempotent).
     CommitFault {
         instance: Id128,
@@ -1172,7 +1174,16 @@ pub enum LedgerReply {
         generation: u64,
     },
     Issued(IssueOutcome),
-    TokenKey(KeyTransfer),
+    /// K and L's latch state, inseparable: the only way H receives K.
+    Handover {
+        key: KeyTransfer,
+        latch: LatchState,
+    },
+    /// B7 RTC-14: L refused a forward effect under its own latch or fail-stop marker,
+    /// whatever H believed. Nothing was written. H latches on this answer too.
+    Latched {
+        kind: String,
+    },
     Compacted(Box<CompactReply>),
     /// A ledger commit failed: L wrote the fail-stop marker and latched (RTC-R2-01).
     SyncFailed {
@@ -1207,11 +1218,64 @@ pub enum LedgerReply {
     },
 }
 
+/// L's RTC-14 latch as handed to H at every handover: the durable fault rows, the
+/// fail-stop marker and L's in-memory latch. Any one of them latches H.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LatchState {
+    /// The kinds of the `node_faults` rows, oldest first.
+    pub node_faults: Vec<String>,
+    /// The fail-stop marker beside the ledger (RTC-R2-01).
+    pub failstop: bool,
+    /// L's in-memory latch, set before any fault commit is attempted.
+    pub latched: bool,
+}
+
+impl LatchState {
+    /// The latch kind H records, or `None` when nothing is latched.
+    pub fn kind(&self) -> Option<String> {
+        if let Some(kind) = self.node_faults.first() {
+            return Some(kind.clone());
+        }
+        if self.failstop {
+            return Some("fail_stop".into());
+        }
+        self.latched.then(|| "rollback".into())
+    }
+}
+
+/// B7 RTC-14 at L: the ledger writes that start or continue a forward effect. Under L's
+/// own latch each is refused before anything is written, whoever sends it. Preflight's
+/// issuance and a first attach are refused inside their own transactions
+/// (`issue_and_snapshot`, `attach_instance`), which read the same latch and the fault
+/// rows. Validate journals nothing; H refuses it under its latch. Cleanup and evidence
+/// (Inspect, List, Stop, Remove, Gc, FenceAbsent, settlement, observed records, `booting`
+/// and `ready` after the fact) are never refused here.
+pub(super) fn forward_effect(request: &LedgerRequest) -> bool {
+    match request {
+        // C2, replays included: an exact replay reports Accepted and lets H go on.
+        LedgerRequest::Admit { .. } => true,
+        // C3's PREPARING, the only phase advance there is.
+        LedgerRequest::AdvancePhase { .. } => true,
+        // S's spawn intent and Exec's EXEC_INTENT, each before its effect.
+        LedgerRequest::SetPhase { to, .. } => FORWARD_PHASES.contains(&to.as_str()),
+        LedgerRequest::RecordResource {
+            record: super::supervisor::ResourceRecord::Exec { state, .. },
+            ..
+        } => state == "intent",
+        _ => false,
+    }
+}
+
+/// Phases whose record authorizes the effect that follows it.
+pub(super) const FORWARD_PHASES: [&str; 2] = ["spawn_intent", "exec_intent"];
+
 /// L's in-memory state beside the ledger: the RTC-14 latch and the compactor's
-/// checkpoints. Neither survives L; the durable fault rows and the fail-stop marker do.
+/// checkpoints. Neither survives L; the durable fault rows and the fail-stop marker do,
+/// and a new L starts latched from either.
 pub(super) struct LedgerState {
-    /// Set before any fault commit is attempted, and by any failed commit. Never cleared
-    /// while this L lives.
+    /// Set before any fault commit is attempted, by any failed commit, and at open by any
+    /// durable fault row. Never cleared while this L lives.
     pub(super) latched: bool,
     pub(super) failstop: bool,
     pub(super) compactor: Compactor,
@@ -1219,13 +1283,41 @@ pub(super) struct LedgerState {
     pub(super) config: LedgerConfig,
 }
 
-fn handle_ledger(
+impl LedgerState {
+    /// L's latch as H must import it at handover.
+    pub(super) fn latch_state(&self, ledger: &Ledger) -> Result<LatchState, LedgerError> {
+        Ok(LatchState {
+            node_faults: ledger
+                .faults()?
+                .into_iter()
+                .map(|(_, kind, _, _)| kind)
+                .collect(),
+            failstop: self.failstop,
+            latched: self.latched,
+        })
+    }
+
+    /// The refusal of a forward effect under L's own latch (RTC-14, RTC-R2-01).
+    fn forward_refusal(&self, request: &LedgerRequest) -> Option<LedgerReply> {
+        if !(self.latched || self.failstop) || !forward_effect(request) {
+            return None;
+        }
+        let kind = if self.failstop { "fail_stop" } else { "rollback" };
+        Some(LedgerReply::Latched { kind: kind.into() })
+    }
+}
+
+pub(super) fn handle_ledger(
     ledger: &mut Ledger,
     state: &mut LedgerState,
     attestor: &mut PeerAttestor,
     revocations: &RevocationTable,
     request: LedgerRequest,
 ) -> Result<LedgerReply, LedgerError> {
+    if let Some(refusal) = state.forward_refusal(&request) {
+        fault_point("L.latched_refusal");
+        return Ok(refusal);
+    }
     Ok(match request {
         LedgerRequest::Attach {
             instance,
@@ -1271,7 +1363,10 @@ fn handle_ledger(
                 },
             }
         }
-        LedgerRequest::TokenKey => LedgerReply::TokenKey(KeyTransfer::of(ledger.token_key())),
+        LedgerRequest::Handover => LedgerReply::Handover {
+            latch: state.latch_state(ledger)?,
+            key: KeyTransfer::of(ledger.token_key()),
+        },
         LedgerRequest::CommitFault {
             instance,
             token,
@@ -1581,10 +1676,14 @@ pub fn ledger_main(
     let directory_config = config.clone();
     let policy = config.compaction;
     let mut ledger = Ledger::open(config);
-    // RTC-R2-01: a marker left by any earlier failed commit latches this L at open.
+    // RTC-R2-01: a marker left by any earlier failed commit latches this L at open, and
+    // so does any durable fault row (RTC-14). An unreadable answer latches too.
     let failstop = compaction::failstop_latched(&directory_config).unwrap_or(true);
+    let faulted = ledger
+        .as_ref()
+        .is_ok_and(|ledger| ledger.durable_faults().map_or(true, |faults| faults != 0));
     let mut state = LedgerState {
-        latched: false,
+        latched: faulted,
         failstop,
         compactor: Compactor::start(policy, ledger.as_ref().ok(), compaction::boot_ms()),
         config: directory_config.clone(),

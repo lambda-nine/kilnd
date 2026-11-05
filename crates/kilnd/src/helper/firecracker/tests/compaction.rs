@@ -2432,3 +2432,161 @@ fn b7_scenario_names_match_the_scripts() {
         }
     }
 }
+
+/// B7 M1 break-it finding 1 (`reviews/poc-b7m1/run-failstop-replacement.sh`, now a
+/// regression): an uncertain commit makes L write the durable fail-stop marker, and L
+/// is killed at `L.reply` before H receives `SyncFailed`. H sees only a closed channel.
+/// The replacement L hands its latch over with K, and H imports it before it publishes
+/// the channel, so the previously prepared token's Create, and any Preflight, are
+/// refused; the marker was never cleared.
+#[tokio::test]
+async fn b7_crash_a_lost_syncfailed_then_a_replaced_l_keeps_forward_effects_latched() {
+    let fixture = Fixture::new(compacting(POLICY)).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let (prepared, plan) = issued(&runtime, instance).await;
+    let old_l = fixture.census().await["ledger"].as_i64().unwrap();
+    // Any uncertain ledger commit takes the same path; the compactor's is the one that
+    // needs no caller. Hold at the common reply boundary, after L latched and wrote the
+    // marker, and kill L there.
+    fixture.fault("H.ledger.latch_imported.hold");
+    fixture.fault("L.compact.sync_fail");
+    fixture.fault("L.reply.stall");
+    fixture.wait_reached("L.reply").await;
+    let marker = fixture
+        .root
+        .join("ledger")
+        .join(super::super::compaction::FAILSTOP_MARKER);
+    assert!(std::fs::read(&marker).unwrap().starts_with(b"latched"));
+    assert_eq!(fixture.census().await["latched"], json!(false), "H never saw SyncFailed");
+    signal(old_l, libc::SIGKILL);
+    fixture.clear("L.reply.stall");
+    fixture.clear("L.compact.sync_fail");
+    // The replacement's handover: H has imported the latch and the channel is not yet
+    // published, so nothing could have reached the new L unlatched.
+    fixture.wait_reached("H.ledger.latch_imported").await;
+    let census = fixture.census().await;
+    assert_eq!(census["latched"], json!(true), "the latch came over with K: {census}");
+    fixture.clear("H.ledger.latch_imported.hold");
+    let mut replaced = false;
+    for _ in 0..2_000 {
+        let census = fixture.census().await;
+        if census["ledger"].as_i64().is_some_and(|pid| pid != old_l) {
+            replaced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(replaced, "the replacement L was never published");
+    // The prepared token's Create starts nothing: no C2, no supervisor, no effect.
+    let calls = census_u64(&fixture.census().await, "ledger_calls");
+    let reply = raw_call(
+        &fixture,
+        instance,
+        Some(epoch_of(&runtime).await),
+        create_operation(&prepared, &plan),
+        wire_deadline(25),
+        25_000,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !matches!(reply, FirecrackerResponse::Create(CreateReply::Accepted { .. })),
+        "a Create was admitted through the fail-stop marker: {reply:?}"
+    );
+    assert_eq!(
+        census_u64(&fixture.census().await, "ledger_calls"),
+        calls,
+        "refused before any L call"
+    );
+    assert_eq!(
+        fixture.count(&format!(
+            "SELECT COUNT(*) FROM allocations WHERE allocation_id = '{}'",
+            prepared.allocation_id
+        )),
+        0,
+        "no C2 claim"
+    );
+    assert!(!fixture.fake_dir(&prepared).exists(), "no host effect started");
+    assert!(
+        runtime
+            .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
+            .await
+            .is_err(),
+        "Preflight is refused too"
+    );
+    // Cleanup still works under the latch, and the marker stays until root's clear.
+    fenced(
+        runtime
+            .fence_absent(&prepared, &plan.plan_digest(), deadline(20), &no_cancel())
+            .await
+            .unwrap(),
+    );
+    assert!(std::fs::read(&marker).unwrap().starts_with(b"latched"));
+    b7_matrix(
+        "B7 M1 finding 1: lost SyncFailed, L replaced",
+        json!({"h_latched_before_publication": true, "prepared_create": "refused", "fence_under_latch": "Absent"}),
+    );
+}
+
+/// B7 M1 break-it finding 2: Create passed its first latch check, committed C2 and is
+/// held after supervisor setup, immediately before `OpenGate`. A rollback latches H
+/// meanwhile. Released, the Create rechecks the latch, never opens S's gate and starts
+/// no host effect; its C2 claim is held for an exact fence, which still works.
+#[tokio::test]
+async fn b7_rtc14_a_latch_during_create_setup_is_rechecked_before_open_gate() {
+    let fixture = Fixture::new(compacting(POLICY)).await;
+    let (a, b) = (Id128::random(), Id128::random());
+    let (runtime_a, runtime_b) = (
+        fixture.runtime(a, Id128::random()),
+        fixture.runtime(b, Id128::random()),
+    );
+    let (queued, queued_plan) = issued(&runtime_b, b).await;
+    let (_recorded, _, _) = rolled_back(&fixture, &runtime_a, &runtime_b, (a, b)).await;
+    let epoch_b = epoch_of(&runtime_b).await;
+    fixture.fault("H.create.before_open_gate.hold");
+    let create = {
+        let request = create_operation(&queued, &queued_plan);
+        let socket = fixture.root.join("helper.sock");
+        tokio::spawn(async move {
+            let request = Request {
+                version: VERSION,
+                timeout_ms: 25_000,
+                deadline_ns: wire_deadline(25),
+                operation: Operation::Firecracker(FirecrackerRequest {
+                    group_version: FIRECRACKER_GROUP_VERSION,
+                    instance_id: b,
+                    connection_epoch: Some(epoch_b),
+                    operation: request,
+                }),
+            };
+            let mut stream = UnixStream::connect(socket).await.unwrap();
+            fds::send(&stream, &[]).await.unwrap();
+            write_frame(&mut stream, &request).await.unwrap();
+            assert!(fds::receive(&stream).await.unwrap().is_empty());
+            read_frame::<Response>(&mut stream).await.unwrap()
+        })
+    };
+    fixture.wait_reached("H.create.before_open_gate").await;
+    assert_eq!(fixture.census().await["latched"], json!(false));
+    // A's attachment detects the rollback: H latches while the Create is held.
+    assert!(runtime_a.prove_attachment(deadline(20)).await.is_err());
+    assert_eq!(fixture.census().await["latched"], json!(true));
+    fixture.clear("H.create.before_open_gate.hold");
+    let Response::Firecracker(FirecrackerResponse::Create(reply)) = create.await.unwrap() else {
+        panic!("not a create reply");
+    };
+    assert_eq!(class_of(&reply), AmbiguousClass::Latched, "{reply:?}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!fixture.fake_dir(&queued).exists(), "no host effect after the latch");
+    fenced(
+        runtime_b
+            .fence_absent(&queued, &queued_plan.plan_digest(), deadline(20), &no_cancel())
+            .await
+            .unwrap(),
+    );
+    b7_matrix(
+        "B7 M1 finding 2: latch rechecked before OpenGate",
+        json!({"queued_create": "Latched, gate never opened", "fence_under_latch": "Absent"}),
+    );
+}

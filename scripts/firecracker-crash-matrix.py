@@ -35,7 +35,8 @@ adapter with fake host effects and a FULL-sync ledger: the four issuance boundar
 refusal after issuance, L replaced while H lives, H process death, the watermark advance,
 the G_W refresh, every delete-batch boundary, non-compactable rows, Create and Remove
 racing compaction, a restored stale daemon database, a restart at the checkpoint bound,
-the rollback fault commit at every boundary, and the offline clear. They run on macOS and
+the rollback fault commit at every boundary, the offline clear, and a lost SyncFailed
+followed by an L replacement (B7 M1 break-it finding 1). They run on macOS and
 in CI as well.
 """
 import os
@@ -77,6 +78,7 @@ B7_SCENARIOS = [
     'b7_crash_a_helper_restart_resets_checkpoints_to_one_restart_point',
     'b7_crash_rollback_fault_commit_at_every_boundary_keeps_forward_effects_refused',
     'b7_crash_the_offline_clear_killed_before_or_after_its_commit',
+    'b7_crash_a_lost_syncfailed_then_a_replaced_l_keeps_forward_effects_latched',
 ]
 
 if __name__ == '__main__':

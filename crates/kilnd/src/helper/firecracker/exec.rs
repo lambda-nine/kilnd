@@ -185,6 +185,8 @@ pub(super) trait Host: Send + Sync + 'static {
     fn contain(&self, reason: &str);
     /// K's verdict once dispatched: `Some(true)` is proof the subtree is gone.
     fn contained(&self) -> Option<bool>;
+    /// B7 RTC-14: forward effects are latched node-wide.
+    fn latched(&self) -> bool;
 }
 
 /// One allocation of this node, as [`Host`].
@@ -333,6 +335,10 @@ impl Host for NodeHost {
             .unwrap()
             .get(&self.key)
             .and_then(|entry| entry.contained)
+    }
+
+    fn latched(&self) -> bool {
+        self.node.is_latched()
     }
 }
 
@@ -731,6 +737,21 @@ impl<H: Host> Execution<H> {
                     )
                     .await;
             }
+        }
+        // B7 RTC-14: the node latch, rechecked after EXEC_INTENT and immediately before
+        // the descriptors and the broker Exec. A latch that linearized while EXEC_INTENT
+        // was being written dispatches nothing; the journal now says EXEC_INTENT, so the
+        // VM is retired under the uncertainty rule rather than put back to READY.
+        #[cfg(test)]
+        workers::faults::hold("H.exec.before_dispatch").await;
+        if self.host.latched() {
+            return self
+                .retire_undispatched(
+                    Kind::Unavailable,
+                    "forward effects were latched node-wide after EXEC_INTENT; nothing was \
+                     dispatched and the VM was retired",
+                )
+                .await;
         }
         let job = next_job();
         let raw: Vec<RawFd> = stdio.iter().map(AsRawFd::as_raw_fd).collect();
