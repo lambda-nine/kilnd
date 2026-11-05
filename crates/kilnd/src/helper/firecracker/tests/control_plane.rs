@@ -1515,8 +1515,11 @@ async fn b3r_linux_root_the_listener_tells_real_accounts_apart() {
     );
 }
 
-/// B3R-01 with a real second account: the attacker can fence the copied ID only in its
-/// own namespace, and the victim's token is still its own afterward.
+/// B3R-01 with a real second account: the attacker's copy of the victim's fence touches
+/// nothing of the victim's, and the victim's token is still its own afterward. Since B7
+/// milestone 1 the token carries the issuing instance's tag (RTC-3), so H refuses the
+/// copy at its tag check, before any gate or ledger row (B7 integration: this root test
+/// still expected the pre-B7 fence in the attacker's own namespace).
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "needs root on Linux: run in the VM"]
@@ -1593,20 +1596,21 @@ async fn b3r_01_linux_root_a_prefence_from_a_real_second_account_stays_its_own()
     assert!(aimed.attach.is_ok(), "{:?}", aimed.attach);
     assert!(
         matches!(
-            aimed.fence,
-            Some(FirecrackerResponse::Fence(FenceReply::Absent { .. }))
+            &aimed.fence,
+            Some(FirecrackerResponse::Error(GroupError { kind: GroupErrorKind::Incompatible, message }))
+                if message.contains("not issued to this instance")
         ),
         "{:?}",
         aimed.fence
     );
-    // Its row is its own, and the victim's claim did not move.
+    // Nothing reached the ledger for either account, and the victim's claim did not move.
     let count = |sql: String| fixture.count(&sql);
     assert_eq!(
         count(format!(
             "SELECT COUNT(*) FROM retired_tokens WHERE allocation_id = '{allocation_id}'
              AND instance_id = '{attacker}'"
         )),
-        1
+        0
     );
     assert_eq!(
         count(format!(
