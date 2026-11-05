@@ -423,7 +423,16 @@ impl Deployment {
             }
             assert!(
                 std::time::Instant::now() < end,
-                "allocation stayed {phase}, never {phases:?}\n{}",
+                "allocation stayed {phase}, never {phases:?}; stop reasons {:?}\n{}",
+                self.real.fixture.read(|view| {
+                    let mut statement = view.prepare(
+                        "SELECT reason FROM stop_events WHERE allocation_id = ?1 \
+                         ORDER BY generation",
+                    )?;
+                    let rows = statement
+                        .query_map([allocation.to_string()], |r| r.get::<_, String>(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                }),
                 self.real.fixture.log()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
