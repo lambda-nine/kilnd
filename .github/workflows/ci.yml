@@ -124,10 +124,10 @@ jobs:
   # name@version from two registries; the authoritative test's fixed root; recheck 3's
   # compiler cfg inputs and #[path] module outside the library directory). It resolves
   # fs-err and parking_lot and vendors the locked crates from the registry in disposable
-  # copies.
+  # copies. Recheck 3's cases took it past 45 minutes on a slow runner.
   gate-regressions:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       CARGO_TERM_COLOR: always
     steps:
