@@ -1315,8 +1315,29 @@ mod linux {
         let v = adopt(link, plan, &identity)?;
         let v_pidfd = pin(v).map_err(|e| Abort::Refused(format!("VMM pidfd: {e}")))?;
         link.after("adopt");
-        let actual = as_fs_ids(plan.uid, plan.gid, || {
-            executable::observe_process_image(v.pid, Role::Firecracker, vmm.installation_generation)
+        // J exits once it has cloned V and written the PID file, which can be before V
+        // has dropped to the VMM's IDs and exec'd: until then the ptrace-read check on
+        // /proc/<V>/exe refuses the VMM's filesystem IDs (V is root, or undumpable
+        // between setuid and exec). Only that refusal is waited out, within the bound;
+        // the image observed afterwards is still checked against the journal below.
+        let actual = link.wait_for(Duration::from_secs(5), || {
+            if pidfd_exited(&v_pidfd) {
+                return Err(io::Error::other("the VMM exited before its exec"));
+            }
+            match as_fs_ids(plan.uid, plan.gid, || {
+                executable::observe_process_image(
+                    v.pid,
+                    Role::Firecracker,
+                    vmm.installation_generation,
+                )
+            }) {
+                Ok(actual) => Ok(Some(actual)),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(None),
+                Err(error) => Err(io::Error::new(
+                    error.kind(),
+                    format!("observing the VMM image: {error}"),
+                )),
+            }
         })?;
         let status_text = proc_status(v.pid)?;
         if pidfd_exited(&v_pidfd) {
