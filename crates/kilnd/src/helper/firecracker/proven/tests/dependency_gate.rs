@@ -1,11 +1,13 @@
 //! Design section 7.1's dependency gate, rebuilt for the B7 milestone 2 break-it
 //! (HIGH-1, MEDIUM-1 and LOW-1), its recheck (HIGH-1's method and transitive wrappers)
-//! and its recheck 2 (the build's own feature graph, type-alias UFCS, duplicate package
-//! identities and the authoritative test's root).
+//! its recheck 2 (the build's own feature graph, type-alias UFCS, duplicate package
+//! identities and the authoritative test's root) and its recheck 3 (compiler cfg inputs,
+//! `#[path]` modules outside the library directory, every build instruction).
 //!
 //! The gate fails closed on *review*, not on detection. For builds made through the
 //! supported entry point, `scripts/build.sh` with one of dependency-gate.json's
-//! `profiles`, it guarantees:
+//! `profiles`, in its closed compiler environment (no ambient rustflags, wrappers or
+//! clippy arguments), it guarantees:
 //!
 //! - **No unreviewed package enters the build.** Each profile names only workspace
 //!   features, and the gate resolves each with exactly the flags `build.sh` passes
@@ -20,14 +22,15 @@
 //!   feature set fails until a person reviews it.
 //! - **Common destructive sinks in packages declared non-destructive are flagged for
 //!   review.** For every package declared `none`, `network` or `no_destructive_api` (in the
-//!   runtime graph, or a direct dependency), the source of its whole runtime dependency
-//!   subtree is scanned for every occurrence of a curated sink identifier (`set_len`,
+//!   runtime graph, or a direct dependency), the checked-in source of its whole runtime
+//!   dependency subtree (each package's whole directory, following literal `#[path]` and
+//!   `include!` edges) is scanned for every occurrence of a curated sink identifier (`set_len`,
 //!   `remove_file`, `kill` …) whatever surrounds it, for std, Tokio and libc paths
 //!   clippy.toml disallows, and for trait impls on (and `type` aliases of) std's and
 //!   Tokio's file and process types. A hit refuses the declaration unless `sink_exceptions`
 //!   records a reviewed exception scoped to the package, version and feature set it is in.
 //!
-//! A raw `cargo build` with other feature flags is outside the guarantee.
+//! A raw `cargo build` with other feature or compiler flags is outside the guarantee.
 //!
 //! The gate is not a proof. Deciding whether an API is destructive is the reviewer's job;
 //! the scan is lexical and catches the common shapes of an honest mistake, not a dependency
@@ -2643,38 +2646,42 @@ fn package_source_files(
         for edge in source_edges(&text) {
             let (written, candidates, fallback): (String, Vec<Option<PathBuf>>, Vec<PathBuf>) =
                 match &edge {
-                SourceEdge::Generated => continue,
-                SourceEdge::Unresolved(what) => {
-                    unresolved.push((format!("{UNRESOLVED} `{INCLUDE}({what})`"), file.clone()));
-                    continue;
-                }
-                SourceEdge::Include(path) => (
-                    format!("{INCLUDE}(\"{path}\")"),
-                    vec![within(&dir, path)],
-                    source_dirs.iter().filter_map(|d| within(d, path)).collect(),
-                ),
-                SourceEdge::Module { path, inline } => {
-                    // Outside an inline module the path is relative to the file's
-                    // directory. Inside one it is relative to that directory plus the
-                    // inline modules' components, after the file's own stem for a
-                    // non-mod-rs file; both readings are tried.
-                    let mut bases = vec![Some(dir.clone())];
-                    if !inline.is_empty() && !mod_rs {
-                        bases.push(file.file_stem().map(|s| dir.join(s)));
+                    SourceEdge::Generated => continue,
+                    SourceEdge::Unresolved(what) => {
+                        unresolved
+                            .push((format!("{UNRESOLVED} `{INCLUDE}({what})`"), file.clone()));
+                        continue;
                     }
-                    let resolve = |base: Option<PathBuf>| {
-                        inline
-                            .iter()
-                            .try_fold(base?, |at, component| within(&at, component))
-                            .and_then(|at| within(&at, path))
-                    };
-                    (
-                        format!("#[path = \"{path}\"]"),
-                        bases.into_iter().map(resolve).collect(),
-                        source_dirs.iter().filter_map(|d| resolve(Some(d.clone()))).collect(),
-                    )
-                }
-            };
+                    SourceEdge::Include(path) => (
+                        format!("{INCLUDE}(\"{path}\")"),
+                        vec![within(&dir, path)],
+                        source_dirs.iter().filter_map(|d| within(d, path)).collect(),
+                    ),
+                    SourceEdge::Module { path, inline } => {
+                        // Outside an inline module the path is relative to the file's
+                        // directory. Inside one it is relative to that directory plus the
+                        // inline modules' components, after the file's own stem for a
+                        // non-mod-rs file; both readings are tried.
+                        let mut bases = vec![Some(dir.clone())];
+                        if !inline.is_empty() && !mod_rs {
+                            bases.push(file.file_stem().map(|s| dir.join(s)));
+                        }
+                        let resolve = |base: Option<PathBuf>| {
+                            inline
+                                .iter()
+                                .try_fold(base?, |at, component| within(&at, component))
+                                .and_then(|at| within(&at, path))
+                        };
+                        (
+                            format!("#[path = \"{path}\"]"),
+                            bases.into_iter().map(resolve).collect(),
+                            source_dirs
+                                .iter()
+                                .filter_map(|d| resolve(Some(d.clone())))
+                                .collect(),
+                        )
+                    }
+                };
             let found = candidates.iter().flatten().find(|c| paths.contains(*c));
             let escapes = found.is_none() && candidates.iter().any(Option::is_none);
             match found.or_else(|| fallback.iter().find(|c| !escapes && paths.contains(*c))) {
@@ -2755,16 +2762,29 @@ enum SourceEdge {
 /// `cfg_attr(condition, …, path = "…")`.
 fn path_attribute<'a>(content: &[Token<'a>]) -> Option<&'a str> {
     match content {
-        [Token::Ident("path"), Token::Punct('='), Token::Literal(path)] => Some(path),
-        [Token::Ident("cfg_attr"), Token::Punct('('), inner @ .., Token::Punct(')')] => {
+        [
+            Token::Ident("path"),
+            Token::Punct('='),
+            Token::Literal(path),
+        ] => Some(path),
+        [
+            Token::Ident("cfg_attr"),
+            Token::Punct('('),
+            inner @ ..,
+            Token::Punct(')'),
+        ] => {
             let mut depth = 0;
             for (at, token) in inner.iter().enumerate() {
                 match token {
                     Token::Punct('(' | '[' | '{') => depth += 1,
                     Token::Punct(')' | ']' | '}') => depth -= 1,
                     Token::Punct(',') if depth == 0 => {
-                        if let [Token::Ident("path"), Token::Punct('='), Token::Literal(path), ..] =
-                            &inner[at + 1..]
+                        if let [
+                            Token::Ident("path"),
+                            Token::Punct('='),
+                            Token::Literal(path),
+                            ..,
+                        ] = &inner[at + 1..]
                         {
                             return Some(path);
                         }
@@ -2831,9 +2851,9 @@ fn source_edges(text: &str) -> Vec<SourceEdge> {
                     [Token::Literal(path)] | [Token::Literal(path), Token::Punct(',')] => {
                         SourceEdge::Include(path.to_string())
                     }
-                    _ if inner
-                        .iter()
-                        .any(|t| matches!(t, Token::Literal(s) | Token::Ident(s) if *s == GENERATED)) =>
+                    _ if inner.iter().any(
+                        |t| matches!(t, Token::Literal(s) | Token::Ident(s) if *s == GENERATED),
+                    ) =>
                     {
                         SourceEdge::Generated
                     }
@@ -3101,13 +3121,16 @@ fn supported_builds_use_the_build_entry_point() {
     ];
     // The Firecracker jailer build (a patched upstream workspace, not kilnd's): a raw
     // cargo build naming `-p jailer` on the same line, in these files only.
-    const JAILER: [&str; 2] = ["scripts/build-phase1b-tools.sh", "deploy/firecracker/README.md"];
+    const JAILER: [&str; 2] = [
+        "scripts/build-phase1b-tools.sh",
+        "deploy/firecracker/README.md",
+    ];
     // Records, not instructions: past runs' evidence and the guarantee's stated limits
     // ("a raw `cargo build` ... is outside the guarantee"). Each file's exact number of
     // raw mentions, so a new one anywhere fails until it is looked at.
     const RECORDS: [(&str, usize); 2] = [
         ("CHANGELOG.md", 2),
-        ("docs/design/phase1b-firecracker.md", 25),
+        ("docs/design/phase1b-firecracker.md", 30),
     ];
     let root = workspace_root();
     let mut files = Vec::new();
@@ -3122,7 +3145,11 @@ fn supported_builds_use_the_build_entry_point() {
                 }
                 continue;
             }
-            let relative = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             let workflow = relative.starts_with(".github/workflows/")
                 && (name.ends_with(".yml") || name.ends_with(".yaml"));
             if workflow || [".md", ".sh", ".py"].iter().any(|e| name.ends_with(e)) {
@@ -3131,8 +3158,15 @@ fn supported_builds_use_the_build_entry_point() {
         }
     }
     files.sort();
-    for needed in [".github/workflows/ci.yml", "CLAUDE.md", "scripts/install.sh"] {
-        assert!(files.iter().any(|f| f == needed), "{needed} was not inspected");
+    for needed in [
+        ".github/workflows/ci.yml",
+        "CLAUDE.md",
+        "scripts/install.sh",
+    ] {
+        assert!(
+            files.iter().any(|f| f == needed),
+            "{needed} was not inspected"
+        );
     }
     let mut raw = Vec::new();
     let mut records: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -3165,7 +3199,9 @@ fn supported_builds_use_the_build_entry_point() {
                     continue;
                 }
                 let found = format!("{file}:{}: {}", number + 1, line.trim());
-                if JAILER.contains(&file.as_str()) && words.windows(2).any(|w| w == ["-p", "jailer"]) {
+                if JAILER.contains(&file.as_str())
+                    && words.windows(2).any(|w| w == ["-p", "jailer"])
+                {
                     continue;
                 }
                 match RECORDS.iter().find(|(record, _)| record == file) {
@@ -4870,7 +4906,8 @@ fn package_tree(files: &[(&str, &str)]) -> PackageSource<PathBuf> {
 }
 
 fn unbar(text: &str) -> String {
-    text.replace("include|!", INCLUDE).replace("OUT|_DIR", GENERATED)
+    text.replace("include|!", INCLUDE)
+        .replace("OUT|_DIR", GENERATED)
 }
 
 fn names(files: &[PathBuf]) -> Vec<String> {
@@ -4881,7 +4918,10 @@ fn names(files: &[PathBuf]) -> Vec<String> {
 fn b7m2_recheck3_the_whole_package_is_scanned_and_its_edges_followed() {
     // Daybreak's layout: the library root delegates to a package-root module.
     let found = package_tree(&[
-        ("src/lib.rs", "#[path = \"../hidden.rs\"]\nmod hidden;\npub use hidden::Reset;\n"),
+        (
+            "src/lib.rs",
+            "#[path = \"../hidden.rs\"]\nmod hidden;\npub use hidden::Reset;\n",
+        ),
         ("hidden.rs", "pub trait Reset {}\n"),
         ("build.rs", "fn main() {}\n"),
         ("src/bin/tool.rs", "fn main() {}\n"),
@@ -4894,7 +4934,10 @@ fn b7m2_recheck3_the_whole_package_is_scanned_and_its_edges_followed() {
         names(&found.files),
         ["build.rs", "hidden.rs", "src/bin/tool.rs", "src/lib.rs"]
     );
-    assert!(found.errors.is_empty() && found.unresolved.is_empty(), "{found:?}");
+    assert!(
+        found.errors.is_empty() && found.unresolved.is_empty(),
+        "{found:?}"
+    );
 
     // Edges reach into tests/, benches/ and examples/, through cfg_attr, an inline
     // module, a visibility and an include!, and on from the files they reach.
@@ -4928,18 +4971,27 @@ fn b7m2_recheck3_the_whole_package_is_scanned_and_its_edges_followed() {
             "tests/nested.in"
         ]
     );
-    assert!(found.errors.is_empty() && found.unresolved.is_empty(), "{found:?}");
+    assert!(
+        found.errors.is_empty() && found.unresolved.is_empty(),
+        "{found:?}"
+    );
 
     // A macro body's path resolves from where the macro is invoked (serde's crate_root!).
     let found = package_tree(&[
-        ("src/lib.rs", "#[path = \"core/root.rs\"]\nmod root;\nroot!();\n"),
+        (
+            "src/lib.rs",
+            "#[path = \"core/root.rs\"]\nmod root;\nroot!();\n",
+        ),
         (
             "src/core/root.rs",
             "macro_rules! root { () => { #[path = \"core/de.rs\"] mod de; } }\n",
         ),
         ("src/core/de.rs", ""),
     ]);
-    assert!(found.errors.is_empty() && found.unresolved.is_empty(), "{found:?}");
+    assert!(
+        found.errors.is_empty() && found.unresolved.is_empty(),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -4957,7 +5009,9 @@ fn b7m2_recheck3_an_edge_outside_the_package_or_to_nothing_is_reported() {
         [
             "src/lib.rs: `#[path = \"../../other-1.0.0/src/lib.rs\"]` resolves outside the package root",
             "src/lib.rs: `#[path = \"/etc/absolute.rs\"]` resolves outside the package root",
-            &unbar("src/lib.rs: `include|!(\"../../../outside.rs\")` resolves outside the package root"),
+            &unbar(
+                "src/lib.rs: `include|!(\"../../../outside.rs\")` resolves outside the package root"
+            ),
         ]
     );
     let unresolved: Vec<&str> = found.unresolved.iter().map(|(s, _)| s.as_str()).collect();
@@ -4985,10 +5039,9 @@ fn wrapper_with_edges(errors: &[&str], unresolved: &[&str]) -> Inputs {
     source(&mut inputs, "path-wrapper", "pub fn f() {}\n");
     let key = "path-wrapper@1.0.0".to_string();
     if !errors.is_empty() {
-        inputs.source_errors.insert(
-            key.clone(),
-            errors.iter().map(|e| e.to_string()).collect(),
-        );
+        inputs
+            .source_errors
+            .insert(key.clone(), errors.iter().map(|e| e.to_string()).collect());
     }
     if !unresolved.is_empty() {
         inputs.unresolved_edges.insert(
@@ -5101,7 +5154,11 @@ fn b7m2_recheck3_workspace_build_scripts_emit_no_feature_cfg() {
             continue;
         };
         let name = krate.file_name().to_string_lossy().into_owned();
-        wrong.extend(feature_cfgs(&text).into_iter().map(|e| format!("{name}/build.rs: {e}")));
+        wrong.extend(
+            feature_cfgs(&text)
+                .into_iter()
+                .map(|e| format!("{name}/build.rs: {e}")),
+        );
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     for bad in [

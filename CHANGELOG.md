@@ -6,6 +6,28 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Integrate B7 milestones 1 and 2 (`phase1b/b7-integrated`) and close the milestone 2
+  recheck 3 findings (design section 15, *Recheck 3* and *B7 milestones 1 and 2
+  integrated*). `scripts/build.sh` runs cargo in a closed compiler environment: it
+  refuses a nonempty `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`,
+  `RUSTDOCFLAGS`, `CARGO_TARGET_*_RUSTFLAGS`, `CARGO_PROFILE_*_RUSTFLAGS`, `RUSTC`,
+  `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC*`, `RUSTC_BOOTSTRAP`,
+  `CARGO_UNSTABLE_*` and `CLIPPY_ARGS`, sets empty encoded flags itself (so no Cargo config
+  file supplies any) and resets `build.rustflags` and the target tables; Clippy's
+  arguments are its fixed `-D warnings -D clippy::disallowed_methods`, and a caller's tail
+  is refused. New `--crt-static` (with `--target`) replaces `b4-vm-tests.sh`'s exported
+  `RUSTFLAGS`. Every workspace crate has a build script that refuses a `--cfg`, `-Z` or
+  response-file compiler flag, raw builds included. The dependency gate scans each
+  scanned package's whole directory (build scripts and binaries included; unreached
+  `tests/`, `benches/` and `examples/` files excepted) and follows literal `#[path]` and
+  `include!` edges; an edge outside the package refuses it, and one it cannot follow is
+  an `unresolved source edge` needing a reviewed exception. Ten new exceptions (37) and
+  seven packages moved from groups to their own justifications. The raw-build policy
+  test reads every Markdown, shell, Python and workflow file; `CLAUDE.md` and the test
+  deployment's README use `build.sh` profiles. The regression script adds Daybreak's
+  compiler-cfg and `#[path]` PoCs. The VM test library build's optimized dependencies are
+  now the `vm-test` Cargo profile.
+
 - Fix the B7 milestone 1 recheck residuals (design section 16.10, "Recheck residuals").
   A lost answer to a fault-bearing ledger request (its deadline or cancellation dropped the
   helper's wait) is consumed when it arrives and its fault imported, and forward effects are
