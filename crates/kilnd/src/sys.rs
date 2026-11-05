@@ -541,7 +541,7 @@ mod linux {
         /// them), listed through a read descriptor of its root itself, as
         /// [`super::read_dir_fd`]. More than `limit` entries is an error.
         pub fn read_root_dir(limit: usize) -> io::Result<Vec<super::DirEntry>> {
-            let root = root()?;
+            let (root, _) = root()?;
             // SAFETY: a live root descriptor; "." is that directory itself, so no link
             // is followed and no mount is crossed.
             let fd = unsafe {
