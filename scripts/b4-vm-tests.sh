@@ -11,6 +11,7 @@
 #   B4_GUEST   a kiln-guest bundle directory with Image, rootfs.squashfs and
 #              kilnd-guest-broker (the B5 production bundle; earlier: the schema-1
 #              guest, which listens for no command, so a boot ends at BOOTING
+#   KILND_B7_CYCLES  sessions b7_linux_root_compaction_cycles runs (default 300)
 #   B6_EVIDENCE  where b6_linux_root writes its transcript and SQLite/journal evidence
 #              (default: none). B6's session test also runs the kilnd and kilndctl
 #              binaries, built here as ordinary dynamic executables in their own
@@ -95,6 +96,7 @@ sudo setpriv --bounding-set="$caps" --inh-caps=-all \
     KILND_B5_KILL_INNER_GUEST="${KILND_B5_KILL_INNER_GUEST:-}" \
     KILND_B5_CONSOLE_FLOOD_GUEST="${KILND_B5_CONSOLE_FLOOD_GUEST:-}" \
     KILND_B6_BIN="$work/bin" KILND_B6_EVIDENCE="${B6_EVIDENCE:-}" \
+    KILND_B7_CYCLES="${KILND_B7_CYCLES:-}" \
     "$work/kilnd-lib-tests" --include-ignored --test-threads=1 --nocapture "$filter"
 sudo setpriv --bounding-set="$caps" --inh-caps=-all \
     env RUST_BACKTRACE=${RUST_BACKTRACE:-1} \
