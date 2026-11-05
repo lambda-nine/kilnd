@@ -444,14 +444,16 @@ async fn serve_with_final_wait<R: Runtime>(
             let credentials = stream.peer_cred();
             let uid = credentials.as_ref().ok().map(|c| c.uid());
             // B6-BI-03: a general slot within this UID's share, else one of the slots
-            // held back for Health and cleanup, else the socket is closed here.
+            // held back for Health and cleanup, else (UID 0 only) the root slot, else
+            // the socket is closed here.
             let permit = admission.try_connection(uid).ok()?;
             match &credentials {
                 Ok(c) => info!(
                     uid = c.uid(),
                     gid = c.gid(),
                     pid = c.pid().unwrap_or(0),
-                    reserved = permit.lane() == ConnectionLane::Reserved,
+                    reserved = permit.lane().health_and_cleanup_only(),
+                    root_slot = permit.lane() == ConnectionLane::Root,
                     "client connected"
                 ),
                 Err(e) => warn!(error = %e, "client connected; peer credentials unavailable"),
@@ -879,6 +881,27 @@ mod tests {
             1
         );
         reserved.health(pb::HealthRequest {}).await.unwrap();
+        // Every ordinary RPC, each valid on the general connection (B7 milestone 2,
+        // LOW-2: Exec and GetExecution too).
+        let exec = || pb::ExecRequest {
+            sandbox_id: id.clone(),
+            argv: vec!["echo".into(), "x".into()],
+            ..Default::default()
+        };
+        let execution = general
+            .exec(exec())
+            .await
+            .unwrap()
+            .into_inner()
+            .execution
+            .unwrap()
+            .id;
+        general
+            .get_execution(pb::GetExecutionRequest {
+                id: execution.clone(),
+            })
+            .await
+            .unwrap();
         for status in [
             reserved
                 .create_sandbox(pb::CreateSandboxRequest::default())
@@ -886,6 +909,11 @@ mod tests {
                 .unwrap_err(),
             reserved
                 .list_sandboxes(pb::ListSandboxesRequest::default())
+                .await
+                .unwrap_err(),
+            reserved.exec(exec()).await.unwrap_err(),
+            reserved
+                .get_execution(pb::GetExecutionRequest { id: execution })
                 .await
                 .unwrap_err(),
         ] {

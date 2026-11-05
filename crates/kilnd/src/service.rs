@@ -29,12 +29,16 @@ impl<R> Service<R> {
 impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
     async fn health(
         &self,
-        _: Request<pb::HealthRequest>,
+        req: Request<pb::HealthRequest>,
     ) -> Result<Response<pb::HealthResponse>, Status> {
+        let uid = req
+            .extensions()
+            .get::<PeerIdentity>()
+            .and_then(|peer| peer.uid);
         let _permit = self
             .manager
             .admission()
-            .try_health()
+            .try_health(uid)
             .map_err(|_| Status::resource_exhausted("Health RPC capacity reached"))?;
         let h = self.manager.health().await.map_err(status)?;
         let status = if h.shutting_down {
@@ -224,9 +228,10 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
 }
 
 impl<R: Runtime> Service<R> {
-    /// The caller's RPC permit (B7, B6-BI-03). A connection on a reserved slot serves
-    /// only Health and cleanup; an ordinary RPC needs a global permit within the UID's
-    /// share, and a cleanup RPC may fall back to the cleanup lane.
+    /// The caller's RPC permit (B7, B6-BI-03). A connection on a reserved slot or the
+    /// root slot serves only Health and cleanup; an ordinary RPC needs a global permit
+    /// within the UID's share, and a cleanup RPC may fall back to the cleanup lane (and
+    /// for UID 0, to its root permit).
     fn rpc_permit<T>(
         &self,
         req: &Request<T>,
@@ -237,7 +242,7 @@ impl<R: Runtime> Service<R> {
             .extensions()
             .get::<PeerIdentity>()
             .map_or(ConnectionLane::General, |peer| peer.lane);
-        if lane == ConnectionLane::Reserved && class == RpcClass::Ordinary {
+        if lane.health_and_cleanup_only() && class == RpcClass::Ordinary {
             return Err(Status::resource_exhausted(
                 "connection capacity reached: this connection holds a reserved slot, which serves only Health, GetSandbox and DeleteSandbox",
             ));
@@ -810,48 +815,147 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
         drop((held, cleanup));
 
-        // A reserved-slot connection: Health, Get and Delete, never an ordinary RPC.
-        let reserved = ConnectionLane::Reserved;
-        for error in [
+        // A reserved-slot connection, and root's own slot: Health, Get and Delete,
+        // never an ordinary RPC (Create, List, Exec and GetExecution, each valid on a
+        // general connection).
+        let execution = exec_as(&service, &victim.id, 1002).await;
+        for (uid, lane) in [(1002, ConnectionLane::Reserved), (0, ConnectionLane::Root)] {
+            let victim = create_as(&service, uid).await;
+            let execution = if uid == 0 {
+                exec_as(&service, &victim.id, 0).await
+            } else {
+                execution.clone()
+            };
+            for error in [
+                service
+                    .create_sandbox(on_lane(pb::CreateSandboxRequest::default(), uid, lane))
+                    .await
+                    .unwrap_err(),
+                service
+                    .list_sandboxes(on_lane(pb::ListSandboxesRequest::default(), uid, lane))
+                    .await
+                    .unwrap_err(),
+                service
+                    .exec(on_lane(
+                        pb::ExecRequest {
+                            sandbox_id: victim.id.clone(),
+                            argv: vec!["echo".into(), "secret".into()],
+                            ..Default::default()
+                        },
+                        uid,
+                        lane,
+                    ))
+                    .await
+                    .unwrap_err(),
+                service
+                    .get_execution(on_lane(
+                        pb::GetExecutionRequest {
+                            id: execution.id.clone(),
+                        },
+                        uid,
+                        lane,
+                    ))
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert_eq!(error.code(), tonic::Code::ResourceExhausted, "{lane:?}");
+                assert!(error.message().contains("reserved slot"), "{error:?}");
+            }
             service
-                .create_sandbox(on_lane(pb::CreateSandboxRequest::default(), 1002, reserved))
+                .health(on_lane(pb::HealthRequest {}, uid, lane))
                 .await
-                .unwrap_err(),
+                .unwrap();
             service
-                .list_sandboxes(on_lane(pb::ListSandboxesRequest::default(), 1002, reserved))
+                .get_sandbox(on_lane(
+                    pb::GetSandboxRequest {
+                        id: victim.id.clone(),
+                        ..Default::default()
+                    },
+                    uid,
+                    lane,
+                ))
                 .await
-                .unwrap_err(),
-        ] {
-            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-            assert!(error.message().contains("reserved slot"), "{error:?}");
+                .unwrap();
+            service
+                .delete_sandbox(on_lane(
+                    pb::DeleteSandboxRequest {
+                        id: victim.id.clone(),
+                    },
+                    uid,
+                    lane,
+                ))
+                .await
+                .unwrap();
         }
+        let snapshot = manager.admission().snapshot();
+        assert_eq!((snapshot.rpcs.current, snapshot.cleanup.current), (0, 0));
+    }
+
+    /// B7 milestone 2 (MEDIUM-2): with the Health lane, the ordinary RPCs and the cleanup
+    /// lane all held by other UIDs, root on its own slot still gets Health, Get and
+    /// Delete; another UID gets none of them.
+    #[tokio::test]
+    async fn b7m2_root_reaches_health_and_cleanup_with_every_lane_held() {
+        let manager = Arc::new(Manager::new(
+            FakeRuntime::default(),
+            Store::open_in_memory().unwrap(),
+            Limits {
+                max_concurrent_rpcs: 2,
+                max_concurrent_rpcs_per_uid: 1,
+                max_concurrent_cleanup: 2,
+                max_concurrent_health: 1,
+                ..Limits::default()
+            },
+        ));
+        let service = Service::new(manager.clone());
+        let sandbox = create_as(&service, 0).await;
+        let admission = manager.admission();
+        let mut held = Vec::new();
+        for uid in [1001, 1002] {
+            held.push(admission.try_rpc(RpcClass::Ordinary, Some(uid)).unwrap());
+            held.push(admission.try_rpc(RpcClass::Cleanup, Some(uid)).unwrap());
+        }
+        held.push(admission.try_health(Some(1003)).unwrap());
+        let root = ConnectionLane::Root;
+        let other = create_as_error(&service, 1004).await;
+        assert_eq!(other.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            service
+                .health(on_lane(
+                    pb::HealthRequest {},
+                    1004,
+                    ConnectionLane::Reserved
+                ))
+                .await
+                .is_err()
+        );
         service
-            .health(on_lane(pb::HealthRequest {}, 1002, reserved))
+            .health(on_lane(pb::HealthRequest {}, 0, root))
             .await
             .unwrap();
         service
             .get_sandbox(on_lane(
                 pb::GetSandboxRequest {
-                    id: victim.id.clone(),
+                    id: sandbox.id.clone(),
                     ..Default::default()
                 },
-                1002,
-                reserved,
+                0,
+                root,
             ))
             .await
             .unwrap();
         service
             .delete_sandbox(on_lane(
                 pb::DeleteSandboxRequest {
-                    id: victim.id.clone(),
+                    id: sandbox.id.clone(),
                 },
-                1002,
-                reserved,
+                0,
+                root,
             ))
             .await
             .unwrap();
-        let snapshot = manager.admission().snapshot();
-        assert_eq!((snapshot.rpcs.current, snapshot.cleanup.current), (0, 0));
+        assert_eq!(admission.snapshot().root_rpc.current, 0);
+        drop(held);
     }
 
     #[tokio::test]
@@ -1483,6 +1587,13 @@ mod tests {
             .into_inner()
             .sandbox
             .unwrap()
+    }
+
+    async fn create_as_error(service: &Service<FakeRuntime>, uid: u32) -> Status {
+        service
+            .create_sandbox(as_uid(pb::CreateSandboxRequest::default(), uid))
+            .await
+            .unwrap_err()
     }
 
     async fn exec_as(service: &Service<FakeRuntime>, sandbox_id: &str, uid: u32) -> pb::Execution {

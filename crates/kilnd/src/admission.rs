@@ -9,11 +9,20 @@
 //!   slot (at most one per UID), and that connection then serves only Health and the
 //!   cleanup RPCs (`GetSandbox`, `DeleteSandbox`). The UID is the kernel's
 //!   `SO_PEERCRED` answer, read once at accept; a connection whose credentials are
-//!   unavailable shares one bucket with every other such connection.
+//!   unavailable shares one bucket with every other such connection. The reserve is
+//!   first-come and bounded per UID, not per caller: UIDs that collude can hold all of
+//!   it (the threat model accepts colluding UIDs filling shared capacity).
+//! - **Root.** Beyond `max_connections`, one more slot only UID 0 may take, once the
+//!   general and reserved slots refuse it, and one RPC permit only UID 0 may use for
+//!   Health, `GetSandbox` and `DeleteSandbox` once their own lanes refuse it. So the
+//!   operator can always reach Health and cleanup (B7 milestone 2, MEDIUM-2).
 //! - **RPCs.** Health keeps its own reserved lane. An ordinary RPC needs a global
 //!   permit and its UID's share (`max_concurrent_rpcs_per_uid`). A cleanup RPC tries
 //!   the ordinary lane first and, when that is full or its UID's share is spent, one
 //!   permit of the cleanup lane (`max_concurrent_cleanup`, at most one per UID).
+//!
+//! [`validate_ingress`] holds the invariants that make these shares fair; kilnd refuses
+//! to start without them (B7 milestone 2, HIGH-2).
 //!
 //! The server also drops a connection that has not sent the HTTP/2 client preface
 //! within `connection_preface_timeout`, releasing its slot (`server.rs`).
@@ -29,6 +38,65 @@ use crate::manager::Limits;
 /// A UID's share in one lane. `None` is the one bucket for connections whose peer
 /// credentials were unavailable.
 pub type ShareKey = Option<u32>;
+
+/// The kernel's UID for root, the only caller of the root slot and the root RPC permit.
+const ROOT: ShareKey = Some(0);
+
+/// Reserved connection slots one UID may hold.
+pub const RESERVED_CONNECTIONS_PER_UID: usize = 1;
+
+/// B7 milestone 2 (HIGH-2): the ingress flag invariants. Without them one UID could
+/// hold every connection slot, or every ordinary RPC, and starve every other UID's
+/// fresh Health and cleanup connections. kilnd refuses to start on a violation; the
+/// error names the flags.
+///
+/// - `--reserved-connections` is at least 1 and below `--max-connections`;
+/// - `--max-connections-per-uid` is below the general pool
+///   (`--max-connections` minus `--reserved-connections`);
+/// - `--max-connections-per-uid` plus one UID's reserved allowance is below
+///   `--max-connections`;
+/// - `--max-concurrent-rpcs-per-uid` is below `--max-concurrent-rpcs`;
+/// - `--max-concurrent-cleanup` is at least 1.
+pub fn validate_ingress(limits: &Limits) -> Result<(), String> {
+    let (total, reserved, per_uid) = (
+        limits.max_connections,
+        limits.reserved_connections,
+        limits.max_connections_per_uid,
+    );
+    if reserved < 1 {
+        return Err("--reserved-connections must be at least 1, so Health and cleanup always have a held-back slot".into());
+    }
+    if reserved >= total {
+        return Err(format!(
+            "--reserved-connections ({reserved}) must be below --max-connections ({total})"
+        ));
+    }
+    let general = total - reserved;
+    if per_uid >= general {
+        return Err(format!(
+            "--max-connections-per-uid ({per_uid}) must be below the general connection slots \
+             (--max-connections {total} - --reserved-connections {reserved} = {general}), \
+             so no one UID holds every general slot"
+        ));
+    }
+    if per_uid.saturating_add(RESERVED_CONNECTIONS_PER_UID) >= total {
+        return Err(format!(
+            "--max-connections-per-uid ({per_uid}) plus one UID's {RESERVED_CONNECTIONS_PER_UID} \
+             reserved slot must be below --max-connections ({total})"
+        ));
+    }
+    if limits.max_concurrent_rpcs_per_uid >= limits.max_concurrent_rpcs {
+        return Err(format!(
+            "--max-concurrent-rpcs-per-uid ({}) must be below --max-concurrent-rpcs ({}), \
+             so no one UID holds every ordinary RPC",
+            limits.max_concurrent_rpcs_per_uid, limits.max_concurrent_rpcs
+        ));
+    }
+    if limits.max_concurrent_cleanup < 1 {
+        return Err("--max-concurrent-cleanup must be at least 1".into());
+    }
+    Ok(())
+}
 
 struct Budget {
     max: usize,
@@ -165,15 +233,38 @@ pub enum ConnectionLane {
     General,
     /// A held-back slot: Health and the cleanup RPCs only.
     Reserved,
+    /// The one slot beyond `max_connections` that only UID 0 may hold: Health and the
+    /// cleanup RPCs only.
+    Root,
+}
+
+impl ConnectionLane {
+    /// Whether this connection serves only Health, `GetSandbox` and `DeleteSandbox`.
+    pub fn health_and_cleanup_only(self) -> bool {
+        self != Self::General
+    }
+}
+
+/// What a connection's slot holds: a lane permit with its UID's share, or the root slot.
+enum ConnectionSlot {
+    Shared { _permit: SharedPermit },
+    Root { _permit: OwnedSemaphorePermit },
 }
 
 /// A connection's slot, held for the connection's life.
 pub struct ConnectionPermit {
     lane: ConnectionLane,
-    _permit: SharedPermit,
+    _slot: ConnectionSlot,
 }
 
 impl ConnectionPermit {
+    fn shared(lane: ConnectionLane, permit: SharedPermit) -> Self {
+        Self {
+            lane,
+            _slot: ConnectionSlot::Shared { _permit: permit },
+        }
+    }
+
     pub fn lane(&self) -> ConnectionLane {
         self.lane
     }
@@ -193,6 +284,8 @@ pub enum RpcClass {
 pub enum RpcPermit {
     Shared(SharedPermit),
     Health(OwnedSemaphorePermit),
+    /// UID 0's own Health or cleanup permit, once the shared lanes refuse it.
+    Root(OwnedSemaphorePermit),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +301,8 @@ pub struct AdmissionSnapshot {
     pub connections: BudgetSnapshot,
     /// The held-back Health and cleanup slots (part of `connections`).
     pub reserved_connections: BudgetSnapshot,
+    /// UID 0's own slot, beyond `connections`.
+    pub root_connection: BudgetSnapshot,
     /// Connections refused because their UID held its whole general share and a
     /// reserved slot already (part of `connections.rejected`).
     pub rejected_connection_shares: u64,
@@ -218,6 +313,8 @@ pub struct AdmissionSnapshot {
     /// The cleanup lane, used once the ordinary lane refuses a cleanup RPC.
     pub cleanup: BudgetSnapshot,
     pub health: BudgetSnapshot,
+    /// UID 0's own Health and cleanup RPC permit.
+    pub root_rpc: BudgetSnapshot,
     pub execs: BudgetSnapshot,
     pub stdin: BudgetSnapshot,
     pub max_queued_execs_per_sandbox: u64,
@@ -227,6 +324,7 @@ pub struct AdmissionSnapshot {
 pub struct Admission {
     general_connections: Lane,
     reserved_connections: Lane,
+    root_connection: Budget,
     rejected_connections: AtomicU64,
     rejected_reserved: AtomicU64,
     rejected_connection_shares: AtomicU64,
@@ -236,6 +334,7 @@ pub struct Admission {
     cleanup: Lane,
     rejected_cleanup: AtomicU64,
     health: Budget,
+    root_rpc: Budget,
     execs: Budget,
     stdin: Budget,
     max_queued_execs_per_sandbox: usize,
@@ -259,7 +358,8 @@ impl Admission {
         let general = limits.max_connections - reserved;
         Self {
             general_connections: Lane::new(general, limits.max_connections_per_uid.max(1)),
-            reserved_connections: Lane::new(reserved, 1),
+            reserved_connections: Lane::new(reserved, RESERVED_CONNECTIONS_PER_UID),
+            root_connection: Budget::new(1),
             rejected_connections: AtomicU64::new(0),
             rejected_reserved: AtomicU64::new(0),
             rejected_connection_shares: AtomicU64::new(0),
@@ -272,6 +372,7 @@ impl Admission {
             cleanup: Lane::new(limits.max_concurrent_cleanup, 1),
             rejected_cleanup: AtomicU64::new(0),
             health: Budget::new(limits.max_concurrent_health),
+            root_rpc: Budget::new(1),
             execs: Budget::new(limits.max_concurrent_execs),
             stdin: Budget::new(limits.max_queued_exec_stdin_bytes),
             max_queued_execs_per_sandbox: limits.max_queued_execs_per_sandbox,
@@ -280,39 +381,44 @@ impl Admission {
     }
 
     /// A connection slot for `uid`: a general one within its share, else one reserved
-    /// Health and cleanup slot, else none (the server closes the socket).
+    /// Health and cleanup slot, else (UID 0 only) the root slot, else none (the server
+    /// closes the socket).
     pub fn try_connection(&self, uid: ShareKey) -> Result<ConnectionPermit, TryAcquireError> {
         let general = match self.general_connections.try_acquire(uid) {
-            Ok(permit) => {
-                return Ok(ConnectionPermit {
-                    lane: ConnectionLane::General,
-                    _permit: permit,
-                });
-            }
+            Ok(permit) => return Ok(ConnectionPermit::shared(ConnectionLane::General, permit)),
             Err(refusal) => refusal,
         };
-        match self.reserved_connections.try_acquire(uid) {
-            Ok(permit) => Ok(ConnectionPermit {
-                lane: ConnectionLane::Reserved,
-                _permit: permit,
-            }),
-            Err(reserved) => {
-                self.rejected_connections.fetch_add(1, Ordering::Relaxed);
-                if reserved == Refusal::Global {
-                    self.rejected_reserved.fetch_add(1, Ordering::Relaxed);
-                }
-                if general == Refusal::Share {
-                    self.rejected_connection_shares
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(TryAcquireError::NoPermits)
-            }
+        let reserved = match self.reserved_connections.try_acquire(uid) {
+            Ok(permit) => return Ok(ConnectionPermit::shared(ConnectionLane::Reserved, permit)),
+            Err(refusal) => refusal,
+        };
+        if uid == ROOT
+            && let Ok(permit) = self.root_connection.acquire(1)
+        {
+            return Ok(ConnectionPermit {
+                lane: ConnectionLane::Root,
+                _slot: ConnectionSlot::Root { _permit: permit },
+            });
         }
+        self.rejected_connections.fetch_add(1, Ordering::Relaxed);
+        if reserved == Refusal::Global {
+            self.rejected_reserved.fetch_add(1, Ordering::Relaxed);
+        }
+        if general == Refusal::Share {
+            self.rejected_connection_shares
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TryAcquireError::NoPermits)
     }
 
-    /// Health's own reserved lane, shared by every caller.
-    pub fn try_health(&self) -> Result<RpcPermit, TryAcquireError> {
-        self.health.acquire(1).map(RpcPermit::Health)
+    /// Health's own reserved lane, shared by every caller; once it is full, UID 0's
+    /// root permit.
+    pub fn try_health(&self, uid: ShareKey) -> Result<RpcPermit, TryAcquireError> {
+        match self.health.acquire(1) {
+            Ok(permit) => Ok(RpcPermit::Health(permit)),
+            Err(_) if uid == ROOT => self.root_rpc.acquire(1).map(RpcPermit::Root),
+            Err(error) => Err(error),
+        }
     }
 
     /// An ordinary or cleanup RPC for `uid`.
@@ -325,6 +431,12 @@ impl Admission {
             && let Ok(permit) = self.cleanup.try_acquire(uid)
         {
             return Ok(RpcPermit::Shared(permit));
+        }
+        if class == RpcClass::Cleanup
+            && uid == ROOT
+            && let Ok(permit) = self.root_rpc.acquire(1)
+        {
+            return Ok(RpcPermit::Root(permit));
         }
         self.rejected_rpcs.fetch_add(1, Ordering::Relaxed);
         if ordinary == Refusal::Share {
@@ -379,6 +491,7 @@ impl Admission {
                 current: count(self.reserved_connections.current()),
                 rejected: self.rejected_reserved.load(Ordering::Relaxed),
             },
+            root_connection: self.root_connection.snapshot(),
             rejected_connection_shares: self.rejected_connection_shares.load(Ordering::Relaxed),
             rpcs: BudgetSnapshot {
                 max: count(self.rpcs.max),
@@ -392,6 +505,7 @@ impl Admission {
                 rejected: self.rejected_cleanup.load(Ordering::Relaxed),
             },
             health: self.health.snapshot(),
+            root_rpc: self.root_rpc.snapshot(),
             execs: self.execs.snapshot(),
             stdin: self.stdin.snapshot(),
             max_queued_execs_per_sandbox: count(self.max_queued_execs_per_sandbox),
@@ -419,13 +533,13 @@ mod tests {
         let connection = shared.try_connection(Some(7)).unwrap();
         assert_eq!(connection.lane(), ConnectionLane::General);
         let rpc = shared.try_rpc(RpcClass::Ordinary, Some(7)).unwrap();
-        let health = shared.try_health().unwrap();
+        let health = shared.try_health(Some(7)).unwrap();
         let exec = shared.try_exec().unwrap();
         let stdin = shared.try_stdin(3).unwrap();
         assert!(admission.try_stdin(0).unwrap().is_none());
         assert!(admission.try_connection(Some(7)).is_err());
         assert!(admission.try_rpc(RpcClass::Ordinary, Some(7)).is_err());
-        assert!(admission.try_health().is_err());
+        assert!(admission.try_health(Some(7)).is_err());
         assert!(admission.try_exec().is_err());
         assert!(admission.try_stdin(1).is_err());
         let snapshot = admission.snapshot();
@@ -605,5 +719,143 @@ mod tests {
         assert_eq!(admission.connections_held_by(Some(1)), (5, 1));
         drop(held);
         assert_eq!(admission.snapshot().connections.current, 0);
+    }
+
+    /// B7 milestone 2 (MEDIUM-2): at the defaults, four UIDs holding 33, 29, 1 and 1
+    /// connections take all 64 slots, the whole reserve included; a fifth UID is
+    /// refused, but root still gets its own slot, and only one.
+    #[test]
+    fn b7m2_root_gets_its_slot_after_a_four_uid_fill() {
+        let limits = Limits::default();
+        validate_ingress(&limits).unwrap();
+        let admission = Admission::new(&limits);
+        let mut held = Vec::new();
+        for (uid, count, expected) in [
+            (1001, 33, (32, 1)),
+            (1002, 29, (28, 1)),
+            (1003, 1, (0, 1)),
+            (1004, 1, (0, 1)),
+        ] {
+            for _ in 0..count {
+                held.push(admission.try_connection(Some(uid)).unwrap());
+            }
+            assert_eq!(admission.connections_held_by(Some(uid)), expected, "{uid}");
+        }
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.connections.current, 64);
+        assert_eq!(snapshot.reserved_connections.current, 4);
+        assert!(admission.try_connection(Some(1005)).is_err());
+        assert!(admission.try_connection(None).is_err());
+        let root = admission.try_connection(Some(0)).unwrap();
+        assert_eq!(root.lane(), ConnectionLane::Root);
+        assert!(root.lane().health_and_cleanup_only());
+        assert!(admission.try_connection(Some(0)).is_err());
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.root_connection.current, 1);
+        assert_eq!(
+            snapshot.connections.current, 64,
+            "the root slot is beyond the budget"
+        );
+        drop(root);
+        assert_eq!(admission.snapshot().root_connection.current, 0);
+        // While general or reserved slots are free, root takes those like anyone else.
+        drop(held);
+        assert_eq!(
+            admission.try_connection(Some(0)).unwrap().lane(),
+            ConnectionLane::General
+        );
+    }
+
+    /// B7 milestone 2 (MEDIUM-2): with Health, the ordinary RPCs and the cleanup lane
+    /// all held by other UIDs, root still gets one Health or cleanup permit; another UID
+    /// does not, and no UID gets an ordinary RPC from it.
+    #[test]
+    fn b7m2_root_keeps_one_health_and_cleanup_permit() {
+        let admission = Admission::new(&Limits {
+            max_concurrent_rpcs: 2,
+            max_concurrent_rpcs_per_uid: 1,
+            max_concurrent_cleanup: 2,
+            max_concurrent_health: 1,
+            ..Limits::default()
+        });
+        let mut held = Vec::new();
+        for uid in [1001, 1002] {
+            held.push(admission.try_rpc(RpcClass::Ordinary, Some(uid)).unwrap());
+            held.push(admission.try_rpc(RpcClass::Cleanup, Some(uid)).unwrap());
+        }
+        held.push(admission.try_health(Some(1003)).unwrap());
+        assert!(admission.try_health(Some(1004)).is_err());
+        assert!(admission.try_rpc(RpcClass::Cleanup, Some(1004)).is_err());
+        assert!(admission.try_rpc(RpcClass::Ordinary, Some(0)).is_err());
+        let health = admission.try_health(Some(0)).unwrap();
+        assert!(matches!(health, RpcPermit::Root(_)));
+        assert!(admission.try_rpc(RpcClass::Cleanup, Some(0)).is_err());
+        drop(health);
+        let cleanup = admission.try_rpc(RpcClass::Cleanup, Some(0)).unwrap();
+        assert!(matches!(cleanup, RpcPermit::Root(_)));
+        assert_eq!(admission.snapshot().root_rpc.current, 1);
+        drop((cleanup, held));
+        let snapshot = admission.snapshot();
+        assert_eq!(
+            (
+                snapshot.rpcs.current,
+                snapshot.cleanup.current,
+                snapshot.health.current,
+                snapshot.root_rpc.current
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
+    /// B7 milestone 2 (HIGH-2): each invariant, refused at equality and accepted one
+    /// below it.
+    #[test]
+    fn b7m2_ingress_invariants() {
+        let with = |total, reserved, per_uid| Limits {
+            max_connections: total,
+            reserved_connections: reserved,
+            max_connections_per_uid: per_uid,
+            ..Limits::default()
+        };
+        let error = validate_ingress(&with(33, 1, 32)).unwrap_err();
+        assert!(error.contains("--max-connections-per-uid (32)"), "{error}");
+        validate_ingress(&with(33, 1, 31)).unwrap();
+        assert!(
+            validate_ingress(&with(33, 0, 16))
+                .unwrap_err()
+                .contains("at least 1")
+        );
+        assert!(
+            validate_ingress(&with(4, 4, 1))
+                .unwrap_err()
+                .contains("below --max-connections")
+        );
+        let error = validate_ingress(&Limits {
+            max_concurrent_rpcs: 4,
+            max_concurrent_rpcs_per_uid: 4,
+            ..Limits::default()
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("--max-concurrent-rpcs-per-uid (4)"),
+            "{error}"
+        );
+        let error = validate_ingress(&Limits {
+            max_concurrent_cleanup: 0,
+            ..Limits::default()
+        })
+        .unwrap_err();
+        assert!(error.contains("--max-concurrent-cleanup"), "{error}");
+        // Under the accepted 33/1/31, one UID cannot hold every slot: one general slot
+        // stays for another UID.
+        let admission = Admission::new(&with(33, 1, 31));
+        let held: Vec<_> = (0..64)
+            .filter_map(|_| admission.try_connection(Some(1001)).ok())
+            .collect();
+        assert_eq!(held.len(), 32);
+        assert_eq!(
+            admission.try_connection(Some(1002)).unwrap().lane(),
+            ConnectionLane::General
+        );
     }
 }

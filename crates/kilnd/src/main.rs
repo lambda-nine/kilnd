@@ -583,16 +583,11 @@ fn validated_limits(args: &Args) -> Result<Limits> {
             bail!("--{name} exceeds u32 semaphore capacity");
         }
     }
-    // B6-BI-03: the reserve leaves a general pool, and no one UID's share is the whole
-    // general pool or every ordinary RPC.
-    if limits.reserved_connections >= limits.max_connections {
-        bail!("--reserved-connections must be below --max-connections");
-    }
-    if limits.max_connections_per_uid > limits.max_connections - limits.reserved_connections {
-        bail!("--max-connections-per-uid exceeds the general connection slots");
-    }
-    if limits.max_concurrent_rpcs_per_uid > limits.max_concurrent_rpcs {
-        bail!("--max-concurrent-rpcs-per-uid exceeds --max-concurrent-rpcs");
+    // B6-BI-03 and B7 milestone 2 (HIGH-2): the reserve leaves a general pool, and no
+    // one UID's share is the whole general pool, the whole connection budget with its
+    // reserved slot, or every ordinary RPC. Strictly: equality is refused.
+    if let Err(error) = kilnd::admission::validate_ingress(&limits) {
+        bail!("{error}");
     }
     if !(100..=60_000).contains(&args.connection_preface_timeout_ms) {
         bail!("--connection-preface-timeout-ms must be 100 to 60000");
@@ -943,7 +938,18 @@ mod tests {
             (
                 "--max-concurrent-rpcs-per-uid",
                 "65",
-                "exceeds --max-concurrent-rpcs",
+                "below --max-concurrent-rpcs",
+            ),
+            // B7 milestone 2 (HIGH-2): equality is refused too.
+            (
+                "--max-concurrent-rpcs-per-uid",
+                "64",
+                "below --max-concurrent-rpcs",
+            ),
+            (
+                "--max-connections-per-uid",
+                "60",
+                "general connection slots",
             ),
             ("--connection-preface-timeout-ms", "99", "100 to 60000"),
             ("--connection-preface-timeout-ms", "60001", "100 to 60000"),
@@ -962,6 +968,70 @@ mod tests {
                 "{flag} {value}"
             );
         }
+    }
+
+    /// B7 milestone 2 (HIGH-2): the ingress invariants at their boundaries. Daybreak's
+    /// `33/1/32` let one UID hold all 32 general slots and the only reserved slot; it is
+    /// refused at startup, and one fewer per UID is accepted.
+    #[test]
+    fn b7m2_ingress_flags_are_refused_at_their_boundaries() {
+        let check = |flags: &[&str]| {
+            let mut argv = vec!["kilnd"];
+            argv.extend_from_slice(flags);
+            validated_limits(&Args::try_parse_from(argv).unwrap()).map_err(|e| e.to_string())
+        };
+        let connections = |total: &str, reserved: &str, per_uid: &str| {
+            check(&[
+                "--max-connections",
+                total,
+                "--reserved-connections",
+                reserved,
+                "--max-connections-per-uid",
+                per_uid,
+            ])
+        };
+        let refused = connections("33", "1", "32").unwrap_err();
+        assert!(
+            refused.contains(
+                "--max-connections-per-uid (32) must be below the general connection slots"
+            ),
+            "{refused}"
+        );
+        connections("33", "1", "31").unwrap();
+        assert!(connections("64", "4", "60").is_err());
+        connections("64", "4", "59").unwrap();
+        // The smallest accepted budget: one reserved slot, one general slot per UID and
+        // one more general slot for everyone else.
+        connections("3", "1", "1").unwrap();
+        for (total, reserved, per_uid) in [("2", "1", "1"), ("3", "2", "1"), ("3", "3", "1")] {
+            assert!(
+                connections(total, reserved, per_uid).is_err(),
+                "{total}/{reserved}/{per_uid}"
+            );
+        }
+        let refused = connections("33", "0", "16").unwrap_err();
+        assert!(refused.contains("--reserved-connections"), "{refused}");
+        let rpcs = |total: &str, per_uid: &str| {
+            check(&[
+                "--max-concurrent-rpcs",
+                total,
+                "--max-concurrent-rpcs-per-uid",
+                per_uid,
+            ])
+        };
+        let refused = rpcs("8", "8").unwrap_err();
+        assert!(
+            refused.contains(
+                "--max-concurrent-rpcs-per-uid (8) must be below --max-concurrent-rpcs (8)"
+            ),
+            "{refused}"
+        );
+        rpcs("8", "7").unwrap();
+        let refused = check(&["--max-concurrent-cleanup", "0"]).unwrap_err();
+        assert!(refused.contains("--max-concurrent-cleanup"), "{refused}");
+        check(&["--max-concurrent-cleanup", "1"]).unwrap();
+        // The defaults satisfy every invariant.
+        check(&[]).unwrap();
     }
 
     fn own_account_name() -> String {
