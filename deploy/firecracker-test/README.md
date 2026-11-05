@@ -10,13 +10,14 @@ B6 can drive whole sessions through the real daemon and `kilndctl` on the dev VM
 
 | Field | Value | Meaning |
 |---|---|---|
-| `schema` | `kilnd-firecracker-test-deployment/1` | The only schema this build reads |
+| `schema` | `kilnd-firecracker-test-deployment/2` | The only schema this build reads (B7 added `kilnd.cgroup`) |
 | `deployment` | `isolated-test` | The only kind before B7 |
 | `profile` | `offline-768-v1` | The one Phase 1b guest profile (768 MiB, one vCPU, offline) |
 | `kilnd.socket` | `/run/kilnd-fctest/kilnd.sock` | The test daemon's API socket |
 | `kilnd.socket_group`, `kilnd.account` | `kilnd-fctest` | Its own account and group, never `kilnd` |
 | `kilnd.state_dir` | `/var/lib/kilnd-fctest` | Its own database, never `/var/lib/kilnd` |
 | `kilnd.unit` | `kilnd-fctest.service` | Its own unit, so its own cgroup to enroll |
+| `kilnd.cgroup` | `/system.slice/kilnd-fctest.service` | That unit's exact cgroup, the one the helper enrolls (B6-RC-02) |
 | `helper.root`, `helper.socket` | `/run/kilnd-fctest-helper`, `…/helper.sock` | The test helper's private root (ledger, logs) and socket, never `/run/kilnd-helper` |
 
 The daemon side is `kilnd --backend firecracker --firecracker-test-deployment <file>`, and
@@ -36,15 +37,17 @@ start unless:
   UIDs are the UID `getpwnam` gives the file's account (which must exist, and is never 0
   or the production `kilnd` account's), the GID of the CLI's `--socket-group` is the
   file's group's (never the production `kilnd` group's), and its own cgroup, read from
-  its procfs entry beneath kilnd's private procfs instance, ends in exactly
-  `/<unit>`. Every mismatch is named in the refusal.
+  its procfs entry beneath kilnd's private procfs instance, is exactly the file's
+  `kilnd.cgroup`, which must end in `/<unit>` below a slice (B7: the same unit name
+  under another slice is refused, B6-RC-02). Every mismatch is named in the refusal.
 
 `--backend firecracker` without the file is refused, and so is the file with the default
 `kiln` backend. The installed units never pass either flag.
 `scripts/test-deployment-gate-regressions.sh` checks all of this: `release` mode against a
 default build, `feature` mode against a feature build unprivileged, and `root` mode (in
-the VM) with a real account and transient unit, where each wrong account, group or unit
-is refused on its own and the matching identity is selected.
+the VM) with a real account and transient unit, where each wrong account, group or unit,
+and the right unit under another slice, is refused on its own and the matching identity
+is selected.
 
 ## Why production stays off
 

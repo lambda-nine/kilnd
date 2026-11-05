@@ -6,6 +6,26 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B7 milestone 2: the hardening follow-ups (design section 15, *B7 milestone
+  2*). Ingress fairness (B6-BI-03): 4 of the 64 connection slots are held back for
+  Health, GetSandbox and DeleteSandbox (one per UID; a connection on one serves nothing
+  else), one UID holds at most 32 general slots and 32 ordinary RPCs, Get and Delete
+  fall back to a 4-permit cleanup lane (one per UID), and a connection that has not sent
+  the HTTP/2 preface within 5 s is closed. New flags `--reserved-connections`,
+  `--max-connections-per-uid`, `--connection-preface-timeout-ms`,
+  `--max-concurrent-rpcs-per-uid` and `--max-concurrent-cleanup`; new
+  `scripts/hostile-public-caller.py` (64 idle sockets from one UID, Health, Get and
+  Delete from another), also run on the Firecracker chain by
+  `scripts/firecracker-regressions.py`. B4 recheck 6: a socket filesystem without file
+  handles (`EOPNOTSUPP`) is refused instead of falling back to an all-zero handle;
+  `dependency-gate.json` and a new gate test check every dependency that can wrap
+  system calls against `Cargo.lock` and `clippy.toml`; the private procfs root is made
+  once under a mutex; `sys::read_dir_fd` lists a fresh `openat(fd, ".")` description, so
+  the caller's offset is untouched. B6 recheck: the unprivileged procfs component walk
+  refuses a component on another mount; the isolated test deployment's schema 2 names
+  the unit's exact cgroup (`kilnd.cgroup`); the capacity crash scenario runs both settle
+  paths on every run. Debug and test builds compile `sha2` at opt-level 3, so the debug
+  test helper hashes its 71 MiB image in under a second instead of about 14 s on the VM.
 - Design the Phase 1b retired-token compaction for B7 (design section 16): today's node
   ledger admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1
   refusals; helper-issued sequence tokens with a per-instance durable watermark remove

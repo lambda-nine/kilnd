@@ -271,7 +271,10 @@ The daemon's admission flags and defaults are:
 | Flags | Defaults |
 |-------|----------|
 | `--max-connections`, `--max-streams-per-connection` | 64, 8 |
+| `--reserved-connections`, `--max-connections-per-uid` | 4 (one per UID), 32 |
+| `--connection-preface-timeout-ms` | 5000 |
 | `--max-concurrent-rpcs`, `--max-concurrent-health` | 64, 4 |
+| `--max-concurrent-rpcs-per-uid`, `--max-concurrent-cleanup` | 32, 4 (one per UID) |
 | `--max-concurrent-execs`, `--max-queued-execs-per-sandbox` | 32, 8 (plus one running) |
 | `--max-queued-exec-stdin-bytes` | 16777216 (16 MiB) |
 | `--max-request-bytes`, `--max-response-bytes` | 2097152, 4194304 |
@@ -285,7 +288,10 @@ The daemon's admission flags and defaults are:
 | `--health-success-cache-secs`, `--health-failure-cache-secs` | 5, 1 |
 
 Limits are validated before state/socket creation. Required values must be
-nonzero except `--max-queued-execs-per-sandbox`, which may be zero. Counts
+nonzero except `--max-queued-execs-per-sandbox`, which may be zero. The reserved
+connections must leave at least one general slot, one UID's connection share must
+fit in the general slots, its RPC share in `--max-concurrent-rpcs`, and the
+preface deadline is 100 to 60000 ms. Counts
 used by semaphores and stream counts must fit `u32`; the per-sandbox queue
 plus one must fit too. Request bytes must cover stdin + argv + 64 KiB, and
 response bytes must cover twice `--max-output-bytes`, maximum argv, and 64 KiB.
@@ -315,9 +321,13 @@ Health handlers have separate budgets. Full handler/Exec/stdin budgets return
 `RESOURCE_EXHAUSTED`; a full connection budget closes the socket without a
 guaranteed gRPC status. tonic message-size cap failures use `OUT_OF_RANGE`.
 Messages decode before handler admission under connection/stream/message
-caps. Slow authorized clients can monopolize those bounded slots; there is no
-tenant fairness, and synchronous SQLite/filesystem operations are not hard
-real time. Terminal history is bounded by age/count retention; charged and
+caps. Phase 1b B7 split the connection and RPC budgets by the caller's kernel UID
+(B6-BI-03): reserved slots for Health and cleanup, per-UID shares and a cleanup RPC
+lane, and the HTTP/2 preface deadline; the [architecture](architecture.md) has the
+rules. One UID can still fill its own share with slow clients, and synchronous
+SQLite/filesystem operations are not hard real time.
+`sudo python3 -I scripts/hostile-public-caller.py --socket SOCKET --kilndctl KILNDCTL`
+runs the hostile public caller against a running daemon in the VM. Terminal history is bounded by age/count retention; charged and
 unfinished rows stay. See [history retention](../README.md#history-retention).
 
 An Exec timeout includes queueing. Expiry before row insertion returns

@@ -137,10 +137,14 @@ sandbox compromises the host.
 
 ## Known gaps
 
-- **Capacity is not fairness or isolation.** An authorized caller can occupy
-  all bounded slots; there are no per-UID quotas or tenant scheduling. Slow
-  clients consume only bounded connection/stream slots but can deny
-  availability until disconnected. There is no body-progress or idle watchdog.
+- **Capacity is not fairness or isolation.** Since Phase 1b B7 one UID can
+  hold at most its share of connections (32 of 64) and ordinary RPCs (32 of
+  64), and Health and cleanup keep reserved connection slots and RPC lanes
+  (B6-BI-03); a socket that never sends the HTTP/2 preface is closed after 5
+  seconds. There is still no tenant scheduling: a UID's own slow clients fill
+  its share, several colluding UIDs can fill the general pool, and a client
+  that sends the preface can then idle on its slot. There is no body-progress
+  or idle watchdog after the preface.
   Raw connection rejection closes the transport and cannot guarantee a gRPC
   status. Service permits end after response construction; transport caps
   bound slots held during response backpressure. These are capacity bounds,

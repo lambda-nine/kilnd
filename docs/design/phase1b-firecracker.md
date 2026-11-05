@@ -603,7 +603,7 @@ Delete proves VMM/worker exit and FD closure, unmounts owned binds/tmpfs (no laz
 - *The compile-time gate guards against honest mistakes by kilnd developers (B4 recheck 5).* It is not a defence against malicious source changes; code review covers those. A deliberately obfuscated bypass, such as `build.rs` code generation, names assembled from fragments or `include!` of generated code, is out of scope. Cheap checks still close the obvious routes: a test fails on any build script but `kilnd-api`'s and on any `include!` or `OUT_DIR` outside its protobuf stubs.
 - *Kernel facts relied on,* verified on the VM's 6.8.0-147 by `b4_linux_root_kernel_generation_ids_are_never_reused`: a replacement tmpfs gets a new unique mount ID although the reusable tuple is reused; a detached mount keeps its unique ID when attached; detach plus reattach of the same slot, inode and tuple changes the disk sequence number; `LOOP_SET_STATUS64` does not. B4 recheck 2 added, on the same kernel: ext4 gave a recreated work file the deleted file's inode number at once, with a later birth time (`b4_linux_root_cleanup_refuses_a_work_file_reusing_the_inode`). Also observed: while cleanup's descriptor on a slot is open, another opener's `LOOP_CLR_FD` only marks it autoclear and a rebinding `LOOP_CONFIGURE` fails `EBUSY`, so a replacement cannot land inside cleanup's own comparison-to-clear window. Deletion is destructive and authorized by DeleteSandbox; there is no export/retention or secure-erasure claim. Encryption/export/snapshots remain separate features.
 
-**The destructive-action invariant (B4 recheck 3, November 2, 2026).** No destructive action may run on a resource unless the caller holds proof that the resource's current generation equals a durable journaled generation from the current boot. A resource with no such proof is Unknown: it stays charged, nothing is done to it, and it never counts toward ABSENT. The destructive actions are signals (`pidfd_send_signal`, `kill`), writes to `cgroup.kill`, `rmdir` of a cgroup or directory, `unlink` of a file, `umount2` and `LOOP_CLR_FD`. The type system enforces it: `crates/kilnd/src/helper/firecracker/proven.rs` holds one proof type per resource kind (`ProvenProcess`, `ProvenCgroupVm` and `ProvenCgroupTree`, `ProvenFile`, `ProvenDir`, `ProvenMount`, `ProvenLoop`), none `Clone` and none constructible outside that module. Only its verification functions make them, each from the journaled identity, the current boot ID and the live kernel object, returning `Result<Proven*, Unprovable>` (`Gone`, `Replaced` or `Unknown`). Every destructive helper takes its proof, and the raw capabilities appear nowhere else: since B4 recheck 4 clippy enforces it semantically for the whole workspace (*The clippy gate* below), with the lexical test `proven::tests::no_destructive_call_outside_the_gate` kept as defense in depth. Each check stays as close to its action as the kernel allows, which is the decided residual window: a pidfd for processes, the `vm` node's descriptor for `cgroup.kill` with its children re-listed from that descriptor (`getdents64` on a rewound duplicate) just before, the parent's descriptor with the child's inode or birth time re-read just before each `rmdir` and `unlinkat`, the loop descriptor the generation was compared on, and for mounts a fresh descriptor's unique mount ID read just before `umount2` of the single name resolved from the held parent descriptor (that descriptor must be closed first, or a non-lazy unmount is busy). No proof reads a `/proc/self/fd` pathname (B4 recheck 5).
+**The destructive-action invariant (B4 recheck 3, November 2, 2026).** No destructive action may run on a resource unless the caller holds proof that the resource's current generation equals a durable journaled generation from the current boot. A resource with no such proof is Unknown: it stays charged, nothing is done to it, and it never counts toward ABSENT. The destructive actions are signals (`pidfd_send_signal`, `kill`), writes to `cgroup.kill`, `rmdir` of a cgroup or directory, `unlink` of a file, `umount2` and `LOOP_CLR_FD`. The type system enforces it: `crates/kilnd/src/helper/firecracker/proven.rs` holds one proof type per resource kind (`ProvenProcess`, `ProvenCgroupVm` and `ProvenCgroupTree`, `ProvenFile`, `ProvenDir`, `ProvenMount`, `ProvenLoop`), none `Clone` and none constructible outside that module. Only its verification functions make them, each from the journaled identity, the current boot ID and the live kernel object, returning `Result<Proven*, Unprovable>` (`Gone`, `Replaced` or `Unknown`). Every destructive helper takes its proof, and the raw capabilities appear nowhere else: since B4 recheck 4 clippy enforces it semantically for the whole workspace (*The clippy gate* below), with the lexical test `proven::tests::no_destructive_call_outside_the_gate` kept as defense in depth. Each check stays as close to its action as the kernel allows, which is the decided residual window: a pidfd for processes, the `vm` node's descriptor for `cgroup.kill` with its children re-listed from that descriptor (`getdents64` on a fresh open file description of it, `openat(fd, ".")`, since B7) just before, the parent's descriptor with the child's inode or birth time re-read just before each `rmdir` and `unlinkat`, the loop descriptor the generation was compared on, and for mounts a fresh descriptor's unique mount ID read just before `umount2` of the single name resolved from the held parent descriptor (that descriptor must be closed first, or a non-lazy unmount is busy). No proof reads a `/proc/self/fd` pathname (B4 recheck 5).
 
 - *Boot ID everywhere.* Every durable process identity (`ProcessId`, so `ResourceRecord::Vmm`, `StopTarget`, M's and K's targets and the worker rows) carries a validated boot ID. A process whose PID and start time match is proven only when its journaled boot ID is this boot's. A different boot ID only shows that the journaled process is gone, and never leads to a signal. An absent or invalid one, from an older row, proves nothing: that process is never signaled and stays charged until it is provably gone. An unreadable host boot ID is an error, never `unknown`.
 - *The cgroup tree.* `cgroup.kill` needs `ProvenCgroupVm`: the boot ID and the journaled inodes of the parent, `vm`, `vm/vmm` and `vm/console`, and no other cgroup anywhere below `vm`. A replaced or unexpected child is Replaced, with no signal. Removal needs `ProvenCgroupTree`, which covers every node and admits no other cgroup below the parent. H's monitor target, K's emergency target, `kill_recorded`, `contain` and `remove_tree` all go through these.
@@ -635,7 +635,7 @@ The executable store has no destructive call at all since B4 recheck 4: `executa
 
 | Use | Before | Now |
 |---|---|---|
-| `proven::child_cgroups` (the `cgroup.kill` and removal proofs) | `read_dir("/proc/self/fd/N")` | `sys::read_dir_fd`: `getdents64` on an `F_DUPFD_CLOEXEC` duplicate of the retained node descriptor, rewound with `lseek(0)` |
+| `proven::child_cgroups` (the `cgroup.kill` and removal proofs) | `read_dir("/proc/self/fd/N")` | `sys::read_dir_fd`: `getdents64` on a fresh open file description of the retained node descriptor, `openat(fd, ".", O_RDONLY\|O_DIRECTORY\|O_CLOEXEC)` (B7; until then an `F_DUPFD_CLOEXEC` duplicate rewound with `lseek(0)`, which also rewound the caller's offset) |
 | `proven::unmount` | `umount2("/proc/self/fd/<parent>/<name>")` after checking the real parent | `umount2(name)` from a thread whose working directory is the parent descriptor (below) |
 | `storage::list` (the jail hardening walk) | `read_dir("/proc/self/fd/N")` | `sys::read_dir_fd` |
 | `cgroup::allocation_names` (inventory) | `read_dir("/proc/self/fd/N")` | `sys::read_dir_fd` |
@@ -662,6 +662,8 @@ The other `/proc` pathname reads moved beneath `sys::procfs`, a private procfs s
 Each allow is `#[allow(clippy::disallowed_methods)]` (inner for a whole module) with an `// Approved (design 7.1):` justification immediately above it. The CI test `proven::tests::disallowed_allows_only_in_approved_modules` scans every Rust source in the workspace and fails on an `allow` or `expect` of `disallowed_methods`, `disallowed_types` or anything that would silence them (`clippy::style`, `clippy::all`, `warnings`, also inside `cfg_attr`) other than exactly these, on a `#[cfg(test)]` item, or on a test-only file (a `tests.rs` its parent declares `#[cfg(test)] mod tests;`, or an integration test); on one without the justification; on any `[lints]` table or `.cargo/config`; and on a `clippy.toml` that drops a required path. (`kilnd-api`'s generated code no longer allows `clippy::all`.) `proven::tests::no_foreign_declarations_or_inline_assembly` rejects a local `extern` block, inline assembly, `#[link]`, `link_name` or `dlsym` anywhere, which clippy cannot see through. Since B4 recheck 5, `proven::tests::no_unapproved_build_scripts_or_generated_includes` fails on any build script other than `kilnd-api/build.rs`, a `build` key in a manifest, and any `include!`, `include_proto!` or `OUT_DIR` other than `kilnd-api`'s `tonic::include_proto!("kilnd.v1")`, since generated code is invisible to every source check; and `proven::tests::proc_and_control_paths_only_in_approved_modules` fails on a production string literal containing `/proc/` or `cgroup.` outside `sys.rs`, `cgroup.rs` and `proven.rs`, except four justified ones (the two publish `linkat` paths above, kiln's read-only `exec/cgroup.events`, and one `cfg(test)` fixture). Every helper write under `/proc` or `/sys` goes through `cgroup::write_control`'s `ControlFile` enum, `proven::write_cgroup_kill` (the two `/sys/fs/cgroup` writers) or `sys::write_sysfs` (the one `/sys/block` file); nothing writes under `/proc`. The lexical test now matches whole expressions with comments and whitespace removed, so an allowed expression cannot hide another on the same line, and its needles also catch aliases (`libc::kill` without a call), `rename`, subprocesses, `start_kill`, raw `syscall`, `ioctl`, `prctl`, `ptrace` and `fallocate` outside `sys.rs`, truncation (`set_len`, `.truncate(true)`, `File::create(`, `truncate`, `ftruncate`), `process_vm_writev`, `pidfd_getfd`, foreign declarations and inline assembly; it scans the helper and `sys.rs`, where its one `unlinkat` is allow-listed by exact expression.
 
 Test fixtures are excluded from the gate. Outside the approved items above, nothing in the workspace calls or names any listed capability.
+
+*The dependency gate (B7, B4 recheck 6 item 2).* Clippy matches paths, so a dependency could offer an equivalent of a listed capability under a name `clippy.toml` does not know. `dependency-gate.json` at the workspace root classifies the dependencies, and `proven::tests::dependencies_that_can_wrap_syscalls_are_allowlisted` checks it against `Cargo.lock`, every workspace manifest and `clippy.toml` on every `cargo test`. A package *can wrap system calls* when it is a raw binding (`libc`, `linux-raw-sys`, `rustix`, `nix`, `syscalls`, `sc`), a `*-sys` crate, or depends directly on one; the rule is in the test, not the file. The test fails when a normal or build dependency of any workspace crate is not under `direct` (each with its `destructive` paths and a reason); a dev-only one is not under `dev`; any package that can wrap system calls is not listed at all (transitive ones under `transitive`, with what pulls them in); an entry names a package `Cargo.lock` lacks or a kind it does not have; an entry's `syscalls` flag disagrees with `Cargo.lock`; a direct entry's `destructive` paths differ, in either direction, from `clippy.toml`'s paths under that crate; `clippy.toml` names a crate that is neither `std` nor a direct entry; a raw binding is direct with no destructive paths; or a dependency is renamed. Today `libc` and `tokio` carry exactly their `clippy.toml` lists, `hyper-util`, `tokio-util` and `rusqlite` reach system calls with no destructive API, `tempfile` is dev-only, and thirteen transitive packages (`mio`, `socket2`, `rustix`, `libsqlite3-sys` and the rest) are listed with their reasons. So a new dependency that can reach system calls joins the file, and its destructive methods join `clippy.toml`, in the same change. `the_dependency_gate_refuses_unlisted_syscall_dependencies` proves each refusal on synthetic lockfiles. Like the rest of the gate it catches honest mistakes, not a malicious dependency.
 
 ## 7.2 Durable reservation vector
 
@@ -979,15 +981,17 @@ kiln-guest embeds the broker at a pinned kilnd commit/binary digest, adds the vd
 
 **B4 recheck 6 hardening follow-ups** (`reviews/2026-11-03-b4-recheck6.md`, ranked; none blocks B5):
 
-1. *Fail closed when a socket filesystem cannot export a file handle* (MEDIUM). `name_to_handle_at` returning `EOPNOTSUPP` becomes the all-zero handle, so the API socket's generation silently falls back to device, inode and birth time; ramfs accepts Unix sockets and returns `EOPNOTSUPP`. Reject `EOPNOTSUPP`, or validate an explicit allowlist of socket filesystems that export handles (`sys.rs` socket generation).
-2. *Make the destructive-method gate dependency-aware* (LOW). Clippy's list names libc/std/tokio paths; a future system-call crate could expose an equivalent the lexical backstop misses. Reject new syscall-wrapper dependencies by manifest allowlist, or require their destructive methods to join `clippy.toml` in the same change.
-3. *Serialize initialization of the private procfs cache* (LOW). The cache publishes its mount ID and descriptor through two atomics; concurrent first callers can each create a procfs root, and the losers' descriptors leak for the process's life. Use `OnceLock` or a mutex.
-4. *Give `read_dir_fd` an independent file description* (LOW). `F_DUPFD_CLOEXEC` shares the directory offset, so its rewind also rewinds the original description. Reopen `.` beneath the held descriptor instead, preserving the fd-native property.
+All five are done in B7 milestone 2 (section 15, *B7 milestone 2: hardening follow-ups*), with the B6 recheck's three LOW items.
+
+1. **Done.** *Fail closed when a socket filesystem cannot export a file handle* (MEDIUM). `name_to_handle_at` returning `EOPNOTSUPP` becomes the all-zero handle, so the API socket's generation silently falls back to device, inode and birth time; ramfs accepts Unix sockets and returns `EOPNOTSUPP`. Reject `EOPNOTSUPP`, or validate an explicit allowlist of socket filesystems that export handles (`sys.rs` socket generation).
+2. **Done.** *Make the destructive-method gate dependency-aware* (LOW). Clippy's list names libc/std/tokio paths; a future system-call crate could expose an equivalent the lexical backstop misses. Reject new syscall-wrapper dependencies by manifest allowlist, or require their destructive methods to join `clippy.toml` in the same change.
+3. **Done.** *Serialize initialization of the private procfs cache* (LOW). The cache publishes its mount ID and descriptor through two atomics; concurrent first callers can each create a procfs root, and the losers' descriptors leak for the process's life. Use `OnceLock` or a mutex.
+4. **Done.** *Give `read_dir_fd` an independent file description* (LOW). `F_DUPFD_CLOEXEC` shares the directory offset, so its rewind also rewinds the original description. Reopen `.` beneath the held descriptor instead, preserving the fd-native property.
 
 **B6 break-it follow-up** (`reviews/2026-11-03-b6-breakit.md`, B6-BI-03, MEDIUM; does not
 block B6):
 
-5. *Keep idle public sockets from starving Health and cleanup.* The server takes one of
+5. **Done.** *Keep idle public sockets from starving Health and cleanup.* The server takes one of
    the 64 global connection permits before it reads peer credentials and holds it for
    the connection's life, and admission has only global connection and ordinary-RPC
    budgets. Any principal the socket's filesystem gate lets in can open 64 sockets that
@@ -3178,6 +3182,217 @@ and transcripts are in `reviews/2026-11-03-b6-fixes-vm/`. Before the phase,
 `/var/lib/kilnd` was byte-copied with the installed `734e275` daemon stopped; afterwards
 it was restored, `cmp` found `kilnd.db` and `kilnd.lock` identical, a stopped copy is
 schema 7 with `quick_check` ok, and the installed binaries' hashes are unchanged.
+
+## B7 milestone 2: hardening follow-ups (November 4, 2026)
+
+Milestone 2 of B7 closes section 11's five B7 follow-ups (B4 recheck 6 items 1 to 4 and
+B6-BI-03) and the three LOW items of the B6 recheck (`reviews/2026-11-04-b6-recheck.md`,
+B6-RC-01 to B6-RC-03), each with a regression test. Milestone 1, retired-token compaction
+(section 16), is separate work on `phase1b/b7-compaction`. Production Firecracker stays
+disabled.
+
+### Ingress fairness (B6-BI-03, MEDIUM)
+
+Daybreak's PoC held all 64 connection slots with idle sockets that never sent an HTTP/2
+preface; a new Health, Get or Delete connection was closed before authorization or
+Health's reserved RPC lane could help. Admission (`admission.rs`) now splits each shared
+budget by the caller's kernel UID:
+
+- *Reserved connection slots.* `--reserved-connections` (default 4) of the
+  `--max-connections` slots are held back from the general pool. A connection takes a
+  general slot while its UID holds fewer than `--max-connections-per-uid` (default 32,
+  half the general pool), otherwise one reserved slot, at most one per UID, otherwise the
+  socket is closed at accept. A reserved-slot connection carries its lane in
+  `PeerIdentity` and serves only Health, GetSandbox and DeleteSandbox; Create, List, Exec
+  and GetExecution on it are `RESOURCE_EXHAUSTED`. The UID comes from `SO_PEERCRED`,
+  read once, before any byte, with one `getsockopt`; unavailable credentials share one
+  bucket (and every RPC but Health from them is still `UNAUTHENTICATED`). There is no
+  public Gc RPC: garbage collection is manager-owned, so the cleanup set is Get and
+  Delete.
+- *Per-UID RPC shares and a cleanup lane.* An ordinary RPC needs a global permit and room
+  in its UID's `--max-concurrent-rpcs-per-uid` share (default 32 of 64). GetSandbox and
+  DeleteSandbox try that lane first and, when it refuses, take one of the
+  `--max-concurrent-cleanup` permits (default 4, at most one per UID). Health keeps its
+  own four. Each share's check and increment happen under one lock, so concurrent
+  callers of one UID never overshoot it. Health exposes the existing totals; the new
+  per-lane counters are internal (`AdmissionSnapshot`), so `kilnd.v1` is unchanged.
+- *Preface deadline.* `AdmittedUnixStream` fails its next read once
+  `--connection-preface-timeout-ms` (default 5000, 100 to 60000) passes before the
+  24-byte HTTP/2 client preface has arrived. The deadline is polled with every read, so
+  a socket that sends nothing is woken for it, and the transport then closes the
+  connection and drops its slot. A slow drip of 23 bytes gets the same deadline.
+
+Residual: a client that sends the preface may then idle on its slot (bounded by its UID's
+share), and several colluding UIDs can fill the general pool; the reserved slots and
+lanes still serve Health and cleanup to up to four other UIDs. Tests:
+`admission::tests::b7_one_uid_cannot_exhaust_connections`,
+`b7_rpc_shares_and_the_cleanup_lane`, `b7_shares_hold_under_concurrent_callers`;
+`service::tests::b7_rpc_shares_cleanup_lane_and_reserved_connections`;
+`server::tests::b7_idle_sockets_are_dropped_at_the_preface_deadline` (fails without the
+deadline: the idle sockets outlive it) and `b7_a_reserved_slot_serves_health_and_cleanup_only`
+on the real transport. The real-daemon regression is
+`scripts/hostile-public-caller.py`, Daybreak's PoC made harder: as root it starts a
+hostile caller under another UID (`nobody` with the socket's group as its one
+supplementary group), which keeps 64 idle sockets open for the whole victim phase and
+reconnects each one the daemon closes; while that runs, Health, GetSandbox and
+DeleteSandbox as root must each succeed within 5, 5 and 60 s; afterwards every hostile
+socket must have been closed by the daemon, none living past the preface deadline plus
+3 s, and at least one must have held its slot until about the deadline (so the victim's
+success is not a failed attack). It runs against the installed daemon and, as the new
+`b7_linux_root_attack_hostile_public_caller_cannot_starve_health_or_cleanup` in
+`scripts/firecracker-regressions.py`, against the Firecracker test deployment's daemon
+with a READY session that the Delete then releases with its ABSENT receipt.
+
+### Socket file handles fail closed (B4 recheck 6 item 1, MEDIUM)
+
+`sys::socket` no longer turns `name_to_handle_at`'s `EOPNOTSUPP` into the all-zero
+handle. A socket filesystem that exports no handle is refused (`ErrorKind::Unsupported`,
+"cannot export file handles"), so `server::bind` fails rather than keep a socket whose
+generation is device, inode and birth time alone; a zero-length or oversized handle is
+an error too. The handle is read before the birth-time check, so ramfs (which lacks
+both) is refused by name. Rejecting outright was chosen over a filesystem allowlist:
+kilnd's socket directories are tmpfs (`/run`), ext4 or XFS, all of which export handles.
+Tests: `sys::tests::b7_a_socket_filesystem_without_file_handles_is_refused` (the errno
+mapping, every platform) and, as root in a private mount namespace on a real ramfs,
+`b7_linux_root_sys_a_ramfs_socket_has_no_generation_and_is_refused`.
+
+### The dependency gate (B4 recheck 6 item 2, LOW)
+
+Section 7.1's *The dependency gate*: `dependency-gate.json`, checked against `Cargo.lock`,
+the manifests and `clippy.toml` by `proven::tests::dependencies_that_can_wrap_syscalls_are_allowlisted`
+on every `cargo test` (so in CI), with
+`the_dependency_gate_refuses_unlisted_syscall_dependencies` for each refusal.
+
+### One procfs root (B4 recheck 6 item 3, LOW)
+
+`sys::procfs::root` now goes through `sys::RootCache`, one mutex over the cached
+descriptor and its unique mount ID: the identity check and, at most once, the creation
+happen under it, so concurrent first callers make exactly one private procfs instance and
+none leaks. A cached descriptor whose identity no longer reads (a forked worker closed it,
+or the number was reused) is replaced and never closed, as before. Workers fork only from
+single-threaded processes, so no child inherits the mutex held. Test:
+`sys::tests::b7_concurrent_first_callers_make_exactly_one_procfs_root` (16 callers behind
+a barrier with a slowed creation: one creation, one shared answer; replacement once
+stale; a failed creation caches nothing).
+
+### Directory listings read their own file description (B4 recheck 6 item 4, LOW)
+
+`sys::read_dir_fd` lists `openat(fd, ".", O_RDONLY|O_DIRECTORY|O_CLOEXEC)`, a fresh open
+file description of the held directory, instead of an `F_DUPFD_CLOEXEC` duplicate
+rewound with `lseek`. `.` resolves to the descriptor's own mount and dentry, so the
+listing is still fd-native, and reading from offset 0 no longer moves the caller's
+offset. Test: `sys::tests::b7_read_dir_fd_leaves_the_callers_offset_alone` (a partly read
+200-entry directory keeps its offset, the listing is whole, and an `O_PATH` descriptor,
+as the helper holds, lists the same).
+
+### The B6 recheck's LOW items
+
+- *B6-RC-01: procfs fallback redirection.* The unprivileged `ENOSYS` component walk
+  (`sys::procfs::open_by_components`) now also compares every component's unique mount
+  ID with the procfs root's. A bind mount of another process's `/proc/<pid>` over this
+  one's is on the same procfs superblock, so `fstatfs` cannot see it, but it is a new
+  mount with a new ID, so the walk is refused ("crosses a mount"), restoring
+  `RESOLVE_NO_XDEV`'s meaning. Cheap (one `statx` per component, on the kernels the
+  walk already requires); the attack still needs root control of the daemon's own mount
+  namespace, which is in its TCB. Tests:
+  `sys::tests::the_component_walk_reads_what_openat2_reads` (a wrong root ID is refused)
+  and, as root, `b7_linux_root_sys_the_component_walk_refuses_a_bind_mounted_procfs_directory`
+  (the PoC's bind mount in a private namespace, with an unredirected control).
+- *B6-RC-02: unit basename under another slice.* The test deployment's schema is now
+  `kilnd-firecracker-test-deployment/2`, which adds `kilnd.cgroup`, the unit's whole
+  cgroup path (`/system.slice/kilnd-fctest.service` for the checked-in file). It must be
+  absolute, normal, below a slice and end in the unit; the daemon's own cgroup must equal
+  it exactly. The session harness enrolls that same path with the helper. Tests:
+  `test_deployment::tests::b6_bi_01_identity_is_observed_not_declared` (the recheck's
+  `/b6.slice/b6-recheck.slice/kilnd-fctest.service`, and a user service's cgroup, are
+  refused), `production_paths_names_and_other_kinds_are_refused` (bad `cgroup` values and
+  schema 1), and `scripts/test-deployment-gate-regressions.sh root`'s new case: the right
+  unit under `b7gate.slice` is refused.
+- *B6-RC-03: nondeterministic capacity coverage.* A test-only hold at H's Inspect entry
+  (`H.inspect`, compiled only into the test helper) holds a failed Create's settlement
+  at its first look. `b6_linux_root_crash_capacity_commit_reply_lost_keeps_one_claim` now
+  runs both settle paths on every run: first H is killed and restarted while the
+  settlement is held, so it fails, the row stays FAILED and charged, the restarted
+  helper replays exactly one claim and only Delete's ABSENT receipt releases it; then a
+  second Create's settlement is held until the census shows H's replacement L, so the
+  failed Create's own settlement proves the token absent and releases the row with that
+  receipt.
+
+### Debug-build hashing
+
+The VM runs found the test helper no longer starting within its fixtures' 30-second wait,
+on main `1c107f9` as on this branch: H hashes its own image (the 71 MiB stripped debug
+test binary) and every approved artifact at start, and unoptimized `sha2` (its portable
+code, since the crate's `asm` feature is off) hashes about 5 MiB/s on the VM (71 MiB in
+13.9 s, 0.68 s at opt-level 3). The workspace `Cargo.toml` now builds `sha2` at
+opt-level 3 in dev and test profiles only (`[profile.dev.package.sha2]`); release builds,
+dependencies and `Cargo.lock` are unchanged.
+
+### Files shared with milestone 1
+
+`helper/firecracker/mod.rs` gains only the five-line test hold above, `manager.rs` only
+the five new `Limits` fields and their defaults, and the workspace `Cargo.toml` only the
+`sha2` profile override. Everything else is in `sys.rs`,
+`server.rs`, `service.rs`, `admission.rs`, `main.rs`, `test_deployment.rs`, the gate
+(`proven.rs` tests, `dependency-gate.json`), the B6 test harness (`tests/session.rs`,
+`tests/recovery.rs`), scripts and docs.
+
+### Evidence
+
+Branch `phase1b/b7-hardening` from main `1c107f9`: `51d1733` (the code), `0147703` (a
+needless borrow clippy 1.88 found on Linux), `ddafe5d` (the `sha2` profile) and the
+documentation commit after it.
+
+- *macOS.* `cargo test --locked --workspace`, default and `firecracker-test-deployment`
+  features: every test passes (kilnd lib 496 passed, 3 ignored). `cargo clippy --locked
+  --all-targets -- -D warnings -D clippy::disallowed_methods` on Rust 1.88 and 1.99,
+  both feature sets: clean. The gate tests, the new dependency gate included, pass;
+  `git diff --check` and `scripts/kilnd-maintenance-tests.py` pass. Mutation check: with
+  the preface deadline removed, `b7_idle_sockets_are_dropped_at_the_preface_deadline`
+  fails ("an idle socket outlived the preface deadline").
+- *CI.* Green on `0147703` (run 41958571713) and `ddafe5d` (run 41969039008): both jobs,
+  tests and clippy on 1.88 and 1.99, default and feature. The first push failed only that
+  needless borrow.
+- *VM, Linux unit tests* (`0147703`, `umask 022`). Default and feature
+  `cargo test --locked --workspace --no-fail-fast`: everything passes (kilnd lib 505
+  passed, 77 ignored) except the untouched `kilnd-broker-protocol` timing test
+  `wide_objects_check_in_well_under_quadratic_time`, whose 200 ms bound the VM's debug
+  build misses (211 to 226 ms alone; main `1c107f9` in the same VM: 180, 180 and 200.5 ms,
+  one failure in three). The new root tests (`b7_linux_root_sys_*`, run with `sudo`):
+  2/2 passed.
+- *VM, gate regressions.* `scripts/test-deployment-gate-regressions.sh feature` and `root`
+  against a feature build: all checks passed, the new slice case refused with "runs in
+  cgroup /b7gate.slice/kilnd-fcgate.service, not in unit "kilnd-fcgate.service" at
+  /system.slice/kilnd-fcgate.service".
+- *VM, real chain* (`ddafe5d`, with jailer and mkfs.xfs rebuilt by
+  `scripts/build-phase1b-tools.sh` at their approved digests, the Firecracker v1.17.0
+  release at `fe726e0b…`, and `bundle-a` rebuilt from kiln-guest `86fbf26` with broker
+  `35fad74f…`). `scripts/firecracker-regressions.py`: **8/8 passed**, the whole session
+  and the new hostile public caller included; under the attack the hostile UID opened and
+  had closed 798,341 sockets, held 66 to the 5-second deadline (none longer than 5.003 s,
+  none left open), while Health, Get and Delete answered in 3 ms, 1 ms and 116 ms and the
+  Delete released the session with its ABSENT receipt. `scripts/firecracker-crash-matrix.py`:
+  **11/11 passed**; the capacity scenario reported both paths, and three more runs of it
+  alone each reported both again.
+- *VM, installed daemon* (`ddafe5d` installed with `scripts/install.sh`): Linux clippy
+  (both feature sets) clean, `scripts/integration-test.sh`,
+  `scripts/daemon-singleton-regressions.sh`, `scripts/state-path-regressions.sh`,
+  `sudo python3 -I scripts/phase0-regressions.py`, `scripts/smoke.sh`,
+  `scripts/kilnd-maintenance-tests.py` and `scripts/hostile-public-caller.py` against
+  `/run/kilnd/kilnd.sock` all passed; the hostile caller there held 66 sockets to the
+  deadline (longest 5.004 s), none left, while Health, Get and Delete succeeded.
+- *Installed state.* Before installing, with kilnd stopped, `/var/lib/kilnd` and the
+  installed binaries were byte-copied and `cmp` found `kilnd.db`, `kilnd.lock` and the
+  three binaries identical; a copy reported schema 10 and `quick_check` ok (the live
+  database was never opened with `sqlite3`). Afterwards main `2a1faea` was reinstalled,
+  whose rebuilt binaries `cmp` identical to the pre-phase copies, the state was restored
+  and `cmp` found `kilnd.db` and `kilnd.lock` identical, and the daemon served with no
+  test account, unit, mount, cgroup, VMM or path left.
+
+Logs, matrices and transcripts are in `reviews/2026-11-04-b7-m2-vm/`. The first real-chain
+attempt, before the `sha2` profile, failed every scenario at "timed out waiting: the
+helper listens" on this branch and on main alike (`phase2/debug-session-main*.log`);
+a `gdb` sample showed H in `sha2::sha256::soft` under `verify_self_image`.
 
 # 16. Retired-token compaction (pre-B7 design)
 
