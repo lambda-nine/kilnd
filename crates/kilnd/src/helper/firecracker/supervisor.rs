@@ -1313,7 +1313,7 @@ mod linux {
         drop(control_s);
         link.step("adopt")?;
         let v = adopt(link, plan, &identity)?;
-        let v_pidfd = pin(v)?;
+        let v_pidfd = pin(v).map_err(|e| Abort::Refused(format!("VMM pidfd: {e}")))?;
         link.after("adopt");
         let actual = as_fs_ids(plan.uid, plan.gid, || {
             executable::observe_process_image(v.pid, Role::Firecracker, vmm.installation_generation)
@@ -1484,37 +1484,42 @@ mod linux {
         plan: &LaunchPlan,
         identity: &CgroupIdentity,
     ) -> Result<ProcessId, Abort> {
-        let leaf = cgroup::open_node(&format!("{}/vm/vmm", plan.cgroup))?;
-        if cgroup::inode(&leaf)? != identity.vmm_ino {
+        // Each failure names what it was reading: adoption races the jailer's exec.
+        let at = |what: &'static str| move |e: io::Error| Abort::Refused(format!("{what}: {e}"));
+        let leaf = cgroup::open_node(&format!("{}/vm/vmm", plan.cgroup)).map_err(at("vm/vmm"))?;
+        if cgroup::inode(&leaf).map_err(at("vm/vmm inode"))? != identity.vmm_ino {
             return Err(Abort::Refused("vm/vmm was replaced".into()));
         }
         let root = storage::open_trusted(&plan.paths.jail_dir)
-            .and_then(|dir| storage::open_dir_at(&dir, "root"))?;
+            .and_then(|dir| storage::open_dir_at(&dir, "root"))
+            .map_err(at("jail root"))?;
         let candidate = link.wait_for(Duration::from_secs(5), || {
             match storage::open_private(&root, "firecracker.pid") {
                 Ok(file) => {
                     use std::io::Read;
                     let mut text = String::new();
-                    file.take(32).read_to_string(&mut text)?;
+                    file.take(32)
+                        .read_to_string(&mut text)
+                        .map_err(|e| io::Error::new(e.kind(), format!("pid file read: {e}")))?;
                     Ok(text.trim().parse::<i32>().ok())
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error),
+                Err(error) => Err(io::Error::new(error.kind(), format!("pid file: {error}"))),
             }
         })?;
-        let procs = cgroup::procs(&leaf)?;
+        let procs = cgroup::procs(&leaf).map_err(at("vm/vmm procs"))?;
         if procs != vec![candidate] {
             return Err(Abort::Refused(format!(
                 "vm/vmm holds {procs:?}, not only {candidate}"
             )));
         }
         // SAFETY: getpid has no preconditions.
-        if ppid(candidate)? != unsafe { libc::getpid() } {
+        if ppid(candidate).map_err(at("VMM status"))? != unsafe { libc::getpid() } {
             return Err(Abort::Refused(
                 "the VMM candidate is not this supervisor's child".into(),
             ));
         }
-        Ok(identify(candidate)?)
+        identify(candidate).map_err(at("VMM stat"))
     }
 
     /// Kills the allocation's `vm` subtree only through its proven journaled identity
