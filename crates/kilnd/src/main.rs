@@ -80,9 +80,27 @@ struct Args {
     /// Simultaneous admitted Unix connections; excess sockets are closed.
     #[arg(long, default_value_t = 64)]
     max_connections: usize,
+    /// Connection slots, of --max-connections, held back for Health, GetSandbox and
+    /// DeleteSandbox; each UID may hold one.
+    #[arg(long, default_value_t = 4)]
+    reserved_connections: usize,
+    /// General connection slots one UID may hold at once.
+    #[arg(long, default_value_t = 32)]
+    max_connections_per_uid: usize,
+    /// How long an accepted connection may take to send the HTTP/2 client preface
+    /// before it is closed and its slot released, in milliseconds.
+    #[arg(long, default_value_t = 5000)]
+    connection_preface_timeout_ms: u64,
     /// Simultaneous ordinary RPC handlers, after message decoding.
     #[arg(long, default_value_t = 64)]
     max_concurrent_rpcs: usize,
+    /// Ordinary RPC handlers one UID may hold at once.
+    #[arg(long, default_value_t = 32)]
+    max_concurrent_rpcs_per_uid: usize,
+    /// Reserved GetSandbox and DeleteSandbox handlers, used once the ordinary RPCs are
+    /// full; each UID may hold one.
+    #[arg(long, default_value_t = 4)]
+    max_concurrent_cleanup: usize,
     /// Reserved simultaneous Health RPC handlers.
     #[arg(long, default_value_t = 4)]
     max_concurrent_health: usize,
@@ -517,7 +535,12 @@ fn validated_limits(args: &Args) -> Result<Limits> {
         max_node_virtual_cpu_slots: args.max_node_virtual_cpu_slots,
         max_node_host_pids: args.max_node_host_pids,
         max_connections: args.max_connections,
+        reserved_connections: args.reserved_connections,
+        max_connections_per_uid: args.max_connections_per_uid,
+        connection_preface_timeout: Duration::from_millis(args.connection_preface_timeout_ms),
         max_concurrent_rpcs: args.max_concurrent_rpcs,
+        max_concurrent_rpcs_per_uid: args.max_concurrent_rpcs_per_uid,
+        max_concurrent_cleanup: args.max_concurrent_cleanup,
         max_concurrent_health: args.max_concurrent_health,
         max_concurrent_execs: args.max_concurrent_execs,
         max_queued_execs_per_sandbox: args.max_queued_execs_per_sandbox,
@@ -534,7 +557,14 @@ fn validated_limits(args: &Args) -> Result<Limits> {
     };
     for (name, value) in [
         ("max-connections", limits.max_connections),
+        ("reserved-connections", limits.reserved_connections),
+        ("max-connections-per-uid", limits.max_connections_per_uid),
         ("max-concurrent-rpcs", limits.max_concurrent_rpcs),
+        (
+            "max-concurrent-rpcs-per-uid",
+            limits.max_concurrent_rpcs_per_uid,
+        ),
+        ("max-concurrent-cleanup", limits.max_concurrent_cleanup),
         ("max-concurrent-health", limits.max_concurrent_health),
         ("max-concurrent-execs", limits.max_concurrent_execs),
         (
@@ -552,6 +582,20 @@ fn validated_limits(args: &Args) -> Result<Limits> {
         if u32::try_from(value).is_err() || value > tokio::sync::Semaphore::MAX_PERMITS {
             bail!("--{name} exceeds u32 semaphore capacity");
         }
+    }
+    // B6-BI-03: the reserve leaves a general pool, and no one UID's share is the whole
+    // general pool or every ordinary RPC.
+    if limits.reserved_connections >= limits.max_connections {
+        bail!("--reserved-connections must be below --max-connections");
+    }
+    if limits.max_connections_per_uid > limits.max_connections - limits.reserved_connections {
+        bail!("--max-connections-per-uid exceeds the general connection slots");
+    }
+    if limits.max_concurrent_rpcs_per_uid > limits.max_concurrent_rpcs {
+        bail!("--max-concurrent-rpcs-per-uid exceeds --max-concurrent-rpcs");
+    }
+    if !(100..=60_000).contains(&args.connection_preface_timeout_ms) {
+        bail!("--connection-preface-timeout-ms must be 100 to 60000");
     }
     let outstanding = limits
         .max_queued_execs_per_sandbox
@@ -792,6 +836,11 @@ mod tests {
         let args = Args::try_parse_from(["kilnd"]).unwrap();
         let limits = validated_limits(&args).unwrap();
         assert_eq!(limits.max_connections, 64);
+        assert_eq!(limits.reserved_connections, 4);
+        assert_eq!(limits.max_connections_per_uid, 32);
+        assert_eq!(limits.connection_preface_timeout, Duration::from_secs(5));
+        assert_eq!(limits.max_concurrent_rpcs_per_uid, 32);
+        assert_eq!(limits.max_concurrent_cleanup, 4);
         assert_eq!(limits.max_request_bytes, 2 << 20);
         assert_eq!(limits.health_probe_timeout, Duration::from_secs(2));
         assert_eq!(limits.max_node_memory_bytes, 3 << 30);
@@ -817,7 +866,11 @@ mod tests {
     fn invalid_limits_fail_with_specific_diagnostics() {
         for flag in [
             "--max-connections",
+            "--reserved-connections",
+            "--max-connections-per-uid",
             "--max-concurrent-rpcs",
+            "--max-concurrent-rpcs-per-uid",
+            "--max-concurrent-cleanup",
             "--max-concurrent-health",
             "--max-concurrent-execs",
             "--max-queued-exec-stdin-bytes",
@@ -881,6 +934,19 @@ mod tests {
                 "default sandbox memory",
             ),
             ("--max-node-pids", "127", "default sandbox pids"),
+            ("--reserved-connections", "64", "below --max-connections"),
+            (
+                "--max-connections-per-uid",
+                "61",
+                "general connection slots",
+            ),
+            (
+                "--max-concurrent-rpcs-per-uid",
+                "65",
+                "exceeds --max-concurrent-rpcs",
+            ),
+            ("--connection-preface-timeout-ms", "99", "100 to 60000"),
+            ("--connection-preface-timeout-ms", "60001", "100 to 60000"),
             (
                 "--max-node-disk-bytes",
                 "1073741823",

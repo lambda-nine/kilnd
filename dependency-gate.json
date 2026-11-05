@@ -1,0 +1,215 @@
+{
+  "about": [
+    "Design section 7.1's dependency gate (Phase 1b B7, B4 recheck 6 item 2). clippy.toml",
+    "disallows destructive paths by name; a dependency could expose an equivalent under",
+    "another name. proven::tests::dependencies_that_can_wrap_syscalls_are_allowlisted",
+    "checks this file against Cargo.lock and every workspace manifest. It fails when:",
+    "a direct (normal or build) dependency of any workspace crate is not under `direct`;",
+    "a dev-only one is not under `dev`; any package in Cargo.lock that can wrap system",
+    "calls (libc, linux-raw-sys, rustix, nix, syscalls, sc, any *-sys crate, or one that",
+    "depends directly on any of them) is not listed at all; an entry names a package",
+    "Cargo.lock lacks, or a kind it does not have; `syscalls` disagrees with Cargo.lock;",
+    "a direct entry's `destructive` paths and clippy.toml's paths under that crate differ;",
+    "clippy.toml names a crate that is neither std nor a direct entry; or a raw-syscall",
+    "crate is direct with no destructive paths. So a new dependency that can reach",
+    "system calls joins this file, and its destructive methods join clippy.toml, in the",
+    "same change. std is the toolchain's, gated by its clippy.toml paths directly."
+  ],
+  "direct": {
+    "anyhow": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "error values"
+    },
+    "clap": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "argument parsing"
+    },
+    "hyper-util": {
+      "syscalls": true,
+      "destructive": [],
+      "why": "TokioIo adapters for the Unix-socket transport; its libc use is socket options, with no removal, signal or subprocess API"
+    },
+    "libc": {
+      "syscalls": true,
+      "destructive": [
+        "libc::kill",
+        "libc::killpg",
+        "libc::tgkill",
+        "libc::pidfd_send_signal",
+        "libc::syscall",
+        "libc::unlink",
+        "libc::unlinkat",
+        "libc::rmdir",
+        "libc::remove",
+        "libc::umount",
+        "libc::umount2",
+        "libc::unmount",
+        "libc::rename",
+        "libc::renameat",
+        "libc::renameat2",
+        "libc::renameatx_np",
+        "libc::truncate",
+        "libc::ftruncate",
+        "libc::fallocate",
+        "libc::fallocate64",
+        "libc::posix_fallocate",
+        "libc::prctl",
+        "libc::ptrace",
+        "libc::process_vm_writev",
+        "libc::process_vm_readv",
+        "libc::pidfd_getfd",
+        "libc::ioctl",
+        "libc::execve",
+        "libc::execv",
+        "libc::execvp",
+        "libc::execvpe",
+        "libc::execveat",
+        "libc::fexecve",
+        "libc::posix_spawn",
+        "libc::posix_spawnp",
+        "libc::system"
+      ],
+      "why": "the raw system-call surface: every destructive function is in clippy.toml, reachable only from the approved modules"
+    },
+    "prost": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "protobuf encoding"
+    },
+    "rusqlite": {
+      "syscalls": true,
+      "destructive": [],
+      "why": "SQLite through bundled libsqlite3-sys; no removal API. SQLite's own -wal/-shm/-journal maintenance is the one dependency-internal unlink (design 7.1)"
+    },
+    "serde": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "serialization"
+    },
+    "serde_json": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "JSON"
+    },
+    "sha2": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "SHA-256"
+    },
+    "thiserror": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "error derives"
+    },
+    "tokio": {
+      "syscalls": true,
+      "destructive": [
+        "tokio::process::Child::kill",
+        "tokio::process::Child::start_kill",
+        "tokio::fs::remove_file",
+        "tokio::fs::remove_dir",
+        "tokio::fs::remove_dir_all",
+        "tokio::fs::rename",
+        "tokio::fs::File::set_len",
+        "tokio::fs::File::create",
+        "tokio::fs::OpenOptions::truncate",
+        "tokio::fs::write",
+        "tokio::process::Command::new"
+      ],
+      "why": "the async runtime: its file removal, rename, truncation, signal and subprocess APIs are in clippy.toml"
+    },
+    "tokio-stream": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "stream adapters"
+    },
+    "tokio-util": {
+      "syscalls": true,
+      "destructive": [],
+      "why": "CancellationToken and task trackers; no file, signal or subprocess API"
+    },
+    "tonic": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "gRPC"
+    },
+    "tonic-prost": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "gRPC codec"
+    },
+    "tonic-prost-build": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "kilnd-api's build script only: generates the gRPC stubs on the build host, linked into no binary"
+    },
+    "tower": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "service adapters"
+    },
+    "tracing": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "logging"
+    },
+    "tracing-subscriber": {
+      "syscalls": false,
+      "destructive": [],
+      "why": "log formatting to stderr"
+    }
+  },
+  "dev": {
+    "h2": {
+      "syscalls": false,
+      "why": "raw HTTP/2 clients in admission tests"
+    },
+    "tempfile": {
+      "syscalls": true,
+      "why": "test scratch directories; TempDir removes its own on drop. Never a normal dependency"
+    }
+  },
+  "transitive": {
+    "anstyle-query": {
+      "why": "clap's terminal styling (Windows console queries)"
+    },
+    "anstyle-wincon": {
+      "why": "clap's terminal styling (Windows console)"
+    },
+    "cpufeatures": {
+      "why": "sha2's CPU feature detection (getauxval)"
+    },
+    "errno": {
+      "why": "rustix's errno access, for tempfile"
+    },
+    "getrandom": {
+      "why": "random numbers for tempfile names and hash seeds"
+    },
+    "libsqlite3-sys": {
+      "why": "rusqlite's bundled SQLite"
+    },
+    "linux-raw-sys": {
+      "why": "rustix's raw Linux bindings, for tempfile"
+    },
+    "mio": {
+      "why": "tokio's event loop"
+    },
+    "nu-ansi-term": {
+      "why": "tracing-subscriber's terminal colors (Windows console)"
+    },
+    "rustix": {
+      "why": "tempfile's system calls; tempfile is dev-only, so rustix is never named by workspace code"
+    },
+    "signal-hook-registry": {
+      "why": "tokio's signal handling (sigaction, not signal sending)"
+    },
+    "socket2": {
+      "why": "tokio's and hyper-util's socket options"
+    },
+    "windows-sys": {
+      "why": "Windows bindings of several crates; not built for Linux or macOS"
+    }
+  }
+}

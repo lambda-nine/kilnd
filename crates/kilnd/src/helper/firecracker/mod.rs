@@ -2212,6 +2212,10 @@ impl Node {
                             .await
                         }
                         FirecrackerOperation::Inspect { allocation_id } => {
+                            // Holds a settlement's first look for the deterministic
+                            // capacity crash scenario (B7, B6-RC-03).
+                            #[cfg(test)]
+                            workers::faults::hold("H.inspect").await;
                             self.inspect(instance, allocation_id, deadline).await
                         }
                         FirecrackerOperation::List => {

@@ -16,9 +16,10 @@
 #   sudo scripts/test-deployment-gate-regressions.sh root BINARY
 #       A feature build as a real test account in a real transient unit: with everything
 #       matching it selects the deployment (the control); a wrong account, a wrong socket
-#       group, a wrong unit and no unit at all are each refused on their own, before any
-#       state is opened. Root, in the kiln VM. It creates the account and group
-#       kilnd-fcgate and the units kilnd-fcgate.service and kilnd-fcgate-other.service,
+#       group, a wrong unit, the right unit under another slice (B6-RC-02, B7) and no
+#       unit at all are each refused on their own, before any state is opened. Root, in
+#       the kiln VM. It creates the account and group kilnd-fcgate, the units
+#       kilnd-fcgate.service and kilnd-fcgate-other.service and the slice b7gate.slice,
 #       and removes them on exit.
 set -eu
 
@@ -35,11 +36,11 @@ pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
 SERVING="serving the isolated Firecracker test deployment"
 
-# manifest FILE ROOT ACCOUNT GROUP UNIT
+# manifest FILE ROOT ACCOUNT GROUP UNIT: the unit's cgroup is /system.slice/UNIT.
 manifest() {
     cat >"$1" <<EOF
 {
-  "schema": "kilnd-firecracker-test-deployment/1",
+  "schema": "kilnd-firecracker-test-deployment/2",
   "deployment": "isolated-test",
   "profile": "offline-768-v1",
   "kilnd": {
@@ -47,7 +48,8 @@ manifest() {
     "socket_group": "$4",
     "state_dir": "$2/state-parent/state",
     "account": "$3",
-    "unit": "$5"
+    "unit": "$5",
+    "cgroup": "/system.slice/$5"
   },
   "helper": {
     "root": "$2/helper",
@@ -150,10 +152,11 @@ root)
     account=kilnd-fcgate
     unit=$account.service
     other_unit=$account-other.service
+    other_slice=b7gate.slice
     run=$(mktemp -d /var/tmp/kilnd-fcgate.XXXXXX)
     created=0
     cleanup() {
-        for u in "$unit" "$other_unit"; do
+        for u in "$unit" "$other_unit" "$other_slice"; do
             systemctl stop "$u" >/dev/null 2>&1 || true
             systemctl reset-failed "$u" >/dev/null 2>&1 || true
         done
@@ -176,10 +179,11 @@ root)
     other_group=nogroup
     getent group nogroup >/dev/null 2>&1 || other_group=nobody
 
-    # case NAME UNIT ACCOUNT-IN-FILE GROUP-ON-CLI [systemd|setpriv]: a fresh root and file,
-    # then the daemon as $account, in UNIT or outside any unit.
+    # case NAME UNIT ACCOUNT-IN-FILE GROUP-ON-CLI [systemd|setpriv] [SLICE]: a fresh root
+    # and file, then the daemon as $account, in UNIT (under SLICE, default system.slice)
+    # or outside any unit.
     attempt() {
-        name=$1 in_unit=$2 file_account=$3 cli_group=$4 how=$5
+        name=$1 in_unit=$2 file_account=$3 cli_group=$4 how=$5 slice=${6:-system.slice}
         root=$run/$name
         mkdir -m 0755 "$root"
         install -d -m 0700 -o "$account" -g "$account" "$root/socket" "$root/state-parent" "$root/helper"
@@ -192,6 +196,7 @@ root)
         if [ "$how" = systemd ]; then
             systemctl reset-failed "$in_unit" >/dev/null 2>&1 || true
             timeout 60 systemd-run --quiet --wait --pipe --collect --unit "$in_unit" \
+                --slice "$slice" \
                 --property=User="$account" --property=Group="$account" -- "$@" \
                 >"$root/kilnd.log" 2>&1 </dev/null || status=$?
         else
@@ -223,6 +228,12 @@ root)
     attempt unit "$other_unit" "$account" "$account" systemd
     expect_refused "a wrong unit alone is refused" "$run/unit/kilnd.log" "$status" \
         "$run/unit" "not in unit \"$unit\"" "UIDs" "--socket-group"
+
+    # B6-RC-02: the right unit name, but under another slice, so not the enrolled cgroup.
+    attempt slice "$unit" "$account" "$account" systemd "$other_slice"
+    expect_refused "the right unit under another slice is refused" "$run/slice/kilnd.log" \
+        "$status" "$run/slice" "runs in cgroup /$other_slice/$unit, not in unit \"$unit\"" \
+        "UIDs" "--socket-group"
 
     attempt nounit - "$account" "$account" setpriv
     expect_refused "the right account outside any unit is refused" "$run/nounit/kilnd.log" \

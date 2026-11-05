@@ -179,7 +179,14 @@ pub(super) fn deployment_for(name: &str) -> TestDeployment {
         return checked_in;
     }
     let mut value: Value = serde_json::from_str(CHECKED_IN).unwrap();
-    for field in ["socket", "socket_group", "state_dir", "account", "unit"] {
+    for field in [
+        "socket",
+        "socket_group",
+        "state_dir",
+        "account",
+        "unit",
+        "cgroup",
+    ] {
         let text = value["kilnd"][field]
             .as_str()
             .unwrap()
@@ -449,6 +456,7 @@ fn deployment_json(deployment: &TestDeployment) -> Value {
             "state_dir": deployment.kilnd.state_dir,
             "account": deployment.kilnd.account,
             "unit": deployment.kilnd.unit,
+            "cgroup": deployment.kilnd.cgroup,
         },
         "helper": {
             "root": deployment.helper.root,
@@ -477,7 +485,7 @@ fn enroll(real: &Real, config: &ChildConfig, image: &Path, daemon: &Daemon) {
     let enrollment = Enrollment {
         instance_id: daemon.instance,
         unit: daemon.deployment.kilnd.unit.clone(),
-        cgroup: format!("/system.slice/{}", daemon.deployment.kilnd.unit),
+        cgroup: daemon.deployment.kilnd.cgroup.clone(),
         uid: daemon.uid,
         gid: daemon.gid,
         executable,

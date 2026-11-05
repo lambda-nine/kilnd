@@ -1,5 +1,5 @@
 {
-  "schema": "kilnd-firecracker-test-deployment/1",
+  "schema": "kilnd-firecracker-test-deployment/2",
   "deployment": "isolated-test",
   "profile": "offline-768-v1",
   "kilnd": {
@@ -7,7 +7,8 @@
     "socket_group": "kilnd-fctest",
     "state_dir": "/var/lib/kilnd-fctest",
     "account": "kilnd-fctest",
-    "unit": "kilnd-fctest.service"
+    "unit": "kilnd-fctest.service",
+    "cgroup": "/system.slice/kilnd-fctest.service"
   },
   "helper": {
     "root": "/run/kilnd-fctest-helper",

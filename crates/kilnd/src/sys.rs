@@ -46,6 +46,49 @@ pub fn process_exists(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// A process-wide descriptor cache keyed by an identity (B7, B4 recheck 6 item 3): the
+/// private procfs root and its unique mount ID. One mutex orders the check and the
+/// creation, so concurrent first callers make exactly one root and none leaks; a cached
+/// descriptor whose identity no longer matches (a forked worker closed it, or its number
+/// was reused) is replaced, never closed, since the number may now be another file.
+///
+/// The mutex is held only across the identity read and, once, the creation. A worker
+/// forks only from a single-threaded process (`workers::spawn_process`), so no fork
+/// inherits it locked; a multithreaded fork would already risk the allocator's own locks.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct RootCache(std::sync::Mutex<Option<(std::os::fd::RawFd, u64)>>);
+
+#[cfg(any(target_os = "linux", test))]
+impl RootCache {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// The cached descriptor and identity if `identity` still reads that identity from
+    /// it; otherwise one `make`, recorded and kept open for the process's life.
+    pub(crate) fn get(
+        &self,
+        identity: impl Fn(std::os::fd::RawFd) -> std::io::Result<u64>,
+        make: impl FnOnce() -> std::io::Result<std::fs::File>,
+    ) -> std::io::Result<(std::os::fd::RawFd, u64)> {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let mut cached = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((fd, id)) = *cached
+            && identity(fd).ok() == Some(id)
+        {
+            return Ok((fd, id));
+        }
+        let file = make()?;
+        let id = identity(file.as_raw_fd())?;
+        let fd = file.into_raw_fd();
+        *cached = Some((fd, id));
+        Ok((fd, id))
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::CStr;
@@ -175,21 +218,27 @@ mod linux {
     }
 
     /// Every entry of the directory `dir` holds, except `.` and `..`: `getdents64` on a
-    /// `F_DUPFD_CLOEXEC` duplicate rewound to the start, so the listing is of exactly
-    /// that inode, never of a `/proc/self/fd/N` pathname a mount could shadow. More
-    /// than `limit` entries is an error.
+    /// fresh open file description of that same directory, `openat(dir, ".",
+    /// O_RDONLY|O_DIRECTORY|O_CLOEXEC)`, so the listing is of exactly that inode, never
+    /// of a `/proc/self/fd/N` pathname a mount could shadow. `.` resolves to the held
+    /// descriptor's own mount and dentry, crossing nothing. The description is
+    /// independent: unlike an `F_DUPFD` duplicate, reading it from the start leaves the
+    /// caller's directory offset where it was (B7, B4 recheck 6 item 4). More than
+    /// `limit` entries is an error.
     pub fn read_dir_fd(dir: &File, limit: usize) -> io::Result<Vec<DirEntry>> {
-        // SAFETY: duplicating a live descriptor this process owns.
-        let fd = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        // SAFETY: a live directory descriptor and a NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: fcntl returned a new descriptor nothing else owns.
+        // SAFETY: openat returned a new descriptor nothing else owns.
         let dup = unsafe { OwnedFd::from_raw_fd(fd) };
-        // SAFETY: rewinding the shared directory offset to its start.
-        if unsafe { libc::lseek(dup.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
         // u64 storage keeps the records 8-byte aligned, as the kernel writes them.
         let mut buffer = vec![0u64; 4096];
         let bytes = buffer.len() * 8;
@@ -281,7 +330,6 @@ mod linux {
         use std::fs::File;
         use std::io::{self, Read};
         use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-        use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
         const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
         const RESOLVE_NO_XDEV: u64 = 0x01;
@@ -290,8 +338,8 @@ mod linux {
         const RESOLVE_BENEATH: u64 = 0x08;
         const PROC_SUPER_MAGIC: libc::__fsword_t = 0x9fa0;
 
-        static ROOT_FD: AtomicI32 = AtomicI32::new(-1);
-        static ROOT_ID: AtomicU64 = AtomicU64::new(0);
+        /// The private root and its unique mount ID (B7, B4 recheck 6 item 3).
+        static ROOT: super::super::RootCache = super::super::RootCache::new();
 
         #[repr(C)]
         struct OpenHow {
@@ -356,20 +404,10 @@ mod linux {
             }
         }
 
-        /// The cached root, re-verified by its unique mount ID; a fresh one otherwise.
-        pub(in crate::sys) fn root() -> io::Result<RawFd> {
-            let fd = ROOT_FD.load(Ordering::Acquire);
-            if fd >= 0 && unique_mount_id(fd).ok() == Some(ROOT_ID.load(Ordering::Acquire)) {
-                return Ok(fd);
-            }
-            let file = new_root()?;
-            let id = unique_mount_id(file.as_raw_fd())?;
-            // The descriptor stays open for the process's life: a cached number is
-            // never closed, so a stale one can only fail its identity check above.
-            let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
-            ROOT_ID.store(id, Ordering::Release);
-            ROOT_FD.store(fd, Ordering::Release);
-            Ok(fd)
+        /// The cached root and its unique mount ID, re-verified on every use; a fresh
+        /// one otherwise. Concurrent first callers make exactly one (`RootCache`).
+        pub(in crate::sys) fn root() -> io::Result<(RawFd, u64)> {
+            ROOT.get(unique_mount_id, new_root)
         }
 
         fn check(relative: &str) -> io::Result<()> {
@@ -397,7 +435,7 @@ mod linux {
         pub fn open(relative: &str, flags: libc::c_int) -> io::Result<File> {
             check(relative)?;
             let path = std::ffi::CString::new(relative)?;
-            let root = root()?;
+            let (root, root_id) = root()?;
             let how = OpenHow {
                 flags: (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
                 mode: 0,
@@ -425,7 +463,7 @@ mod linux {
                     if error.raw_os_error() == Some(libc::ENOSYS)
                         && unsafe { libc::geteuid() } != 0 =>
                 {
-                    open_by_components(root, relative, flags)
+                    open_by_components(root, root_id, relative, flags)
                 }
                 Err(error) => Err(error),
             }
@@ -434,9 +472,15 @@ mod linux {
         /// `openat2`'s resolution by hand, for an unprivileged process whose seccomp
         /// filter refuses `openat2`: `check` already allowed only plain names, each is
         /// opened `O_NOFOLLOW` beneath the previous one (no link of any kind is followed),
-        /// and each must still be procfs (`RESOLVE_NO_XDEV`'s substitute).
+        /// and each must still be procfs on the root's own mount: `RESOLVE_NO_XDEV`'s
+        /// substitute. The superblock check alone cannot see a bind mount of another
+        /// `/proc` path on the same procfs (B6-RC-01); the unique mount ID can, since a
+        /// bind mount is a new mount with a new ID. That attack needs root control of
+        /// the daemon's own mount namespace, which is in its TCB; the check is the cheap
+        /// defense in depth B7 adds.
         pub(in crate::sys) fn open_by_components(
             root: RawFd,
+            root_id: u64,
             relative: &str,
             flags: libc::c_int,
         ) -> io::Result<File> {
@@ -466,6 +510,11 @@ mod linux {
                 if stat.f_type != PROC_SUPER_MAGIC {
                     return Err(io::Error::other(format!(
                         "{relative:?} leaves procfs at {part:?}"
+                    )));
+                }
+                if unique_mount_id(file.as_raw_fd())? != root_id {
+                    return Err(io::Error::other(format!(
+                        "{relative:?} crosses a mount at {part:?}"
                     )));
                 }
                 if last {
@@ -508,7 +557,7 @@ mod linux {
                 return Err(io::Error::from(io::ErrorKind::InvalidInput));
             }
             let path = std::ffi::CString::new(format!("{pid}/exe"))?;
-            let root = root()?;
+            let (root, _) = root()?;
             // SAFETY: a live root descriptor and a NUL-terminated relative path.
             let fd = unsafe { libc::openat(root, path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
             if fd < 0 {
@@ -1008,9 +1057,10 @@ pub mod socket {
         handle: Handle,
     }
 
-    /// `name_to_handle_at`'s answer: type, length and bytes. All zero where the
-    /// filesystem cannot export handles, which leaves the birth time as the only
-    /// generation field (none of kilnd's supported socket filesystems).
+    /// `name_to_handle_at`'s answer: type, length and bytes. On Linux it is never empty:
+    /// a socket filesystem that cannot export a handle is refused (B7, B4 recheck 6
+    /// item 1), so the birth time is never the only generation field there. macOS has no
+    /// file handles; its sockets carry the empty one.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Handle {
         kind: i32,
@@ -1018,11 +1068,31 @@ pub mod socket {
         bytes: [u8; 128],
     }
 
+    #[cfg(target_os = "macos")]
     const NO_HANDLE: Handle = Handle {
         kind: 0,
         len: 0,
         bytes: [0; 128],
     };
+
+    /// What a failed `name_to_handle_at` means. `ENOENT` is a vanished name; every other
+    /// error is an error, `EOPNOTSUPP` included: a filesystem that exports no handle
+    /// (ramfs, say, which accepts Unix sockets) has no inode generation to compare, and
+    /// device, inode and birth time alone are not a generation (B4 recheck 6 item 1).
+    /// There is no all-zero fallback.
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn handle_error(error: io::Error) -> io::Result<Option<()>> {
+        match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::EOPNOTSUPP) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the socket directory's filesystem cannot export file handles \
+                 (name_to_handle_at: EOPNOTSUPP), so a socket's generation cannot be \
+                 proved; put the socket on tmpfs, ext4 or XFS",
+            )),
+            _ => Err(error),
+        }
+    }
 
     #[cfg(target_os = "linux")]
     fn handle_at(dir: &File, name: &CString) -> io::Result<Option<Handle>> {
@@ -1050,14 +1120,15 @@ pub mod socket {
             )
         };
         if rc != 0 {
-            let error = io::Error::last_os_error();
-            return match error.raw_os_error() {
-                Some(libc::ENOENT) => Ok(None),
-                Some(libc::EOPNOTSUPP) => Ok(Some(NO_HANDLE)),
-                _ => Err(error),
-            };
+            return handle_error(io::Error::last_os_error()).map(|_| None);
         }
-        let len = raw.handle_bytes.min(128);
+        if raw.handle_bytes == 0 || raw.handle_bytes > 128 {
+            return Err(io::Error::other(format!(
+                "name_to_handle_at returned a {}-byte handle",
+                raw.handle_bytes
+            )));
+        }
+        let len = raw.handle_bytes;
         let mut bytes = [0u8; 128];
         bytes[..len as usize].copy_from_slice(&raw.f_handle[..len as usize]);
         Ok(Some(Handle {
@@ -1105,15 +1176,17 @@ pub mod socket {
             }
             return Err(error);
         }
+        // The file handle first: a filesystem without one is refused by name, whatever
+        // else it lacks (ramfs has neither handles nor birth times).
+        let Some(handle) = handle_at(dir, name)? else {
+            return Ok(None);
+        };
         if stx.stx_mask & libc::STATX_BTIME == 0 {
             return Err(io::Error::other(
                 "the socket directory's filesystem reports no birth time (STATX_BTIME)",
             ));
         }
         let socket = u32::from(stx.stx_mode) & libc::S_IFMT == libc::S_IFSOCK;
-        let Some(handle) = handle_at(dir, name)? else {
-            return Ok(None);
-        };
         Ok(Some((
             socket,
             SocketGeneration {
@@ -1212,15 +1285,328 @@ mod tests {
         use super::linux::procfs;
         use std::io::Read;
         let relative = procfs::own("cgroup");
-        let root = procfs::root().unwrap();
+        let (root, root_id) = procfs::root().unwrap();
         let mut walked = String::new();
-        procfs::open_by_components(root, &relative, libc::O_RDONLY)
+        procfs::open_by_components(root, root_id, &relative, libc::O_RDONLY)
             .unwrap()
             .read_to_string(&mut walked)
             .unwrap();
         assert_eq!(walked, procfs::read_to_string(&relative).unwrap());
         assert!(walked.starts_with("0::/"), "{walked}");
         // `self` is a link: never followed.
-        assert!(procfs::open_by_components(root, "self/cgroup", libc::O_RDONLY).is_err());
+        assert!(procfs::open_by_components(root, root_id, "self/cgroup", libc::O_RDONLY).is_err());
+        // A root ID that is not the walk's mount refuses the first component.
+        let error =
+            procfs::open_by_components(root, root_id ^ 1, &relative, libc::O_RDONLY).unwrap_err();
+        assert!(error.to_string().contains("crosses a mount"), "{error}");
+    }
+
+    /// B4 recheck 6 item 1: `EOPNOTSUPP` from `name_to_handle_at` is an error, never the
+    /// all-zero handle; a vanished name is still "nothing there".
+    #[test]
+    fn b7_a_socket_filesystem_without_file_handles_is_refused() {
+        use super::socket::handle_error;
+        use std::io;
+        let error = handle_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains("cannot export file handles"),
+            "{error}"
+        );
+        assert!(matches!(
+            handle_error(io::Error::from_raw_os_error(libc::ENOENT)),
+            Ok(None)
+        ));
+        assert_eq!(
+            handle_error(io::Error::from_raw_os_error(libc::EIO))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+    }
+
+    /// B4 recheck 6 item 3: concurrent first callers make exactly one root and all get
+    /// it; a cached descriptor whose identity changed is replaced once, and the old one
+    /// is not closed.
+    #[test]
+    fn b7_concurrent_first_callers_make_exactly_one_procfs_root() {
+        use super::RootCache;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        static CACHE: RootCache = RootCache::new();
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static STALE: AtomicBool = AtomicBool::new(false);
+        let directory = tempfile::tempdir().unwrap();
+        let path = Arc::new(directory.path().to_path_buf());
+        // The identity of a descriptor: its inode, or another value once marked stale.
+        fn identity(fd: std::os::fd::RawFd) -> std::io::Result<u64> {
+            // SAFETY: fstat writes into the zeroed buffer.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(stat.st_ino + u64::from(STALE.load(Ordering::SeqCst)))
+        }
+        let barrier = Arc::new(Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let (barrier, path) = (barrier.clone(), path.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    CACHE
+                        .get(identity, || {
+                            MADE.fetch_add(1, Ordering::SeqCst);
+                            // Widen the race: every other caller arrives meanwhile.
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            std::fs::File::open(&*path)
+                        })
+                        .unwrap()
+                })
+            })
+            .collect();
+        let roots: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(
+            MADE.load(Ordering::SeqCst),
+            1,
+            "more than one root was made"
+        );
+        assert!(roots.iter().all(|r| *r == roots[0]), "{roots:?}");
+        // Still cached: no second make.
+        let again = CACHE.get(identity, || unreachable!()).unwrap();
+        assert_eq!(again, roots[0]);
+        // The cached descriptor no longer reads its identity: replaced once, the old
+        // descriptor left open (its number may be another file's by now).
+        STALE.store(true, Ordering::SeqCst);
+        let made = CACHE
+            .get(identity, || {
+                MADE.fetch_add(1, Ordering::SeqCst);
+                std::fs::File::open(&*path)
+            })
+            .unwrap();
+        assert_eq!(MADE.load(Ordering::SeqCst), 2);
+        assert_ne!(made.0, roots[0].0);
+        assert!(
+            identity(roots[0].0).is_ok(),
+            "the replaced descriptor was closed"
+        );
+        // A make that fails caches nothing.
+        STALE.store(false, Ordering::SeqCst);
+        let fresh = RootCache::new();
+        assert!(
+            fresh
+                .get(identity, || Err(std::io::Error::other("no root")))
+                .is_err()
+        );
+        assert_eq!(
+            fresh
+                .get(identity, || std::fs::File::open(&*path))
+                .unwrap()
+                .1,
+            { identity(made.0).unwrap() }
+        );
+    }
+
+    /// B4 recheck 6 item 4: listing a directory reads its own open file description, so
+    /// the caller's directory offset is exactly where it was, and the listing is whole.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn b7_read_dir_fd_leaves_the_callers_offset_alone() {
+        use std::os::fd::AsRawFd;
+        let directory = tempfile::tempdir().unwrap();
+        for n in 0..200 {
+            std::fs::File::create(directory.path().join(format!("entry-{n:03}"))).unwrap();
+        }
+        let dir = std::fs::File::open(directory.path()).unwrap();
+        // Advance the caller's own offset partway with a small getdents64.
+        let mut buffer = vec![0u64; 64];
+        // SAFETY: the buffer is writable for its length; the descriptor is live.
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                dir.as_raw_fd(),
+                buffer.as_mut_ptr().cast::<u8>(),
+                buffer.len() * 8,
+            )
+        };
+        assert!(n > 0);
+        // SAFETY: reading the descriptor's offset.
+        let before = unsafe { libc::lseek(dir.as_raw_fd(), 0, libc::SEEK_CUR) };
+        assert!(before > 0, "the caller's offset did not advance");
+        let entries = super::read_dir_fd(&dir, 1000).unwrap();
+        assert_eq!(entries.len(), 200);
+        // SAFETY: as above.
+        let after = unsafe { libc::lseek(dir.as_raw_fd(), 0, libc::SEEK_CUR) };
+        assert_eq!(
+            after, before,
+            "read_dir_fd moved the caller's directory offset"
+        );
+        // An O_PATH descriptor, as the helper holds, lists the same.
+        let path = std::ffi::CString::new(directory.path().to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0);
+        // SAFETY: open returned a new descriptor.
+        let held = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        assert_eq!(super::read_dir_fd(&held, 1000).unwrap().len(), 200);
+    }
+
+    /// Runs `body` on a thread of its own with a private copy of the mount namespace, so
+    /// mounts it makes vanish with the thread.
+    #[cfg(target_os = "linux")]
+    fn in_private_mount_namespace<T: Send + 'static>(
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        std::thread::spawn(move || {
+            // SAFETY: unsharing this thread's filesystem attributes and mount namespace.
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_NEWNS) },
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: NUL-terminated strings; MS_REC|MS_PRIVATE stops propagation out.
+            let rc = unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+            body()
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// B6-RC-01: a bind mount of another process's procfs directory over this one's, on
+    /// the same procfs superblock, passes the superblock check but not the mount check.
+    /// Root, in a private mount namespace on one thread (the PoC's `procfs-fallback-
+    /// redirect.sh` without the seccomp filter: the walk is called directly).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: sudo the kilnd lib test binary --ignored b7_linux_root_sys"]
+    fn b7_linux_root_sys_the_component_walk_refuses_a_bind_mounted_procfs_directory() {
+        use super::linux::procfs;
+        use std::io::Read;
+        let refused = in_private_mount_namespace(|| {
+            // SAFETY: getpid has no preconditions.
+            let me = unsafe { libc::getpid() };
+            let target = std::ffi::CString::new(format!("/proc/{me}")).unwrap();
+            // SAFETY: NUL-terminated paths; a plain bind of PID 1's directory.
+            let rc = unsafe {
+                libc::mount(
+                    c"/proc/1".as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+            let root = std::fs::File::open("/proc").unwrap();
+            use std::os::fd::AsRawFd;
+            let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+            // SAFETY: statx writes into the zeroed buffer.
+            assert_eq!(
+                unsafe {
+                    libc::statx(
+                        root.as_raw_fd(),
+                        c"".as_ptr(),
+                        libc::AT_EMPTY_PATH,
+                        0x4000,
+                        &mut stx,
+                    )
+                },
+                0
+            );
+            let root_id = stx.stx_mnt_id;
+            // Through the bind: the walk is refused at the redirected component.
+            let redirected = procfs::open_by_components(
+                root.as_raw_fd(),
+                root_id,
+                &format!("{me}/cgroup"),
+                libc::O_RDONLY,
+            )
+            .unwrap_err()
+            .to_string();
+            // Without it (another process's own directory): the walk reads.
+            let mut text = String::new();
+            procfs::open_by_components(root.as_raw_fd(), root_id, "1/cgroup", libc::O_RDONLY)
+                .unwrap()
+                .read_to_string(&mut text)
+                .unwrap();
+            assert!(text.starts_with("0::/"), "{text}");
+            redirected
+        });
+        assert!(refused.contains("crosses a mount"), "{refused}");
+    }
+
+    /// B4 recheck 6 item 1 on a real kernel: ramfs accepts a Unix socket but exports no
+    /// file handle, so kilnd refuses to bind its API socket there (the socket's
+    /// generation could not be proved before a later unlink).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: sudo the kilnd lib test binary --ignored b7_linux_root_sys"]
+    fn b7_linux_root_sys_a_ramfs_socket_has_no_generation_and_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mountpoint = scratch.path().join("ramfs");
+        std::fs::create_dir(&mountpoint).unwrap();
+        let errors = in_private_mount_namespace(move || {
+            let target = std::ffi::CString::new(mountpoint.to_str().unwrap()).unwrap();
+            // SAFETY: NUL-terminated strings; a fresh ramfs instance.
+            let rc = unsafe {
+                libc::mount(
+                    c"kilnd-b7-ramfs".as_ptr(),
+                    target.as_ptr(),
+                    c"ramfs".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+            std::fs::set_permissions(
+                &mountpoint,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+            // The raw socket: ramfs takes it, and its generation is refused.
+            let dir = std::fs::File::open(&mountpoint).unwrap();
+            let _listener =
+                std::os::unix::net::UnixListener::bind(mountpoint.join("raw.sock")).unwrap();
+            let raw = super::socket::socket_generation_at(&dir, std::ffi::OsStr::new("raw.sock"))
+                .unwrap_err();
+            // kilnd's own bind refuses the directory.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let bound = runtime
+                .block_on(crate::server::bind(
+                    &mountpoint.join("run/kilnd.sock"),
+                    None,
+                ))
+                .err()
+                .expect("kilnd bound its socket on ramfs");
+            (raw, format!("{bound:#}"))
+        });
+        assert_eq!(
+            errors.0.kind(),
+            std::io::ErrorKind::Unsupported,
+            "{}",
+            errors.0
+        );
+        assert!(
+            errors.1.contains("cannot export file handles"),
+            "{}",
+            errors.1
+        );
     }
 }

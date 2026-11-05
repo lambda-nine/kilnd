@@ -16,13 +16,13 @@ use anyhow::{Context, Result, bail};
 use kilnd_api::v1::kilnd_service_server::KilndServiceServer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::Connected;
 use tracing::{info, warn};
 
+use crate::admission::{ConnectionLane, ConnectionPermit};
 use crate::lock::ExclusiveFileLock;
 use crate::manager::Manager;
 use crate::runtime::Runtime;
@@ -43,12 +43,26 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PeerIdentity {
     pub uid: Option<u32>,
+    /// The connection's slot: a reserved one serves Health and cleanup only.
+    pub lane: ConnectionLane,
+}
+
+/// The HTTP/2 client connection preface, `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`.
+const HTTP2_PREFACE_BYTES: usize = 24;
+
+/// The deadline for a connection's first 24 bytes (B6-BI-03). Until the preface is in,
+/// every read also polls the deadline, so an idle socket is woken and failed at the
+/// deadline even while no byte arrives; transport then closes it and drops its slot.
+struct PrefaceDeadline {
+    remaining: usize,
+    deadline: Pin<Box<tokio::time::Sleep>>,
 }
 
 struct AdmittedUnixStream {
     stream: UnixStream,
     peer: PeerIdentity,
-    _permit: OwnedSemaphorePermit,
+    preface: Option<PrefaceDeadline>,
+    _permit: ConnectionPermit,
 }
 
 impl Connected for AdmittedUnixStream {
@@ -65,7 +79,26 @@ impl AsyncRead for AdmittedUnixStream {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
+        if let Some(preface) = self.preface.as_mut()
+            && preface.deadline.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no HTTP/2 preface before the connection deadline",
+            )));
+        }
+        let before = buf.filled().len();
+        let read = Pin::new(&mut self.stream).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = read {
+            let got = buf.filled().len() - before;
+            if let Some(preface) = self.preface.as_mut() {
+                preface.remaining = preface.remaining.saturating_sub(got);
+                if preface.remaining == 0 {
+                    self.preface = None;
+                }
+            }
+        }
+        read
     }
 }
 
@@ -402,29 +435,37 @@ async fn serve_with_final_wait<R: Runtime>(
     let service = KilndServiceServer::new(Service::new(manager.clone()))
         .max_decoding_message_size(limits.max_request_bytes)
         .max_encoding_message_size(limits.max_response_bytes);
+    let preface_timeout = limits.connection_preface_timeout;
     let incoming = UnixListenerStream::new(listener).filter_map(move |conn| match conn {
         Ok(stream) => {
-            let permit = admission.try_connection().ok()?;
-            // The socket's credentials are fixed at connect, so this one read
-            // is what the log shows and what every request is authorized as.
-            let uid = match stream.peer_cred() {
-                Ok(c) => {
-                    info!(
-                        uid = c.uid(),
-                        gid = c.gid(),
-                        pid = c.pid().unwrap_or(0),
-                        "client connected"
-                    );
-                    Some(c.uid())
-                }
-                Err(e) => {
-                    warn!(error = %e, "client connected; peer credentials unavailable");
-                    None
-                }
-            };
+            // The socket's credentials are fixed at connect, so this one read is what
+            // admission shares by, what the log shows and what every request is
+            // authorized as. It is one getsockopt, before any byte is read.
+            let credentials = stream.peer_cred();
+            let uid = credentials.as_ref().ok().map(|c| c.uid());
+            // B6-BI-03: a general slot within this UID's share, else one of the slots
+            // held back for Health and cleanup, else the socket is closed here.
+            let permit = admission.try_connection(uid).ok()?;
+            match &credentials {
+                Ok(c) => info!(
+                    uid = c.uid(),
+                    gid = c.gid(),
+                    pid = c.pid().unwrap_or(0),
+                    reserved = permit.lane() == ConnectionLane::Reserved,
+                    "client connected"
+                ),
+                Err(e) => warn!(error = %e, "client connected; peer credentials unavailable"),
+            }
             Some(Ok(AdmittedUnixStream {
                 stream,
-                peer: PeerIdentity { uid },
+                peer: PeerIdentity {
+                    uid,
+                    lane: permit.lane(),
+                },
+                preface: Some(PrefaceDeadline {
+                    remaining: HTTP2_PREFACE_BYTES,
+                    deadline: Box::pin(tokio::time::sleep(preface_timeout)),
+                }),
                 _permit: permit,
             }))
         }
@@ -663,6 +704,218 @@ mod tests {
         drop(recovered);
         wait_connections(&manager, 0).await;
         stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn wait_admitted(manager: &Manager<FakeRuntime>, current: u64, rejected: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = manager.admission().snapshot().connections;
+                if (snapshot.current, snapshot.rejected) == (current, rejected) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "connections never reached {current} admitted and {rejected} rejected: {:?}",
+                manager.admission().snapshot()
+            )
+        });
+    }
+
+    async fn client(
+        path: &Path,
+    ) -> kilnd_api::v1::kilnd_service_client::KilndServiceClient<tonic::transport::Channel> {
+        let path = path.to_path_buf();
+        let channel = tonic::transport::Endpoint::try_from("http://kilnd.invalid")
+            .unwrap()
+            .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+                let path = path.clone();
+                async move {
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
+                        UnixStream::connect(path).await?,
+                    ))
+                }
+            }))
+            .await
+            .unwrap();
+        kilnd_api::v1::kilnd_service_client::KilndServiceClient::new(channel)
+    }
+
+    async fn serve_with(
+        limits: Limits,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<Manager<FakeRuntime>>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("run/kilnd.sock");
+        let manager = Arc::new(Manager::new(
+            FakeRuntime::default(),
+            Store::open_in_memory().unwrap(),
+            limits,
+        ));
+        let listener = bind(&path, None).await.unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            manager.clone(),
+            listener,
+            async {
+                let _ = stop_rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+        (temp, path, manager, stop_tx, server)
+    }
+
+    /// B6-BI-03 on the real transport: one UID's idle sockets get its share of general
+    /// slots and one reserved slot, the rest are closed at accept, and every admitted one
+    /// that never sends the HTTP/2 preface (none, or 23 of its 24 bytes) is closed at
+    /// the preface deadline with its slot released. A connection that sends the preface
+    /// in time stays open past the deadline.
+    #[tokio::test]
+    async fn b7_idle_sockets_are_dropped_at_the_preface_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let deadline = Duration::from_millis(400);
+        let (_temp, path, manager, stop_tx, server) = serve_with(Limits {
+            max_connections: 8,
+            reserved_connections: 2,
+            max_connections_per_uid: 3,
+            connection_preface_timeout: deadline,
+            ..Limits::default()
+        })
+        .await;
+        // SAFETY: geteuid has no preconditions.
+        let me = Some(unsafe { libc::geteuid() });
+        let started = std::time::Instant::now();
+        let mut idle = Vec::new();
+        for _ in 0..10 {
+            idle.push(UnixStream::connect(&path).await.unwrap());
+        }
+        // One of the admitted four is a slow drip: 23 bytes, never the 24th.
+        wait_admitted(&manager, 4, 6).await;
+        assert_eq!(manager.admission().connections_held_by(me), (3, 1));
+        assert_eq!(manager.admission().snapshot().rejected_connection_shares, 6);
+        for stream in &mut idle {
+            stream
+                .write_all(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r"[..23])
+                .await
+                .ok();
+        }
+        let mut closed = Vec::new();
+        for mut stream in idle {
+            let mut byte = [0; 64];
+            let closed_at = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match stream.read(&mut byte).await {
+                        Ok(0) | Err(_) => break started.elapsed(),
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .await
+            .expect("an idle socket outlived the preface deadline");
+            closed.push(closed_at);
+        }
+        let late = closed.iter().filter(|t| **t >= deadline).count();
+        assert!(late >= 4, "the admitted sockets closed early: {closed:?}");
+        wait_admitted(&manager, 0, 6).await;
+        assert_eq!(manager.admission().connections_held_by(me), (0, 0));
+
+        // A real client sends its preface at once and stays past the deadline.
+        let mut live = client(&path).await;
+        tokio::time::sleep(deadline * 2).await;
+        live.health(kilnd_api::v1::HealthRequest {}).await.unwrap();
+        assert_eq!(manager.admission().snapshot().connections.current, 1);
+        drop(live);
+        wait_admitted(&manager, 0, 6).await;
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    /// B6-BI-03: once a UID holds its whole general share, its next connection gets a
+    /// reserved slot, where Health, Get and Delete are served and every other RPC is
+    /// refused; and a further connection from it is closed.
+    #[tokio::test]
+    async fn b7_a_reserved_slot_serves_health_and_cleanup_only() {
+        use kilnd_api::v1 as pb;
+        let (_temp, path, manager, stop_tx, server) = serve_with(Limits {
+            max_connections: 4,
+            reserved_connections: 1,
+            max_connections_per_uid: 2,
+            ..Limits::default()
+        })
+        .await;
+        let mut general = client(&path).await;
+        let _second = client(&path).await;
+        let id = general
+            .create_sandbox(pb::CreateSandboxRequest::default())
+            .await
+            .unwrap()
+            .into_inner()
+            .sandbox
+            .unwrap()
+            .id;
+        wait_admitted(&manager, 2, 0).await;
+        let mut reserved = client(&path).await;
+        wait_admitted(&manager, 3, 0).await;
+        assert_eq!(
+            manager.admission().snapshot().reserved_connections.current,
+            1
+        );
+        reserved.health(pb::HealthRequest {}).await.unwrap();
+        for status in [
+            reserved
+                .create_sandbox(pb::CreateSandboxRequest::default())
+                .await
+                .unwrap_err(),
+            reserved
+                .list_sandboxes(pb::ListSandboxesRequest::default())
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+            assert!(status.message().contains("reserved slot"), "{status:?}");
+        }
+        reserved
+            .get_sandbox(pb::GetSandboxRequest {
+                id: id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        reserved
+            .delete_sandbox(pb::DeleteSandboxRequest { id })
+            .await
+            .unwrap();
+        // The UID's share and its reserved slot are both held: the next is closed.
+        let mut excess = UnixStream::connect(&path).await.unwrap();
+        let mut byte = [0];
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut excess, &mut byte),
+        )
+        .await
+        .expect("the excess socket stayed open");
+        assert!(matches!(read, Ok(0) | Err(_)));
+        wait_admitted(&manager, 3, 1).await;
+        stop_tx.send(()).unwrap();
+        drop((general, reserved));
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .unwrap()

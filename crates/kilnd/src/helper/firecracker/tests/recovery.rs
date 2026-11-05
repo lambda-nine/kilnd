@@ -400,9 +400,21 @@ async fn b6_linux_root_crash_absent_sync_failure_stays_charged_until_retried() {
     );
 }
 
-/// L dies right after committing a capacity claim, so its reply is lost. The claim
-/// survives L's death and the helper's restart as exactly one claim, never a second; the
-/// row is charged until the token's removal proves it absent.
+/// L dies right after committing a capacity claim, so its reply is lost, and the failed
+/// Create settles its own token at once. Which way that settlement goes once depended
+/// on timing (B6-RC-03): it proves the never-launched allocation absent if H has already
+/// replaced L, and otherwise fails and leaves the claim to survive a helper restart. B7
+/// makes both deterministic, each on every run, by holding the settlement at its first
+/// Inspect (the test-only `H.inspect` hold):
+///
+/// 1. *Settlement held across a helper restart.* H is killed while the settlement is
+///    held, so it fails; the row stays FAILED and charged, the restarted helper replays
+///    exactly one claim, and only Delete's ABSENT receipt releases it.
+/// 2. *Settlement after L's replacement.* The hold is released only once H has a new L,
+///    so the failed Create's own settlement proves the token absent and releases the
+///    row with that receipt.
+///
+/// Either way there is one claim, never a second, and only a matching receipt frees it.
 #[tokio::test]
 #[ignore = "needs root with the B4 launch capabilities: run scripts/firecracker-crash-matrix.py"]
 async fn b6_linux_root_crash_capacity_commit_reply_lost_keeps_one_claim() {
@@ -412,41 +424,24 @@ async fn b6_linux_root_crash_capacity_commit_reply_lost_keeps_one_claim() {
     let mut transcript = Transcript::default();
     daemon.start(&deployment.image);
     daemon.wait_serving(real).await;
-    real.fixture.fault("L.admit.after_commit.panic");
-    let created = daemon.kilndctl(&mut transcript, &["create", "--net", "none"], None);
+
+    // 1. The settlement is held while the helper restarts.
+    transcript.text.push_str(
+        "# path 1: the failed Create's settlement is held at its first Inspect; H restarts under it\n\n",
+    );
+    let (create, id, allocation, _) = lose_capacity_reply(&deployment, daemon).await;
+    real.fixture.kill_helper().await;
+    real.fixture.clear("H.inspect.hold");
+    real.start().await;
+    let (text, created) = create.join().unwrap();
+    transcript.text.push_str(&text);
     assert_ne!(created.code, 0, "no READY without the reply");
-    real.fixture.clear("L.admit.after_commit.panic");
-    let id = daemon.sandbox_ids()[0].clone();
-    let allocation = Id128::parse(&daemon.row(&id, "allocation_id").unwrap()).unwrap();
-    // The failed Create settles its token at once. When H has already replaced L, that
-    // settlement can prove the never-launched allocation absent and release the row with
-    // the token's own ABSENT receipt (once in three VM runs, Nov 3); otherwise the row stays
-    // charged and the claim must survive a helper restart. Either way there is one claim,
-    // never a second, and only a matching receipt releases it.
-    if !charged(daemon, &id) {
-        transcript
-            .text
-            .push_str("# the failed Create's own settlement proved the token absent at once\n\n");
-        assert_eq!(deployment.allocations(daemon.instance).len(), 1);
-        let released = assert_released(&deployment, daemon, &id, allocation, "failed");
-        assert_eq!(deployment.claims(), 0);
-        daemon.kilndctl(&mut transcript, &["get", &id], None);
-        finish("crash-capacity-reply-lost", &transcript, &deployment);
-        matrix(
-            "capacity commit, reply lost (L dies after commit)",
-            json!({"released_by": "the failed Create's settlement (ABSENT receipt)", "release": released}),
-        );
-        return;
-    }
+    assert_eq!(daemon.row(&id, "state").as_deref(), Some("failed"));
+    assert!(charged(daemon, &id), "the held settlement released the row");
     assert!(
         unreleased_claim(&deployment, allocation),
         "the claim committed"
     );
-    assert_eq!(deployment.claims(), 1);
-    transcript
-        .text
-        .push_str("# the helper restarts on the same ledger\n\n");
-    deployment.restart_helper().await;
     assert_eq!(
         deployment.claims(),
         1,
@@ -461,13 +456,88 @@ async fn b6_linux_root_crash_capacity_commit_reply_lost_keeps_one_claim() {
         removed.stderr,
         real.fixture.log()
     );
-    let released = assert_released(&deployment, daemon, &id, allocation, "deleted");
+    let restart = assert_released(&deployment, daemon, &id, allocation, "deleted");
     assert_eq!(deployment.claims(), 0);
+
+    // 2. The settlement proceeds only once H has replaced L.
+    transcript
+        .text
+        .push_str("# path 2: the failed Create's settlement is released once H has replaced L\n\n");
+    let (create, id, allocation, dead) = lose_capacity_reply(&deployment, daemon).await;
+    let replaced = async {
+        loop {
+            let ledger = real.fixture.census().await["ledger"].clone();
+            if ledger.as_i64().is_some_and(|pid| pid > 1) && ledger != dead {
+                return ledger;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let ledger = tokio::time::timeout(Duration::from_secs(3), replaced)
+        .await
+        .unwrap_or_else(|_| panic!("H did not replace L\n{}", real.fixture.log()));
+    real.fixture.clear("H.inspect.hold");
+    let (text, created) = create.join().unwrap();
+    transcript.text.push_str(&text);
+    assert_ne!(created.code, 0, "no READY without the reply");
+    assert_eq!(deployment.allocations(daemon.instance).len(), 2);
+    let settled = assert_released(&deployment, daemon, &id, allocation, "failed");
+    assert_eq!(deployment.claims(), 0);
+    daemon.kilndctl(&mut transcript, &["get", &id], None);
+
     finish("crash-capacity-reply-lost", &transcript, &deployment);
     matrix(
         "capacity commit, reply lost (L dies after commit)",
-        json!({"claims_after_helper_restart": 1, "released_by": "Delete (ABSENT receipt)", "release": released}),
+        json!({
+            "settlement_held_across_helper_restart": {
+                "claims_after_helper_restart": 1,
+                "released_by": "Delete (ABSENT receipt)",
+                "release": restart,
+            },
+            "settlement_after_ledger_replaced": {
+                "old_ledger": dead,
+                "new_ledger": ledger,
+                "released_by": "the failed Create's settlement (ABSENT receipt)",
+                "release": settled,
+            },
+        }),
     );
+}
+
+/// A Create whose capacity commit loses its reply: L panics right after committing, and
+/// the failed Create's settlement is held at its first Inspect (`H.inspect`), the row
+/// FAILED and charged with one claim. Returns the background `kilndctl create`, the
+/// sandbox, its allocation and the ledger worker that died.
+async fn lose_capacity_reply(
+    deployment: &Deployment,
+    daemon: &Daemon,
+) -> (
+    std::thread::JoinHandle<(String, super::session::Ran)>,
+    String,
+    Id128,
+    Value,
+) {
+    let real = &deployment.real;
+    let before = daemon.sandbox_ids().len();
+    let ledger = real.fixture.census().await["ledger"].clone();
+    real.fixture.clear("H.inspect.reached");
+    real.fixture.fault("H.inspect.hold");
+    real.fixture.fault("L.admit.after_commit.panic");
+    let create = daemon.kilndctl_background(&["create", "--net", "none"]);
+    real.fixture.wait_reached("H.inspect").await;
+    real.fixture.clear("L.admit.after_commit.panic");
+    let ids = daemon.sandbox_ids();
+    assert_eq!(ids.len(), before + 1, "{ids:?}");
+    let id = ids.last().unwrap().clone();
+    let allocation = Id128::parse(&daemon.row(&id, "allocation_id").unwrap()).unwrap();
+    assert_eq!(daemon.row(&id, "state").as_deref(), Some("failed"));
+    assert!(charged(daemon, &id));
+    assert!(
+        unreleased_claim(&deployment, allocation),
+        "the claim committed"
+    );
+    assert_eq!(deployment.claims(), 1);
+    (create, id, allocation, ledger)
 }
 
 /// The helper restarts under a READY session. Its supervisor stops the VM on H's death,
@@ -1266,6 +1336,72 @@ async fn b6_linux_root_attack_hostile_io_beside_real_lifecycle_requests() {
         })
         .collect();
     matrix("hostile I/O beside real lifecycle requests", json!(worst));
+}
+
+/// B6-BI-03 on the real chain (Phase 1b B7 milestone 2): a hostile public caller, a
+/// UID the socket's group lets in, keeps 64 sockets open that never send the HTTP/2
+/// preface, reconnecting each one the daemon closes. Health, Get and Delete from another
+/// UID (root here) still answer within their deadlines, every hostile socket is closed
+/// (over-share ones at accept, admitted ones at the preface deadline), and the Delete
+/// releases the session with its ABSENT receipt. `scripts/hostile-public-caller.py`
+/// runs the attack and checks the timings; the same script runs against the installed
+/// daemon.
+#[tokio::test]
+#[ignore = "needs root with the B4 launch capabilities: run scripts/firecracker-regressions.py"]
+async fn b7_linux_root_attack_hostile_public_caller_cannot_starve_health_or_cleanup() {
+    let deployment = Deployment::new(&["fctest"], NodeOptions::default()).await;
+    let daemon = deployment.daemon("fctest");
+    let real = &deployment.real;
+    let mut transcript = Transcript::default();
+    daemon.start(&deployment.image);
+    daemon.wait_serving(real).await;
+    let (id, allocation) = ready_session(daemon, &mut transcript);
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/hostile-public-caller.py");
+    let socket = daemon.socket().to_str().unwrap().to_string();
+    let kilndctl = daemon.bin.join("kilndctl");
+    let attack = tokio::task::spawn_blocking({
+        let (socket, id) = (socket.clone(), id.clone());
+        move || {
+            output(
+                Command::new("python3")
+                    .arg("-I")
+                    .arg(&script)
+                    .args(["--socket", &socket, "--kilndctl"])
+                    .arg(&kilndctl)
+                    .args(["--sandbox", &id, "--hostile-user", "nobody"]),
+            )
+        }
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&attack.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&attack.stderr).into_owned();
+    transcript.text.push_str(&format!(
+        "$ python3 -I scripts/hostile-public-caller.py --socket {socket} --sandbox {id} --hostile-user nobody\n{stdout}{stderr}[exit {:?}]\n\n",
+        attack.status.code()
+    ));
+    assert!(attack.status.success(), "{stdout}\n{stderr}");
+    let line = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("B7 hostile: "))
+        .expect("the attack's result line");
+    let result: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(result["passed"], json!(true), "{result}");
+    let released = assert_released(&deployment, daemon, &id, allocation, "deleted");
+    let after = daemon.kilndctl(&mut transcript, &["health"], None);
+    assert_eq!(after.code, 0, "{}", after.stderr);
+    finish("attack-hostile-public-caller", &transcript, &deployment);
+    let victim: Vec<Value> = result["victim"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| json!({"request": call["command"], "seconds": call["seconds"], "limit": call["limit"]}))
+        .collect();
+    matrix(
+        "hostile public caller: 64 idle sockets (B6-BI-03)",
+        json!({"victim": victim, "hostile": result["hostile"], "release": released}),
+    );
 }
 
 /// B5-R1 on the real chain: L stalls inside Remove's final fence. Delete answers within

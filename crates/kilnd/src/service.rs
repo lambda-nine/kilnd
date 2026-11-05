@@ -7,6 +7,7 @@ use kilnd_api::v1 as pb;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
+use crate::admission::{ConnectionLane, RpcClass, RpcPermit};
 use crate::manager::{CreateRequest, Error, ExecRequest, Manager};
 use crate::model::{
     Captured, Execution, ExecutionState, Network, Sandbox, SandboxSpec, SandboxState,
@@ -33,7 +34,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         let _permit = self
             .manager
             .admission()
-            .try_rpc(true)
+            .try_health()
             .map_err(|_| Status::resource_exhausted("Health RPC capacity reached"))?;
         let h = self.manager.health().await.map_err(status)?;
         let status = if h.shutting_down {
@@ -62,8 +63,8 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         &self,
         req: Request<pb::CreateSandboxRequest>,
     ) -> Result<Response<pb::CreateSandboxResponse>, Status> {
-        let _permit = self.rpc_permit()?;
         let uid = caller_uid(&req)?;
+        let _permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
         let spec = req.into_inner().spec.unwrap_or_default();
         let sandbox = self
             .manager
@@ -79,8 +80,8 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         &self,
         req: Request<pb::GetSandboxRequest>,
     ) -> Result<Response<pb::GetSandboxResponse>, Status> {
-        let _permit = self.rpc_permit()?;
         let uid = caller_uid(&req)?;
+        let _permit = self.rpc_permit(&req, RpcClass::Cleanup, uid)?;
         let req = req.into_inner();
         self.manager.authorize(&req.id, uid).map_err(status)?;
         let (sandbox, executions) = self
@@ -97,8 +98,8 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         &self,
         req: Request<pb::ListSandboxesRequest>,
     ) -> Result<Response<pb::ListSandboxesResponse>, Status> {
-        let _permit = self.rpc_permit()?;
         let uid = caller_uid(&req)?;
+        let _permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
         let req = req.into_inner();
         let limits = self.manager.limits();
         let paginated = req.page_size.is_some();
@@ -167,8 +168,8 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         &self,
         req: Request<pb::DeleteSandboxRequest>,
     ) -> Result<Response<pb::DeleteSandboxResponse>, Status> {
-        let _permit = self.rpc_permit()?;
         let uid = caller_uid(&req)?;
+        let _permit = self.rpc_permit(&req, RpcClass::Cleanup, uid)?;
         let id = req.into_inner().id;
         self.manager.authorize(&id, uid).map_err(status)?;
         let sandbox = self.manager.delete(&id).await.map_err(status)?;
@@ -182,8 +183,8 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         req: Request<pb::ExecRequest>,
     ) -> Result<Response<pb::ExecResponse>, Status> {
         let received_at = tokio::time::Instant::now();
-        let _permit = self.rpc_permit()?;
         let uid = caller_uid(&req)?;
+        let _permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
         let req = req.into_inner();
         self.manager
             .authorize(&req.sandbox_id, uid)
@@ -210,8 +211,8 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         &self,
         req: Request<pb::GetExecutionRequest>,
     ) -> Result<Response<pb::GetExecutionResponse>, Status> {
-        let _permit = self.rpc_permit()?;
         let uid = caller_uid(&req)?;
+        let _permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
         let id = req.into_inner().id;
         // Decide before the row's output BLOBs are read.
         self.manager.authorize_execution(&id, uid).map_err(status)?;
@@ -223,10 +224,27 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
 }
 
 impl<R: Runtime> Service<R> {
-    fn rpc_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+    /// The caller's RPC permit (B7, B6-BI-03). A connection on a reserved slot serves
+    /// only Health and cleanup; an ordinary RPC needs a global permit within the UID's
+    /// share, and a cleanup RPC may fall back to the cleanup lane.
+    fn rpc_permit<T>(
+        &self,
+        req: &Request<T>,
+        class: RpcClass,
+        uid: u32,
+    ) -> Result<RpcPermit, Status> {
+        let lane = req
+            .extensions()
+            .get::<PeerIdentity>()
+            .map_or(ConnectionLane::General, |peer| peer.lane);
+        if lane == ConnectionLane::Reserved && class == RpcClass::Ordinary {
+            return Err(Status::resource_exhausted(
+                "connection capacity reached: this connection holds a reserved slot, which serves only Health, GetSandbox and DeleteSandbox",
+            ));
+        }
         self.manager
             .admission()
-            .try_rpc(false)
+            .try_rpc(class, Some(uid))
             .map_err(|_| Status::resource_exhausted("ordinary RPC capacity reached"))
     }
 }
@@ -594,9 +612,10 @@ mod tests {
     /// What the transport attaches: tests have no socket, so they name a caller.
     fn as_uid<T>(message: T, uid: u32) -> Request<T> {
         let mut request = Request::new(message);
-        request
-            .extensions_mut()
-            .insert(PeerIdentity { uid: Some(uid) });
+        request.extensions_mut().insert(PeerIdentity {
+            uid: Some(uid),
+            lane: ConnectionLane::General,
+        });
         request
     }
 
@@ -692,7 +711,7 @@ mod tests {
         });
         gate.entered().await;
         let error = service
-            .get_sandbox(as_root(pb::GetSandboxRequest::default()))
+            .list_sandboxes(as_root(pb::ListSandboxesRequest::default()))
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
@@ -721,6 +740,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manager.admission().snapshot().rpcs.current, 0);
+    }
+
+    fn on_lane<T>(message: T, uid: u32, lane: ConnectionLane) -> Request<T> {
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(PeerIdentity {
+            uid: Some(uid),
+            lane,
+        });
+        request
+    }
+
+    /// B6-BI-03: one UID's ordinary RPCs stop at its share while another UID's proceed;
+    /// its Get and Delete still reach the cleanup lane, one at a time; and a connection
+    /// on a reserved slot serves Health, Get and Delete but nothing else.
+    #[tokio::test]
+    async fn b7_rpc_shares_cleanup_lane_and_reserved_connections() {
+        let manager = Arc::new(Manager::new(
+            FakeRuntime::default(),
+            Store::open_in_memory().unwrap(),
+            Limits {
+                max_concurrent_rpcs: 4,
+                max_concurrent_rpcs_per_uid: 1,
+                max_concurrent_cleanup: 2,
+                ..Limits::default()
+            },
+        ));
+        let service = Service::new(manager.clone());
+        let hostile = create_as(&service, 1001).await;
+        let victim = create_as(&service, 1002).await;
+        let held = manager
+            .admission()
+            .try_rpc(RpcClass::Ordinary, Some(1001))
+            .unwrap();
+        let error = service
+            .create_sandbox(as_uid(pb::CreateSandboxRequest::default(), 1001))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(manager.admission().snapshot().rejected_rpc_shares, 1);
+        create_as(&service, 1002).await;
+        // Its own Get through the cleanup lane; with that lane's one permit per UID
+        // held, a second is refused.
+        service
+            .get_sandbox(as_uid(
+                pb::GetSandboxRequest {
+                    id: hostile.id.clone(),
+                    ..Default::default()
+                },
+                1001,
+            ))
+            .await
+            .unwrap();
+        let cleanup = manager
+            .admission()
+            .try_rpc(RpcClass::Cleanup, Some(1001))
+            .unwrap();
+        assert_eq!(manager.admission().snapshot().cleanup.current, 1);
+        let error = service
+            .get_sandbox(as_uid(
+                pb::GetSandboxRequest {
+                    id: hostile.id.clone(),
+                    ..Default::default()
+                },
+                1001,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        drop((held, cleanup));
+
+        // A reserved-slot connection: Health, Get and Delete, never an ordinary RPC.
+        let reserved = ConnectionLane::Reserved;
+        for error in [
+            service
+                .create_sandbox(on_lane(pb::CreateSandboxRequest::default(), 1002, reserved))
+                .await
+                .unwrap_err(),
+            service
+                .list_sandboxes(on_lane(pb::ListSandboxesRequest::default(), 1002, reserved))
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            assert!(error.message().contains("reserved slot"), "{error:?}");
+        }
+        service
+            .health(on_lane(pb::HealthRequest {}, 1002, reserved))
+            .await
+            .unwrap();
+        service
+            .get_sandbox(on_lane(
+                pb::GetSandboxRequest {
+                    id: victim.id.clone(),
+                    ..Default::default()
+                },
+                1002,
+                reserved,
+            ))
+            .await
+            .unwrap();
+        service
+            .delete_sandbox(on_lane(
+                pb::DeleteSandboxRequest {
+                    id: victim.id.clone(),
+                },
+                1002,
+                reserved,
+            ))
+            .await
+            .unwrap();
+        let snapshot = manager.admission().snapshot();
+        assert_eq!((snapshot.rpcs.current, snapshot.cleanup.current), (0, 0));
     }
 
     #[tokio::test]
@@ -1622,7 +1753,13 @@ mod tests {
         let created = fake.state().created.len();
         let exec_calls = fake.state().exec_calls.len();
         // No extension at all, then the transport's "the kernel gave no answer".
-        for peer in [None, Some(PeerIdentity { uid: None })] {
+        for peer in [
+            None,
+            Some(PeerIdentity {
+                uid: None,
+                lane: ConnectionLane::General,
+            }),
+        ] {
             fn identified<T>(message: T, peer: Option<PeerIdentity>) -> Request<T> {
                 let mut request = Request::new(message);
                 if let Some(peer) = peer {
