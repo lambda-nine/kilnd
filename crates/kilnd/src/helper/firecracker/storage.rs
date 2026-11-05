@@ -2276,7 +2276,15 @@ mod tests {
         ]
         .into();
         assert_eq!(found, expected);
-        let after = families(ObservationBackend::Real.observe_offline(&known));
+        // A loop detach completes asynchronously: give the kernel a moment to unbind it.
+        let mut after = families(ObservationBackend::Real.observe_offline(&known));
+        for _ in 0..50 {
+            if after.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            after = families(ObservationBackend::Real.observe_offline(&known));
+        }
         assert!(after.is_empty(), "the test left resources behind: {after:?}");
     }
 
