@@ -21,6 +21,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   a typed `RemoveTarget`; Firecracker refuses a legacy target before any wire call. The
   measured per-token bound is 20 KiB, the fence allowance 128 MiB, delete batches 16 tokens.
   Schema 1 ledgers must be re-provisioned. Production Firecracker stays disabled.
+- Fix a B4 launch race the B7 real-chain run found: the supervisor could observe the VMM
+  before its exec, when the ptrace-read check still refuses it, and refused a few
+  launches in a hundred under load. It now waits out that refusal, bounded, and refusal
+  reasons name their launch step. The VM test build optimizes dependencies so a real
+  helper meets its wire deadlines.
 
 - Design the Phase 1b retired-token compaction for B7 (design section 16): today's node
   ledger admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1

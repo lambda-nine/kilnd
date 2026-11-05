@@ -4407,8 +4407,10 @@ the section 9.1 Runtime contract. Production Firecracker stays disabled (milesto
   `tests/compaction.rs` uses the real H, L, listener and adapter (and, for the restored
   database, the real manager and Store) with fake host effects and a FULL-sync ledger, at an
   exact fault point. They run on macOS and in CI, and in the kiln VM through
-  `scripts/firecracker-crash-matrix.py`, whose runner now passes `--include-ignored` so
-  these ordinary tests are selected. Real VMs add nothing at these boundaries, which are
+  `scripts/firecracker-crash-matrix.py` (the attack regressions likewise through
+  `scripts/firecracker-regressions.py`), whose runner gives these unprivileged scenarios to
+  `cargo test` as the calling user: the fixture enrolls the test process's own account, and
+  an instance account is never root. Real VMs add nothing at these boundaries, which are
   ledger and process boundaries; `b7_linux_root_compaction_cycles` and the B4 to B6 suites
   cover the real chain.
 - **"H task or channel restart while L lives" is not a reachable boundary here.** H owns
@@ -4421,6 +4423,20 @@ the section 9.1 Runtime contract. Production Firecracker stays disabled (milesto
   share, so `AttachOutcome::NoSpace` is gone; enrollment past the policy maximum is refused
   when it would leave a slot short of its share, and a policy whose allowance cannot give
   every slot a never-admitted window (fewer than four entries per slot) is refused.
+- **A B4 adoption race, found by the real-chain run.** J exits once it has cloned V and
+  written the PID file, which can be before V has dropped to the VMM's IDs and exec'd.
+  Until then the ptrace-read check on `/proc/<V>/exe` refuses S, which takes the VMM's
+  filesystem IDs for it, so on a loaded host a few launches in a hundred were refused
+  `at adopt: Permission denied`. S now waits out exactly that refusal, within five seconds
+  and while V lives, and still checks the observed image against the journal. Refusal
+  reasons now name the launch step they came from.
+- **The VM test build optimizes dependencies.** `scripts/b4-vm-tests.sh` builds kilnd's
+  own code as before (debug, with overflow checks) but its dependencies at `opt-level=2`:
+  a real helper hashes its image and parses the bundle's 33 MB manifest at start and in
+  every Preflight, which unoptimized `sha2` and `serde_json` made slower than the wire
+  deadlines. The faster helper start exposed a test race in B6's capacity scenario (the
+  Delete became the daemon's first call to the restarted helper, while Health answered
+  from its 5 s cache); the scenario now lets a fresh Health probe reattach first.
 - **The offline inventory reports and destroys nothing.** Root settles whatever it names
   and runs it again; the clear accepts only an `explained`, canonical report, read through
   a protected walk, whose digest, ledger generation, fault set, fail-stop state and instance
@@ -4457,5 +4473,23 @@ the section 9.1 Runtime contract. Production Firecracker stays disabled (milesto
   of the 28 window boundaries; the open audit took 68 ms after the second window and 43 ms
   at the end; the idle tail compacted the last token and left the instance no rows. No
   headroom, quota or ledger-space refusal occurred (any would have failed the test).
+  Rerun at `fe82b55`, the code as shipped: the same 28,000 and 5,000 in 851 s, live bytes
+  225,280 at all 28 boundaries, retained admitted rows peaking at 1,181 of the two shares'
+  1,228, and the open audit 15 ms.
 - **Batches, macOS:** 16-token full batches well under 100 ms; 256 tokens 310 to 580 ms.
-- The kiln VM results follow in the milestone report and the next revision of this section.
+- **Real chain, kiln VM** (`b7_linux_root_compaction_cycles`, real jailer, Firecracker and
+  guest, three concurrent lanes against a 64-entry allowance, 3-minute lease and 30 s pass):
+  300 sessions, each booted to READY, executed once and removed, in 1,304 s, four times the
+  allowance. The watermark reached 281 of 325 issued; retained admitted rows peaked at 47,
+  exactly the share, and never above it; 1,322 headroom or preparation-slot refusals were
+  waited out and retried; 37 compaction records were kept.
+- **Crash matrix, kiln VM:** 28 of 28 (B6's 11 on the real chain, B7's 17) at `fe82b55`.
+  In one earlier run B6's "daemon death while booting" saw its allocation stop before READY
+  (stop reason not captured then; the scenario now prints it); it passed in the 13 runs
+  since, including the full matrix.
+- **Attack regressions, kiln VM:** 19 of 19 at `fe82b55`, including B6's whole session
+  through kilnd and kilndctl and B7's 12.
+- **B5 suite** 8 of 8 (with both B5 test guests), **B4 suite** 31 of 31, and all 61 B7
+  fixture tests on Linux, each in its own phase.
+- **The installed kilnd** (main `2a1faea`, schema 10) was never replaced; its database is
+  byte-identical to the backup taken before the VM phases (`cmp`, SHA-256 `ef02941f…`).
