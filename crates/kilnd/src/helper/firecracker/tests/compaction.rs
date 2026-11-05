@@ -1920,10 +1920,13 @@ async fn b7_crash_a_remove_racing_compaction_keeps_its_rows_and_its_own_receipt(
     wait_watermark_past(&runtime, super::super::token::seq_of(target.allocation_id)).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(fixture.active_allocations(), 1, "not absent yet: the batch skips it");
+    // Hold every G_W refresh until the fence row has been read.
+    fixture.fault("L.compact.advance.before_commit.panic");
     fixture.clear("H.remove.after_state.hold");
     let receipt = fenced(removing.await.unwrap().unwrap());
     let durable = fixture.retired_receipt(target.allocation_id).expect("its own fence row");
     assert_eq!(receipt, FencedAbsence::decode(&durable).unwrap(), "its own receipt");
+    fixture.clear("L.compact.advance.before_commit.panic");
     // Its fence came after the advance: a refresh precedes its compaction (RTC-9).
     mature(&fixture, &mut clock, POLICY).await;
     wait_until("compacted after the refresh", || {
