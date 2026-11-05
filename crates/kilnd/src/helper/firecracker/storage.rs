@@ -2210,6 +2210,7 @@ mod tests {
     /// resources this walk would rightly call orphans.
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "needs root: run scripts/b4-vm-tests.sh b7_linux_root_offline"]
     fn b7_linux_root_offline_walk_names_an_orphan_in_every_real_family() {
         use super::super::cgroup::{CGROUP_ROOT, FIRECRACKER_TREE};
         use super::super::identity::host_name;
