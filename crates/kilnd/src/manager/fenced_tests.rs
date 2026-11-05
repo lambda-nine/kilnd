@@ -1040,6 +1040,14 @@ async fn c0_rejection_leaves_no_row_no_charge_and_no_fence() {
     let error = m.create(CreateRequest::default()).await.unwrap_err();
     assert!(matches!(error, Error::FailedPrecondition(_)), "{error}");
     fake.state().fenced.fail_prepare = None;
+    // B7: an adapter with no room refuses before Preflight: RESOURCE_EXHAUSTED, no row.
+    fake.state().fenced.exhaust_prepare = Some("digest cache full".into());
+    let error = m.create(CreateRequest::default()).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::ResourceExhausted(m) if m.contains("digest cache full")),
+        "{error}"
+    );
+    fake.state().fenced.exhaust_prepare = None;
     fake.state().fenced.prepare_panics = true;
     let error = m.create(CreateRequest::default()).await.unwrap_err();
     assert!(error.to_string().contains("panicked"), "{error}");

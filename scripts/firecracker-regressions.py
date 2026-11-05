@@ -57,6 +57,7 @@ B7_SCENARIOS = [
     'b7_rtc18_compaction_has_its_own_lane_and_a_full_batch_stays_under_100_ms',
     'b7_rtc18_a_busy_normal_lane_from_two_instances_never_starves_a_third_instances_refill',
     'b7_rtc14_a_latch_during_create_setup_is_rechecked_before_open_gate',
+    'b7_rtc13_completed_sessions_leave_no_digest_entries',
 ]
 
 if __name__ == '__main__':

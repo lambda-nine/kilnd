@@ -3,15 +3,16 @@
 //! statistics. Each runs over no socket, as root, with the helper stopped: it takes the
 //! node lock exactly as `enroll` does, so no H or L can run beside it.
 //!
-//! The inventory walks every enrolled instance's owned namespaces (work directories and
-//! the cgroup tree, where every VMM runs) against the ledger's active allocations, and
+//! The inventory walks everything owned on the host, node-wide (every jail directory,
+//! jail mount, loop device, VMM and supervisor process, cgroup and work file; see
+//! `inventory::OfflineObservation`), against the ledger's active allocations, and
 //! reads each instance's daemon database read-only for its highest token whose tag
 //! verifies. It destroys nothing: anything the ledger does not own is reported, root
 //! settles it by hand, and the inventory runs again. Its verdict is `explained` only
 //! when nothing is left unaccounted for. The clear accepts only a current, canonical,
 //! root-owned, explained report.
 use super::executable::{WalkPolicy, walk_directory};
-use super::inventory::{NodeObservation, ObservationBackend};
+use super::inventory::{ObservationBackend, OfflineObservation};
 use super::journal::{self, ClearOutcome, Ledger, LedgerConfig};
 use crate::firecracker::{canonical, strict_json};
 use crate::model::{Digest, Id128};
@@ -176,27 +177,29 @@ fn build_report(
         );
     }
     let mut unexplained = Vec::new();
-    let mut rows = Vec::new();
+    let mut known: BTreeMap<Id128, Vec<Id128>> = BTreeMap::new();
     for instance in &instances {
-        let pointers = ledger.pointers(*instance).map_err(|e| e.to_string())?;
         let active = ledger.inventory(*instance).map_err(|e| e.to_string())?;
         if active.overflow {
             unexplained.push(format!("instance {instance}: more active allocations than one listing"));
         }
-        let known: Vec<Id128> = active.records.iter().map(|r| r.allocation_id).collect();
-        match observation.observe_node(*instance, &known) {
-            // Anything owned on the host that no active allocation explains.
-            NodeObservation::Observed { allocations } => {
-                for allocation in allocations.iter().filter(|a| !known.contains(a)) {
-                    unexplained.push(format!(
-                        "instance {instance}: resources of allocation {allocation} have no active ledger record"
-                    ));
-                }
-            }
-            NodeObservation::Unknown { reason } => {
-                unexplained.push(format!("instance {instance}: {reason}"));
+        known.insert(*instance, active.records.iter().map(|r| r.allocation_id).collect());
+    }
+    // One node-wide walk: anything owned on the host that no active allocation explains.
+    match observation.observe_offline(&known) {
+        OfflineObservation::Observed { orphans, .. } => {
+            for orphan in orphans {
+                unexplained.push(format!("{}: {}", orphan.family, orphan.detail));
             }
         }
+        OfflineObservation::Unknown { reason } => {
+            unexplained.push(format!("host observation incomplete: {reason}"));
+        }
+    }
+    let mut rows = Vec::new();
+    for instance in &instances {
+        let pointers = ledger.pointers(*instance).map_err(|e| e.to_string())?;
+        let active_allocations = known[instance].len() as u64;
         let path = &daemon_databases[instance];
         let tokens = daemon_tokens(path, *instance)?;
         let key = ledger.token_key();
@@ -218,7 +221,7 @@ fn build_report(
             unverified_tokens: unverified,
             issue_next: pointers.issue_next,
             watermark: pointers.watermark,
-            active_allocations: known.len() as u64,
+            active_allocations,
         });
     }
     let faults = ledger

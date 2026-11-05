@@ -152,6 +152,8 @@ pub struct FakeFenced {
     /// Allocations ever claimed. A retried token never increases this.
     pub claims_made: u64,
     pub fail_prepare: Option<String>,
+    /// Prepare refuses as Exhausted, as a full adapter cache does before Preflight.
+    pub exhaust_prepare: Option<String>,
     pub prepare_gate: Option<FakeGate>,
     pub prepare_panics: bool,
     /// Preflight finishes even after cancellation, so only the manager's own
@@ -788,6 +790,9 @@ impl Runtime for FakeRuntime {
             let mut state = self.state();
             if state.mode == FakeEvidenceMode::Legacy {
                 return Ok(PreparedCreate::legacy(spec.clone(), "fake"));
+            }
+            if let Some(message) = state.fenced.exhaust_prepare.clone() {
+                return Err(RuntimeError::Exhausted(message));
             }
             state.fenced.prepare_calls += 1;
             // B7: the fake authority issues the token, as the helper does: a sequence

@@ -843,7 +843,8 @@ impl From<RuntimeError> for WireError {
                 Self::Incompatible(text)
             }
             RuntimeError::Io(_) => Self::Io(text),
-            RuntimeError::Backend(_) => Self::Backend(text),
+            // The kiln wire has no exhausted class; the helper never produces one.
+            RuntimeError::Backend(_) | RuntimeError::Exhausted(_) => Self::Backend(text),
         }
     }
 }

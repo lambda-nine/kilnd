@@ -1619,6 +1619,10 @@ impl<R: Runtime> Manager<R> {
             Ok(Err(error @ (RuntimeError::Incompatible(_) | RuntimeError::Unsupported(_)))) => {
                 return Err(Error::FailedPrecondition(error.to_string()));
             }
+            // Refused before any backend effect (B7: the Firecracker digest cache's cap).
+            Ok(Err(RuntimeError::Exhausted(reason))) => {
+                return Err(Error::ResourceExhausted(format!("prepare sandbox: {reason}")));
+            }
             Ok(Err(error)) => return Err(backend(error)),
             Err(join) => {
                 let reason = if join.is_panic() {

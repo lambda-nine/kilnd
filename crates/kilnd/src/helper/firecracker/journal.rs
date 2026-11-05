@@ -347,12 +347,27 @@ BEGIN UPDATE instance_tokens SET retained_admitted = retained_admitted + 1
 CREATE TRIGGER allocations_count_delete AFTER DELETE ON allocations
 BEGIN UPDATE instance_tokens SET retained_admitted = retained_admitted - 1
     WHERE instance_id = OLD.instance_id; END;
--- B7 RTC-10: an allocation record goes only once absent and compactable.
+-- B7 RTC-10: an allocation record goes only once absent and compactable, and after every
+-- child row of its token. The child order is checked here, not left to foreign keys.
 CREATE TRIGGER allocations_no_delete BEFORE DELETE ON allocations
 WHEN NOT (OLD.phase = 'absent' AND EXISTS (SELECT 1 FROM retired_tokens r
     JOIN instance_tokens t ON t.instance_id = r.instance_id
     WHERE r.instance_id = OLD.instance_id AND r.allocation_id = OLD.allocation_id
-      AND r.issue_seq < t.watermark AND r.helper_generation < t.watermark_generation))
+      AND r.issue_seq < t.watermark AND r.helper_generation < t.watermark_generation)
+    AND NOT EXISTS (SELECT 1 FROM allocation_plans c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM capacity_claims c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM identity_leases c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM executable_leases c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM worker_intents c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM stop_events c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM resource_events c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id))
 BEGIN SELECT RAISE(ABORT, 'an allocation record is permanent until compactable'); END;
 
 CREATE TRIGGER allocation_plans_no_replace BEFORE INSERT ON allocation_plans
@@ -484,10 +499,25 @@ WHEN NOT EXISTS (SELECT 1 FROM instance_tokens t WHERE t.instance_id = NEW.insta
         OR EXISTS (SELECT 1 FROM allocations a WHERE a.instance_id = NEW.instance_id
                    AND a.allocation_id = NEW.allocation_id)))
 BEGIN SELECT RAISE(ABORT, 'a fence needs an issued token, and below W its allocation'); END;
--- B7 RTC-10: the fence row goes last, below W, behind G_W, with no allocation left.
+-- B7 RTC-10: the fence row goes last, below W, behind G_W, with no allocation and no
+-- child row of its token left, whether or not foreign keys are enforced.
 CREATE TRIGGER retired_tokens_no_delete BEFORE DELETE ON retired_tokens
 WHEN NOT (NOT EXISTS (SELECT 1 FROM allocations a WHERE a.instance_id = OLD.instance_id
         AND a.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM allocation_plans c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM capacity_claims c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM identity_leases c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM executable_leases c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM worker_intents c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM stop_events c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
+    AND NOT EXISTS (SELECT 1 FROM resource_events c WHERE c.instance_id = OLD.instance_id
+        AND c.allocation_id = OLD.allocation_id)
     AND EXISTS (SELECT 1 FROM instance_tokens t WHERE t.instance_id = OLD.instance_id
         AND OLD.issue_seq < t.watermark AND OLD.helper_generation < t.watermark_generation))
 BEGIN SELECT RAISE(ABORT, 'a fence is permanent until compactable'); END;

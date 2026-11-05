@@ -18,7 +18,7 @@ use super::{
 };
 use crate::helper::firecracker::token;
 use crate::firecracker::{canonical, offline_768_v1_reservation, strict_json};
-use crate::helper::firecracker::journal::AccountingSnapshot;
+use crate::helper::firecracker::journal::{AccountingSnapshot, MAX_ACTIVE_LISTED};
 use crate::helper::protocol::{
     AccountingReply, AmbiguousClass, CreateReply, FIRECRACKER_GROUP_VERSION, FenceReply,
     FirecrackerOperation, FirecrackerRequest, FirecrackerResponse, GcOutcome, GcTarget,
@@ -30,6 +30,7 @@ use crate::model::{AllocationBinding, Digest, Id128, Network, SandboxSpec};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +55,16 @@ const READY_POLL: Duration = Duration::from_millis(100);
 /// One Inspect inside a create's or an execution's own deadline.
 const INSPECT_BUDGET: Duration = Duration::from_secs(5);
 
+/// The helper's per-node bound on non-durable token gates (`MAX_TOKEN_GATES` in
+/// `helper/firecracker/mod.rs`), mirrored here; a test asserts the two are equal.
+pub(crate) const HELPER_TOKEN_GATES: usize = 4096;
+/// B7 RTC-13: the digest cache's backstop. An entry lives from `create` (after C1) to
+/// the allocation's terminal answer, so the cache holds at most this instance's live
+/// allocations, which a complete inventory bounds at `MAX_ACTIVE_LISTED` (1024), plus
+/// those in flight, which the helper's node-wide token gates bound at 4096: 5120. At the
+/// cap `prepare` refuses before Preflight; nothing past C1 is ever refused or evicted.
+pub(crate) const MAX_DIGESTS: usize = MAX_ACTIVE_LISTED + HELPER_TOKEN_GATES;
+
 pub struct FirecrackerRuntime {
     client: Client,
     instance_id: Id128,
@@ -64,10 +75,13 @@ pub struct FirecrackerRuntime {
     /// B7 RTC-14: the highest complete token this daemon has recorded, reported at every
     /// attachment. Seeded from the Store at startup and raised by every verified prepare.
     highest_token: Mutex<Option<Id128>>,
-    /// B7: each allocation's Store plan digest, learned from the Store-bound calls
-    /// (create, inspect, fence, remove), so a later Validate or Exec can read its boot
-    /// with the digest Inspect requires. Never a source of release evidence.
+    /// B7: each allocation's Store plan digest, learned at `create` (after C1) and by a
+    /// non-terminal Inspect, so a later Validate or Exec can read its boot with the
+    /// digest Inspect requires. Every terminal answer forgets it. Never a source of
+    /// release evidence.
     digests: Mutex<HashMap<Id128, Digest>>,
+    /// `MAX_DIGESTS`, lowered only by tests.
+    max_digests: AtomicUsize,
 }
 
 fn group_failure(error: GroupError) -> RuntimeError {
@@ -249,9 +263,12 @@ impl FirecrackerRuntime {
             sessions: Mutex::new(HashMap::new()),
             highest_token: Mutex::new(None),
             digests: Mutex::new(HashMap::new()),
+            max_digests: AtomicUsize::new(MAX_DIGESTS),
         }
     }
 
+    /// Always records, even at the cap: it runs only past C1, where refusing or evicting
+    /// would strand a live allocation's Validate and Exec.
     fn learn_digest(&self, allocation: Id128, digest: Digest) {
         self.digests.lock().unwrap().insert(allocation, digest);
     }
@@ -270,6 +287,22 @@ impl FirecrackerRuntime {
     #[cfg(test)]
     pub(crate) fn test_highest_token(&self) -> Option<Id128> {
         *self.highest_token.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_digest_count(&self) -> usize {
+        self.digests.lock().unwrap().len()
+    }
+
+    /// Seeds an entry, as an earlier create or Inspect would have.
+    #[cfg(test)]
+    pub(crate) fn test_learn_digest(&self, allocation: Id128, digest: Digest) {
+        self.learn_digest(allocation, digest);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_max_digests(&self, cap: usize) {
+        self.max_digests.store(cap, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -461,8 +494,16 @@ impl FirecrackerRuntime {
         );
     }
 
-    fn forget(&self, allocation: Id128) {
+    /// The remembered boot is stale, but the allocation may be READY again: keep its
+    /// digest so the next Validate or Exec re-reads the boot.
+    fn forget_session(&self, allocation: Id128) {
         self.sessions.lock().unwrap().remove(&allocation);
+    }
+
+    /// The allocation reached a terminal answer: nothing will name it again.
+    fn forget_allocation(&self, allocation: Id128) {
+        self.sessions.lock().unwrap().remove(&allocation);
+        self.digests.lock().unwrap().remove(&allocation);
     }
 
     /// The boot and inner sandbox to name. Missing after a daemon restart, it is read
@@ -564,6 +605,7 @@ impl FirecrackerRuntime {
                 }
                 Ok(InspectReply::AbsentFenced { receipt }) => {
                     let receipt = decode_fence(&receipt.0, context, &plan_digest)?;
+                    self.forget_allocation(context.allocation_id);
                     return Err(CreateFailure::absent_fenced(
                         receipt,
                         RuntimeError::Backend("the allocation was fenced before READY".into()),
@@ -606,8 +648,9 @@ impl FirecrackerRuntime {
             .await?
         {
             FirecrackerResponse::Remove(FenceReply::Absent { receipt }) => {
-                self.forget(allocation);
-                decode_removal(&receipt.0, self.instance_id, allocation)
+                let receipt = decode_removal(&receipt.0, self.instance_id, allocation)?;
+                self.forget_allocation(allocation);
+                Ok(receipt)
             }
             FirecrackerResponse::Remove(FenceReply::Ambiguous { class, message }) => {
                 Err(ambiguous_error(
@@ -705,6 +748,13 @@ impl Runtime for FirecrackerRuntime {
                 "preparation names another instance".into(),
             ));
         }
+        // RTC-13: checked before Preflight, so a refusal spends no seq.
+        let cap = self.max_digests.load(Ordering::Relaxed);
+        if self.digests.lock().unwrap().len() >= cap {
+            return Err(RuntimeError::Exhausted(format!(
+                "this daemon already tracks {cap} unsettled Firecracker allocations"
+            )));
+        }
         match self
             .call(
                 FirecrackerOperation::Preflight {
@@ -719,10 +769,8 @@ impl Runtime for FirecrackerRuntime {
         {
             FirecrackerResponse::Prepared(reply) => {
                 let prepared = verify_prepared(context, spec, *reply)?;
+                // Not learned here: a plan the manager refuses before C1 leaves no entry.
                 self.record_token(prepared.allocation_id());
-                if let Some(token) = prepared.allocation_id() {
-                    self.learn_digest(token, prepared.plan_digest());
-                }
                 Ok(prepared)
             }
             FirecrackerResponse::Error(error) => Err(group_failure(error)),
@@ -738,6 +786,8 @@ impl Runtime for FirecrackerRuntime {
         cancel: &CancellationToken,
     ) -> Result<CreatedSandbox, CreateFailure> {
         let plan_digest = prepared.plan_digest();
+        // The manager calls create only after C1: from here the allocation may exist.
+        self.learn_digest(context.allocation_id, plan_digest);
         let response = self
             .call(
                 FirecrackerOperation::Create {
@@ -755,6 +805,7 @@ impl Runtime for FirecrackerRuntime {
             FirecrackerResponse::Create(CreateReply::Absent { receipt }) => {
                 let receipt =
                     decode_fence(&receipt.0, context, &plan_digest).map_err(CreateFailure::from)?;
+                self.forget_allocation(context.allocation_id);
                 Err(CreateFailure::absent_fenced(
                     receipt,
                     RuntimeError::Backend("this allocation token is permanently fenced".into()),
@@ -784,11 +835,18 @@ impl Runtime for FirecrackerRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<AllocationObservation, RuntimeError> {
-        self.learn_digest(context.allocation_id, *prepared_digest);
-        match self
+        let reply = self
             .inspect_raw(context.allocation_id, *prepared_digest, deadline, cancel)
-            .await?
-        {
+            .await?;
+        // Only a non-terminal answer (re)learns the digest: how a restarted daemon
+        // relearns its live allocations for Validate and Exec.
+        if !matches!(
+            reply,
+            InspectReply::AbsentFenced { .. } | InspectReply::Incompatible { .. }
+        ) {
+            self.learn_digest(context.allocation_id, *prepared_digest);
+        }
+        match reply {
             // The helper's READY: idle on the journaled boot, no execution in flight.
             InspectReply::PresentReady {
                 generation,
@@ -806,9 +864,11 @@ impl Runtime for FirecrackerRuntime {
                 healthy_idle: true,
                 uncertain_execution: false,
             }),
-            InspectReply::AbsentFenced { receipt } => Ok(AllocationObservation::AbsentFenced(
-                decode_fence(&receipt.0, context, prepared_digest)?,
-            )),
+            InspectReply::AbsentFenced { receipt } => {
+                let receipt = decode_fence(&receipt.0, context, prepared_digest)?;
+                self.forget_allocation(context.allocation_id);
+                Ok(AllocationObservation::AbsentFenced(receipt))
+            }
             InspectReply::StoppedWithResources { generation } => {
                 Ok(AllocationObservation::StoppedWithResources {
                     helper_generation: generation,
@@ -835,7 +895,7 @@ impl Runtime for FirecrackerRuntime {
         // Its FenceAbsent would close the token's gate and still refuse while resources
         // exist. A retired token answers with its fence either way. Only a token with no
         // journal record falls through to FenceAbsent, which fences it never-admitted.
-        self.learn_digest(context.allocation_id, *prepared_digest);
+        // The Store digest is passed explicitly and never cached here.
         match self
             .remove_allocation(context.allocation_id, *prepared_digest, deadline, cancel)
             .await
@@ -867,9 +927,11 @@ impl Runtime for FirecrackerRuntime {
             )
             .await?
         {
-            FirecrackerResponse::Fence(FenceReply::Absent { receipt }) => Ok(
-                AbsenceReceipt::Fenced(decode_fence(&receipt.0, context, prepared_digest)?),
-            ),
+            FirecrackerResponse::Fence(FenceReply::Absent { receipt }) => {
+                let receipt = decode_fence(&receipt.0, context, prepared_digest)?;
+                self.forget_allocation(context.allocation_id);
+                Ok(AbsenceReceipt::Fenced(receipt))
+            }
             FirecrackerResponse::Fence(FenceReply::Ambiguous { class, message }) => Err(
                 ambiguous_error(class, format!("allocation stays charged ({class:?}): {message}")),
             ),
@@ -908,7 +970,7 @@ impl Runtime for FirecrackerRuntime {
                 RuntimeError::Backend(format!("allocation {allocation}'s control slot is busy")),
             ),
             FirecrackerResponse::Validate(ValidateReply::Incompatible { message }) => {
-                self.forget(allocation);
+                self.forget_session(allocation);
                 Err(RuntimeError::Incompatible(message))
             }
             FirecrackerResponse::Validate(ValidateReply::Unknown { reason }) => {
@@ -986,7 +1048,7 @@ impl Runtime for FirecrackerRuntime {
         };
         let outcome = self.client.firecracker_exec(request, spec, cancel).await;
         if outcome.disposition != crate::model::SandboxDisposition::Reusable {
-            self.forget(allocation);
+            self.forget_session(allocation);
         }
         outcome
     }
@@ -1004,7 +1066,7 @@ impl Runtime for FirecrackerRuntime {
         let binding = target.fenced()?;
         self.epoch(deadline).await?;
         check_binding(binding, self.attached_node()?, self.instance_id)?;
-        self.learn_digest(binding.allocation_id, binding.plan_digest);
+        // The Store digest is passed explicitly; only the absence forgets the entry.
         self.remove_allocation(binding.allocation_id, binding.plan_digest, deadline, cancel)
             .await
             .map(AbsenceReceipt::Fenced)
@@ -1114,12 +1176,10 @@ impl Runtime for FirecrackerRuntime {
             }
             match result.outcome {
                 GcOutcome::Removed { receipt } => {
-                    self.forget(result.allocation_id);
-                    receipts.push(AbsenceReceipt::Fenced(decode_removal(
-                        &receipt.0,
-                        self.instance_id,
-                        result.allocation_id,
-                    )?));
+                    let receipt =
+                        decode_removal(&receipt.0, self.instance_id, result.allocation_id)?;
+                    self.forget_allocation(result.allocation_id);
+                    receipts.push(AbsenceReceipt::Fenced(receipt));
                 }
                 GcOutcome::Skipped { reason } => {
                     refused.push(format!("{}: skipped: {reason}", result.allocation_id));
@@ -1139,5 +1199,63 @@ impl Runtime for FirecrackerRuntime {
             "nothing was collected: {}",
             refused.join("; ")
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> SandboxSpec {
+        SandboxSpec {
+            image: "alpine".into(),
+            memory_bytes: 512 << 20,
+            cpu_millis: 1000,
+            pids: 128,
+            disk_bytes: 1 << 30,
+            network: Network::None,
+            read_only_root: false,
+            writable_paths: vec![],
+            labels: Default::default(),
+        }
+    }
+
+    /// RTC-13's backstop: at the cap, prepare refuses as Exhausted with no helper call,
+    /// so no seq is spent; below it the same call reaches the socket. Past C1 nothing is
+    /// refused: `learn_digest` still records over the cap.
+    #[tokio::test]
+    async fn prepare_at_the_digest_cap_is_exhausted_before_any_helper_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helper.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let instance = Id128::random();
+        let runtime = FirecrackerRuntime::new(path, instance, Id128::random());
+        runtime.test_set_max_digests(1);
+        let context = PrepareContext {
+            instance_id: instance,
+            sandbox_id: "sb-cap".into(),
+        };
+        let cancel = CancellationToken::new();
+        let soon = || Instant::now() + Duration::from_millis(200);
+        // Below the cap the call reaches the socket (and times out unanswered).
+        let below = runtime.prepare(&context, &spec(), soon(), &cancel).await;
+        assert!(!matches!(below, Err(RuntimeError::Exhausted(_))), "{below:?}");
+        let (first, _) = listener.accept().expect("below the cap, prepare connects");
+        drop(first);
+        runtime.learn_digest(Id128::random(), Digest::of(b"one"));
+        match runtime.prepare(&context, &spec(), soon(), &cancel).await {
+            Err(RuntimeError::Exhausted(reason)) => assert!(reason.contains('1'), "{reason}"),
+            other => panic!("not exhausted: {other:?}"),
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "at the cap, nothing reached the helper"
+        );
+        assert_eq!(runtime.test_highest_token(), None);
+        runtime.learn_digest(Id128::random(), Digest::of(b"two"));
+        assert_eq!(runtime.test_digest_count(), 2, "learning past C1 is never refused");
+        assert_eq!(MAX_DIGESTS, 1024 + 4096);
     }
 }

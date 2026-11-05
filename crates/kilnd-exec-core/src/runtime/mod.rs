@@ -32,6 +32,10 @@ pub enum RuntimeError {
     /// legacy kiln.
     #[error("{0}")]
     Unsupported(String),
+    /// The backend has no room for the operation now and did nothing; the caller may
+    /// retry later. The daemon answers it as RESOURCE_EXHAUSTED.
+    #[error("{0}")]
+    Exhausted(String),
 }
 
 pub struct ExecSpec<'a> {

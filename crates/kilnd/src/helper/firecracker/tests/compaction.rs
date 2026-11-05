@@ -2295,6 +2295,94 @@ async fn b7_crash_the_offline_clear_killed_before_or_after_its_commit() {
     b7_matrix("offline fault clear", json!({"before_commit": "unchanged", "after_commit": "cleared"}));
 }
 
+/// Design 16.6, 16.7 (B7 M1 break-it finding 3): the offline inventory walks every
+/// owned resource family node-wide, through the real walk over a fake host tree. An
+/// orphan whose name matches no work directory or cgroup still makes the report
+/// unexplained, and the clear refuses it.
+#[tokio::test]
+async fn b7_offline_inventory_walks_every_host_family_before_the_clear() {
+    use crate::helper::firecracker::identity::host_name;
+    use crate::helper::firecracker::inventory::{HostRoots, ProcSource};
+    let fixture = Fixture::new(compacting(POLICY)).await;
+    let (a, b) = (Id128::random(), Id128::random());
+    let (runtime_a, runtime_b) = (
+        fixture.runtime(a, Id128::random()),
+        fixture.runtime(b, Id128::random()),
+    );
+    let (recorded, active, _) = rolled_back(&fixture, &runtime_a, &runtime_b, (a, b)).await;
+    assert!(runtime_a.prove_attachment(deadline(5)).await.is_err());
+    fixture.kill_helper().await;
+    let config = fixture_ledger(&fixture);
+    let directory = reports(&fixture);
+    let mut databases = BTreeMap::new();
+    for (instance, tokens) in [(a, vec![recorded]), (b, vec![])] {
+        let path = directory.join(format!("{instance}.db"));
+        daemon_db(&path, instance, &tokens);
+        databases.insert(instance, path);
+    }
+    // B's live allocation on the host: jail, work file, cgroup, loop and VMM.
+    let root = fixture.root.join("host");
+    let roots = HostRoots {
+        jail_base: root.join("jails"),
+        work_base: root.join("work"),
+        cgroup_tree: root.join("cgroup/kilnd-firecracker"),
+        sys_block: root.join("block"),
+        proc: ProcSource::Directory(root.join("proc")),
+        mountinfo: String::new(),
+    };
+    let file = |path: PathBuf, text: String| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    let live = host_name(b, active.allocation_id);
+    std::fs::create_dir_all(roots.jail_base.join("firecracker").join(&live)).unwrap();
+    let work = roots.work_base.join(b.to_string()).join(&live).join("work.xfs");
+    file(work.clone(), String::new());
+    file(roots.sys_block.join("loop3/loop/backing_file"), format!("{}\n", work.display()));
+    std::fs::create_dir_all(roots.cgroup_tree.join(b.to_string()).join(&live).join("vm/vmm"))
+        .unwrap();
+    let process = |pid: u32, cgroup: String, comm: &str| {
+        file(root.join(format!("proc/{pid}/cgroup")), format!("0::{cgroup}\n"));
+        file(root.join(format!("proc/{pid}/comm")), format!("{comm}\n"));
+    };
+    process(1, "/init.scope".into(), "systemd");
+    process(70, format!("/kilnd-firecracker/{b}/{live}/vm/vmm"), "firecracker");
+    let observation = ObservationBackend::FakeHost(roots.clone());
+    let inventory = |name: &str| {
+        offline::offline_inventory(&config, &observation, &databases, &directory.join(name))
+    };
+    // An orphan jail directory alone, with no work directory or cgroup of its name.
+    let orphan = roots
+        .jail_base
+        .join("firecracker")
+        .join(host_name(b, Id128::random()));
+    std::fs::create_dir(&orphan).unwrap();
+    let report = offline_when_stopped(|| inventory("orphan-jail.json")).await.unwrap();
+    assert_eq!(report.verdict, "unexplained");
+    assert_eq!(report.unexplained.len(), 1, "{:?}", report.unexplained);
+    assert!(report.unexplained[0].starts_with("jail directory: "), "{:?}", report.unexplained);
+    let error = offline::clear_node_faults(&config, &directory.join("orphan-jail.json")).unwrap_err();
+    assert!(error.contains("unexplained"), "{error}");
+    std::fs::remove_dir(&orphan).unwrap();
+    // An orphan VMM outside every allocation's cgroup alone.
+    process(71, "/system.slice/stray.service".into(), "firecracker");
+    let report = inventory("orphan-vmm.json").unwrap();
+    assert_eq!(report.verdict, "unexplained");
+    assert!(report.unexplained[0].starts_with("process: 71 (firecracker)"), "{:?}", report.unexplained);
+    assert!(offline::clear_node_faults(&config, &directory.join("orphan-vmm.json")).is_err());
+    std::fs::remove_dir_all(root.join("proc/71")).unwrap();
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM node_faults"), 1, "nothing cleared");
+    // Every family explained: the clear goes through.
+    let report = inventory("good.json").unwrap();
+    assert_eq!(report.verdict, "explained", "{:?}", report.unexplained);
+    offline::clear_node_faults(&config, &directory.join("good.json")).unwrap();
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM node_faults"), 0);
+    b7_matrix(
+        "offline inventory walks every host family",
+        json!({"orphan_jail": "unexplained", "orphan_vmm": "unexplained", "all_explained": "cleared"}),
+    );
+}
+
 #[tokio::test]
 async fn b7_rtc18_a_busy_normal_lane_from_two_instances_never_starves_a_third_instances_refill() {
     let fixture = Arc::new(
@@ -2397,6 +2485,96 @@ async fn b7_rtc18_a_busy_normal_lane_from_two_instances_never_starves_a_third_in
         "RTC-18: a busy normal lane never starves another instance's refill",
         json!({"refilled_in_lease": 0, "concurrent_sessions": sessions}),
     );
+}
+
+/// Reads an allocation as reconciliation would, retrying a busy observation slot.
+async fn observe(
+    runtime: &FirecrackerRuntime,
+    context: &CreateContext,
+    plan: &PreparedCreate,
+) -> AllocationObservation {
+    for _ in 0..500 {
+        if let Ok(observation) = runtime
+            .inspect_allocation(context, &plan.plan_digest(), deadline(5), &no_cancel())
+            .await
+        {
+            return observation;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("no observation of {}", context.allocation_id)
+}
+
+/// B7 RTC-13, the daemon's side (Daybreak B7 M1 finding 4): the adapter's digest cache
+/// holds only allocations past C1 that are not yet settled. Completed sessions, a
+/// Preflight dropped before C1, and every terminal path (fence, AbsentFenced Inspect,
+/// Remove, Gc) leave no entry; only Create and a non-terminal Inspect learn one, and
+/// Remove and Gc never (re)insert the Store digest they are given.
+#[tokio::test]
+async fn b7_rtc13_completed_sessions_leave_no_digest_entries() {
+    let fixture = Fixture::new(compacting(POLICY)).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    for _ in 0..8 {
+        session(&fixture, &runtime, instance).await;
+    }
+    assert_eq!(runtime.test_digest_count(), 0, "eight completed sessions");
+    // A Preflight the manager refuses or abandons before C1 records nothing.
+    let (dropped, _) = issued(&runtime, instance).await;
+    assert_eq!(runtime.test_highest_token(), Some(dropped.allocation_id));
+    assert_eq!(runtime.test_digest_count(), 0, "a prepared, dropped Preflight");
+    // Create learns it past C1 and a non-terminal Inspect keeps it; the fence forgets
+    // it, and the AbsentFenced Inspect after it relearns nothing.
+    let (context, plan) = issued(&runtime, instance).await;
+    let failure = runtime
+        .create(&context, &plan, deadline(2), &no_cancel())
+        .await
+        .unwrap_err();
+    assert!(failure.absence().is_none(), "fake effects never reach READY");
+    assert_eq!(runtime.test_digest_count(), 1, "learned at create");
+    let observed = observe(&runtime, &context, &plan).await;
+    assert!(!matches!(observed, AllocationObservation::AbsentFenced(_)), "{observed:?}");
+    assert_eq!(runtime.test_digest_count(), 1);
+    fence_retrying(&runtime, &context, &plan).await;
+    assert_eq!(runtime.test_digest_count(), 0, "the fence forgets it");
+    let observed = observe(&runtime, &context, &plan).await;
+    assert!(matches!(observed, AllocationObservation::AbsentFenced(_)), "{observed:?}");
+    assert_eq!(runtime.test_digest_count(), 0, "an absent answer relearns nothing");
+    // As after a daemon restart: Inspect relearns a live allocation; its fence forgets it.
+    let (context, plan) = issued(&runtime, instance).await;
+    create_accepted(&fixture, &runtime, &context, &plan).await;
+    assert_eq!(runtime.test_digest_count(), 0, "the raw Create bypassed the adapter");
+    observe(&runtime, &context, &plan).await;
+    assert_eq!(runtime.test_digest_count(), 1, "relearned by a live Inspect");
+    fence_retrying(&runtime, &context, &plan).await;
+    assert_eq!(runtime.test_digest_count(), 0);
+    // Remove and Gc forget what their absence settles. (A live Remove needs Linux
+    // cleanup; a retired token's Remove and Gc answer with its fence on any host.)
+    let binding = binding_of(&context, &plan);
+    runtime.test_learn_digest(context.allocation_id, plan.plan_digest());
+    let target = RemoveTarget::Fenced { binding: &binding };
+    fenced(runtime.remove(target, deadline(10), &no_cancel()).await.unwrap());
+    assert_eq!(runtime.test_digest_count(), 0, "Remove forgets it");
+    runtime.test_learn_digest(context.allocation_id, plan.plan_digest());
+    let targets = [RemoveTarget::Fenced { binding: &binding }];
+    let collected = runtime.gc(&targets, deadline(10), &no_cancel()).await.unwrap();
+    assert_eq!(collected.len(), 1);
+    assert_eq!(runtime.test_digest_count(), 0, "Gc forgets it");
+    let target = RemoveTarget::Fenced { binding: &binding };
+    fenced(runtime.remove(target, deadline(10), &no_cancel()).await.unwrap());
+    assert_eq!(runtime.test_digest_count(), 0, "Remove never inserts the Store digest");
+    b7_matrix(
+        "RTC-13: completed sessions leave no daemon digest entries",
+        json!({"sessions": 8, "entries_after": 0}),
+    );
+}
+
+/// The daemon's digest cap mirrors the helper's bounds it is the sum of.
+#[test]
+fn b7_digest_cap_is_the_listed_bound_plus_the_token_gates() {
+    use crate::runtime::firecracker::{HELPER_TOKEN_GATES, MAX_DIGESTS};
+    assert_eq!(HELPER_TOKEN_GATES, super::super::MAX_TOKEN_GATES);
+    assert_eq!(MAX_DIGESTS, super::super::journal::MAX_ACTIVE_LISTED + super::super::MAX_TOKEN_GATES);
 }
 
 /// The sandbox ID a prepared plan's substitutions name.

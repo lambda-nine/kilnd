@@ -488,6 +488,28 @@ mod linux {
             Ok(text)
         }
 
+        /// The private instance's own top-level entries (every process directory among
+        /// them), listed through a read descriptor of its root itself, as
+        /// [`super::read_dir_fd`]. More than `limit` entries is an error.
+        pub fn read_root_dir(limit: usize) -> io::Result<Vec<super::DirEntry>> {
+            let root = root()?;
+            // SAFETY: a live root descriptor; "." is that directory itself, so no link
+            // is followed and no mount is crossed.
+            let fd = unsafe {
+                libc::openat(
+                    root,
+                    c".".as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a new owned descriptor.
+            let dir = unsafe { File::from_raw_fd(fd) };
+            super::read_dir_fd(&dir, limit)
+        }
+
         /// `relative` below this process's own directory (`<pid>/relative`), since
         /// `self` is a link and links are not followed.
         pub fn own(relative: &str) -> String {
@@ -1222,5 +1244,15 @@ mod tests {
         assert!(walked.starts_with("0::/"), "{walked}");
         // `self` is a link: never followed.
         assert!(procfs::open_by_components(root, "self/cgroup", libc::O_RDONLY).is_err());
+    }
+
+    /// The root listing holds this process's own directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_private_root_lists_this_process() {
+        let own = std::process::id().to_string().into_bytes();
+        let entries = super::linux::procfs::read_root_dir(1 << 16).unwrap();
+        assert!(entries.iter().any(|entry| entry.name == own));
+        assert!(super::linux::procfs::read_root_dir(0).is_err(), "bounded");
     }
 }

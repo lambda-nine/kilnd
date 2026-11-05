@@ -2202,6 +2202,83 @@ mod tests {
         );
     }
 
+    /// B7 M1 break-it finding 3, on the real host: the production offline walk
+    /// (`ObservationBackend::Real`, the private procfs, `/sys/block`, this namespace's
+    /// mountinfo, the real cgroup tree) names an orphan in every family planted for an
+    /// enrolled instance with no active allocation, and a clean host has none. Run alone
+    /// (`scripts/b4-vm-tests.sh b7_linux_root_offline`): concurrent B4 tests own
+    /// resources this walk would rightly call orphans.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn b7_linux_root_offline_walk_names_an_orphan_in_every_real_family() {
+        use super::super::cgroup::{CGROUP_ROOT, FIRECRACKER_TREE};
+        use super::super::identity::host_name;
+        use super::super::inventory::{ObservationBackend, OfflineObservation};
+        use crate::model::Id128;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::process::Command;
+        prepare_jail_base().unwrap();
+        let instance = Id128::random();
+        let host = host_name(instance, Id128::random());
+        let known = BTreeMap::from([(instance, Vec::new())]);
+        let families = |observation: OfflineObservation| -> BTreeSet<&'static str> {
+            match observation {
+                OfflineObservation::Observed { orphans, .. } => {
+                    orphans.iter().map(|o| o.family).collect()
+                }
+                OfflineObservation::Unknown { reason } => panic!("unknown: {reason}"),
+            }
+        };
+        let clean = families(ObservationBackend::Real.observe_offline(&known));
+        assert!(clean.is_empty(), "the host is not clean before the test: {clean:?}");
+        // One orphan per family, all of one allocation no ledger row explains.
+        let jail = Path::new(JAIL_BASE).join("firecracker").join(&host);
+        std::fs::create_dir_all(&jail).unwrap();
+        raw_mount("kilnd-jail-b7-offline", &jail, "tmpfs", "size=1M");
+        let work_dir = Path::new(WORK_BASE).join(instance.to_string()).join(&host);
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let work = work_dir.join(WORK_FILE);
+        std::fs::write(&work, vec![0u8; 1 << 20]).unwrap();
+        let attached = Command::new("losetup")
+            .args(["--find", "--show"])
+            .arg(&work)
+            .output()
+            .unwrap();
+        assert!(attached.status.success(), "{attached:?}");
+        let device = String::from_utf8(attached.stdout).unwrap().trim().to_string();
+        let instance_cgroup = Path::new(CGROUP_ROOT)
+            .join(FIRECRACKER_TREE)
+            .join(instance.to_string());
+        let control = instance_cgroup.join(&host).join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        let mut sleeper = Command::new("sleep").arg("60").spawn().unwrap();
+        std::fs::write(control.join("cgroup.procs"), sleeper.id().to_string()).unwrap();
+        let found = families(ObservationBackend::Real.observe_offline(&known));
+        // Undo everything before asserting, so a failure leaves nothing behind.
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        let detached = Command::new("losetup").args(["--detach", &device]).status();
+        raw_umount(&jail);
+        let _ = std::fs::remove_dir(&jail);
+        let _ = std::fs::remove_dir_all(Path::new(WORK_BASE).join(instance.to_string()));
+        for dir in [control.clone(), instance_cgroup.join(&host), instance_cgroup.clone()] {
+            let _ = std::fs::remove_dir(dir);
+        }
+        assert!(detached.unwrap().success());
+        let expected: BTreeSet<&str> = [
+            "jail directory",
+            "jail mount",
+            "loop device",
+            "process",
+            "cgroup",
+            "work file",
+        ]
+        .into();
+        assert_eq!(found, expected);
+        let after = families(ObservationBackend::Real.observe_offline(&known));
+        assert!(after.is_empty(), "the test left resources behind: {after:?}");
+    }
+
     /// B4 recheck 5 finding 1, the unmount half: `unmount` used to call `umount2` on
     /// `/proc/self/fd/<parent>/<name>` after checking the real parent descriptor, so a
     /// shadowed `/proc/self/fd` could redirect a proven unmount onto another mount.

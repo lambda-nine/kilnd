@@ -826,6 +826,164 @@ fn rtc10_trigger_matrix_refuses_every_delete_of_a_non_compactable_row() {
     }
 }
 
+/// Every table whose rows are a token's children, in compaction's delete order.
+const CHILD_FAMILIES: [&str; 7] = [
+    "resource_events",
+    "stop_events",
+    "worker_intents",
+    "executable_leases",
+    "identity_leases",
+    "capacity_claims",
+    "allocation_plans",
+];
+
+/// Gives a finished token a row in `table` if it has none: a fence already removed its
+/// plan, and settle_unstarted leaves no worker, stop or resource rows. Generations are
+/// far above the counter and unique per token.
+fn ensure_child(config: &LedgerConfig, conn: &Connection, who: Id128, token: Id128, table: &str) {
+    let generation = (1i64 << 40) + token::seq_of(token) as i64 * 4;
+    let (who, token) = (who.to_string(), token.to_string());
+    let present: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE instance_id = ?1 AND allocation_id = ?2"),
+            [&who, &token],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if present != 0 {
+        return;
+    }
+    let insert = match table {
+        "allocation_plans" => {
+            format!("INSERT INTO allocation_plans VALUES ('{who}', '{token}', x'00')")
+        }
+        "executable_leases" => format!(
+            "INSERT INTO executable_leases (instance_id, allocation_id, role, st_dev, st_ino,
+                bytes, sha256, installation_generation, released_generation)
+             VALUES ('{who}', '{token}', 'test', 1, 1, 1, 'x', 1, {generation})"
+        ),
+        "worker_intents" => format!(
+            "INSERT INTO worker_intents (instance_id, allocation_id, mode,
+                operation_generation, allowed_names, cgroup, exec_role, exec_st_dev,
+                exec_st_ino, exec_bytes, exec_sha256, settled_generation, settlement)
+             VALUES ('{who}', '{token}', 'test', {generation}, '', '', 'test', 1, 1, 1, 'x',
+                {generation} + 1, 'exited')"
+        ),
+        "stop_events" => format!(
+            "INSERT INTO stop_events (instance_id, allocation_id, generation, reason)
+             VALUES ('{who}', '{token}', {generation}, 'test')"
+        ),
+        "resource_events" => {
+            // An absent allocation owns nothing new: written behind that one guard.
+            behind_trigger(
+                config,
+                "resource_events_not_after_absent",
+                &format!(
+                    "INSERT INTO resource_events (instance_id, allocation_id, kind, detail,
+                        generation) VALUES ('{who}', '{token}', 'intent', 'test', {generation})"
+                ),
+            );
+            return;
+        }
+        other => panic!("{other} has no row for {token}"),
+    };
+    conn.execute_batch(&insert).unwrap();
+}
+
+/// Daybreak B7 M1 finding 5: RTC-10's child order is the triggers' own, not the foreign
+/// keys'. With `foreign_keys=OFF`, neither the allocation nor its fence may go while any
+/// child row of the token remains, including the review's unreleased identity lease;
+/// the honest order still compacts with foreign keys off.
+#[test]
+fn rtc10_child_order_triggers_hold_with_foreign_keys_off() {
+    let fixture = temp_ledger(unrestricted());
+    let mut ledger = fresh(&fixture.config);
+    let who = instance();
+    let sessions: Vec<AdmitRequest> = (1..=9).map(|i| finished(&mut ledger, who, i)).collect();
+    issue(&mut ledger, who);
+    let pointer = ledger.pointers(who).unwrap().issue_next;
+    advance_to(&mut ledger, who, pointer).unwrap();
+    let conn = Connection::open(fixture.config.directory.join(LEDGER_DB)).unwrap();
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let fk: i64 = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
+    assert_eq!(fk, 0);
+    let delete = |table: &str, token: Id128| {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE instance_id = ?1 AND allocation_id = ?2"),
+            [who.to_string(), token.to_string()],
+        )
+    };
+    let refused = |token: Id128, why: &str| {
+        for (table, message) in [
+            ("allocations", "an allocation record is permanent until compactable"),
+            ("retired_tokens", "a fence is permanent until compactable"),
+        ] {
+            match delete(table, token) {
+                Err(error) => assert!(error.to_string().contains(message), "{why}: {error}"),
+                Ok(rows) => panic!("{why}: {table} deleted {rows} rows with a child left"),
+            }
+        }
+    };
+    // The review's PoC: an unreleased identity lease under an absent, fenced, below-W
+    // allocation. The lease itself is undeletable, so the token stays whole.
+    let poc = sessions[0].allocation_id;
+    behind_trigger(
+        &fixture.config,
+        "identity_leases_immutable",
+        &format!(
+            "UPDATE identity_leases SET released_generation = NULL
+             WHERE allocation_id = '{poc}' AND kind = 'cid'"
+        ),
+    );
+    refused(poc, "unreleased lease, nothing else deleted");
+    for family in CHILD_FAMILIES {
+        if family == "identity_leases" {
+            let released = conn.execute(
+                "DELETE FROM identity_leases WHERE allocation_id = ?1
+                   AND released_generation IS NOT NULL",
+                [poc.to_string()],
+            );
+            assert_eq!(released, Ok(4), "the four released leases may go");
+            assert!(delete(family, poc).is_err(), "an unreleased lease is permanent");
+        } else {
+            delete(family, poc).unwrap();
+        }
+    }
+    refused(poc, "unreleased lease, every other child gone");
+    // Each child family alone keeps its token's allocation and fence.
+    for (family, session) in CHILD_FAMILIES.iter().zip(&sessions[1..8]) {
+        let token = session.allocation_id;
+        ensure_child(&fixture.config, &conn, who, token, family);
+        for other in CHILD_FAMILIES.iter().filter(|f| *f != family) {
+            delete(other, token).unwrap();
+        }
+        refused(token, family);
+        assert!(delete(family, token).unwrap() > 0, "{family}");
+        assert_eq!(delete("allocations", token), Ok(1), "{family}: then the allocation");
+        assert_eq!(delete("retired_tokens", token), Ok(1), "{family}: then the fence");
+    }
+    // The honest order compacts with foreign keys off: children, allocation, fence.
+    let honest = sessions[8].allocation_id;
+    for family in CHILD_FAMILIES {
+        delete(family, honest).unwrap();
+    }
+    assert_eq!(delete("allocations", honest), Ok(1));
+    assert_eq!(delete("retired_tokens", honest), Ok(1));
+    for session in &sessions[1..] {
+        for table in CHILD_FAMILIES.iter().chain(&["allocations", "retired_tokens"]) {
+            let left: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE allocation_id = ?1"),
+                    [session.allocation_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "{table}");
+        }
+    }
+    assert_eq!(ledger.pointers(who).unwrap().retained_admitted, 1, "only the PoC's row");
+}
+
 #[test]
 fn rtc11_a_failed_delete_or_advance_commit_rolls_back_whole() {
     let fixture = temp_ledger(unrestricted());
