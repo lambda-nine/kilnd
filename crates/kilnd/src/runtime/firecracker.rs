@@ -77,11 +77,61 @@ pub struct FirecrackerRuntime {
     highest_token: Mutex<Option<Id128>>,
     /// B7: each allocation's Store plan digest, learned at `create` (after C1) and by a
     /// non-terminal Inspect, so a later Validate or Exec can read its boot with the
-    /// digest Inspect requires. Every terminal answer forgets it. Never a source of
-    /// release evidence.
-    digests: Mutex<HashMap<Id128, Digest>>,
+    /// digest Inspect requires. Every terminal answer forgets it, and a learn begun
+    /// before that answer never brings it back (recheck R3). Never a source of release
+    /// evidence.
+    digests: Mutex<DigestCache>,
     /// `MAX_DIGESTS`, lowered only by tests.
     max_digests: AtomicUsize,
+}
+
+/// B7 recheck R3: the digests, and the allocations with a learning call in flight (a
+/// Create or an Inspect), each with how many and whether a terminal answer arrived
+/// meanwhile. An in-flight entry lives only while its calls do, so both maps stay
+/// bounded: the cap bounds the first, concurrent calls the second.
+#[derive(Default)]
+struct DigestCache {
+    entries: HashMap<Id128, Digest>,
+    in_flight: HashMap<Id128, InFlight>,
+}
+
+#[derive(Default)]
+struct InFlight {
+    calls: u32,
+    forgotten: bool,
+}
+
+/// One learning call's claim on an allocation (B7 recheck R3). Its learn is refused if
+/// the allocation reached a terminal answer after the claim began; dropped, it ends the
+/// claim, whichever way the call ended (an answer, an error, a deadline or a cancel).
+struct LearnClaim<'a> {
+    cache: &'a Mutex<DigestCache>,
+    allocation: Id128,
+}
+
+impl LearnClaim<'_> {
+    fn learn(&self, digest: Digest) {
+        let mut cache = self.cache.lock().unwrap();
+        if !cache
+            .in_flight
+            .get(&self.allocation)
+            .is_some_and(|claim| claim.forgotten)
+        {
+            cache.entries.insert(self.allocation, digest);
+        }
+    }
+}
+
+impl Drop for LearnClaim<'_> {
+    fn drop(&mut self) {
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(claim) = cache.in_flight.get_mut(&self.allocation) {
+            claim.calls -= 1;
+            if claim.calls == 0 {
+                cache.in_flight.remove(&self.allocation);
+            }
+        }
+    }
 }
 
 fn group_failure(error: GroupError) -> RuntimeError {
@@ -262,7 +312,7 @@ impl FirecrackerRuntime {
             node_id: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             highest_token: Mutex::new(None),
-            digests: Mutex::new(HashMap::new()),
+            digests: Mutex::default(),
             max_digests: AtomicUsize::new(MAX_DIGESTS),
         }
     }
@@ -270,7 +320,48 @@ impl FirecrackerRuntime {
     /// Always records, even at the cap: it runs only past C1, where refusing or evicting
     /// would strand a live allocation's Validate and Exec.
     fn learn_digest(&self, allocation: Id128, digest: Digest) {
-        self.digests.lock().unwrap().insert(allocation, digest);
+        self.digests.lock().unwrap().entries.insert(allocation, digest);
+    }
+
+    /// B7 recheck R3: claims `allocation` for one learning call. A terminal answer while
+    /// the claim lives marks it, so the call's own learn cannot reinsert the digest, and
+    /// reconciliation never drops a digest a claim may still need.
+    fn claim_learn(&self, allocation: Id128) -> LearnClaim<'_> {
+        let mut cache = self.digests.lock().unwrap();
+        let claim = cache.in_flight.entry(allocation).or_default();
+        if claim.calls == 0 {
+            claim.forgotten = false;
+        }
+        claim.calls += 1;
+        LearnClaim {
+            cache: &self.digests,
+            allocation,
+        }
+    }
+
+    /// B7 recheck R3: reconciliation's recovery of the cap. A complete inventory names
+    /// every allocation of this instance the helper still holds; a digest known before it
+    /// was asked whose allocation it omits is retired or absent and is dropped, unless a
+    /// learning call held a claim on it at the start or still does.
+    fn drop_unlisted_digests(&self, before: &[Id128], listed: &[Id128]) {
+        let mut cache = self.digests.lock().unwrap();
+        for allocation in before {
+            if !listed.contains(allocation) && !cache.in_flight.contains_key(allocation) {
+                cache.entries.remove(allocation);
+            }
+        }
+    }
+
+    /// The digests known now with no learning call in flight: the only ones a complete
+    /// inventory may drop.
+    fn settled_digests(&self) -> Vec<Id128> {
+        let cache = self.digests.lock().unwrap();
+        cache
+            .entries
+            .keys()
+            .filter(|allocation| !cache.in_flight.contains_key(allocation))
+            .copied()
+            .collect()
     }
 
     /// B7 RTC-14: raises the reported highest token to `token` if its sequence is
@@ -291,7 +382,7 @@ impl FirecrackerRuntime {
 
     #[cfg(test)]
     pub(crate) fn test_digest_count(&self) -> usize {
-        self.digests.lock().unwrap().len()
+        self.digests.lock().unwrap().entries.len()
     }
 
     /// Seeds an entry, as an earlier create or Inspect would have.
@@ -500,10 +591,15 @@ impl FirecrackerRuntime {
         self.sessions.lock().unwrap().remove(&allocation);
     }
 
-    /// The allocation reached a terminal answer: nothing will name it again.
+    /// The allocation reached a terminal answer: nothing will name it again, and a
+    /// learning call begun before this answer cannot bring its digest back (recheck R3).
     fn forget_allocation(&self, allocation: Id128) {
         self.sessions.lock().unwrap().remove(&allocation);
-        self.digests.lock().unwrap().remove(&allocation);
+        let mut cache = self.digests.lock().unwrap();
+        cache.entries.remove(&allocation);
+        if let Some(claim) = cache.in_flight.get_mut(&allocation) {
+            claim.forgotten = true;
+        }
     }
 
     /// The boot and inner sandbox to name. Missing after a daemon restart, it is read
@@ -517,7 +613,7 @@ impl FirecrackerRuntime {
         if let Some(session) = self.sessions.lock().unwrap().get(&allocation).cloned() {
             return Ok(session);
         }
-        let Some(digest) = self.digests.lock().unwrap().get(&allocation).copied() else {
+        let Some(digest) = self.digests.lock().unwrap().entries.get(&allocation).copied() else {
             return Err(RuntimeError::Backend(format!(
                 "allocation {allocation} has no known binding yet; reconciliation reads it"
             )));
@@ -750,7 +846,7 @@ impl Runtime for FirecrackerRuntime {
         }
         // RTC-13: checked before Preflight, so a refusal spends no seq.
         let cap = self.max_digests.load(Ordering::Relaxed);
-        if self.digests.lock().unwrap().len() >= cap {
+        if self.digests.lock().unwrap().entries.len() >= cap {
             return Err(RuntimeError::Exhausted(format!(
                 "this daemon already tracks {cap} unsettled Firecracker allocations"
             )));
@@ -787,6 +883,8 @@ impl Runtime for FirecrackerRuntime {
     ) -> Result<CreatedSandbox, CreateFailure> {
         let plan_digest = prepared.plan_digest();
         // The manager calls create only after C1: from here the allocation may exist.
+        // The claim keeps reconciliation from dropping it before C2 is listed.
+        let _claim = self.claim_learn(context.allocation_id);
         self.learn_digest(context.allocation_id, plan_digest);
         let response = self
             .call(
@@ -835,17 +933,21 @@ impl Runtime for FirecrackerRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<AllocationObservation, RuntimeError> {
+        let claim = self.claim_learn(context.allocation_id);
         let reply = self
             .inspect_raw(context.allocation_id, *prepared_digest, deadline, cancel)
             .await?;
         // Only a non-terminal answer (re)learns the digest: how a restarted daemon
-        // relearns its live allocations for Validate and Exec.
-        if !matches!(
-            reply,
-            InspectReply::AbsentFenced { .. } | InspectReply::Incompatible { .. }
-        ) {
-            self.learn_digest(context.allocation_id, *prepared_digest);
+        // relearns its live allocations for Validate and Exec. A terminal answer that
+        // arrived while this one was in flight (a Remove's, a Gc's) wins: the stale
+        // continuation learns nothing (recheck R3). A refusal forgets: the digest it
+        // names is not this token's.
+        match reply {
+            InspectReply::AbsentFenced { .. } => {}
+            InspectReply::Incompatible { .. } => self.forget_allocation(context.allocation_id),
+            _ => claim.learn(*prepared_digest),
         }
+        drop(claim);
         match reply {
             // The helper's READY: idle on the journaled boot, no execution in flight.
             InspectReply::PresentReady {
@@ -1077,11 +1179,20 @@ impl Runtime for FirecrackerRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<BackendInventory, RuntimeError> {
+        let before = self.settled_digests();
         match self
             .call(FirecrackerOperation::List, deadline, cancel)
             .await?
         {
-            FirecrackerResponse::List(reply) => Ok(BackendInventory {
+            FirecrackerResponse::List(reply) => {
+                // B7 recheck R3: a complete inventory recovers the cap from digests whose
+                // allocations the helper no longer holds.
+                if reply.complete {
+                    let listed: Vec<Id128> =
+                        reply.records.iter().map(|record| record.allocation_id).collect();
+                    self.drop_unlisted_digests(&before, &listed);
+                }
+                Ok(BackendInventory {
                 generation: reply.generation,
                 complete: reply.complete,
                 records: reply
@@ -1102,7 +1213,8 @@ impl Runtime for FirecrackerRuntime {
                         generation: record.generation,
                     })
                     .collect(),
-            }),
+                })
+            }
             FirecrackerResponse::Error(error) => Err(group_failure(error)),
             _ => Err(unexpected()),
         }
@@ -1257,5 +1369,71 @@ mod tests {
         runtime.learn_digest(Id128::random(), Digest::of(b"two"));
         assert_eq!(runtime.test_digest_count(), 2, "learning past C1 is never refused");
         assert_eq!(MAX_DIGESTS, 1024 + 4096);
+    }
+
+    /// B7 M1 recheck R3 (`reviews/poc-b7m1-recheck`, `poc_b7m1_stale_inspects_fill_the_
+    /// digest_cap`, now a regression): each allocation is learned at Create, an Inspect's
+    /// reply is in flight, Remove's terminal answer forgets the allocation, and then the
+    /// delayed Inspect resumes. Its learn is refused, so the cap never fills with entries
+    /// nothing will remove, and the next Preflight reaches the helper.
+    #[tokio::test]
+    async fn stale_learns_after_terminal_answers_never_fill_the_digest_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helper.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let instance = Id128::random();
+        let runtime = FirecrackerRuntime::new(path, instance, Id128::random());
+        runtime.test_set_max_digests(2);
+        for label in [b"one".as_slice(), b"two".as_slice()] {
+            let allocation = Id128::random();
+            let digest = Digest::of(label);
+            runtime.learn_digest(allocation, digest); // Create, after C1.
+            let inspect = runtime.claim_learn(allocation); // Inspect's reply in flight.
+            runtime.forget_allocation(allocation); // Remove's terminal answer.
+            inspect.learn(digest); // The delayed Inspect resumes.
+            drop(inspect);
+        }
+        assert_eq!(runtime.test_digest_count(), 0, "no stale entry survives");
+        // A claim begun after the terminal answer learns normally: a restarted daemon's
+        // Inspect relearns its live allocations.
+        let allocation = Id128::random();
+        let claim = runtime.claim_learn(allocation);
+        claim.learn(Digest::of(b"live"));
+        drop(claim);
+        assert_eq!(runtime.test_digest_count(), 1);
+        let context = PrepareContext {
+            instance_id: instance,
+            sandbox_id: "sb-stale-inspects".into(),
+        };
+        let soon = Instant::now() + Duration::from_millis(200);
+        let below = runtime.prepare(&context, &spec(), soon, &CancellationToken::new()).await;
+        assert!(!matches!(below, Err(RuntimeError::Exhausted(_))), "{below:?}");
+        listener.accept().expect("the Preflight reached the helper");
+    }
+
+    /// B7 M1 recheck R3: a complete inventory drops the digests of allocations it does not
+    /// name (retired or absent), never one a learning call holds a claim on, nor one
+    /// learned after the inventory was asked.
+    #[test]
+    fn a_complete_inventory_drops_only_unclaimed_unlisted_digests() {
+        let runtime = FirecrackerRuntime::new("/nonexistent".into(), Id128::random(), Id128::random());
+        let [live, retired, creating, later] = [(); 4].map(|_| Id128::random());
+        for allocation in [live, retired, creating] {
+            runtime.learn_digest(allocation, Digest::of(allocation.to_string().as_bytes()));
+        }
+        let claim = runtime.claim_learn(creating);
+        let before = runtime.settled_digests();
+        assert_eq!(before.len(), 2, "a claimed digest is never a candidate");
+        runtime.learn_digest(later, Digest::of(b"later"));
+        runtime.drop_unlisted_digests(&before, &[live]);
+        let cache = runtime.digests.lock().unwrap();
+        assert!(cache.entries.contains_key(&live));
+        assert!(!cache.entries.contains_key(&retired), "the unlisted digest is dropped");
+        assert!(cache.entries.contains_key(&creating));
+        assert!(cache.entries.contains_key(&later));
+        drop(cache);
+        drop(claim);
+        assert!(runtime.digests.lock().unwrap().in_flight.is_empty(), "claims end with their calls");
     }
 }

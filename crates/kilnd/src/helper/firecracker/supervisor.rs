@@ -45,6 +45,10 @@ pub enum SupervisorRecord {
     /// have succeeded. Evidence of what was executed by descriptor, not an observation
     /// of the process image; L records it as `retained_fd`.
     InferredFromRetainedFd(ExecutableIdentity),
+    /// B7 recheck R2: not a record but S's last check before each Initialize it sends
+    /// the guest broker. H answers `true` only while neither H nor L is latched, the
+    /// boot is unfenced and L still has the allocation `booting`.
+    Initialize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1339,12 +1343,33 @@ mod linux {
                 )),
             }
         })?;
-        let status_text = proc_status(v.pid)?;
-        if pidfd_exited(&v_pidfd) {
-            return Err(Abort::Refused("the VMM exited during observation".into()));
-        }
-        let credentials = storage::parse_status(&status_text)?;
-        let credentials = test_credentials(credentials);
+        // B7 recheck R4: the image is visible as soon as V has exec'd, which can be
+        // before Firecracker has installed its own seccomp filter. Within the same
+        // bound, only that state (`Seccomp` still 0, every other field already as the
+        // contract says) is sampled again; any other sample is taken as it is, so a
+        // wrong credential or another `Seccomp` value is refused at once below, and a
+        // filter never observed is refused when the bound ends.
+        let recipe = &plan.launch["resource_recipe"]["vmm_credentials"];
+        let mut sample = None;
+        let sampled = link.wait_for(Duration::from_secs(5), || {
+            let status_text = proc_status(v.pid)?;
+            if pidfd_exited(&v_pidfd) {
+                return Err(io::Error::other("the VMM exited during observation"));
+            }
+            let credentials = test_credentials(storage::parse_status(&status_text)?);
+            let pending = storage::vmm_seccomp_pending(&credentials, recipe);
+            sample = Some(credentials);
+            Ok((!pending).then_some(()))
+        });
+        let credentials = match (sampled, sample) {
+            (Ok(()), Some(credentials)) => credentials,
+            // The bound ended with the filter still absent: refused below as `Seccomp`.
+            (Err(Abort::Expired), Some(credentials)) if monotonic_ns() < link.deadline_ns() => {
+                credentials
+            }
+            (Err(abort), _) => return Err(abort),
+            (Ok(()), None) => unreachable!("a finished wait has a sample"),
+        };
         link.record(SupervisorRecord::Child {
             role: ChildRole::Vm,
             process: v,
@@ -1360,11 +1385,7 @@ mod linux {
                 "the VMM's actual image differs from the journal".into(),
             ));
         }
-        storage::check_vmm_credentials(
-            &credentials,
-            &plan.launch["resource_recipe"]["vmm_credentials"],
-        )
-        .map_err(Abort::Refused)?;
+        storage::check_vmm_credentials(&credentials, recipe).map_err(Abort::Refused)?;
         // No bootstrap or executable descriptor survived V's exec.
         for (fd, target) in as_fs_ids(plan.uid, plan.gid, || open_descriptors(v.pid))? {
             if target == format!("socket:[{socket_ino}]") || target.ends_with("/firecracker") {
@@ -1416,6 +1437,21 @@ mod linux {
             let mut credentials = credentials;
             if super::super::workers::fault_enabled("S.credentials.capbnd") {
                 credentials.cap_bnd |= 1 << 10;
+            }
+            // B7 recheck R4: the first samples see no filter yet, as on a loaded host
+            // between V's exec and Firecracker's own filter installation.
+            static SAMPLES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if super::super::workers::fault_enabled("S.credentials.seccomp_late")
+                && SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+            {
+                credentials.seccomp = 0;
+            }
+            if super::super::workers::fault_enabled("S.credentials.seccomp_never") {
+                credentials.seccomp = 0;
+            }
+            // Strict mode is a different filter state, never a filter still to come.
+            if super::super::workers::fault_enabled("S.credentials.seccomp_strict") {
+                credentials.seccomp = 1;
             }
             credentials
         }

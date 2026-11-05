@@ -2611,6 +2611,182 @@ fn b7_scenario_names_match_the_scripts() {
     }
 }
 
+/// B7 M1 recheck R1 (`reviews/poc-b7m1-recheck`, `poc_b7m1_timed_out_syncfailed_is_not_
+/// propagated_to_h`, now a regression): a Create is queued immediately before its final
+/// `OpenGate` check; an unrelated FenceAbsent's commit fails, L writes the fail-stop
+/// marker and stalls before its `SyncFailed` reply, and the FenceAbsent's five-second
+/// deadline drops H's wait. The same L lives on. From the lost answer H holds every
+/// forward effect: the queued Create waits at its final boundary instead of crossing it.
+/// When L answers, nobody waits for the `SyncFailed`, but H consumes it all the same and
+/// latches; the Create is then refused with no gate and no host effect.
+#[tokio::test]
+async fn b7_crash_a_timed_out_syncfailed_latches_h_while_the_same_l_lives() {
+    let mut options = compacting(POLICY);
+    options.compaction_tick_ms = 60_000;
+    let fixture = Fixture::new(options).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let (queued, queued_plan) = issued(&runtime, instance).await;
+    let (faulted, faulted_plan) = issued(&runtime, instance).await;
+    create_accepted(&fixture, &runtime, &faulted, &faulted_plan).await;
+    let epoch = epoch_of(&runtime).await;
+
+    fixture.fault("H.create.before_open_gate.hold");
+    let create = spawn_raw_create(&fixture, instance, epoch, &queued, &queued_plan);
+    fixture.wait_reached("H.create.before_open_gate").await;
+
+    fixture.fault("L.fence.sync_fail");
+    fixture.fault("L.sync_failed_reply.stall");
+    let fence = spawn_raw_fence(&fixture, instance, epoch, &faulted, &faulted_plan, 5);
+    fixture.wait_reached("L.sync_failed_reply").await;
+    let marker = fixture
+        .root
+        .join("ledger")
+        .join(super::super::compaction::FAILSTOP_MARKER);
+    assert!(std::fs::read(&marker).unwrap().starts_with(b"latched"));
+    let old_l = fixture.census().await["ledger"].as_i64().unwrap();
+    let reply = fence.await.unwrap().unwrap();
+    assert!(matches!(reply, FirecrackerResponse::Fence(FenceReply::Ambiguous { .. })), "{reply:?}");
+    // The answer is lost and L is still stalled before it: forward effects are held.
+    let census = fixture.census().await;
+    assert_eq!(census["lost_answers"], json!(1), "{census}");
+    assert_eq!(census["ledger"].as_i64(), Some(old_l), "the same L");
+    fixture.clear("H.create.before_open_gate.hold");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!create.is_finished(), "the queued Create waits at its final boundary");
+    assert!(!fixture.fake_dir(&queued).exists(), "nothing started during the hold");
+
+    // L answers: the abandoned SyncFailed is consumed, H latches, the Create is refused.
+    fixture.clear("L.sync_failed_reply.stall");
+    fixture.clear("L.fence.sync_fail");
+    let Response::Firecracker(FirecrackerResponse::Create(reply)) = create.await.unwrap() else {
+        panic!("not a create reply");
+    };
+    assert_eq!(class_of(&reply), AmbiguousClass::Latched, "{reply:?}");
+    assert!(!fixture.fake_dir(&queued).exists(), "no host effect after the latch");
+    let census = fixture.census().await;
+    assert_eq!(census["latched"], json!(true), "H imported the lost SyncFailed: {census}");
+    assert_eq!(census["latch_kind"], json!("fail_stop"), "{census}");
+    assert_eq!(census["lost_answers"], json!(0), "{census}");
+    assert_eq!(census["ledger"].as_i64(), Some(old_l), "L survived");
+    assert!(std::fs::read(&marker).unwrap().starts_with(b"latched"));
+    let refused = runtime.prepare(&prep(instance), &spec(), deadline(10), &no_cancel()).await;
+    assert!(refused.is_err(), "Preflight is refused under the latch: {refused:?}");
+    b7_matrix(
+        "B7 M1 recheck R1: lost SyncFailed, same L",
+        json!({"hold_on_lost_answer": true, "queued_create": "held, then Latched", "h_latched": "on the consumed answer"}),
+    );
+}
+
+/// B7 M1 recheck R1's control: a lost answer that carries no fault holds forward effects
+/// only until it arrives, and never latches. A FenceAbsent's deadline lapses while L is
+/// held inside its fence; a Create queued at its final boundary waits; when L answers
+/// the fence normally the hold lifts, the Create is accepted, and a client that lets its
+/// own deadline lapse has fail-stopped nothing.
+#[tokio::test]
+async fn b7_crash_a_timed_out_benign_answer_holds_forward_effects_only_until_it_arrives() {
+    let mut options = compacting(POLICY);
+    options.compaction_tick_ms = 60_000;
+    let fixture = Fixture::new(options).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let (queued, queued_plan) = issued(&runtime, instance).await;
+    let (fenced_token, fenced_plan) = issued(&runtime, instance).await;
+    let epoch = epoch_of(&runtime).await;
+    fixture.fault("H.create.before_open_gate.hold");
+    let create = spawn_raw_create(&fixture, instance, epoch, &queued, &queued_plan);
+    fixture.wait_reached("H.create.before_open_gate").await;
+    // L holds the fence itself, so the request whose deadline lapses is a write.
+    fixture.fault("L.fence.stall");
+    let fence = spawn_raw_fence(&fixture, instance, epoch, &fenced_token, &fenced_plan, 2);
+    fixture.wait_reached("L.fence").await;
+    let reply = fence.await.unwrap().unwrap();
+    assert!(matches!(reply, FirecrackerResponse::Fence(FenceReply::Ambiguous { .. })), "{reply:?}");
+    assert_eq!(fixture.census().await["lost_answers"], json!(1));
+    fixture.clear("H.create.before_open_gate.hold");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!create.is_finished(), "held, not refused");
+    fixture.clear("L.fence.stall");
+    let Response::Firecracker(FirecrackerResponse::Create(reply)) = create.await.unwrap() else {
+        panic!("not a create reply");
+    };
+    assert!(matches!(reply, CreateReply::Accepted { .. }), "{reply:?}");
+    let census = fixture.census().await;
+    assert_eq!(census["latched"], json!(false), "{census}");
+    assert_eq!(census["lost_answers"], json!(0), "{census}");
+    issued(&runtime, instance).await;
+    b7_matrix(
+        "B7 M1 recheck R1: lost benign answer",
+        json!({"hold": "until the answer", "queued_create": "Accepted", "latched": false}),
+    );
+}
+
+fn spawn_raw_create(
+    fixture: &Fixture,
+    instance: Id128,
+    epoch: Id128,
+    context: &CreateContext,
+    plan: &PreparedCreate,
+) -> tokio::task::JoinHandle<Response> {
+    let socket = fixture.root.join("helper.sock");
+    let operation = create_operation(context, plan);
+    tokio::spawn(async move {
+        let request = Request {
+            version: VERSION,
+            timeout_ms: 25_000,
+            deadline_ns: wire_deadline(25),
+            operation: Operation::Firecracker(FirecrackerRequest {
+                group_version: FIRECRACKER_GROUP_VERSION,
+                instance_id: instance,
+                connection_epoch: Some(epoch),
+                operation,
+            }),
+        };
+        let mut stream = UnixStream::connect(socket).await.unwrap();
+        fds::send(&stream, &[]).await.unwrap();
+        write_frame(&mut stream, &request).await.unwrap();
+        assert!(fds::receive(&stream).await.unwrap().is_empty());
+        read_frame::<Response>(&mut stream).await.unwrap()
+    })
+}
+
+fn spawn_raw_fence(
+    fixture: &Fixture,
+    instance: Id128,
+    epoch: Id128,
+    context: &CreateContext,
+    plan: &PreparedCreate,
+    seconds: u64,
+) -> tokio::task::JoinHandle<std::io::Result<FirecrackerResponse>> {
+    let socket = fixture.root.join("helper.sock");
+    let operation = FirecrackerOperation::FenceAbsent {
+        allocation_id: context.allocation_id,
+        sandbox_id: context.sandbox_id.clone(),
+        plan_digest: plan.plan_digest(),
+    };
+    tokio::spawn(async move {
+        let request = Request {
+            version: VERSION,
+            timeout_ms: (seconds * 1_000) as u32,
+            deadline_ns: wire_deadline(seconds),
+            operation: Operation::Firecracker(FirecrackerRequest {
+                group_version: FIRECRACKER_GROUP_VERSION,
+                instance_id: instance,
+                connection_epoch: Some(epoch),
+                operation,
+            }),
+        };
+        let mut stream = UnixStream::connect(socket).await.unwrap();
+        fds::send(&stream, &[]).await.unwrap();
+        write_frame(&mut stream, &request).await.unwrap();
+        assert!(fds::receive(&stream).await.unwrap().is_empty());
+        match read_frame::<Response>(&mut stream).await.unwrap() {
+            Response::Firecracker(reply) => Ok(reply),
+            other => Err(std::io::Error::other(format!("not Firecracker: {other:?}"))),
+        }
+    })
+}
+
 /// B7 M1 break-it finding 1 (`reviews/poc-b7m1/run-failstop-replacement.sh`, now a
 /// regression): an uncertain commit makes L write the durable fail-stop marker, and L
 /// is killed at `L.reply` before H receives `SyncFailed`. H sees only a closed channel.
@@ -2767,4 +2943,207 @@ async fn b7_rtc14_a_latch_during_create_setup_is_rechecked_before_open_gate() {
         "B7 M1 finding 2: latch rechecked before OpenGate",
         json!({"queued_create": "Latched, gate never opened", "fence_under_latch": "Absent"}),
     );
+}
+
+/// B7 M1 recheck R3 through the real adapter and helper: an Inspect's answer is read
+/// from L and then held in H while a Remove of the same allocation completes and its
+/// terminal answer forgets the digest. Released, the stale non-terminal answer does not
+/// bring the digest back. With the cap lowered to two, two such races used to leave two
+/// permanent entries and refuse the next Preflight with no live allocation; now none is
+/// left and Preflight is served. A complete List also drops a digest whose allocation
+/// the helper no longer holds.
+#[tokio::test]
+async fn b7_rtc13_stale_inspects_racing_removes_never_fill_the_digest_cap() {
+    let fixture = Fixture::new(compacting(POLICY)).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    runtime.test_set_max_digests(2);
+    for _ in 0..2 {
+        let (context, plan) = issued(&runtime, instance).await;
+        create_accepted(&fixture, &runtime, &context, &plan).await;
+        let digest = plan.plan_digest();
+        fixture.clear("H.inspect.after_lookup.reached");
+        fixture.fault("H.inspect.after_lookup.hold");
+        let cancel = no_cancel();
+        let (observed, ()) = tokio::join!(
+            runtime.inspect_allocation(&context, &digest, deadline(20), &cancel),
+            async {
+                fixture.wait_reached("H.inspect.after_lookup").await;
+                fenced(
+                    runtime
+                        .fence_absent(&context, &digest, deadline(20), &no_cancel())
+                        .await
+                        .unwrap(),
+                );
+                fixture.clear("H.inspect.after_lookup.hold");
+            }
+        );
+        // The held answer predates the Remove: not terminal, so it would have relearned.
+        let observed = observed.unwrap();
+        assert!(
+            !matches!(observed, AllocationObservation::AbsentFenced(_)),
+            "{observed:?}"
+        );
+    }
+    assert_eq!(runtime.test_digest_count(), 0, "no stale digest survives");
+    let (live, live_plan) = issued(&runtime, instance).await;
+    create_accepted(&fixture, &runtime, &live, &live_plan).await;
+    // Reconciliation's recovery: seeded entries for a retired and an unknown token are
+    // dropped by a complete List; the live allocation's entry stays.
+    runtime.test_learn_digest(live.allocation_id, live_plan.plan_digest());
+    let (retired, retired_plan) = issued(&runtime, instance).await;
+    fenced(
+        runtime
+            .fence_absent(&retired, &retired_plan.plan_digest(), deadline(20), &no_cancel())
+            .await
+            .unwrap(),
+    );
+    runtime.test_learn_digest(retired.allocation_id, retired_plan.plan_digest());
+    assert_eq!(runtime.test_digest_count(), 2, "at the cap");
+    let listed = runtime.list(deadline(20), &no_cancel()).await.unwrap();
+    assert!(listed.complete);
+    assert_eq!(runtime.test_digest_count(), 1, "the retired token's digest is dropped");
+    issued(&runtime, instance).await;
+    b7_matrix(
+        "B7 M1 recheck R3: stale Inspects racing Removes",
+        json!({"stale_entries": 0, "next_preflight": "served", "list_recovery": "retired dropped"}),
+    );
+}
+
+/// B7 M1 recheck R2's real-chain regressions (the kiln VM, as root).
+#[cfg(target_os = "linux")]
+mod linux_root {
+    use super::*;
+
+    /// B7 M1 recheck R2, real chain: latches H by a real failed commit, the never-admitted
+    /// fence of another token of this instance (RTC-R2-01's fail-stop).
+    async fn latch_by_a_failed_commit(fixture: &Fixture, runtime: &FirecrackerRuntime) {
+        let instance = runtime.test_instance();
+        let (other, other_plan) = issued(runtime, instance).await;
+        fixture.fault("L.fence.sync_fail");
+        let failed = runtime
+            .fence_absent(&other, &other_plan.plan_digest(), deadline(20), &no_cancel())
+            .await;
+        fixture.clear("L.fence.sync_fail");
+        assert!(!matches!(failed, Ok(AbsenceReceipt::Fenced(_))), "{failed:?}");
+        assert_eq!(fixture.census().await["latched"], json!(true), "H latched");
+    }
+
+    /// Waits until H has seen S exit, and returns the census entry.
+    async fn supervisor_exited(fixture: &Fixture, allocation: Id128) -> Value {
+        for _ in 0..1_200 {
+            let census = fixture.census().await;
+            let entry = census["supervisors"][allocation.to_string()].clone();
+            if !entry["exit"].is_null() {
+                return entry;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("S never exited: {}", fixture.log());
+    }
+
+    fn intents(real: &super::super::lifecycle::Real, allocation: Id128) -> Vec<String> {
+        real.fixture.read(|view| {
+            let mut statement = view.prepare(
+                "SELECT detail FROM resource_events WHERE allocation_id = ?1 ORDER BY generation",
+            )?;
+            let rows = statement
+                .query_map([allocation.to_string()], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// B7 M1 recheck R2, real chain, H's check before L: S is held at its cgroup step, then
+    /// the node latches. Released, S's cgroup intent is never journaled or acknowledged, so
+    /// no cgroup tree is created; S is contained and the allocation still removes to ABSENT
+    /// under the latch.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "needs root, KVM and the B4 artifacts: run scripts/firecracker-regressions.py"]
+    async fn b7_rtc14_linux_root_a_latch_while_s_waits_grants_no_resource_authority() {
+        use super::super::lifecycle::{Real, create, host_leftovers, remove};
+        let real = Real::new(NodeOptions::default()).await;
+        real.fixture.fault("S.step.cgroup.stall");
+        let (runtime, context, _plan) = create(&real).await;
+        real.fixture.wait_reached("S.step.cgroup").await;
+        latch_by_a_failed_commit(&real.fixture, &runtime).await;
+        real.fixture.clear("S.step.cgroup.stall");
+        let entry = supervisor_exited(&real.fixture, context.allocation_id).await;
+        assert_eq!(entry["stop_fenced"], json!(true), "S was contained: {entry}");
+        assert_eq!(real.phase(context.allocation_id), "preparing");
+        assert_eq!(intents(&real, context.allocation_id), Vec::<String>::new(), "no intent");
+        assert_eq!(host_leftovers(&real, &context, None), Vec::<String>::new(), "no host effect");
+        let removed = remove(&real, &runtime, &context).await;
+        assert!(matches!(removed, FenceReply::Absent { .. }), "{removed:?}");
+        b7_matrix(
+            "B7 M1 recheck R2: latch before S's cgroup intent",
+            json!({"cgroup_intent": "never sent", "host_effect": "none", "remove": "Absent"}),
+        );
+    }
+
+    /// B7 M1 recheck R2, real chain, H's check after L: S's cgroup intent is journaled by
+    /// an unlatched L, and H is held between that answer and its acknowledgement while
+    /// the node latches. H reads the latch again after the answer and refuses the
+    /// acknowledgement: S never creates the tree, is contained, and Remove reaches ABSENT.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "needs root, KVM and the B4 artifacts: run scripts/firecracker-regressions.py"]
+    async fn b7_rtc14_linux_root_a_latch_while_h_awaits_l_refuses_the_acknowledgement() {
+        use super::super::lifecycle::{Real, create, host_leftovers, remove};
+        let real = Real::new(NodeOptions::default()).await;
+        real.fixture.fault("S.step.cgroup.stall");
+        let (runtime, context, _plan) = create(&real).await;
+        real.fixture.wait_reached("S.step.cgroup").await;
+        real.fixture.fault("H.record.after_ledger.hold");
+        real.fixture.clear("S.step.cgroup.stall");
+        real.fixture.wait_reached("H.record.after_ledger").await;
+        let recorded = intents(&real, context.allocation_id);
+        assert_eq!(recorded.len(), 1, "L journaled the intent: {recorded:?}");
+        assert!(recorded[0].contains("cgroup"), "{recorded:?}");
+        latch_by_a_failed_commit(&real.fixture, &runtime).await;
+        real.fixture.clear("H.record.after_ledger.hold");
+        let entry = supervisor_exited(&real.fixture, context.allocation_id).await;
+        assert_eq!(entry["stop_fenced"], json!(true), "S was contained: {entry}");
+        assert_eq!(intents(&real, context.allocation_id), recorded, "nothing after it");
+        assert_eq!(host_leftovers(&real, &context, None), Vec::<String>::new(), "no tree");
+        let removed = remove(&real, &runtime, &context).await;
+        assert!(matches!(removed, FenceReply::Absent { .. }), "{removed:?}");
+        b7_matrix(
+            "B7 M1 recheck R2: latch while H awaits the cgroup intent",
+            json!({"intent": "journaled", "acknowledgement": "refused", "host_effect": "none", "remove": "Absent"}),
+        );
+    }
+
+    /// B7 M1 recheck R2, real chain, Initialize: the VM is BOOTING and S is held at its
+    /// broker readiness step, before any Initialize. The node latches; released, S's
+    /// Initialize check is refused, so no Initialize is sent: the allocation never reaches
+    /// READY, its VMM is contained, and Remove reaches ABSENT under the latch.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "needs root, KVM and the B4 artifacts: run scripts/firecracker-regressions.py"]
+    async fn b7_rtc14_linux_root_a_latch_before_initialize_sends_none() {
+        use super::super::lifecycle::{Real, create, host_leftovers, remove};
+        let real = Real::new(NodeOptions::default()).await;
+        real.fixture.fault("S.step.broker_ready.stall");
+        let (runtime, context, _plan) = create(&real).await;
+        real.fixture.wait_reached("S.step.broker_ready").await;
+        assert_eq!(real.phase(context.allocation_id), "booting");
+        let vmm = real.vmm(context.allocation_id).expect("the VMM is journaled");
+        latch_by_a_failed_commit(&real.fixture, &runtime).await;
+        real.fixture.clear("S.step.broker_ready.stall");
+        let entry = supervisor_exited(&real.fixture, context.allocation_id).await;
+        assert_eq!(entry["stop_fenced"], json!(true), "S was contained: {entry}");
+        assert_eq!(real.phase(context.allocation_id), "booting", "never READY");
+        assert!(
+            !intents(&real, context.allocation_id)
+                .iter()
+                .any(|detail| detail.contains("\"broker\"")),
+            "no broker identity journaled"
+        );
+        let removed = remove(&real, &runtime, &context).await;
+        assert!(matches!(removed, FenceReply::Absent { .. }), "{removed:?}");
+        assert_eq!(host_leftovers(&real, &context, Some(vmm)), Vec::<String>::new());
+        b7_matrix(
+            "B7 M1 recheck R2: latch before Initialize",
+            json!({"initialize": "never sent", "phase": "booting", "remove": "Absent"}),
+        );
+    }
 }

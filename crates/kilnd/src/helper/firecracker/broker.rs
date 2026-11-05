@@ -1754,6 +1754,9 @@ pub mod supervise {
             },
             deadline_ns: link.deadline_ns(),
         };
+        // B7 recheck R2: H and L authorize each Initialize sent, so none is sent under
+        // the node latch or after a stop fence.
+        link.record(SupervisorRecord::Initialize)?;
         submit(link, plan, booted, workers, request.clone(), Vec::new()).map_err(|(_, e)| e)?;
         // The guest is still booting when BOOTING is journaled: until its broker
         // listens, the VMM answers CONNECT without OK. Only that is retried, every
@@ -1769,6 +1772,7 @@ pub mod supervise {
             }
             if retry_at.is_some_and(|at| std::time::Instant::now() >= at) {
                 retry_at = None;
+                link.record(SupervisorRecord::Initialize)?;
                 submit(link, plan, booted, workers, request.clone(), Vec::new())
                     .map_err(|(_, e)| e)?;
             }

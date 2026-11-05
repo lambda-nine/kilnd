@@ -51,6 +51,36 @@ pub(super) fn allocation_cgroup(key: AllocationKey) -> String {
     )
 }
 
+/// Why a supervisor was contained at a record under the node latch (B7 recheck R2).
+const LATCHED_RECORD: &str = "forward effects are latched node-wide";
+
+/// How long a record of S's waits for a lost ledger answer to be consumed before it is
+/// treated as latched (B7 recheck R1).
+const LOST_ANSWER_WAIT: Duration = Duration::from_secs(2);
+
+/// B7 recheck R2: whether L still journals this record of S's under its latch
+/// (`workers::allowed_under_latch`). H does not send any other while latched.
+fn recorded_under_latch(record: &SupervisorRecord) -> bool {
+    match record {
+        SupervisorRecord::Resource(resource) => workers::resource_allowed_under_latch(resource),
+        SupervisorRecord::Phase { from, to } => workers::phase_allowed_under_latch(from, to),
+        SupervisorRecord::Child { .. }
+        | SupervisorRecord::Observed(_)
+        | SupervisorRecord::InferredFromRetainedFd(_) => true,
+        SupervisorRecord::Initialize => false,
+    }
+}
+
+/// B7 recheck R2: the only records H acknowledges under the latch, the explicit
+/// teardown set. A cleanup S proves a loop generation gone; nothing else S sends is
+/// teardown, so every other answer under the latch is `false` and S stops.
+fn acknowledged_under_latch(record: &SupervisorRecord) -> bool {
+    matches!(
+        record,
+        SupervisorRecord::Resource(ResourceRecord::LoopReleased { .. })
+    )
+}
+
 impl Node {
     /// One record from S, answered in order. A fenced boot gets no further authority:
     /// the answer is `false` and S stops forward work.
@@ -75,8 +105,30 @@ impl Node {
                 | SupervisorRecord::Child { .. }
                 | SupervisorRecord::Resource(ResourceRecord::LoopReleased { .. })
         );
+        // B7 recheck R2: under the node latch S gets no further authority. A record L
+        // would refuse is not sent; one it still takes (an identity cleanup needs) is
+        // journaled, but only teardown is acknowledged, and the latch is read again
+        // after L answers, so a latch set while H waited is never missed.
+        let acknowledged_latched = acknowledged_under_latch(&record);
+        let settle = Instant::now() + LOST_ANSWER_WAIT;
+        if !recorded_under_latch(&record) && self.latched_once_answered(settle).await {
+            self.contain_allocation(key, LATCHED_RECORD);
+            return false;
+        }
         let lane = Lane::Normal;
         let ok = match record {
+            SupervisorRecord::Initialize => matches!(
+                self.ledger_call(
+                    lane,
+                    &LedgerRequest::AuthorizeInitialize {
+                        instance: key.instance,
+                        allocation: key.allocation,
+                    },
+                    u64::MAX,
+                )
+                .await,
+                Ok(LedgerReply::Done)
+            ),
             SupervisorRecord::Resource(resource) => {
                 if let ResourceRecord::Cgroup(identity) = &resource {
                     // M must hold the subtree before J could clone anything into it.
@@ -220,10 +272,19 @@ impl Node {
                 Ok(LedgerReply::Done)
             ),
         };
+        // B7 recheck R2: holds H between L's answer and the latch check after it.
+        #[cfg(test)]
+        workers::faults::hold("H.record.after_ledger").await;
+        let latched = !acknowledged_latched
+            && self
+                .latched_once_answered(Instant::now() + LOST_ANSWER_WAIT)
+                .await;
         if !ok {
             self.contain_allocation(key, "a supervisor record could not be journaled");
+        } else if latched {
+            self.contain_allocation(key, LATCHED_RECORD);
         }
-        ok && (evidence_only || !fenced)
+        ok && !latched && (evidence_only || !fenced)
     }
 
     /// Gives M a concrete stop target (merged with anything it already had).

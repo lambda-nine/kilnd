@@ -2969,6 +2969,21 @@ impl Ledger {
 
     /// Everything cleanup needs for one active allocation: its plan, identity and every
     /// recorded resource, in order.
+    /// One allocation's phase alone (B7 recheck R2's Initialize check).
+    pub fn allocation_phase(
+        &self,
+        instance: Id128,
+        allocation: Id128,
+    ) -> Result<Option<String>, LedgerError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT phase FROM allocations WHERE instance_id = ?1 AND allocation_id = ?2",
+            )?
+            .query_row([instance.to_string(), allocation.to_string()], |r| r.get(0))
+            .optional()?)
+    }
+
     pub fn allocation_state(
         &self,
         instance: Id128,

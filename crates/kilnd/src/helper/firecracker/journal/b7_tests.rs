@@ -1970,3 +1970,258 @@ fn rtc14_l_refuses_forward_writes_under_its_own_latch_whatever_h_believes() {
         "{reply:?}"
     );
 }
+
+/// B7 M1 recheck R2 (`reviews/poc-b7m1-recheck`, `poc_b7m1_latched_l_accepts_supervisor_
+/// resource_intent`, now a regression): under its latch or fail-stop marker L refuses
+/// every one of S's records that precedes the effect it authorizes (each intent, the loop
+/// generation, the jail mounts and binds, the work and private files, the broker's
+/// identity, an Exec intent), every forward phase (`spawn_intent`, `booting`, readiness
+/// from `booting`) and the Initialize check, writing nothing. The identities of objects
+/// that already exist (cgroup, work and jail directories, the VMM) and an execution's
+/// settlement are still journaled, for cleanup.
+#[test]
+fn rtc14_r2_l_refuses_every_supervisor_forward_record_and_initialize_under_its_latch() {
+    use crate::helper::firecracker::cgroup::CgroupIdentity;
+    use crate::helper::firecracker::compaction::Compactor;
+    use crate::helper::firecracker::peer::PeerAttestor;
+    use crate::helper::firecracker::storage::*;
+    use crate::helper::firecracker::supervisor::{IntentKind, ResourceRecord as R};
+    use crate::helper::firecracker::workers::{
+        LedgerReply, LedgerRequest, LedgerState, ProcessId, RevocationTable, handle_ledger,
+        phase_allowed_under_latch,
+    };
+    let boot = "0f8e2c1a-1b2c-3d4e-5f60-718293a4b5c6".to_string();
+    let fid = |n: u64| FileIdentity {
+        st_dev: 3,
+        st_ino: 50 + n,
+        bytes: 4096,
+        btime_sec: 1,
+        btime_nsec: 2,
+    };
+    let binding = LoopBinding {
+        major: 7,
+        minor: 9,
+        backing_dev: 3,
+        backing_ino: 51,
+        offset: 0,
+        size_limit: 1 << 30,
+        block_size: 4096,
+    };
+    let refused: Vec<R> = vec![
+        R::Intent(IntentKind::Cgroup),
+        R::Intent(IntentKind::WorkDir),
+        R::Intent(IntentKind::WorkFile),
+        R::Intent(IntentKind::PrivateFiles),
+        R::Intent(IntentKind::JailDir),
+        R::WorkFile(fid(2)),
+        R::PrivateFiles {
+            identity: fid(3),
+            config: fid(4),
+        },
+        R::LoopIntent(binding),
+        R::Loop {
+            binding,
+            generation: LoopGeneration {
+                boot_id: boot.clone(),
+                diskseq: 11,
+            },
+        },
+        R::JailIntent(JailIdentity { nonce: "ab".repeat(16) }),
+        R::JailMount(JailMount {
+            boot_id: boot.clone(),
+            unique_id: 1,
+            mount_id: 2,
+            st_dev: 3,
+            st_ino: 4,
+            root_ino: 5,
+        }),
+        R::JailBinds(vec![BindMount {
+            name: "kernel".into(),
+            boot_id: boot.clone(),
+            unique_id: 6,
+            mount_id: 7,
+            st_dev: 3,
+            st_ino: 8,
+        }]),
+        R::Broker {
+            boot_id: boot.clone(),
+            inner_id: "in-0123456789abcdef".into(),
+        },
+        R::Exec {
+            token: Id128::random().to_string(),
+            execution_id: "ex-0123456789abcdef".into(),
+            boot_id: boot.clone(),
+            state: "intent".into(),
+        },
+    ];
+    let journaled: Vec<R> = vec![
+        R::Cgroup(CgroupIdentity {
+            boot_id: boot.clone(),
+            parent_ino: 1,
+            control_ino: 2,
+            relay_ino: 3,
+            vm_ino: 4,
+            vmm_ino: 5,
+            console_ino: 6,
+        }),
+        R::WorkDir(fid(1)),
+        R::JailDir(fid(5)),
+        R::Vmm {
+            process: ProcessId {
+                pid: 4242,
+                start_time: 99,
+                boot_id: None,
+            },
+            credentials: Credentials {
+                uid: [1; 4],
+                gid: [1; 4],
+                groups: vec![1],
+                cap_inh: 0,
+                cap_prm: 0,
+                cap_eff: 0,
+                cap_bnd: 0,
+                cap_amb: 0,
+                no_new_privs: 1,
+                seccomp: 2,
+            },
+        },
+    ];
+    let fixture = temp_ledger(unrestricted());
+    let mut ledger = fresh(&fixture.config);
+    let mut attestor = PeerAttestor::new();
+    let revocations = RevocationTable::new(4).unwrap();
+    for (latched, failstop, kind) in [(true, false, "rollback"), (false, true, "fail_stop")] {
+        let active = admitted(&mut ledger, instance(), if latched { 1 } else { 2 });
+        let who = instance();
+        let allocation = active.allocation_id;
+        ledger
+            .set_phase(who, allocation, &["intent".into()], "preparing")
+            .unwrap();
+        let mut state = LedgerState {
+            latched,
+            failstop,
+            compactor: Compactor::start(fixture.config.compaction, Some(&ledger), 0),
+            config: fixture.config.clone(),
+        };
+        let phase = |from: &str, to: &str| LedgerRequest::SetPhase {
+            instance: who,
+            allocation,
+            from: vec![from.into()],
+            to: to.into(),
+        };
+        let mut forward: Vec<LedgerRequest> = refused
+            .iter()
+            .cloned()
+            .map(|record| LedgerRequest::RecordResource {
+                instance: who,
+                allocation,
+                record,
+            })
+            .collect();
+        forward.extend([
+            phase("preparing", "spawn_intent"),
+            phase("spawn_intent", "booting"),
+            phase("booting", "ready"),
+            phase("ready", "exec_intent"),
+            LedgerRequest::AuthorizeInitialize {
+                instance: who,
+                allocation,
+            },
+        ]);
+        let changes = ledger.connection().total_changes();
+        for request in forward {
+            let label = format!("{request:?}");
+            let reply = handle_ledger(&mut ledger, &mut state, &mut attestor, &revocations, request)
+                .unwrap();
+            assert!(
+                matches!(&reply, LedgerReply::Latched { kind: k } if k == kind),
+                "{label}: {reply:?}"
+            );
+        }
+        assert_eq!(ledger.connection().total_changes(), changes, "nothing written");
+        // What already exists is still journaled, so cleanup can find it by generation.
+        for record in journaled.iter().cloned() {
+            let label = format!("{record:?}");
+            let reply = handle_ledger(
+                &mut ledger,
+                &mut state,
+                &mut attestor,
+                &revocations,
+                LedgerRequest::RecordResource {
+                    instance: who,
+                    allocation,
+                    record,
+                },
+            )
+            .unwrap();
+            assert!(matches!(reply, LedgerReply::Generation(_)), "{label}: {reply:?}");
+        }
+        assert!(ledger.connection().total_changes() > changes, "identities journaled");
+    }
+    // The phase allowlist, exactly: settlement and H's teardown stay.
+    let strings = |phases: &[&str]| phases.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    for (from, to, allowed) in [
+        (&["exec_intent"][..], "busy", true),
+        (&["exec_intent"][..], "ready", true),
+        (&["busy"][..], "ready", true),
+        (&["ready", "booting"][..], "stopped", true),
+        (&["stop_intent"][..], "cleaning", true),
+        (&["booting"][..], "ready", false),
+        (&["booting", "busy"][..], "ready", false),
+        (&[][..], "ready", false),
+        (&["ready"][..], "busy", false),
+        (&["preparing"][..], "spawn_intent", false),
+        (&["spawn_intent"][..], "booting", false),
+        (&["ready"][..], "exec_intent", false),
+    ] {
+        assert_eq!(phase_allowed_under_latch(&strings(from), to), allowed, "{from:?} -> {to}");
+    }
+}
+
+/// B7 M1 recheck R2: unlatched, the Initialize check passes only a `booting` allocation.
+#[test]
+fn rtc14_r2_initialize_is_authorized_only_while_booting() {
+    use crate::helper::firecracker::compaction::Compactor;
+    use crate::helper::firecracker::peer::PeerAttestor;
+    use crate::helper::firecracker::workers::{
+        LedgerReply, LedgerRequest, LedgerState, RevocationTable, handle_ledger,
+    };
+    let fixture = temp_ledger(unrestricted());
+    let mut ledger = fresh(&fixture.config);
+    let mut attestor = PeerAttestor::new();
+    let revocations = RevocationTable::new(4).unwrap();
+    let active = admitted(&mut ledger, instance(), 1);
+    let (who, allocation) = (instance(), active.allocation_id);
+    let mut state = LedgerState {
+        latched: false,
+        failstop: false,
+        compactor: Compactor::start(fixture.config.compaction, Some(&ledger), 0),
+        config: fixture.config.clone(),
+    };
+    let mut ask = |ledger: &mut Ledger| {
+        handle_ledger(
+            ledger,
+            &mut state,
+            &mut attestor,
+            &revocations,
+            LedgerRequest::AuthorizeInitialize {
+                instance: who,
+                allocation,
+            },
+        )
+        .unwrap()
+    };
+    assert!(matches!(ask(&mut ledger), LedgerReply::Failed { .. }));
+    for (from, to) in [("intent", "preparing"), ("preparing", "spawn_intent")] {
+        ledger.set_phase(who, allocation, &[from.into()], to).unwrap();
+        assert!(matches!(ask(&mut ledger), LedgerReply::Failed { .. }), "{to}");
+    }
+    ledger
+        .set_phase(who, allocation, &["spawn_intent".into()], "booting")
+        .unwrap();
+    assert!(matches!(ask(&mut ledger), LedgerReply::Done));
+    ledger
+        .set_phase(who, allocation, &["booting".into()], "ready")
+        .unwrap();
+    assert!(matches!(ask(&mut ledger), LedgerReply::Failed { .. }), "ready");
+}

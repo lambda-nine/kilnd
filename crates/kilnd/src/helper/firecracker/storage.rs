@@ -493,6 +493,22 @@ pub fn check_vmm_credentials(
     Ok(())
 }
 
+/// B7 recheck R4: whether this sample of the VMM's status is the one transient state
+/// adoption waits out: Firecracker has exec'd but not yet installed its own seccomp
+/// filter, so `Seccomp` still reads 0 (disabled) where the contract expects 2 (filter)
+/// while every other field already matches. Any other difference is a mismatch, refused
+/// at once, as is any other `Seccomp` value.
+pub fn vmm_seccomp_pending(observed: &Credentials, recipe: &serde_json::Value) -> bool {
+    if observed.seccomp != 0 || recipe["status_seccomp"].as_u64() != Some(2) {
+        return false;
+    }
+    let installed = Credentials {
+        seccomp: 2,
+        ..observed.clone()
+    };
+    check_vmm_credentials(&installed, recipe).is_ok()
+}
+
 /// What an absence observation found for one allocation's owned names.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3315,6 +3331,31 @@ mod tests {
     fn recipe() -> serde_json::Value {
         json!({"uid": 300123, "gid": 300456, "groups": [], "CapInh": 0, "CapPrm": 0,
                "CapEff": 0, "CapBnd": 0, "CapAmb": 0, "NoNewPrivs": 1, "status_seccomp": 2})
+    }
+
+    /// B7 M1 recheck R4: only `Seccomp` 0, with every other field as the contract says,
+    /// is the filter still to come; strict mode, any other credential difference, or a
+    /// contract that expects no filter is a mismatch at once.
+    #[test]
+    fn vmm_seccomp_pending_is_only_the_filter_not_yet_installed() {
+        let at = |seccomp: &str| {
+            parse_status(&status("0000000000000000", "").replace("Seccomp:\t2", seccomp)).unwrap()
+        };
+        assert!(vmm_seccomp_pending(&at("Seccomp:\t0"), &recipe()));
+        assert!(!vmm_seccomp_pending(&at("Seccomp:\t2"), &recipe()), "installed");
+        assert!(!vmm_seccomp_pending(&at("Seccomp:\t1"), &recipe()), "strict is a mismatch");
+        let mut bounding = at("Seccomp:\t0");
+        bounding.cap_bnd = 1 << 10;
+        assert!(!vmm_seccomp_pending(&bounding, &recipe()), "a capability mismatch");
+        let mut uid = at("Seccomp:\t0");
+        uid.uid = [0; 4];
+        assert!(!vmm_seccomp_pending(&uid, &recipe()), "a UID mismatch");
+        let mut none = recipe();
+        none["status_seccomp"] = json!(0);
+        assert!(!vmm_seccomp_pending(&at("Seccomp:\t0"), &none));
+        // Pending is never acceptance: the same sample is refused if the bound ends.
+        let error = check_vmm_credentials(&at("Seccomp:\t0"), &recipe()).unwrap_err();
+        assert!(error.contains("Seccomp"), "{error}");
     }
 
     #[test]

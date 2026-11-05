@@ -79,6 +79,8 @@ B7_SCENARIOS = [
     'b7_crash_rollback_fault_commit_at_every_boundary_keeps_forward_effects_refused',
     'b7_crash_the_offline_clear_killed_before_or_after_its_commit',
     'b7_crash_a_lost_syncfailed_then_a_replaced_l_keeps_forward_effects_latched',
+    'b7_crash_a_timed_out_syncfailed_latches_h_while_the_same_l_lives',
+    'b7_crash_a_timed_out_benign_answer_holds_forward_effects_only_until_it_arrives',
 ]
 
 if __name__ == '__main__':

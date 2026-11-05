@@ -155,6 +155,7 @@ pub(super) enum Journaled {
 }
 
 pub(super) type BoxedJournal = Pin<Box<dyn Future<Output = Journaled> + Send>>;
+pub(super) type BoxedLatch = Pin<Box<dyn Future<Output = bool> + Send>>;
 
 /// What Validate and Exec need from H for one allocation.
 pub(super) trait Host: Send + Sync + 'static {
@@ -185,8 +186,9 @@ pub(super) trait Host: Send + Sync + 'static {
     fn contain(&self, reason: &str);
     /// K's verdict once dispatched: `Some(true)` is proof the subtree is gone.
     fn contained(&self) -> Option<bool>;
-    /// B7 RTC-14: forward effects are latched node-wide.
-    fn latched(&self) -> bool;
+    /// B7 RTC-14: forward effects are latched node-wide, once any lost ledger answer
+    /// is consumed (recheck R1); still held at `until`, latched.
+    fn latched(&self, until: Instant) -> BoxedLatch;
 }
 
 /// One allocation of this node, as [`Host`].
@@ -337,8 +339,9 @@ impl Host for NodeHost {
             .and_then(|entry| entry.contained)
     }
 
-    fn latched(&self) -> bool {
-        self.node.is_latched()
+    fn latched(&self, until: Instant) -> BoxedLatch {
+        let node = self.node.clone();
+        Box::pin(async move { node.latched_once_answered(until).await })
     }
 }
 
@@ -744,7 +747,7 @@ impl<H: Host> Execution<H> {
         // VM is retired under the uncertainty rule rather than put back to READY.
         #[cfg(test)]
         workers::faults::hold("H.exec.before_dispatch").await;
-        if self.host.latched() {
+        if self.host.latched(self.deadline.instant).await {
             return self
                 .retire_undispatched(
                     Kind::Unavailable,

@@ -6,7 +6,12 @@
  *                     seconds for READY to settle, and kills it from the guest's outer
  *                     PID namespace, leaving the broker itself Idle (B5-04).
  *   B5_CONSOLE_FLOOD  writes about 128 KiB/s to the serial console for the VM's life:
- *                     past D's 64 KiB prefix, under its 1 MiB/s retirement rate.
+ *                     past D's 64 KiB prefix, under its 1 MiB/s retirement rate. It
+ *                     starts only once the broker's Initialize has created the
+ *                     persistent kiln sandbox, so the broker's one-shot startup
+ *                     capability probe has finished: the test is of a healthy run's
+ *                     drainer, and a flood racing the probe would make the guest fail
+ *                     readiness instead (B7 M1 recheck, harness ordering).
  * Test guests only: scripts/b5-test-guest.sh builds it into a copy of a production
  * bundle, never into the product image.
  */
@@ -30,22 +35,7 @@ static void sleep_ms(long milliseconds) {
     while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {}
 }
 
-#if defined(B5_CONSOLE_FLOOD)
-static void attack(void) {
-    static unsigned char block[4 * 1024];
-    memset(block, 'F', sizeof(block));
-    for (;;) {
-        size_t done = 0;
-        while (done < sizeof(block)) {
-            ssize_t n = write(STDERR_FILENO, block + done, sizeof(block) - done);
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) _exit(20);
-            done += (size_t)n;
-        }
-        sleep_ms(31);
-    }
-}
-#elif defined(B5_KILL_INNER)
+/* The persistent kiln sandbox's init PID, once Initialize has created it. */
 static pid_t find_inner_init(void) {
     const char *root = "/var/lib/kiln/runs";
     DIR *runs = opendir(root);
@@ -74,12 +64,38 @@ static pid_t find_inner_init(void) {
     return found;
 }
 
-static void attack(void) {
+/* Waits up to 60 s for the persistent inner sandbox: -1 if it never appeared. */
+static pid_t wait_inner_init(void) {
     pid_t inner = -1;
-    for (int attempt = 0; attempt < 600 && inner < 0; ++attempt) {
+    for (int attempt = 0; attempt < 1200 && inner < 0; ++attempt) {
         inner = find_inner_init();
         if (inner < 0) sleep_ms(50);
     }
+    return inner;
+}
+
+#if defined(B5_CONSOLE_FLOOD)
+static void attack(void) {
+    /* After Initialize, never before the broker's startup probe. A guest that never
+     * initializes floods anyway, so the test still sees the attack. */
+    pid_t inner = wait_inner_init();
+    dprintf(STDERR_FILENO, "B5_TEST_FLOOD_START inner=%ld\n", (long)inner);
+    static unsigned char block[4 * 1024];
+    memset(block, 'F', sizeof(block));
+    for (;;) {
+        size_t done = 0;
+        while (done < sizeof(block)) {
+            ssize_t n = write(STDERR_FILENO, block + done, sizeof(block) - done);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) _exit(20);
+            done += (size_t)n;
+        }
+        sleep_ms(31);
+    }
+}
+#elif defined(B5_KILL_INNER)
+static void attack(void) {
+    pid_t inner = wait_inner_init();
     if (inner < 0) _exit(21);
     sleep_ms(5000);
     if (kill(inner, SIGKILL) != 0) _exit(22);

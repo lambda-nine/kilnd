@@ -549,7 +549,49 @@ pub enum Lane {
 
 struct PendingCall {
     reply: oneshot::Sender<Result<Value, CallError>>,
+    /// B7 recheck R1: set when the waiter gave up; the answer goes here instead.
+    orphan: Option<Arc<dyn Orphan>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// B7 recheck R1: who consumes an answer whose waiter gave up after the request was on
+/// its way (a deadline or a cancellation dropped it). Its answer, or `Closed` if the
+/// worker died first, is still delivered, exactly once, off the request's path.
+pub trait Orphan: Send + Sync {
+    /// The waiter was dropped before the answer came; `answer` follows with `parked`.
+    fn parked(&self);
+    /// The answer. `parked` is false when it had already arrived as the waiter dropped.
+    fn answer(&self, reply: Result<Value, CallError>, parked: bool);
+}
+
+/// The waiter's side of one call. Dropped before the answer was taken, it hands any
+/// owner the answer: at once if it had arrived, else by parking the owner on the pending
+/// call, which the reader resolves under the same lock that guards its send.
+struct Waiter<'a> {
+    pending: &'a Mutex<HashMap<u64, PendingCall>>,
+    id: u64,
+    answer: Option<oneshot::Receiver<Result<Value, CallError>>>,
+    owner: Option<Arc<dyn Orphan>>,
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let (Some(mut answer), Some(owner)) = (self.answer.take(), self.owner.take()) else {
+            return;
+        };
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(call) = pending.get_mut(&self.id) {
+            owner.parked();
+            call.orphan = Some(owner);
+            return;
+        }
+        drop(pending);
+        // The reader took the call and sent under the lock: the answer is here.
+        answer.close();
+        if let Ok(reply) = answer.try_recv() {
+            owner.answer(reply, false);
+        }
+    }
 }
 
 /// H's end of a worker socket. Reader and writer are separate tasks, so abandoning a
@@ -633,15 +675,45 @@ impl Channel {
                     // A full event queue drops only that event; evidence always
                     // comes again from the process table or a later report.
                     let _ = event_tx.try_send(envelope.body);
-                } else if let Some(call) = pending.lock().unwrap().remove(&envelope.id) {
-                    let _ = call.reply.send(Ok(envelope.body));
+                } else {
+                    // Removed and sent under one lock, so a waiter dropping meanwhile
+                    // either parks its owner first or finds the answer sent.
+                    let mut body = Some(envelope.body);
+                    let orphaned = {
+                        let mut pending = pending.lock().unwrap();
+                        match pending.remove(&envelope.id) {
+                            Some(PendingCall {
+                                orphan: Some(orphan),
+                                ..
+                            }) => Some(orphan),
+                            Some(call) => {
+                                let _ = call.reply.send(Ok(body.take().unwrap_or_default()));
+                                None
+                            }
+                            None => None,
+                        }
+                    };
+                    if let (Some(orphan), Some(body)) = (orphaned, body) {
+                        orphan.answer(Ok(body), true);
+                    }
                 }
             }
             closed.cancel();
             // Every unanswered call learns the process is gone.
-            let drained: Vec<_> = pending.lock().unwrap().drain().collect();
-            for (_, call) in drained {
-                let _ = call.reply.send(Err(CallError::Closed));
+            let mut orphans = Vec::new();
+            {
+                let drained: Vec<_> = pending.lock().unwrap().drain().collect();
+                for (_, call) in drained {
+                    match call.orphan {
+                        Some(orphan) => orphans.push(orphan),
+                        None => {
+                            let _ = call.reply.send(Err(CallError::Closed));
+                        }
+                    }
+                }
+            }
+            for orphan in orphans {
+                orphan.answer(Err(CallError::Closed), true);
             }
         });
         Ok((channel, events))
@@ -666,6 +738,18 @@ impl Channel {
         lane: Lane,
         body: &impl Serialize,
         deadline_ns: u64,
+    ) -> Result<Rep, CallError> {
+        self.call_owned(lane, body, deadline_ns, None).await
+    }
+
+    /// `call`, and if this waiter is dropped once the request is sent, `owner` receives
+    /// its answer instead of the answer being discarded (B7 recheck R1).
+    pub async fn call_owned<Rep: DeserializeOwned>(
+        &self,
+        lane: Lane,
+        body: &impl Serialize,
+        deadline_ns: u64,
+        owner: Option<Arc<dyn Orphan>>,
     ) -> Result<Rep, CallError> {
         let permit = match lane {
             Lane::Normal => self.normal.clone().try_acquire_owned(),
@@ -693,6 +777,7 @@ impl Channel {
             id,
             PendingCall {
                 reply,
+                orphan: None,
                 _permit: permit,
             },
         );
@@ -704,7 +789,16 @@ impl Channel {
             self.pending.lock().unwrap().remove(&id);
             return Err(CallError::Closed);
         }
-        let value = answer.await.map_err(|_| CallError::Closed)??;
+        let mut waiter = Waiter {
+            pending: &self.pending,
+            id,
+            answer: Some(answer),
+            owner,
+        };
+        let answered = waiter.answer.as_mut().expect("unsettled").await;
+        // Taken: nothing is handed to the owner now.
+        waiter.answer = None;
+        let value = answered.map_err(|_| CallError::Closed)??;
         serde_json::from_value(value).map_err(|_| CallError::Protocol)
     }
 
@@ -1143,6 +1237,54 @@ pub enum LedgerRequest {
         instance: Id128,
     },
     Replay,
+    /// B7 recheck R2: S's last check before it sends the guest broker Initialize. Under
+    /// the latch it is refused; otherwise only a `booting` allocation is answered `Done`.
+    AuthorizeInitialize {
+        instance: Id128,
+        allocation: Id128,
+    },
+}
+
+impl LedgerRequest {
+    /// B7 recheck R1: whether L's answer could carry a fault H must import (`SyncFailed`
+    /// from any commit, `Latched` from a forward write, `FaultPending` from an attach). A
+    /// lost answer to one of these holds forward effects until it is consumed; only the
+    /// reads below, which commit nothing and are never refused under the latch, may be
+    /// lost without it. Exhaustive, so a new request is classified when it is added.
+    pub(super) fn fault_bearing(&self) -> bool {
+        match self {
+            LedgerRequest::Lookup { .. }
+            | LedgerRequest::NeverAdmittedFenceAllowed { .. }
+            | LedgerRequest::Inspect { .. }
+            | LedgerRequest::Handover
+            | LedgerRequest::AllocationState { .. }
+            | LedgerRequest::Accounting { .. }
+            | LedgerRequest::Inventory { .. }
+            | LedgerRequest::Replay => false,
+            #[cfg(test)]
+            LedgerRequest::TestEnroll { .. } => true,
+            LedgerRequest::Attach { .. }
+            | LedgerRequest::IssueAndSnapshot { .. }
+            | LedgerRequest::CommitFault { .. }
+            | LedgerRequest::Compact { .. }
+            | LedgerRequest::Admit { .. }
+            | LedgerRequest::RecordWorker { .. }
+            | LedgerRequest::RecordInfrastructure { .. }
+            | LedgerRequest::InfrastructureIntent { .. }
+            | LedgerRequest::RecordChild { .. }
+            | LedgerRequest::AdvancePhase { .. }
+            | LedgerRequest::RecordStop { .. }
+            | LedgerRequest::RecordObserved { .. }
+            | LedgerRequest::RecordInferred { .. }
+            | LedgerRequest::RecordResource { .. }
+            | LedgerRequest::SetPhase { .. }
+            | LedgerRequest::AllocationWorkerIntent { .. }
+            | LedgerRequest::Settle { .. }
+            | LedgerRequest::SettleUnstarted { .. }
+            | LedgerRequest::Fence(_)
+            | LedgerRequest::AuthorizeInitialize { .. } => true,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1244,31 +1386,97 @@ impl LatchState {
     }
 }
 
-/// B7 RTC-14 at L: the ledger writes that start or continue a forward effect. Under L's
-/// own latch each is refused before anything is written, whoever sends it. Preflight's
-/// issuance and a first attach are refused inside their own transactions
-/// (`issue_and_snapshot`, `attach_instance`), which read the same latch and the fault
-/// rows. Validate journals nothing; H refuses it under its latch. Cleanup and evidence
-/// (Inspect, List, Stop, Remove, Gc, FenceAbsent, settlement, observed records, `booting`
-/// and `ready` after the fact) are never refused here.
-pub(super) fn forward_effect(request: &LedgerRequest) -> bool {
+/// B7 RTC-14 and recheck R2 at L: the requests L still serves under its own latch or
+/// fail-stop marker, whoever sends them. This is an allowlist: anything not named here
+/// starts or extends work and is refused before anything is written (`Latched`). Reads,
+/// the fault itself, compaction of absent rows, stop, fence, settlement and cleanup stay,
+/// with the identities of objects and processes that already exist, which cleanup and the
+/// offline inventory need. Preflight's issuance and a first attach are refused inside
+/// their own transactions (`issue_and_snapshot`, `attach_instance`), which read the same
+/// latch and the fault rows. Validate journals nothing; H refuses it under its latch.
+/// Exhaustive, so a new request is classified when it is added.
+pub(super) fn allowed_under_latch(request: &LedgerRequest) -> bool {
     match request {
-        // C2, replays included: an exact replay reports Accepted and lets H go on.
-        LedgerRequest::Admit { .. } => true,
-        // C3's PREPARING, the only phase advance there is.
-        LedgerRequest::AdvancePhase { .. } => true,
-        // S's spawn intent and Exec's EXEC_INTENT, each before its effect.
-        LedgerRequest::SetPhase { to, .. } => FORWARD_PHASES.contains(&to.as_str()),
-        LedgerRequest::RecordResource {
-            record: super::supervisor::ResourceRecord::Exec { state, .. },
-            ..
-        } => state == "intent",
+        // Reads.
+        LedgerRequest::Lookup { .. }
+        | LedgerRequest::NeverAdmittedFenceAllowed { .. }
+        | LedgerRequest::Inspect { .. }
+        | LedgerRequest::Handover
+        | LedgerRequest::AllocationState { .. }
+        | LedgerRequest::Accounting { .. }
+        | LedgerRequest::Inventory { .. }
+        | LedgerRequest::Replay => true,
+        // Refused inside their own transactions under the latch.
+        LedgerRequest::Attach { .. } | LedgerRequest::IssueAndSnapshot { .. } => true,
+        // The fault, its marker, and compaction, which deletes only absent rows.
+        LedgerRequest::CommitFault { .. } | LedgerRequest::Compact { .. } => true,
+        // Teardown: stop, fence, settlement and a cleanup S's intent.
+        LedgerRequest::RecordStop { .. }
+        | LedgerRequest::Fence(_)
+        | LedgerRequest::Settle { .. }
+        | LedgerRequest::SettleUnstarted { .. }
+        | LedgerRequest::AllocationWorkerIntent { .. } => true,
+        // Identities of workers and children that already exist, and evidence of what
+        // ran: without them a live process would be an orphan to cleanup.
+        LedgerRequest::RecordWorker { .. }
+        | LedgerRequest::RecordInfrastructure { .. }
+        | LedgerRequest::InfrastructureIntent { .. }
+        | LedgerRequest::RecordChild { .. }
+        | LedgerRequest::RecordObserved { .. }
+        | LedgerRequest::RecordInferred { .. } => true,
+        LedgerRequest::SetPhase { from, to, .. } => phase_allowed_under_latch(from, to),
+        LedgerRequest::RecordResource { record, .. } => resource_allowed_under_latch(record),
+        // C2 (replays included: an exact replay reports Accepted and lets H go on), C3's
+        // PREPARING, and S's last check before the broker's Initialize.
+        LedgerRequest::Admit { .. }
+        | LedgerRequest::AdvancePhase { .. }
+        | LedgerRequest::AuthorizeInitialize { .. } => false,
+        #[cfg(test)]
+        LedgerRequest::TestEnroll { .. } => true,
+    }
+}
+
+/// B7 recheck R2: the phase changes allowed under the latch, by exact source and target.
+/// An execution's acceptance and settlement (`exec_intent` to `busy`, either to `ready`)
+/// and H's teardown (`stopped`, `cleaning`) stay; `spawn_intent`, `exec_intent`, `booting`
+/// and readiness from `booting` start or extend work and are refused.
+pub(super) fn phase_allowed_under_latch(from: &[String], to: &str) -> bool {
+    let from_only = |allowed: &[&str]| {
+        !from.is_empty() && from.iter().all(|phase| allowed.contains(&phase.as_str()))
+    };
+    match to {
+        "stopped" | "cleaning" => true,
+        "busy" => from_only(&["exec_intent"]),
+        "ready" => from_only(&["exec_intent", "busy"]),
         _ => false,
     }
 }
 
-/// Phases whose record authorizes the effect that follows it.
-pub(super) const FORWARD_PHASES: [&str; 2] = ["spawn_intent", "exec_intent"];
+/// B7 recheck R2: S's resource records allowed under the latch. An object that already
+/// exists keeps its identity (cleanup removes it by that generation); teardown evidence
+/// and an execution's settlement stay. Every record that precedes the effect it
+/// authorizes (a creation, a loop configuration, an attachment, a link, readiness or an
+/// Exec) is refused: refused, its object never exists, or it dies with S's descriptor.
+pub(super) fn resource_allowed_under_latch(record: &super::supervisor::ResourceRecord) -> bool {
+    use super::supervisor::ResourceRecord;
+    match record {
+        ResourceRecord::Cgroup(_)
+        | ResourceRecord::WorkDir(_)
+        | ResourceRecord::JailDir(_)
+        | ResourceRecord::Vmm { .. } => true,
+        ResourceRecord::LoopReleased { .. } | ResourceRecord::ExecHistory { .. } => true,
+        ResourceRecord::Exec { state, .. } => state != "intent",
+        ResourceRecord::Intent(_)
+        | ResourceRecord::LoopIntent(_)
+        | ResourceRecord::Loop { .. }
+        | ResourceRecord::JailIntent(_)
+        | ResourceRecord::JailMount(_)
+        | ResourceRecord::JailBinds(_)
+        | ResourceRecord::WorkFile(_)
+        | ResourceRecord::PrivateFiles { .. }
+        | ResourceRecord::Broker { .. } => false,
+    }
+}
 
 /// L's in-memory state beside the ledger: the RTC-14 latch and the compactor's
 /// checkpoints. Neither survives L; the durable fault rows and the fail-stop marker do,
@@ -1299,7 +1507,7 @@ impl LedgerState {
 
     /// The refusal of a forward effect under L's own latch (RTC-14, RTC-R2-01).
     fn forward_refusal(&self, request: &LedgerRequest) -> Option<LedgerReply> {
-        if !(self.latched || self.failstop) || !forward_effect(request) {
+        if !(self.latched || self.failstop) || allowed_under_latch(request) {
             return None;
         }
         let kind = if self.failstop { "fail_stop" } else { "rollback" };
@@ -1629,6 +1837,15 @@ pub(super) fn handle_ledger(
         LedgerRequest::Inventory { instance } => {
             LedgerReply::Inventory(ledger.inventory(instance)?)
         }
+        LedgerRequest::AuthorizeInitialize {
+            instance,
+            allocation,
+        } => match ledger.allocation_phase(instance, allocation)?.as_deref() {
+            Some("booting") => LedgerReply::Done,
+            _ => LedgerReply::Failed {
+                reason: "Initialize needs a booting allocation".into(),
+            },
+        },
         LedgerRequest::Replay => {
             let mut snapshot = ledger.replay()?;
             if state.failstop {
@@ -1739,6 +1956,9 @@ pub fn ledger_main(
                 }
             }
         };
+        if matches!(reply, LedgerReply::SyncFailed { .. }) {
+            fault_point("L.sync_failed_reply");
+        }
         fault_point("L.reply");
         if send_ledger_reply(&mut endpoint, id, &reply).is_err() || exit_after {
             return;

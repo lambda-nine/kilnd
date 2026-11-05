@@ -606,6 +606,11 @@ pub struct Node {
     /// B7 RTC-14: checked before any gate, L write or host action of forward work.
     latched: std::sync::atomic::AtomicBool,
     latch: Mutex<NodeLatch>,
+    /// B7 recheck R1: answers to fault-bearing requests whose waiters gave up while L
+    /// may still answer. Each holds every forward effect fail-closed, exactly as the
+    /// latch does, until its answer is consumed (`LostAnswers`).
+    lost_answers: AtomicUsize,
+    lost_owner: Arc<LostAnswers>,
     /// B7: the last compaction stuck token, for Health.
     compaction_fault: Mutex<Option<String>>,
     /// Test instrumentation: L calls made and tokens refused by the tag check.
@@ -830,7 +835,7 @@ impl Node {
         let (monitor, monitor_events) = spawn_monitor_slot(&config, &sockets)?;
         let [prep0, prep1] = prep;
         let [kill0, kill1] = kill;
-        let node = Arc::new(Self {
+        let node = Arc::new_cyclic(|me| Self {
             config,
             _lock: Some(lock),
             sockets,
@@ -860,6 +865,8 @@ impl Node {
             stop: CancellationToken::new(),
             latched: std::sync::atomic::AtomicBool::new(false),
             latch: Mutex::default(),
+            lost_answers: AtomicUsize::new(0),
+            lost_owner: Arc::new(LostAnswers { node: me.clone() }),
             compaction_fault: Mutex::new(None),
             ledger_calls: AtomicU64::new(0),
             tag_refusals: AtomicU64::new(0),
@@ -1064,12 +1071,12 @@ impl Node {
                         kind.mode()
                     ));
                 }
-                let channel = self.ledger_channel();
                 let request = LedgerRequest::RecordInfrastructure {
                     spec: Box::new(infrastructure_spec(kind, image)),
                     pid,
                 };
-                let call = channel.call::<LedgerReply>(Lane::Reserved, &request, u64::MAX);
+                // Through `ledger_call`, so a `SyncFailed` or a lost answer latches H.
+                let call = self.ledger_call(Lane::Reserved, &request, u64::MAX);
                 if let Ok(Ok(LedgerReply::Worker { worker_id })) =
                     tokio::time::timeout(remaining, call).await
                 {
@@ -1274,13 +1281,70 @@ impl Node {
         self.latched.store(true, Ordering::SeqCst);
     }
 
+    /// Forward effects are refused: by the latch, or while a lost answer that may
+    /// carry a fault is outstanding (B7 recheck R1).
     fn is_latched(&self) -> bool {
+        self.is_latched_durably() || self.lost_answers.load(Ordering::SeqCst) > 0
+    }
+
+    /// The RTC-14 latch itself, which only root's offline clear ends.
+    fn is_latched_durably(&self) -> bool {
         self.latched.load(Ordering::SeqCst)
+    }
+
+    /// B7 recheck R1 at a forward boundary that can wait: whether forward effects are
+    /// latched once every outstanding lost answer has been consumed. L answers in order,
+    /// so a hold normally lasts as long as L's queue; still held at `until`, the answer
+    /// is treated as a fault (fail-closed). A client's own lapsed deadline therefore
+    /// delays other work for that long at most and never refuses it on its own.
+    async fn latched_once_answered(&self, until: Instant) -> bool {
+        loop {
+            if self.is_latched_durably() {
+                return true;
+            }
+            if self.lost_answers.load(Ordering::SeqCst) == 0 {
+                return false;
+            }
+            if Instant::now() >= until {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// B7 recheck R1: imports an answer nobody waits for any longer. It is consumed
+    /// whenever it arrives, so a fault it carries latches H even though the request
+    /// that asked has gone; an answer that cannot be read while L lives fails stop.
+    fn import_lost_answer(&self, reply: Result<serde_json::Value, CallError>) {
+        let Ok(value) = reply else {
+            // L is gone: its replacement's handover imports whatever it made durable,
+            // before anything can reach the new L.
+            return;
+        };
+        match serde_json::from_value::<LedgerReply>(value) {
+            Ok(LedgerReply::SyncFailed { .. }) => self.set_latch("fail_stop", None, None),
+            Ok(LedgerReply::Latched { kind }) => self.set_latch(&kind, None, None),
+            // L wrote the fail-stop marker at detection; the commit waits for the next
+            // handover, which H's latch now forces.
+            Ok(LedgerReply::FaultPending { .. }) => self.set_latch("rollback", None, None),
+            Ok(_) => {}
+            Err(_) => self.set_latch("fail_stop", None, None),
+        }
+        if self.is_latched_durably() {
+            tracing::error!("a lost ledger answer carried a fault: forward effects are latched");
+        }
     }
 
     /// The refusal every forward effect gets under the latch: no gate, no L write and
     /// no host action (section 8.3's ledger-loss rule).
     fn latch_refusal(&self) -> FirecrackerResponse {
+        if !self.is_latched_durably() {
+            return group_error(
+                GroupErrorKind::Unavailable,
+                "forward effects are held: a ledger answer that may carry a fault is \
+                 still outstanding",
+            );
+        }
         let kind = self.latch.lock().unwrap().kind.clone();
         group_error(
             GroupErrorKind::Unavailable,
@@ -1443,7 +1507,24 @@ impl Node {
             self.ledger_calls.fetch_add(1, Ordering::Relaxed);
         }
         let channel = self.ledger_channel();
-        let reply = channel.call(lane, request, deadline_ns).await;
+        // B7 recheck R1: if this future is dropped once the request is on its way (a
+        // deadline, a cancellation), the channel hands the answer to `LostAnswers`
+        // instead of discarding it, and forward effects are held until it arrives.
+        let owner = request
+            .fault_bearing()
+            .then(|| self.lost_owner.clone() as Arc<dyn workers::Orphan>);
+        let raw = channel
+            .call_owned::<serde_json::Value>(lane, request, deadline_ns, owner)
+            .await;
+        let reply = raw.and_then(|value| {
+            serde_json::from_value::<LedgerReply>(value).map_err(|_| {
+                // L answered and lives, but H cannot read the answer: fail stop.
+                if request.fault_bearing() {
+                    self.set_latch("fail_stop", None, None);
+                }
+                CallError::Protocol
+            })
+        });
         // RTC-R2-01: a failed commit latched L and wrote the fail-stop marker. H latches
         // too, and the caller sees an ordinary failure that proves nothing.
         let reply = match reply {
@@ -1470,7 +1551,35 @@ impl Node {
         }
         reply
     }
+}
 
+/// B7 recheck R1: the owner of every ledger answer whose waiter gave up. The channel
+/// parks it on the pending call when the waiter is dropped and hands it the answer
+/// (or L's death) when it comes: the fault is imported whatever happened to the request,
+/// and the hold on forward effects lasts exactly until then.
+struct LostAnswers {
+    node: std::sync::Weak<Node>,
+}
+
+impl workers::Orphan for LostAnswers {
+    fn parked(&self) {
+        if let Some(node) = self.node.upgrade() {
+            node.lost_answers.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn answer(&self, reply: Result<serde_json::Value, CallError>, parked: bool) {
+        if let Some(node) = self.node.upgrade() {
+            // Imported first, so a fault latches before the hold lifts.
+            node.import_lost_answer(reply);
+            if parked {
+                node.lost_answers.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+impl Node {
     /// One reserved K slot, then the other. A stuck slot stays occupied by its original
     /// process; this only moves on to the other fixed slot and never spawns a third.
     async fn dispatch_kill(&self, target: StopTarget) -> Option<bool> {
@@ -2231,14 +2340,13 @@ impl Node {
         }
         // B7 RTC-14: under the latch, work that starts anything is refused before any
         // gate, L write or host action. Cleanup and reads stay.
-        if self.is_latched()
-            && matches!(
-                request.operation,
-                FirecrackerOperation::Preflight { .. }
-                    | FirecrackerOperation::Create { .. }
-                    | FirecrackerOperation::Validate { .. }
-                    | FirecrackerOperation::Exec { .. }
-            )
+        if matches!(
+            request.operation,
+            FirecrackerOperation::Preflight { .. }
+                | FirecrackerOperation::Create { .. }
+                | FirecrackerOperation::Validate { .. }
+                | FirecrackerOperation::Exec { .. }
+        ) && self.latched_once_answered(deadline.instant).await
         {
             return self.latch_refusal();
         }
@@ -2962,7 +3070,7 @@ impl Node {
         };
         #[cfg(test)]
         workers::faults::hold("H.preflight.before_issue").await;
-        if self.is_latched() {
+        if self.latched_once_answered(deadline.instant).await {
             return self.latch_refusal();
         }
         let issued = self
@@ -3290,7 +3398,7 @@ impl Node {
                         AmbiguousClass::OldEpoch,
                         "the attachment was replaced as this committed",
                     ))
-                } else if self.is_latched() {
+                } else if self.latched_once_answered(token.deadline.instant).await {
                     // RTC-R2-03: the latch linearized before any host effect began.
                     Some((
                         AmbiguousClass::Latched,
@@ -3570,7 +3678,7 @@ impl Node {
         // slot, the checks above) starts nothing.
         #[cfg(test)]
         workers::faults::hold("H.create.before_open_gate").await;
-        if self.is_latched() {
+        if self.latched_once_answered(token.deadline.instant).await {
             return Err(abort(
                 AmbiguousClass::Latched,
                 "forward effects were latched node-wide during setup; nothing starts".into(),
@@ -4101,6 +4209,9 @@ impl Node {
                 deadline.ns,
             )
             .await;
+        // B7 recheck R3: holds an answer read before a concurrent terminal Remove.
+        #[cfg(test)]
+        workers::faults::hold("H.inspect.after_lookup").await;
         FirecrackerResponse::Inspect(match reply {
             Ok(LedgerReply::Lookup(
                 TokenLookup::Fenced { receipt } | TokenLookup::Compacted { receipt },
@@ -4271,8 +4382,10 @@ impl Node {
             // the RTC-14 latch.
             "ledger_calls": self.ledger_calls.load(Ordering::Relaxed),
             "tag_refusals": self.tag_refusals.load(Ordering::Relaxed),
-            "latched": self.is_latched(),
+            "latched": self.is_latched_durably(),
             "pending_fault": self.latch.lock().unwrap().pending.is_some(),
+            "latch_kind": self.latch.lock().unwrap().kind.clone(),
+            "lost_answers": self.lost_answers.load(Ordering::SeqCst),
         })
     }
 }

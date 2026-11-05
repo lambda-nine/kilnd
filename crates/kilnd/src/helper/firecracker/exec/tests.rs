@@ -201,8 +201,9 @@ impl Host for Scripted {
         self.contained().then_some(true)
     }
 
-    fn latched(&self) -> bool {
-        self.latched.load(Ordering::SeqCst)
+    fn latched(&self, _until: Instant) -> BoxedLatch {
+        let latched = self.latched.load(Ordering::SeqCst);
+        Box::pin(async move { latched })
     }
 }
 

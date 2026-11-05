@@ -303,7 +303,7 @@ mod host {
                     .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())
                     .collect(),
                 #[cfg(test)]
-                Self::Directory(root) => list(root, MAX_PROCESSES)?
+                Self::Directory(root) => list_mandatory(root, MAX_PROCESSES)?
                     .into_iter()
                     .map(|entry| entry.name)
                     .collect(),
@@ -363,11 +363,24 @@ mod host {
         pub directory: bool,
     }
 
-    /// Every entry of `path`; an absent directory has none. Any other error, or more
-    /// than `bound` entries, fails the walk.
+    /// Every entry of an owned directory `path`; one never created has none. Any other
+    /// error, or more than `bound` entries, fails the walk.
     pub(super) fn list(path: &Path, bound: usize) -> Result<Vec<Entry>, String> {
+        list_from(path, bound, false)
+    }
+
+    /// B7 recheck R5: every entry of a mandatory enumeration root, which the kernel
+    /// always provides (`/sys/block`). Missing or unreadable, it is an unexplained state,
+    /// never an empty listing, and fails the walk.
+    pub(super) fn list_mandatory(path: &Path, bound: usize) -> Result<Vec<Entry>, String> {
+        list_from(path, bound, true)
+    }
+
+    fn list_from(path: &Path, bound: usize, mandatory: bool) -> Result<Vec<Entry>, String> {
         let entries = match std::fs::read_dir(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !mandatory => {
+                return Ok(vec![]);
+            }
             Err(error) => return Err(format!("{}: {error}", path.display())),
             Ok(entries) => entries,
         };
@@ -555,7 +568,7 @@ mod host {
     /// Every bound loop device backed inside either owned base, inside one known
     /// allocation's work directory. Devices backed elsewhere are not ours.
     fn loop_devices(roots: &HostRoots, ledger: &Ledger, walk: &mut Walk) -> Result<(), String> {
-        for entry in list(&roots.sys_block, MAX_BLOCK_DEVICES)? {
+        for entry in list_mandatory(&roots.sys_block, MAX_BLOCK_DEVICES)? {
             if !entry.name.starts_with("loop") {
                 continue;
             }
@@ -1408,6 +1421,55 @@ mod tests {
             panic!("an overflowing listing is not observed");
         };
         assert!(reason.contains("listing bound"), "{reason}");
+    }
+
+    /// B7 M1 recheck R5 (`reviews/poc-b7m1-recheck`, `poc_b7m1_missing_sys_block_is_
+    /// treated_as_empty`, now a regression): a missing or unreadable mandatory
+    /// enumeration root (`/sys/block`, the process table) is an unexplained state, not an
+    /// empty listing, so the offline report is never `Observed` and the clear refuses it.
+    /// An owned base that was never created stays an empty listing.
+    #[test]
+    fn offline_walk_fails_closed_without_a_mandatory_enumeration_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut host, known, _) = live();
+        std::fs::remove_dir_all(&host.roots.sys_block).unwrap();
+        let OfflineObservation::Unknown { reason } = host.observe(&known) else {
+            panic!("a missing /sys/block was observed");
+        };
+        assert!(reason.contains("sys_block") || reason.contains("No such file"), "{reason}");
+
+        let (mut host, known, _) = live();
+        std::fs::set_permissions(&host.roots.sys_block, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let unreadable = host.observe(&known);
+        std::fs::set_permissions(&host.roots.sys_block, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        // Root reads a mode-000 directory; only an unprivileged run can prove this half.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                matches!(unreadable, OfflineObservation::Unknown { .. }),
+                "an unreadable /sys/block was observed: {unreadable:?}"
+            );
+        }
+
+        let (mut host, known, _) = live();
+        // Refutable only where the private procfs variant exists (Linux).
+        #[allow(irrefutable_let_patterns)]
+        let ProcSource::Directory(proc) = host.roots.proc.clone() else {
+            panic!("the fake host has a directory process table");
+        };
+        std::fs::remove_dir_all(&proc).unwrap();
+        assert!(
+            matches!(host.observe(&known), OfflineObservation::Unknown { .. }),
+            "a missing process table was observed"
+        );
+
+        // The control: owned bases never created are empty, and the walk is observed.
+        let (mut host, known, _) = live();
+        for base in [&host.roots.jail_base, &host.roots.cgroup_tree] {
+            std::fs::remove_dir_all(base).unwrap();
+        }
+        assert!(matches!(host.observe(&known), OfflineObservation::Observed { .. }));
     }
 
     #[test]

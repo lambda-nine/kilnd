@@ -58,6 +58,10 @@ B7_SCENARIOS = [
     'b7_rtc18_a_busy_normal_lane_from_two_instances_never_starves_a_third_instances_refill',
     'b7_rtc14_a_latch_during_create_setup_is_rechecked_before_open_gate',
     'b7_rtc13_completed_sessions_leave_no_digest_entries',
+    'b7_rtc13_stale_inspects_racing_removes_never_fill_the_digest_cap',
+    'b7_rtc14_linux_root_a_latch_while_s_waits_grants_no_resource_authority',
+    'b7_rtc14_linux_root_a_latch_while_h_awaits_l_refuses_the_acknowledgement',
+    'b7_rtc14_linux_root_a_latch_before_initialize_sends_none',
 ]
 
 if __name__ == '__main__':

@@ -1085,6 +1085,55 @@ async fn b4_linux_root_real_credentials_and_a_bounding_mismatch_stops_the_launch
     }
 }
 
+/// B7 M1 recheck R4: V's image is visible from its exec, before Firecracker installs its
+/// own seccomp filter. A VMM whose first three status samples still read `Seccomp` 0 is
+/// waited out and boots; a strict-mode sample is refused at once, without waiting the
+/// bound; a filter never observed is refused when the bound ends. Each refusal stops the
+/// launch before BOOTING, and the allocation stays charged until ABSENT.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs root, KVM and the B4 artifacts: run scripts/b4-vm-tests.sh"]
+async fn b4_linux_root_a_late_vmm_seccomp_filter_is_waited_out_and_a_wrong_one_refused() {
+    let real = Real::new(NodeOptions::default()).await;
+    real.fixture.fault("S.credentials.seccomp_late");
+    let (runtime, context, _plan) = create(&real).await;
+    real.wait_phase(context.allocation_id, "booting").await;
+    real.fixture.clear("S.credentials.seccomp_late");
+    remove_to_absent(&real, &runtime, &context, "late seccomp").await;
+    for (fault, at_once) in [
+        ("S.credentials.seccomp_strict", true),
+        ("S.credentials.seccomp_never", false),
+    ] {
+        real.fixture.fault(fault);
+        real.fixture.clear("S.step.adopt.reached");
+        real.fixture.fault("S.step.adopt.stall");
+        let (runtime, context, _plan) = create(&real).await;
+        real.fixture.wait_reached("S.step.adopt").await;
+        // Timed from adoption itself, not from the preparation before it.
+        let started = std::time::Instant::now();
+        real.fixture.clear("S.step.adopt.stall");
+        wait_until("refused", || {
+            worker_pid(&real, context.allocation_id, "supervisor").is_some_and(|s| !running(s))
+        })
+        .await;
+        let took = started.elapsed();
+        real.fixture.clear(fault);
+        if at_once {
+            assert!(took < Duration::from_secs(4), "{fault}: refused after {took:?}");
+        } else {
+            assert!(took >= Duration::from_secs(5), "{fault}: refused after {took:?}");
+        }
+        wait_until("contained", || vm_subtree_empty(&context)).await;
+        assert!(
+            ["spawn_intent", "stop_intent"].contains(&real.phase(context.allocation_id).as_str()),
+            "{fault}: {}",
+            real.phase(context.allocation_id)
+        );
+        assert!(claim_held(&real, context.allocation_id));
+        eprintln!("B7 evidence: {fault} refused after {took:?}");
+        remove_to_absent(&real, &runtime, &context, fault).await;
+    }
+}
+
 const PAYLOAD_ENV: &str = "KILND_B4_PAYLOAD";
 
 #[derive(Debug, Serialize, Deserialize)]
