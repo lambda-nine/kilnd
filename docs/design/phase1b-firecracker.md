@@ -743,7 +743,7 @@ Hold existing daemon state/socket ownership locks and establish AttachInstance b
 
 A host reboot invalidates all recorded PID identities. It does not erase work disks, jail state or reservations. Confirm old processes cannot exist via the changed host boot ID, then remove remaining owned resources normally. If proof is unavailable, serve degraded read/authorized cleanup operations where possible, deny Create/Exec and preserve rows. Do not weaken existing kiln startup behavior merely to make Firecracker recoverable.
 
-A durable rollback fault (RTC-14, section 16.5), set only by a helper-verified token at or above the ledger's issue pointer, is treated like ledger loss, node-wide and for every instance: the helper refuses Preflight, Create, Validate, Exec and every other forward effect, keeps bounded Inspect, List, Stop, Remove, Gc and FenceAbsent so reconciliation and Delete can drain, and stays latched across restarts until root's offline inventory and fault clear (section 16.6). Reconciliation under the latch publishes only what that cleanup proves; it never infers absence from the refusals.
+A durable rollback fault (RTC-14, section 16.5), set only by a helper-verified token at or above the ledger's issue pointer, is treated like ledger loss, node-wide and for every instance: the helper refuses Preflight, Create, Validate, Exec and every other forward effect, keeps bounded Inspect, List, Stop, Remove, Gc and FenceAbsent so reconciliation and Delete can drain, and stays latched across restarts until root's offline inventory and fault clear (section 16.6). Reconciliation under the latch publishes only what that cleanup proves; it never infers absence from the refusals. The latch is enforced in three places, so no single lost message reopens the node (B7 milestone 1 break-it corrections, section 16.9): H refuses forward requests at its request gate; queued work rechecks H's latch at its final effect boundary (Preflight before issuance, Create immediately before S's `OpenGate`, Exec after its EXEC_INTENT write and immediately before the descriptors and the broker Exec, retiring the VM if latched there); and L refuses every forward write (C2 admission, PREPARING, `spawn_intent`, EXEC_INTENT, issuance and a first attach) under its own latch, its fail-stop marker or any fault row, whatever H believes. Every L hands its latch state to H together with K, and H imports it before it publishes that L's channel.
 
 Periodic reconciliation runs at 30-second intervals with jitter and singleflight ownership, plus on failed operations; stop attempts back off 1, 2, 4, 8, then 30 seconds. Work remains charged between attempts. A lower configured budget degrades Health and rejects new creates without preventing cleanup. No hidden guest restart or network repair is performed by Health.
 
@@ -3601,9 +3601,12 @@ lease, pass and allowance are root policy fields (`compaction_lease_seconds`,
     seq < W, its fence row exists with a helper generation below G_W, and, if it was
     admitted, its allocation is `absent` with the claim and every identity and executable
     lease released and every worker row settled. Children go first, then the allocation,
-    then the fence row last, in one transaction. SQL triggers enforce each condition.
-    Active, stopped, quarantined or ambiguous allocations are never deleted, whatever their
-    seq.
+    then the fence row last, in one transaction. SQL triggers enforce each condition,
+    including the child order itself: the allocation and fence delete guards check with
+    explicit `NOT EXISTS` that no plan, claim, identity or executable lease, worker intent,
+    stop event or resource event of the token remains, so the order holds even on a
+    connection with `foreign_keys` off. Active, stopped, quarantined or ambiguous
+    allocations are never deleted, whatever their seq.
 11. **RTC-11 Crash-safe and idempotent.** Advancing W and deleting rows are separate atomic
     transactions; any crash leaves a state where RTC-6 to RTC-8 give the same answers, and a
     rerun deletes nothing more than the rule allows. Compaction runs only in L, performs no
@@ -3976,7 +3979,18 @@ so no H or L can run. It refuses to start without the report of the mandatory of
 inventory (section 16.7), produced by `kilnd-helper offline-inventory` under the same
 conditions: every jail, cgroup, loop device, work file and VMM process walked against the
 ledger, everything the ledger does not own settled or destroyed by root, and each enrolled
-instance's daemon database read (read-only) for its Firecracker tokens. The report records
+instance's daemon database read (read-only) for its Firecracker tokens. The walk is one
+node-wide pass over six families, each listed from its owned base and mapped back only
+through `host_name(instance, allocation)` of an active ledger allocation (and, where the path
+names one, the same instance): jail directories (`jails/` and `jails/firecracker/`), jail
+mounts (every mountinfo entry at or below the jail or work base, or with a `kilnd-jail-`
+source, read through the private procfs), loop devices (every `/sys/block/loop*` whose
+backing file, deleted or not, lies under either base), VMM and supervisor processes (every
+process in the Firecracker cgroup tree, by its allocation subtree, and any `firecracker` or
+`jailer` outside it), cgroups (instance and allocation directories) and work files. Anything
+else under an owned base is an orphan, never adopted for looking like `fc-*`; any orphan in
+any family, and any listing that cannot be read completely and within its bound, makes the
+verdict `unexplained`, which the clear refuses. The report records
 the ledger's highest generation at the end of the inventory, the fault rows it saw, for each
 instance the highest token in its daemon database whose tag verifies, the digest of the
 report itself and a verdict, `explained` only when no resource is left unaccounted for. The
@@ -4017,7 +4031,13 @@ any plain-SQL DELETE or UPDATE of `node_faults` is refused, and the attempt chan
   sent on: a late reply on the old channel is discarded, never matched to a request on the
   new one, and its flow fails as ambiguous through the normal deadline path. H holds no
   pointer, watermark or row cache, so every later answer comes from the new L's committed
-  state. Any pending RTC-14 fault is committed by the new L before it serves.
+  state. Any pending RTC-14 fault is committed by the new L before it serves. K comes
+  only in L's `Handover` reply, which always carries L's latch state (its `node_faults`
+  kinds, the fail-stop marker and its in-memory latch); H imports that state, latching if
+  any part is set, before it publishes the channel, so no channel is served whose handover
+  omitted it. This is what keeps a fail-stop latched when L wrote the marker and died before
+  H received its `SyncFailed`: H never saw the failure, but the replacement's handover
+  carries the marker.
 - *H's request-serving task or channel restarted while L lives.* The replacement task
   receives K over the private channel before it checks any tag, and accepts no reply that
   was addressed to the old task's channel.
@@ -4290,6 +4310,12 @@ about five times over and many compaction cycles, inside one VM window.
   The cost of fail-stop on every sync failure is stated plainly: one transient fsync error
   on the node ledger stops new work node-wide until root intervenes; cleanup and reads keep
   working.
+  *Corrected after the milestone 1 break-it review:* the marker alone was not enough while H
+  lived, because H latched only when its own request received `SyncFailed`; an L killed
+  between writing the marker and replying left H unlatched, and the replacement L admitted a
+  prepared token. Every L's handover now carries its latch with K and H imports it before
+  publishing the channel, and L refuses forward writes under its own latch whatever H
+  sends. The remaining residual is unchanged: a marker write that itself fails.
 - **Abandoned issuance.** Some issued seqs are never delivered (RTC-4). They cost nothing
   but a number; Accounting's `issue_next` therefore counts issuances, not sessions.
 - **Daemon-side growth.** `release_evidence` rows (about 1 KB each with indexes) stay
@@ -4297,6 +4323,19 @@ about five times over and many compaction cycles, inside one VM window.
   admission on it. Pruning evidence together with its retention-pruned sandbox row is safe
   once tokens are helper-issued, except that it lowers RTC-14's recorded maximum, so a
   follow-up after B7 must keep the highest complete token as its own permanent value.
+- **Daemon digest cache.** The daemon keeps each allocation's Store plan digest in memory
+  only from Create (after C1) to the allocation's terminal answer, so Validate and Exec can
+  read the boot after a restart. A hard cap of 5,120 entries (the 1,024-allocation complete
+  listing bound plus the 4,096 node-wide token gates) is a backstop, never an eviction:
+  at the cap Preflight is refused `RESOURCE_EXHAUSTED` before any seq is issued. One benign
+  race remains: a reconciliation Inspect answered live just before a concurrent Remove
+  finishes can re-learn one entry after the Remove forgot it; the cap bounds it.
+- **What the offline inventory cannot see.** It reads the mount namespace and cgroup
+  namespace it runs in, so root runs it from the host's initial namespaces. The helper unit
+  runs in its own mount namespace (`ProtectSystem=strict`), so with the helper stopped its
+  jail mounts survive only through a surviving jailer or VMM process, which the process
+  family reports; a mount namespace kept alive some other way (a bind-mounted nsfs file) is
+  not walked. That is root's own action and outside the fault model, like a ledger restore.
 - **Synthesized receipts differ from originals.** A daemon that lost its terminal commit
   after compaction gets a different, equally valid receipt, and a later G_W gives yet
   another. Section 8.3's "replay the same receipt" becomes "replay a matching receipt"; B6's
@@ -4355,7 +4394,7 @@ the section 9.1 Runtime contract. Production Firecracker stays disabled (milesto
 | Token form, HMAC-SHA-256 over `sha2`, the key, its check value and its private transfer form | `helper/firecracker/token.rs` |
 | Schema 2 tables and triggers, issuance, classification, admission and fence changes, watermark advance, compaction batch, RTC-17 shares, fault commit and offline clear, the open audit | `helper/firecracker/journal.rs` |
 | L's checkpoints, boot clock and fail-stop marker | `helper/firecracker/compaction.rs` |
-| L's protocol (`IssueAndSnapshot`, `TokenKey`, `CommitFault`, `Compact`, `FaultPending`, `SyncFailed`) and its in-memory latch | `helper/firecracker/workers.rs` |
+| L's protocol (`IssueAndSnapshot`, `Handover` (K with the latch), `CommitFault`, `Compact`, `FaultPending`, `SyncFailed`, `Latched`), its in-memory latch and its forward-write refusal | `helper/firecracker/workers.rs` |
 | H: tag checks before any gate, the latch gate, issuing Preflight, digests on Inspect, Remove and Gc, the compactor task, key handover with each L | `helper/firecracker/mod.rs`, `lifecycle.rs` |
 | Root's `offline-inventory`, `clear-node-faults` and `ledger-stats` | `helper/firecracker/offline.rs`, `bin/kilnd-helper.rs` |
 | Group schema 2 wire | `helper/protocol.rs` |
@@ -4455,11 +4494,11 @@ the section 9.1 Runtime contract. Production Firecracker stays disabled (milesto
 | RTC-7 nothing admitted below W | lookup in C2; `allocations_issued_above_watermark`, `retired_tokens_issued` | `rtc7_nothing_below_w_is_admitted_or_newly_fenced_even_by_raw_sql`, `b7_crash_a_create_racing_compaction_is_fenced_or_pinned_by_commit_order` |
 | RTC-8 compacted means absent | `compacted_receipt`; every flow's `Compacted` arm | `rtc8_compacted_receipts_bind_the_callers_digest_generation_and_write_nothing`, `b7_rtc8_real_wire_*`, `b7_crash_a_restored_stale_daemon_db_after_compaction_releases_by_synthesized_receipts` |
 | RTC-9 never stale | G_W refresh in `advance_watermark` | `rtc9_a_late_pinned_fence_refreshes_g_w_before_anything_is_compacted`, `b7_crash_g_w_refresh_*`, `b7_crash_a_remove_racing_compaction_*` |
-| RTC-10 only absent rows | `compact_batch`; delete triggers | `rtc10_*` (trigger matrix, stuck rows), `b7_crash_non_compactable_allocations_below_w_are_never_deleted` |
+| RTC-10 only absent rows | `compact_batch`; delete triggers, child order by explicit `NOT EXISTS` | `rtc10_*` (trigger matrix, stuck rows, `rtc10_child_order_triggers_hold_with_foreign_keys_off`), `b7_crash_non_compactable_allocations_below_w_are_never_deleted` |
 | RTC-11 crash-safe, idempotent | separate transactions; fault points | `rtc11_*`, `b7_crash_delete_batch_rolls_back_whole_at_every_boundary` |
 | RTC-12 quotas per window | `never_admitted_fences` over retained rows; issuance floor | `rtc12_*`, `b7_rtc12_*`, `b7_crash_issuance_then_a_preparation_refusal_*` |
-| RTC-13 bounded checkpoints | `Compactor` | `rtc13_*` (unit and ledger), `b7_rtc13_a_five_lease_flood_*`, `b7_crash_a_helper_restart_resets_checkpoints_*`, `b7_crash_h_process_death_*` |
-| RTC-14 verified rollback, latch | `attach_instance`; `Node::rollback_detected`, `set_latch`; `commit_fault`; `offline.rs` | `rtc14_*`, `b7_rtc14_*`, `b7_rtc_r2_0*`, `b7_crash_rollback_fault_commit_*`, `b7_crash_the_offline_clear_*` |
+| RTC-13 bounded checkpoints, bounded daemon cache | `Compactor`; `FirecrackerRuntime::digests`, `MAX_DIGESTS` | `rtc13_*` (unit and ledger), `b7_rtc13_a_five_lease_flood_*`, `b7_crash_a_helper_restart_resets_checkpoints_*`, `b7_crash_h_process_death_*`, `b7_rtc13_completed_sessions_leave_no_digest_entries`, `prepare_at_the_digest_cap_is_exhausted_before_any_helper_call` |
+| RTC-14 verified rollback, latch | `attach_instance`; `Node::rollback_detected`, `set_latch`, `fetch_key` (latch with K); `workers::forward_effect`; `commit_fault`; `offline.rs`, `inventory::observe_offline` | `rtc14_*`, `b7_rtc14_*`, `b7_rtc_r2_0*`, `b7_crash_rollback_fault_commit_*`, `b7_crash_the_offline_clear_*`, `b7_crash_a_lost_syncfailed_then_a_replaced_l_keeps_forward_effects_latched`, `offline_walk_*`, `b7_offline_inventory_walks_every_host_family_before_the_clear` |
 | RTC-15 gates follow L | `create_flow`, `fence_flow` classification arms | `b7_rtc3_forged_*` (no gate), `b7_rtc3_a_valid_tag_*` (no gate for NotIssued) |
 | RTC-16 audit and observability | `audit_tokens`; `accounting`; Health | `rtc16_*`, `b7_a_historical_kiln_row_stays_deleting_and_charged_under_a_fenced_backend` |
 | RTC-17 reserved shares | `Shares` | `rtc17_*`, `b7_rtc17_an_instance_enrolled_beside_a_borrower_finds_its_share_at_once` |
@@ -4493,3 +4532,25 @@ the section 9.1 Runtime contract. Production Firecracker stays disabled (milesto
   fixture tests on Linux, each in its own phase.
 - **The installed kilnd** (main `2a1faea`, schema 10) was never replaced; its database is
   byte-identical to the backup taken before the VM phases (`cmp`, SHA-256 `ef02941f…`).
+
+## 16.10 B7 milestone 1 break-it corrections (November 5, 2026)
+
+Daybreak Blue's break-it review of `179837c` (`reviews/2026-11-05-b7m1-breakit.md`) found no
+compacted-token replay and no digest-binding break, one HIGH and four lower findings. Each
+is corrected on `phase1b/b7-compaction`; the lead's decisions are recorded here.
+
+| Finding | Correction | Proving tests |
+|---|---|---|
+| 1 (HIGH) A replacement L bypassed a durable fail-stop marker: L wrote it and died before H received `SyncFailed`, the replacement's handover carried only K, and L's Admit ignored its own latch | **Handover:** K now comes only in L's `Handover` reply, which always carries `LatchState` (the `node_faults` kinds, the fail-stop marker, L's in-memory latch); H imports it, latching if any part is set, before it publishes the channel, at startup and at every replacement. **L enforces:** a new L starts latched from any fault row as well as the marker, and under its latch refuses every forward write whoever sends it (C2 `Admit`, PREPARING, `spawn_intent`, EXEC_INTENT and its exec intent record; issuance and a first attach already refused in their own transactions), answering `Latched`, on which H latches too. Inspect, List, Stop, Remove, Gc, FenceAbsent, settlement and evidence records stay | `b7_crash_a_lost_syncfailed_then_a_replaced_l_keeps_forward_effects_latched` (the review's PoC as a regression: L killed at `L.reply` after the marker, H held after importing the latch and before publication, then the prepared token's Create and a Preflight refused with no L call, no C2 row, no effect, and the fence still working); `rtc14_l_refuses_forward_writes_under_its_own_latch_whatever_h_believes` (L-level: an Admit with a current authority, as an unlatched H would send it, and every other forward write refused with nothing written, under the latch and under the marker; reads and the never-admitted fence allowed; the handover carries the latch) |
+| 2 (MEDIUM) Queued Create and Exec could cross their final effect boundary after H latched | Create rechecks the node latch last, immediately before `OpenGate` (`AmbiguousClass::Latched`; the C2 claim stays for an exact fence). Exec rechecks it after its EXEC_INTENT write and immediately before the descriptors and the broker Exec; latched there, it dispatches nothing and retires the VM by the stop fence and K, since the journal says EXEC_INTENT | `b7_rtc14_a_latch_during_create_setup_is_rechecked_before_open_gate` (held at `H.create.before_open_gate`, latched by a real rollback, released: `Latched`, no gate, no effect); `b7_rtc14_a_latch_during_exec_intent_dispatches_nothing_and_retires_the_vm` (EXEC_INTENT held, latched, released: no descriptor, no broker Exec, no BUSY, VM retired) and its unlatched control |
+| 3 (MEDIUM) The offline inventory listed only work and cgroup directories | `ObservationBackend::observe_offline`: one node-wide walk over jail directories, jail mounts (mountinfo through the private procfs), loop devices, VMM and supervisor processes, cgroups and work files (section 16.6), over injectable `HostRoots`; any orphan or incomplete listing makes the report `unexplained` | `offline_walk_*` in `inventory.rs` (one fixture per family, an all-explained host, a vanished process, unreadable sources); `b7_offline_inventory_walks_every_host_family_before_the_clear` (the real walk over a planted tree feeds the report: an orphan jail directory alone, then an orphan VMM process alone, each refused by the clear; explained, it clears); `b7_linux_root_offline_walk_names_an_orphan_in_every_real_family` (root, real host: one planted orphan per family found, none before or after) |
+| 4 (MEDIUM) The daemon digest cache grew for its lifetime | Learned at Create (after C1), not at Preflight, so a plan refused or abandoned before C1 leaves nothing; forgotten on every terminal answer (Remove, each released Gc result, FenceAbsent, Create's or Inspect's absence); kept across a non-reusable Exec or an incompatible Validate, which may be READY again. Hard cap `MAX_DIGESTS` = 1,024 + 4,096 = 5,120, never evicting: at the cap `prepare` returns the new `RuntimeError::Exhausted` before any helper call, which the manager answers `RESOURCE_EXHAUSTED` | `b7_rtc13_completed_sessions_leave_no_digest_entries` (the review's PoC as a regression: eight sessions and a dropped Preflight leave none); `b7_digest_cap_is_the_listed_bound_plus_the_token_gates`; `prepare_at_the_digest_cap_is_exhausted_before_any_helper_call`; `c0_rejection_leaves_no_row_no_charge_and_no_fence` |
+| 5 (LOW) RTC-10's child order depended on `foreign_keys` | `allocations_no_delete` and `retired_tokens_no_delete` check with explicit `NOT EXISTS` that none of the token's seven child tables has a row left. Schema 2 is unreleased, so its triggers changed in place; a schema-2 development ledger provisioned before this change refuses to open ("ledger schema differs") and is re-provisioned | `rtc10_child_order_triggers_hold_with_foreign_keys_off` (the review's SQL PoC with `PRAGMA foreign_keys=OFF`: both deletes refused for each child table; the honest order still compacts) |
+
+**PoC results.** `reviews/poc-b7m1/run-failstop-replacement.sh` at `179837c` still passes
+(the bypass). Its test, appended unchanged to the corrected tree, fails at its first
+assertion: H is latched when the replacement L is published. The digest PoC's count is now
+zero (`b7_rtc13_completed_sessions_leave_no_digest_entries`).
+
+**Validate.** It journals no intent, so there is nothing for L to refuse; H refuses it at
+its request gate under the latch, as before.

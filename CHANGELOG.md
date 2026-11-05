@@ -6,6 +6,20 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix the B7 milestone 1 break-it findings (design section 16.10). A replacement ledger
+  process now hands its latch state (fault rows, fail-stop marker, in-memory latch) to the
+  helper together with the token key, and the helper latches before publishing it, so a
+  fail-stop survives a ledger process that died before its `SyncFailed` reached the helper;
+  the ledger process itself refuses C2 admission, PREPARING, `spawn_intent` and EXEC_INTENT
+  under its own latch. Create rechecks the latch immediately before releasing the
+  supervisor, and Exec after EXEC_INTENT and before dispatch (retiring the VM). The offline
+  inventory walks jail directories, jail mounts, loop devices, VMM and supervisor
+  processes, cgroups and work files node-wide, and any orphan blocks `clear-node-faults`.
+  The daemon's per-allocation digest cache is learned at Create, forgotten at every terminal
+  answer and capped at 5,120 entries (Preflight answers `RESOURCE_EXHAUSTED` at the cap; new
+  `RuntimeError::Exhausted`). RTC-10's delete triggers check the child rows explicitly, so
+  they hold with `foreign_keys` off; schema-2 development ledgers provisioned before this
+  change must be re-provisioned.
 - Build Phase 1b B7 milestone 1, retired-token compaction (design section 16, RTC-1 to
   RTC-18; as built in section 16.9). The helper issues every Firecracker allocation token
   (seq and an HMAC-SHA-256 tag under a per-node key); node ledger schema 2 keeps an exact
