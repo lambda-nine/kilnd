@@ -527,7 +527,10 @@ impl Fixture {
     async fn start(&self) {
         let _ = std::fs::remove_file(self.root.join("helper.sock"));
         self.spawn_helper();
-        wait_until("the helper listens", || {
+        // A real helper verifies its own image, the whole bundle manifest and every
+        // artifact before it listens; an unoptimized test build in the VM can take
+        // well over half a minute for that.
+        wait_until_for("the helper listens", Duration::from_secs(240), || {
             std::os::unix::net::UnixStream::connect(self.root.join("helper.sock")).is_ok()
         })
         .await;
@@ -713,8 +716,12 @@ impl Drop for Fixture {
     }
 }
 
-async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let end = std::time::Instant::now() + Duration::from_secs(30);
+async fn wait_until(what: &str, condition: impl FnMut() -> bool) {
+    wait_until_for(what, Duration::from_secs(30), condition).await;
+}
+
+async fn wait_until_for(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + limit;
     while !condition() {
         assert!(std::time::Instant::now() < end, "timed out waiting: {what}");
         tokio::time::sleep(Duration::from_millis(5)).await;
