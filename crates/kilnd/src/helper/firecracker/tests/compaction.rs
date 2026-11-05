@@ -826,7 +826,8 @@ async fn b7_rtc14_a_real_rollback_latches_every_forward_effect_until_the_offline
 async fn offline_when_stopped<T>(mut command: impl FnMut() -> Result<T, String>) -> Result<T, String> {
     for _ in 0..1000 {
         match command() {
-            Err(error) if error.contains("stop kilnd-helper") => {
+            // The stopped helper's L may still be closing the ledger's files.
+            Err(error) if error.contains("stop kilnd-helper") || error.contains("unsafe") => {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             other => return other,
@@ -1379,7 +1380,7 @@ async fn lifetime(sessions_per_instance: u32, refusals_per_instance: u32, window
         if window == 2 || done_sessions == SESSIONS {
             // Open-audit time, with the helper stopped.
             let config = fixture_ledger(&fixture);
-            fixture.kill_helper().await;
+            stop_helper(&fixture).await;
             let began = std::time::Instant::now();
             offline_when_stopped(|| {
                 super::super::journal::Ledger::open(config.clone())
@@ -2030,6 +2031,9 @@ async fn b7_crash_g_w_refresh_for_a_late_pinned_fence_before_and_after_its_commi
     let mut clock = 0;
     mature(&fixture, &mut clock, POLICY).await;
     let first = wait_watermark_past(&runtime, super::super::token::seq_of(pinned.allocation_id)).await;
+    // Every refresh crashes before its commit from here on, so no pass can slip in
+    // between the fence and the crash under test.
+    fixture.fault("L.compact.advance.before_commit.panic");
     // Fenced after the advance: its generation is at or above G_W.
     let original = fenced(
         runtime
@@ -2039,12 +2043,11 @@ async fn b7_crash_g_w_refresh_for_a_late_pinned_fence_before_and_after_its_commi
     );
     assert!(original.helper_generation() > first.watermark_generation);
     // A crash before the refresh commits: nothing is compacted, the original answers.
-    fixture.fault("L.compact.advance.before_commit.panic");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    fixture.clear("L.compact.advance.before_commit.panic");
     assert!(fixture.retired_receipt(pinned.allocation_id).is_some());
     // A crash after the refresh, before its delete commits: still the original.
     fixture.fault("L.compact.delete.after_fence.panic");
+    fixture.clear("L.compact.advance.before_commit.panic");
     wait_until("the refresh commits", || {
         fixture.count(&format!(
             "SELECT COUNT(*) FROM instance_tokens WHERE watermark_generation > {}",
