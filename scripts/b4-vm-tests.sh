@@ -40,7 +40,12 @@ export RUSTFLAGS="-C target-feature=+crt-static"
 
 # kilnd's library tests, and since Phase 1b B5 the direct-kiln core's, which hold the
 # moved capability-drop regression (process::tests).
+# Dependencies are optimized (kilnd itself stays a debug build with its overflow checks):
+# a real helper hashes its own image and parses the bundle's 33 MB manifest at start and
+# in every Preflight, which unoptimized sha2 and serde_json made slower than the wire
+# deadlines on a loaded host.
 built=$(cargo test --locked -p kilnd -p kilnd-exec-core --lib --no-run --target "$target" \
+    --config 'profile.dev.package."*".opt-level=2' \
     --message-format=json \
     | python3 -I -c '
 import json, sys
