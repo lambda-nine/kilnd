@@ -218,7 +218,7 @@ Only one live holder may use an instance ID. Operations carry a helper-generated
 
 **Every post-C1 release requires ABSENT.** C0 rejection creates no daemon row and no reservation. Once C1 commits, the helper first looks up the token under its per-allocation serialization, before revalidation or allocator selection. An existing ABSENT row is returned unchanged; an existing active or conflicting plan is never DefinitelyNotCreated. For a new token rejected before INTENT, `FenceAbsent` closes its admission gate, cancels or invalidates every queued dispatch generation, waits for all previously issued side-effect permits/workers to settle, verifies all derived resources absent, and commits the retired-token entry plus matching ABSENT receipt in one FULL-sync transaction. Only then can the helper return AbsentFenced/DefinitelyNotCreated. A lock alone, absence in one invocation, deadline, error string or empty listing does not suffice. Late requests check the durable fence again before any side effect.
 
-Receipts identify node, instance, allocation, plan digest, monotonically increasing helper generation and kind `AbsentFenced`. A prior candidate collision or revalidation failure with no fence returns AllocationAmbiguous and the daemon keeps its FAILED row charged while fencing is retried. A ledger failure or a stuck accepted worker forbids the receipt. Retired entries remain even when API history expires. Initially reserve a 64 MiB retired-ID ledger allowance; stop accepting new tokens before the space needed to fence already accepted tokens would be exhausted. A quarter of that allowance is set aside for tokens the ledger never admitted, divided equally among the policy's possible instances, and each instance's quota is checked in the fence's own transaction. At its quota, FenceAbsent for a never-seen token fails closed with no row written, and the daemon keeps its charge; a token the ledger admitted is never refused by this quota. Admission reserves the whole set-aside up front, so never-admitted fences and admitted tokens together always fit the allowance. Never prune fences by age; epoch-safe compaction is separate work, designed in [section 16](#retired-token-compaction-pre-b7-design) for B7. Bound console retention to 64 KiB combined; its mandatory drain/rate policy is in section 5.6.
+Receipts identify node, instance, allocation, plan digest, monotonically increasing helper generation and kind `AbsentFenced`. A prior candidate collision or revalidation failure with no fence returns AllocationAmbiguous and the daemon keeps its FAILED row charged while fencing is retried. A ledger failure or a stuck accepted worker forbids the receipt. Retired entries remain even when API history expires, until B7's compaction (section 16) removes them: the helper issues every token, and only rows of an absent token below its instance's durable watermark are ever deleted, so nothing is pruned by age or clock. Since B7 the ledger reserves a 128 MiB fence allowance, counted at a measured 20 KiB per retained token; stop accepting new tokens before the space needed to fence already accepted tokens would be exhausted. A quarter of that allowance is set aside for tokens the ledger never admitted, divided equally among the policy's possible instances, and each instance's quota, counted over retained rows only (a budget per lease window, RTC-12), is checked in the fence's own transaction. At its quota, FenceAbsent for a never-seen token fails closed with no row written, and the daemon keeps its charge; a token the ledger admitted is never refused by this quota. The admitted remainder is shared by reserved per-slot shares (RTC-17), so never-admitted fences and admitted tokens together always fit the allowance. Bound console retention to 64 KiB combined; its mandatory drain/rate policy is in section 5.6.
 
 **Daemon database boundary (B2):** `/var/lib/kilnd/kilnd.db`, or `/var/lib/kilnd-<name>/kilnd.db` for a further instance, is owned by that instance's account: directory 0700, regular single-link database and SQLite sidecars 0600. Installation checks these modes/owners after any legacy root-to-service transfer; startup validates them before opening and again after SQLite setup. These filesystem permissions protect access. A process able to open its own SQLite connection already has kilnd's file authority and is equivalent to a schema/file rewriter. A connection that disables triggers (`SQLITE_DBCONFIG_ENABLE_TRIGGER`) or registers a spoofed validator is explicitly out of scope for SQL guards. Triggers defend kilnd bugs and honest direct-SQL mistakes through standard tools; they cannot bind another connection's configuration or function implementation. The root-owned node ledger above never frees node capacity or host resources without its own ABSENT receipt, whatever this daemon database says. B3/B4 implement that authority; B2 does not claim it exists yet.
 
@@ -687,7 +687,7 @@ The daemon still uses its SQLite IMMEDIATE sum-and-insert transaction at C1 for 
 
 Default node policy: three VM slots, **3072 MiB total Firecracker memory budget including shared workers**, three vCPU slots, 3500 host CPU millis (3000 session + 500 shared), 2048 aggregate accounted PIDs with an explicit 128 host-task ceiling (96 session + 32 shared), and 16 GiB total backend storage. All arithmetic is checked; any exceeded component rejects admission, then obtains ABSENT before releasing the C1 row. The root catalog fixes node ceilings; a daemon cannot supply a larger node budget. Startup compares measurable physical/free capacity, existing reservations and configured host/service headroom. Lower limits degrade Health/deny admission, never delete work or discount existing commitments.
 
-Reserve shared infrastructure **once per node**, before any session: 128 MiB RAM, 500 CPU millis, 32 PIDs for H/L/M/K plus shared validation/control processes, and 512 MiB on durable storage for the node ledger/WAL, bounded queues/control metadata and retired fences (64 MiB of that is the fence allowance). Give those shared processes their own cgroup with those ceilings outside all VM parents. Bound WAL/checkpoint growth and queues; stop new claims while retaining room for all outstanding stop/absence records. The immutable bundle store has a separate root-configured size/inode cap, initially 1 GiB, also deducted from the 16 GiB backend budget; do not sum it once per daemon. Provision actual filesystem free space for these reservations plus host-service headroom. The per-session 128 MiB disk allowance is neither license for arbitrary jail writes nor a substitute for shared journal space.
+Reserve shared infrastructure **once per node**, before any session: 128 MiB RAM, 500 CPU millis, 32 PIDs for H/L/M/K plus shared validation/control processes, and 512 MiB on durable storage for the node ledger/WAL, bounded queues/control metadata and retired fences (128 MiB of that is the fence allowance since B7; it was 64 MiB, which the frozen B1 launch contract still records). Give those shared processes their own cgroup with those ceilings outside all VM parents. Bound WAL/checkpoint growth and queues; stop new claims while retaining room for all outstanding stop/absence records. The immutable bundle store has a separate root-configured size/inode cap, initially 1 GiB, also deducted from the 16 GiB backend budget; do not sum it once per daemon. Provision actual filesystem free space for these reservations plus host-service headroom. The per-session 128 MiB disk allowance is neither license for arbitrary jail writes nor a substitute for shared journal space.
 
 | Guest profile | Inner memory ceiling | Charge per VM | Capacity in a 3072 MiB backend budget, after 128 MiB shared reserve |
 |---|---:|---:|---:|
@@ -1168,8 +1168,9 @@ changed. Conservative readings taken where this document left room:
 - **Slot waits.** Preflight refuses when both P slots are busy. Create revalidation may
   wait among at most 16 waiters up to its wire deadline, or concurrent admission would
   fail on a transient; it never adds a process or borrows K.
-- **Fence headroom.** Each token is bounded at 4096 bytes. Space for never-admitted tokens,
-  including C1 rows the helper has not seen, is reserved from the 64 MiB allowance (see the
+- **Fence headroom.** Each token was bounded at 4096 bytes (B7 measures 20 KiB and doubles
+  the allowance to 128 MiB, section 16). Space for never-admitted tokens,
+  including C1 rows the helper has not seen, is reserved from the allowance (see the
   break-it corrections for the quota). Preflight and C2 refuse a new token past that; a
   fence for an admitted token is always allowed.
 - **POSIX record locks.** Closing any descriptor for a file drops all of a process's locks
@@ -1327,11 +1328,11 @@ service accounts, since instances no longer share one.
 - **Children of a compromised daemon.** Its children inside its own unit pass the proof for
   that instance, which is that unit's own authority. The kilnd unit must not set
   `Delegate=`, so that its cgroup stays root-writable only.
-- **Never-admitted fences are a lifetime budget.** Fences are permanent, so a quota spent
-  stays spent until epoch-safe compaction exists. A daemon that really does exhaust it,
-  through many pre-INTENT rejections, keeps those charges until an operator acts. A
-  policy with a lower `max_enrolled_instances` gives each instance more. Compaction and
-  that repair remain separate work, now designed in section 16 for B7.
+- **Never-admitted fences were a lifetime budget** (superseded by B7, section 16). Fences
+  were permanent, so a quota spent stayed spent. Since B7 the quota counts retained rows
+  only, and rows below the watermark are compacted, so it refills every lease window
+  (RTC-12; `b7_rtc12_a_never_admitted_flood_stops_at_the_floor_and_refills_after_a_lease`).
+  A policy with a lower `max_enrolled_instances` still gives each instance more.
 
 ## B3 recheck corrections (November 1, 2026)
 
@@ -3503,6 +3504,15 @@ per window at the default 8 instances; of the remaining 6,143 admitted entries e
 8 policy slots reserves 767, whether or not an instance is enrolled in it, and only the
 7-entry remainder can be borrowed). All are root policy, never daemon input.
 
+*As built in B7 milestone 1 (section 16.9):* the measured worst case is about 18.0 KB per
+token, so the bound is 20 KiB and the 128 MiB allowance holds 6,553 entries: a pool of
+1,638 (204 per instance per window at 8 instances, Preflight's floor at 153), 4,914
+admitted entries, a reserved share of 614 per slot and a 2-entry remainder, so a ceiling of
+616 retained admitted rows per instance at the default policy. A full 256-token delete
+transaction took 310 to 580 ms, so the batch is 16 tokens (RTC-18's 100 ms cap). The
+lease, pass and allowance are root policy fields (`compaction_lease_seconds`,
+`compaction_pass_seconds`, `fence_allowance_bytes`).
+
 ## 16.5 Rules for B7 (RTC-1 to RTC-18)
 
 1. **RTC-1 Token form and key.** A Firecracker allocation ID is seq ‖ tag: `seq` is the
@@ -3950,10 +3960,14 @@ refuses the first instance's fifth row instead of the second instance's first;
 The price is borrowing: only the floor remainder is borrowable, so at the default policy
 (128 MiB allowance, 6,143 admitted entries, 8 slots) every instance's ceiling is 774
 retained admitted rows, including a lone instance on its node, where the earlier rule let
-it take all 6,143. That still does not limit throughput: 774 retained rows per 15-minute
-lease is about 51 sessions a minute per instance, several times what a node's capacity
-claims can boot (about 14 s per boot on mini-one), and a node that will only ever run one
-instance sets `max_enrolled_instances` to 1. The implementation cost is one counter column
+it take all 6,143. That still does not limit throughput. RTC-13 guarantees maturity within
+one lease plus two passes, 17 minutes at the defaults (RTC-R2-04), so the conservative
+sustainable rate is 774 / 17, about 45 completed sessions a minute per instance (51 is the
+ideal lease-only figure). With B7's measured bound the ceiling is 616 (section 16.9), so
+616 / 17 is about 36 a minute. Either is several times what a node can boot: three VM
+slots at about 14 s per boot on mini-one is at most 12.9 new boots a minute, about 219
+retained completions over 17 minutes plus three active sessions, 36% of 616. A node that
+will only ever run one instance sets `max_enrolled_instances` to 1. The implementation cost is one counter column
 kept by triggers and a sum over at most 64 instance rows per check.
 
 **Clearing a rollback fault** (`kilnd-helper clear-node-faults`, new in B7). Root only,
@@ -4262,9 +4276,20 @@ about five times over and many compaction cycles, inside one VM window.
 - **Rollback latch.** A genuine RTC-14 detection stops new work on every instance until root
   runs the offline inventory and the fault clear; that is the intended cost of a node whose
   ledger is provably behind a token it issued. No instance can cause it without a
-  helper-issued token for which the ledger's pointer is behind. One narrow window remains:
-  if the fault commit itself is lost and the whole helper process then restarts, forward
-  effects for other instances resume until the detecting daemon reattaches and re-detects.
+  helper-issued token for which the ledger's pointer is behind. *Chosen resolution of
+  RTC-R2-01 (lead decision, November 4): fail-stop.* L writes a durable fail-stop marker
+  (`failstop`, beside the ledger) the moment it detects a verified future token, before it
+  answers H or attempts the fault commit, and on any failed or uncertain ledger commit. A
+  helper that finds the marker latched at start refuses every forward effect, whatever the
+  fault row's fate, until root's offline inventory and clear-node-faults reset it. The
+  window the recheck named (a lost fault commit followed by a whole-helper restart) is
+  closed: `b7_crash_rollback_fault_commit_at_every_boundary_keeps_forward_effects_refused`
+  kills the whole helper after a commit that never landed and finds it still latched. What
+  remains is a marker write that itself fails while H dies before any replacement L can
+  commit the pending fault: the node then reopens until the detecting daemon reattaches.
+  The cost of fail-stop on every sync failure is stated plainly: one transient fsync error
+  on the node ledger stops new work node-wide until root intervenes; cleanup and reads keep
+  working.
 - **Abandoned issuance.** Some issued seqs are never delivered (RTC-4). They cost nothing
   but a number; Accounting's `issue_next` therefore counts issuances, not sessions.
 - **Daemon-side growth.** `release_evidence` rows (about 1 KB each with indexes) stay
@@ -4315,3 +4340,122 @@ new HIGH. Every finding is accepted.
 | RTC-RC-06 (LOW) RTC-18's service wording was stronger than its mechanism | RTC-18 phrased at the queue boundary (bounds start at enqueue) and as reserved capacity, not priority; 100 ms batch cap kept. Test saturates all three other lanes and measures the 96-frame wait and a full 256-token batch |
 | RTC-RC-07 (LOW) H/L restart tests needed exact process boundaries | Three cases: L replaced while H lives (new channel and verified K published atomically only after the replacement settled its predecessor and journaled itself; stale replies stay bound to the old channel), H task or channel restart while L lives, and H process death (L exits). RTC-1 now says K never appears in a public or wire reply |
 | Test-plan sufficiency 1 to 8 | 1: spoof set, real rollback, fault-commit loss, restart persistence, every forward operation denied, cleanup kept, non-root and running-helper clear refused, offline clear with immediate reattach. 2: the four issuance boundaries, no reuse, documented gap, Unknown then Compacted. 3: checkpoint flood over five leases with a fixed count and RSS bound and final maturity. 4: enrollment with live borrower rows, plus the full-space Preflight/C2 race proving admitted tokens fence. 5: exact L queues. 6: Legacy refusal before the wire, mixed-node and mixed-instance Gc, mismatched digest with rows, arbitrary digest without rows, compile-time contract. 7: replacement handover at each boundary. 8: lifetime refusals interleaved at most 90 per window, under the quota and its issuance floor |
+
+## 16.9 B7 milestone 1: retired-token compaction as built (November 4, 2026)
+
+Branch `phase1b/b7-compaction` from main `1c107f9`. Everything in section 16.6 is built:
+helper-issued tokens and the key, node ledger schema 2, the classifier, compaction and its
+lane, the RTC-17 shares, the RTC-14 latch with root's offline commands, group schema 2 and
+the section 9.1 Runtime contract. Production Firecracker stays disabled (milestone 3).
+
+### Where it lives
+
+| Piece | Code |
+|---|---|
+| Token form, HMAC-SHA-256 over `sha2`, the key, its check value and its private transfer form | `helper/firecracker/token.rs` |
+| Schema 2 tables and triggers, issuance, classification, admission and fence changes, watermark advance, compaction batch, RTC-17 shares, fault commit and offline clear, the open audit | `helper/firecracker/journal.rs` |
+| L's checkpoints, boot clock and fail-stop marker | `helper/firecracker/compaction.rs` |
+| L's protocol (`IssueAndSnapshot`, `TokenKey`, `CommitFault`, `Compact`, `FaultPending`, `SyncFailed`) and its in-memory latch | `helper/firecracker/workers.rs` |
+| H: tag checks before any gate, the latch gate, issuing Preflight, digests on Inspect, Remove and Gc, the compactor task, key handover with each L | `helper/firecracker/mod.rs`, `lifecycle.rs` |
+| Root's `offline-inventory`, `clear-node-faults` and `ledger-stats` | `helper/firecracker/offline.rs`, `bin/kilnd-helper.rs` |
+| Group schema 2 wire | `helper/protocol.rs` |
+| `PrepareContext`, `PreparedCreate::allocation_id`, `RemoveTarget` | `runtime/mod.rs`, every adapter, `manager.rs` |
+| The daemon's highest recorded token | `store.rs` (`highest_fenced_token`), `runtime/firecracker.rs` |
+
+### Lead decisions on the recheck's notes
+
+- **RTC-R2-01, fail-stop** (section 16.7). L writes the `failstop` marker at detection and on
+  any failed commit; every later helper latches at start until the offline clear resets
+  it. Tests: `b7_rtc_r2_01_an_uncertain_fault_commit_fails_stop_across_every_restart`,
+  `b7_crash_rollback_fault_commit_at_every_boundary_keeps_forward_effects_refused` (its
+  fourth case kills the whole helper after a commit that never landed).
+- **RTC-R2-02.** An empty checkpoint list takes `(issue_next, now)` at the next pass
+  (`Compactor::snapshot`). Tests: `rtc_r2_02_an_empty_list_takes_the_next_pointer_at_once`,
+  `rtc13_nothing_advances_for_a_lease_after_start_and_an_idle_tail_compacts` (drain, idle,
+  issue one: compacted within a lease plus two passes), and the lifetime test's idle tail.
+- **RTC-R2-03.** L answers `FaultPending` having latched and written nothing; H latches
+  atomically and only then sends `CommitFault`. Queued work rechecks the latch at its last
+  boundary: Preflight before issuance, Create after C2 and before any host effect, Validate
+  and Exec at dispatch. Test:
+  `b7_rtc_r2_03_h_latches_before_the_commit_and_queued_work_starts_nothing` holds H between
+  its latch and the commit, proves no fault row exists yet, and releases a Create held after
+  C2: it answers `latched` with no supervisor and no host effect.
+- **RTC-R2-04.** The capacity arithmetic uses the 17-minute worst case (section 16.6).
+
+### Changes from the design, and why
+
+- **The per-token bound is 20 KiB, not 16.** `b7_fence_entry_bound_is_the_measured_worst_case`
+  fills every bounded family of one allocation to its cap (sixteen stop reasons of the
+  longest length, eight settled workers in each real mode, every resource kind with every
+  field at its widest, an execution left in flight, a long receipt) and measures about
+  18.0 KB per token. The defaults therefore become 6,553 entries, a pool of 1,638, a share
+  of 614 and a ceiling of 616 (section 16.4). The lifetime schedule still fits: 500 sessions
+  per window under 616, and at most 90 refusals per window under the 153 issuance floor.
+- **The delete batch is 16 tokens.** A full 256-token batch of admitted sessions took 310
+  to 580 ms on mini-one, and 32 about 40 ms idle but up to 195 ms on a loaded host; 16 keeps
+  the measured batch under RTC-18's 100 ms
+  (`b7_rtc18_compaction_has_its_own_lane_and_a_full_batch_stays_under_100_ms`).
+- **The frozen B1 launch contract still says 64 MiB.** Its `shared.fence_allowance_bytes`
+  is pinned into every guest bundle through `contract_sha256`. The allowance is helper-only
+  ledger accounting that no guest or plan consumes, so B7 changes the helper's default and
+  leaves the contract; reconciling the contract's value needs a bundle rebuild.
+- **Preflight takes its preparation slot before issuing.** A busy node refuses without
+  consuming a seq, instead of abandoning one for every refused Preflight.
+- **Fail-stop on any failed commit** (lead decision). Earlier tests that injected a sync
+  failure and then created again now expect the latch.
+- **The crash scenarios run through the B3 fixture.** Each `b7_crash_` test in
+  `tests/compaction.rs` uses the real H, L, listener and adapter (and, for the restored
+  database, the real manager and Store) with fake host effects and a FULL-sync ledger, at an
+  exact fault point. They run on macOS and in CI, and in the kiln VM through
+  `scripts/firecracker-crash-matrix.py`, whose runner now passes `--include-ignored` so
+  these ordinary tests are selected. Real VMs add nothing at these boundaries, which are
+  ledger and process boundaries; `b7_linux_root_compaction_cycles` and the B4 to B6 suites
+  cover the real chain.
+- **"H task or channel restart while L lives" is not a reachable boundary here.** H owns
+  exactly one channel per L process; the only swap is an L replacement, which publishes the
+  new channel and its K together (`b7_crash_ledger_replaced_while_h_lives_serves_nothing_before_publication`).
+- **The lifetime test cannot execute.** B3's fake effects have no broker, so each fake
+  session is Preflight, Create and Remove; the real-chain test runs one execution per
+  session.
+- **First attachment is no longer refused for space.** RTC-17 reserves every policy slot's
+  share, so `AttachOutcome::NoSpace` is gone; enrollment past the policy maximum is refused
+  when it would leave a slot short of its share, and a policy whose allowance cannot give
+  every slot a never-admitted window (fewer than four entries per slot) is refused.
+- **The offline inventory reports and destroys nothing.** Root settles whatever it names
+  and runs it again; the clear accepts only an `explained`, canonical report, read through
+  a protected walk, whose digest, ledger generation, fault set, fail-stop state and instance
+  set all match the stopped node.
+
+### Rules to code and proving tests
+
+| Rule | Code | Tests (those that fail without the rule) |
+|---|---|---|
+| RTC-1 key and token form | `token.rs`; `Ledger::provision`, `audit_token_key`; `token_key` triggers | `rtc1_*` in `token.rs` and `journal/b7_tests.rs`; `rtc16_accounting_reports_only_the_callers_token_figures` (no K in replies) |
+| RTC-2 only the helper mints | `Node::preflight`, `issue_and_snapshot`; `verify_prepared`; manager's context after `prepare` | `exit1_prepared_wire_is_reconstructed_and_verified_field_by_field`, `b7_runtime_contract_compiles_for_every_backend` |
+| RTC-3 H checks the tag, L classifies | `Node::check_token`; `Ledger::lookup_on` | `b7_rtc3_forged_foreign_and_seq_zero_tokens_never_reach_a_gate_or_l`, `b7_rtc3_a_valid_tag_at_the_pointer_reaches_l_and_is_not_issued_across_restarts`, `rtc3_rtc6_l_classifies_*` |
+| RTC-4 exact pointer | `issue_and_snapshot`; `instance_tokens_monotonic` | `rtc4_*`, the four `b7_crash_issuance_*` scenarios |
+| RTC-5 watermark | `advance_watermark`; triggers | `rtc4_the_pointer_never_wraps_and_never_moves_back`, `b7_crash_watermark_advance_before_and_after_its_commit` |
+| RTC-6 rows outrank W, digest binds | `lookup_on`; `remove_inner`, `gc_flow` | `rtc3_rtc6_*`, `b7_rtc8_real_wire_digests_after_compaction_and_a_helper_restart` |
+| RTC-7 nothing admitted below W | lookup in C2; `allocations_issued_above_watermark`, `retired_tokens_issued` | `rtc7_nothing_below_w_is_admitted_or_newly_fenced_even_by_raw_sql`, `b7_crash_a_create_racing_compaction_is_fenced_or_pinned_by_commit_order` |
+| RTC-8 compacted means absent | `compacted_receipt`; every flow's `Compacted` arm | `rtc8_compacted_receipts_bind_the_callers_digest_generation_and_write_nothing`, `b7_rtc8_real_wire_*`, `b7_crash_a_restored_stale_daemon_db_after_compaction_releases_by_synthesized_receipts` |
+| RTC-9 never stale | G_W refresh in `advance_watermark` | `rtc9_a_late_pinned_fence_refreshes_g_w_before_anything_is_compacted`, `b7_crash_g_w_refresh_*`, `b7_crash_a_remove_racing_compaction_*` |
+| RTC-10 only absent rows | `compact_batch`; delete triggers | `rtc10_*` (trigger matrix, stuck rows), `b7_crash_non_compactable_allocations_below_w_are_never_deleted` |
+| RTC-11 crash-safe, idempotent | separate transactions; fault points | `rtc11_*`, `b7_crash_delete_batch_rolls_back_whole_at_every_boundary` |
+| RTC-12 quotas per window | `never_admitted_fences` over retained rows; issuance floor | `rtc12_*`, `b7_rtc12_*`, `b7_crash_issuance_then_a_preparation_refusal_*` |
+| RTC-13 bounded checkpoints | `Compactor` | `rtc13_*` (unit and ledger), `b7_rtc13_a_five_lease_flood_*`, `b7_crash_a_helper_restart_resets_checkpoints_*`, `b7_crash_h_process_death_*` |
+| RTC-14 verified rollback, latch | `attach_instance`; `Node::rollback_detected`, `set_latch`; `commit_fault`; `offline.rs` | `rtc14_*`, `b7_rtc14_*`, `b7_rtc_r2_0*`, `b7_crash_rollback_fault_commit_*`, `b7_crash_the_offline_clear_*` |
+| RTC-15 gates follow L | `create_flow`, `fence_flow` classification arms | `b7_rtc3_forged_*` (no gate), `b7_rtc3_a_valid_tag_*` (no gate for NotIssued) |
+| RTC-16 audit and observability | `audit_tokens`; `accounting`; Health | `rtc16_*`, `b7_a_historical_kiln_row_stays_deleting_and_charged_under_a_fenced_backend` |
+| RTC-17 reserved shares | `Shares` | `rtc17_*`, `b7_rtc17_an_instance_enrolled_beside_a_borrower_finds_its_share_at_once` |
+| RTC-18 compaction lane | `Lane::Compaction`; `Node::compactor`; `COMPACTION_BATCH` | `b7_rtc18_*` |
+
+### Evidence
+
+- **Lifetime, macOS** (`b7_lifetime_past_16384_sessions`, release test binary, real H and
+  L, FULL-sync ledger): 28,000 admitted sessions and 5,000 never-admitted fences across two
+  instances (16,500 issuances each) in 1,241 s. Live ledger bytes were 225,280 at every one
+  of the 28 window boundaries; the open audit took 68 ms after the second window and 43 ms
+  at the end; the idle tail compacted the last token and left the instance no rows. No
+  headroom, quota or ledger-space refusal occurred (any would have failed the test).
+- **Batches, macOS:** 16-token full batches well under 100 ms; 256 tokens 310 to 580 ms.
+- The kiln VM results follow in the milestone report and the next revision of this section.

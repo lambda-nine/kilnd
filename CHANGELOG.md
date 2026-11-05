@@ -6,6 +6,22 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Build Phase 1b B7 milestone 1, retired-token compaction (design section 16, RTC-1 to
+  RTC-18; as built in section 16.9). The helper issues every Firecracker allocation token
+  (seq and an HMAC-SHA-256 tag under a per-node key); node ledger schema 2 keeps an exact
+  issue pointer and a watermark per instance, and a compactor deletes only absent, released,
+  settled rows below it on its own lane, behind SQL triggers, so a node admits sessions
+  indefinitely. Group schema 2: Preflight issues the token, Inspect and Remove carry the
+  plan digest, Gc takes digest-bearing targets all or nothing, AttachInstance reports the
+  daemon's highest verified token. Compacted tokens answer a synthesized receipt for the
+  caller's digest. Reserved per-slot headroom shares, per-window never-admitted quotas,
+  bounded checkpoints. A verified future token or any failed ledger commit fail-stops
+  forward effects node-wide until root's new `kilnd-helper offline-inventory` and
+  `clear-node-faults`; `ledger-stats` reports. The Runtime trait takes `PrepareContext` and
+  a typed `RemoveTarget`; Firecracker refuses a legacy target before any wire call. The
+  measured per-token bound is 20 KiB, the fence allowance 128 MiB, delete batches 16 tokens.
+  Schema 1 ledgers must be re-provisioned. Production Firecracker stays disabled.
+
 - Design the Phase 1b retired-token compaction for B7 (design section 16): today's node
   ledger admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1
   refusals; helper-issued sequence tokens with a per-instance durable watermark remove

@@ -264,6 +264,53 @@ Startup problems leave kiln running and the group disabled or Unavailable. Every
 profile is refused by the disabled gate until a reviewed release (B7). Do not expect a
 sandbox from this: Capabilities reports `launch_enabled: false`.
 
+### Retired-token compaction (B7)
+
+The node ledger is schema 2: the helper issues every Firecracker allocation token, and a
+compactor removes the rows of absent tokens once they fall below their instance's
+watermark, so a node no longer stops admitting after a fixed number of sessions. A schema 1
+ledger fails its audit with a message to re-provision: settle every Firecracker session on
+the node, stop the helper, move the old ledger aside and provision again. Root policy may
+set `fence_allowance_bytes` (whole 20 KiB entries, at least four per enrolled instance,
+default 128 MiB), `compaction_lease_seconds` (default 900) and `compaction_pass_seconds`
+(default 60). Size `max_enrolled_instances` to the instances the node will really run:
+every policy slot reserves a share of admitted headroom whether or not it is enrolled
+(614 retained sessions per slot at the defaults, all 4,914 with a limit of 1).
+
+What Health and Accounting show: the instance's issue pointer, watermark, retained admitted
+and never-admitted rows, its reserved share, rows pinned below the watermark, checkpoints and
+compaction lag; Health is degraded below 25% retained headroom, past two leases of lag, for a
+token that cannot be compacted, or after a policy change shrank the shares, and fails on a
+node fault. `kilnd-helper ledger-stats` (root, helper stopped) prints the same per instance.
+
+**A node fault latches every forward effect, node-wide.** It comes from a daemon reporting a
+verified token the ledger has not issued, which only a restored or copied ledger produces,
+or from any failed ledger commit. New sessions and executions are refused on every instance;
+Inspect, List, Stop, Delete and reconciliation keep draining. Any restore, copy-back or
+suspected clone of `node.db` is treated the same way. To recover:
+
+```sh
+sudo systemctl stop 'kilnd*' kilnd-helper.service kilnd-helper.socket
+sudo kilnd-helper offline-inventory --report /root/inventory.json \
+    --daemon-db <instance>=/var/lib/kilnd/kilnd.db ...   # one per enrolled instance
+# settle or destroy whatever the report lists as unexplained, then run it again
+sudo kilnd-helper clear-node-faults --report /root/inventory.json
+sudo systemctl start kilnd-helper.socket kilnd.service
+```
+
+The inventory reads each daemon database read-only and destroys nothing. The clear refuses a
+running helper, a report that is stale (the ledger moved), unexplained, altered or not
+root-owned, and raises each issue pointer past the highest token its daemon recorded, so no
+recorded token is ever issued again. If anything cannot be explained, re-provision after
+proving every resource absent.
+
+**Selecting Firecracker for a database that holds kiln rows.** Historical kiln rows do not
+drain under `--backend firecracker`: their Delete is refused before any helper call and the
+row stays DELETING and charged, and Health names the count. Before switching, run the
+database with `--backend kiln` and delete every kiln row until `kilndctl list` shows none
+charged. Each further Firecracker instance has a fresh database, so this arises only for
+the default instance.
+
 ## Operating notes
 
 The daemon's admission flags and defaults are:

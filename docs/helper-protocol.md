@@ -110,10 +110,12 @@ without admitting a replacement probe. A failed helper exchange is an
 ambiguous create failure, or an Exec CleanupFailed result retaining already observed output prefixes; it cannot claim
 allocation absence, exact output totals, or successful execution.
 
-## Firecracker group schema 1
+## Firecracker group schema 2
 
 `operation: {"firecracker": {group_version, instance_id, connection_epoch, operation}}`
-travels inside the same v3 envelope, deadline, frame bound and peer checks. Kiln
+travels inside the same v3 envelope, deadline, frame bound and peer checks. Schema 2 is
+B7's retired-token compaction (design section 16): the helper issues every allocation
+token, and a schema 1 daemon is refused as a wrong group version. Kiln
 frames and every kiln reply are byte-identical to before; regression goldens pin
 them. Replies use the separate `Response::Firecracker` branch. An old v3 helper
 closes the connection on the unknown variant, which is how a client detects it.
@@ -128,17 +130,17 @@ command or environment. Identities are typed 128-bit IDs and digests, profiles a
 
 | Operation | Budget | Result |
 | --- | --- | --- |
-| `attach_instance {database_uuid}` | 5 s | `attached {node_id, connection_epoch, admission_open}`, and the connection stays open: its EOF is the detach |
+| `attach_instance {database_uuid, highest_token}` | 5 s | `attached {node_id, connection_epoch, admission_open}`, and the connection stays open: its EOF is the detach. `highest_token` is the daemon's highest recorded complete token, or null; one that does not verify for this instance fails this attachment alone (`incompatible`), and a verified one at or above the issue pointer latches the node (see below) |
 | `capabilities` | 2 s | Cached group and worker health. Without a policy: `enabled: false` |
-| `accounting` | 5 s | Node totals with generation and once-only shared reserve, or `unknown`. No other namespace's identity |
-| `preflight {allocation_id, sandbox_id, profile, spec}` | 30 s | `prepared` plan bytes, digests and reservation, or a refusal with no session effects |
+| `accounting` | 5 s | Node totals with generation and once-only shared reserve, or `unknown`. No other namespace's identity. B7 adds the caller's own token figures (issue pointer, watermark, retained admitted and never-admitted rows, reserved share, pinned rows below the watermark, checkpoints, compaction lag), node retained totals, the share shortfall, a node fault by kind and a `degraded` reason |
+| `preflight {sandbox_id, profile, spec}` | 30 s | `prepared {allocation_id, ..}`: the token the helper issued for this preflight, bound into the plan's substitutions, with plan bytes, digests and reservation; or a refusal with no session effects. A refusal before issuance (a full preparation slot, no headroom, the never-admitted floor, the latch) consumes no sequence |
 | `create {allocation_id, sandbox_id, plan, plan_digest}` | 120 s | `accepted`, the token's `absent` fence, or `ambiguous {class}`. There is no READY variant |
-| `inspect {allocation_id}` | 5 s | `present_ready {generation, boot_id, inner_id}` (B5: the phase is READY and no execution is in flight), `present_busy`, `stopped_with_resources`, `absent_fenced`, `incompatible` or `unknown`. A missing record is `unknown` |
+| `inspect {allocation_id, plan_digest}` | 5 s | `present_ready {generation, boot_id, inner_id}` (B5: the phase is READY and no execution is in flight), `present_busy`, `stopped_with_resources`, `absent_fenced`, `incompatible` or `unknown`. A row with another plan digest is `incompatible`; a never-issued token is `incompatible`; an issued token with no row at or above the watermark is `unknown`; below it, `absent_fenced` with a receipt synthesized for this digest |
 | `list` | 30 s | This namespace's records with `complete`; anything stale or unexplained makes it incomplete |
 | `fence_absent {allocation_id, sandbox_id, plan_digest}` | 30 s | The permanent receipt, byte for byte, or `ambiguous {class}` |
 | `stop {allocation_id, expected_generation, reason}` | 60 s | `stopped {generation, observations}` once STOP_INTENT is durable, the `vm` subtree is proven empty and S has exited, or `unknown {reason}`. Never a release. `expected_generation` is the C2 generation; `reason` is `delete`, `interrupted`, `unhealthy` or `operator` |
-| `remove {allocation_id}` | 60 s | Stop, exact cleanup and the ABSENT fence: the permanent receipt, or `ambiguous {class}` with the charge held. Idempotent; an unknown token is `ambiguous {conflict}` (only `fence_absent` fences those) |
-| `gc {allocation_ids}` | 30 s | At most 1024 unique IDs. Per ID: `removed {receipt}`, `skipped {reason}` (live, quarantined, unknown or another instance's) or `failed {class}`. Empty is a no-op |
+| `remove {allocation_id, plan_digest}` | 60 s | Stop, exact cleanup and the ABSENT fence: the permanent receipt, or `ambiguous {class}` with the charge held. Idempotent; acts only on the journaled resources of a row whose digest matches (another digest is `ambiguous {conflict}`); a compacted token gets a receipt synthesized for this digest and nothing acts; an unknown token is `ambiguous {conflict}` (only `fence_absent` fences those) |
+| `gc {targets: [{allocation_id, plan_digest}]}` | 30 s | At most 1024 unique tokens, all tag-checked first: one that is not this instance's refuses the whole request. Per target: `removed {receipt}` (a compacted one's synthesized receipt included), `skipped {reason}` (live, quarantined or unknown) or `failed {class}` (a mismatched digest is `failed {conflict}`). Empty is a no-op |
 | `validate {allocation_id, expected_boot_id, expected_inner_id}` | 5 s | B5. `ready {boot_id, inner_id}` after a broker Probe on the reserved control channel finds it idle on the journaled boot and inner sandbox; `busy {execution_token}` from the recorded state during an execution, with no guest polling; `incompatible` for another boot or inner sandbox; `unknown {reason}` otherwise. Never absence; a probe that fails or finds the broker in any other state retires the VM |
 | `exec {allocation_id, expected_boot_id, execution_token, execution_id, argv, stdin_bytes, max_output}` | 3,600 s | B5. One execution in the persistent sandbox: `{finish, status, stdout, stderr, cleanup, reusable, dispatched}`, with `finish` `completed`, `timed_out`, `canceled` or `failed {diagnostic}` and `cleanup` `no_child_started`, `guest_cgroup_drained`, `vm_stopped` or `unknown`. argv at most 256 KiB, stdin at most 1 MiB, `max_output` 1 byte to 1 MiB. EXEC_INTENT is journaled before any byte is sent; only a validated, delivered result with the guest's drain evidence leaves the VM `reusable`. Any interruption after dispatch (deadline, the caller's disconnect, Stop, a protocol, transport or cleanup failure) sends Cancel, allows two seconds, then stops the VM through the barrier: `reusable: false`, and `vm_stopped` once K proved the `vm` subtree gone |
 
@@ -163,6 +165,31 @@ shared page mapped before any fork; H clears it with one atomic store, without w
 on L. Create rechecks it after P answers, L reads it at its commit point, and H rechecks
 it after L's reply and again before S's gate. A commit that just beat the revocation
 keeps its claim for an exact fence, and no effect starts.
+
+**Tokens (B7).** An allocation ID is `seq ‖ tag`: eight big-endian bytes of the instance's
+issue sequence, then eight bytes of HMAC-SHA-256 under the node's key, bound to the node and
+instance. The key is written once into the node ledger at provisioning and crosses only the
+private L-to-H channel. Before any gate, quota or ledger call, H checks every token a
+request names (a Gc's whole vector) and refuses one whose tag does not verify for the
+caller's instance, or whose sequence is 0, as `incompatible`: an old random ID, a flipped bit
+and another instance's valid token are all refused there. L then classifies inside its
+transaction: never issued, rows, compacted (below the instance's watermark with no rows:
+absent forever), or unknown. A compactor in L deletes only absent, released and settled
+rows below the watermark, on its own one-permit lane, in 16-token transactions.
+
+**Rollback latch (B7).** A verified token at or above the issue pointer proves the node
+ledger is behind a token it issued. L and H latch (L writes a durable fail-stop marker
+first), the fault is committed, and from then on the node refuses Preflight, Create,
+Validate, Exec and first attachments for every instance, while Inspect, List, Stop,
+Remove, Gc and FenceAbsent keep draining. The same marker latches after any failed ledger
+commit. Only root's offline commands end it, with the helper stopped:
+`kilnd-helper offline-inventory --daemon-db <instance>=<kilnd.db> ... --report <file>` walks
+every enrolled instance's owned resources against the ledger and reads each daemon
+database read-only, destroying nothing; `kilnd-helper clear-node-faults --report <file>`
+accepts only a current, explained, root-owned report, raises each issue pointer past the
+daemon's highest verified token and deletes the faults in one transaction.
+`kilnd-helper ledger-stats` prints each instance's pointers, watermark, retained rows and last
+compaction.
 
 Create and FenceAbsent from any process but the instance's live holder are refused as
 `old_epoch` with no lookup and no state. From the holder, they look the token up in the
