@@ -663,7 +663,21 @@ Each allow is `#[allow(clippy::disallowed_methods)]` (inner for a whole module) 
 
 Test fixtures are excluded from the gate. Outside the approved items above, nothing in the workspace calls or names any listed capability.
 
-*The dependency gate (B7, B4 recheck 6 item 2; rebuilt after the B7 milestone 2 break-it).* Clippy matches paths, so a dependency could offer an equivalent of a listed capability under a name `clippy.toml` does not know. `dependency-gate.json` at the workspace root records a reviewed decision for **every** direct dependency of every workspace crate (normal, build and dev): its `kind` (`runtime`, `build-only` or `dev-only`), its `capability` (`none`, or a set of `filesystem`, `process`, `signals`, `syscalls` and `network`) and why. `proven::tests::dependency_gate` checks it on every `cargo test`. The gate never overrides an honest declaration: `Cargo.lock` can only *require* more. A raw system-call crate (`libc`, `linux-raw-sys`, `rustix`, `nix`, `syscalls`, `sc`, any `*-sys`) must declare `syscalls`, and a `none` dependency that depends directly on one must record in `raw_use` what it uses it for (`tokio-util`: `libc::memchr`). A dependency with a destructive-capable category (filesystem, process, signals, syscalls) lists its `destructive` paths and `clippy.toml` disallows each one, or records in `no_destructive_api` why its API has none (only `rusqlite`, and never a raw crate); `clippy.toml` names no dependency path its entry does not list. The test also fails on a direct dependency with no entry, an unknown field or capability, a kind the manifests contradict, a `build-only` or `dev-only` dependency that `Cargo.lock` reaches from the runtime dependencies (unless `runtime_via` names the path: `h2` is a dev dependency and also `tonic`'s transport), a package that can wrap system calls without being listed (transitive ones under `transitive`), a stale entry or a renamed dependency. Two lexical backstops catch a mistaken `none`: production code (every crate's `src` and build script, comments and strings ignored, `use` aliases resolved) that names a destructive-looking function through a dependency's path that `clippy.toml` does not disallow, or glob-imports a dependency reviewed as having no destructive API; and a `none`, `network` or no-destructive-API dependency whose own locked registry source reaches a `std`, Tokio or libc path `clippy.toml` disallows. Completeness is tested, not asserted: `every_destructive_libc_function_is_disallowed` reads every exported function of the locked `libc` (all targets, from the registry source `Cargo.lock` pins) and requires each one matching the curated patterns (`*unlink*`, `rmdir`, `rename*`, `*truncate*`, `creat*`, `exec*`, `posix_spawn*`, `system`, `popen`, `*kill*`, `tkill`, `tgkill`, `*sigqueue*`, `pidfd_send_signal`, `umount*`, `mount`, `remove*`, `*removexattr`, `fallocate*`, `ptrace`, `process_vm_writev`, `prctl`, `syscall`, `reboot`, `swapoff`) to be disallowed, 104 in libc 0.2.190, most of them other targets' (marked `allow-invalid`); `std_and_tokio_destructive_surfaces_are_disallowed` holds `clippy.toml` to a curated, justified review of `std::fs`, `std::process` and the Unix extensions (std is not a `Cargo.lock` input; the list is re-read at each toolchain bump) and to every public function of the locked Tokio's `fs` module, failing on one the review does not classify. Reviewed and not gated: `fork`, `vfork` and `clone` (they duplicate the caller; running another program needs `exec*`, which is gated), `unshare`, `setns` and `chroot` (the caller's own view), `mknod`, `link` and `symlink` (they create, never replace), descriptor writes and `O_TRUNC` passed by flag to `open`/`openat`, which no path-based gate can see. The jail base's two mounts moved into typed wrappers (`sys::bind_onto_itself`, `sys::make_private_recursive`) when `libc::mount` joined the list, and `kilnd-api/build.rs` carries the one approved allow for `tonic-prost-build`. `scripts/dependency-gate-regressions.sh` (and a CI job) replays Daybreak's PoCs against the real crates and clippy on Rust 1.88 and 1.99. Like the rest of the gate it catches honest mistakes, not a malicious dependency.
+*The dependency gate (B7, B4 recheck 6 item 2; rebuilt after the B7 milestone 2 break-it and its recheck).* Clippy resolves workspace code, but it never lints a dependency's own body, so a dependency can offer a destructive operation under a name `clippy.toml` does not know, or perform one inside a method that workspace code calls under a harmless name (an extension trait on `std::fs::File` whose `reset` calls `set_len(0)`). The gate therefore fails closed on *review*, not on detection, and it guarantees exactly two things: **no unreviewed package enters the build**, and **common destructive sinks, method forms included, in packages declared non-destructive are flagged for review**. Deciding whether an API is destructive is the reviewer's job. The gate is a lexical aid to that review, not a proof, and it is built for honest mistakes, not for a dependency written to hide one. `proven::tests::dependency_gate` checks it on every `cargo test`.
+
+*Every locked package is reviewed.* `dependency-gate.json` has an entry under `packages` for every package in `Cargo.lock` outside the workspace, direct and transitive (144 today), keyed `name@version` and pinned to `Cargo.lock`'s `checksum` and to the `features` that `cargo metadata --locked --all-features` resolves for it. Each entry has a `kind`, a `capability` (`none`, or a set of `filesystem`, `process`, `signals`, `syscalls` and `network`) and a justification: its own `why`, or a `group` with a shared one. A new package, a changed version or checksum, or a changed feature set fails the test, so every lock change needs a person's review; a path or git dependency outside the workspace has no checksum and is refused. `scripts/dependency-gate-review.py --write` drafts entries for new packages, filling the checksum, features and kind and leaving the capability and justification empty, so the test fails until someone writes them. A group is allowed only for `none` packages with no raw system-call crate underneath whose library source names no `std::fs`, `std::process`, `std::os` fs, fd or process extension (or the Unix prelude that re-exports them), libc, or `tokio::fs`/`tokio::process` path at all, and the test checks that. Today 78 packages share `pure-computation` and 15 share `compile-time` (procedural macros and the syntax libraries only they use); the other 51 have their own justification. A direct dependency's kind comes from the manifests and any other package's from the dependency graph: `runtime` if a workspace crate's normal dependencies reach it through normal edges, otherwise `build-only` or `dev-only`. A procedural macro runs in the compiler, so it and what only it reaches are build-only. A direct `build-only` or `dev-only` dependency that the runtime graph also reaches records `runtime_via` (`h2`, also `tonic`'s transport).
+
+*Capabilities.* `Cargo.lock` can only require more, never override a reviewed decision. A raw system-call crate (`libc`, `linux-raw-sys`, `rustix`, `nix`, `syscalls`, `sc`, any `*-sys`) declares `syscalls`, and a `none` package directly over one records in `raw_use` what it uses it for (`tokio-util`: `libc::memchr`; `errno`, `cpufeatures`, `getrandom` and three Windows console crates likewise). A direct dependency with a destructive-capable category (filesystem, process, signals, syscalls) lists its `destructive` paths and `clippy.toml` disallows each one, or records in `no_destructive_api` why its API has none (only `rusqlite`, and never a raw crate). `clippy.toml` names only std and direct dependencies, and no path an entry does not list. Workspace code cannot name a transitive crate, so a transitive entry lists no paths: its API reaches the workspace only through a direct dependency, whose own review covers it. The test also refuses an unknown field, capability or group, a stale entry or exception, and a renamed dependency. Production code (every crate's `src` and build script, comments and strings ignored, `use` aliases resolved) may not name a destructive-looking function through a dependency path `clippy.toml` does not disallow, or glob-import a dependency reviewed as non-destructive.
+
+*The subtree scan.* For every package declared `none`, `network` or `no_destructive_api` that is in the runtime graph or is a direct dependency, the test reads the library source of its whole runtime dependency subtree (normal edges for any target; procedural macros excluded) from where cargo extracted it. In each package of that subtree it flags three things. First, a method call named by the curated, justified list in `METHOD_SINKS`, whatever the receiver: `set_len`, `truncate`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `unlink*`, `copy`, `kill`, `start_kill`, `send_signal`, `persist*`, `exec`, `umount*` and `unmount*`. Second, any path `clippy.toml` disallows, however it is aliased or glob-imported (`use std::fs::*;` then `remove_file(p)`). Third, a trait impl for `std::fs::File`, `std::fs::OpenOptions`, `std::process::Child` or `Command`, or Tokio's file and process types (a bare `File` counts unless the package imports or defines its own). A hit refuses the declaration unless `sink_exceptions` records a reviewed exception for that package, version and exact feature set, naming the sinks and why. An exception does nothing outside that scope, and one that no longer matches a hit is refused as stale. Today there are 22 exceptions: harmless methods that share a sink's name (`Vec`, `BytesMut` and `SmallVec` `set_len` and `truncate`, bitflags' `Flags::truncate` in its own tests), `unlink` on h2's and futures-util's own intrusive lists, mio's `FIONBIO` `ioctl` on its own pipe, writer impls for a `File` the caller passes (anstream, anstyle-wincon, tracing-subscriber), and Tokio's own implementation of the API its entry lists. Inline `#[cfg(test)]` modules are skipped; out-of-line test files are scanned.
+
+*What the scan does not see.* A destructive operation behind a name not on the list, on a receiver of unknown type and without a flagged impl (for example a generic method that is only later instantiated with `File`). Code generated by build scripts, procedural macros or macros built from strings. C code behind FFI (SQLite's own journal files, under `rusqlite`'s `no_destructive_api`). Windows API names (`windows-sys` is reviewed, scanned and never compiled for kilnd's targets). Build-only and dev-only packages are reviewed but not scanned, since they never link into a kilnd binary.
+
+*Completeness.* This is tested, not asserted. `every_destructive_libc_function_is_disallowed` reads every exported function of the locked `libc` (all targets, from the source cargo resolved) and requires each one matching the curated patterns (`*unlink*`, `rmdir`, `rename*`, `*truncate*`, `creat*`, `exec*`, `posix_spawn*`, `system`, `popen`, `*kill*`, `tkill`, `tgkill`, `*sigqueue*`, `pidfd_send_signal`, `umount*`, `mount`, `remove*`, `*removexattr`, `fallocate*`, `ptrace`, `process_vm_writev`, `prctl`, `syscall`, `reboot`, `swapoff`) to be disallowed: 104 in libc 0.2.190, most of them for other targets (marked `allow-invalid`). `std_and_tokio_destructive_surfaces_are_disallowed` holds `clippy.toml` to a curated, justified review of `std::fs`, `std::process` and the Unix extensions (std is not a `Cargo.lock` input, so the list is re-read at each toolchain bump), and to every public function of the locked Tokio's `fs` module, failing on any the review does not classify.
+
+*Reviewed and not gated.* `fork`, `vfork` and `clone` duplicate the caller, and running another program needs `exec*`, which is gated. `unshare`, `setns` and `chroot` change only the caller's own view. `mknod`, `link` and `symlink` create and never replace. Descriptor writes, and `O_TRUNC` passed by flag to `open`/`openat`, are invisible to any path-based gate.
+
+The jail base's two mounts moved into typed wrappers (`sys::bind_onto_itself`, `sys::make_private_recursive`) when `libc::mount` joined the list, and `kilnd-api/build.rs` carries the one approved allow, for `tonic-prost-build`. `scripts/dependency-gate-regressions.sh` (and a CI job) replays Daybreak's PoCs on Rust 1.88 and 1.99 through the actual source loader, cargo and clippy. Its method and transitive wrappers are vendored registry packages with `Cargo.lock` checksums, and the gate test binary is pointed at each case's workspace with `KILND_DEPENDENCY_GATE_ROOT`, which nothing else sets.
 
 ## 7.2 Durable reservation vector
 
@@ -3416,7 +3430,9 @@ a `gdb` sample showed H in `sha2::sha256::soft` under `verify_self_image`.
 Daybreak Blue's break-it review of milestone 2 at `01cc7bc`
 (`reviews/2026-11-05-b7m2-breakit.md`) returned MUST-FIX with two HIGH findings, two
 MEDIUM and two LOW. All six are accepted and corrected on `phase1b/b7-hardening`; none is
-rejected. Production Firecracker stays disabled.
+rejected. Daybreak's recheck of those fixes at `1d11ac9`
+(`reviews/2026-11-05-b7m2-recheck.md`) found HIGH-1 only partly fixed; *HIGH-1 recheck*
+below closes it. Production Firecracker stays disabled.
 
 ### HIGH-1: a wrapper around std passed the dependency gate
 
@@ -3427,18 +3443,81 @@ equal that inference. `fs-err`, a drop-in wrapper around `std::fs` that depends 
 production could call `fs_err::remove_dir_all`, which clippy saw under the wrapper's name.
 The gate now records a reviewed decision for every direct dependency (kind, capability,
 reason) and never overrides it; `Cargo.lock` can only require more. A destructive-capable
-category lists its destructive paths and `clippy.toml` disallows them. Two backstops catch
-a mistaken `none`: a production path to a destructive-looking function that clippy does
-not disallow (aliases, grouped imports and `extern crate ... as` resolved; a glob import of
-such a crate refused), and a dependency whose own locked source reaches a disallowed
-std, Tokio or libc path (the real `fs-err` 3.3.2 reaches thirteen). Section 7.1 has the
-whole model. Tests: `proven::tests::dependency_gate::b7m2_an_fs_err_wrapper_declared_none_is_refused`
+category lists its destructive paths and `clippy.toml` disallows them. Two lexical checks
+flag a mistaken `none`: a production path to a destructive-looking function that clippy
+does not disallow (aliases, grouped imports and `extern crate ... as` resolved; a glob
+import of such a crate refused), and a dependency whose own locked source reaches a
+disallowed std, Tokio or libc path (the real `fs-err` 3.3.2 reaches thirteen). The recheck
+showed these were narrower than this section first claimed; see *HIGH-1 recheck*. Tests: `proven::tests::dependency_gate::b7m2_an_fs_err_wrapper_declared_none_is_refused`
 (Daybreak's PoC on a synthetic lockfile, manifest and source: unreviewed, `none`, aliased,
 glob, `filesystem` without paths and with paths not disallowed are refused; listed and
 disallowed passes, though `Cargo.lock` shows no raw crate), `the_lock_graph_requires_but_never_overrides`
 and `the_dependency_gate_holds`; on the real crates, `scripts/dependency-gate-regressions.sh`
 shows the gate refusing `fs-err` reviewed as `none` and, reviewed as `filesystem` with its
 paths disallowed, clippy rejecting the call on Rust 1.88 and 1.99.
+
+### HIGH-1 recheck: method and transitive wrappers
+
+Daybreak's recheck (`reviews/poc-b7m2-recheck/`) showed that both lexical checks missed two
+ordinary shapes. In the first, `method-wrapper`, reviewed `filesystem` with
+`no_destructive_api`, implements an extension trait for `std::fs::File` whose `reset`
+calls `self.set_len(0)`; production imports it `as _` and calls `file.reset()`. In the
+second, `outer-wrapper`, reviewed `none`, re-exports the same trait from `inner-wrapper`,
+a transitive package with no entry and no scanned source. Neither check could see a method
+call: the source scan matched only rooted paths, read only direct dependencies, and cut each
+file at its first `#[cfg(test)] mod`, so an out-of-line `mod tests;` near the top hid the
+rest of the file (`smallvec`'s `lib.rs`, for one). Workspace clippy accepted both, because
+it does not lint dependency bodies.
+
+The gate now fails closed on review, not detection (section 7.1 has the model):
+
+- *Every locked package is reviewed.* There are 144 entries, one per package in
+  `Cargo.lock` outside the workspace, keyed `name@version` and pinned to the lock
+  checksum and the resolved feature set, each with a kind, a capability and a written
+  justification. Shared justifications are limited to packages the test proves name no
+  file, process, libc or Tokio fs/process path: 78 under `pure-computation` and 15 under
+  `compile-time`. A new package, a version or checksum change or a feature change fails
+  until reviewed. `scripts/dependency-gate-review.py` drafted the initial entries and their
+  mechanical fields; each capability and justification was written by hand.
+- *Method-form sinks across the subtree.* For each `none`, `network` or
+  `no_destructive_api` declaration, the whole runtime subtree's source is scanned for the
+  curated method names (whatever the receiver), disallowed paths and trait impls on
+  std's and Tokio's file and process types. The sources come from cargo's own resolve
+  (`cargo metadata`), so the loader also reads transitive packages and libraries rooted
+  outside `src/` (`fnv`'s is). Inline test modules are skipped by their braces, not by
+  truncating the file, and out-of-line test files in the library directory are read too. Each hit
+  needs a `sink_exceptions` entry scoped to package, version and feature set. The 22 today
+  are listed with their reasons in `dependency-gate.json`.
+- *The claim is narrowed.* Section 7.1 and `dependency-gate.json`'s `about` now promise
+  only that no unreviewed package enters the build and that common destructive sinks in
+  packages declared non-destructive are flagged for review. Wording that the backstops
+  *catch* a mistaken capability is gone; identifying a destructive API is the reviewer's
+  job.
+
+Tests (synthetic, under `cargo test`):
+
+- `b7m2_recheck_a_method_wrapper_is_refused`: Daybreak's direct case, reviewed
+  `filesystem` with `no_destructive_api` or `none`, is refused for `.set_len(` and
+  `impl for std::fs::File`, and the refusal drafts the scoped exception. So is the same
+  shape through a lifetime-qualified reference, UFCS, an aliased module, a glob-imported
+  `File` and glob-imported free functions, and each other sink name. A definition, a field, `write`, strings, comments, the
+  package's own `File` and an imported non-std `File` are not hits.
+- `b7m2_recheck_a_transitive_wrapper_is_refused`: the unreviewed inner package is refused,
+  and the outer package's subtree reaches the inner `.set_len(`. Reviewing the inner package
+  as `none` leaves both declarations refused, and missing source is refused.
+- `b7m2_recheck_every_locked_package_is_reviewed`: a version bump (new version
+  unreviewed, old entry stale), a checksum change, a feature change, a transitive kind the
+  graph contradicts, a git dependency, the group purity check, an unknown group and a
+  transitive `destructive` list.
+- `b7m2_recheck_an_exception_holds_only_for_its_scope`: it holds at its exact scope.
+  Another feature set, another version, another sink, another package, or no reason or
+  features is refused.
+- `b7m2_recheck_proc_macros_are_build_time`; `the_dependency_gate_holds` on the real
+  workspace.
+
+On the real crates, `scripts/dependency-gate-regressions.sh` uses the actual loader, cargo
+and clippy, with the fixtures as vendored registry packages. The cases and their results
+are under *Recheck corrections evidence* below.
 
 ### HIGH-2: accepted flags let one UID own every connection slot
 
@@ -3558,6 +3637,60 @@ job) and the documentation commit after them. The VM runs used `62fb76e`.
   with no test account, group, unit, mount, cgroup, VMM or temporary path left.
 
 Logs, matrices and the PoC harness are in `reviews/2026-11-05-b7m2-fixes-vm/`.
+
+### Recheck corrections evidence
+
+Branch `phase1b/b7-hardening`: `a65bbe2` (the gate: every locked package reviewed,
+the subtree scan, the narrowed claim), `9986dd7` (the regression script and CI job) and
+the documentation commit after them. No runtime code changed, so no VM run was needed.
+
+- *macOS, the gate.* `proven::tests::dependency_gate`: 13 passed on Rust 1.88 and 1.99,
+  `the_dependency_gate_holds` included. That is 144 reviewed packages (78
+  `pure-computation`, 15 `compile-time`, 51 with their own justification; 102 runtime, 40
+  build-only, 2 dev-only) and 22 scoped exceptions. On a 10-core Mac the gate test reads
+  48 MB of dependency source, lexes the 15 MB that could hold a hit, and takes about 7 s
+  wall.
+- *macOS, clippy.* `cargo clippy --locked --all-targets -- -D warnings
+  -D clippy::disallowed_methods` on Rust 1.88 and 1.99, default and
+  `firecracker-test-deployment` features: clean. `git diff --check` and
+  `scripts/kilnd-maintenance-tests.py` pass.
+- *macOS, the full suites.* `cargo test --locked --no-fail-fast`, default and
+  `firecracker-test-deployment` features, ran with the Mac mini at a load average of
+  3 to 12 from other work. Every test binary passed except three timing-bound tests:
+  `runtime::kiln_direct`'s `late_failure_frame_settles_after_kill_and_retains_cleanup_proof`
+  and `received_runtime_failure_wins_cancellation_and_timeout_while_cli_is_alive` (5 s
+  fixture-marker waits), and the broker's `wide_objects_check_in_well_under_quadratic_time`
+  (kilnd lib 509 passed, 2 failed, 3 ignored). The unchanged `1d11ac9`, run the same way
+  under the same load, failed the same `kiln_direct` tests (503 passed, 3 failed). No
+  runtime code changed, and the Linux CI below passes them.
+- *`scripts/dependency-gate-regressions.sh` on Rust 1.88 and 1.99* (macOS, at
+  `9986dd7`): all passed.
+  - fs-err reviewed `none`: refused, for the production call and for
+    `std::fs::remove_dir_all` in its source. Reviewed `filesystem` with its paths
+    disallowed: the gate holds, and clippy rejects `fs_err::remove_dir_all`.
+  - `method-wrapper`, reviewed `filesystem` with `no_destructive_api` or reviewed `none`:
+    refused for `.set_len(` (and `impl for std::fs::File`) in its source, while clippy
+    accepts the workspace.
+  - `outer-wrapper` (`none`) over `inner-wrapper`: refused. With the drafter's skeleton
+    entry for the inner package, it needs a reviewed capability; with no entry at all,
+    it is in Cargo.lock with no reviewed entry. Both times the outer package's subtree
+    reaches the inner `.set_len(`, and clippy accepts the workspace.
+  - With a reviewed exception for `method-wrapper` 1.0.0 and no features, the gate holds
+    and clippy accepts.
+  - A lock change to 1.0.1 is refused (1.0.1 unreviewed, the 1.0.0 entry and exception
+    stale), and holds once 1.0.1 is reviewed.
+  - Enabling `extra` is refused: the reviewed features, the exception's scope and the
+    `.set_len(` hit all fail.
+  - `std::fs::copy` and `libc::creat`: clippy rejects both.
+- *CI.* Run 42032865841 on `9986dd7`: `check` and `gate-regressions` green.
+  `gate-regressions` ran every case above on Linux with Rust 1.88 and 1.99, all
+  passed, in 25 minutes; `the_dependency_gate_holds` took 14 s on the 4-core runner. The
+  first attempt's `feature` job failed only the untouched
+  `exit3_second_helper_is_refused_by_the_persistent_node_lock`, which read the second
+  helper's `start-error` file before its reason was written; the rerun passed.
+
+Logs: `reviews/2026-11-05-b7m2-recheck-fixes/` (the regression script on macOS and in
+CI, the full suites, and the `1d11ac9` baseline).
 
 # 16. Retired-token compaction (pre-B7 design)
 

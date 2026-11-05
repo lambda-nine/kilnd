@@ -6,6 +6,23 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B7 milestone 2 recheck, HIGH-1 (design section 15, *HIGH-1 recheck*):
+  the dependency gate now fails closed on review. `dependency-gate.json` reviews every
+  package in `Cargo.lock` (144: direct and transitive), each keyed `name@version` and
+  pinned to its lock checksum and resolved features, with a kind, a capability and a
+  written justification (shared ones only for packages the test proves name no file,
+  process, libc or Tokio fs/process path). A new package, version, checksum or feature set
+  fails until reviewed; new `scripts/dependency-gate-review.py` drafts the mechanical
+  fields. For every package declared `none`, `network` or `no_destructive_api`, the
+  source of its whole runtime subtree, read from cargo's own resolve, is scanned for
+  curated destructive method names whatever the receiver (`.set_len(`, `.truncate(`,
+  `.remove_file(`, `.kill(` and the rest), disallowed paths and trait impls on std's and
+  Tokio's file and process types. Each hit needs a `sink_exceptions` entry scoped to
+  package, version and feature set (22 today). This refuses Daybreak's extension-trait
+  `method-wrapper` and the re-exporting `outer-wrapper`/`inner-wrapper`. The claim is
+  narrowed to what the gate guarantees, and identifying a destructive API stays the
+  reviewer's job. `scripts/dependency-gate-regressions.sh` runs the recheck PoCs, a
+  version bump and an exception's scope through the actual loader, cargo and clippy.
 - Phase 1b B7 milestone 2 break-it corrections (design section 15, *B7 milestone 2
   break-it corrections*). Ingress: kilnd refuses to start unless one UID's connection
   share is strictly below the general pool and, with its reserved slot, below
