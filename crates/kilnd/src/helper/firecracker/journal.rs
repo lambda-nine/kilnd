@@ -3396,7 +3396,14 @@ impl Ledger {
                         + shares
                             .entries
                             .saturating_sub(shares.slots.saturating_mul(shares.share));
-                    if pointers.retained_admitted.saturating_mul(4) > ceiling.saturating_mul(3) {
+                    if pointers.issue_next > token::MAX_SEQ {
+                        degraded = Some(
+                            "this instance's issue sequence is exhausted: Preflight refuses"
+                                .to_string(),
+                        );
+                    } else if pointers.retained_admitted.saturating_mul(4)
+                        > ceiling.saturating_mul(3)
+                    {
                         degraded = Some(format!(
                             "retained admitted rows {} of {ceiling}: under 25% headroom left",
                             pointers.retained_admitted

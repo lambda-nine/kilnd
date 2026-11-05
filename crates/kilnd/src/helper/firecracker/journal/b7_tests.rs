@@ -385,6 +385,9 @@ fn rtc4_the_pointer_never_wraps_and_never_moves_back() {
             refusal: IssueRefusal::Exhausted
         }
     );
+    // A health fault, not a silent refusal.
+    let degraded = ledger.accounting(Some(instance())).unwrap().degraded.unwrap();
+    assert!(degraded.contains("exhausted"), "{degraded}");
     for sql in [
         "UPDATE instance_tokens SET issue_next = 5",
         "UPDATE instance_tokens SET issue_next = 9223372036854775807 + 1",
