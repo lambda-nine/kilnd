@@ -112,3 +112,30 @@ jobs:
         run: |
           cargo build --locked -p kilnd --bin kilnd --features "$FEATURES"
           sh scripts/test-deployment-gate-regressions.sh feature target/debug/kilnd
+
+  # B7 milestone 2: Daybreak's dependency-gate PoCs against the real crates and clippy
+  # on both toolchains (fs-err reviewed as none and as filesystem; std::fs::copy and
+  # libc::creat). It resolves fs-err from the registry in a disposable copy.
+  gate-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install Rust 1.88 and 1.99
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component clippy
+          rustup toolchain install 1.99.0 --profile minimal --component clippy
+          rustup default 1.88.0
+
+      - name: Dependency gate regressions
+        run: sh scripts/dependency-gate-regressions.sh 1.88.0 1.99.0
