@@ -6,6 +6,26 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Phase 1b B7 milestone 2 recheck 2 (design section 15, *Recheck 2*): the dependency
+  gate's guarantee now covers builds made through the one supported entry point, new
+  `scripts/build.sh PROFILE COMMAND`. `dependency-gate.json` gains `profiles` (`default`,
+  `firecracker-test-deployment`), each a set of workspace features; `build.sh` runs cargo
+  with `--locked` and only its profile's features, and refuses `--features`/`-F` (so
+  `tokio/full`-style dependency selectors), `--all-features`, `--no-default-features`,
+  `--manifest-path`, `--config` and `-Z`. The gate resolves every profile with exactly
+  those flags instead of one `--all-features` resolve, so a package or feature any profile
+  builds must be locked and reviewed, and kinds come from the union of the profiles' graphs.
+  CI, `scripts/install.sh`, the VM scripts and the setup instructions build through it, and
+  a test refuses a raw cargo build there; a raw `cargo build` with other feature flags is
+  outside the guarantee. The subtree scan now flags every occurrence of a sink identifier
+  (`LocalFile::set_len(self, 0)`, a function value, a `use` list, a definition), not only
+  `.name(` calls, resolves `type` aliases in the impl check and flags an alias of std's or
+  Tokio's file or process types itself; exceptions are labelled by identifier (27, five
+  new). One `name@version` from two sources is refused by the gate and the drafter. The
+  authoritative `the_dependency_gate_holds` always checks its own workspace; the
+  regression script uses the ignored `regression_fixture_gate` instead of
+  `KILND_DEPENDENCY_GATE_ROOT`, and adds Daybreak's feature-injection, type-alias UFCS,
+  two-registry and root-override cases.
 - Phase 1b B7 milestone 2 recheck, HIGH-1 (design section 15, *HIGH-1 recheck*):
   the dependency gate now fails closed on review. `dependency-gate.json` reviews every
   package in `Cargo.lock` (144: direct and transitive), each keyed `name@version` and

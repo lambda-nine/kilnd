@@ -1,24 +1,33 @@
 //! Design section 7.1's dependency gate, rebuilt for the B7 milestone 2 break-it
-//! (HIGH-1, MEDIUM-1 and LOW-1) and its recheck (HIGH-1's method and transitive
-//! wrappers).
+//! (HIGH-1, MEDIUM-1 and LOW-1), its recheck (HIGH-1's method and transitive wrappers)
+//! and its recheck 2 (the build's own feature graph, type-alias UFCS, duplicate package
+//! identities and the authoritative test's root).
 //!
-//! The gate fails closed on *review*, not on detection. What it guarantees:
+//! The gate fails closed on *review*, not on detection. For builds made through the
+//! supported entry point, `scripts/build.sh` with one of dependency-gate.json's
+//! `profiles`, it guarantees:
 //!
-//! - **No unreviewed package enters the build.** `dependency-gate.json` has an entry for
-//!   every package in Cargo.lock outside the workspace, direct and transitive, keyed by
-//!   `name@version` and pinned to Cargo.lock's checksum and to the features cargo resolves
-//!   for it: its `kind` (runtime, build-only or dev-only), its `capability` (`none` or a
-//!   set of `filesystem`, `process`, `signals`, `syscalls`, `network`) and why. A new
-//!   package, a changed version or checksum, or a changed feature set fails until a person
-//!   reviews it.
+//! - **No unreviewed package enters the build.** Each profile names only workspace
+//!   features, and the gate resolves each with exactly the flags `build.sh` passes
+//!   (`cargo metadata --locked [--features ...]`). Every package a profile resolves must
+//!   be in Cargo.lock, and `dependency-gate.json` has an entry for every package in
+//!   Cargo.lock outside the workspace, direct and transitive, keyed by `name@version`
+//!   (one name and version from two sources is refused outright) and pinned to
+//!   Cargo.lock's checksum and to the union of the features the profiles resolve for it:
+//!   its `kind` (runtime, build-only or dev-only, from the union of the profiles' graphs),
+//!   its `capability` (`none` or a set of `filesystem`, `process`, `signals`, `syscalls`,
+//!   `network`) and why. A new package, a changed version or checksum, or a changed
+//!   feature set fails until a person reviews it.
 //! - **Common destructive sinks in packages declared non-destructive are flagged for
 //!   review.** For every package declared `none`, `network` or `no_destructive_api` (in the
 //!   runtime graph, or a direct dependency), the source of its whole runtime dependency
-//!   subtree is scanned for curated destructive method names whatever their receiver
-//!   (`.set_len(`, `.remove_file(`, `.kill(` …), for std, Tokio and libc paths clippy.toml
-//!   disallows, and for trait impls on std's and Tokio's file and process types. A hit
-//!   refuses the declaration unless `sink_exceptions` records a reviewed exception scoped to
-//!   the package, version and feature set it is in.
+//!   subtree is scanned for every occurrence of a curated sink identifier (`set_len`,
+//!   `remove_file`, `kill` …) whatever surrounds it, for std, Tokio and libc paths
+//!   clippy.toml disallows, and for trait impls on (and `type` aliases of) std's and
+//!   Tokio's file and process types. A hit refuses the declaration unless `sink_exceptions`
+//!   records a reviewed exception scoped to the package, version and feature set it is in.
+//!
+//! A raw `cargo build` with other feature flags is outside the guarantee.
 //!
 //! The gate is not a proof. Deciding whether an API is destructive is the reviewer's job;
 //! the scan is lexical and catches the common shapes of an honest mistake, not a dependency
@@ -116,13 +125,15 @@ pub(super) const DESTRUCTIVE_NAMES: [&str; 25] = [
 /// truncates, and `persist` replaces a name.
 const WRAPPER_NAMES: [&str; 4] = ["copy", "write", "set_len", "persist*"];
 
-/// The B7 milestone 2 recheck's method-form sinks: a call `.name(` (or `.name::<`) with
-/// one of these names is flagged in a non-destructive declaration's subtree whatever its
-/// receiver, since a lexical scan cannot resolve the receiver's type (an extension trait
-/// on `std::fs::File` hides `File::set_len` behind any name; its body still calls it).
-/// Same patterns as above. Each is a std or Tokio destructive method, or the method form
-/// a handle-based wrapper gives one; several share a name with harmless methods
-/// (`Vec::truncate`, `Vec::set_len`), which is what `sink_exceptions` is for.
+/// The sink identifiers (B7 milestone 2 recheck, and recheck 2 HIGH-2): every identifier
+/// matching one of these is flagged in a non-destructive declaration's subtree, whatever
+/// surrounds it (`.set_len(`, `LocalFile::set_len(`, `X::set_len` as a value, a `use`
+/// list, a definition), since a lexical scan cannot resolve a receiver's or a qualifier's
+/// type (an extension trait on `std::fs::File` hides `File::set_len` behind any name; its
+/// body still names it). Same patterns as above. Each is a std or Tokio destructive
+/// method, or the method form a handle-based wrapper gives one; several share a name with
+/// harmless items (`Vec::truncate`, `Vec::set_len`, `ptr::copy`), which is what
+/// `sink_exceptions` is for.
 pub(super) const METHOD_SINKS: [(&str, &str); 15] = [
     (
         "set_len",

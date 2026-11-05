@@ -663,21 +663,23 @@ Each allow is `#[allow(clippy::disallowed_methods)]` (inner for a whole module) 
 
 Test fixtures are excluded from the gate. Outside the approved items above, nothing in the workspace calls or names any listed capability.
 
-*The dependency gate (B7, B4 recheck 6 item 2; rebuilt after the B7 milestone 2 break-it and its recheck).* Clippy resolves workspace code, but it never lints a dependency's own body, so a dependency can offer a destructive operation under a name `clippy.toml` does not know, or perform one inside a method that workspace code calls under a harmless name (an extension trait on `std::fs::File` whose `reset` calls `set_len(0)`). The gate therefore fails closed on *review*, not on detection, and it guarantees exactly two things: **no unreviewed package enters the build**, and **common destructive sinks, method forms included, in packages declared non-destructive are flagged for review**. Deciding whether an API is destructive is the reviewer's job. The gate is a lexical aid to that review, not a proof, and it is built for honest mistakes, not for a dependency written to hide one. `proven::tests::dependency_gate` checks it on every `cargo test`.
+*The dependency gate (B7, B4 recheck 6 item 2; rebuilt after the B7 milestone 2 break-it and its two rechecks).* Clippy resolves workspace code, but it never lints a dependency's own body, so a dependency can offer a destructive operation under a name `clippy.toml` does not know, or perform one inside a method that workspace code calls under a harmless name (an extension trait on `std::fs::File` whose `reset` calls `set_len(0)`). The gate therefore fails closed on *review*, not on detection. For builds made through the supported entry point, `scripts/build.sh` with one of the reviewed build profiles, it guarantees exactly two things: **no unreviewed package enters the build**, and **every occurrence of a curated destructive sink identifier, and every trait impl or type alias on std's and Tokio's file and process types, in the runtime subtree of a package declared non-destructive is flagged for review**. A raw `cargo build` (or `test`, `clippy`) given other feature flags builds a graph the gate has not reviewed, and is outside the guarantee. Deciding whether an API is destructive is the reviewer's job. The gate is a lexical aid to that review, not a proof, and it is built for honest mistakes, not for a dependency written to hide one. `proven::tests::dependency_gate` checks it on every `cargo test`.
 
-*Every locked package is reviewed.* `dependency-gate.json` has an entry under `packages` for every package in `Cargo.lock` outside the workspace, direct and transitive (144 today), keyed `name@version` and pinned to `Cargo.lock`'s `checksum` and to the `features` that `cargo metadata --locked --all-features` resolves for it. Each entry has a `kind`, a `capability` (`none`, or a set of `filesystem`, `process`, `signals`, `syscalls` and `network`) and a justification: its own `why`, or a `group` with a shared one. A new package, a changed version or checksum, or a changed feature set fails the test, so every lock change needs a person's review; a path or git dependency outside the workspace has no checksum and is refused. `scripts/dependency-gate-review.py --write` drafts entries for new packages, filling the checksum, features and kind and leaving the capability and justification empty, so the test fails until someone writes them. A group is allowed only for `none` packages with no raw system-call crate underneath whose library source names no `std::fs`, `std::process`, `std::os` fs, fd or process extension (or the Unix prelude that re-exports them), libc, or `tokio::fs`/`tokio::process` path at all, and the test checks that. Today 78 packages share `pure-computation` and 15 share `compile-time` (procedural macros and the syntax libraries only they use); the other 51 have their own justification. A direct dependency's kind comes from the manifests and any other package's from the dependency graph: `runtime` if a workspace crate's normal dependencies reach it through normal edges, otherwise `build-only` or `dev-only`. A procedural macro runs in the compiler, so it and what only it reaches are build-only. A direct `build-only` or `dev-only` dependency that the runtime graph also reaches records `runtime_via` (`h2`, also `tonic`'s transport).
+*Supported builds.* `dependency-gate.json`'s `profiles` lists every supported build: `default` (no features: the release build `scripts/install.sh` installs and `scripts/upgrade.sh` takes, CI's default tests, clippy and release build, and the library tests the VM scripts build) and `firecracker-test-deployment` (`kilnd/firecracker-test-deployment`: CI's feature job and the daemon and client `scripts/b4-vm-tests.sh` builds). `scripts/build.sh [+TOOLCHAIN] PROFILE build|test|clippy|check ...` reads the same list and runs `cargo COMMAND --locked`, with `--features` only for the profile's own. A profile enables only features a workspace member declares (`member/feature`), so a dependency feature a build needs is forwarded through a checked-in workspace feature. Before `--`, `build.sh` refuses every argument that selects features or another graph: `--features` and `-F` (so `dep/feature` selectors such as `tokio/full`), `--all-features`, `--no-default-features`, `--manifest-path`, `--config` and `-Z`, in every spelling cargo accepts (`--features=x`, `-Fx`, `-rF x`). The gate runs `cargo metadata --locked` once per profile with exactly those flags, and refuses a profile that names anything but a declared workspace feature, any package a profile resolves that `Cargo.lock` does not lock, and any locked package no profile resolves. The reviewed features are the union over the profiles, and kinds are judged from the union of their graphs. `supported_builds_use_the_build_entry_point` fails on a raw `cargo build`, `test`, `clippy`, `check`, `run`, `rustc`, `doc` or `install` in CI, the installer, the upgrade path, the VM scripts or the setup instructions.
+
+*Every locked package is reviewed.* `dependency-gate.json` has an entry under `packages` for every package in `Cargo.lock` outside the workspace, direct and transitive (144 today), keyed `name@version` and pinned to `Cargo.lock`'s `checksum` and to the `features` that `cargo metadata --locked` resolves for it in any supported profile (their union). A `name@version` key cannot tell two sources apart, so two packages with one name and version (two registries, or a registry and a path) are refused outright, in `Cargo.lock` and in each profile's metadata, before any review is matched; the drafter refuses them too. Each entry has a `kind`, a `capability` (`none`, or a set of `filesystem`, `process`, `signals`, `syscalls` and `network`) and a justification: its own `why`, or a `group` with a shared one. A new package, a changed version or checksum, or a changed feature set fails the test, so every lock change needs a person's review; a path or git dependency outside the workspace has no checksum and is refused. `scripts/dependency-gate-review.py --write` drafts entries for new packages, filling the checksum, features and kind and leaving the capability and justification empty, so the test fails until someone writes them. A group is allowed only for `none` packages with no raw system-call crate underneath whose library source names no `std::fs`, `std::process`, `std::os` fs, fd or process extension (or the Unix prelude that re-exports them), libc, or `tokio::fs`/`tokio::process` path at all, and the test checks that. Today 78 packages share `pure-computation` and 15 share `compile-time` (procedural macros and the syntax libraries only they use); the other 51 have their own justification. A direct dependency's kind comes from the manifests and any other package's from the dependency graph: `runtime` if a workspace crate's normal dependencies reach it through normal edges, otherwise `build-only` or `dev-only`. A procedural macro runs in the compiler, so it and what only it reaches are build-only. A direct `build-only` or `dev-only` dependency that the runtime graph also reaches records `runtime_via` (`h2`, also `tonic`'s transport).
 
 *Capabilities.* `Cargo.lock` can only require more, never override a reviewed decision. A raw system-call crate (`libc`, `linux-raw-sys`, `rustix`, `nix`, `syscalls`, `sc`, any `*-sys`) declares `syscalls`, and a `none` package directly over one records in `raw_use` what it uses it for (`tokio-util`: `libc::memchr`; `errno`, `cpufeatures`, `getrandom` and three Windows console crates likewise). A direct dependency with a destructive-capable category (filesystem, process, signals, syscalls) lists its `destructive` paths and `clippy.toml` disallows each one, or records in `no_destructive_api` why its API has none (only `rusqlite`, and never a raw crate). `clippy.toml` names only std and direct dependencies, and no path an entry does not list. Workspace code cannot name a transitive crate, so a transitive entry lists no paths: its API reaches the workspace only through a direct dependency, whose own review covers it. The test also refuses an unknown field, capability or group, a stale entry or exception, and a renamed dependency. Production code (every crate's `src` and build script, comments and strings ignored, `use` aliases resolved) may not name a destructive-looking function through a dependency path `clippy.toml` does not disallow, or glob-import a dependency reviewed as non-destructive.
 
-*The subtree scan.* For every package declared `none`, `network` or `no_destructive_api` that is in the runtime graph or is a direct dependency, the test reads the library source of its whole runtime dependency subtree (normal edges for any target; procedural macros excluded) from where cargo extracted it. In each package of that subtree it flags three things. First, a method call named by the curated, justified list in `METHOD_SINKS`, whatever the receiver: `set_len`, `truncate`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `unlink*`, `copy`, `kill`, `start_kill`, `send_signal`, `persist*`, `exec`, `umount*` and `unmount*`. Second, any path `clippy.toml` disallows, however it is aliased or glob-imported (`use std::fs::*;` then `remove_file(p)`). Third, a trait impl for `std::fs::File`, `std::fs::OpenOptions`, `std::process::Child` or `Command`, or Tokio's file and process types (a bare `File` counts unless the package imports or defines its own). A hit refuses the declaration unless `sink_exceptions` records a reviewed exception for that package, version and exact feature set, naming the sinks and why. An exception does nothing outside that scope, and one that no longer matches a hit is refused as stale. Today there are 22 exceptions: harmless methods that share a sink's name (`Vec`, `BytesMut` and `SmallVec` `set_len` and `truncate`, bitflags' `Flags::truncate` in its own tests), `unlink` on h2's and futures-util's own intrusive lists, mio's `FIONBIO` `ioctl` on its own pipe, writer impls for a `File` the caller passes (anstream, anstyle-wincon, tracing-subscriber), and Tokio's own implementation of the API its entry lists. Inline `#[cfg(test)]` modules are skipped; out-of-line test files are scanned.
+*The subtree scan.* For every package declared `none`, `network` or `no_destructive_api` that is in the runtime graph or is a direct dependency, the test reads the library source of its whole runtime dependency subtree (normal edges for any target; procedural macros excluded) from where cargo extracted it. In each package of that subtree it flags four things. First, every occurrence of an identifier the curated, justified list in `METHOD_SINKS` names, wherever it is: `set_len`, `truncate`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `unlink*`, `copy`, `kill`, `start_kill`, `send_signal`, `persist*`, `exec`, `umount*` and `unmount*`. The identifier token is the sink, not a call shape: a method call on any receiver, a call through any qualifier or type alias (`LocalFile::set_len(self, 0)`, `<T as Tr>::set_len`), a function value, a `use` list, a definition, a field and an attribute argument all count. Second, any path `clippy.toml` disallows, however it is aliased or glob-imported (`use std::fs::*;` then `remove_file(p)`). Third, a trait impl for `std::fs::File`, `std::fs::OpenOptions`, `std::process::Child` or `Command`, or Tokio's file and process types, named directly or through a `use` or `type` alias (a bare `File` counts unless the package imports it from elsewhere or defines its own). Fourth, a `type` alias (`pub type LocalFile = File;`, an associated type's included) whose target resolves to one of those types. A hit refuses the declaration unless `sink_exceptions` records a reviewed exception for that package, version and exact feature set, naming the sinks and why. An exception does nothing outside that scope, and one that no longer matches a hit is refused as stale. Today there are 27 exceptions: harmless identifiers that share a sink's name (`Vec`, `BytesMut` and `SmallVec` `set_len` and `truncate`, `core::ptr::copy` inside a package's own buffer, `futures::io::copy` and `tokio::io::copy` between streams, executor bindings named `exec` in hyper, hyper-util, tonic and Tokio, a `$copy` macro metavariable in serde_json, bitflags' `Flags::truncate` in its own tests), `unlink` on h2's and futures-util's own intrusive lists, libc's own declarations of the C functions (each destructive one disallowed for workspace code), Win32 binding parameters in windows-sys, mio's `FIONBIO` `ioctl` on its own pipe, writer impls for a `File` the caller passes (anstream, anstyle-wincon, tracing-subscriber, whose writer type alias is `&std::fs::File`), and Tokio's own implementation of the API its entry lists. Inline `#[cfg(test)]` modules are skipped; out-of-line test files are scanned.
 
-*What the scan does not see.* A destructive operation behind a name not on the list, on a receiver of unknown type and without a flagged impl (for example a generic method that is only later instantiated with `File`). Code generated by build scripts, procedural macros or macros built from strings. C code behind FFI (SQLite's own journal files, under `rusqlite`'s `no_destructive_api`). Windows API names (`windows-sys` is reviewed, scanned and never compiled for kilnd's targets). Build-only and dev-only packages are reviewed but not scanned, since they never link into a kilnd binary.
+*What the gate does not see.* A build outside `scripts/build.sh` and the reviewed profiles. A destructive operation behind a name not on the list, on a receiver of unknown type and without a flagged impl or alias (for example a generic method that is only later instantiated with `File`). Code generated by build scripts, procedural macros or macros built from strings. C code behind FFI (SQLite's own journal files, under `rusqlite`'s `no_destructive_api`). Windows API names (`windows-sys` is reviewed, scanned and never compiled for kilnd's targets). Build-only and dev-only packages are reviewed but not scanned, since they never link into a kilnd binary.
 
 *Completeness.* This is tested, not asserted. `every_destructive_libc_function_is_disallowed` reads every exported function of the locked `libc` (all targets, from the source cargo resolved) and requires each one matching the curated patterns (`*unlink*`, `rmdir`, `rename*`, `*truncate*`, `creat*`, `exec*`, `posix_spawn*`, `system`, `popen`, `*kill*`, `tkill`, `tgkill`, `*sigqueue*`, `pidfd_send_signal`, `umount*`, `mount`, `remove*`, `*removexattr`, `fallocate*`, `ptrace`, `process_vm_writev`, `prctl`, `syscall`, `reboot`, `swapoff`) to be disallowed: 104 in libc 0.2.190, most of them for other targets (marked `allow-invalid`). `std_and_tokio_destructive_surfaces_are_disallowed` holds `clippy.toml` to a curated, justified review of `std::fs`, `std::process` and the Unix extensions (std is not a `Cargo.lock` input, so the list is re-read at each toolchain bump), and to every public function of the locked Tokio's `fs` module, failing on any the review does not classify.
 
 *Reviewed and not gated.* `fork`, `vfork` and `clone` duplicate the caller, and running another program needs `exec*`, which is gated. `unshare`, `setns` and `chroot` change only the caller's own view. `mknod`, `link` and `symlink` create and never replace. Descriptor writes, and `O_TRUNC` passed by flag to `open`/`openat`, are invisible to any path-based gate.
 
-The jail base's two mounts moved into typed wrappers (`sys::bind_onto_itself`, `sys::make_private_recursive`) when `libc::mount` joined the list, and `kilnd-api/build.rs` carries the one approved allow, for `tonic-prost-build`. `scripts/dependency-gate-regressions.sh` (and a CI job) replays Daybreak's PoCs on Rust 1.88 and 1.99 through the actual source loader, cargo and clippy. Its method and transitive wrappers are vendored registry packages with `Cargo.lock` checksums, and the gate test binary is pointed at each case's workspace with `KILND_DEPENDENCY_GATE_ROOT`, which nothing else sets.
+The jail base's two mounts moved into typed wrappers (`sys::bind_onto_itself`, `sys::make_private_recursive`) when `libc::mount` joined the list, and `kilnd-api/build.rs` carries the one approved allow, for `tonic-prost-build`. `scripts/dependency-gate-regressions.sh` (and a CI job) replays Daybreak's PoCs on Rust 1.88 and 1.99 through the actual source loader, cargo and clippy. Its method, transitive and type-alias wrappers are vendored registry packages with `Cargo.lock` checksums. The script points the ignored `regression_fixture_gate` test (the same loader and gate) at each case's workspace with `KILND_DEPENDENCY_GATE_FIXTURE`; the authoritative `the_dependency_gate_holds` always checks the workspace its test binary was built from and reads no variable, which `the_authoritative_gate_reads_no_environment` checks in its source and the script checks by setting both variables.
 
 ## 7.2 Durable reservation vector
 
@@ -3691,6 +3693,153 @@ the documentation commit after them. No runtime code changed, so no VM run was n
 
 Logs: `reviews/2026-11-05-b7m2-recheck-fixes/` (the regression script on macOS and in
 CI, the full suites, and the `1d11ac9` baseline).
+
+### Recheck 2: the build's own graph, identifiers, identities and the root
+
+Daybreak's second recheck (`reviews/2026-11-05-b7m2-recheck2.md`, PoCs in
+`reviews/poc-b7m2-recheck2/`) at `c500a6e` failed the gate on two HIGHs and raised two
+MEDIUMs:
+
+- *HIGH-1: the gate reviewed a different feature graph from the build.* The gate test ran
+  its own `cargo metadata --locked --all-features`, which does not inherit a dependency
+  feature the parent command selects. `cargo test --locked --all-features --features
+  tokio/full` passed the gate while the build used four unreviewed Tokio features (`full`,
+  `io-std`, `parking_lot`, `rt-multi-thread`) and four packages in neither `Cargo.lock` nor
+  the review (`lock_api`, `parking_lot`, `parking_lot_core`, `scopeguard`). `--locked`
+  left the lock byte-identical.
+- *HIGH-2: a type alias plus UFCS evaded the method and impl checks.* In a package
+  reviewed `none`, `pub type LocalFile = File;` and `LocalFile::set_len(self, 0)` inside an
+  extension trait's impl for `LocalFile` is not a `.set_len(` call, not a rooted std path,
+  and not an impl on a flagged type: the alias counted as a type the package defines.
+- *MEDIUM-1: `name@version` collapsed distinct source identities.* Two local registries'
+  `dupe@1.0.0` became one key in the gate and the drafter, so one review covered both and
+  the unreviewed one (whose `tidy` removes a file) disappeared. The drafter reported
+  `145 locked packages, 0 to review`.
+- *MEDIUM-2: an ambient root override.* `KILND_DEPENDENCY_GATE_ROOT` redirected the
+  authoritative test from a dirty workspace it refused to a clean copy that passed.
+
+The corrections:
+
+- *One supported entry point, one graph per profile* (HIGH-1). `scripts/build.sh PROFILE
+  COMMAND` is the only supported way to build, test or lint, and `dependency-gate.json`'s
+  `profiles` (`default`; `firecracker-test-deployment`, which enables
+  `kilnd/firecracker-test-deployment`) is the one list it and the gate read. It runs
+  `cargo COMMAND --locked` with only the profile's workspace features and refuses every
+  argument that would select features or another graph, in every spelling cargo accepts.
+  The gate resolves each profile with exactly those flags; a profile may name only a
+  feature a workspace member declares, so a dependency feature goes through a checked-in
+  workspace feature; every package a profile resolves must be locked and reviewed; the
+  reviewed features are the union over the profiles and kinds come from the union of
+  their graphs. CI's jobs, `scripts/install.sh` (and so the binaries `scripts/upgrade.sh`
+  takes), `scripts/b4-vm-tests.sh`, `scripts/integration-test.sh`, `docs/setup.md` and the
+  README build through it, and `supported_builds_use_the_build_entry_point` refuses a raw
+  cargo build in any of them. No build needs a dependency feature today; the two profiles
+  resolve the same 150 packages.
+- *Identifiers, not call shapes* (HIGH-2). Every identifier matching a `METHOD_SINKS`
+  pattern is a hit wherever it occurs in the scanned subtree (labelled by the identifier:
+  `set_len`, not `.set_len(`). `type` aliases (any visibility, generics skipped, associated
+  types included) resolve like `use` aliases in the impl check, and an alias whose target
+  is one of std's or Tokio's file or process types is flagged itself (`type alias for
+  std::fs::File`, or `type alias for File` through a glob import). A `type` name no longer
+  counts as a type the package defines. The wider match reached harmless identifiers in 12
+  packages; each was read and recorded: seven existing exceptions widened (bytes,
+  futures-util, hyper, serde_json, smallvec, Tokio, tracing-subscriber) and five added
+  (hyper-util and tonic executor bindings, libc's own declarations, windows-sys binding
+  parameters, zmij's `ptr::copy`), 27 in all, each still scoped to package, version and
+  feature set.
+- *Duplicate identities refused* (MEDIUM-1). Two packages with one `name@version` in
+  `Cargo.lock` fail the gate before any review is matched, naming both sources and
+  checksums; two in a profile's `cargo metadata` fail the loader; the drafter refuses both.
+  Multiple sources for one name and version are not supported.
+- *A fixed root* (MEDIUM-2). `the_dependency_gate_holds` always checks
+  `workspace_root()`, the workspace its test binary was compiled from, and reads no
+  variable (`the_authoritative_gate_reads_no_environment` checks its body). The regression
+  script runs the same loader and gate through `regression_fixture_gate`, a test ignored by
+  default that requires `KILND_DEPENDENCY_GATE_FIXTURE`; `cargo test` and CI never run it.
+- *The claim, narrowed again.* Section 7.1, the CHANGELOG and `dependency-gate.json`'s
+  `about` now promise only builds made through `scripts/build.sh` and a reviewed profile,
+  describe the sink check as identifier-level, and state that duplicate identities are
+  refused. A raw `cargo build` with other feature flags is outside the guarantee.
+
+Tests (synthetic, under `cargo test`):
+
+- `b7m2_recheck2_each_profile_graph_is_reviewed`: a profile selecting `tokio/full` is no
+  workspace feature; a workspace feature forwarding it resolves an unlocked
+  `parking_lot` and an unreviewed `libc` feature, and reviewing the union holds; an
+  undeclared feature, a `default` with features, an unknown field, an unresolved profile
+  and a missing section are refused.
+- `b7m2_recheck2_duplicate_identities_are_refused`: two `dupe@1.0.0` lock entries return
+  only the identity error; two metadata packages fail the loader.
+- `b7m2_recheck2_type_aliases_resolve`: aliases (with references and lifetimes, through
+  `use` aliases and chains, glob-imported, associated) are flagged and their impls
+  resolved; the package's own `File`, another crate's and target-less associated types
+  are not.
+- `b7m2_recheck_a_method_wrapper_is_refused` now also refuses Daybreak's alias-UFCS
+  wrapper, `Handle::set_len(x, 0)`, `<Handle as Len>::set_len`, a function value, a `use`
+  list, a definition and a field; strings, comments and aliases of non-std types are not
+  hits.
+- `supported_builds_use_the_build_entry_point`,
+  `the_authoritative_gate_reads_no_environment`, and `the_dependency_gate_holds` on the
+  real workspace (both profiles).
+
+`scripts/dependency-gate-regressions.sh` keeps every earlier case and adds Daybreak's
+type-alias UFCS wrapper (vendored, its source exact), feature injection through
+`build.sh`, a profile's own graph, the two-registry collision and the root override.
+Results are under *Recheck 2 corrections evidence*.
+
+### Recheck 2 corrections evidence
+
+Branch `phase1b/b7-hardening`: `aaff49b` (build profiles and `scripts/build.sh`, the
+per-profile gate, identifier matching and type aliases, duplicate identities, the fixed
+root, the regression cases and CI) and the documentation commit after it. No runtime code
+changed, so no VM run was needed.
+
+- *macOS, the gate.* `proven::tests::dependency_gate`: 18 passed and 1 ignored
+  (`regression_fixture_gate`) on Rust 1.88 and 1.99, `the_dependency_gate_holds` included.
+  That is two profiles resolving the same 150 packages, 144 reviewed packages (unchanged:
+  78 `pure-computation`, 15 `compile-time`, 51 with their own justification; 102 runtime,
+  40 build-only, 2 dev-only) and 27 scoped exceptions. `scripts/dependency-gate-review.py`
+  reports `144 locked packages, 0 to review`.
+- *macOS, clippy.* `scripts/build.sh [+1.99.0] PROFILE clippy --all-targets -- -D warnings
+  -D clippy::disallowed_methods` on Rust 1.88 and 1.99, both profiles: clean. `git diff
+  --check` and `scripts/kilnd-maintenance-tests.py` pass.
+- *macOS, the full suites.* `scripts/build.sh +1.88.0 PROFILE test --no-fail-fast`, both
+  profiles: every test binary passed (kilnd lib 516 passed, 4 ignored). The timing-bound
+  `kiln_direct` tests and the broker's `wide_objects_check_in_well_under_quadratic_time`,
+  which failed under load at the recheck, passed this time.
+- *`scripts/dependency-gate-regressions.sh` on Rust 1.88 and 1.99* (macOS, at `aaff49b`):
+  all passed. Every earlier case held its result (fs-err `none` refused and `filesystem`
+  holding with clippy rejecting the call; `method-wrapper` refused as `filesystem` with
+  `no_destructive_api` and as `none`; `outer-wrapper` over `inner-wrapper` refused with
+  and without the inner entry; the exception holding at its scope; the 1.0.1 bump refused
+  until reviewed; `extra` refused; clippy rejecting `std::fs::copy` and `libc::creat`),
+  with hits now labelled `set_len` rather than `.set_len(`. The new cases:
+  - Daybreak's type-alias UFCS wrapper, reviewed `none`: refused for `set_len`, `type
+    alias for std::fs::File` and `impl for std::fs::File`; clippy accepts the workspace.
+  - Feature injection through `build.sh`: the PoC's `--all-features --features
+    tokio/full` and ten other spellings (`--features=`, `-F`, `-Fx`, `-rF`,
+    `--all-features`, `--no-default-features`, `--manifest-path`, `--config`, `-Z`) are
+    refused before cargo runs.
+  - A profile selecting `tokio/full`: `build.sh` refuses it; the gate refuses it as no
+    workspace feature and for `lock_api`, `parking_lot`, `parking_lot_core` and
+    `scopeguard`, which its graph resolves and `Cargo.lock` does not lock. `Cargo.lock` is
+    unchanged.
+  - A workspace feature forwarding `tokio/full`, in a profile: refused for the
+    unreviewed `parking_lot` (and the rest) it locks and Tokio's unreviewed features.
+  - Two `dupe@1.0.0` registries: the drafter and the gate refuse the duplicate identity.
+  - The root override: the dirty workspace's authoritative test refuses with both
+    variables naming a clean copy; the pristine copy's holds with both naming the dirty
+    one; the ignored fixture test follows its variable and refuses the dirty one.
+- *CI.* Run 42051232479 on `aaff49b`: `check` and `gate-regressions` green.
+  `gate-regressions` ran every case above on Linux with Rust 1.88 and 1.99, with the same
+  73 outcomes as on macOS, in 25 minutes. The first attempt's `feature` job failed only
+  the untouched `b3_04_startup_that_cannot_journal_never_serves_and_leaves_no_workers`,
+  which read the helper's `start-error` file before its reason was written (the same race
+  as the recheck's `exit3_second_helper…` flake); the rerun passed, and the run concluded
+  green.
+
+Logs: `reviews/2026-11-05-b7m2-recheck2-fixes/` (the regression script on macOS and in
+CI, the full suites, and the failed `feature` attempt).
 
 # 16. Retired-token compaction (pre-B7 design)
 
