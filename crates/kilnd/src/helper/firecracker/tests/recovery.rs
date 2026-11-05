@@ -533,7 +533,7 @@ async fn lose_capacity_reply(
     assert_eq!(daemon.row(&id, "state").as_deref(), Some("failed"));
     assert!(charged(daemon, &id));
     assert!(
-        unreleased_claim(&deployment, allocation),
+        unreleased_claim(deployment, allocation),
         "the claim committed"
     );
     assert_eq!(deployment.claims(), 1);
