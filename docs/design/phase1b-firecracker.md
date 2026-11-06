@@ -26,7 +26,7 @@ Initial scope is Linux aarch64, cgroup v2, the pinned Firecracker/jailer 1.17.0 
 
 ## 1.2 Evidence update and launch-contract gate
 
-The requested guest-contract work has arrived locally: kiln-guest `7d9d956`, with `results/launch-contract/summary.json` recording a matching A/B manifest digest:
+The requested guest-contract work has arrived locally: kiln-guest `13c037a`, with `results/launch-contract/summary.json` recording a matching A/B manifest digest:
 
 ```text
 e855fbee1914cc6ea5e57a1250610e128412c85a905c94a48fb54afdaa47f3d3
@@ -182,7 +182,7 @@ turn a mutated recipe into an accepted launch.
 
 ## 3.4 Executable identity from verification through exec
 
-**Use one protected store and descriptor-based handoff for every host executable in the Firecracker helper chain.** Mirror kiln-guest `e1082f2`'s root-private installation, descriptor-relative ancestry walk, hashing through an open FD and retained-jailer-FD execution (`scripts/privileged_launch.py`, `tests/test_vmm_path_race.py`). Extend that rule to the VMM's final exec, formatter and every separate supervisor/worker/relay/drainer binary. This is a specification for kilnd, not a claim that kiln-guest already implements those extensions.
+**Use one protected store and descriptor-based handoff for every host executable in the Firecracker helper chain.** Mirror kiln-guest `a928731`'s root-private installation, descriptor-relative ancestry walk, hashing through an open FD and retained-jailer-FD execution (`scripts/privileged_launch.py`, `tests/test_vmm_path_race.py`). Extend that rule to the VMM's final exec, formatter and every separate supervisor/worker/relay/drainer binary. This is a specification for kilnd, not a claim that kiln-guest already implements those extensions.
 
 The installer, outside Create, copies from already authenticated source descriptors into `/opt/kilnd/exec/sha256/<digest>/<role-name>`. It checks the completed private copy's size/digest, makes it root-owned 0555 with no setuid/setgid bits or file capabilities, fsyncs it, atomically publishes it without replacing an existing digest object, and fsyncs its parent. Existing objects must match; never repair one in place. No hardlinks to a build cache. Missing objects fail C0; Create cannot install/download them. Approved role names include `jailer`, `firecracker`, `mkfs.xfs` and the explicitly enumerated helper binaries, not caller-selected names.
 
@@ -933,7 +933,7 @@ All production assertions below are **required future tests**, not tests perform
 14. Stall artifact reads/hash, fallocate, mkfs, ledger fsync, file fsync, mount/unmount, cgroup operations and inventory one class at a time; then exhaust P and per-allocation lifecycle slots. Independent Capabilities/Inspect/Stop stay responsive and no extra worker is spawned. For allocation-local stalls, healthy Stop succeeds; for shared ledger/kernel failure, bounded Unknown with independent kill dispatch is the required honest result. Recover only after the original workers exit/settle; confirm charges/FDs/permits are not lost.
 15. Start two actual daemons with distinct databases/sockets/instance IDs sharing one helper. Race four 896 MiB requests against three node slots: exactly three reach INTENT and the rejected token obtains a durable ABSENT fence before local release. Kill either daemon, restore an older DB and remove its DB in separate runs; helper charges survive and ownership mismatch blocks new admission. Repeat disk/vCPU exhaustion, same-instance simultaneous attachment, helper restart/ledger replay and release-reply loss. Record the global vector and shared overhead, not the sum of successful local API calls.
 
-16. Reproduce kiln-guest `e1082f2`'s KR-05 source-parent race as an unrelated unprivileged UID: rename the old build/source tree after verification, plant a replacement, and separately try renaming each protected installation ancestor. The old source rename may succeed; protected-tree replacement must be denied or launch must refuse. Pause immediately before S executes J and between J verification and V exec; replace the Firecracker `--exec-file` name in a test-only root fault injection as well. The only allowed outcomes are refusal or execution of the retained approved inode. Assert actual `/proc/<J>/exe` and `/proc/<V>/exe` **device, inode and FD-computed digest** against their pre-exec journal records, not only path strings, configured hashes or exit codes. Repeat every race for the formatter and each separately executed S/L/P/R/D/M/K image; verify fork-only workers inherit the approved image. A test-only exec-stop fixture may hold short-lived children for `/proc` inspection; production does not acquire a ptrace dependency. Missing evidence fails the test. Check bootstrap FDs do not survive V exec, no fallback path is attempted, preflight mismatches create no session resource, and every post-C1 mismatch holds its charge until ABSENT.
+16. Reproduce kiln-guest `a928731`'s KR-05 source-parent race as an unrelated unprivileged UID: rename the old build/source tree after verification, plant a replacement, and separately try renaming each protected installation ancestor. The old source rename may succeed; protected-tree replacement must be denied or launch must refuse. Pause immediately before S executes J and between J verification and V exec; replace the Firecracker `--exec-file` name in a test-only root fault injection as well. The only allowed outcomes are refusal or execution of the retained approved inode. Assert actual `/proc/<J>/exe` and `/proc/<V>/exe` **device, inode and FD-computed digest** against their pre-exec journal records, not only path strings, configured hashes or exit codes. Repeat every race for the formatter and each separately executed S/L/P/R/D/M/K image; verify fork-only workers inherit the approved image. A test-only exec-stop fixture may hold short-lived children for `/proc` inspection; production does not acquire a ptrace dependency. Missing evidence fails the test. Check bootstrap FDs do not survive V exec, no fallback path is attempted, preflight mismatches create no session resource, and every post-C1 mismatch holds its charge until ABSENT.
 
 ## 10.3 Evidence and review gates
 
@@ -1044,8 +1044,8 @@ Local evidence is deliberately distinguished from future design obligations. Pat
 
 - kilnd baseline: `CLAUDE.md`, `README.md`, `docs/architecture.md`, `docs/threat-model.md`, `docs/roadmap.md`, `docs/helper-protocol.md`; `crates/kilnd/src/runtime/{mod,kiln,kiln_direct}.rs`, helper protocol/server, manager/store/model/admission/retention/service and `proto/kilnd/v1/kilnd.proto` at `734e275`.
 - Spike: `research/2026-10-30-firecracker-spike.md`, especially “Proposed Phase 1 backend” and “What the Runtime trait needs.” Its tiny idle guests and snapshot feasibility do not authorize production sizing or restore.
-- Guest: kiln-guest README, `scripts/launch_contract.py`, `dist/bundle-a/manifest.json` and `results/launch-contract/{summary,reproducibility}.json` observed at `7d9d956`; current bundle digest in section 1.2. The new broker profile remains unbuilt/unapproved.
-- Executable-handoff reference: kiln-guest `e1082f2af3a7f112789377c8a9f7d98db66cb092`, README validation section, `scripts/privileged_launch.py`, `tests/test_vmm_path_race.py` and `results/kr05/README.md`. It supplies protected installation/retained-jailer-inode regressions; section 3.4 explicitly extends the rule to the entire Phase 1b helper chain. Guest manifest/artifact identity did not change.
+- Guest: kiln-guest README, `scripts/launch_contract.py`, `dist/bundle-a/manifest.json` and `results/launch-contract/{summary,reproducibility}.json` observed at `13c037a`; current bundle digest in section 1.2. The new broker profile remains unbuilt/unapproved.
+- Executable-handoff reference: kiln-guest `a928731d3015bfc49f316e0d9c5ba825bd149c32`, README validation section, `scripts/privileged_launch.py`, `tests/test_vmm_path_race.py` and `results/kr05/README.md`. It supplies protected installation/retained-jailer-inode regressions; section 3.4 explicitly extends the rule to the entire Phase 1b helper chain. Guest manifest/artifact identity did not change.
 - Capacity: `kiln-guest/results/boot-regression/DENSITY.md`; hardened 768 MiB guest about 770 MiB PSS, contained five-VM OOM and the correction to cgroup membership before allocation. Three sessions per 3 GiB sandbox budget is planning, not a measured backend throughput claim.
 - Adversarial constraints: `reviews/2026-10-30-guest-breakit.md` (KG-06 admission, KG-07 restore); `reviews/2026-10-30-guest-reattack.md` (KR-01 full launch binding, snapshot/KASLR, build and DNS boundaries); `reviews/2026-10-30-phase0-breakit.md`, `reviews/2026-10-30-helper-recheck.md`, `reviews/2026-10-30-receiptack-recheck.md` (descriptor authority, receipt lifetime and original wire deadlines). Later guest evidence addresses the old kernel/build/DNS findings; it does not implement this backend's admission.
 - Design review: `reviews/2026-10-31-phase1b-design-attack.md` at the first design commit `c81de00`; all seven findings accepted in section 15. The report specifies deterministic attacks; it says no standalone PoC was necessary.
@@ -2691,7 +2691,7 @@ retention. The ledger keeps schema 1, as the B4 notes allow.
 
 All root evidence is from the `kiln` Lima VM (Ubuntu, kernel 6.8.0-147, 4 vCPUs, 4 GiB),
 Firecracker 1.17.0 through the patched jailer, with the pinned production bundle (kiln-guest
-`74f3a89`, the broker built from kilnd `fb9034d`). The B5 root suite's final run is at
+`92c7acd`, the broker built from kilnd `fb9034d`). The B5 root suite's final run is at
 `7d117af` (R's read pacing; an earlier run at `c2fc1f6`, before pacing, also passed). The
 B4 and installed suites ran at `95ab9bf`; the only later host change is that pacing, which
 the B5 suite covers. Logs are in `reviews/2026-11-03-b5-vm/`.
@@ -2710,7 +2710,7 @@ the B5 suite covers. Logs are in `reviews/2026-11-03-b5-vm/`.
 | Two warmups and twenty cold boots | `b5_linux_root_boot_timings`, below |
 | Legacy privileged suites | `scripts/b4-vm-tests.sh b4_linux_root` at `95ab9bf`: 31 passed (and the core's 1). Its first run at `c2fc1f6` failed one test only because a healthy neighbour now reaches READY (`PresentReady`) where it asserted `PresentBusy`; `95ab9bf` accepts both. Installed at `95ab9bf`: `install.sh`, `integration-test.sh` (with the dedicated-child admission FD/RSS, slow-client, queue and concurrent-Health stress regression), the singleton, state-path and Phase 0 regressions, `smoke.sh` and the maintenance tests all pass. `deployment-regressions.py` was not needed: B5 changes no install, upgrade or maintenance script or unit |
 
-*Reproducible bundle* (kiln-guest `74f3a89`, both builds):
+*Reproducible bundle* (kiln-guest `92c7acd`, both builds):
 
 | Artifact | Bytes | SHA-256 |
 |---|---|---|
@@ -2742,7 +2742,7 @@ do not break down; B7 owns that profile.
 ## B5 break-it corrections (November 3, 2026)
 
 Daybreak's B5 break-it review (`reviews/2026-11-03-b5-breakit.md`, kilnd `38aefb4`,
-kiln-guest `74f3a89`) found three HIGH, six MEDIUM and one LOW defect. Stephen's rule
+kiln-guest `92c7acd`) found three HIGH, six MEDIUM and one LOW defect. Stephen's rule
 governs every fix: any post-dispatch timeout, cancel or uncertainty terminates the VM,
 and a guest that breaks the session protocol is not reusable. The attacks that held
 (framing and budgets, retirement on timeout, disconnect, Stop and worker death, the
@@ -2822,7 +2822,7 @@ evidence is from the `kiln` Lima VM (kernel 6.8, 4 vCPUs, 4 GiB) under the manag
 | B4 root suite | 31 passed in 1,368 s, and the core's capability-drop test. The first attempt was cut off when the VM itself failed (Virtualization.framework `VirtualMachineStateError` at 10:49, during the scoped-GC test); the VM was restarted through its managed process and the rerun passed |
 | Installed suites at `c0b303f` | `install.sh`, `integration-test.sh`, the singleton, state-path and Phase 0 regressions, `smoke.sh` and the maintenance tests all pass. `/var/lib/kilnd` was restored from its byte copy afterwards (`cmp` identical, schema 7) and kilnd `734e275` reinstalled |
 
-*Re-pinned bundle* (kiln-guest `86fbf26`, broker from kilnd `71fe6c4`, archive
+*Re-pinned bundle* (kiln-guest `ba890f8`, broker from kilnd `71fe6c4`, archive
 `5e23b69da19226473656c61cb4943cb17118e68e21ba529606e36d3533803b00`; two clean builds,
 `verify.py` `reproducible: true`, every file byte-identical):
 
@@ -2947,7 +2947,7 @@ production's) and fails if any remain.
 ### Milestone 1 exit evidence
 
 All in the `kiln` Lima VM (kernel 6.8.0-147, 4 vCPUs, 4 GiB) under the managed `kiln-vm`
-process, with the re-pinned production bundle (kiln-guest `86fbf26`, broker `35fad74f…`),
+process, with the re-pinned production bundle (kiln-guest `ba890f8`, broker `35fad74f…`),
 the approved jailer `42e9dea3…`, `mkfs.xfs` `9571cecc…` and the release Firecracker
 v1.17.0. Logs, the transcript and the SQLite and journal evidence are in
 `reviews/2026-11-03-b6-vm/`.
@@ -3069,7 +3069,7 @@ charged, Delete errors until K recovers, then reaches ABSENT).
 
 All in the `kiln` Lima VM under the managed `kiln-vm` process, restarted at 21:04 UTC
 for a fresh window, with the inputs of milestone 1 (the approved jailer and `mkfs.xfs`,
-release Firecracker v1.17.0, kiln-guest `86fbf26`'s bundle with broker `35fad74f…`).
+release Firecracker v1.17.0, kiln-guest `ba890f8`'s bundle with broker `35fad74f…`).
 Matrices, transcripts and daemon and helper logs are in `reviews/2026-11-03-b6-vm/m2-final/`.
 
 | B6 exit criterion | Evidence |
@@ -3186,7 +3186,7 @@ released only by the matching receipt (it took the immediate path in 2 of 4 runs
 *Evidence (VM, November 3–4).* In the `kiln` Lima VM under the managed `kiln-vm`
 process, restarted at 03:18 UTC for a fresh window, at `7474f4f`, with the approved
 jailer `42e9dea3…` and `mkfs.xfs` `9571cecc…` rebuilt by `build-phase1b-tools.sh`,
-release Firecracker v1.17.0 `fe726e0b…` and kiln-guest `86fbf26`'s bundle (broker
+release Firecracker v1.17.0 `fe726e0b…` and kiln-guest `ba890f8`'s bundle (broker
 `35fad74f…`): `test-deployment-gate-regressions.sh` release, feature and root all pass,
 and Daybreak's PoC no longer selects Firecracker from either build; the whole session
 through kilnd and kilndctl as `kilnd-fctest` in `kilnd-fctest.service` passes;
@@ -3404,7 +3404,7 @@ documentation commit after it.
   /system.slice/kilnd-fcgate.service".
 - *VM, real chain* (`ddafe5d`, with jailer and mkfs.xfs rebuilt by
   `scripts/build-phase1b-tools.sh` at their approved digests, the Firecracker v1.17.0
-  release at `fe726e0b…`, and `bundle-a` rebuilt from kiln-guest `86fbf26` with broker
+  release at `fe726e0b…`, and `bundle-a` rebuilt from kiln-guest `ba890f8` with broker
   `35fad74f…`). `scripts/firecracker-regressions.py`: **8/8 passed**, the whole session
   and the new hostile public caller included; under the attack the hostile UID opened and
   had closed 798,341 sockets, held 66 to the 5-second deadline (none longer than 5.003 s,
