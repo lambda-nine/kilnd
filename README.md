@@ -43,6 +43,11 @@ kilnd runs as the unprivileged `kilnd` system account with no capabilities.
 The root helper accepts only validated kiln operations from that service UID.
 API callers can control only their own sandboxes; root can control all of them. See [docs/threat-model.md](docs/threat-model.md).
 
+The design documents cite paths under `reviews/` and `research/`. Those are
+the maintainer's private review reports and notes, and they are not part of
+this repository. Each cited finding's fix and its regression test are in the
+code, the test suite and `CHANGELOG.md`.
+
 ## What it does
 
 - **gRPC API `kilnd.v1`** ([proto/kilnd/v1/kilnd.proto](proto/kilnd/v1/kilnd.proto)):

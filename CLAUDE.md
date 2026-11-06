@@ -48,7 +48,7 @@ through its CLI. Read [README.md](README.md),
   with its own test and commit.
 - **No LLM or product code here.** The agent loop, providers, memory and tool
   registry come later as a separate layer over the API (docs/roadmap.md).
-  Idea Marathon consumes the harness; nothing specific to it belongs here.
+  Downstream products consume the harness; nothing specific to them belongs here.
 - **The API is backend-neutral.** Don't add kiln-only fields to
   `proto/kilnd/v1`; within v1, only add fields and RPCs.
 - **Keep the docs in step,** and add a line to CHANGELOG.md.

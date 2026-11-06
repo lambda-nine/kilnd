@@ -2,7 +2,7 @@
 
 This milestone is the runtime control plane. Each step below builds on the
 one before and keeps the rule that the harness talks to sandboxes only
-through the kilnd API. Product-specific code (Idea Marathon and others) stays
+through the kilnd API. Product-specific code stays
 in the products that consume the harness.
 
 ## Phase 0: control-plane privilege gate (done)
@@ -64,7 +64,7 @@ A separate crate or service that talks to kilnd over `kilnd.v1`:
 - Session transcripts and tool results stored next to kilnd's run records.
 - Long-term memory: summaries and retrieved notes per user or project, with
   explicit write and forget operations.
-- First consumer: Idea Marathon, through the harness API, not through code
+- First consumer: a downstream product, through the harness API, not through code
   in this repository.
 
 ## 6. Beyond one node
