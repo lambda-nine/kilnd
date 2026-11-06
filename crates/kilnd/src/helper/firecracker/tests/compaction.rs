@@ -2739,6 +2739,14 @@ pub(super) async fn census_until(fixture: &Fixture, what: &str, ready: impl Fn(&
     panic!("{what}: {}", fixture.census().await);
 }
 
+/// At least the lost answer's hold is transferred, and every hold is a transferred one.
+/// Any other fault-bearing call that reached the dead L (a refused Create's own record,
+/// say) is transferred with it, so the count is not exact.
+fn assert_transferred(census: &Value, what: &str) {
+    assert!(census["transferred_holds"].as_u64() >= Some(1), "{what}: {census}");
+    assert_eq!(census["lost_answers"], census["transferred_holds"], "{what}: {census}");
+}
+
 /// Integrated recheck HIGH-2's setup: a Create waits at its final `OpenGate` boundary
 /// (deadline `create_seconds`); a FenceAbsent's answer is lost while L is inside it
 /// (`fault`: the fail-stop marker written and `SyncFailed` stalled, or a benign stall);
@@ -2799,8 +2807,7 @@ async fn l_death_before_a_lost_answer(
     }
     fixture.wait_reached("H.ledger.before_publish").await;
     let census = fixture.census().await;
-    assert_eq!(census["lost_answers"], json!(1), "the hold was transferred, not released: {census}");
-    assert_eq!(census["transferred_holds"], json!(1), "{census}");
+    assert_transferred(&census, "the hold was transferred, not released");
     assert_eq!(census["latched"], json!(false), "Handover has imported nothing yet: {census}");
     (create, queued, old_l)
 }
@@ -2833,7 +2840,7 @@ async fn b7_crash_l_death_keeps_a_lost_fault_held_until_the_replacement_imports_
     assert_eq!(class_of(&reply), AmbiguousClass::Latched, "{reply:?}");
     assert!(!fixture.fake_dir(&queued).exists(), "no gate opened and no host effect");
     let census = fixture.census().await;
-    assert_eq!(census["transferred_holds"], json!(1), "still held at the deadline: {census}");
+    assert_transferred(&census, "still held at the deadline");
 
     fixture.clear("H.ledger.before_publish.hold");
     let census = census_until(&fixture, "the replacement never imported the latch", |c| {
@@ -2908,8 +2915,7 @@ async fn b7_crash_a_failed_replacement_handover_keeps_the_transferred_hold() {
             .is_some_and(|f| f.contains("not replaced"))
     })
     .await;
-    assert_eq!(census["transferred_holds"], json!(1), "{census}");
-    assert_eq!(census["lost_answers"], json!(1), "{census}");
+    assert_transferred(&census, "the failed Handover drained nothing");
     assert_eq!(census["latched"], json!(false), "{census}");
 
     fixture.clear("H.create.before_open_gate.hold");
@@ -2918,7 +2924,7 @@ async fn b7_crash_a_failed_replacement_handover_keeps_the_transferred_hold() {
     };
     assert_eq!(class_of(&reply), AmbiguousClass::Latched, "{reply:?}");
     assert!(!fixture.fake_dir(&queued).exists(), "no gate opened and no host effect");
-    assert_eq!(fixture.census().await["transferred_holds"], json!(1));
+    assert_transferred(&fixture.census().await, "still held at the deadline");
 
     fixture.clear("L.handover.panic");
     let census = census_until(&fixture, "no replacement ever handed over", |c| {

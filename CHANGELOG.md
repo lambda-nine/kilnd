@@ -6,6 +6,18 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Close Daybreak's integrated B7 recheck (design section 15, *B7 integrated recheck*, and
+  section 16.10, *Integrated recheck: the transferred hold*). A fault-bearing ledger call
+  that ends because the ledger process died no longer lifts its hold on forward effects:
+  the hold moves to a barrier for that ledger generation and lifts only after a
+  replacement's Handover has imported its latch state, so Create's final boundary and an
+  Exec past EXEC_INTENT refuse at their deadlines while no replacement has handed over.
+  Health reports `transferred_holds`. The dependency gate follows ordinary out-of-line
+  `mod name;` declarations from every scanned file (`name.rs` or `name/mod.rs`, inline
+  modules nesting), so a child module under an otherwise unscanned `tests/` directory is
+  read. The Firecracker runtime publishes a READY session only under the same
+  terminal-aware claim as its digest, and a complete List prunes stale sessions too.
+
 - Integrate B7 milestones 1 and 2 (`phase1b/b7-integrated`) and close the milestone 2
   recheck 3 findings (design section 15, *Recheck 3* and *B7 milestones 1 and 2
   integrated*). `scripts/build.sh` runs cargo in a closed compiler environment: it
