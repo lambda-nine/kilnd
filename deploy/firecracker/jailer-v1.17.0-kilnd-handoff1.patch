@@ -405,7 +405,7 @@ index 0000000..8538b00
 --- /dev/null
 +++ b/src/jailer/src/handoff.rs
 @@ -0,0 +1,1078 @@
-+// Copyright 2026 Estrada Systems LLC. All Rights Reserved.
++// Copyright 2026 Stephen Estrada
 +// SPDX-License-Identifier: Apache-2.0
 +
 +//! kilnd handoff (`kilnd-handoff1`): descriptor handoff, bootstrap gate and capability drop.

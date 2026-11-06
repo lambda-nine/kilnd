@@ -35,7 +35,7 @@ XFS_URL="https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprog
 XFS_SHA256=50ca2f4676df8fab4cb4c3ef3dd512d5551e6844d40a65a31d5b8e03593d22df
 # The approved patch and outputs. A change to any of them is a reviewed edit here and in
 # deploy/firecracker/README.md, never a silently different root executable.
-PATCH_SHA256=e54547ff520a91a25f4b292f450163f972505a383374f23b099a4f4414b0ff5d
+PATCH_SHA256=47bd422c0ff01086afbb193201e85eff3f3b6f719de49212b1ad94ee512c7eeb
 JAILER_SHA256=42e9dea3ed1b94292464c9af0286ea0eaf09934ac0b92b439fc3e76b55e8ad11
 MKFS_SHA256=9571cecc3e015742c19d1e762fb4389b15f7ff0746f52af55fd2879c96e160ab
 DEB_BASE_URL="https://launchpad.net/ubuntu/+archive/primary/+files"

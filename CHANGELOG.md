@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Close Daybreak's integrated B7 recheck 2 (design section 15, *B7 integrated recheck 2*).
+  The dependency gate reads a `#[path]` emitted by nested `cfg_attr`s at any depth
+  (`#[cfg_attr(a, cfg_attr(b, path = "..."))]`), and every `path` a `cfg_attr` emits rather
+  than the first, each as a conditional source edge beside the module's ordinary location.
+  `scripts/dependency-gate-regressions.sh` adds the PoC as case 11. The jailer patch's
+  copyright line is now Stephen Estrada; its pinned digest is updated, and the jailer it
+  builds is unchanged.
+
 - Close Daybreak's integrated B7 recheck (design section 15, *B7 integrated recheck*, and
   section 16.10, *Integrated recheck: the transferred hold*). A fault-bearing ledger call
   that ends because the ledger process died no longer lifts its hold on forward effects:

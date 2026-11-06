@@ -2815,9 +2815,10 @@ fn within(dir: &Path, relative: &str) -> Option<PathBuf> {
 /// A literal source edge in one file.
 #[derive(Debug, PartialEq, Eq)]
 enum SourceEdge {
-    /// `#[path = "…"] mod name;` (or through `cfg_attr`), inside these inline modules,
-    /// each by its name or by its own `#[path]`. A module with several `#[path]`s has an
-    /// edge for each, and one for each reading of inline modules with several.
+    /// `#[path = "…"] mod name;` (or through `cfg_attr`, nested at any depth), inside these
+    /// inline modules, each by its name or by its own `#[path]`. A module with several
+    /// `#[path]`s has an edge for each, and one for each reading of inline modules with
+    /// several.
     Module { path: String, inline: Vec<String> },
     /// An out-of-line `mod name;` with no unconditional `#[path]`, inside these inline
     /// modules: resolved by Rust's `name.rs` / `name/mod.rs` rules from the declaring file
@@ -2839,43 +2840,45 @@ enum SourceEdge {
     Unresolved(String),
 }
 
-/// The `path = "…"` an attribute's tokens (between `#[` and `]`) set, directly or through
-/// `cfg_attr(condition, …, path = "…")`.
-fn path_attribute<'a>(content: &[Token<'a>]) -> Option<&'a str> {
+/// Every `path = "…"` an attribute's tokens (between `#[` and `]`) set, directly or emitted
+/// through `cfg_attr(condition, attribute, …)` at any depth (`cfg_attr(a, cfg_attr(b, path
+/// = "…"))`, integrated recheck 2 HIGH-1), each with whether it is conditional: any one
+/// reached through a `cfg_attr` is.
+fn path_attributes<'a>(content: &[Token<'a>], conditional: bool, out: &mut Vec<(&'a str, bool)>) {
     match content {
         [
             Token::Ident("path"),
             Token::Punct('='),
             Token::Literal(path),
-        ] => Some(path),
+            ..,
+        ] => out.push((path, conditional)),
         [
             Token::Ident("cfg_attr"),
             Token::Punct('('),
             inner @ ..,
             Token::Punct(')'),
         ] => {
+            // The condition, then each attribute it emits, split at top-level commas.
             let mut depth = 0;
+            let mut attribute = None;
             for (at, token) in inner.iter().enumerate() {
                 match token {
                     Token::Punct('(' | '[' | '{') => depth += 1,
                     Token::Punct(')' | ']' | '}') => depth -= 1,
                     Token::Punct(',') if depth == 0 => {
-                        if let [
-                            Token::Ident("path"),
-                            Token::Punct('='),
-                            Token::Literal(path),
-                            ..,
-                        ] = &inner[at + 1..]
-                        {
-                            return Some(path);
+                        if let Some(from) = attribute {
+                            path_attributes(&inner[from..at], true, out);
                         }
+                        attribute = Some(at + 1);
                     }
                     _ => {}
                 }
             }
-            None
+            if let Some(from) = attribute {
+                path_attributes(&inner[from..], true, out);
+            }
         }
-        _ => None,
+        _ => {}
     }
 }
 
@@ -2918,8 +2921,9 @@ fn source_edges(text: &str) -> Vec<SourceEdge> {
                 if toks.get(open) == Some(&Token::Punct('[')) {
                     let close = closing(&toks, open);
                     let content = &toks[open + 1..close.min(toks.len())];
-                    if let Some(path) = path_attribute(content) {
-                        let conditional = content.first() != Some(&Token::Ident("path"));
+                    let mut paths = Vec::new();
+                    path_attributes(content, false, &mut paths);
+                    for (path, conditional) in paths {
                         pending.push((path.to_string(), conditional));
                     }
                     i = close + 1;
@@ -5213,6 +5217,111 @@ fn b7int_ordinary_out_of_line_modules_are_source_edges() {
             child("j", &["p"]),
             child("j", &["i"]),
         ]
+    );
+}
+
+#[test]
+fn b7int2_nested_cfg_attr_paths_are_source_edges() {
+    // Daybreak's integrated recheck 2 HIGH-1: a `path` emitted by a `cfg_attr` inside a
+    // `cfg_attr` is as conditional an edge as one directly inside it, at any depth, and
+    // the module keeps its ordinary location for a configuration none of them applies to.
+    let module = |path: &str, inline: &[&str]| SourceEdge::Module {
+        path: path.into(),
+        inline: inline.iter().map(|c| c.to_string()).collect(),
+    };
+    let child = |name: &str, inline: &[&str], fallback: bool| SourceEdge::Child {
+        name: name.into(),
+        inline: inline.iter().map(|c| c.to_string()).collect(),
+        fallback,
+    };
+
+    // Out-of-line modules, depths 2 and 3, the PoC's exact attribute first.
+    let edges = source_edges(
+        "#[cfg_attr(all(), cfg_attr(all(), path = \"../tests/hidden.rs\"))]\nmod hidden;\n\
+         #[cfg_attr(unix, cfg_attr(target_os = \"linux\", cfg_attr(feature = \"x\", \
+         path = \"deep.rs\")))]\npub(crate) mod deep;\n",
+    );
+    assert_eq!(
+        edges,
+        [
+            module("../tests/hidden.rs", &[]),
+            child("hidden", &[], true),
+            module("deep.rs", &[]),
+            child("deep", &[], true),
+        ]
+    );
+
+    // Inline modules, depths 2 and 3: each path is a directory reading, and so is the
+    // module's own name.
+    let edges = source_edges(
+        "#[cfg_attr(a, cfg_attr(b, path = \"p\"))]\nmod i { mod j; }\n\
+         #[cfg_attr(a, cfg_attr(any(b, c), cfg_attr(d, path = \"q\")))]\nmod k { mod l; }\n",
+    );
+    assert_eq!(
+        edges,
+        [
+            child("j", &["p"], false),
+            child("j", &["i"], false),
+            child("l", &["q"], false),
+            child("l", &["k"], false),
+        ]
+    );
+
+    // Every attribute a `cfg_attr` emits is read, not only the first `path`: several
+    // paths, beside other attributes, at different depths, each an edge; an unconditional
+    // `#[path]` still removes the ordinary location.
+    let edges = source_edges(
+        "#[cfg_attr(a, allow(dead_code), cfg_attr(b, doc = \"x\", path = \"p.rs\"), \
+         path = \"q.rs\",)]\nmod m;\n\
+         #[cfg_attr(a, cfg_attr(b, path = \"r.rs\"))]\n#[path = \"s.rs\"]\nmod n;\n\
+         #[cfg_attr(a, cfg_attr(b, allow(unused)))]\nmod o;\n",
+    );
+    assert_eq!(
+        edges,
+        [
+            module("p.rs", &[]),
+            module("q.rs", &[]),
+            child("m", &[], true),
+            module("r.rs", &[]),
+            module("s.rs", &[]),
+            child("o", &[], false),
+        ]
+    );
+
+    // The PoC's package: both the nested path's file under tests/ and the ordinary
+    // src/hidden.rs are scanned.
+    let found = package_tree(&[
+        (
+            "src/lib.rs",
+            "#[cfg_attr(all(), cfg_attr(all(), path = \"../tests/hidden.rs\"))]\nmod hidden;\n\
+             pub use hidden::Reset;\n",
+        ),
+        ("src/hidden.rs", "pub trait Reset {}\n"),
+        ("tests/hidden.rs", "pub trait Reset {}\n"),
+        ("tests/unreached.rs", "#[test] fn t() {}\n"),
+    ]);
+    assert_eq!(
+        found.files,
+        paths_of(&["src/hidden.rs", "src/lib.rs", "tests/hidden.rs"])
+    );
+    assert!(
+        found.errors.is_empty() && found.unresolved.is_empty(),
+        "{found:?}"
+    );
+
+    // Depth 3 into an inline module under tests/, whose ordinary child is scanned too.
+    let found = package_tree(&[
+        (
+            "src/lib.rs",
+            "#[cfg_attr(a, cfg_attr(b, cfg_attr(c, path = \"../tests/t\")))]\nmod t { mod u; }\n",
+        ),
+        ("tests/t/u.rs", "pub fn reset() {}\n"),
+        ("tests/unreached.rs", ""),
+    ]);
+    assert_eq!(found.files, paths_of(&["src/lib.rs", "tests/t/u.rs"]));
+    assert!(
+        found.errors.is_empty() && found.unresolved.is_empty(),
+        "{found:?}"
     );
 }
 

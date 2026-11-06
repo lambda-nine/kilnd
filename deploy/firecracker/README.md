@@ -102,11 +102,12 @@ and this table.
 
 Approved digests, first from 2026-11-02 (built twice from different `--out` directories
 with identical results) and reproduced on 2026-11-02 from the pinned sysroot, so pinning
-did not change them:
+did not change them. On 2026-11-06 only the patch's copyright line changed, so its digest
+did; the rebuilt jailer and `mkfs.xfs` are byte-identical:
 
 | Artifact | SHA-256 |
 |----------|---------|
-| `jailer-v1.17.0-kilnd-handoff1.patch` | `e54547ff520a91a25f4b292f450163f972505a383374f23b099a4f4414b0ff5d` |
+| `jailer-v1.17.0-kilnd-handoff1.patch` | `47bd422c0ff01086afbb193201e85eff3f3b6f719de49212b1ad94ee512c7eeb` |
 | source `firecracker v1.17.0.tar.gz` | `1f61367c07266dc9caa5135d655ba532a3d6a994b9320eec85de5efcbd8a759f` |
 | `jailer` | `42e9dea3ed1b94292464c9af0286ea0eaf09934ac0b92b439fc3e76b55e8ad11` |
 | source `xfsprogs-6.6.0.tar.xz` | `50ca2f4676df8fab4cb4c3ef3dd512d5551e6844d40a65a31d5b8e03593d22df` |

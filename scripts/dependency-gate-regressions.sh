@@ -83,6 +83,15 @@
 #    b. Two levels: tests/common/mod.rs's `mod a;` is tests/common/a.rs, whose `mod b;`
 #       is tests/common/a/b.rs (the sink): refused on b.rs.
 #    c. The same through tests/common/a/mod.rs: refused on b.rs.
+# 11. Integrated recheck 2 HIGH-1, Daybreak's nested-cfg_attr PoC (reviews/
+#    poc-b7-integrated-recheck2/nested-cfgattr-path-bypass.sh): its exact vendored
+#    nested-module-wrapper (src/lib.rs's `#[cfg_attr(all(), cfg_attr(all(), path =
+#    "../tests/hidden.rs"))] mod hidden;`, a harmless ordinary src/hidden.rs, and a
+#    tests/hidden.rs whose extension trait on std::fs::File calls `set_len(0)`), reviewed
+#    `none`.
+#    a. The toolchain compiles the nested path (a demo binary's file is truncated); the
+#       gate refuses on tests/hidden.rs's `set_len` and impl; clippy accepts the workspace.
+#    b. The same path three `cfg_attr`s deep: refused on tests/hidden.rs.
 #
 # Default toolchains: 1.88.0 and 1.99.0. It resolves fs-err and parking_lot from the
 # registry and vendors the locked crates (the network, or cargo's cache), so it is not
@@ -865,6 +874,87 @@ for toolchain in $toolchains; do
     child_wrapper tests/common/a/b.rs a tests/common/a/mod.rs
     expect_refused "$toolchain" "$fixture" \
         "\`set_len\` in nested-module-wrapper@1.0.0 (nested-module-wrapper-1.0.0/tests/common/a/b.rs)"
+done
+
+# --- 11. a #[path] nested in cfg_attr (integrated recheck 2 HIGH-1) -------------------
+# nested-cfgattr-path-bypass.sh's vendored wrapper, exactly, with $1 as src/lib.rs's
+# attribute on `mod hidden;`.
+nested_cfgattr_wrapper() { # attribute
+    dir=$fixture/vendor/nested-module-wrapper-1.0.0
+    rm -rf "$dir"
+    mkdir -p "$dir/src" "$dir/tests"
+    printf '[package]\nname = "nested-module-wrapper"\nversion = "1.0.0"\nedition = "2021"\n' \
+        >"$dir/Cargo.toml"
+    printf '%s\nmod hidden;\npub use hidden::Reset;\n' "$1" >"$dir/src/lib.rs"
+    cat >"$dir/src/hidden.rs" <<'EOF'
+pub trait Reset {
+    fn reset(&self) -> std::io::Result<()>;
+}
+EOF
+    cat >"$dir/tests/hidden.rs" <<'EOF'
+use std::fs::File;
+
+pub trait Reset {
+    fn reset(&self) -> std::io::Result<()>;
+}
+
+impl Reset for File {
+    fn reset(&self) -> std::io::Result<()> {
+        self.set_len(0)
+    }
+}
+EOF
+    python3 -I -c 'import hashlib, json
+print(json.dumps({"files": {}, "package": hashlib.sha256(b"nested-module-wrapper 1.0.0").hexdigest()}))' \
+        >"$dir/.cargo-checksum.json"
+    uses 'nested-module-wrapper = "=1.0.0"' nested_module_wrapper
+    review "$fixture" 'nested-module-wrapper={"capability": "none", "why": "a convenience trait selected by a nested conditional path"}'
+}
+# The PoC's demo: rustc really selects the nested path, whose reset() truncates a file.
+demo=$scratch/nested-cfgattr-demo
+mkdir -p "$demo/src"
+cat >"$demo/Cargo.toml" <<EOF
+[package]
+name = "nested-module-demo"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+nested-module-wrapper = { path = "$fixture/vendor/nested-module-wrapper-1.0.0" }
+
+[workspace]
+EOF
+cat >"$demo/src/main.rs" <<'EOF'
+use nested_module_wrapper::Reset as _;
+
+fn main() {
+    let path = std::env::temp_dir().join(format!("b7-child-module-{}", std::process::id()));
+    std::fs::write(&path, b"not empty").unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.reset().unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 0);
+    std::fs::remove_file(path).unwrap();
+}
+EOF
+for toolchain in $toolchains; do
+    echo "== Rust $toolchain: nested-module-wrapper (none), cfg_attr(all(), cfg_attr(all(), path)) =="
+    nested_cfgattr_wrapper '#[cfg_attr(all(), cfg_attr(all(), path = "../tests/hidden.rs"))]'
+    if cargo "+$toolchain" run -q --manifest-path "$demo/Cargo.toml" >"$scratch/demo.log" 2>&1; then
+        echo "the toolchain compiles the nested path: the demo's file was truncated"
+    else
+        cat "$scratch/demo.log" >&2
+        fail "the nested-cfg_attr demo did not truncate its file"
+    fi
+    expect_refused "$toolchain" "$fixture" \
+        "nested-module-wrapper@1.0.0 is declared \`none\`, but its runtime subtree reaches" \
+        "\`set_len\` in nested-module-wrapper@1.0.0 (nested-module-wrapper-1.0.0/tests/hidden.rs)" \
+        "\`impl for std::fs::File\` in nested-module-wrapper@1.0.0 (nested-module-wrapper-1.0.0/tests/hidden.rs)"
+    clippy_accepts "$toolchain" "$fixture"
+
+    echo "== Rust $toolchain: the same path three cfg_attrs deep =="
+    nested_cfgattr_wrapper '#[cfg_attr(all(), cfg_attr(not(windows), cfg_attr(any(unix, windows), path = "../tests/hidden.rs")))]'
+    expect_refused "$toolchain" "$fixture" \
+        "\`set_len\` in nested-module-wrapper@1.0.0 (nested-module-wrapper-1.0.0/tests/hidden.rs)"
 done
 
 if [ "$failed" -ne 0 ]; then
