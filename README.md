@@ -24,9 +24,9 @@ Licensed under [Apache-2.0](LICENSE).
 **Quickstart:** see [Quick start](#quick-start-in-kilns-lima-vm) below; it
 installs kiln at a pinned commit, then kilnd, inside kiln's Lima VM on a Mac.
 On an Ubuntu 24.04 host with Linux 6.8+, follow kiln's README to install kiln,
-then run the "in the VM" half directly. Builds use `cargo` as shown here; a
-`scripts/build.sh` wrapper with a closed compiler environment arrives with
-Phase 1b B7.
+then run the "in the VM" half directly. Every build goes through
+`scripts/build.sh PROFILE`, which runs cargo in a closed compiler environment
+for a reviewed build profile.
 
 ```
 kilndctl ──gRPC over /run/kilnd/kilnd.sock──▶ kilnd ──typed Unix IPC──▶ root kilnd-helper ──argv──▶ kiln

@@ -54,8 +54,8 @@ through its CLI. Read [README.md](README.md),
 - **Keep the docs in step,** and add a line to CHANGELOG.md.
 - **Commits are attributed to Stephen only** (Stephen Estrada
   <stcrestrada@gmail.com>). No `Co-Authored-By` trailers of any kind.
-- **Both repositories stay private.** Making either public, or publishing a
-  release, needs Stephen's explicit approval.
+- **Releases need Stephen's explicit approval.** The repositories are public;
+  never push secrets, private notes or `reviews/` material.
 - **Security wording:** kiln is experimental shared-kernel isolation, not a
   boundary for hostile multi-tenant workloads.
 
