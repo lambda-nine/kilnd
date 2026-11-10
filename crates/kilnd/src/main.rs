@@ -160,7 +160,8 @@ struct Args {
     /// How often the expiry sweeper rescans the boot clock, in seconds (1 to 300).
     #[arg(long, default_value_t = 30)]
     expiry_rescan_secs: u64,
-    /// Expiry removals running at once (1 to 16).
+    /// Removals of expiry-owned sandboxes running at once, including client Deletes
+    /// that follow one (1 to 16).
     #[arg(long, default_value_t = 4)]
     max_concurrent_expiry_deletes: usize,
     /// On SIGTERM, how long running requests may finish before executions are

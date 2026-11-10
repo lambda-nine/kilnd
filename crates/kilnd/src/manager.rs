@@ -444,10 +444,56 @@ struct ExpiryState {
 }
 
 struct PendingDelete {
+    /// The boottime of the persisted expiry intent (MEDIUM 1): a restart keeps it.
     since: i64,
     failures: u32,
     retry_at: i64,
+    /// An attempt holds an expiry removal permit: a worker's or a joined Delete's.
     running: bool,
+    /// Due, but every permit was taken. It has no queue entry and no task; a
+    /// returned permit starts it (break-it HIGH 1).
+    waiting: bool,
+}
+
+/// Who runs `delete_inner`: a client Delete (which joins an expiry-owned removal
+/// under the expiry permit) or an expiry worker already holding that permit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeleteRole {
+    Client,
+    ExpiryWorker,
+}
+
+fn expiry_owned(s: &Sandbox) -> bool {
+    s.state == SandboxState::Deleting
+        && matches!(
+            s.lifecycle.deletion_reason,
+            Some(DeletionReason::ExpiredIdle | DeletionReason::ExpiredLifetime)
+        )
+}
+
+/// A client Delete following an expiry removal: it holds one expiry permit for its
+/// attempt and, if no expiry attempt was running, that slot's attempt too. Dropping
+/// it, on completion or cancellation, settles the attempt, returns the permit and
+/// starts a waiting removal.
+struct ExpiryJoin<R: Runtime + 'static> {
+    manager: Arc<Manager<R>>,
+    id: String,
+    key: u64,
+    permit: Option<OwnedSemaphorePermit>,
+    claimed: bool,
+    /// The attempt's result, or `None` if the caller was canceled first.
+    outcome: Option<bool>,
+}
+
+impl<R: Runtime + 'static> Drop for ExpiryJoin<R> {
+    fn drop(&mut self) {
+        if self.claimed {
+            self.manager
+                .settle_expiry_attempt(&self.id, self.key, self.outcome);
+        }
+        drop(self.permit.take());
+        self.manager.start_waiting_expiry_removals();
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2260,14 +2306,14 @@ impl<R: Runtime> Manager<R> {
         }
     }
 
-    pub async fn delete(&self, id: &str) -> Result<Sandbox> {
-        let result = self.delete_inner(id).await;
+    pub async fn delete(self: &Arc<Self>, id: &str) -> Result<Sandbox> {
+        let result = self.delete_inner(id, DeleteRole::Client).await;
         // A finished delete leaves no timer; a failed one keeps its retry if expiry owns it.
         self.expiry_refresh(id);
         result
     }
 
-    async fn delete_inner(&self, id: &str) -> Result<Sandbox> {
+    async fn delete_inner(self: &Arc<Self>, id: &str, role: DeleteRole) -> Result<Sandbox> {
         let sandbox = self.load(id)?;
         if sandbox.state == SandboxState::Deleted {
             return Ok(sandbox);
@@ -2279,6 +2325,25 @@ impl<R: Runtime> Manager<R> {
         if sandbox.state == SandboxState::Deleted {
             return Ok(sandbox);
         }
+        // Break-it HIGH 1: once the first-wins reason is an expiry's, this caller is
+        // a follower of that expiry removal and every backend removal it runs counts
+        // against `--max-concurrent-expiry-deletes`. It takes the same permit (and,
+        // when no expiry attempt is running, the slot's attempt) before the exec lock.
+        let join = match role {
+            DeleteRole::Client if expiry_owned(&sandbox) => {
+                Some(self.join_expiry_removal(id).await?)
+            }
+            DeleteRole::Client | DeleteRole::ExpiryWorker => None,
+        };
+        let result = self.remove_deleting(id, &slot).await;
+        if let Some(mut join) = join {
+            join.outcome = Some(matches!(&result, Ok(s) if s.state == SandboxState::Deleted));
+        }
+        result
+    }
+
+    /// The backend removal of a row this caller has moved to, or found, DELETING.
+    async fn remove_deleting(&self, id: &str, slot: &Slot) -> Result<Sandbox> {
         info!(sandbox = %id, "deleting sandbox");
         if let Some(cancel) = &*slot.running.lock().unwrap() {
             cancel.request(ExecCancelReason::SandboxDeleted);
@@ -2880,6 +2945,7 @@ impl<R: Runtime> Manager<R> {
     /// starts the restart grace. Run after reconciliation and the rebase.
     pub fn rebuild_expiry(&self) -> Result<()> {
         let rows = self.store.expiry_rows()?;
+        let ages = self.store.expiry_intent_ages()?;
         let reserved =
             usize::try_from(self.store.sandbox_resources()?.sandboxes).unwrap_or(usize::MAX);
         let now = self.clock.boottime_ms();
@@ -2893,20 +2959,19 @@ impl<R: Runtime> Manager<R> {
             let Some(key) = crate::expiry::key(&row.id) else {
                 continue;
             };
-            if row.state == SandboxState::Deleting
-                && matches!(
-                    row.lifecycle.deletion_reason,
-                    Some(DeletionReason::ExpiredIdle | DeletionReason::ExpiredLifetime)
-                )
-                && row.is_charged()
-            {
+            if expiry_owned(&row) && row.is_charged() {
+                // MEDIUM 1: the age is the persisted intent's, rebased across a
+                // reboot, so a restart never grants a stale delete a fresh window.
+                // A row without one is treated as already stale.
+                let since = ages.get(&row.id).copied().flatten().unwrap_or(i64::MIN);
                 st.pending.insert(
                     key,
                     PendingDelete {
-                        since: now,
+                        since,
                         failures: 0,
                         retry_at: now,
                         running: false,
+                        waiting: false,
                     },
                 );
             }
@@ -2952,6 +3017,7 @@ impl<R: Runtime> Manager<R> {
     /// One sweep: every entry due now, earliest first. Never awaits; removals run as
     /// tracked operations under `--max-concurrent-expiry-deletes`.
     pub fn expire_due(self: &Arc<Self>) {
+        self.start_waiting_expiry_removals();
         let now = self.clock.boottime_ms();
         let due = self.expiry.lock().unwrap().queue.pop_due(now);
         for key in due {
@@ -2977,18 +3043,13 @@ impl<R: Runtime> Manager<R> {
             }
         };
         if row.state == SandboxState::Deleting {
-            let start = {
-                let mut st = self.expiry.lock().unwrap();
-                match st.pending.get_mut(&key) {
-                    Some(p) if !p.running && p.retry_at <= now => {
-                        p.running = true;
-                        true
-                    }
-                    _ => false,
-                }
+            let due = {
+                let st = self.expiry.lock().unwrap();
+                matches!(st.pending.get(&key), Some(p) if !p.running && p.retry_at <= now)
             };
-            if start {
-                self.spawn_expiry_removal(id);
+            if due {
+                // Started now, or left waiting for a permit with no task and no entry.
+                self.try_start_expiry_removal(key);
             } else {
                 self.refresh_after_miss(&id, key, now);
             }
@@ -3025,7 +3086,7 @@ impl<R: Runtime> Manager<R> {
                 if let Some(cancel) = &*slot.running.lock().unwrap() {
                     cancel.request(ExecCancelReason::ExpiredLifetime);
                 }
-                self.begin_expiry_removal(id, key, now);
+                self.begin_expiry_removal(key, now);
             }
             Ok(false) => self.refresh_after_miss(id, key, now),
             Err(error) => {
@@ -3077,7 +3138,7 @@ impl<R: Runtime> Manager<R> {
             Ok(true) => {
                 self.expired_idle.fetch_add(1, Ordering::Relaxed);
                 info!(sandbox = %id, "sandbox reached its idle timeout; deleting");
-                self.begin_expiry_removal(id, key, now);
+                self.begin_expiry_removal(key, now);
             }
             Ok(false) => self.refresh_after_miss(id, key, now),
             Err(error) => {
@@ -3087,62 +3148,154 @@ impl<R: Runtime> Manager<R> {
         }
     }
 
-    fn begin_expiry_removal(self: &Arc<Self>, id: &str, key: u64, now: i64) {
+    fn begin_expiry_removal(self: &Arc<Self>, key: u64, now: i64) {
         self.expiry.lock().unwrap().pending.insert(
             key,
             PendingDelete {
                 since: now,
                 failures: 0,
                 retry_at: now,
-                running: true,
+                running: false,
+                waiting: false,
             },
         );
-        self.spawn_expiry_removal(id.to_string());
+        self.try_start_expiry_removal(key);
+    }
+
+    /// Break-it HIGH 1: a removal task exists only while it holds a permit. Without
+    /// a free permit the pending delete waits, bounded by reservations like the
+    /// queue, and the next returned permit starts it.
+    fn try_start_expiry_removal(self: &Arc<Self>, key: u64) -> bool {
+        let permit = {
+            let mut st = self.expiry.lock().unwrap();
+            let Some(p) = st.pending.get_mut(&key) else {
+                return false;
+            };
+            if p.running {
+                return false;
+            }
+            match self.expiry_deletes.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    p.running = true;
+                    p.waiting = false;
+                    permit
+                }
+                Err(_) => {
+                    p.waiting = true;
+                    st.queue.set(key, None);
+                    return false;
+                }
+            }
+        };
+        self.spawn_expiry_removal(key, permit);
+        true
+    }
+
+    /// Starts waiting removals, earliest retry first, while permits are free. Every
+    /// returned permit calls this; each sweep does too, so none is ever stranded.
+    fn start_waiting_expiry_removals(self: &Arc<Self>) {
+        loop {
+            if self.shutting_down.is_cancelled() {
+                return;
+            }
+            let started = {
+                let mut st = self.expiry.lock().unwrap();
+                let Some(key) = st
+                    .pending
+                    .iter()
+                    .filter(|(_, p)| p.waiting && !p.running)
+                    .min_by_key(|(key, p)| (p.retry_at, **key))
+                    .map(|(key, _)| *key)
+                else {
+                    return;
+                };
+                let Ok(permit) = self.expiry_deletes.clone().try_acquire_owned() else {
+                    return;
+                };
+                let p = st.pending.get_mut(&key).expect("selected above");
+                p.waiting = false;
+                p.running = true;
+                (key, permit)
+            };
+            self.spawn_expiry_removal(started.0, started.1);
+        }
+    }
+
+    /// A client Delete of an expiry-owned row: wait for an expiry permit (refused at
+    /// shutdown), then take the slot's attempt unless an expiry attempt is running,
+    /// in which case the exec lock orders this caller behind it.
+    async fn join_expiry_removal(self: &Arc<Self>, id: &str) -> Result<ExpiryJoin<R>> {
+        let key = crate::expiry::key(id)
+            .ok_or_else(|| Error::InvalidArgument(format!("invalid sandbox ID {id:?}")))?;
+        let permit = tokio::select! {
+            biased;
+            () = self.shutting_down.cancelled() => return Err(Error::ShuttingDown),
+            permit = self.expiry_deletes.clone().acquire_owned() => permit
+                .map_err(|_| Error::ShuttingDown)?,
+        };
+        let claimed = {
+            let mut st = self.expiry.lock().unwrap();
+            match st.pending.get_mut(&key) {
+                Some(p) if !p.running => {
+                    p.running = true;
+                    p.waiting = false;
+                    st.queue.set(key, None);
+                    true
+                }
+                _ => false,
+            }
+        };
+        Ok(ExpiryJoin {
+            manager: Arc::clone(self),
+            id: id.to_string(),
+            key,
+            permit: Some(permit),
+            claimed,
+            outcome: None,
+        })
+    }
+
+    /// Ends one expiry attempt: a failure backs off and counts; a cancellation
+    /// retries at its old time. Then the row's entry is recomputed.
+    fn settle_expiry_attempt(&self, id: &str, key: u64, outcome: Option<bool>) {
+        if outcome == Some(false) {
+            self.failed_expiry_deletes.fetch_add(1, Ordering::Relaxed);
+        }
+        {
+            let now = self.clock.boottime_ms();
+            let mut st = self.expiry.lock().unwrap();
+            if let Some(p) = st.pending.get_mut(&key) {
+                p.running = false;
+                if outcome == Some(false) {
+                    p.failures = p.failures.saturating_add(1);
+                    let delay = crate::expiry::retry_delay(p.failures);
+                    p.retry_at =
+                        now.saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX));
+                }
+            }
+        }
+        self.expiry_refresh(id);
     }
 
     /// One expiry removal: the ordinary delete path, under the expiry delete permit
-    /// and no client RPC permit. A failure leaves the row DELETING and charged, retried
-    /// with backoff; shutdown stops waiting removals, and startup completes them.
-    fn spawn_expiry_removal(self: &Arc<Self>, id: String) {
+    /// it was started with and no client RPC permit. A failure leaves the row
+    /// DELETING and charged, retried with backoff; startup completes any left.
+    fn spawn_expiry_removal(self: &Arc<Self>, key: u64, permit: OwnedSemaphorePermit) {
         let manager = Arc::clone(self);
+        let id = crate::expiry::id(key);
         self.operations.spawn(async move {
-            let Some(key) = crate::expiry::key(&id) else {
-                return;
-            };
-            let permit = tokio::select! {
-                biased;
-                () = manager.shutting_down.cancelled() => None,
-                permit = manager.expiry_deletes.clone().acquire_owned() => permit.ok(),
-            };
-            let Some(_permit) = permit else {
-                if let Some(p) = manager.expiry.lock().unwrap().pending.get_mut(&key) {
-                    p.running = false;
-                }
-                return;
-            };
-            let result = manager.delete_inner(&id).await;
+            let result = manager.delete_inner(&id, DeleteRole::ExpiryWorker).await;
             let deleted = matches!(&result, Ok(s) if s.state == SandboxState::Deleted);
             if !deleted {
-                manager.failed_expiry_deletes.fetch_add(1, Ordering::Relaxed);
                 let why = match &result {
                     Ok(s) => format!("still {}", s.state.as_str()),
                     Err(error) => error.to_string(),
                 };
                 warn!(sandbox = %id, error = %why, "expiry delete failed; the sandbox stays charged and is retried");
             }
-            {
-                let now = manager.clock.boottime_ms();
-                let mut st = manager.expiry.lock().unwrap();
-                if let Some(p) = st.pending.get_mut(&key) {
-                    p.running = false;
-                    if !deleted {
-                        p.failures = p.failures.saturating_add(1);
-                        let delay = crate::expiry::retry_delay(p.failures);
-                        p.retry_at = now.saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX));
-                    }
-                }
-            }
-            manager.expiry_refresh(&id);
+            manager.settle_expiry_attempt(&id, key, Some(deleted));
+            drop(permit);
+            manager.start_waiting_expiry_removals();
         });
     }
 
@@ -3460,7 +3613,7 @@ fn next_action(
     };
     match s.state {
         SandboxState::Deleting => match st.pending.get(&key) {
-            Some(p) if !p.running => Some((p.retry_at, Due::Retry)),
+            Some(p) if !p.running && !p.waiting => Some((p.retry_at, Due::Retry)),
             _ => None,
         },
         SandboxState::Ready | SandboxState::Lost | SandboxState::Quarantined => {

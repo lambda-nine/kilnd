@@ -1,7 +1,7 @@
 //! SQLite state: one row per sandbox and per execution. kilnd is the only
 //! writer; the database lives in a kilnd-owned private directory.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -360,6 +360,8 @@ ALTER TABLE sandboxes ADD COLUMN activity_boottime_ms INTEGER CHECK (activity_bo
 ALTER TABLE sandboxes ADD COLUMN clock_boot_id TEXT CHECK (clock_boot_id IS NULL OR (typeof(clock_boot_id) = 'text' AND length(clock_boot_id) BETWEEN 1 AND 64));
 ALTER TABLE sandboxes ADD COLUMN activity_seq INTEGER NOT NULL DEFAULT 0 CHECK (typeof(activity_seq) = 'integer' AND activity_seq >= 0);
 ALTER TABLE sandboxes ADD COLUMN deletion_reason TEXT CHECK (deletion_reason IS NULL OR deletion_reason IN ('requested', 'expired_idle', 'expired_lifetime'));
+ALTER TABLE sandboxes ADD COLUMN expiry_intent_at_ms INTEGER CHECK (expiry_intent_at_ms IS NULL OR typeof(expiry_intent_at_ms) = 'integer');
+ALTER TABLE sandboxes ADD COLUMN expiry_intent_boottime_ms INTEGER CHECK (expiry_intent_boottime_ms IS NULL OR typeof(expiry_intent_boottime_ms) = 'integer');
 ALTER TABLE executions ADD COLUMN cancel_reason TEXT CHECK (cancel_reason IS NULL OR cancel_reason IN ('client_disconnected', 'sandbox_deleted', 'daemon_shutdown', 'sandbox_expired_lifetime'));
 CREATE INDEX sandboxes_expiry ON sandboxes (id)
     WHERE state IN ('ready', 'lost', 'quarantined', 'deleting')
@@ -382,6 +384,16 @@ WHEN (OLD.ready_at_ms IS NOT NULL AND NEW.ready_at_ms IS NOT OLD.ready_at_ms)
     OR (OLD.ready_boottime_ms IS NOT NULL AND NEW.ready_boottime_ms IS NOT OLD.ready_boottime_ms
         AND NEW.clock_boot_id IS OLD.clock_boot_id)
 BEGIN SELECT RAISE(ABORT, 'a READY anchor changes only in the cross-boot rebase'); END;
+CREATE TRIGGER sandboxes_expiry_intent_anchor BEFORE UPDATE ON sandboxes
+WHEN (OLD.expiry_intent_at_ms IS NOT NULL AND NEW.expiry_intent_at_ms IS NOT OLD.expiry_intent_at_ms)
+    OR (OLD.expiry_intent_boottime_ms IS NOT NULL AND NEW.expiry_intent_boottime_ms IS NOT OLD.expiry_intent_boottime_ms
+        AND NEW.clock_boot_id IS OLD.clock_boot_id)
+    OR ((NEW.expiry_intent_at_ms IS NOT NULL OR NEW.expiry_intent_boottime_ms IS NOT NULL)
+        AND (NEW.deletion_reason IS NULL OR NEW.deletion_reason NOT IN ('expired_idle', 'expired_lifetime')))
+BEGIN SELECT RAISE(ABORT, 'an expiry intent anchor is written once, with its reason, and moves only in the cross-boot rebase'); END;
+CREATE TRIGGER sandboxes_expiry_intent_insert BEFORE INSERT ON sandboxes
+WHEN NEW.expiry_intent_at_ms IS NOT NULL OR NEW.expiry_intent_boottime_ms IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'an expiry intent anchor is written only by the expiry intent'); END;
 CREATE TRIGGER executions_cancel_reason_once BEFORE UPDATE ON executions
 WHEN OLD.cancel_reason IS NOT NULL AND NEW.cancel_reason IS NOT OLD.cancel_reason
 BEGIN SELECT RAISE(ABORT, 'a cancel reason is written once'); END;
@@ -936,13 +948,27 @@ fn stamp_first_ready(conn: &Connection, id: &str, now: &ClockReading) -> Result<
 
 /// Records one activity (design 2.1) in the caller's transaction. A row that was
 /// never READY only bumps its sequence: no clock runs before READY.
-fn record_activity(conn: &Connection, id: &str, now: &ClockReading) -> Result<()> {
+///
+/// MEDIUM 2: startup's terminal publications run before the cross-boot rebase. A row
+/// still anchored in another boot gets only the wall anchor, and keeps that boot's
+/// boottime and ID; the rebase then derives this boot's activity anchor from the new
+/// wall time, so neither anchor is stranded in a boot the other has left. Without a
+/// clock (no boot ID), only the sequence moves.
+fn record_activity(conn: &Connection, id: &str, now: Option<&ClockReading>) -> Result<()> {
+    let Some(now) = now else {
+        conn.execute(
+            "UPDATE sandboxes SET activity_seq = activity_seq + 1 WHERE id = ?1",
+            [id],
+        )?;
+        return Ok(());
+    };
     conn.execute(
         "UPDATE sandboxes SET activity_seq = activity_seq + 1,
              activity_at_ms = CASE WHEN ready_boottime_ms IS NULL THEN activity_at_ms ELSE ?2 END,
-             activity_boottime_ms = CASE WHEN ready_boottime_ms IS NULL THEN activity_boottime_ms ELSE ?3 END
+             activity_boottime_ms = CASE WHEN ready_boottime_ms IS NULL OR clock_boot_id IS NOT ?4
+                 THEN activity_boottime_ms ELSE ?3 END
          WHERE id = ?1",
-        params![id, now.wall_ms, now.boottime_ms],
+        params![id, now.wall_ms, now.boottime_ms, now.boot_id],
     )?;
     Ok(())
 }
@@ -1263,10 +1289,20 @@ impl Store {
             tx.execute_batch(MIGRATE_V9)?;
         }
         if version < 10 {
+            // Schema 10 introduces the membership marker: seed it from the rows
+            // this one transaction has just migrated.
             tx.execute_batch(MIGRATE_V10)?;
+            refresh_reservation_integrity(&tx)?;
+        } else {
+            // Break-it MEDIUM 3: a schema 10 database already has a marker. Audit it
+            // as it stands, before anything else changes, and never rewrite it: the
+            // schema 11 columns are not membership. A mismatch refuses startup and
+            // rolls the whole migration back, leaving the evidence at schema 10.
+            audit_accounting(&tx).context(
+                "schema 10 reservation integrity does not match; refusing to migrate to schema 11",
+            )?;
         }
         tx.execute_batch(MIGRATE_V11)?;
-        refresh_reservation_integrity(&tx)?;
         audit_accounting(&tx)?;
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
@@ -1474,13 +1510,26 @@ impl Store {
         if reason == DeletionReason::Requested {
             bail!("sandbox {id}: expiry publishes an expiry reason");
         }
+        // MEDIUM 1: the intent's own anchor, in this boot, so Health's stale-delete
+        // age survives a restart and is rebased with the other anchors after a reboot.
+        let now = self.clock_reading()?;
         let n = self.conn().execute(
-            "UPDATE sandboxes SET state = 'deleting', deletion_reason = ?2, updated_at_ms = ?3
+            "UPDATE sandboxes SET state = 'deleting', deletion_reason = ?2, updated_at_ms = ?3,
+                 expiry_intent_at_ms = ?3,
+                 expiry_intent_boottime_ms = CASE WHEN clock_boot_id IS NULL OR clock_boot_id = ?6 THEN ?5 END,
+                 clock_boot_id = COALESCE(clock_boot_id, ?6)
              WHERE id = ?1 AND state IN ('ready', 'lost', 'quarantined') AND deletion_reason IS NULL
                AND (expiry_lifetime_ms IS NOT NULL OR expiry_idle_ms IS NOT NULL)
                AND (accounting_kind = 'fenced' OR backend_id IS NOT NULL)
                AND (?4 IS NULL OR activity_seq = ?4)",
-            params![id, reason.as_str(), now_ms(), expected_seq],
+            params![
+                id,
+                reason.as_str(),
+                now.wall_ms,
+                expected_seq,
+                now.boottime_ms,
+                now.boot_id
+            ],
         )?;
         Ok(n == 1)
     }
@@ -1536,15 +1585,23 @@ impl Store {
         let now = self.clock_reading()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // (id, lifetime limit, idle limit, ready wall anchor, activity wall anchor)
-        type Foreign = (String, Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+        // (id, lifetime limit, idle limit, ready wall anchor, activity wall anchor,
+        // expiry intent wall anchor)
+        type Foreign = (
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
         let rows: Vec<Foreign> = {
             let mut stmt = tx.prepare(
-                "SELECT id, expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, activity_at_ms FROM sandboxes
-                 WHERE clock_boot_id IS NOT NULL AND clock_boot_id != ?1",
+                "SELECT id, expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, activity_at_ms, expiry_intent_at_ms
+                 FROM sandboxes WHERE clock_boot_id IS NOT NULL AND clock_boot_id != ?1",
             )?;
             stmt.query_map([&now.boot_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
             })?
             .collect::<rusqlite::Result<_>>()?
         };
@@ -1552,18 +1609,48 @@ impl Store {
             let spent = now.wall_ms.saturating_sub(anchor?).max(0);
             Some(limit.map_or(spent, |limit| spent.min(limit)))
         };
-        for (id, lifetime, idle, ready_at, activity_at) in &rows {
+        for (id, lifetime, idle, ready_at, activity_at, intent_at) in &rows {
             let ready = elapsed(*lifetime, *ready_at).map(|e| now.boottime_ms.saturating_sub(e));
             let activity = elapsed(*idle, activity_at.or(*ready_at))
                 .map(|e| now.boottime_ms.saturating_sub(e));
+            // A pending expiry delete keeps its whole wall age: it only grows.
+            let intent = elapsed(None, *intent_at).map(|e| now.boottime_ms.saturating_sub(e));
             tx.execute(
-                "UPDATE sandboxes SET ready_boottime_ms = ?2, activity_boottime_ms = ?3, clock_boot_id = ?4
+                "UPDATE sandboxes SET ready_boottime_ms = ?2, activity_boottime_ms = ?3, clock_boot_id = ?4,
+                     expiry_intent_boottime_ms = ?5
                  WHERE id = ?1",
-                params![id, ready, activity, now.boot_id],
+                params![id, ready, activity, now.boot_id, intent],
             )?;
         }
         tx.commit()?;
         Ok(rows.len())
+    }
+
+    /// MEDIUM 1: each expiry-owned DELETING row's intent boottime, in this boot (run
+    /// after the rebase), or `None` when it has none or another boot's.
+    pub fn expiry_intent_ages(&self) -> Result<HashMap<String, Option<i64>>> {
+        let reading = self.clock_reading().ok();
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, expiry_intent_boottime_ms, clock_boot_id FROM sandboxes INDEXED BY sandboxes_expiry
+             WHERE state IN ('ready', 'lost', 'quarantined', 'deleting')
+               AND (expiry_lifetime_ms IS NOT NULL OR expiry_idle_ms IS NOT NULL)
+               AND state = 'deleting' AND deletion_reason IN ('expired_idle', 'expired_lifetime')",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut ages = HashMap::new();
+        for row in rows {
+            let (id, since, boot) = row?;
+            let ours = reading.as_ref().is_some_and(|r| boot.as_deref() == Some(&r.boot_id));
+            ages.insert(id, since.filter(|_| ours));
+        }
+        Ok(ages)
     }
 
     /// Rows the expiry queue may need an entry for, read through the partial index:
@@ -1822,6 +1909,7 @@ impl Store {
         stopped: bool,
         reason: &str,
     ) -> Result<usize> {
+        let reading = self.clock_reading().ok();
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
@@ -1846,6 +1934,8 @@ impl Store {
             )?
         };
         if concluded != 0 {
+            // MEDIUM 2: a terminal publication is finish activity, even at startup.
+            record_activity(&tx, sandbox_id, reading.as_ref())?;
             apply_disposition(
                 &tx,
                 sandbox_id,
@@ -2013,7 +2103,7 @@ impl Store {
             ],
         )?;
         if n == 1 {
-            record_activity(&tx, &e.sandbox_id, &reading)?;
+            record_activity(&tx, &e.sandbox_id, Some(&reading))?;
         }
         tx.commit()?;
         Ok(n == 1)
@@ -2142,7 +2232,7 @@ impl Store {
             |row| row.get(0),
         )?;
         // The terminal publication is activity (design 2.1).
-        record_activity(&tx, &sandbox_id, &self.clock_reading()?)?;
+        record_activity(&tx, &sandbox_id, Some(&self.clock_reading()?))?;
         if let Some(disposition) = r.disposition {
             apply_disposition(
                 &tx,
@@ -2322,7 +2412,18 @@ impl Store {
         backend: &str,
         reason: &str,
     ) -> Result<usize> {
-        Ok(self.conn().execute(
+        let reading = self.clock_reading().ok();
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let parents: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT e.sandbox_id FROM executions e JOIN sandboxes s ON s.id = e.sandbox_id
+                 WHERE e.state = 'running' AND s.backend = ?1 AND s.accounting_kind = 'legacy'",
+            )?;
+            stmt.query_map([backend], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let n = tx.execute(
             "UPDATE executions
              SET state = 'interrupted', failure_reason = ?2, finished_at_ms = ?3
              WHERE state = 'running'
@@ -2333,7 +2434,14 @@ impl Store {
                      AND sandboxes.accounting_kind = 'legacy'
                )",
             params![backend, reason, now_ms()],
-        )?)
+        )?;
+        // MEDIUM 2: each parent's terminal publication is its finish activity, in
+        // the same transaction.
+        for parent in &parents {
+            record_activity(&tx, parent, reading.as_ref())?;
+        }
+        tx.commit()?;
+        Ok(n)
     }
 }
 
@@ -4224,6 +4332,153 @@ mod tests {
         }
     }
 
+    /// Break-it MEDIUM 3 regression (the review's PoC): a schema 10 marker that no
+    /// longer matches refuses the upgrade, which rolls back whole: still schema 10,
+    /// the same rows and the same marker, so the evidence survives for an operator.
+    #[test]
+    fn schema11_upgrade_refuses_a_v10_reservation_mismatch() {
+        for corruption in ["missing charged row", "changed marker"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut conn = disk_database_at(tmp.path(), 7);
+            register_receipt_validator(&conn).unwrap();
+            let tx = conn.transaction().unwrap();
+            migrate_v8(&tx).unwrap();
+            tx.execute_batch(MIGRATE_V9).unwrap();
+            tx.execute_batch(MIGRATE_V10).unwrap();
+            let mut charged = sandbox();
+            charged.state = SandboxState::Failed;
+            charged.failure_reason = Some("ambiguous create".into());
+            insert_sandbox_before_v11(&tx, &charged).unwrap();
+            refresh_reservation_integrity(&tx).unwrap();
+            tx.commit().unwrap();
+            conn.execute_batch("CREATE TEMP TABLE accounting_quarantine (id TEXT PRIMARY KEY);")
+                .unwrap();
+            assert!(audit_accounting(&conn).is_ok(), "{corruption}: intact first");
+            match corruption {
+                "missing charged row" => {
+                    // Membership lost after v10 last wrote its marker, past the triggers.
+                    conn.set_db_config(
+                        rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+                        false,
+                    )
+                    .unwrap();
+                    conn.execute("DELETE FROM sandboxes WHERE id = ?1", [&charged.id])
+                        .unwrap();
+                }
+                _ => {
+                    conn.execute(
+                        "UPDATE reservation_integrity SET digest = ?1 WHERE id = 1",
+                        [vec![7u8; 32]],
+                    )
+                    .unwrap();
+                }
+            }
+            assert!(audit_accounting(&conn).is_err(), "{corruption}: v10 detects it");
+            let rows = table_snapshot(&conn, "sandboxes");
+            let marker = table_snapshot(&conn, "reservation_integrity");
+            release_database(conn, tmp.path());
+
+            let error = Store::open(tmp.path()).err().expect(corruption);
+            let message = format!("{error:#}");
+            assert!(message.contains("reservation integrity"), "{message}");
+
+            let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
+            let version: i64 = conn
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 10, "{corruption}: the migration rolled back");
+            assert_eq!(table_snapshot(&conn, "sandboxes"), rows, "{corruption}");
+            assert_eq!(
+                table_snapshot(&conn, "reservation_integrity"),
+                marker,
+                "{corruption}: the marker is never rewritten"
+            );
+            drop(conn);
+        }
+    }
+
+    /// MEDIUM 3: an intact schema 10 upgrades without rewriting its marker, since
+    /// the schema 11 columns are not reservation membership.
+    #[test]
+    fn schema11_upgrade_keeps_an_intact_v10_marker_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = disk_database_at(tmp.path(), 7);
+        register_receipt_validator(&conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        migrate_v8(&tx).unwrap();
+        tx.execute_batch(MIGRATE_V9).unwrap();
+        tx.execute_batch(MIGRATE_V10).unwrap();
+        let mut charged = sandbox();
+        charged.state = SandboxState::Failed;
+        charged.failure_reason = Some("ambiguous create".into());
+        insert_sandbox_before_v11(&tx, &charged).unwrap();
+        refresh_reservation_integrity(&tx).unwrap();
+        tx.commit().unwrap();
+        let marker = table_snapshot(&conn, "reservation_integrity");
+        release_database(conn, tmp.path());
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(table_snapshot(&store.conn(), "reservation_integrity"), marker);
+        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+    }
+
+    /// MEDIUM 2: both startup publications of a terminal execution record the
+    /// parent's finish activity in their own transaction, legacy and fenced.
+    #[test]
+    fn startup_terminal_publications_record_finish_activity() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = crate::expiry::ManualClock::default();
+        store.set_clock(std::sync::Arc::new(clock.clone()));
+        let mut legacy = sandbox();
+        legacy.lifecycle.expiry.idle_timeout_ms = Some(60_000);
+        store.insert_sandbox(&legacy).unwrap();
+        store
+            .set_sandbox_state(&legacy.id, SandboxState::Ready, Some("b-1"), None)
+            .unwrap();
+        let e = execution(&legacy.id);
+        assert!(store.start_execution(&e).unwrap());
+        let before = store.sandbox(&legacy.id).unwrap().unwrap().lifecycle;
+        clock.advance(900_000);
+        assert_eq!(
+            store
+                .interrupt_running_executions_for_backend(&legacy.backend, "restart")
+                .unwrap(),
+            1
+        );
+        let after = store.sandbox(&legacy.id).unwrap().unwrap().lifecycle;
+        assert_eq!(after.activity_seq, before.activity_seq + 1);
+        assert_eq!(after.activity_boottime_ms, Some(clock.boottime_ms()));
+
+        let mut fenced = fenced_sandbox();
+        fenced.lifecycle.expiry.idle_timeout_ms = Some(60_000);
+        store.insert_sandbox(&fenced).unwrap();
+        let binding = fenced.accounting.allocation.clone().unwrap();
+        let created = CreatedSandbox {
+            backend_id: binding.backend_id(),
+            receipt: RuntimeReceipt::Ready(crate::runtime::ReadyReceipt {
+                node_id: binding.node_id,
+                instance_id: binding.instance_id,
+                allocation_id: binding.allocation_id,
+                plan_digest: binding.plan_digest,
+                helper_generation: 3,
+                boot_id: "boot-1".into(),
+            }),
+        };
+        assert!(store.publish_fenced_ready(&fenced.id, &created).unwrap());
+        let e = execution(&fenced.id);
+        assert!(store.start_execution(&e).unwrap());
+        let before = store.sandbox(&fenced.id).unwrap().unwrap().lifecycle;
+        clock.advance(900_000);
+        assert_eq!(
+            store
+                .conclude_running_executions(&fenced.id, true, "restart")
+                .unwrap(),
+            1
+        );
+        let after = store.sandbox(&fenced.id).unwrap().unwrap().lifecycle;
+        assert_eq!(after.activity_seq, before.activity_seq + 1);
+        assert_eq!(after.activity_boottime_ms, Some(clock.boottime_ms()));
+    }
+
     #[test]
     fn schema11_triggers_defend_policy_reasons_sequence_and_anchors() {
         let store = Store::open_in_memory().unwrap();
@@ -4280,9 +4535,28 @@ mod tests {
                 .unwrap()
         );
         let conn = store.conn();
+        // MEDIUM 1: the intent's wall anchor is written; its boottime only in the
+        // row's own boot (this one is boot-b's), and both move only with a rebase.
+        let (intent_at, intent_boot): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT expiry_intent_at_ms, expiry_intent_boottime_ms FROM sandboxes WHERE id = ?1",
+                [&row.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(intent_at.is_some());
+        assert_eq!(intent_boot, None);
+        conn.execute(
+            "UPDATE sandboxes SET expiry_intent_boottime_ms = 9, clock_boot_id = 'boot-c' WHERE id = ?1",
+            [&row.id],
+        )
+        .unwrap();
         for attack in [
             "UPDATE sandboxes SET deletion_reason = 'expired_lifetime' WHERE id = ?1",
             "UPDATE sandboxes SET deletion_reason = NULL WHERE id = ?1",
+            "UPDATE sandboxes SET expiry_intent_at_ms = expiry_intent_at_ms + 1 WHERE id = ?1",
+            "UPDATE sandboxes SET expiry_intent_boottime_ms = 10 WHERE id = ?1",
+            "UPDATE sandboxes SET expiry_intent_at_ms = NULL WHERE id = ?1",
         ] {
             assert!(conn.execute(attack, [&row.id]).is_err(), "{attack}");
         }
@@ -5812,7 +6086,7 @@ mod tests {
                     use rusqlite::types::Value::{Integer, Null};
                     assert_eq!(
                         &after[before.len()..],
-                        &[Null, Null, Null, Null, Null, Null, Null, Integer(0), Null]
+                        &[Null, Null, Null, Null, Null, Null, Null, Integer(0), Null, Null, Null]
                     );
                 }
                 assert_eq!(table_snapshot(&store.conn(), "release_evidence"), evidence);

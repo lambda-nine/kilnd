@@ -15,6 +15,9 @@ use crate::model::{ExpiryPolicy, Sandbox, SandboxState};
 
 /// The shortest lifetime or idle timeout a request may ask for, in ms.
 pub const MIN_EXPIRY_MS: u64 = 10_000;
+/// The longest lifetime or idle timeout a request may ask for, in ms, even with no
+/// node maximum: the schema stores durations as signed 64-bit integers.
+pub const MAX_EXPIRY_MS: u64 = i64::MAX as u64;
 /// A Renew this soon after the last durable activity writes nothing.
 pub const RENEW_COALESCE_MS: i64 = 1_000;
 /// Expiry removal retry backoff.
@@ -232,6 +235,13 @@ pub fn resolve_expiry(
         if value < MIN_EXPIRY_MS {
             return Err(format!(
                 "expiry.{name} {value} ms is below the minimum of {MIN_EXPIRY_MS} ms"
+            ));
+        }
+        // Break-it LOW 1: the persisted columns are signed, so this is an API
+        // limit even on a node with no maximum, refused before any allocation.
+        if value > MAX_EXPIRY_MS {
+            return Err(format!(
+                "expiry.{name} {value} ms is above the representable maximum of {MAX_EXPIRY_MS} ms"
             ));
         }
         if max != 0 && value > max {
@@ -456,11 +466,20 @@ mod tests {
             max_idle_ms: 0,
             ..node
         };
-        let huge = RequestedExpiry {
-            max_lifetime_ms: u64::MAX,
-            idle_timeout_ms: u64::MAX,
+        let largest = RequestedExpiry {
+            max_lifetime_ms: MAX_EXPIRY_MS,
+            idle_timeout_ms: MAX_EXPIRY_MS,
         };
-        assert!(resolve_expiry(Some(huge), &uncapped).is_ok());
+        assert!(resolve_expiry(Some(largest), &uncapped).is_ok());
+        // Break-it LOW 1: uncapped is still bounded by what the schema can store.
+        for (lifetime, idle) in [(MAX_EXPIRY_MS + 1, 0), (0, MAX_EXPIRY_MS + 1), (u64::MAX, 0)] {
+            let huge = RequestedExpiry {
+                max_lifetime_ms: lifetime,
+                idle_timeout_ms: idle,
+            };
+            let error = resolve_expiry(Some(huge), &uncapped).unwrap_err();
+            assert!(error.contains("representable maximum"), "{error}");
+        }
     }
 
     #[test]

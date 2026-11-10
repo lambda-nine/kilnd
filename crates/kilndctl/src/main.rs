@@ -377,6 +377,7 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(0)
         }
         Command::Renew { id } => {
+            require_feature(&mut client, pb::Feature::SandboxExpiry, "renew").await?;
             let s = client
                 .renew_sandbox(pb::RenewSandboxRequest { id })
                 .await
@@ -476,6 +477,16 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
             max_lifetime_ms: lifetime.unwrap_or(0),
             idle_timeout_ms: idle.unwrap_or(0),
         });
+    if expiry.is_some() {
+        // An older daemon ignores the unknown field and creates a sandbox that never
+        // expires, so discover first and send nothing it would not honor.
+        require_feature(
+            client,
+            pb::Feature::SandboxExpiry,
+            "--max-lifetime, --idle-timeout or --expiry-defaults",
+        )
+        .await?;
+    }
     let spec = pb::SandboxSpec {
         image: a.image.unwrap_or_default(),
         limits: Some(pb::ResourceLimits {
@@ -507,6 +518,45 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
         .into_inner()
         .sandbox
         .context("response has no sandbox")
+}
+
+/// Design section 1: a client uses a feature only from a fresh SERVING Health
+/// response that advertises it. Asked right before the request that needs it.
+async fn require_feature(
+    client: &mut KilndServiceClient<Channel>,
+    feature: pb::Feature,
+    what: &str,
+) -> Result<()> {
+    let health = client
+        .health(pb::HealthRequest {})
+        .await
+        .map_err(rpc)?
+        .into_inner();
+    check_feature(&health, feature, what)
+}
+
+fn check_feature(health: &pb::HealthResponse, feature: pb::Feature, what: &str) -> Result<()> {
+    let name = feature_name(feature as i32);
+    if health.status != pb::health_response::Status::Serving as i32 {
+        let status = pb::health_response::Status::try_from(health.status)
+            .map(|s| s.as_str_name().trim_start_matches("STATUS_").to_lowercase())
+            .unwrap_or_else(|_| format!("unknown({})", health.status));
+        bail!(
+            "kilnd is {status}, not serving, so its features are unproven; refusing to send {what} (needs {name}): {}",
+            health.detail
+        );
+    }
+    let advertised = health
+        .runtime_capabilities
+        .as_ref()
+        .is_some_and(|c| c.features.contains(&(feature as i32)));
+    if !advertised {
+        bail!(
+            "this kilnd (version {}) does not advertise {name}; refusing to send {what}, which it would ignore or refuse",
+            health.version
+        );
+    }
+    Ok(())
 }
 
 async fn exec(
@@ -1063,6 +1113,58 @@ mod tests {
             panic!("create")
         };
         assert_eq!(args.idle_timeout.as_deref(), Some("10m"));
+    }
+
+    /// Break-it MEDIUM 4: expiry and Renew need a SERVING Health that advertises
+    /// SANDBOX_EXPIRY. A 0547a0c daemon's Health has capabilities but no features.
+    #[test]
+    fn expiry_requires_a_serving_daemon_that_advertises_it() {
+        let serving = pb::health_response::Status::Serving as i32;
+        let old_daemon = pb::HealthResponse {
+            status: serving,
+            version: "0.1.0".into(),
+            runtime_capabilities: Some(pb::RuntimeCapabilities {
+                interruption_preserves_session: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = check_feature(&old_daemon, pb::Feature::SandboxExpiry, "--max-lifetime")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not advertise sandbox_expiry"), "{error}");
+        let no_capabilities = pb::HealthResponse {
+            status: serving,
+            ..Default::default()
+        };
+        assert!(check_feature(&no_capabilities, pb::Feature::SandboxExpiry, "renew").is_err());
+        let current = pb::HealthResponse {
+            status: serving,
+            runtime_capabilities: Some(pb::RuntimeCapabilities {
+                features: vec![
+                    pb::Feature::SandboxExpiry as i32,
+                    pb::Feature::TypedReasons as i32,
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        check_feature(&current, pb::Feature::SandboxExpiry, "--max-lifetime").unwrap();
+        assert!(check_feature(&current, pb::Feature::ExecEnv, "--env").is_err());
+        for status in [
+            pb::health_response::Status::Degraded,
+            pb::health_response::Status::ShuttingDown,
+            pb::health_response::Status::Unspecified,
+        ] {
+            let not_serving = pb::HealthResponse {
+                status: status as i32,
+                ..current.clone()
+            };
+            let error = check_feature(&not_serving, pb::Feature::SandboxExpiry, "renew")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not serving"), "{error}");
+        }
     }
 
     #[test]

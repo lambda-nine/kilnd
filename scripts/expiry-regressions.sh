@@ -37,11 +37,16 @@ restart_kilnd() {
     sudo systemctl restart kilnd
     wait_ready
 }
+# Runs in this shell, never in a command substitution (which would append to a
+# subshell's copy of `created` and leave EXIT cleanup blind): the ID is in $created_id.
+created_id=
 create() {
-    local id
-    id=$(ctl create "${small[@]}" "$@")
-    created+=("$id")
-    echo "$id"
+    [ "$BASHPID" = "$$" ] || fail "create ran in a subshell; its ID would escape EXIT cleanup"
+    created_id=
+    ctl create "${small[@]}" "$@" >"$out/created"
+    created_id=$(cat "$out/created")
+    [ -n "$created_id" ] || fail "create printed no ID"
+    created+=("$created_id")
 }
 state_of() { ctl get "$1" | awk '/^state:/ { print $2 }'; }
 reason_of() { ctl get "$1" | awk '/^deleted by:/ { print $3 }'; }
@@ -59,8 +64,29 @@ backend_gone() {
     if sudo kiln ls | grep -q "^$1[[:space:]]"; then fail "kiln still has $1"; fi
 }
 
-echo "1. Health lists the expiry features"
+# The cleanup self-test's child: create one sandbox, then fail an assertion.
+if [ "${EXPIRY_REGRESSIONS_FORCE_FAIL:-}" = 1 ]; then
+    wait_ready
+    create --max-lifetime 1h
+    echo "$created_id $(backend_of "$created_id")" >"$EXPIRY_REGRESSIONS_FORCE_FAIL_OUT"
+    fail "forced failure (cleanup self-test)"
+fi
+
+echo "0. A failed assertion's EXIT cleanup removes what the run created"
 wait_ready
+if (create) >"$out/subshell" 2>&1; then fail "create ran in a subshell"; fi
+grep -q 'create ran in a subshell' "$out/subshell" || fail "subshell guard: $(cat "$out/subshell")"
+if EXPIRY_REGRESSIONS_FORCE_FAIL=1 EXPIRY_REGRESSIONS_FORCE_FAIL_OUT="$out/forced" \
+    "${BASH_SOURCE[0]}" >"$out/forced.log" 2>&1; then
+    fail "the forced failure passed"
+fi
+grep -q 'FAIL: forced failure' "$out/forced.log" || fail "self-test: $(cat "$out/forced.log")"
+read -r forced forced_backend <"$out/forced"
+[ -n "$forced_backend" ] || fail "self-test recorded no backend"
+[ "$(state_of "$forced")" = deleted ] || fail "EXIT cleanup left $forced $(state_of "$forced")"
+backend_gone "$forced_backend"
+
+echo "1. Health lists the expiry features"
 health=$(ctl health)
 grep -q '^features: .*sandbox_expiry' <<<"$health" || fail "no sandbox_expiry feature: $health"
 grep -q '^features: .*typed_reasons' <<<"$health" || fail "no typed_reasons feature"
@@ -81,9 +107,12 @@ done
 echo "3. A restart starts the idle grace; lifetime has none"
 restart_kilnd
 started=$(now)
-never=$(create)
-grace_idle=$(create --idle-timeout 10s)
-lifetime=$(create --max-lifetime 15s)
+create
+never=$created_id
+create --idle-timeout 10s
+grace_idle=$created_id
+create --max-lifetime 15s
+lifetime=$created_id
 lifetime_backend=$(backend_of "$lifetime")
 ctl get "$lifetime" | grep -q '^expiry: *lifetime 15 s, idle never' || fail "effective policy not shown"
 ctl get "$lifetime" | grep -q '(lifetime)' || fail "lifetime deadline not shown"
@@ -117,7 +146,8 @@ if ctl renew "$grace_idle" >"$out/refused" 2>&1; then fail "renew of an expired 
 grep -q 'failedprecondition: expired_idle: ' "$out/refused" || fail "untyped renew refusal: $(cat "$out/refused")"
 
 echo "4. Renew and executions are activity; observers are not"
-renewed=$(create --idle-timeout 15s)
+create --idle-timeout 15s
+renewed=$created_id
 for _ in 1 2 3 4 5 6; do
     sleep 5
     ctl renew "$renewed" >/dev/null
@@ -131,7 +161,8 @@ wait_deleted "$renewed" $((quiet + 50))
 [ "$(reason_of "$renewed")" = expired_idle ] || fail "renewed reason $(reason_of "$renewed")"
 
 echo "5. A daemon restart keeps a lifetime deadline"
-kept=$(create --max-lifetime 30s)
+create --max-lifetime 30s
+kept=$created_id
 kept_at=$(now)
 sleep 5
 restart_kilnd
@@ -140,7 +171,37 @@ wait_deleted "$kept" $((kept_at + 70))
 [ "$(now)" -ge $((kept_at + 29)) ] || fail "lifetime expired early after restart"
 [ "$(reason_of "$kept")" = expired_lifetime ] || fail "kept reason $(reason_of "$kept")"
 
-echo "6. A sandbox without a policy never expired; stats add up"
+echo "6. Client Deletes racing a mass expiry join it and all finish"
+# Eight lifetimes fall together, past the four expiry removal permits; a client rm of
+# each races the sweeper. Each rm either runs first (requested) or follows the expiry
+# under its permit (expired_lifetime); none may fail, strand or leave a backend.
+racers=()
+racer_backends=()
+for _ in 1 2 3 4 5 6 7 8; do
+    create --max-lifetime 10s
+    racers+=("$created_id")
+    racer_backends+=("$(backend_of "$created_id")")
+done
+race_at=$(now)
+sleep 10
+rm_pids=()
+for s in "${racers[@]}"; do
+    ctl rm "$s" >"$out/rm-$s" 2>&1 &
+    rm_pids+=($!)
+done
+for pid in "${rm_pids[@]}"; do wait "$pid" || fail "a racing rm failed: $(cat "$out"/rm-*)"; done
+for s in "${racers[@]}"; do
+    wait_deleted "$s" $((race_at + 60))
+    case "$(reason_of "$s")" in
+        requested | expired_lifetime) ;;
+        *) fail "$s reason $(reason_of "$s")" ;;
+    esac
+done
+for b in "${racer_backends[@]}"; do backend_gone "$b"; done
+expiry=$(ctl health | awk '/^expiry:/')
+grep -q '0 pending deletes' <<<"$expiry" || fail "racing deletes left pending expiry deletes: $expiry"
+
+echo "7. A sandbox without a policy never expired; stats add up"
 [ "$(state_of "$never")" = ready ] || fail "a sandbox without a policy is $(state_of "$never")"
 ctl get "$never" | grep -q '^expiry:' && fail "a sandbox without a policy shows an expiry"
 ctl rm "$never" >/dev/null

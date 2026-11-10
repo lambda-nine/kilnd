@@ -467,7 +467,9 @@ backend proves a dynamic feature yet (exec cwd, env and streaming come later); t
 create-time and Exec-time gates will read the same set Health publishes. An older
 daemon lists no features and ignores unknown request fields, so a client sets a
 field only when its feature is listed in a `SERVING` response, and re-reads the
-list after every reconnect.
+list after every reconnect. `kilndctl` does this itself: `create` with an expiry
+option and `renew` first read Health and refuse, sending nothing, unless it is
+`SERVING` and lists `SANDBOX_EXPIRY`; a plain `create` sends no Health request.
 
 Refusals defined by the additions, and the existing "is X, not ready" refusals of
 Exec and RenewSandbox, carry a `kilnd-reason: <token>` metadata entry, and their
@@ -486,8 +488,9 @@ at create, into an effective policy stored with the row and never changed. An
 absent message never expires, whatever the node is configured with, so a client
 that predates expiry cannot be expired. In a present message a nonzero field is
 used as given, within 10 s and the node maximum (`--max-sandbox-lifetime-secs`,
-`--max-sandbox-idle-secs`; 0 is no cap), else `INVALID_ARGUMENT` before anything is
-prepared; a zero field takes the node default for that field
+`--max-sandbox-idle-secs`; 0 is no cap), and never above `i64::MAX` ms, which the
+signed schema columns can store even on a node with no cap, else `INVALID_ARGUMENT`
+before anything is prepared; a zero field takes the node default for that field
 (`--default-sandbox-lifetime-secs`, `--default-sandbox-idle-secs`, shipped as 0,
 never).
 
@@ -497,7 +500,11 @@ insert, its terminal publication and a successful `RenewSandbox`. Get, List,
 GetExecution, Health and Delete never count. While an execution runs or an admitted
 Exec is queued (the slot's outstanding permits are not all free) idle is paused and
 `ExpiryStatus.idle_paused` is true; the finish that releases the last permit restarts
-it. Nothing runs before `READY`. Deadlines run in `READY`, `LOST` and `QUARANTINED`,
+it. Startup's terminal publications (an interrupted legacy execution, a fenced one
+concluded across a crash) are finish activity too, in the same transaction. They run
+before the cross-boot rebase, so a row still anchored in another boot gets only its
+wall activity anchor and keeps that boot's boottime and ID; the rebase then derives
+this boot's anchor from it, and neither anchor is stranded in a boot the other left. Nothing runs before `READY`. Deadlines run in `READY`, `LOST` and `QUARANTINED`,
 because those rows still hold reservations; a legacy row without a backend ID is an
 ambiguous reservation Delete refuses, so expiry never targets it. Renew is accepted
 only in `READY`, and within a second of the last durable activity it writes nothing.
@@ -510,7 +517,8 @@ daemon restart exactly and ignores NTP and administrator steps. After startup
 reconciliation and before the prune, the sweeper and serving, one `IMMEDIATE`
 transaction rebases every row anchored in another boot: for each anchor it
 subtracts `min(limit, max(0, now_wall - anchor_wall))` from current boottime and
-writes the current boot ID with both anchors. That one wall read is unavoidable
+writes the current boot ID with both anchors, and moves a pending expiry delete's
+intent anchor by its whole wall age. That one wall read is unavoidable
 across a reboot and harmless, since neither backend survives one: such a sandbox is
 `LOST`, and a skewed estimate frees a dead reservation sooner or later. The API's
 `*_unix_ms` fields are wall projections computed at read time and move if the wall
@@ -559,15 +567,29 @@ refuse, and one that commits after always finds the execution to cancel.
 `deletion_reason` is written with the delete intent, only while null, and never
 changes; a user Delete records `requested`, and a Delete of an expired row succeeds
 as a follower and shows its expiry. At most `--max-concurrent-expiry-deletes` (4)
-removals run at once, and they use no client RPC permit; every intent publishes at
-once, so a mass expiry refuses new work immediately while the backend sees a bounded
-number of removals. A failed removal leaves the row `DELETING` and charged, retried
-with backoff from 5 s to 5 min; `HealthResponse.lifecycle` reports expiries, pending
-and failed expiry deletes, and one pending longer than `--expiry-degraded-after-secs`
-(600) makes Health `DEGRADED`. A crash after an intent commits is completed at
+removals of expiry-owned rows run at once, and they use no client RPC permit; every
+intent publishes at once, so a mass expiry refuses new work immediately while the
+backend sees a bounded number of removals. A removal task exists only while it holds
+one of those permits: a due delete that finds none free waits as a flag on its
+pending entry, with no task and no queue entry, bounded by reservations like the
+queue, and each returned permit starts the earliest waiting one. A client Delete of
+an expiry-owned `DELETING` row is that removal's follower: it waits for an expiry
+permit before the exec lock, and runs the attempt itself only when no expiry attempt
+is running (otherwise the lock orders it behind that attempt, which it then
+observes). So the limit holds across expiry and client Delete together, and a Delete
+that finishes a row leaves nothing waiting behind it; a canceled follower returns
+its permit and hands the attempt back to expiry. A Delete of a row whose first reason
+is `requested` is an ordinary client removal, bounded by RPC admission, and never
+takes an expiry permit. A failed removal leaves the row `DELETING` and charged,
+retried with backoff from 5 s to 5 min; `HealthResponse.lifecycle` reports expiries,
+pending and failed expiry deletes, and one pending longer than
+`--expiry-degraded-after-secs` (600) makes Health `DEGRADED`. That age counts from
+the intent, whose boottime is stored with it (schema 11's
+`expiry_intent_boottime_ms`, rebased with the other anchors), so a restart never
+grants a stale delete a fresh window. A crash after an intent commits is completed at
 startup like any `DELETING` row, keeping its reason. At shutdown the sweeper stops
-scheduling; removals already running are tracked operations and drain, and ones
-still waiting for a permit stop and are completed at the next startup.
+scheduling; removals already running are tracked operations and drain, and waiting
+ones are completed at the next startup.
 
 ## Concurrency
 
@@ -681,14 +703,20 @@ use this order.
 
 Schema v11 adds the expiry policy (`expiry_lifetime_ms`, `expiry_idle_ms`, null for
 never), the `READY` and last-activity anchors in wall time and boottime with their
-`clock_boot_id`, `activity_seq` and `deletion_reason` to `sandboxes`, `cancel_reason`
-to `executions`, and a partial index on rows with a policy in a live or `DELETING`
-state. Triggers keep the policy immutable, write `deletion_reason` once and only with
-`DELETING` or `DELETED`, keep `activity_seq` increasing and move a `READY` anchor only
-together with its boot ID, and write `cancel_reason` once. None of these columns enters
-the reservation digest or the fenced identity triggers: they are lifecycle data, not
-reservation membership. History migrates with nulls and sequence 0, which means never
-expires and reason unknown.
+`clock_boot_id`, `activity_seq`, `deletion_reason` and an expiry intent's wall and
+boottime anchors (`expiry_intent_at_ms`, `expiry_intent_boottime_ms`) to `sandboxes`,
+`cancel_reason` to `executions`, and a partial index on rows with a policy in a live
+or `DELETING` state. Triggers keep the policy immutable, write `deletion_reason` once
+and only with `DELETING` or `DELETED`, keep `activity_seq` increasing, move a `READY`
+anchor or the intent's boottime anchor only together with its boot ID, write the
+intent anchors only with an expiry reason and never on insert, and write
+`cancel_reason` once. None of these columns enters the reservation digest or the
+fenced identity triggers: they are lifecycle data, not reservation membership.
+History migrates with nulls and sequence 0, which means never expires and reason
+unknown. So the upgrade never rewrites a schema 10 membership marker: it audits the
+marker as it stands before any change, and a mismatch refuses startup and rolls the
+whole migration back, leaving the database at schema 10 with its evidence intact.
+Only an upgrade from below 10 seeds a marker. Both paths audit again before commit.
 
 Schema v3 adds nullable command termination kind/value/core and bounded JSON
 runtime diagnostics. Persistence caps messages at 2048 UTF-8 bytes and native

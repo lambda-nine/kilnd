@@ -1046,3 +1046,360 @@ async fn exec_refuses_a_sandbox_that_left_ready_before_its_row() {
     assert_eq!(row(&m, &sandbox.id).lifecycle.activity_seq, 0);
     assert!(fake.state().exec_calls.is_empty());
 }
+
+// ---- Break-it fixes (API additions M1 review) ----
+
+/// HIGH 1 regression (the review's PoC): an expiry removal task exists only with a
+/// permit, and a client Delete of an expiry-owned row joins under the same permit.
+/// So tracked expiry operations and active backend removals both stay at the
+/// configured limit, and no waiter outlives its row.
+#[tokio::test]
+async fn client_delete_joins_expiry_removals_under_the_removal_bound() {
+    // Joined Deletes hold their reservations until they finish, so make room.
+    let (m, fake, clock) = clocked(Limits {
+        max_sandboxes: 128,
+        ..test_limits()
+    });
+    m.rebuild_expiry().unwrap();
+    let limit = m.limits.expiry.max_concurrent_deletes;
+    assert_eq!(limit, 4);
+
+    let hold = Arc::new(tokio::sync::Notify::new());
+    fake.state().remove_hold = Some(hold.clone());
+    let mut held = Vec::new();
+    for _ in 0..limit {
+        held.push(m.create(policy(10, 0)).await.unwrap().id);
+    }
+    clock.advance(10 * SEC);
+    m.expire_due();
+    until(|| fake.state().active_removes == limit as u32).await;
+
+    // The review's interleaving: later removals are not held, the four are.
+    fake.state().remove_hold = None;
+    const CHURN: usize = 64;
+    let mut clients = Vec::new();
+    for _ in 0..CHURN {
+        let sandbox = m.create(policy(10, 0)).await.unwrap();
+        clock.advance(10 * SEC);
+        m.expire_due();
+        assert_eq!(row(&m, &sandbox.id).state, SandboxState::Deleting);
+        let key = crate::expiry::key(&sandbox.id).unwrap();
+        {
+            let st = m.expiry.lock().unwrap();
+            let p = st.pending.get(&key).unwrap();
+            assert!(p.waiting && !p.running, "no permit: it waits, with no task");
+            assert_eq!(st.queue.get(key), None);
+        }
+        let (manager, id) = (m.clone(), sandbox.id.clone());
+        clients.push(tokio::spawn(async move { manager.delete(&id).await }));
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(m.operations.len(), limit, "only permit holders are tracked");
+        assert!(fake.state().max_active_removes <= limit as u32);
+        assert!(m.lifecycle_snapshot().pending_expiry_deletes as usize <= limit + CHURN);
+    }
+    assert!(
+        clients.iter().all(|c| !c.is_finished()),
+        "a joined Delete waits for an expiry permit"
+    );
+    assert_eq!(fake.state().max_active_removes, limit as u32);
+
+    // Releasing the four lets every joined Delete and waiting removal finish.
+    hold.notify_waiters();
+    for client in clients {
+        assert_eq!(client.await.unwrap().unwrap().state, SandboxState::Deleted);
+    }
+    until(|| m.operations.is_empty()).await;
+    for id in &held {
+        assert_eq!(row(&m, id).state, SandboxState::Deleted);
+    }
+    assert_eq!(fake.state().max_active_removes, limit as u32);
+    assert_eq!(m.lifecycle_snapshot().pending_expiry_deletes, 0);
+    assert_eq!(m.expiry_queue_len().0, 0);
+    assert_eq!(m.expiry_deletes.available_permits(), limit);
+    assert_eq!(m.lifecycle_snapshot().failed_expiry_deletes, 0);
+}
+
+/// HIGH 1: a joined Delete that is canceled while it waits, or while it holds the
+/// slot's attempt, returns its permit and hands the attempt back to expiry.
+#[tokio::test]
+async fn a_canceled_joined_delete_hands_the_attempt_back() {
+    let (m, fake, clock) = clocked(Limits {
+        expiry: ExpiryLimits {
+            max_concurrent_deletes: 1,
+            ..test_limits().expiry
+        },
+        ..test_limits()
+    });
+    m.rebuild_expiry().unwrap();
+    let hold = Arc::new(tokio::sync::Notify::new());
+    fake.state().remove_hold = Some(hold.clone());
+    let first = m.create(policy(10, 0)).await.unwrap();
+    let second = m.create(policy(10, 0)).await.unwrap();
+    clock.advance(10 * SEC);
+    m.expire_due();
+    until(|| fake.state().active_removes == 1).await;
+    // Whichever started, the other waits for the single permit.
+    let waiting = if row(&m, &first.id).state == SandboxState::Deleting
+        && m.expiry.lock().unwrap().pending[&crate::expiry::key(&first.id).unwrap()].waiting
+    {
+        first.id.clone()
+    } else {
+        second.id.clone()
+    };
+    let (manager, id) = (m.clone(), waiting.clone());
+    let client = tokio::spawn(async move { manager.delete(&id).await });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    client.abort();
+    assert!(client.await.unwrap_err().is_cancelled());
+    let key = crate::expiry::key(&waiting).unwrap();
+    assert!(m.expiry.lock().unwrap().pending[&key].waiting);
+
+    // Now a joined Delete that claims the attempt and is canceled mid-removal.
+    fake.state().remove_hold = None;
+    hold.notify_waiters();
+    until(|| m.expiry.lock().unwrap().pending.is_empty()).await;
+    assert_eq!(row(&m, &waiting).state, SandboxState::Deleted);
+
+    let third = m.create(policy(10, 0)).await.unwrap();
+    let hold = Arc::new(tokio::sync::Notify::new());
+    fake.state().fail_remove = true;
+    clock.advance(10 * SEC);
+    sweep(&m).await;
+    assert_eq!(row(&m, &third.id).state, SandboxState::Deleting);
+    fake.state().fail_remove = false;
+    fake.state().remove_hold = Some(hold.clone());
+    let (manager, id) = (m.clone(), third.id.clone());
+    let client = tokio::spawn(async move { manager.delete(&id).await });
+    until(|| fake.state().active_removes == 1).await;
+    let key = crate::expiry::key(&third.id).unwrap();
+    assert!(m.expiry.lock().unwrap().pending[&key].running, "the Delete claimed it");
+    client.abort();
+    assert!(client.await.unwrap_err().is_cancelled());
+    {
+        let st = m.expiry.lock().unwrap();
+        let p = &st.pending[&key];
+        assert!(!p.running && !p.waiting);
+        assert!(st.queue.get(key).is_some(), "expiry owns the retry again");
+    }
+    assert_eq!(m.expiry_deletes.available_permits(), 1);
+    fake.state().remove_hold = None;
+    hold.notify_waiters();
+    clock.advance(600 * SEC);
+    sweep(&m).await;
+    assert_eq!(row(&m, &third.id).state, SandboxState::Deleted);
+    until(|| m.operations.is_empty()).await;
+}
+
+/// MEDIUM 1 regression (the review's PoC): the stale-delete age is the persisted
+/// intent's, so a same-boot restart keeps Health degraded.
+#[tokio::test]
+async fn restart_keeps_the_health_age_of_a_stale_expiry_delete() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default();
+    let clock = ManualClock::default();
+    let limits = test_limits();
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    m.reconcile().await.unwrap();
+    let sandbox = m.create(policy(10, 0)).await.unwrap();
+    m.rebuild_expiry().unwrap();
+    fake.state().fail_remove = true;
+    clock.advance(10 * SEC);
+    sweep(&m).await;
+    clock.advance(300 * SEC);
+    assert!(m.health().await.unwrap().serving);
+    clock.advance(300 * SEC);
+    assert!(!m.health().await.unwrap().serving);
+
+    for _ in 0..2 {
+        m.begin_shutdown();
+        m.drain_operations().await;
+    }
+    drop(m);
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let reconciled = m.reconcile().await.unwrap();
+    assert_eq!(reconciled.still_deleting, vec![sandbox.id.clone()]);
+    assert_eq!(m.rebase_expiry_clocks().unwrap(), 0);
+    m.rebuild_expiry().unwrap();
+    let health = m.health().await.unwrap();
+    assert!(!health.serving, "a restart must not reset the age");
+    assert!(health.detail.contains("expiry delete(s) pending"), "{}", health.detail);
+    fake.state().fail_remove = false;
+    sweep(&m).await;
+    assert_eq!(row(&m, &sandbox.id).state, SandboxState::Deleted);
+    assert!(m.health().await.unwrap().serving);
+}
+
+/// MEDIUM 1: across a reboot the intent's age is rebased with the other anchors:
+/// it keeps the wall time already spent and keeps growing.
+#[tokio::test]
+async fn a_reboot_rebases_the_expiry_delete_age() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default();
+    let clock = ManualClock::default();
+    let limits = test_limits();
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    m.reconcile().await.unwrap();
+    let sandbox = m.create(policy(10, 0)).await.unwrap();
+    m.rebuild_expiry().unwrap();
+    fake.state().fail_remove = true;
+    clock.advance(10 * SEC);
+    sweep(&m).await;
+    clock.advance(400 * SEC);
+    m.begin_shutdown();
+    m.drain_operations().await;
+    drop(m);
+    // 100 s of wall time pass while the node is down; the backend keeps failing.
+    clock.reboot("boot-b", 5_000, 100 * SEC);
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    m.reconcile().await.unwrap();
+    assert_eq!(m.rebase_expiry_clocks().unwrap(), 1);
+    m.rebuild_expiry().unwrap();
+    assert!(m.health().await.unwrap().serving, "500 s so far");
+    clock.advance(100 * SEC - 1);
+    assert!(m.health().await.unwrap().serving);
+    clock.advance(1);
+    assert!(!m.health().await.unwrap().serving, "600 s since the intent");
+    fake.state().fail_remove = false;
+    sweep(&m).await;
+    assert_eq!(row(&m, &sandbox.id).state, SandboxState::Deleted);
+}
+
+/// MEDIUM 2 regression (the review's PoC): startup's terminal publication of an
+/// interrupted execution is finish activity, so idle restarts from it.
+#[tokio::test]
+async fn startup_execution_interruption_restarts_the_idle_timeout() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default();
+    let clock = ManualClock::default();
+    let limits = Limits {
+        expiry: ExpiryLimits {
+            restart_grace: Duration::from_secs(60),
+            ..ExpiryLimits::default()
+        },
+        ..test_limits()
+    };
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    m.reconcile().await.unwrap();
+    let sandbox = m.create(policy(0, 300)).await.unwrap();
+    let execution = running_execution(&sandbox.id);
+    assert!(m.store.start_execution(&execution).unwrap());
+    let start = row(&m, &sandbox.id).lifecycle;
+    clock.advance(900 * SEC);
+    m.begin_shutdown();
+    m.drain_operations().await;
+    drop(m);
+
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let reconciled = m.reconcile().await.unwrap();
+    assert_eq!(reconciled.interrupted_executions, 1);
+    let after = row(&m, &sandbox.id).lifecycle;
+    assert_eq!(after.activity_seq, start.activity_seq + 1);
+    assert_eq!(after.activity_boottime_ms, Some(clock.boottime_ms()));
+    m.rebase_expiry_clocks().unwrap();
+    m.rebuild_expiry().unwrap();
+    clock.advance(300 * SEC - 1);
+    sweep(&m).await;
+    assert_eq!(row(&m, &sandbox.id).state, SandboxState::Ready);
+    clock.advance(1);
+    sweep(&m).await;
+    assert_eq!(
+        row(&m, &sandbox.id).lifecycle.deletion_reason,
+        Some(DeletionReason::ExpiredIdle),
+        "idle runs 300 s from the reconciliation finish publication"
+    );
+}
+
+/// MEDIUM 2 across a reboot: the publication runs before the rebase, so only the
+/// wall anchor moves; the rebase then places this boot's activity anchor at now.
+#[tokio::test]
+async fn startup_interruption_after_a_reboot_restarts_idle_from_the_rebase() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default();
+    let clock = ManualClock::default();
+    let limits = test_limits();
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    m.reconcile().await.unwrap();
+    let sandbox = m.create(policy(0, 300)).await.unwrap();
+    let execution = running_execution(&sandbox.id);
+    assert!(m.store.start_execution(&execution).unwrap());
+    m.begin_shutdown();
+    m.drain_operations().await;
+    drop(m);
+    clock.reboot("boot-b", 5_000, 900 * SEC);
+    // The legacy fake backend still lists the sandbox: it stays READY.
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    assert_eq!(m.reconcile().await.unwrap().interrupted_executions, 1);
+    let published = row(&m, &sandbox.id).lifecycle;
+    assert_eq!(published.clock_boot_id.as_deref(), Some("boot-a"), "not yet rebased");
+    assert_eq!(published.activity_at_ms, Some(clock.wall_ms()));
+    assert_eq!(m.rebase_expiry_clocks().unwrap(), 1);
+    let rebased = row(&m, &sandbox.id).lifecycle;
+    assert_eq!(rebased.clock_boot_id.as_deref(), Some("boot-b"));
+    assert_eq!(rebased.activity_boottime_ms, Some(5_000));
+    assert_eq!(rebased.ready_boottime_ms, Some(5_000 - 900 * SEC));
+}
+
+fn running_execution(sandbox_id: &str) -> Execution {
+    Execution {
+        id: new_id("ex"),
+        sandbox_id: sandbox_id.into(),
+        argv: vec!["sleep".into()],
+        state: ExecutionState::Running,
+        exit_code: None,
+        command_status: None,
+        runtime_error: None,
+        failure_reason: None,
+        started_at_ms: now_ms(),
+        finished_at_ms: None,
+        timeout_ms: 0,
+        stdin_bytes: 0,
+        stdout: Captured::default(),
+        stderr: Captured::default(),
+        sandbox_reusable: None,
+        cleanup_evidence: CleanupEvidence::Unknown,
+        cancel_reason: None,
+    }
+}
+
+/// LOW 1 regression (the review's PoC): with no node maximum, a duration the
+/// schema cannot store is refused as INVALID_ARGUMENT before preparation.
+#[tokio::test]
+async fn uncapped_unrepresentable_expiry_is_refused_before_preparation() {
+    let (m, fake, _) = clocked(Limits {
+        expiry: ExpiryLimits {
+            max_lifetime_ms: 0,
+            max_idle_ms: 0,
+            ..ExpiryLimits::default()
+        },
+        ..test_limits()
+    });
+    {
+        let mut state = fake.state();
+        state.mode = crate::runtime::fake::FakeEvidenceMode::Fenced;
+        state.fenced.node_id = Some(Id128::random());
+    }
+    for expiry in [
+        RequestedExpiry {
+            max_lifetime_ms: i64::MAX as u64 + 1,
+            idle_timeout_ms: 0,
+        },
+        RequestedExpiry {
+            max_lifetime_ms: 0,
+            idle_timeout_ms: u64::MAX,
+        },
+    ] {
+        let request = CreateRequest {
+            expiry: Some(expiry),
+            ..CreateRequest::default()
+        };
+        let error = m.create(request).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)), "{error}");
+    }
+    assert_eq!(fake.state().fenced.prepare_calls, 0);
+    assert_eq!(fake.state().fenced.issued, 0);
+    assert!(m.store.sandboxes(true).unwrap().is_empty());
+}

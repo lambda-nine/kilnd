@@ -32,6 +32,25 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   `kilndctl` gains `create --max-lifetime/--idle-timeout/--expiry-defaults`, `renew`,
   and shows features, expiry and reasons; `scripts/expiry-regressions.sh` checks real
   deadlines under the installed daemon.
+  Daybreak's milestone 1 break-it fixes: an expiry removal task now exists only while
+  it holds one of the `--max-concurrent-expiry-deletes` permits; a due delete without
+  one waits as a flag on its bounded pending entry, and each returned permit starts
+  the next. A client Delete of an expiry-owned row joins that removal under the same
+  permit instead of running a fifth removal, and leaves no waiter behind (HIGH 1).
+  Schema 11 stores the expiry intent's anchors, so a restart no longer resets the
+  stale-delete age Health reports, and a reboot rebases it (MEDIUM 1). Startup's
+  terminal publications of interrupted and concluded executions record finish
+  activity, before the rebase in a way that keeps both anchors in one boot
+  (MEDIUM 2). The schema 11 upgrade audits a schema 10 membership marker before any
+  change and never rewrites it, so a mismatch refuses startup and rolls back
+  (MEDIUM 3). `kilndctl create` with an expiry option and `kilndctl renew` require a
+  `SERVING` Health that lists `SANDBOX_EXPIRY` first, so an older daemon can no longer
+  silently create a sandbox that never expires (MEDIUM 4). A duration above
+  `i64::MAX` ms is refused as `INVALID_ARGUMENT` before preparation even with no node
+  maximum (LOW 1). `scripts/expiry-regressions.sh` no longer loses created IDs to a
+  command substitution: its `create` runs only in the main shell and refuses a subshell,
+  and a forced-failure self-test checks its EXIT cleanup (LOW 2). A new step races
+  client Deletes against a mass lifetime expiry past the four permits.
 
 - Close Daybreak's integrated B7 recheck 2 (design section 15, *B7 integrated recheck 2*).
   The dependency gate reads a `#[path]` emitted by nested `cfg_attr`s at any depth

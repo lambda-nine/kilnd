@@ -133,7 +133,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   administers the node. Across a reboot one rebase reads the wall clock once, which
   only moves when a dead reservation (every sandbox is `LOST` after a reboot) comes
   back. Removals are bounded by `--max-concurrent-expiry-deletes`, so a mass expiry
-  cannot starve the helper's slots, and the timer queue holds one entry per durable
+  cannot starve the helper's slots: a client Delete of an expiry-owned row takes the
+  same permit, and a removal task exists only while it holds one, so neither churn
+  nor Deletes can pile up waiting tasks or run a fifth removal, and the timer queue holds one entry per durable
   reservation however fast callers renew or run commands. Health and the
   `kilnd-reason` trailer reveal only node aggregates and the caller's own rows'
   reasons.
