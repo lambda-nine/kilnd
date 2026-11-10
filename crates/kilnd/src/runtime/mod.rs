@@ -654,6 +654,18 @@ pub trait Runtime: Send + Sync + 'static {
         async { Ok(None) }
     }
 
+    /// The dynamic API features (design section 1) the installed backend proves now,
+    /// read in the shared Health probe. An error, or any result short of fresh proof,
+    /// withdraws every dynamic feature until the next success. No backend proves any
+    /// before exec options and live output exist.
+    fn proven_features(
+        &self,
+        _deadline: Instant,
+        _cancel: &CancellationToken,
+    ) -> impl Future<Output = Result<crate::manager::ProvenFeatures, RuntimeError>> + Send {
+        async { Ok(crate::manager::ProvenFeatures::default()) }
+    }
+
     /// Read-only preflight before any reservation: must allocate nothing.
     /// Returning an error leaves no row and no charge. A fenced backend's plan names
     /// the token its authority issued (`PreparedCreate::allocation_id`).

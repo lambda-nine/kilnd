@@ -6,6 +6,33 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone 1 of the kilnd API additions for the harness: capability discovery,
+  typed refusal reasons and sandbox expiry, all additive within `kilnd.v1`; a client
+  that sets none of the new fields gets exactly the earlier behavior.
+  `Health.runtime_capabilities` gains `features` (static `SANDBOX_EXPIRY` and
+  `TYPED_REASONS`, plus a fail-closed dynamic set that only a fresh successful backend
+  probe publishes) and `ApiLimits`, and `HealthResponse.lifecycle` reports expiries
+  and pending or failed expiry deletes. Not-ready refusals of Exec and the new
+  `RenewSandbox` carry a `kilnd-reason` trailer and start their message with the same
+  token; codes are unchanged. `CreateSandboxRequest.expiry` sets a maximum lifetime
+  (from the first READY) and an idle timeout (from the last execution start or finish,
+  or Renew; paused while an execution runs or an admitted Exec is queued); an absent
+  policy never expires, and only a present policy's zero fields take the new
+  `--default-sandbox-*-secs` flags. Expiry runs through the ordinary delete path,
+  recorded as `Sandbox.deletion_reason`; a lifetime expiry cancels the running
+  execution with `Execution.cancel_reason = SANDBOX_EXPIRED_LIFETIME`. Deadlines are
+  `CLOCK_BOOTTIME`, survive daemon restarts exactly, are rebased once after a reboot
+  and get a 60-second idle grace after startup. An indexed timer queue holds one
+  entry per durable reservation; idle expiry and Exec admission share a per-slot
+  admission gate, so an admitted Exec is never refused by a concurrent idle expiry
+  (Daybreak's design recheck MEDIUM 1), and the queue bound is stated as
+  `max(--max-sandboxes, reservations at startup)` (LOW 1). Schema 11 adds the policy,
+  anchors, `activity_seq`, `deletion_reason` and `cancel_reason` with their
+  triggers. An execution row is now inserted only while its sandbox is still READY.
+  `kilndctl` gains `create --max-lifetime/--idle-timeout/--expiry-defaults`, `renew`,
+  and shows features, expiry and reasons; `scripts/expiry-regressions.sh` checks real
+  deadlines under the installed daemon.
+
 - Close Daybreak's integrated B7 recheck 2 (design section 15, *B7 integrated recheck 2*).
   The dependency gate reads a `#[path]` emitted by nested `cfg_attr`s at any depth
   (`#[cfg_attr(a, cfg_attr(b, path = "..."))]`), and every `path` a `cfg_attr` emits rather

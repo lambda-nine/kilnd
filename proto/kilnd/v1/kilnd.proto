@@ -20,7 +20,8 @@ service KilndService {
   // SANDBOX_STATE_DELETING so deletion can be retried. Canceling or timing out
   // the RPC only stops waiting: an accepted create continues to READY or
   // compensates its backend resource. Retrying is not idempotent and may
-  // create another sandbox.
+  // create another sandbox. An expiry policy, if sent, is resolved once here and
+  // never changes; without one the sandbox never expires.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
   // Returns one sandbox and its most recent executions.
@@ -32,7 +33,8 @@ service KilndService {
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
 
   // Removes a sandbox. A running execution in it is canceled first.
-  // Deleting a deleted sandbox succeeds.
+  // Deleting a deleted sandbox succeeds, including one that expired; the
+  // first delete intent's deletion_reason is kept.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
   // Runs a command in a ready sandbox and waits for it. Executions in one
@@ -48,11 +50,20 @@ service KilndService {
   // can find recent execution IDs with GetSandbox, then use GetExecution.
   // A successful RPC does not mean the sandbox survived: check the execution's
   // sandbox_reusable before assuming it can take another call. LOST and QUARANTINED
-  // sandboxes fail FAILED_PRECONDITION.
+  // sandboxes fail FAILED_PRECONDITION. Any sandbox that is not READY fails
+  // FAILED_PRECONDITION with a kilnd-reason trailer (sandbox_not_ready,
+  // sandbox_failed, sandbox_lost, sandbox_quarantined, sandbox_deleted,
+  // expired_idle or expired_lifetime), and the message starts with that token.
   rpc Exec(ExecRequest) returns (ExecResponse);
 
   // Returns one execution, including its captured output.
   rpc GetExecution(GetExecutionRequest) returns (GetExecutionResponse);
+
+  // Records activity on a READY sandbox: restarts its idle timer and never
+  // extends max_lifetime. Owner or root only; a foreign ID is NOT_FOUND. Any
+  // other state fails FAILED_PRECONDITION with a kilnd-reason trailer. Needs
+  // FEATURE_SANDBOX_EXPIRY; an older daemon answers UNIMPLEMENTED.
+  rpc RenewSandbox(RenewSandboxRequest) returns (RenewSandboxResponse);
 }
 
 message HealthRequest {}
@@ -79,6 +90,71 @@ message HealthResponse {
   AdmissionStats admission = 9;
   NodeResourceStats node_resources = 10;
   RuntimeCapabilities runtime_capabilities = 11;
+  LifecycleStats lifecycle = 12;
+}
+
+// Sandbox expiry since daemon startup, unless noted.
+message LifecycleStats {
+  uint64 expired_idle = 1;
+  uint64 expired_lifetime = 2;
+  // Expiry deletes published and not yet DELETED, now.
+  uint32 pending_expiry_deletes = 3;
+  // Expiry removal attempts that failed and will be retried.
+  uint64 failed_expiry_deletes = 4;
+  // Reserved for idempotent create; zero until FEATURE_IDEMPOTENT_CREATE.
+  uint64 create_retries_answered = 5;
+  // Reserved for request-ID release; zero until FEATURE_REQUEST_ID_RELEASE.
+  uint64 request_ids_released = 6;
+}
+
+// An optional part of this API. A client sets a field or calls an RPC only if
+// its feature is in RuntimeCapabilities.features of a SERVING Health
+// response, and re-reads the list after every reconnect: an older daemon
+// ignores unknown request fields silently and lists no features. The
+// kilnd-reason token of a feature is its name after FEATURE_, in lower case.
+enum Feature {
+  FEATURE_UNSPECIFIED = 0;
+  // CreateSandboxRequest.expiry, RenewSandbox, Sandbox.expiry and
+  // deletion_reason, Execution.cancel_reason.
+  FEATURE_SANDBOX_EXPIRY = 1;
+  FEATURE_IDEMPOTENT_CREATE = 2;
+  FEATURE_EXEC_CWD = 3;
+  FEATURE_EXEC_ENV = 4;
+  FEATURE_SANDBOX_DEFAULT_ENV = 5;
+  FEATURE_EXEC_STREAM = 6;
+  // Refusals carry a `kilnd-reason: <token>` trailer, and their message starts
+  // with the same token and ": ". Match the trailer, not the prose.
+  FEATURE_TYPED_REASONS = 7;
+  FEATURE_REQUEST_ID_RELEASE = 8;
+}
+
+// Caps, minimums and defaults a client could hit. A field whose feature is not
+// listed is zero.
+message ApiLimits {
+  // 0: no cap.
+  uint64 max_sandbox_lifetime_ms = 1;
+  // 0: no cap.
+  uint64 max_sandbox_idle_ms = 2;
+  // Used only for a zero field of a present ExpiryPolicy. 0: never expires.
+  uint64 default_sandbox_lifetime_ms = 3;
+  uint64 default_sandbox_idle_ms = 4;
+  uint64 create_request_retention_ms = 5;
+  uint32 max_cwd_bytes = 6;
+  uint32 max_env_entries = 7;
+  uint32 max_env_name_bytes = 8;
+  uint32 max_env_value_bytes = 9;
+  // The sum of len(name) + len(value) + 2 over all entries.
+  uint32 max_env_total_bytes = 10;
+  uint32 default_exec_timeout_ms = 11;
+  uint32 max_exec_timeout_ms = 12;
+  uint32 default_stream_timeout_ms = 13;
+  uint32 max_stream_timeout_ms = 14;
+  // Retained bytes per output stream.
+  uint64 max_output_bytes = 15;
+  uint32 stream_chunk_bytes = 16;
+  uint64 stream_buffer_bytes = 17;
+  uint64 min_sandbox_lifetime_ms = 18;
+  uint64 min_sandbox_idle_ms = 19;
 }
 
 // Generic facts about this daemon's execution backend. Clients check these
@@ -89,6 +165,11 @@ message RuntimeCapabilities {
   // False when any interruption after dispatch retires the sandbox.
   bool interruption_preserves_session = 2;
   bool checkpoint = 3;
+  // This daemon's static features plus the dynamic ones its backend has
+  // currently proven. Absent means unsupported. Read it only from a SERVING
+  // response: a failed backend probe withdraws every dynamic feature.
+  repeated Feature features = 4;
+  ApiLimits limits = 5;
 }
 
 // Where NodeResourceStats' totals came from.
@@ -265,10 +346,62 @@ message Sandbox {
   string runtime_profile = 12;
   // Backend-neutral provenance digest; empty when the backend has none.
   string runtime_artifact_digest = 13;
+  // The effective expiry policy, both deadlines and the last activity.
+  ExpiryStatus expiry = 14;
+  // Why it is DELETING or DELETED. Unspecified on history from before expiry.
+  DeletionReason deletion_reason = 15;
+}
+
+// Sent: each nonzero field is used as given; it must be at least 10 s
+// (ApiLimits.min_*) and at most the node maximum unless that is 0, else
+// INVALID_ARGUMENT. A zero field takes the node default for that field.
+// Not sent: the sandbox never expires, whatever the node is configured with.
+message ExpiryPolicy {
+  // Counted from the first READY, whatever the activity. RenewSandbox never
+  // extends it.
+  uint64 max_lifetime_ms = 1;
+  // Counted from the later of READY and the last activity: an execution's
+  // start or finish, or RenewSandbox. Paused while an execution is running or
+  // an admitted Exec is queued.
+  uint64 idle_timeout_ms = 2;
+}
+
+message ExpiryStatus {
+  // 0 in a field: the sandbox does not expire that way.
+  ExpiryPolicy effective = 1;
+  // Wall-clock projections of monotonic deadlines, computed when read; they
+  // move if the wall clock is stepped. 0: none.
+  int64 lifetime_expires_at_unix_ms = 2;
+  // 0: none, or paused.
+  int64 idle_expires_at_unix_ms = 3;
+  // 0 before READY and on history from before expiry.
+  int64 last_activity_at_unix_ms = 4;
+  // An execution is running or an admitted Exec is queued.
+  bool idle_paused = 5;
+}
+
+enum DeletionReason {
+  // Not deleted, or history from before expiry.
+  DELETION_REASON_UNSPECIFIED = 0;
+  DELETION_REASON_REQUESTED = 1;
+  DELETION_REASON_EXPIRED_IDLE = 2;
+  DELETION_REASON_EXPIRED_LIFETIME = 3;
+}
+
+message RenewSandboxRequest {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
+  string id = 1;
+}
+
+message RenewSandboxResponse {
+  Sandbox sandbox = 1;
 }
 
 message CreateSandboxRequest {
   SandboxSpec spec = 1;
+  // Field 2 is reserved for idempotent create.
+  // Absent: never expires. Needs FEATURE_SANDBOX_EXPIRY.
+  ExpiryPolicy expiry = 3;
 }
 
 message CreateSandboxResponse {
@@ -406,6 +539,18 @@ message Execution {
   // cannot take another call, even when this RPC succeeded.
   optional bool sandbox_reusable = 15;
   CleanupEvidence cleanup_evidence = 16;
+  // Fields 17-19 are reserved for exec cwd and env.
+  // Why a CANCELED execution was canceled; unspecified otherwise and on history.
+  CancelReason cancel_reason = 20;
+}
+
+enum CancelReason {
+  CANCEL_REASON_UNSPECIFIED = 0;
+  CANCEL_REASON_CLIENT_DISCONNECTED = 1;
+  CANCEL_REASON_SANDBOX_DELETED = 2;
+  CANCEL_REASON_DAEMON_SHUTDOWN = 3;
+  // The sandbox's max_lifetime passed while the execution ran.
+  CANCEL_REASON_SANDBOX_EXPIRED_LIFETIME = 4;
 }
 
 message CommandStatus {

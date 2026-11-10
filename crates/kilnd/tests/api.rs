@@ -53,6 +53,7 @@ fn signal_number_is_uint32_in_generated_types_schema_and_wire() {
         stderr: Default::default(),
         sandbox_reusable: None,
         cleanup_evidence: Default::default(),
+        cancel_reason: None,
     };
     let converted = kilnd::service::execution_pb(execution);
     let decoded = pb::Execution::decode(converted.encode_to_vec().as_slice()).unwrap();
@@ -372,7 +373,10 @@ async fn every_rpc_over_the_socket() {
         ..Default::default()
     };
     let sandbox = c
-        .create_sandbox(pb::CreateSandboxRequest { spec: Some(spec) })
+        .create_sandbox(pb::CreateSandboxRequest {
+            spec: Some(spec),
+            expiry: None,
+        })
         .await
         .unwrap()
         .into_inner()
@@ -490,9 +494,31 @@ async fn every_rpc_over_the_socket() {
         argv: vec!["echo".into()],
         ..Default::default()
     };
+    let refused = c.exec(exec_deleted).await.unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    // The typed reason crosses the real transport as an ASCII trailer.
     assert_eq!(
-        c.exec(exec_deleted).await.unwrap_err().code(),
-        Code::FailedPrecondition
+        refused
+            .metadata()
+            .get("kilnd-reason")
+            .map(|v| v.to_str().unwrap()),
+        Some("sandbox_deleted")
+    );
+    assert!(
+        refused.message().starts_with("sandbox_deleted: "),
+        "{}",
+        refused.message()
+    );
+    let renew = c
+        .renew_sandbox(pb::RenewSandboxRequest {
+            id: sandbox.id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(renew.code(), Code::FailedPrecondition);
+    assert_eq!(
+        renew.metadata().get("kilnd-reason").map(|v| v.to_str().unwrap()),
+        Some("sandbox_deleted")
     );
     let mixed = pb::SandboxSpec {
         network: Some(pb::NetworkPolicy {
@@ -502,13 +528,19 @@ async fn every_rpc_over_the_socket() {
         ..Default::default()
     };
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest { spec: Some(mixed) })
+        .create_sandbox(pb::CreateSandboxRequest {
+            spec: Some(mixed),
+            expiry: None,
+        })
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument);
     fake.state().fail_create = Some("no image".into());
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest { spec: None })
+        .create_sandbox(pb::CreateSandboxRequest {
+            spec: None,
+            expiry: None,
+        })
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::Internal);
@@ -530,7 +562,10 @@ async fn every_rpc_over_the_socket() {
         backend.fail_create_definitely = Some("image missing".into());
     }
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest { spec: None })
+        .create_sandbox(pb::CreateSandboxRequest {
+            spec: None,
+            expiry: None,
+        })
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::Internal);
@@ -605,6 +640,7 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
                 labels: [("test".into(), "x".repeat(256))].into(),
                 ..Default::default()
             }),
+            expiry: None,
         })
         .await
         .unwrap_err();
@@ -619,6 +655,7 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
                 labels: [("test".into(), "x".repeat(70))].into(),
                 ..Default::default()
             }),
+            expiry: None,
         })
         .await
         .unwrap_err();
@@ -662,7 +699,10 @@ async fn ownership_comes_from_the_kernel_credentials_of_the_socket() {
     let mut c = client(socket.clone()).await;
 
     let mine = c
-        .create_sandbox(pb::CreateSandboxRequest { spec: None })
+        .create_sandbox(pb::CreateSandboxRequest {
+            spec: None,
+            expiry: None,
+        })
         .await
         .unwrap()
         .into_inner()
@@ -924,8 +964,11 @@ async fn graceful_shutdown_drains_a_create_after_its_rpc_disconnects() {
     ));
     let mut c = client(socket.clone()).await;
     let request = tokio::spawn(async move {
-        c.create_sandbox(pb::CreateSandboxRequest { spec: None })
-            .await
+        c.create_sandbox(pb::CreateSandboxRequest {
+            spec: None,
+            expiry: None,
+        })
+        .await
     });
 
     gate.entered().await;

@@ -52,8 +52,13 @@ code, the test suite and `CHANGELOG.md`.
 
 - **gRPC API `kilnd.v1`** ([proto/kilnd/v1/kilnd.proto](proto/kilnd/v1/kilnd.proto)):
   `Health`, `CreateSandbox`, `GetSandbox`, `ListSandboxes`, `DeleteSandbox`,
-  `Exec` and `GetExecution`. Nothing in it is kiln-specific, so a microVM
-  backend can implement the same API.
+  `Exec`, `GetExecution` and `RenewSandbox`. Nothing in it is kiln-specific, so a
+  microVM backend can implement the same API. Optional parts are discovered from
+  `Health.runtime_capabilities.features` (an older daemon lists none and ignores
+  fields it doesn't know), refusals carry a machine-readable `kilnd-reason` trailer,
+  and a create may ask to expire after a maximum lifetime or an idle timeout
+  ([docs/architecture.md](docs/architecture.md#sandbox-expiry)); without a policy a
+  sandbox never expires.
 - **Runtime adapter trait** ([crates/kilnd/src/runtime/mod.rs](crates/kilnd/src/runtime/mod.rs)).
   The kiln implementation calls a private root helper, which runs the installed `kiln` CLI with argument vectors
   (never a shell), a cleared environment, timeouts and bounded output. kiln's
@@ -237,6 +242,7 @@ scripts/daemon-singleton-regressions.sh # duplicate startup cannot disturb live 
 scripts/state-path-regressions.sh # hostile state ancestors/files fail before reconciliation
 sudo python3 -I scripts/phase0-regressions.py # real UID ownership, helper, privilege and retention checks
 scripts/smoke.sh              # kilndctl → socket → service → kiln, checked through the API
+scripts/expiry-regressions.sh # real idle and lifetime expiry, grace, renew and restart (about 3 min)
 ```
 
 ## Layout

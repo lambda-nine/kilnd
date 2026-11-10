@@ -938,6 +938,7 @@ fn c1_row(store: &Store, context: &CreateContext, plan: &PreparedCreate) -> Sand
             release: ReservationRelease::Charged,
             last_helper_generation: Some(0),
         },
+        lifecycle: Default::default(),
     };
     let budgets = SandboxBudgets {
         sandboxes: 64,
@@ -1561,6 +1562,7 @@ async fn exit2_real_manager_publishes_charged_failure_and_only_a_fence_releases_
         read_only_root: false,
         writable_paths: vec![],
         labels: BTreeMap::new(),
+        expiry: None,
     };
     let error = manager.create(request).await.unwrap_err();
     assert!(error.to_string().contains("Capacity"), "{error}");

@@ -14,11 +14,13 @@ use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
 use crate::admission::{Admission, AdmissionSnapshot};
+use crate::expiry::{Clock, Due, ExpiryLimits, ExpiryQueue, RequestedExpiry, SystemClock};
 use crate::model::{
-    AccountingRegime, AllocationBinding, Captured, CleanupEvidence, CommandStatus, CreateCertainty,
-    Digest, Execution, ExecutionState, Id128, Network, ReservationRelease, RuntimeDiagnostic,
-    RuntimeErrorKind, RuntimeStage, Sandbox, SandboxAccounting, SandboxDisposition, SandboxSpec,
-    SandboxState, new_id, now_ms, spec_digests, valid_id,
+    AccountingRegime, AllocationBinding, CancelReason, Captured, CleanupEvidence, CommandStatus,
+    CreateCertainty, DeletionReason, Digest, Execution, ExecutionState, Id128, Network,
+    ReservationRelease, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage, Sandbox,
+    SandboxAccounting, SandboxDisposition, SandboxLifecycle, SandboxSpec, SandboxState, new_id,
+    now_ms, spec_digests, valid_id,
 };
 use crate::runtime::{
     AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendRecord, BackendStatus,
@@ -87,6 +89,8 @@ pub struct Limits {
     pub health_probe_timeout: Duration,
     pub health_success_cache: Duration,
     pub health_failure_cache: Duration,
+    /// Sandbox expiry flags (API additions design, section 7).
+    pub expiry: ExpiryLimits,
 }
 
 impl Default for Limits {
@@ -133,6 +137,7 @@ impl Default for Limits {
             health_probe_timeout: Duration::from_secs(2),
             health_success_cache: Duration::from_secs(5),
             health_failure_cache: Duration::from_secs(1),
+            expiry: ExpiryLimits::default(),
         }
     }
 }
@@ -149,6 +154,8 @@ pub struct CreateRequest {
     pub read_only_root: bool,
     pub writable_paths: Vec<String>,
     pub labels: BTreeMap<String, String>,
+    /// `CreateSandboxRequest.expiry` if sent; `None` never expires (decision 2).
+    pub expiry: Option<RequestedExpiry>,
 }
 
 pub struct ExecRequest {
@@ -166,7 +173,7 @@ pub enum Error {
     #[error("{0} not found")]
     NotFound(String),
     #[error("{0}")]
-    FailedPrecondition(String),
+    FailedPrecondition(Refusal),
     #[error("{0}")]
     ResourceExhausted(String),
     #[error("{0}")]
@@ -181,6 +188,100 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A refusal's message and, for the typed ones (API additions design, section 1),
+/// its stable `kilnd-reason` token. It derefs to the message alone; it displays as
+/// `<token>: <message>`, which is also the status message the API sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    reason: Option<&'static str>,
+    message: String,
+}
+
+impl Refusal {
+    pub fn typed(reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            reason: Some(reason),
+            message: message.into(),
+        }
+    }
+
+    pub fn reason(&self) -> Option<&'static str> {
+        self.reason
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(message: String) -> Self {
+        Self {
+            reason: None,
+            message,
+        }
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl std::ops::Deref for Refusal {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            Some(reason) => write!(f, "{reason}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+/// The typed reason a non-READY sandbox refuses Exec and Renew (design section 1):
+/// a DELETING or retained DELETED row's deletion reason, else its state.
+pub fn not_ready_reason(s: &Sandbox) -> &'static str {
+    match s.state {
+        SandboxState::Deleting | SandboxState::Deleted => match s.lifecycle.deletion_reason {
+            Some(DeletionReason::ExpiredIdle) => "expired_idle",
+            Some(DeletionReason::ExpiredLifetime) => "expired_lifetime",
+            Some(DeletionReason::Requested) | None => "sandbox_deleted",
+        },
+        SandboxState::Failed => "sandbox_failed",
+        SandboxState::Lost => "sandbox_lost",
+        SandboxState::Quarantined => "sandbox_quarantined",
+        SandboxState::Creating | SandboxState::Ready => "sandbox_not_ready",
+    }
+}
+
+/// Features this daemon's code and flags provide, fixed for the process.
+pub const STATIC_FEATURES: [Feature; 2] = [Feature::SandboxExpiry, Feature::TypedReasons];
+
+/// An optional API part, in `kilnd.v1.Feature` order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Feature {
+    SandboxExpiry,
+    IdempotentCreate,
+    ExecCwd,
+    ExecEnv,
+    SandboxDefaultEnv,
+    ExecStream,
+    TypedReasons,
+    RequestIdRelease,
+}
+
+/// Facts the backend proved in its latest successful probe (design section 1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProvenFeatures(pub Vec<Feature>);
+
 /// Per-sandbox coordination: executions in one sandbox run one at a time
 /// (kiln's PID 1 serves them serially anyway), and delete can cancel the one
 /// running.
@@ -188,6 +289,13 @@ struct Slot {
     exec_lock: tokio::sync::Mutex<()>,
     running: Mutex<Option<Arc<ExecCancellation>>>,
     outstanding_execs: Arc<Semaphore>,
+    capacity: usize,
+    /// The admission gate (Daybreak recheck MEDIUM 1): Exec rechecks READY and takes
+    /// its outstanding permit while holding it, and idle expiry holds it with the
+    /// exec lock from its all-permits-free check through its delete-intent CAS, so a
+    /// newly admitted request and an idle expiry cannot both win. Nothing awaits
+    /// while it is held.
+    admission: Mutex<()>,
 }
 
 impl Slot {
@@ -196,7 +304,14 @@ impl Slot {
             exec_lock: tokio::sync::Mutex::new(()),
             running: Mutex::new(None),
             outstanding_execs: Arc::new(Semaphore::new(capacity)),
+            capacity,
+            admission: Mutex::new(()),
         }
+    }
+
+    /// An execution is running or an admitted request is queued.
+    fn busy(&self) -> bool {
+        self.outstanding_execs.available_permits() != self.capacity
     }
 }
 
@@ -218,6 +333,8 @@ struct HealthProbeState {
 struct Probed {
     version: String,
     node: Option<std::result::Result<(NodeTotals, i64), String>>,
+    /// The dynamic features this probe proved.
+    dynamic: ProvenFeatures,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,6 +342,7 @@ enum ExecCancelReason {
     ClientGone,
     SandboxDeleted,
     Shutdown,
+    ExpiredLifetime,
 }
 
 impl ExecCancelReason {
@@ -233,6 +351,16 @@ impl ExecCancelReason {
             Self::ClientGone => "client disconnected",
             Self::SandboxDeleted => "sandbox deleted",
             Self::Shutdown => "kilnd shut down",
+            Self::ExpiredLifetime => "sandbox reached its max_lifetime",
+        }
+    }
+
+    fn typed(self) -> CancelReason {
+        match self {
+            Self::ClientGone => CancelReason::ClientDisconnected,
+            Self::SandboxDeleted => CancelReason::SandboxDeleted,
+            Self::Shutdown => CancelReason::DaemonShutdown,
+            Self::ExpiredLifetime => CancelReason::SandboxExpiredLifetime,
         }
     }
 }
@@ -284,6 +412,42 @@ pub struct Manager<R> {
     /// allocation may join them until a clean reconciliation.
     admission_blocked: AtomicBool,
     started_at_ms: i64,
+    /// The clocks expiry reads; the store stamps anchors with the same one.
+    clock: Arc<dyn Clock>,
+    expiry: Mutex<ExpiryState>,
+    expiry_changed: Notify,
+    /// Expiry removals running at once (`--max-concurrent-expiry-deletes`).
+    expiry_deletes: Arc<Semaphore>,
+    expired_idle: AtomicU64,
+    expired_lifetime: AtomicU64,
+    failed_expiry_deletes: AtomicU64,
+    /// The dynamic feature set: empty at startup, set by a successful probe and
+    /// cleared by any other result (design section 1, fail closed).
+    dynamic_features: Mutex<ProvenFeatures>,
+    #[cfg(test)]
+    idle_commit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+/// The sweeper's state: the queue, delete retries and the restart grace.
+#[derive(Default)]
+struct ExpiryState {
+    queue: ExpiryQueue,
+    /// Expiry deletes published and not yet DELETED, by sandbox key.
+    pending: HashMap<u64, PendingDelete>,
+    /// Idle deadlines never fall before this boottime (`--expiry-restart-grace-secs`).
+    grace_until: i64,
+    /// The queue's bound (Daybreak recheck LOW 1): one entry per durable reservation,
+    /// which admission holds at `--max-sandboxes` except that reservations made under
+    /// a higher earlier cap remain until they drain. So the bound is
+    /// `max(--max-sandboxes, reservations at startup)`.
+    bound: usize,
+}
+
+struct PendingDelete {
+    since: i64,
+    failures: u32,
+    retry_at: i64,
+    running: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -299,6 +463,18 @@ pub struct Health {
     pub admission: AdmissionSnapshot,
     pub node_resources: NodeResourceSnapshot,
     pub capabilities: RuntimeCapabilities,
+    /// Static features plus the dynamic ones currently proven, in enum order.
+    pub features: Vec<Feature>,
+    pub lifecycle: LifecycleSnapshot,
+}
+
+/// Expiry counters since startup, for `HealthResponse.lifecycle`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LifecycleSnapshot {
+    pub expired_idle: u64,
+    pub expired_lifetime: u64,
+    pub pending_expiry_deletes: u32,
+    pub failed_expiry_deletes: u64,
 }
 
 /// Where a Health report's node totals came from.
@@ -361,7 +537,30 @@ const FENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl<R: Runtime> Manager<R> {
     pub fn new(runtime: R, store: Store, limits: Limits) -> Self {
+        let clock: Arc<dyn Clock> = match SystemClock::new() {
+            Ok(clock) => Arc::new(clock),
+            Err(error) => panic!("read the kernel boot ID: {error}"),
+        };
+        Self::with_clock(runtime, store, limits, clock)
+    }
+
+    /// As [`Self::new`], with the clocks expiry reads.
+    pub fn with_clock(runtime: R, store: Store, limits: Limits, clock: Arc<dyn Clock>) -> Self {
+        store.set_clock(clock.clone());
         Self {
+            expiry: Mutex::new(ExpiryState {
+                bound: limits.max_sandboxes as usize,
+                ..ExpiryState::default()
+            }),
+            expiry_changed: Notify::new(),
+            expiry_deletes: Arc::new(Semaphore::new(limits.expiry.max_concurrent_deletes)),
+            expired_idle: AtomicU64::new(0),
+            expired_lifetime: AtomicU64::new(0),
+            failed_expiry_deletes: AtomicU64::new(0),
+            dynamic_features: Mutex::new(ProvenFeatures::default()),
+            #[cfg(test)]
+            idle_commit_hook: Mutex::new(None),
+            clock,
             runtime,
             store,
             admission: Arc::new(Admission::new(&limits)),
@@ -384,6 +583,18 @@ impl<R: Runtime> Manager<R> {
 
     pub fn runtime(&self) -> &R {
         &self.runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_set_state_for_test(&self, id: &str, state: SandboxState) {
+        self.store.set_sandbox_state(id, state, None, None).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_retire_for_test(&self, id: &str, disposition: SandboxDisposition) {
+        self.store
+            .retire_sandbox(id, disposition, "retired by a test")
+            .unwrap();
     }
 
     #[cfg(test)]
@@ -1159,6 +1370,7 @@ impl<R: Runtime> Manager<R> {
     // Wake API waiters at the probe deadline, while the tracked operation keeps
     // owning cleanup. in_flight remains true, so no replacement probe can start.
     fn publish_health_failure_while_draining(&self, message: &str) {
+        *self.dynamic_features.lock().unwrap() = ProvenFeatures::default();
         self.health_probe.lock().unwrap().cached = Some((Instant::now(), Err(message.into())));
         self.health_changed.notify_waiters();
     }
@@ -1201,6 +1413,7 @@ impl<R: Runtime> Manager<R> {
                         let mut task = tokio::spawn(async move {
                             let runtime = &runtime_manager.runtime;
                             let version = runtime.version(deadline, &probe_cancel).await?;
+                            let dynamic = runtime.proven_features(deadline, &probe_cancel).await?;
                             // A node authority's totals are read in the same bounded probe,
                             // so Health never presents this daemon's local sum as the node's.
                             let node = match runtime.capabilities().accounting {
@@ -1215,7 +1428,11 @@ impl<R: Runtime> Manager<R> {
                                     },
                                 ),
                             };
-                            Ok::<_, RuntimeError>(Probed { version, node })
+                            Ok::<_, RuntimeError>(Probed {
+                                version,
+                                node,
+                                dynamic,
+                            })
                         });
                         let result = tokio::select! {
                             biased;
@@ -1238,6 +1455,11 @@ impl<R: Runtime> Manager<R> {
                         };
                         {
                             let mut state = manager.health_probe.lock().unwrap();
+                            // Fail closed: only a fresh success republishes dynamic features.
+                            *manager.dynamic_features.lock().unwrap() = match &result {
+                                Ok(probed) => probed.dynamic.clone(),
+                                Err(_) => ProvenFeatures::default(),
+                            };
                             state.cached = Some((Instant::now(), result));
                             state.in_flight = false;
                         }
@@ -1381,7 +1603,21 @@ impl<R: Runtime> Manager<R> {
             detail
                 .push_str("backend resources no row explains block CreateSandbox until reconciled");
         }
+        let lifecycle = self.lifecycle_snapshot();
+        let stale = self.stale_expiry_deletes();
+        if stale != 0 {
+            serving = false;
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(&format!(
+                "{stale} expiry delete(s) pending longer than {} s; their sandboxes stay charged",
+                self.limits.expiry.degraded_after.as_secs()
+            ));
+        }
         Ok(Health {
+            features: self.features(),
+            lifecycle,
             serving: serving && !self.shutting_down.is_cancelled(),
             shutting_down: self.shutting_down.is_cancelled(),
             backend: self.runtime.name(),
@@ -1421,7 +1657,10 @@ impl<R: Runtime> Manager<R> {
         let (result_tx, result_rx) = oneshot::channel();
         let manager = Arc::clone(self);
         self.operations.spawn(async move {
-            let result = manager.create_supervised(req, owner_uid).await;
+            let result = Arc::clone(&manager).create_supervised(req, owner_uid).await;
+            if let Ok(sandbox) = &result {
+                manager.expiry_refresh(&sandbox.id);
+            }
             if let Err(result) = result_tx.send(result) {
                 match result {
                     Ok(sandbox) => info!(sandbox = %sandbox.id, "create RPC stopped waiting; supervised operation completed"),
@@ -1447,6 +1686,9 @@ impl<R: Runtime> Manager<R> {
                 "backend resources no row explains block new sandboxes until reconciled".into(),
             ));
         }
+        // Resolved once, before preparation: an invalid policy allocates nothing.
+        let expiry = crate::expiry::resolve_expiry(req.expiry, &self.limits.expiry)
+            .map_err(Error::InvalidArgument)?;
         let spec = self.resolve_spec(req)?;
         // Design 9.1 (B7): preparation names no allocation. A fenced backend's
         // authority issues the token inside its preflight (RTC-2).
@@ -1509,6 +1751,10 @@ impl<R: Runtime> Manager<R> {
                     EvidenceRegime::LegacyLocal => None,
                     EvidenceRegime::AbsenceFenced { .. } => Some(0),
                 },
+            },
+            lifecycle: SandboxLifecycle {
+                expiry,
+                ..SandboxLifecycle::default()
             },
         };
         // C1: recorded before the backend runs, so a crash mid-create leaves a
@@ -1635,7 +1881,7 @@ impl<R: Runtime> Manager<R> {
         let prepared = match task.await {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(error @ (RuntimeError::Incompatible(_) | RuntimeError::Unsupported(_)))) => {
-                return Err(Error::FailedPrecondition(error.to_string()));
+                return Err(Error::FailedPrecondition(error.to_string().into()));
             }
             // Refused before any backend effect (B7: the Firecracker digest cache's cap).
             Ok(Err(RuntimeError::Exhausted(reason))) => {
@@ -1937,9 +2183,9 @@ impl<R: Runtime> Manager<R> {
                 let expected = match sandbox.state {
                     SandboxState::Deleted | SandboxState::Deleting => return Ok(sandbox),
                     SandboxState::Creating => {
-                        return Err(Error::FailedPrecondition(format!(
-                            "sandbox {id} is still being created; retry"
-                        )));
+                        return Err(Error::FailedPrecondition(
+                            format!("sandbox {id} is still being created; retry").into(),
+                        ));
                     }
                     expected => expected,
                 };
@@ -1948,12 +2194,12 @@ impl<R: Runtime> Manager<R> {
                 } else {
                     SandboxState::Deleted
                 };
-                if self.store.compare_and_set_sandbox_state(
+                if self.store.publish_delete_intent(
                     id,
                     expected,
                     next,
-                    None,
                     sandbox.failure_reason.as_deref(),
+                    DeletionReason::Requested,
                 )? {
                     return self.load(id);
                 }
@@ -1974,9 +2220,9 @@ impl<R: Runtime> Manager<R> {
                 // Its backend ID isn't known yet. If kilnd crashed mid-create,
                 // startup reconciliation has already moved it to FAILED.
                 SandboxState::Creating => {
-                    return Err(Error::FailedPrecondition(format!(
-                        "sandbox {id} is still being created; retry"
-                    )));
+                    return Err(Error::FailedPrecondition(
+                        format!("sandbox {id} is still being created; retry").into(),
+                    ));
                 }
                 SandboxState::Failed => {
                     // The ambiguous no-ID case was refused above. What is
@@ -1985,12 +2231,12 @@ impl<R: Runtime> Manager<R> {
                     // while Delete waited for the coordination lock, so never
                     // reassert ownership of the historical backend ID. Without
                     // one, the typed create result proved nothing was allocated.
-                    if self.store.compare_and_set_sandbox_state(
+                    if self.store.publish_delete_intent(
                         id,
                         SandboxState::Failed,
                         SandboxState::Deleted,
                         None,
-                        None,
+                        DeletionReason::Requested,
                     )? {
                         return self.load(id);
                     }
@@ -1999,12 +2245,12 @@ impl<R: Runtime> Manager<R> {
                 expected @ (SandboxState::Ready
                 | SandboxState::Lost
                 | SandboxState::Quarantined) => {
-                    if self.store.compare_and_set_sandbox_state(
+                    if self.store.publish_delete_intent(
                         id,
                         expected,
                         SandboxState::Deleting,
-                        None,
                         sandbox.failure_reason.as_deref(),
+                        DeletionReason::Requested,
                     )? {
                         return self.load(id);
                     }
@@ -2015,6 +2261,13 @@ impl<R: Runtime> Manager<R> {
     }
 
     pub async fn delete(&self, id: &str) -> Result<Sandbox> {
+        let result = self.delete_inner(id).await;
+        // A finished delete leaves no timer; a failed one keeps its retry if expiry owns it.
+        self.expiry_refresh(id);
+        result
+    }
+
+    async fn delete_inner(&self, id: &str) -> Result<Sandbox> {
         let sandbox = self.load(id)?;
         if sandbox.state == SandboxState::Deleted {
             return Ok(sandbox);
@@ -2125,7 +2378,7 @@ impl<R: Runtime> Manager<R> {
             "cannot release the ambiguous reservation for failed sandbox {}: no backend ID was reported; the {} backend listing cannot account for hidden or unpublished resources; authoritative resource reconciliation is required and is not currently supported",
             sandbox.id,
             self.runtime.name()
-        ))
+        ).into())
     }
 
     /// Starts a daemon-owned execution and waits for its result. Once the
@@ -2154,17 +2407,24 @@ impl<R: Runtime> Manager<R> {
                 self.limits.max_concurrent_execs
             ))
         })?;
-        let outstanding = slot
-            .outstanding_execs
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                self.admission.reject_sandbox_exec();
-                Error::ResourceExhausted(format!(
-                    "sandbox Exec capacity reached (one running plus {} queued)",
-                    self.limits.max_queued_execs_per_sandbox
-                ))
-            })?;
+        let outstanding = {
+            // MEDIUM 1: READY is rechecked and the permit taken under the gate idle
+            // expiry holds from its all-permits-free check through its CAS. Either this
+            // admission wins and expiry re-arms, or expiry wins and this request sees its
+            // typed reason without ever being admitted.
+            let _gate = slot.admission.lock().unwrap_or_else(|e| e.into_inner());
+            ready(&self.load(&req.sandbox_id)?)?;
+            slot.outstanding_execs
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    self.admission.reject_sandbox_exec();
+                    Error::ResourceExhausted(format!(
+                        "sandbox Exec capacity reached (one running plus {} queued)",
+                        self.limits.max_queued_execs_per_sandbox
+                    ))
+                })?
+        };
         let stdin = self.admission.try_stdin(req.stdin.len()).map_err(|_| {
             Error::ResourceExhausted(format!(
                 "aggregate retained Exec stdin limit ({} bytes) reached",
@@ -2181,10 +2441,14 @@ impl<R: Runtime> Manager<R> {
         // finish draining the tracker between these two operations.
         let (result_tx, result_rx) = oneshot::channel();
         let manager = Arc::clone(self);
+        let sandbox_id = sandbox.id.clone();
         self.operations.spawn(async move {
-            manager
+            Arc::clone(&manager)
                 .supervise_exec(req, result_tx, slot, timeout, deadline, ticket)
                 .await;
+            // The ticket is released: finishing the last admitted request resumes the
+            // idle timer from its finish activity (design 2.1).
+            manager.expiry_refresh(&sandbox_id);
         });
         result_rx.await.map_err(|_| {
             Error::Internal(anyhow::anyhow!("exec supervisor stopped without a result"))
@@ -2293,17 +2557,42 @@ impl<R: Runtime> Manager<R> {
             stderr: Captured::default(),
             sandbox_reusable: None,
             cleanup_evidence: CleanupEvidence::Unknown,
+            cancel_reason: None,
         };
         if Instant::now() >= deadline {
             return Some(Err(Error::DeadlineExceeded(
                 "Exec deadline expired before row insertion".into(),
             )));
         }
-        if let Err(error) = self.store.insert_execution(&execution) {
-            return Some(Err(error.into()));
-        }
+        // Published before the row, so a lifetime expiry or Delete whose intent commits
+        // after the insert always finds this execution to cancel; one that commits
+        // before it makes the conditional insert refuse.
         let cancel = Arc::new(ExecCancellation::new());
         *slot.running.lock().unwrap() = Some(cancel.clone());
+        match self.store.start_execution(&execution) {
+            Ok(true) => {}
+            Ok(false) => {
+                slot.running.lock().unwrap().take();
+                return Some(Err(
+                    match self.load(&req.sandbox_id).and_then(|s| ready(&s)) {
+                        Err(error) => error,
+                        // The insert saw a non-READY row; only a startup recovery makes one
+                        // READY again, so this is a retryable race, never a run.
+                        Ok(()) => Error::FailedPrecondition(Refusal::typed(
+                            "sandbox_not_ready",
+                            format!(
+                                "sandbox {} changed while the execution was starting; retry",
+                                req.sandbox_id
+                            ),
+                        )),
+                    },
+                ));
+            }
+            Err(error) => {
+                slot.running.lock().unwrap().take();
+                return Some(Err(error.into()));
+            }
+        }
         info!(sandbox = %sandbox.id, execution = %execution.id, argc = execution.argv.len(), "exec started");
 
         // The backend future lives in its own task so both construction-time
@@ -2456,6 +2745,7 @@ impl<R: Runtime> Manager<R> {
                     cleanup_evidence,
                     disposition: Some(disposition),
                     disposition_reason: disposition_reason.as_deref(),
+                    cancel_reason: cancel.reason().map(ExecCancelReason::typed),
                 },
                 self.limits.retention.output_storage,
             ) {
@@ -2493,6 +2783,418 @@ impl<R: Runtime> Manager<R> {
         execution.stdout = outcome.stdout;
         execution.stderr = outcome.stderr;
         Some(Ok(execution))
+    }
+
+    /// RenewSandbox (design 2): activity on a READY sandbox, committed before the
+    /// reply. It never waits for the exec lock. Any other state is refused with its
+    /// typed reason; a Renew that lost to an idle expiry answers `expired_idle`.
+    pub fn renew(&self, id: &str) -> Result<Sandbox> {
+        if !valid_id("sb", id) {
+            return Err(Error::InvalidArgument(format!("invalid sandbox ID {id:?}")));
+        }
+        let (sandbox, renewed) = self
+            .store
+            .renew(id)?
+            .ok_or_else(|| Error::NotFound(format!("sandbox {id}")))?;
+        if !renewed {
+            ready(&sandbox)?;
+        }
+        self.expiry_refresh(id);
+        Ok(sandbox)
+    }
+
+    /// Every feature Health advertises now: static plus currently proven dynamic.
+    pub fn features(&self) -> Vec<Feature> {
+        let mut features: Vec<Feature> = STATIC_FEATURES.to_vec();
+        features.extend(self.dynamic_features.lock().unwrap().0.iter().copied());
+        features.sort();
+        features.dedup();
+        features
+    }
+
+    /// The gate every create-time and Exec-time option check reads: the same set
+    /// Health publishes, so Health never advertises an option this daemon refuses.
+    pub fn has_feature(&self, feature: Feature) -> bool {
+        STATIC_FEATURES.contains(&feature)
+            || self.dynamic_features.lock().unwrap().0.contains(&feature)
+    }
+
+    pub fn lifecycle_snapshot(&self) -> LifecycleSnapshot {
+        let pending = self.expiry.lock().unwrap().pending.len();
+        LifecycleSnapshot {
+            expired_idle: self.expired_idle.load(Ordering::Relaxed),
+            expired_lifetime: self.expired_lifetime.load(Ordering::Relaxed),
+            pending_expiry_deletes: u32::try_from(pending).unwrap_or(u32::MAX),
+            failed_expiry_deletes: self.failed_expiry_deletes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Expiry deletes pending longer than `--expiry-degraded-after-secs`.
+    fn stale_expiry_deletes(&self) -> usize {
+        let now = self.clock.boottime_ms();
+        let after =
+            i64::try_from(self.limits.expiry.degraded_after.as_millis()).unwrap_or(i64::MAX);
+        self.expiry
+            .lock()
+            .unwrap()
+            .pending
+            .values()
+            .filter(|p| now.saturating_sub(p.since) >= after)
+            .count()
+    }
+
+    /// What `Sandbox.expiry` reports: the effective policy, the deadlines projected
+    /// onto the wall clock at read time, the last activity and whether idle is paused.
+    pub fn expiry_view(&self, s: &Sandbox) -> ExpiryView {
+        let policy = s.lifecycle.expiry;
+        let busy = self.existing_slot(&s.id).is_some_and(|slot| slot.busy());
+        let grace = self.expiry.lock().unwrap().grace_until;
+        let (now_wall, now_boot) = (self.clock.wall_ms(), self.clock.boottime_ms());
+        let project = |deadline: i64| now_wall.saturating_add(deadline.saturating_sub(now_boot));
+        let live = crate::expiry::deadlines_run(s.state);
+        let idle_paused = live && busy && policy.idle_timeout_ms.is_some();
+        ExpiryView {
+            policy,
+            lifetime_expires_at_ms: live
+                .then(|| crate::expiry::lifetime_deadline(s).map(project))
+                .flatten(),
+            idle_expires_at_ms: (live && !busy)
+                .then(|| crate::expiry::idle_deadline(s, grace).map(project))
+                .flatten(),
+            last_activity_at_ms: s.lifecycle.activity_at_ms,
+            idle_paused,
+        }
+    }
+
+    fn existing_slot(&self, id: &str) -> Option<Arc<Slot>> {
+        self.slots.lock().unwrap().get(id).and_then(Weak::upgrade)
+    }
+
+    /// The cross-boot rebase (design 2.3). Run once after reconciliation and before
+    /// the sweeper, admission or any prune.
+    pub fn rebase_expiry_clocks(&self) -> Result<usize> {
+        Ok(self.store.rebase_clocks()?)
+    }
+
+    /// Rebuilds the timer queue from the store, one entry per qualifying row, and
+    /// starts the restart grace. Run after reconciliation and the rebase.
+    pub fn rebuild_expiry(&self) -> Result<()> {
+        let rows = self.store.expiry_rows()?;
+        let reserved =
+            usize::try_from(self.store.sandbox_resources()?.sandboxes).unwrap_or(usize::MAX);
+        let now = self.clock.boottime_ms();
+        let grace = i64::try_from(self.limits.expiry.restart_grace.as_millis()).unwrap_or(i64::MAX);
+        let mut st = self.expiry.lock().unwrap();
+        st.queue.clear();
+        st.pending.clear();
+        st.grace_until = now.saturating_add(grace);
+        st.bound = (self.limits.max_sandboxes as usize).max(reserved);
+        for row in rows {
+            let Some(key) = crate::expiry::key(&row.id) else {
+                continue;
+            };
+            if row.state == SandboxState::Deleting
+                && matches!(
+                    row.lifecycle.deletion_reason,
+                    Some(DeletionReason::ExpiredIdle | DeletionReason::ExpiredLifetime)
+                )
+                && row.is_charged()
+            {
+                st.pending.insert(
+                    key,
+                    PendingDelete {
+                        since: now,
+                        failures: 0,
+                        retry_at: now,
+                        running: false,
+                    },
+                );
+            }
+            let next = next_action(Some(&row), false, &mut st, key);
+            st.queue.set(key, next);
+        }
+        drop(st);
+        self.expiry_changed.notify_one();
+        Ok(())
+    }
+
+    /// Starts the sweeper: one tracked task owning the queue's single timer.
+    pub fn start_expiry(self: &Arc<Self>) -> Result<tokio::task::JoinHandle<()>> {
+        self.rebuild_expiry()?;
+        let manager = Arc::clone(self);
+        Ok(tokio::spawn(async move { manager.sweep().await }))
+    }
+
+    async fn sweep(self: Arc<Self>) {
+        loop {
+            if self.shutting_down.is_cancelled() {
+                break;
+            }
+            self.expire_due();
+            let now = self.clock.boottime_ms();
+            let head = self.expiry.lock().unwrap().queue.head();
+            // Timers are derived from the remaining boottime budget, and the rescan
+            // bounds how late a resume from suspend can be noticed.
+            let rescan = self.limits.expiry.rescan;
+            let wait = head.map_or(rescan, |head| {
+                Duration::from_millis(u64::try_from(head.saturating_sub(now)).unwrap_or(0))
+                    .min(rescan)
+            });
+            tokio::select! {
+                biased;
+                () = self.shutting_down.cancelled() => break,
+                () = self.expiry_changed.notified() => {}
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+    }
+
+    /// One sweep: every entry due now, earliest first. Never awaits; removals run as
+    /// tracked operations under `--max-concurrent-expiry-deletes`.
+    pub fn expire_due(self: &Arc<Self>) {
+        let now = self.clock.boottime_ms();
+        let due = self.expiry.lock().unwrap().queue.pop_due(now);
+        for key in due {
+            if self.shutting_down.is_cancelled() {
+                break;
+            }
+            self.process_due(key, now);
+        }
+    }
+
+    fn process_due(self: &Arc<Self>, key: u64, now: i64) {
+        let id = crate::expiry::id(key);
+        let row = match self.store.sandbox(&id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                self.expiry_refresh(&id);
+                return;
+            }
+            Err(error) => {
+                warn!(sandbox = %id, error = %format!("{error:#}"), "expiry could not read the sandbox; retrying");
+                self.requeue(key, now);
+                return;
+            }
+        };
+        if row.state == SandboxState::Deleting {
+            let start = {
+                let mut st = self.expiry.lock().unwrap();
+                match st.pending.get_mut(&key) {
+                    Some(p) if !p.running && p.retry_at <= now => {
+                        p.running = true;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if start {
+                self.spawn_expiry_removal(id);
+            } else {
+                self.refresh_after_miss(&id, key, now);
+            }
+            return;
+        }
+        if !crate::expiry::is_target(&row) {
+            self.expiry_refresh(&id);
+            return;
+        }
+        if crate::expiry::lifetime_deadline(&row).is_some_and(|deadline| deadline <= now) {
+            self.expire_lifetime(&id, key, now);
+            return;
+        }
+        let grace = self.expiry.lock().unwrap().grace_until;
+        if crate::expiry::idle_deadline(&row, grace).is_some_and(|deadline| deadline <= now) {
+            self.expire_idle(&id, key, now);
+            return;
+        }
+        self.refresh_after_miss(&id, key, now);
+    }
+
+    /// Lifetime (design 2.4): no lock. Publish the intent first-wins, cancel the
+    /// running execution with its reason, then join the ordinary serialized delete.
+    fn expire_lifetime(self: &Arc<Self>, id: &str, key: u64, now: i64) {
+        // Held before the intent, as Delete does, so every observer shares this slot.
+        let slot = self.slot(id);
+        match self
+            .store
+            .publish_expiry_intent(id, DeletionReason::ExpiredLifetime, None)
+        {
+            Ok(true) => {
+                self.expired_lifetime.fetch_add(1, Ordering::Relaxed);
+                info!(sandbox = %id, "sandbox reached its max_lifetime; deleting");
+                if let Some(cancel) = &*slot.running.lock().unwrap() {
+                    cancel.request(ExecCancelReason::ExpiredLifetime);
+                }
+                self.begin_expiry_removal(id, key, now);
+            }
+            Ok(false) => self.refresh_after_miss(id, key, now),
+            Err(error) => {
+                warn!(sandbox = %id, error = %format!("{error:#}"), "lifetime expiry could not publish its intent; retrying");
+                self.requeue(key, now);
+            }
+        }
+    }
+
+    /// Idle (design 2.4 with MEDIUM 1's gate): `try_lock` the exec lock, and holding
+    /// it and the admission gate, require every outstanding permit free and commit the
+    /// CAS on `activity_seq`; drop both before the ordinary delete retakes the lock.
+    fn expire_idle(self: &Arc<Self>, id: &str, key: u64, now: i64) {
+        let slot = self.slot(id);
+        let Ok(guard) = slot.exec_lock.try_lock() else {
+            // Not idle: the execution's finish activity re-arms it.
+            self.refresh_after_miss(id, key, now);
+            return;
+        };
+        let committed = {
+            let _gate = slot.admission.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.busy() {
+                Ok(false)
+            } else {
+                let grace = self.expiry.lock().unwrap().grace_until;
+                match self.store.sandbox(id) {
+                    Ok(Some(row))
+                        if crate::expiry::is_target(&row)
+                            && crate::expiry::idle_deadline(&row, grace)
+                                .is_some_and(|deadline| deadline <= now) =>
+                    {
+                        #[cfg(test)]
+                        if let Some(hook) = &*self.idle_commit_hook.lock().unwrap() {
+                            hook();
+                        }
+                        self.store.publish_expiry_intent(
+                            id,
+                            DeletionReason::ExpiredIdle,
+                            Some(row.lifecycle.activity_seq),
+                        )
+                    }
+                    Ok(_) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        drop(guard);
+        match committed {
+            Ok(true) => {
+                self.expired_idle.fetch_add(1, Ordering::Relaxed);
+                info!(sandbox = %id, "sandbox reached its idle timeout; deleting");
+                self.begin_expiry_removal(id, key, now);
+            }
+            Ok(false) => self.refresh_after_miss(id, key, now),
+            Err(error) => {
+                warn!(sandbox = %id, error = %format!("{error:#}"), "idle expiry could not publish its intent; retrying");
+                self.requeue(key, now);
+            }
+        }
+    }
+
+    fn begin_expiry_removal(self: &Arc<Self>, id: &str, key: u64, now: i64) {
+        self.expiry.lock().unwrap().pending.insert(
+            key,
+            PendingDelete {
+                since: now,
+                failures: 0,
+                retry_at: now,
+                running: true,
+            },
+        );
+        self.spawn_expiry_removal(id.to_string());
+    }
+
+    /// One expiry removal: the ordinary delete path, under the expiry delete permit
+    /// and no client RPC permit. A failure leaves the row DELETING and charged, retried
+    /// with backoff; shutdown stops waiting removals, and startup completes them.
+    fn spawn_expiry_removal(self: &Arc<Self>, id: String) {
+        let manager = Arc::clone(self);
+        self.operations.spawn(async move {
+            let Some(key) = crate::expiry::key(&id) else {
+                return;
+            };
+            let permit = tokio::select! {
+                biased;
+                () = manager.shutting_down.cancelled() => None,
+                permit = manager.expiry_deletes.clone().acquire_owned() => permit.ok(),
+            };
+            let Some(_permit) = permit else {
+                if let Some(p) = manager.expiry.lock().unwrap().pending.get_mut(&key) {
+                    p.running = false;
+                }
+                return;
+            };
+            let result = manager.delete_inner(&id).await;
+            let deleted = matches!(&result, Ok(s) if s.state == SandboxState::Deleted);
+            if !deleted {
+                manager.failed_expiry_deletes.fetch_add(1, Ordering::Relaxed);
+                let why = match &result {
+                    Ok(s) => format!("still {}", s.state.as_str()),
+                    Err(error) => error.to_string(),
+                };
+                warn!(sandbox = %id, error = %why, "expiry delete failed; the sandbox stays charged and is retried");
+            }
+            {
+                let now = manager.clock.boottime_ms();
+                let mut st = manager.expiry.lock().unwrap();
+                if let Some(p) = st.pending.get_mut(&key) {
+                    p.running = false;
+                    if !deleted {
+                        p.failures = p.failures.saturating_add(1);
+                        let delay = crate::expiry::retry_delay(p.failures);
+                        p.retry_at = now.saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX));
+                    }
+                }
+            }
+            manager.expiry_refresh(&id);
+        });
+    }
+
+    /// Recomputes one sandbox's single queue entry from its row and slot, replacing
+    /// whatever entry it had. Every activity, pause, resume and retry comes here.
+    pub(crate) fn expiry_refresh(&self, id: &str) {
+        let Some(key) = crate::expiry::key(id) else {
+            return;
+        };
+        let row = match self.store.sandbox(id) {
+            Ok(row) => row,
+            Err(error) => {
+                warn!(sandbox = %id, error = %format!("{error:#}"), "expiry could not read the sandbox; retrying");
+                self.requeue(key, self.clock.boottime_ms());
+                return;
+            }
+        };
+        let busy = self.existing_slot(id).is_some_and(|slot| slot.busy());
+        let mut st = self.expiry.lock().unwrap();
+        let next = next_action(row.as_ref(), busy, &mut st, key);
+        debug_assert!(next.is_none() || st.queue.len() < st.bound || st.queue.get(key).is_some());
+        if st.queue.set(key, next) {
+            drop(st);
+            self.expiry_changed.notify_one();
+        }
+    }
+
+    /// After an attempt that changed nothing, never re-arm at a time already past:
+    /// that would spin. A second later is soon enough for a state that just changed.
+    fn refresh_after_miss(&self, id: &str, key: u64, now: i64) {
+        self.expiry_refresh(id);
+        let mut st = self.expiry.lock().unwrap();
+        if let Some((time, _)) = st.queue.get(key)
+            && time <= now
+        {
+            st.queue
+                .set(key, Some((now.saturating_add(1_000), Due::Retry)));
+        }
+    }
+
+    fn requeue(&self, key: u64, now: i64) {
+        let mut st = self.expiry.lock().unwrap();
+        st.queue
+            .set(key, Some((now.saturating_add(5_000), Due::Retry)));
+        drop(st);
+        self.expiry_changed.notify_one();
+    }
+
+    /// The timer queue's length and its bound, for tests and the LOW 1 contract.
+    pub fn expiry_queue_len(&self) -> (usize, usize) {
+        let st = self.expiry.lock().unwrap();
+        (st.queue.len(), st.bound)
     }
 
     /// Starts shutdown: new sandboxes and executions are refused. Running
@@ -2630,14 +3332,15 @@ impl<R: Runtime> Manager<R> {
     }
 }
 
+/// Today's "is X, not ready" refusal, with its typed reason (design section 1):
+/// only the message's token prefix is new, and the code is unchanged.
 fn ready(s: &Sandbox) -> Result<()> {
     if s.state == SandboxState::Ready {
         Ok(())
     } else {
-        Err(Error::FailedPrecondition(format!(
-            "sandbox {} is {}, not ready",
-            s.id,
-            s.state.as_str()
+        Err(Error::FailedPrecondition(Refusal::typed(
+            not_ready_reason(s),
+            format!("sandbox {} is {}, not ready", s.id, s.state.as_str()),
         )))
     }
 }
@@ -2743,6 +3446,55 @@ fn normalize_exec_outcome(
     settled
 }
 
+/// One sandbox's next expiry action, or none (design 2.4): the earliest of the
+/// lifetime deadline, the idle deadline (absent while paused) and a pending retry.
+fn next_action(
+    row: Option<&Sandbox>,
+    busy: bool,
+    st: &mut ExpiryState,
+    key: u64,
+) -> Option<(i64, Due)> {
+    let Some(s) = row else {
+        st.pending.remove(&key);
+        return None;
+    };
+    match s.state {
+        SandboxState::Deleting => match st.pending.get(&key) {
+            Some(p) if !p.running => Some((p.retry_at, Due::Retry)),
+            _ => None,
+        },
+        SandboxState::Ready | SandboxState::Lost | SandboxState::Quarantined => {
+            st.pending.remove(&key);
+            if !crate::expiry::is_target(s) {
+                return None;
+            }
+            let lifetime = crate::expiry::lifetime_deadline(s).map(|t| (t, Due::Lifetime));
+            let idle = (!busy)
+                .then(|| crate::expiry::idle_deadline(s, st.grace_until))
+                .flatten()
+                .map(|t| (t, Due::Idle));
+            match (lifetime, idle) {
+                (Some(l), Some(i)) => Some(l.min(i)),
+                (l, i) => l.or(i),
+            }
+        }
+        SandboxState::Creating | SandboxState::Deleted | SandboxState::Failed => {
+            st.pending.remove(&key);
+            None
+        }
+    }
+}
+
+/// `Sandbox.expiry` as the API reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExpiryView {
+    pub policy: crate::model::ExpiryPolicy,
+    pub lifetime_expires_at_ms: Option<i64>,
+    pub idle_expires_at_ms: Option<i64>,
+    pub last_activity_at_ms: Option<i64>,
+    pub idle_paused: bool,
+}
+
 /// The owner and root may use a sandbox; nobody else may.
 fn may_use(sandbox: &Sandbox, uid: u32) -> bool {
     uid == 0 || sandbox.owner_uid == uid
@@ -2753,3 +3505,6 @@ mod tests;
 
 #[cfg(test)]
 mod fenced_tests;
+
+#[cfg(test)]
+mod expiry_tests;

@@ -1788,7 +1788,13 @@ mod tests {
             ),
         ];
         // (file, literal, why). Each must still occur.
-        const LITERALS: [(&str, &str, &str); 6] = [
+        const LITERALS: [(&str, &str, &str); 7] = [
+            (
+                "kilnd/src/expiry.rs",
+                "/proc/sys/kernel/random/boot_id",
+                "kilnd reads its own kernel's boot ID once to anchor expiry deadlines \
+                 (API additions design 2.3); read-only",
+            ),
             (
                 "kilnd-guest-broker/src/main.rs",
                 "/proc/sys/kernel/random/boot_id",

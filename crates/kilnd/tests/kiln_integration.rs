@@ -1144,3 +1144,108 @@ async fn real_kiln_post_allocation_failure_stays_charged_across_restart() {
         Err(kilnd::manager::Error::FailedPrecondition(_))
     ));
 }
+
+/// API additions M1: real kiln sandboxes expire by idle and by lifetime, through the
+/// ordinary delete path, and their backends are gone. A manual clock stands in for
+/// waiting; a lifetime expiry cancels a real running command.
+#[tokio::test]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn real_kiln_sandboxes_expire_by_idle_and_lifetime() {
+    use kilnd::expiry::{ExpiryLimits, ManualClock, RequestedExpiry};
+    use kilnd::model::{CancelReason, DeletionReason};
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let clock = ManualClock::default();
+    let (mut limits, small) = one_small_sandbox();
+    limits.max_sandboxes = 3;
+    limits.max_node_memory_bytes *= 3;
+    limits.max_node_pids *= 3;
+    limits.max_node_disk_bytes *= 3;
+    limits.expiry = ExpiryLimits {
+        restart_grace: Duration::ZERO,
+        ..ExpiryLimits::default()
+    };
+    let m = Arc::new(Manager::with_clock(
+        kiln(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        limits,
+        Arc::new(clock.clone()),
+    ));
+    m.reconcile().await.unwrap();
+    m.rebuild_expiry().unwrap();
+    let with = |lifetime_ms, idle_timeout_ms| CreateRequest {
+        expiry: Some(RequestedExpiry {
+            max_lifetime_ms: lifetime_ms,
+            idle_timeout_ms,
+        }),
+        ..small.clone()
+    };
+    let idle = m.create(with(0, 10_000)).await.unwrap();
+    let lifetime = m.create(with(20_000, 0)).await.unwrap();
+    let never = m.create(small.clone()).await.unwrap();
+    let backends: Vec<String> = [&idle, &lifetime, &never]
+        .iter()
+        .map(|s| s.backend_id.clone().unwrap())
+        .collect();
+    let running = {
+        let m = m.clone();
+        let id = lifetime.id.clone();
+        tokio::spawn(async move { m.exec(exec(&id, &["sleep", "120"], 300_000)).await })
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !exec_scope_populated(&backends[1]) {
+        assert!(Instant::now() < deadline, "the long command never started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let settle = |m: Arc<Manager<KilnRuntime>>, id: String| async move {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (s, _) = m.get(&id, 1).unwrap();
+            if s.state == SandboxState::Deleted {
+                return s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{id} stayed {}",
+                s.state.as_str()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    clock.advance(10_000);
+    m.expire_due();
+    let idle_row = settle(m.clone(), idle.id.clone()).await;
+    assert_eq!(
+        idle_row.lifecycle.deletion_reason,
+        Some(DeletionReason::ExpiredIdle)
+    );
+    // Running pauses nothing for lifetime: it is canceled, and the sandbox removed.
+    clock.advance(10_000);
+    m.expire_due();
+    let canceled = running.await.unwrap().unwrap();
+    assert_eq!(canceled.state, ExecutionState::Canceled);
+    assert_eq!(
+        canceled.cancel_reason,
+        Some(CancelReason::SandboxExpiredLifetime)
+    );
+    let lifetime_row = settle(m.clone(), lifetime.id.clone()).await;
+    assert_eq!(
+        lifetime_row.lifecycle.deletion_reason,
+        Some(DeletionReason::ExpiredLifetime)
+    );
+    let listed = listed_ids(&m).await;
+    assert!(!listed.contains(&backends[0]), "idle backend survived");
+    assert!(!listed.contains(&backends[1]), "lifetime backend survived");
+    assert!(listed.contains(&backends[2]), "a sandbox without a policy expired");
+    clock.advance(30 * 86_400_000);
+    m.expire_due();
+    assert_eq!(m.get(&never.id, 1).unwrap().0.state, SandboxState::Ready);
+    m.delete(&never.id).await.unwrap();
+    assert!(!listed_ids(&m).await.contains(&backends[2]));
+    let stats = m.lifecycle_snapshot();
+    assert_eq!((stats.expired_idle, stats.expired_lifetime), (1, 1));
+    assert_eq!(stats.pending_expiry_deletes, 0);
+}

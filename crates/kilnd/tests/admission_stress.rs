@@ -301,6 +301,7 @@ fn metadata_history_rss_child() {
         create_certainty: Default::default(),
         owner_uid: 0,
         accounting: SandboxAccounting::legacy(&spec, ""),
+        lifecycle: Default::default(),
     };
     let capture = Captured {
         data: vec![b'x'; HISTORY_STREAM_BYTES],
@@ -329,6 +330,7 @@ fn metadata_history_rss_child() {
             stderr: Captured::default(),
             sandbox_reusable: None,
             cleanup_evidence: CleanupEvidence::Unknown,
+            cancel_reason: None,
         };
         store.insert_execution(&execution).unwrap();
         store
@@ -346,6 +348,7 @@ fn metadata_history_rss_child() {
                     cleanup_evidence: CleanupEvidence::Unknown,
                     disposition: None,
                     disposition_reason: None,
+                    cancel_reason: None,
                 },
             )
             .unwrap();
@@ -691,7 +694,7 @@ async fn admission_resource_bounds_plateau_and_recover() {
 
     let mut create_client = client.clone();
     let sandbox_id = create_client
-        .create_sandbox(pb::CreateSandboxRequest { spec: None })
+        .create_sandbox(pb::CreateSandboxRequest { spec: None, expiry: None })
         .await
         .unwrap()
         .into_inner()

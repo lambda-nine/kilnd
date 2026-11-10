@@ -137,6 +137,32 @@ struct Args {
     /// Cache lifetime of a failed Health probe, in seconds.
     #[arg(long, default_value_t = 1)]
     health_failure_cache_secs: u64,
+    /// Longest max_lifetime a create may ask for, in seconds. 0: no cap.
+    #[arg(long, default_value_t = 604_800)]
+    max_sandbox_lifetime_secs: u64,
+    /// Longest idle_timeout a create may ask for, in seconds. 0: no cap.
+    #[arg(long, default_value_t = 86_400)]
+    max_sandbox_idle_secs: u64,
+    /// max_lifetime for a zero field of a create's expiry policy, in seconds. Never
+    /// applies to a create that sends no policy. 0: never expires.
+    #[arg(long, default_value_t = 0)]
+    default_sandbox_lifetime_secs: u64,
+    /// idle_timeout for a zero field of a create's expiry policy, in seconds. Never
+    /// applies to a create that sends no policy. 0: never expires.
+    #[arg(long, default_value_t = 0)]
+    default_sandbox_idle_secs: u64,
+    /// After startup, how long no idle expiry fires, so clients can renew, in seconds.
+    #[arg(long, default_value_t = 60)]
+    expiry_restart_grace_secs: u64,
+    /// A pending expiry delete this old makes Health DEGRADED, in seconds.
+    #[arg(long, default_value_t = 600)]
+    expiry_degraded_after_secs: u64,
+    /// How often the expiry sweeper rescans the boot clock, in seconds (1 to 300).
+    #[arg(long, default_value_t = 30)]
+    expiry_rescan_secs: u64,
+    /// Expiry removals running at once (1 to 16).
+    #[arg(long, default_value_t = 4)]
+    max_concurrent_expiry_deletes: usize,
     /// On SIGTERM, how long running requests may finish before executions are
     /// canceled, in seconds.
     #[arg(long, default_value_t = 30)]
@@ -354,7 +380,8 @@ async fn serve_with<R: Runtime>(
     runtime: R,
     limits: Limits,
 ) -> Result<()> {
-    let manager = Arc::new(Manager::new(runtime, store, limits));
+    let clock = Arc::new(kilnd::expiry::SystemClock::new().context("read the kernel boot ID")?);
+    let manager = Arc::new(Manager::with_clock(runtime, store, limits, clock));
     let r = manager
         .reconcile()
         .await
@@ -375,7 +402,15 @@ async fn serve_with<R: Runtime>(
         "reconciled with the backend"
     );
 
+    // After reconciliation and before the sweeper, admission or any prune (design 2.3).
+    let rebased = manager
+        .rebase_expiry_clocks()
+        .context("rebase expiry clocks from an earlier boot")?;
+    if rebased != 0 {
+        info!(rows = rebased, "rebased expiry clocks from an earlier boot");
+    }
     manager.prune().context("startup history prune")?;
+    let expiry_task = manager.start_expiry().context("start the expiry sweeper")?;
     let prune_manager = manager.clone();
     let prune_cancel = tokio_util::sync::CancellationToken::new();
     let stop_prune = prune_cancel.clone();
@@ -400,6 +435,7 @@ async fn serve_with<R: Runtime>(
             _ = int.recv() => info!("SIGINT"),
         }
     };
+    let sweeper = manager.clone();
     let result = kilnd::server::serve(
         manager,
         socket,
@@ -409,6 +445,10 @@ async fn serve_with<R: Runtime>(
     .await;
     prune_cancel.cancel();
     prune_task.await.context("join history pruner")?;
+    // serve began shutdown unless it failed first; either way the sweeper stops.
+    sweeper.begin_shutdown();
+    expiry_task.await.context("join the expiry sweeper")?;
+    drop(sweeper);
     info!("stopped");
     result
 }
@@ -555,8 +595,22 @@ fn validated_limits(args: &Args) -> Result<Limits> {
         health_probe_timeout: Duration::from_secs(args.health_probe_timeout_secs),
         health_success_cache: Duration::from_secs(args.health_success_cache_secs),
         health_failure_cache: Duration::from_secs(args.health_failure_cache_secs),
+        expiry: kilnd::expiry::ExpiryLimits {
+            max_lifetime_ms: secs_ms(args.max_sandbox_lifetime_secs, "max-sandbox-lifetime-secs")?,
+            max_idle_ms: secs_ms(args.max_sandbox_idle_secs, "max-sandbox-idle-secs")?,
+            default_lifetime_ms: secs_ms(
+                args.default_sandbox_lifetime_secs,
+                "default-sandbox-lifetime-secs",
+            )?,
+            default_idle_ms: secs_ms(args.default_sandbox_idle_secs, "default-sandbox-idle-secs")?,
+            restart_grace: Duration::from_secs(args.expiry_restart_grace_secs),
+            degraded_after: Duration::from_secs(args.expiry_degraded_after_secs),
+            rescan: Duration::from_secs(args.expiry_rescan_secs),
+            max_concurrent_deletes: args.max_concurrent_expiry_deletes,
+        },
         ..Limits::default()
     };
+    validate_expiry(&limits.expiry, args)?;
     for (name, value) in [
         ("max-connections", limits.max_connections),
         ("reserved-connections", limits.reserved_connections),
@@ -703,6 +757,60 @@ fn validated_limits(args: &Args) -> Result<Limits> {
 }
 
 /// A named account's UID and primary GID, from the system's account database.
+/// Seconds as milliseconds that fit the store's signed 64-bit columns and every
+/// boottime sum.
+fn secs_ms(secs: u64, name: &str) -> Result<u64> {
+    secs.checked_mul(1000)
+        .filter(|&ms| i64::try_from(ms).is_ok_and(|ms| ms <= i64::MAX / 4))
+        .with_context(|| format!("--{name} is out of range"))
+}
+
+/// Design section 7's expiry rules, checked before any state is opened.
+fn validate_expiry(e: &kilnd::expiry::ExpiryLimits, args: &Args) -> Result<()> {
+    let min = kilnd::expiry::MIN_EXPIRY_MS;
+    for (name, max, default) in [
+        ("sandbox-lifetime", e.max_lifetime_ms, e.default_lifetime_ms),
+        ("sandbox-idle", e.max_idle_ms, e.default_idle_ms),
+    ] {
+        if max != 0 && max < min {
+            bail!(
+                "--max-{name}-secs must be 0 (no cap) or at least {} s",
+                min / 1000
+            );
+        }
+        if default != 0 && default < min {
+            bail!(
+                "--default-{name}-secs must be 0 (never) or at least {} s",
+                min / 1000
+            );
+        }
+        if default != 0 && max != 0 && default > max {
+            bail!("--default-{name}-secs is above --max-{name}-secs");
+        }
+    }
+    if !(1..=300).contains(&args.expiry_rescan_secs) {
+        bail!("--expiry-rescan-secs must be 1 to 300");
+    }
+    if !(1..=16).contains(&e.max_concurrent_deletes) {
+        bail!("--max-concurrent-expiry-deletes must be 1 to 16");
+    }
+    for (name, value) in [
+        ("expiry-restart-grace-secs", args.expiry_restart_grace_secs),
+        (
+            "expiry-degraded-after-secs",
+            args.expiry_degraded_after_secs,
+        ),
+    ] {
+        if value > 86_400 {
+            bail!("--{name} must be at most 86400");
+        }
+    }
+    if args.expiry_degraded_after_secs == 0 {
+        bail!("--expiry-degraded-after-secs must be nonzero");
+    }
+    Ok(())
+}
+
 fn account_ids(name: &str) -> Result<(u32, u32)> {
     let cname = CString::new(name).context("account name contains NUL")?;
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
@@ -826,6 +934,47 @@ mod tests {
             error.contains("kilnd-fctest") && !error.contains("differs from"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn expiry_flags_default_to_never_and_are_validated_before_state() {
+        let args = Args::try_parse_from(["kilnd"]).unwrap();
+        let limits = validated_limits(&args).unwrap();
+        assert_eq!(limits.expiry, kilnd::expiry::ExpiryLimits::default());
+        assert_eq!(limits.expiry.default_lifetime_ms, 0);
+        assert_eq!(limits.expiry.default_idle_ms, 0);
+        for (argv, ok) in [
+            (&["--default-sandbox-idle-secs", "60"][..], true),
+            (
+                &[
+                    "--max-sandbox-idle-secs",
+                    "0",
+                    "--default-sandbox-idle-secs",
+                    "999999",
+                ],
+                true,
+            ),
+            (&["--default-sandbox-idle-secs", "86401"], false),
+            (&["--default-sandbox-lifetime-secs", "9"], false),
+            (&["--max-sandbox-lifetime-secs", "5"], false),
+            (&["--max-sandbox-lifetime-secs", "0"], true),
+            (&["--expiry-rescan-secs", "0"], false),
+            (&["--expiry-rescan-secs", "301"], false),
+            (&["--max-concurrent-expiry-deletes", "0"], false),
+            (&["--max-concurrent-expiry-deletes", "17"], false),
+            (&["--max-concurrent-expiry-deletes", "16"], true),
+            (&["--expiry-degraded-after-secs", "0"], false),
+            (&["--expiry-restart-grace-secs", "0"], true),
+            (
+                &["--max-sandbox-lifetime-secs", "18446744073709551615"],
+                false,
+            ),
+        ] {
+            let mut full = vec!["kilnd"];
+            full.extend_from_slice(argv);
+            let args = Args::try_parse_from(full).unwrap();
+            assert_eq!(validated_limits(&args).is_ok(), ok, "{argv:?}");
+        }
     }
 
     #[test]

@@ -192,7 +192,6 @@ pub struct FakeFenced {
     pub inventory_extra: Vec<BackendRecord>,
 }
 
-#[derive(Default)]
 pub struct FakeState {
     pub mode: FakeEvidenceMode,
     pub fenced: FakeFenced,
@@ -252,7 +251,59 @@ pub struct FakeState {
     /// incomplete but otherwise successful backend listing.
     pub hidden_from_list: Vec<String>,
     pub incompatible_sandboxes: Vec<String>,
+    /// What the dynamic feature probe proves; `Err` models a failed or older probe.
+    pub proven_features: Result<Vec<crate::manager::Feature>, String>,
+    /// Removals running now and the most seen at once (mass-expiry bound).
+    pub active_removes: u32,
+    pub max_active_removes: u32,
+    /// Holds every legacy removal until released, so tests see them overlap.
+    pub remove_hold: Option<std::sync::Arc<tokio::sync::Notify>>,
     next: u64,
+}
+
+impl Default for FakeState {
+    fn default() -> Self {
+        Self {
+            mode: Default::default(),
+            fenced: Default::default(),
+            node_totals: None,
+            sandboxes: Default::default(),
+            created: Vec::new(),
+            removed: Vec::new(),
+            remove_attempts: Vec::new(),
+            remove_targets: Vec::new(),
+            exec_calls: Vec::new(),
+            exec_deadlines: Vec::new(),
+            version_calls: 0,
+            active_version_calls: 0,
+            version_gate: None,
+            version_cleanup_gate: None,
+            panic_version: false,
+            active_execs: 0,
+            canceled_execs: 0,
+            gc_runs: 0,
+            gc_requests: Vec::new(),
+            fail_create: None,
+            fail_create_definitely: None,
+            fail_create_after_allocation: None,
+            panic_create: false,
+            panic_exec: false,
+            fail_remove: false,
+            create_before_allocation: None,
+            create_after_allocation: None,
+            exec_before_run: None,
+            remove_before_delete: None,
+            remove_after_delete: None,
+            unavailable: false,
+            hidden_from_list: Vec::new(),
+            incompatible_sandboxes: Vec::new(),
+            proven_features: Ok(Vec::new()),
+            active_removes: 0,
+            max_active_removes: 0,
+            remove_hold: None,
+            next: 0,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -779,6 +830,18 @@ impl Runtime for FakeRuntime {
         Ok("fake 1.0".into())
     }
 
+    async fn proven_features(
+        &self,
+        _deadline: tokio::time::Instant,
+        _cancel: &CancellationToken,
+    ) -> Result<crate::manager::ProvenFeatures, RuntimeError> {
+        self.state()
+            .proven_features
+            .clone()
+            .map(crate::manager::ProvenFeatures)
+            .map_err(RuntimeError::Backend)
+    }
+
     async fn prepare(
         &self,
         _context: &PrepareContext,
@@ -1187,14 +1250,29 @@ impl Runtime for FakeRuntime {
                 .await;
         }
         let id = target.legacy()?;
-        let gate = {
+        let (gate, hold) = {
             let mut s = self.state();
             s.remove_attempts.push(id.to_string());
             if !s.sandboxes.contains_key(id) {
                 return Err(RuntimeError::NotFound(id.to_string()));
             }
-            s.remove_before_delete.take()
+            s.active_removes += 1;
+            s.max_active_removes = s.max_active_removes.max(s.active_removes);
+            (s.remove_before_delete.take(), s.remove_hold.clone())
         };
+        struct Active(Arc<Mutex<FakeState>>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .active_removes -= 1;
+            }
+        }
+        let _active = Active(self.state.clone());
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
         if let Some(gate) = gate {
             gate.hold().await;
         }

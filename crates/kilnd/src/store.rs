@@ -18,17 +18,19 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 
+use crate::expiry::{Clock, ClockReading, RENEW_COALESCE_MS};
 use crate::lock::ExclusiveFileLock;
 use crate::model::{
-    AccountingRegime, AllocationBinding, Captured, CleanupEvidence, CommandStatus, CreateCertainty,
-    Digest, Execution, ExecutionState, Id128, LegacyRelease, ReservationRelease,
-    ResourceReservation, RuntimeDiagnostic, RuntimeErrorKind, RuntimeStage, Sandbox,
-    SandboxAccounting, SandboxDisposition, SandboxSpec, SandboxState, now_ms,
+    AccountingRegime, AllocationBinding, CancelReason, Captured, CleanupEvidence, CommandStatus,
+    CreateCertainty, DeletionReason, Digest, Execution, ExecutionState, ExpiryPolicy, Id128,
+    LegacyRelease, ReservationRelease, ResourceReservation, RuntimeDiagnostic, RuntimeErrorKind,
+    RuntimeStage, Sandbox, SandboxAccounting, SandboxDisposition, SandboxLifecycle, SandboxSpec,
+    SandboxState, now_ms,
 };
 use crate::retention::{OutputStorage, Pruned, Retention};
 use crate::runtime::{CreatedSandbox, FencedAbsence, RuntimeReceipt};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -343,6 +345,48 @@ const MIGRATE_V10: &str = "
 CREATE TABLE reservation_integrity (id INTEGER PRIMARY KEY CHECK (id = 1), digest BLOB NOT NULL CHECK (length(digest) = 32));
 PRAGMA user_version = 10;";
 
+// Schema 11 (API additions design 2.6): expiry policy, its clock anchors, the
+// activity CAS guard and typed deletion and cancel reasons. None of these enters the
+// reservation digest or the fenced identity triggers: they are lifecycle data, not
+// reservation membership. Historical rows get nulls and seq 0: never expires, reason
+// unknown. Fresh databases reach it through the same step.
+const MIGRATE_V11: &str = "
+ALTER TABLE sandboxes ADD COLUMN expiry_lifetime_ms INTEGER CHECK (expiry_lifetime_ms IS NULL OR (typeof(expiry_lifetime_ms) = 'integer' AND expiry_lifetime_ms > 0));
+ALTER TABLE sandboxes ADD COLUMN expiry_idle_ms INTEGER CHECK (expiry_idle_ms IS NULL OR (typeof(expiry_idle_ms) = 'integer' AND expiry_idle_ms > 0));
+ALTER TABLE sandboxes ADD COLUMN ready_at_ms INTEGER CHECK (ready_at_ms IS NULL OR typeof(ready_at_ms) = 'integer');
+ALTER TABLE sandboxes ADD COLUMN ready_boottime_ms INTEGER CHECK (ready_boottime_ms IS NULL OR typeof(ready_boottime_ms) = 'integer');
+ALTER TABLE sandboxes ADD COLUMN activity_at_ms INTEGER CHECK (activity_at_ms IS NULL OR typeof(activity_at_ms) = 'integer');
+ALTER TABLE sandboxes ADD COLUMN activity_boottime_ms INTEGER CHECK (activity_boottime_ms IS NULL OR typeof(activity_boottime_ms) = 'integer');
+ALTER TABLE sandboxes ADD COLUMN clock_boot_id TEXT CHECK (clock_boot_id IS NULL OR (typeof(clock_boot_id) = 'text' AND length(clock_boot_id) BETWEEN 1 AND 64));
+ALTER TABLE sandboxes ADD COLUMN activity_seq INTEGER NOT NULL DEFAULT 0 CHECK (typeof(activity_seq) = 'integer' AND activity_seq >= 0);
+ALTER TABLE sandboxes ADD COLUMN deletion_reason TEXT CHECK (deletion_reason IS NULL OR deletion_reason IN ('requested', 'expired_idle', 'expired_lifetime'));
+ALTER TABLE executions ADD COLUMN cancel_reason TEXT CHECK (cancel_reason IS NULL OR cancel_reason IN ('client_disconnected', 'sandbox_deleted', 'daemon_shutdown', 'sandbox_expired_lifetime'));
+CREATE INDEX sandboxes_expiry ON sandboxes (id)
+    WHERE state IN ('ready', 'lost', 'quarantined', 'deleting')
+      AND (expiry_lifetime_ms IS NOT NULL OR expiry_idle_ms IS NOT NULL);
+CREATE TRIGGER sandboxes_expiry_policy_immutable BEFORE UPDATE ON sandboxes
+WHEN NEW.expiry_lifetime_ms IS NOT OLD.expiry_lifetime_ms OR NEW.expiry_idle_ms IS NOT OLD.expiry_idle_ms
+BEGIN SELECT RAISE(ABORT, 'a sandbox expiry policy is immutable'); END;
+CREATE TRIGGER sandboxes_deletion_reason_once BEFORE UPDATE ON sandboxes
+WHEN (OLD.deletion_reason IS NOT NULL AND NEW.deletion_reason IS NOT OLD.deletion_reason)
+    OR (OLD.deletion_reason IS NULL AND NEW.deletion_reason IS NOT NULL AND NEW.state NOT IN ('deleting', 'deleted'))
+BEGIN SELECT RAISE(ABORT, 'a deletion reason is written once, with DELETING or DELETED'); END;
+CREATE TRIGGER sandboxes_deletion_reason_insert BEFORE INSERT ON sandboxes
+WHEN NEW.deletion_reason IS NOT NULL AND NEW.state NOT IN ('deleting', 'deleted')
+BEGIN SELECT RAISE(ABORT, 'a deletion reason is written once, with DELETING or DELETED'); END;
+CREATE TRIGGER sandboxes_activity_seq_monotonic BEFORE UPDATE ON sandboxes
+WHEN NEW.activity_seq < OLD.activity_seq
+BEGIN SELECT RAISE(ABORT, 'activity_seq only increases'); END;
+CREATE TRIGGER sandboxes_ready_anchor_fixed BEFORE UPDATE ON sandboxes
+WHEN (OLD.ready_at_ms IS NOT NULL AND NEW.ready_at_ms IS NOT OLD.ready_at_ms)
+    OR (OLD.ready_boottime_ms IS NOT NULL AND NEW.ready_boottime_ms IS NOT OLD.ready_boottime_ms
+        AND NEW.clock_boot_id IS OLD.clock_boot_id)
+BEGIN SELECT RAISE(ABORT, 'a READY anchor changes only in the cross-boot rebase'); END;
+CREATE TRIGGER executions_cancel_reason_once BEFORE UPDATE ON executions
+WHEN OLD.cancel_reason IS NOT NULL AND NEW.cancel_reason IS NOT OLD.cancel_reason
+BEGIN SELECT RAISE(ABORT, 'a cancel reason is written once'); END;
+PRAGMA user_version = 11;";
+
 fn reservation_digest(conn: &Connection) -> Result<Vec<u8>> {
     // Include all immutable reservation/identity data; lifecycle transitions and
     // release references intentionally do not change this membership fingerprint.
@@ -559,6 +603,9 @@ pub struct Store {
     // Keeps the validated directory inode pinned until after SQLite and the
     // instance lock close.
     _state_directory: Option<File>,
+    /// The clocks lifecycle anchors are stamped with; the manager shares its own.
+    /// `None` only when the kernel's boot ID could not be read: then nothing is stamped.
+    clock: std::sync::RwLock<Option<std::sync::Arc<dyn Clock>>>,
     #[cfg(test)]
     reject_execution_finishes: Arc<AtomicBool>,
     #[cfg(test)]
@@ -581,6 +628,8 @@ pub struct ExecutionResult<'a> {
     /// `Quarantined` into QUARANTINED; both stay charged, and DELETING stays DELETING.
     pub disposition: Option<SandboxDisposition>,
     pub disposition_reason: Option<&'a str>,
+    /// Why a CANCELED execution was canceled.
+    pub cancel_reason: Option<CancelReason>,
 }
 
 pub struct SandboxPageRow {
@@ -698,6 +747,101 @@ fn i64_amount(value: u64, what: &str) -> Result<i64> {
 
 fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
     let accounting = &sandbox.accounting;
+    let lifecycle = &sandbox.lifecycle;
+    let reservation = accounting.reservation;
+    let allocation = accounting.allocation.as_ref();
+    let fenced = sandbox.is_fenced();
+    // The tag is schema 7's predicate over this row, never a caller's claim.
+    let legacy_release = (!fenced)
+        .then(|| {
+            LegacyRelease::for_row(
+                sandbox.state,
+                sandbox.backend_id.as_deref(),
+                sandbox.create_certainty,
+            )
+        })
+        .flatten();
+    let release_evidence_id = match accounting.release {
+        ReservationRelease::Fenced(receipt) => Some(receipt.to_string()),
+        _ => None,
+    };
+    // The counter survives retention, so an old page watermark excludes new inserts.
+    conn.execute(
+        "UPDATE history_sequence SET value = value + 1 WHERE id = 1",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO sandboxes (id, backend, backend_id, state, spec, failure_reason, created_at_ms, updated_at_ms, deleted_at_ms, create_certainty, owner_uid,
+            accounting_kind, reserved_memory_bytes, reserved_disk_bytes, reserved_pids, reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids,
+            host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest, disposition, boot_id, legacy_release,
+            node_id, instance_id, allocation_id, plan_version, plan_digest, plan, release_evidence_id, last_helper_generation,
+            expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, ready_boottime_ms, activity_at_ms, activity_boottime_ms, clock_boot_id,
+            activity_seq, deletion_reason, list_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33,
+            ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, (SELECT value FROM history_sequence WHERE id = 1))",
+        params![
+            sandbox.id,
+            sandbox.backend,
+            sandbox.backend_id,
+            sandbox.state.as_str(),
+            serde_json::to_string(&sandbox.spec)?,
+            sandbox.failure_reason,
+            sandbox.created_at_ms,
+            sandbox.updated_at_ms,
+            sandbox.deleted_at_ms,
+            sandbox.create_certainty.as_str(),
+            sandbox.owner_uid,
+            if fenced { "fenced" } else { "legacy" },
+            i64_amount(reservation.memory_bytes, "reserved memory")?,
+            i64_amount(reservation.disk_bytes, "reserved disk")?,
+            i64_amount(reservation.pids, "reserved PIDs")?,
+            i64_amount(reservation.host_cpu_millis, "reserved host CPU")?,
+            i64_amount(reservation.virtual_cpu_slots, "reserved vCPU slots")?,
+            i64_amount(reservation.host_pids, "reserved host PIDs")?,
+            accounting.host_spec_sha256.to_string(),
+            accounting.guest_exec_spec_sha256.to_string(),
+            accounting.runtime_profile,
+            accounting.runtime_artifact_digest,
+            accounting.disposition.as_str(),
+            accounting.boot_id,
+            legacy_release.map(LegacyRelease::as_str),
+            allocation.map(|a| a.node_id.to_string()),
+            allocation.map(|a| a.instance_id.to_string()),
+            allocation.map(|a| a.allocation_id.to_string()),
+            allocation.map(|a| a.plan_version),
+            allocation.map(|a| a.plan_digest.to_string()),
+            allocation.map(|a| a.plan.as_slice()),
+            release_evidence_id,
+            accounting
+                .last_helper_generation
+                .map(|generation| i64_amount(generation, "helper generation"))
+                .transpose()?,
+            lifecycle
+                .expiry
+                .max_lifetime_ms
+                .map(|ms| i64_amount(ms, "expiry lifetime"))
+                .transpose()?,
+            lifecycle
+                .expiry
+                .idle_timeout_ms
+                .map(|ms| i64_amount(ms, "expiry idle timeout"))
+                .transpose()?,
+            lifecycle.ready_at_ms,
+            lifecycle.ready_boottime_ms,
+            lifecycle.activity_at_ms,
+            lifecycle.activity_boottime_ms,
+            lifecycle.clock_boot_id,
+            lifecycle.activity_seq,
+            lifecycle.deletion_reason.map(DeletionReason::as_str),
+        ],
+    )?;
+    Ok(())
+}
+
+/// A schema 8-10 row, for migration tests of those schemas.
+#[cfg(test)]
+fn insert_sandbox_before_v11(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
+    let accounting = &sandbox.accounting;
     let reservation = accounting.reservation;
     let allocation = accounting.allocation.as_ref();
     let fenced = sandbox.is_fenced();
@@ -765,6 +909,40 @@ fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
                 .map(|generation| i64_amount(generation, "helper generation"))
                 .transpose()?,
         ],
+    )?;
+    Ok(())
+}
+
+/// The host's clocks, or none: without a boot ID nothing may be stamped as this
+/// boot's (a fixed stand-in would let another boot's anchors pass as ours), so every
+/// write that stamps an anchor then fails instead.
+fn default_clock() -> Option<std::sync::Arc<dyn Clock>> {
+    crate::expiry::SystemClock::new()
+        .ok()
+        .map(|clock| std::sync::Arc::new(clock) as std::sync::Arc<dyn Clock>)
+}
+
+/// Stamps the first READY publication's anchors, in the caller's transaction. Later
+/// READY publications (a recovered LOST row) keep the first.
+fn stamp_first_ready(conn: &Connection, id: &str, now: &ClockReading) -> Result<()> {
+    conn.execute(
+        "UPDATE sandboxes SET ready_at_ms = ?2, ready_boottime_ms = ?3, activity_at_ms = ?2,
+             activity_boottime_ms = ?3, clock_boot_id = ?4
+         WHERE id = ?1 AND state = 'ready' AND ready_boottime_ms IS NULL",
+        params![id, now.wall_ms, now.boottime_ms, now.boot_id],
+    )?;
+    Ok(())
+}
+
+/// Records one activity (design 2.1) in the caller's transaction. A row that was
+/// never READY only bumps its sequence: no clock runs before READY.
+fn record_activity(conn: &Connection, id: &str, now: &ClockReading) -> Result<()> {
+    conn.execute(
+        "UPDATE sandboxes SET activity_seq = activity_seq + 1,
+             activity_at_ms = CASE WHEN ready_boottime_ms IS NULL THEN activity_at_ms ELSE ?2 END,
+             activity_boottime_ms = CASE WHEN ready_boottime_ms IS NULL THEN activity_boottime_ms ELSE ?3 END
+         WHERE id = ?1",
+        params![id, now.wall_ms, now.boottime_ms],
     )?;
     Ok(())
 }
@@ -977,6 +1155,7 @@ impl Store {
             conn: Mutex::new(conn),
             _instance_lock: instance_lock,
             _state_directory: state_directory,
+            clock: std::sync::RwLock::new(default_clock()),
             #[cfg(test)]
             reject_execution_finishes: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -1083,7 +1262,10 @@ impl Store {
             drop(stmt);
             tx.execute_batch(MIGRATE_V9)?;
         }
-        tx.execute_batch(MIGRATE_V10)?;
+        if version < 10 {
+            tx.execute_batch(MIGRATE_V10)?;
+        }
+        tx.execute_batch(MIGRATE_V11)?;
         refresh_reservation_integrity(&tx)?;
         audit_accounting(&tx)?;
         tx.commit()
@@ -1212,7 +1394,10 @@ impl Store {
     ) -> Result<()> {
         let now = now_ms();
         let deleted_at = (state == SandboxState::Deleted).then_some(now);
-        let n = self.conn().execute(
+        let reading = self.clock_reading()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = tx.execute(
             &format!(
                 "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
                  updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION}
@@ -1223,7 +1408,177 @@ impl Store {
         if n != 1 {
             bail!("sandbox {id} not found");
         }
+        stamp_first_ready(&tx, id, &reading)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// The clocks lifecycle anchors use. The manager installs its own before serving.
+    pub fn set_clock(&self, clock: std::sync::Arc<dyn Clock>) {
+        *self.clock.write().unwrap_or_else(|e| e.into_inner()) = Some(clock);
+    }
+
+    fn clock_reading(&self) -> Result<ClockReading> {
+        match &*self.clock.read().unwrap_or_else(|e| e.into_inner()) {
+            Some(clock) => Ok(ClockReading::now(&**clock)),
+            None => bail!("the kernel boot ID could not be read, so no clock anchor can be stamped"),
+        }
+    }
+
+    /// A user Delete's intent (or a FAILED/unreleased row's direct DELETED), as
+    /// `compare_and_set_sandbox_state`, recording `reason` in the same statement if
+    /// the row has none. An expiry that published first keeps its reason.
+    pub fn publish_delete_intent(
+        &self,
+        id: &str,
+        expected: SandboxState,
+        state: SandboxState,
+        failure_reason: Option<&str>,
+        reason: DeletionReason,
+    ) -> Result<bool> {
+        if !matches!(state, SandboxState::Deleting | SandboxState::Deleted) {
+            bail!("sandbox {id}: a delete intent is DELETING or DELETED");
+        }
+        let now = now_ms();
+        let deleted_at = (state == SandboxState::Deleted).then_some(now);
+        let n = self.conn().execute(
+            &format!(
+                "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
+                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION},
+                 deletion_reason = COALESCE(deletion_reason, ?8)
+             WHERE id = ?1 AND state = ?7"
+            ),
+            params![
+                id,
+                state.as_str(),
+                Option::<&str>::None,
+                failure_reason,
+                now,
+                deleted_at,
+                expected.as_str(),
+                reason.as_str(),
+            ],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Expiry's first-wins delete intent (design 2.4): DELETING and `reason` in one
+    /// statement, only from a live state with no reason yet, only for a row Delete can
+    /// remove, and for idle only if `activity_seq` is still `expected_seq`.
+    pub fn publish_expiry_intent(
+        &self,
+        id: &str,
+        reason: DeletionReason,
+        expected_seq: Option<i64>,
+    ) -> Result<bool> {
+        if reason == DeletionReason::Requested {
+            bail!("sandbox {id}: expiry publishes an expiry reason");
+        }
+        let n = self.conn().execute(
+            "UPDATE sandboxes SET state = 'deleting', deletion_reason = ?2, updated_at_ms = ?3
+             WHERE id = ?1 AND state IN ('ready', 'lost', 'quarantined') AND deletion_reason IS NULL
+               AND (expiry_lifetime_ms IS NOT NULL OR expiry_idle_ms IS NOT NULL)
+               AND (accounting_kind = 'fenced' OR backend_id IS NOT NULL)
+               AND (?4 IS NULL OR activity_seq = ?4)",
+            params![id, reason.as_str(), now_ms(), expected_seq],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// RenewSandbox (design 2.6): one UPDATE, committed before the reply, only on a
+    /// READY row. Within a second of the last durable activity it writes nothing.
+    /// Returns the row as it stands after, or `None` if it does not exist.
+    pub fn renew(&self, id: &str) -> Result<Option<(Sandbox, bool)>> {
+        let reading = self.clock_reading()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let read = |tx: &Connection| -> Result<Option<Sandbox>> {
+            audit_accounting(tx)?;
+            tx.query_row(
+                &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
+                [id],
+                sandbox_row,
+            )
+            .optional()?
+            .transpose()
+        };
+        let Some(row) = read(&tx)? else {
+            return Ok(None);
+        };
+        if row.state != SandboxState::Ready {
+            return Ok(Some((row, false)));
+        }
+        let recent = row
+            .lifecycle
+            .activity_boottime_ms
+            .is_some_and(|last| reading.boottime_ms.saturating_sub(last) < RENEW_COALESCE_MS);
+        if !recent {
+            tx.execute(
+                "UPDATE sandboxes SET activity_seq = activity_seq + 1,
+                     activity_at_ms = CASE WHEN ready_boottime_ms IS NULL THEN activity_at_ms ELSE ?2 END,
+                     activity_boottime_ms = CASE WHEN ready_boottime_ms IS NULL THEN activity_boottime_ms ELSE ?3 END
+                 WHERE id = ?1 AND state = 'ready'",
+                params![id, reading.wall_ms, reading.boottime_ms],
+            )?;
+        }
+        let row = read(&tx)?.with_context(|| format!("sandbox {id} vanished during renew"))?;
+        tx.commit()?;
+        Ok(Some((row, true)))
+    }
+
+    /// The cross-boot rebase (design 2.3), one IMMEDIATE transaction run once at
+    /// startup before the sweeper, admission or any prune. Every row anchored in
+    /// another boot gets, for lifetime and for idle, the elapsed part
+    /// `min(limit, max(0, now_wall - anchor_wall))` subtracted from current boottime,
+    /// with the current boot ID: both anchors in one statement. Returns how many rows
+    /// it rebased. A crash leaves every row either rebased or still foreign.
+    pub fn rebase_clocks(&self) -> Result<usize> {
+        let now = self.clock_reading()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // (id, lifetime limit, idle limit, ready wall anchor, activity wall anchor)
+        type Foreign = (String, Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+        let rows: Vec<Foreign> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, activity_at_ms FROM sandboxes
+                 WHERE clock_boot_id IS NOT NULL AND clock_boot_id != ?1",
+            )?;
+            stmt.query_map([&now.boot_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let elapsed = |limit: Option<i64>, anchor: Option<i64>| -> Option<i64> {
+            let spent = now.wall_ms.saturating_sub(anchor?).max(0);
+            Some(limit.map_or(spent, |limit| spent.min(limit)))
+        };
+        for (id, lifetime, idle, ready_at, activity_at) in &rows {
+            let ready = elapsed(*lifetime, *ready_at).map(|e| now.boottime_ms.saturating_sub(e));
+            let activity = elapsed(*idle, activity_at.or(*ready_at))
+                .map(|e| now.boottime_ms.saturating_sub(e));
+            tx.execute(
+                "UPDATE sandboxes SET ready_boottime_ms = ?2, activity_boottime_ms = ?3, clock_boot_id = ?4
+                 WHERE id = ?1",
+                params![id, ready, activity, now.boot_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    /// Rows the expiry queue may need an entry for, read through the partial index:
+    /// a policy and a live or DELETING state. Bounded by durable reservations.
+    pub fn expiry_rows(&self) -> Result<Vec<Sandbox>> {
+        let mut connection = self.conn();
+        let conn = connection.transaction()?;
+        audit_accounting(&conn)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SANDBOX_COLUMNS} FROM sandboxes INDEXED BY sandboxes_expiry
+             WHERE state IN ('ready', 'lost', 'quarantined', 'deleting')
+               AND (expiry_lifetime_ms IS NOT NULL OR expiry_idle_ms IS NOT NULL)"
+        ))?;
+        let rows = stmt.query_map([], sandbox_row)?;
+        rows.map(|r| r?).collect()
     }
 
     /// Moves a sandbox to `state` only when its current state still matches
@@ -1239,7 +1594,10 @@ impl Store {
     ) -> Result<bool> {
         let now = now_ms();
         let deleted_at = (state == SandboxState::Deleted).then_some(now);
-        let n = self.conn().execute(
+        let reading = self.clock_reading()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = tx.execute(
             &format!(
                 "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
                  updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION}
@@ -1255,6 +1613,10 @@ impl Store {
                 expected.as_str()
             ],
         )?;
+        if n == 1 {
+            stamp_first_ready(&tx, id, &reading)?;
+        }
+        tx.commit()?;
         Ok(n == 1)
     }
 
@@ -1327,6 +1689,7 @@ impl Store {
              WHERE id = ?1",
             params![id, created.backend_id, receipt.boot_id, encoded, generation, now_ms()],
         )?;
+        stamp_first_ready(&tx, id, &self.clock_reading()?)?;
         tx.commit()?;
         Ok(true)
     }
@@ -1629,6 +1992,33 @@ impl Store {
         )?)
     }
 
+    /// Inserts a RUNNING execution only while its sandbox is READY, with the start
+    /// activity (design 2.1) in the same transaction. False: the sandbox is no longer
+    /// READY (an expiry or Delete intent committed first) and nothing was written.
+    pub fn start_execution(&self, e: &Execution) -> Result<bool> {
+        let reading = self.clock_reading()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = tx.execute(
+            "INSERT INTO executions (id, sandbox_id, argv, state, timeout_ms, stdin_bytes, started_at_ms)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS (SELECT 1 FROM sandboxes WHERE id = ?2 AND state = 'ready')",
+            params![
+                e.id,
+                e.sandbox_id,
+                serde_json::to_string(&e.argv)?,
+                e.state.as_str(),
+                e.timeout_ms,
+                e.stdin_bytes as i64,
+                e.started_at_ms
+            ],
+        )?;
+        if n == 1 {
+            record_activity(&tx, &e.sandbox_id, &reading)?;
+        }
+        tx.commit()?;
+        Ok(n == 1)
+    }
+
     pub fn insert_execution(&self, e: &Execution) -> Result<()> {
         self.conn().execute(
             "INSERT INTO executions (id, sandbox_id, argv, state, timeout_ms, stdin_bytes, started_at_ms)
@@ -1715,7 +2105,7 @@ impl Store {
                  stdout = ?6, stdout_bytes = ?7, stdout_truncated = ?8, stdout_total_bytes_known = ?9,
                  stderr = ?10, stderr_bytes = ?11, stderr_truncated = ?12, stderr_total_bytes_known = ?13,
                  command_status_kind = ?14, command_status_value = ?15, command_core_dumped = ?16, runtime_error = ?17,
-                 sandbox_reusable = ?18, cleanup_evidence = ?19
+                 sandbox_reusable = ?18, cleanup_evidence = ?19, cancel_reason = ?20
              WHERE id = ?1 AND state = 'running'",
             params![
                 id,
@@ -1736,18 +2126,24 @@ impl Store {
                 core_dumped,
                 runtime_error,
                 r.sandbox_reusable,
-                r.cleanup_evidence.as_str()
+                r.cleanup_evidence.as_str(),
+                (r.state == ExecutionState::Canceled)
+                    .then_some(r.cancel_reason)
+                    .flatten()
+                    .map(CancelReason::as_str),
             ],
         )?;
         if n != 1 {
             bail!("execution {id} is not running");
         }
+        let sandbox_id: String = tx.query_row(
+            "SELECT sandbox_id FROM executions WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        // The terminal publication is activity (design 2.1).
+        record_activity(&tx, &sandbox_id, &self.clock_reading()?)?;
         if let Some(disposition) = r.disposition {
-            let sandbox_id: String = tx.query_row(
-                "SELECT sandbox_id FROM executions WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )?;
             apply_disposition(
                 &tx,
                 &sandbox_id,
@@ -1895,6 +2291,11 @@ impl Store {
         self.reject_execution_finishes
             .store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(&self, sql: &str, id: &str) -> rusqlite::Result<usize> {
+        self.conn().execute(sql, [id])
     }
 
     #[cfg(test)]
@@ -2399,8 +2800,10 @@ const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_rea
     host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest, disposition, boot_id, legacy_release,
     node_id, instance_id, allocation_id, plan_version, plan_digest,
     CASE WHEN plan IS NULL OR release_evidence_id IS NULL THEN plan ELSE x'' END, release_evidence_id, last_helper_generation,
-    id IN (SELECT id FROM temp.accounting_quarantine)";
-const SANDBOX_COLUMN_COUNT: usize = 34;
+    id IN (SELECT id FROM temp.accounting_quarantine),
+    expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, ready_boottime_ms, activity_at_ms, activity_boottime_ms,
+    clock_boot_id, activity_seq, deletion_reason";
+const SANDBOX_COLUMN_COUNT: usize = 43;
 
 /// Row decoding errors are reported per row rather than as SQLite errors.
 fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
@@ -2427,6 +2830,11 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
     let plan: Option<Vec<u8>> = row.get(30)?;
     let release_evidence_id: Option<String> = row.get(31)?;
     let last_helper_generation: Option<i64> = row.get(32)?;
+    let expiry: [Option<i64>; 2] = [row.get(34)?, row.get(35)?];
+    let anchors: [Option<i64>; 4] = [row.get(36)?, row.get(37)?, row.get(38)?, row.get(39)?];
+    let clock_boot_id: Option<String> = row.get(40)?;
+    let activity_seq: i64 = row.get(41)?;
+    let deletion_reason: Option<String> = row.get(42)?;
     Ok((|| {
         let bad = |what: &str, why: String| anyhow::anyhow!("sandbox {id}: bad {what}: {why}");
         let amount = |index: usize| {
@@ -2509,6 +2917,31 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
                     .map(u64::try_from)
                     .transpose()
                     .map_err(|e| bad("helper generation", e.to_string()))?,
+            },
+            lifecycle: SandboxLifecycle {
+                expiry: ExpiryPolicy {
+                    max_lifetime_ms: expiry[0]
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|e| bad("expiry lifetime", e.to_string()))?,
+                    idle_timeout_ms: expiry[1]
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|e| bad("expiry idle timeout", e.to_string()))?,
+                },
+                ready_at_ms: anchors[0],
+                ready_boottime_ms: anchors[1],
+                activity_at_ms: anchors[2],
+                activity_boottime_ms: anchors[3],
+                clock_boot_id,
+                activity_seq,
+                deletion_reason: deletion_reason
+                    .map(|reason| {
+                        DeletionReason::parse(&reason).with_context(|| {
+                            format!("sandbox {id}: unknown deletion reason {reason:?}")
+                        })
+                    })
+                    .transpose()?,
             },
             id: id.clone(),
         };
@@ -2627,20 +3060,21 @@ const EXECUTION_COLUMNS: &str =
     started_at_ms, finished_at_ms, stdout, stdout_bytes, stdout_truncated, stdout_total_bytes_known,
     stderr, stderr_bytes, stderr_truncated, stderr_total_bytes_known,
     command_status_kind, command_status_value, command_core_dumped, runtime_error,
-    sandbox_reusable, cleanup_evidence";
+    sandbox_reusable, cleanup_evidence, cancel_reason";
 
 const EXECUTION_METADATA_COLUMNS: &str =
     "id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
     started_at_ms, finished_at_ms, x'', stdout_bytes, stdout_truncated, stdout_total_bytes_known,
     x'', stderr_bytes, stderr_truncated, stderr_total_bytes_known,
     command_status_kind, command_status_value, command_core_dumped, runtime_error,
-    sandbox_reusable, cleanup_evidence";
+    sandbox_reusable, cleanup_evidence, cancel_reason";
 
 fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
     let id: String = row.get(0)?;
     let argv: String = row.get(2)?;
     let state: String = row.get(3)?;
     let cleanup_evidence: String = row.get(23)?;
+    let cancel_reason: Option<String> = row.get(24)?;
     Ok((|| {
         Ok(Execution {
             sandbox_id: row.get(1)?,
@@ -2690,6 +3124,13 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
             cleanup_evidence: CleanupEvidence::parse(&cleanup_evidence).with_context(|| {
                 format!("execution {id}: unknown cleanup evidence {cleanup_evidence:?}")
             })?,
+            cancel_reason: cancel_reason
+                .map(|reason| {
+                    CancelReason::parse(&reason).with_context(|| {
+                        format!("execution {id}: unknown cancel reason {reason:?}")
+                    })
+                })
+                .transpose()?,
             id: id.clone(),
         })
     })())
@@ -2866,6 +3307,7 @@ mod tests {
                         cleanup_evidence: CleanupEvidence::Unknown,
                         disposition: None,
                         disposition_reason: None,
+                        cancel_reason: None,
                     },
                     mode,
                 )
@@ -3047,6 +3489,7 @@ mod tests {
                     cleanup_evidence: CleanupEvidence::Unknown,
                     disposition: None,
                     disposition_reason: None,
+                    cancel_reason: None,
                 },
             )
             .unwrap();
@@ -3100,6 +3543,7 @@ mod tests {
                         cleanup_evidence: CleanupEvidence::Unknown,
                         disposition: None,
                         disposition_reason: None,
+                        cancel_reason: None,
                     },
                 )
                 .unwrap();
@@ -3171,6 +3615,7 @@ mod tests {
                 },
                 "",
             ),
+            lifecycle: Default::default(),
         }
     }
 
@@ -3192,6 +3637,7 @@ mod tests {
             stderr: Captured::default(),
             sandbox_reusable: None,
             cleanup_evidence: CleanupEvidence::Unknown,
+            cancel_reason: None,
         }
     }
 
@@ -3732,6 +4178,185 @@ mod tests {
             // Compare after every supported historical schema reaches schema 9.
             assert_eq!(schema_sql(&store.conn()), expected, "v{version}");
         }
+    }
+
+    /// Schema 11 from schemas 9 and 10 (the earlier ones are covered above) equals a
+    /// fresh schema, and history gets nulls and seq 0: never expires, reason unknown.
+    #[test]
+    fn schema11_from_9_and_10_matches_fresh_and_history_never_expires() {
+        let schema_sql = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        let fresh = Store::open_in_memory().unwrap();
+        let expected = schema_sql(&fresh.conn());
+        for version in [9, 10] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut conn = disk_database_at(tmp.path(), 7);
+            register_receipt_validator(&conn).unwrap();
+            let tx = conn.transaction().unwrap();
+            migrate_v8(&tx).unwrap();
+            tx.execute_batch(MIGRATE_V9).unwrap();
+            if version == 10 {
+                tx.execute_batch(MIGRATE_V10).unwrap();
+            }
+            let mut history = sandbox();
+            history.state = SandboxState::Ready;
+            history.backend_id = Some(format!("old-{version}"));
+            insert_sandbox_before_v11(&tx, &history).unwrap();
+            if version == 10 {
+                refresh_reservation_integrity(&tx).unwrap();
+            }
+            tx.commit().unwrap();
+            release_database(conn, tmp.path());
+            let store = Store::reopen_after_restart(tmp.path());
+            assert_eq!(schema_sql(&store.conn()), expected, "v{version}");
+            let row = store.sandbox(&history.id).unwrap().unwrap();
+            assert_eq!(row.lifecycle, SandboxLifecycle::default(), "v{version}");
+            assert!(!row.lifecycle.expiry.expires());
+            assert!(store.expiry_rows().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn schema11_triggers_defend_policy_reasons_sequence_and_anchors() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = crate::expiry::ManualClock::default();
+        store.set_clock(std::sync::Arc::new(clock.clone()));
+        let mut row = sandbox();
+        row.lifecycle.expiry = ExpiryPolicy {
+            max_lifetime_ms: Some(60_000),
+            idle_timeout_ms: Some(30_000),
+        };
+        store.insert_sandbox(&row).unwrap();
+        store
+            .set_sandbox_state(&row.id, SandboxState::Ready, Some("b-1"), None)
+            .unwrap();
+        let ready = store.sandbox(&row.id).unwrap().unwrap();
+        assert_eq!(ready.lifecycle.ready_boottime_ms, Some(1_000_000));
+        assert_eq!(ready.lifecycle.activity_boottime_ms, Some(1_000_000));
+        assert_eq!(ready.lifecycle.clock_boot_id.as_deref(), Some("boot-a"));
+        let conn = store.conn();
+        for attack in [
+            "UPDATE sandboxes SET expiry_lifetime_ms = 1 WHERE id = ?1",
+            "UPDATE sandboxes SET expiry_idle_ms = NULL WHERE id = ?1",
+            "UPDATE sandboxes SET deletion_reason = 'expired_idle' WHERE id = ?1",
+            "UPDATE sandboxes SET deletion_reason = 'bogus', state = 'deleting' WHERE id = ?1",
+            "UPDATE sandboxes SET activity_seq = -1 WHERE id = ?1",
+            "UPDATE sandboxes SET ready_at_ms = ready_at_ms + 1 WHERE id = ?1",
+            "UPDATE sandboxes SET ready_boottime_ms = ready_boottime_ms + 1 WHERE id = ?1",
+            "UPDATE sandboxes SET expiry_lifetime_ms = 'x' WHERE id = ?1",
+        ] {
+            assert!(conn.execute(attack, [&row.id]).is_err(), "{attack}");
+        }
+        conn.execute(
+            "UPDATE sandboxes SET activity_seq = 5 WHERE id = ?1",
+            [&row.id],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE sandboxes SET activity_seq = 4 WHERE id = ?1",
+                [&row.id]
+            )
+            .is_err()
+        );
+        // Only a rebase, which moves the boot ID with them, moves a READY anchor.
+        conn.execute(
+            "UPDATE sandboxes SET ready_boottime_ms = 7, activity_boottime_ms = 7, clock_boot_id = 'boot-b' WHERE id = ?1",
+            [&row.id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            store
+                .publish_expiry_intent(&row.id, DeletionReason::ExpiredIdle, Some(5))
+                .unwrap()
+        );
+        let conn = store.conn();
+        for attack in [
+            "UPDATE sandboxes SET deletion_reason = 'expired_lifetime' WHERE id = ?1",
+            "UPDATE sandboxes SET deletion_reason = NULL WHERE id = ?1",
+        ] {
+            assert!(conn.execute(attack, [&row.id]).is_err(), "{attack}");
+        }
+        let mut inserted = sandbox();
+        inserted.lifecycle.deletion_reason = Some(DeletionReason::Requested);
+        drop(conn);
+        assert!(
+            store.insert_sandbox(&inserted).is_err(),
+            "a reason needs DELETING or DELETED"
+        );
+        // A cancel reason is written once.
+        let mut other = sandbox();
+        other.state = SandboxState::Ready;
+        other.backend_id = Some("b-2".into());
+        store.insert_sandbox(&other).unwrap();
+        let e = execution(&other.id);
+        assert!(store.start_execution(&e).unwrap());
+        store
+            .finish_execution(
+                &e.id,
+                &ExecutionResult {
+                    state: ExecutionState::Canceled,
+                    exit_code: None,
+                    command_status: None,
+                    runtime_error: None,
+                    failure_reason: Some("canceled"),
+                    stdout: &Captured::default(),
+                    stderr: &Captured::default(),
+                    sandbox_reusable: Some(true),
+                    cleanup_evidence: CleanupEvidence::NoChildStarted,
+                    disposition: None,
+                    disposition_reason: None,
+                    cancel_reason: Some(CancelReason::ClientDisconnected),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.execution(&e.id).unwrap().unwrap().cancel_reason,
+            Some(CancelReason::ClientDisconnected)
+        );
+        let conn = store.conn();
+        for attack in [
+            "UPDATE executions SET cancel_reason = 'daemon_shutdown' WHERE id = ?1",
+            "UPDATE executions SET cancel_reason = NULL WHERE id = ?1",
+        ] {
+            assert!(conn.execute(attack, [&e.id]).is_err(), "{attack}");
+        }
+    }
+
+    #[test]
+    fn renew_writes_only_on_ready_and_coalesces_within_a_second() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = crate::expiry::ManualClock::default();
+        store.set_clock(std::sync::Arc::new(clock.clone()));
+        let row = sandbox();
+        store.insert_sandbox(&row).unwrap();
+        let (creating, renewed) = store.renew(&row.id).unwrap().unwrap();
+        assert!(!renewed);
+        assert_eq!(creating.lifecycle.activity_seq, 0);
+        store
+            .set_sandbox_state(&row.id, SandboxState::Ready, Some("b-1"), None)
+            .unwrap();
+        clock.advance(999);
+        let (same, renewed) = store.renew(&row.id).unwrap().unwrap();
+        assert!(renewed);
+        assert_eq!(same.lifecycle.activity_seq, 0, "coalesced with READY");
+        clock.advance(1);
+        let (moved, _) = store.renew(&row.id).unwrap().unwrap();
+        assert_eq!(moved.lifecycle.activity_seq, 1);
+        assert_eq!(
+            moved.lifecycle.activity_boottime_ms,
+            Some(clock.boottime_ms())
+        );
+        assert!(store.renew("sb-0000000000000000").unwrap().is_none());
     }
 
     #[test]
@@ -5165,7 +5790,7 @@ mod tests {
             migrate_v8(&tx).unwrap();
             tx.commit().unwrap();
             let row = fenced_sandbox();
-            insert_sandbox(&conn, &row).unwrap();
+            insert_sandbox_before_v11(&conn, &row).unwrap();
             let receipt = receipt_for(&row);
             let encoded = if valid {
                 receipt.encode().unwrap()
@@ -5179,7 +5804,17 @@ mod tests {
             let upgraded = Store::open(tmp.path());
             if valid {
                 let store = upgraded.unwrap();
-                assert_eq!(table_snapshot(&store.conn(), "sandboxes"), before);
+                // Schema 11 appends lifecycle columns; history gets their nulls and seq 0.
+                let after = table_snapshot(&store.conn(), "sandboxes");
+                assert_eq!(after.len(), before.len());
+                for (after, before) in after.iter().zip(&before) {
+                    assert_eq!(&after[..before.len()], &before[..]);
+                    use rusqlite::types::Value::{Integer, Null};
+                    assert_eq!(
+                        &after[before.len()..],
+                        &[Null, Null, Null, Null, Null, Null, Null, Integer(0), Null]
+                    );
+                }
                 assert_eq!(table_snapshot(&store.conn(), "release_evidence"), evidence);
                 assert_eq!(
                     store
@@ -5771,6 +6406,7 @@ mod tests {
             cleanup_evidence: CleanupEvidence::SandboxStopped,
             disposition: Some(SandboxDisposition::Stopped),
             disposition_reason: Some("retired"),
+            cancel_reason: None,
         };
         store
             .conn()
@@ -6831,6 +7467,7 @@ mod tests {
             cleanup_evidence: CleanupEvidence::Unknown,
             disposition: None,
             disposition_reason: None,
+            cancel_reason: None,
         };
         store.finish_execution(&e.id, &result).unwrap();
         assert!(

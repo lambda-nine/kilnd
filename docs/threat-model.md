@@ -24,7 +24,7 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   the path only when its device and inode still match this instance. Each
   connection's uid, gid and pid are logged from `SO_PEERCRED`.
 - **Per-caller ownership.** Create records the connection's kernel-reported uid
-  as the sandbox's immutable owner. Get, Exec, Delete, GetExecution and List
+  as the sandbox's immutable owner. Get, Exec, RenewSandbox, Delete, GetExecution and List
   authorize that uid before backend execution, Exec admission or stored-output reads,
   and List filters in SQLite before limits and continuation. Only the owner and
   root (uid 0) pass; a foreign ID is `NOT_FOUND`, the same as a missing one, and
@@ -117,6 +117,26 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   [B2 storage design](design/phase1b-firecracker.md#84-schema-ownership-and-history-protection). Receipts are private,
   trusted backend evidence bounded to 16 KiB, never caller strings or guest assertions,
   and the API exposes none of them.
+- **Expiry deletes only through the ordinary delete path, and only what a policy
+  asked for.** A sandbox expires only if its own create sent an expiry policy: an
+  absent policy never expires, whatever the node defaults, so a client that predates
+  expiry cannot lose a sandbox to it. Expiry publishes the same `DELETING` intent a
+  Delete does and removes through the same path, so it frees nothing a Delete could
+  not, and an ambiguous reservation Delete refuses (a legacy row without a backend
+  ID) is never an expiry target. Only the owner and root may renew; observers (Get,
+  List, Health, GetExecution) never count as activity, so another caller cannot keep a
+  sandbox alive by watching it, and a foreign ID is `NOT_FOUND`. An idle expiry can
+  never take a sandbox from under an admitted Exec: Exec admission and the idle
+  compare-and-set are serialized by the slot's admission gate. Deadlines are
+  `CLOCK_BOOTTIME`, so a wall-clock step (NTP or an operator) cannot shorten or extend
+  one within a boot; only root can change the clock's rate, and root already
+  administers the node. Across a reboot one rebase reads the wall clock once, which
+  only moves when a dead reservation (every sandbox is `LOST` after a reboot) comes
+  back. Removals are bounded by `--max-concurrent-expiry-deletes`, so a mass expiry
+  cannot starve the helper's slots, and the timer queue holds one entry per durable
+  reservation however fast callers renew or run commands. Health and the
+  `kilnd-reason` trailer reveal only node aggregates and the caller's own rows'
+  reasons.
 - **No request-owned exec work.** After an execution row is recorded, a
   daemon supervisor owns backend cleanup, pipe capture and finalization even
   if the RPC disappears. kiln places each command in an execution cgroup;

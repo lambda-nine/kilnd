@@ -2165,6 +2165,7 @@ async fn b7_crash_a_restored_stale_daemon_db_after_compaction_releases_by_synthe
         read_only_root: false,
         writable_paths: vec![],
         labels: BTreeMap::new(),
+        expiry: None,
     };
     let manager_over = |store: Store| {
         let identity = store.identity().unwrap();

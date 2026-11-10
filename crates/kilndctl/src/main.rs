@@ -68,6 +68,8 @@ enum Command {
     Execution { id: String },
     /// Delete a sandbox.
     Rm { id: String },
+    /// Record activity on a ready sandbox, restarting its idle timeout.
+    Renew { id: String },
     /// Create a sandbox, run one command in it, and delete it.
     Run {
         #[command(flatten)]
@@ -111,6 +113,18 @@ struct CreateArgs {
     /// Label KEY=VALUE (repeatable).
     #[arg(long, value_name = "KEY=VALUE")]
     label: Vec<String>,
+    /// Delete the sandbox this long after it became ready, like 30m or 2h (at least
+    /// 10s). Needs a kilnd that lists sandbox_expiry.
+    #[arg(long, value_name = "DURATION")]
+    max_lifetime: Option<String>,
+    /// Delete the sandbox after this long without activity (an execution starting or
+    /// finishing, or `kilndctl renew`), like 10m (at least 10s).
+    #[arg(long, value_name = "DURATION")]
+    idle_timeout: Option<String>,
+    /// Send an expiry policy, using kilnd's defaults for any of --max-lifetime and
+    /// --idle-timeout not given. Without these flags the sandbox never expires.
+    #[arg(long)]
+    expiry_defaults: bool,
 }
 
 #[derive(Args)]
@@ -199,6 +213,30 @@ async fn run(cli: Cli) -> Result<u8> {
                     }
                 );
                 println!("rejected creates:   {}", resources.rejected_creates);
+            }
+            if let Some(capabilities) = &h.runtime_capabilities {
+                let features: Vec<String> = capabilities
+                    .features
+                    .iter()
+                    .map(|&f| feature_name(f))
+                    .collect();
+                println!(
+                    "features:           {}",
+                    if features.is_empty() {
+                        "-".to_string()
+                    } else {
+                        features.join(" ")
+                    }
+                );
+            }
+            if let Some(l) = &h.lifecycle {
+                println!(
+                    "expiry:             {} idle, {} lifetime, {} pending deletes, {} failed attempts",
+                    l.expired_idle,
+                    l.expired_lifetime,
+                    l.pending_expiry_deletes,
+                    l.failed_expiry_deletes
+                );
             }
             if let Some(capabilities) = h.runtime_capabilities {
                 println!(
@@ -314,6 +352,9 @@ async fn run(cli: Cli) -> Result<u8> {
             if !e.failure_reason.is_empty() {
                 eprintln!("reason:   {}", e.failure_reason);
             }
+            if e.cancel_reason != pb::CancelReason::Unspecified as i32 {
+                eprintln!("canceled: {}", cancel_reason(e.cancel_reason));
+            }
             eprintln!("reusable: {}", sandbox_reusable(e.sandbox_reusable));
             eprintln!("cleanup:  {}", cleanup_evidence(e.cleanup_evidence));
             eprintln!("started:  {}", time(e.started_at_unix_ms));
@@ -333,6 +374,17 @@ async fn run(cli: Cli) -> Result<u8> {
                 };
                 eprintln!("{name}:   {total}{retained}");
             }
+            Ok(0)
+        }
+        Command::Renew { id } => {
+            let s = client
+                .renew_sandbox(pb::RenewSandboxRequest { id })
+                .await
+                .map_err(rpc)?
+                .into_inner()
+                .sandbox
+                .context("response has no sandbox")?;
+            println!("{} {}", s.id, sandbox_state(s.state));
             Ok(0)
         }
         Command::Rm { id } => {
@@ -409,6 +461,21 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
         (None, false) => pb::NetworkMode::Allowlist,
         (Some(_), false) => bail!("--allow can't be combined with --net"),
     };
+    let lifetime = a
+        .max_lifetime
+        .as_deref()
+        .map(parse_long_duration_ms)
+        .transpose()?;
+    let idle = a
+        .idle_timeout
+        .as_deref()
+        .map(parse_long_duration_ms)
+        .transpose()?;
+    let expiry =
+        (a.expiry_defaults || lifetime.is_some() || idle.is_some()).then(|| pb::ExpiryPolicy {
+            max_lifetime_ms: lifetime.unwrap_or(0),
+            idle_timeout_ms: idle.unwrap_or(0),
+        });
     let spec = pb::SandboxSpec {
         image: a.image.unwrap_or_default(),
         limits: Some(pb::ResourceLimits {
@@ -431,7 +498,10 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
         labels,
     };
     client
-        .create_sandbox(pb::CreateSandboxRequest { spec: Some(spec) })
+        .create_sandbox(pb::CreateSandboxRequest {
+            spec: Some(spec),
+            expiry,
+        })
         .await
         .map_err(rpc)?
         .into_inner()
@@ -599,6 +669,40 @@ fn print_sandbox(s: &pb::Sandbox) {
     if !s.failure_reason.is_empty() {
         println!("reason:     {}", s.failure_reason);
     }
+    if s.deletion_reason != pb::DeletionReason::Unspecified as i32 {
+        println!("deleted by: {}", deletion_reason(s.deletion_reason));
+    }
+    if let Some(e) = &s.expiry {
+        let policy = e.effective.unwrap_or_default();
+        if policy.max_lifetime_ms != 0 || policy.idle_timeout_ms != 0 {
+            let limit = |ms: u64| {
+                if ms == 0 {
+                    "never".to_string()
+                } else {
+                    format!("{} s", ms / 1000)
+                }
+            };
+            println!(
+                "expiry:     lifetime {}, idle {}",
+                limit(policy.max_lifetime_ms),
+                limit(policy.idle_timeout_ms)
+            );
+            if e.lifetime_expires_at_unix_ms != 0 {
+                println!(
+                    "expires:    {} (lifetime)",
+                    time(e.lifetime_expires_at_unix_ms)
+                );
+            }
+            if e.idle_paused {
+                println!("idle:       paused while an execution runs or waits");
+            } else if e.idle_expires_at_unix_ms != 0 {
+                println!("expires:    {} (idle)", time(e.idle_expires_at_unix_ms));
+            }
+        }
+        if e.last_activity_at_unix_ms != 0 {
+            println!("activity:   {}", time(e.last_activity_at_unix_ms));
+        }
+    }
     if let Some(r) = &s.reservation {
         println!(
             "reserved:   memory {} MiB, disk {} MiB, pids {}, host cpu {} millis, vcpus {}, host pids {}",
@@ -652,6 +756,36 @@ fn print_sandbox(s: &pb::Sandbox) {
             println!("labels:     {}", labels.join(" "));
         }
     }
+}
+
+fn feature_name(v: i32) -> String {
+    pb::Feature::try_from(v)
+        .map(|f| {
+            f.as_str_name()
+                .trim_start_matches("FEATURE_")
+                .to_lowercase()
+        })
+        .unwrap_or_else(|_| format!("unknown({v})"))
+}
+
+fn deletion_reason(v: i32) -> String {
+    pb::DeletionReason::try_from(v)
+        .map(|r| {
+            r.as_str_name()
+                .trim_start_matches("DELETION_REASON_")
+                .to_lowercase()
+        })
+        .unwrap_or_else(|_| format!("unknown({v})"))
+}
+
+fn cancel_reason(v: i32) -> String {
+    pb::CancelReason::try_from(v)
+        .map(|r| {
+            r.as_str_name()
+                .trim_start_matches("CANCEL_REASON_")
+                .to_lowercase()
+        })
+        .unwrap_or_else(|_| format!("unknown({v})"))
 }
 
 fn sandbox_state(v: i32) -> String {
@@ -762,6 +896,29 @@ fn parse_duration_ms(s: &str) -> Result<u32> {
         (s, 1000)
     };
     let n: u32 = num
+        .parse()
+        .with_context(|| format!("invalid duration {s:?}"))?;
+    n.checked_mul(mult)
+        .filter(|&ms| ms > 0)
+        .with_context(|| format!("invalid duration {s:?}"))
+}
+
+/// `90s`, `30m`, `2h`, `7d`, `500ms`, or plain seconds, as milliseconds.
+fn parse_long_duration_ms(s: &str) -> Result<u64> {
+    let (num, mult) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1000)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600_000)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400_000)
+    } else {
+        (s, 1000)
+    };
+    let n: u64 = num
         .parse()
         .with_context(|| format!("invalid duration {s:?}"))?;
     n.checked_mul(mult)
@@ -884,6 +1041,28 @@ mod tests {
         for bad in ["0", "", ".", "1.2345", "-1", "x"] {
             assert!(parse_cpus(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn parses_long_durations_and_sends_expiry_only_when_asked() {
+        assert_eq!(parse_long_duration_ms("90s").unwrap(), 90_000);
+        assert_eq!(parse_long_duration_ms("2h").unwrap(), 7_200_000);
+        assert_eq!(parse_long_duration_ms("7d").unwrap(), 604_800_000);
+        assert_eq!(parse_long_duration_ms("15").unwrap(), 15_000);
+        assert!(parse_long_duration_ms("0s").is_err());
+        assert!(parse_long_duration_ms("x").is_err());
+        let cli = Cli::try_parse_from(["kilndctl", "create"]).unwrap();
+        let Command::Create(args) = cli.command else {
+            panic!("create")
+        };
+        assert!(
+            !args.expiry_defaults && args.max_lifetime.is_none() && args.idle_timeout.is_none()
+        );
+        let cli = Cli::try_parse_from(["kilndctl", "create", "--idle-timeout", "10m"]).unwrap();
+        let Command::Create(args) = cli.command else {
+            panic!("create")
+        };
+        assert_eq!(args.idle_timeout.as_deref(), Some("10m"));
     }
 
     #[test]

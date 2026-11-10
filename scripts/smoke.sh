@@ -397,5 +397,14 @@ python3 -I -c 'import json, sys; e = json.loads(sys.argv[1]); assert e["executio
     || fail "log line is not structured JSON: $line"
 echo "$line"
 
+echo "14. Expiry policy and renew (scripts/expiry-regressions.sh waits out real deadlines)"
+ctl health | grep -q '^features: .*sandbox_expiry' || fail "no sandbox_expiry feature"
+expiring=$(ctl create --memory 64M --disk 16M --idle-timeout 1h --max-lifetime 2h)
+created+=("$expiring")
+ctl get "$expiring" | grep -q '^expiry: *lifetime 7200 s, idle 3600 s' || fail "effective policy not shown"
+[ "$(ctl renew "$expiring")" = "$expiring ready" ] || fail "renew"
+ctl rm "$expiring" >/dev/null
+ctl get "$expiring" | grep -q '^deleted by: *requested' || fail "user delete reason not shown"
+
 ctl health | grep -q '^active sandboxes: *0' || fail "smoke test left active sandboxes"
 echo "PASS"

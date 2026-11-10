@@ -233,9 +233,15 @@ dispatch stops the VM through the existing barrier. Production still serves no p
 It refuses Exec with `FAILED_PRECONDITION`, never returns to `READY` by any path, and
 stays charged until Delete proves it gone.
 
+Expiry adds no state: an idle or lifetime deadline passing on a `READY`, `LOST` or
+`QUARANTINED` row is a second caller of the same `DELETING` path, with
+`deletion_reason` `expired_idle` or `expired_lifetime` instead of `requested` (see
+[Sandbox expiry](#sandbox-expiry)).
+
 Executions: `RUNNING` → `EXITED` (with exit code) | `TIMED_OUT` | `CANCELED`
-(caller disconnected, sandbox deleted, or daemon shutdown) | `FAILED` (backend error) |
-`INTERRUPTED` (found running at startup).
+(caller disconnected, sandbox deleted, daemon shutdown or the sandbox's max lifetime,
+recorded as `cancel_reason`) | `FAILED` (backend error) | `INTERRUPTED` (found running
+at startup).
 
 A sandbox row is written as `CREATING` before `kiln create` runs, so a crash
 mid-create leaves evidence. Creation then belongs to a tracked daemon task,
@@ -448,6 +454,121 @@ At startup, after both ownership locks are held and the socket is reserved:
 
 Running it again changes nothing.
 
+## API discovery and typed reasons
+
+`Health.runtime_capabilities.features` lists what this daemon supports, and
+`limits` (`ApiLimits`) every cap, minimum and default from the API additions design a
+client could hit; a feature that is not listed has zero limits. Features come in
+two sets. The static set is fixed by the code and flags: `SANDBOX_EXPIRY` and
+`TYPED_REASONS` today. The dynamic set is what the backend proves in the shared
+Health probe (`Runtime::proven_features`): it is empty at startup, replaced by each
+successful probe and cleared by any failed or timed-out one, so it fails closed. No
+backend proves a dynamic feature yet (exec cwd, env and streaming come later); the
+create-time and Exec-time gates will read the same set Health publishes. An older
+daemon lists no features and ignores unknown request fields, so a client sets a
+field only when its feature is listed in a `SERVING` response, and re-reads the
+list after every reconnect.
+
+Refusals defined by the additions, and the existing "is X, not ready" refusals of
+Exec and RenewSandbox, carry a `kilnd-reason: <token>` metadata entry, and their
+status message starts with the same token and `": "`. The gRPC code is unchanged
+and so is the rest of the message. The tokens are `sandbox_not_ready` (CREATING),
+`sandbox_failed`, `sandbox_lost`, `sandbox_quarantined`, and for a `DELETING` or
+retained `DELETED` row its deletion reason: `expired_idle`, `expired_lifetime` or
+`sandbox_deleted` (requested, or history from before schema 11). A never-existing,
+foreign or pruned ID stays `NOT_FOUND` with no trailer, so "expired" and "never
+existed" stay distinguishable while the row is retained.
+
+## Sandbox expiry
+
+`CreateSandboxRequest.expiry` (`max_lifetime_ms`, `idle_timeout_ms`) resolves once,
+at create, into an effective policy stored with the row and never changed. An
+absent message never expires, whatever the node is configured with, so a client
+that predates expiry cannot be expired. In a present message a nonzero field is
+used as given, within 10 s and the node maximum (`--max-sandbox-lifetime-secs`,
+`--max-sandbox-idle-secs`; 0 is no cap), else `INVALID_ARGUMENT` before anything is
+prepared; a zero field takes the node default for that field
+(`--default-sandbox-lifetime-secs`, `--default-sandbox-idle-secs`, shipped as 0,
+never).
+
+Lifetime counts from the first `READY` publication and ignores activity. Idle counts
+from the later of `READY` and the last activity, which is exactly an execution row's
+insert, its terminal publication and a successful `RenewSandbox`. Get, List,
+GetExecution, Health and Delete never count. While an execution runs or an admitted
+Exec is queued (the slot's outstanding permits are not all free) idle is paused and
+`ExpiryStatus.idle_paused` is true; the finish that releases the last permit restarts
+it. Nothing runs before `READY`. Deadlines run in `READY`, `LOST` and `QUARANTINED`,
+because those rows still hold reservations; a legacy row without a backend ID is an
+ambiguous reservation Delete refuses, so expiry never targets it. Renew is accepted
+only in `READY`, and within a second of the last durable activity it writes nothing.
+
+**Clocks.** Every decision within one boot reads `CLOCK_BOOTTIME`, which counts
+suspend and never steps with the wall clock. The row stores the boottime and wall
+time of `READY` and of the last activity with the kernel `boot_id` both boottime
+anchors belong to. A deadline is `anchor + limit` in boottime, so it survives a
+daemon restart exactly and ignores NTP and administrator steps. After startup
+reconciliation and before the prune, the sweeper and serving, one `IMMEDIATE`
+transaction rebases every row anchored in another boot: for each anchor it
+subtracts `min(limit, max(0, now_wall - anchor_wall))` from current boottime and
+writes the current boot ID with both anchors. That one wall read is unavoidable
+across a reboot and harmless, since neither backend survives one: such a sandbox is
+`LOST`, and a skewed estimate frees a dead reservation sooner or later. The API's
+`*_unix_ms` fields are wall projections computed at read time and move if the wall
+clock steps. For `--expiry-restart-grace-secs` (60) after startup no idle deadline
+falls, so a client reconnecting after an upgrade can renew; lifetime has no grace.
+
+**The sweeper** is one task owning an indexed timer queue: a hash map from sandbox
+to its single next-action time, mirrored by an ordered set. The next action is the
+earliest of the lifetime deadline, the idle deadline (absent while paused) and a
+pending removal retry. Every activity, pause, resume, Renew and retry replaces that
+sandbox's one entry in place, so the queue holds no stale entries and cannot grow
+with churn. An entry exists only for a row with a policy in `READY`, `LOST` or
+`QUARANTINED`, or in `DELETING` awaiting an expiry retry, and every such row holds a
+durable reservation: the queue's length is at most the number of durable
+reservations. Admission holds those at `--max-sandboxes`, except that reservations
+made under a higher earlier cap remain after a restart with a lower one until they
+drain, so the exact bound is `max(--max-sandboxes, reservations at startup)`, at
+most 96 bytes an entry. Startup rebuilds it from a partial index. Its one timer
+sleeps until the head or `--expiry-rescan-secs` (30), whichever is sooner; the
+rescan recomputes from boottime, so a resume from suspend, when tokio's monotonic
+timers stalled, is caught within one interval.
+
+Two expiry paths share Delete's machinery:
+
+- **Idle** `try_lock`s the slot's exec lock; if an execution holds it, the sandbox
+  is not idle and the finish re-arms it. Holding the guard and the slot's admission
+  gate, it requires every outstanding permit free, rereads the row and commits a
+  compare-and-set that publishes `DELETING(expired_idle)` only if the state is live,
+  `activity_seq` is unchanged and no reason is set. It drops both before running the
+  ordinary delete, which retakes the lock with nothing to wait for. Exec rechecks
+  `READY` and takes its outstanding permit under the same gate, so either the Exec is
+  admitted first and expiry re-arms, or the CAS commits first and the Exec is refused
+  `expired_idle` without ever holding a permit. A Renew bumps `activity_seq` in one
+  `UPDATE ... WHERE state = 'ready'`, so whichever commits first wins.
+- **Lifetime** takes no lock: it publishes `DELETING(expired_lifetime)` with the same
+  first-wins write on `deletion_reason IS NULL`, requests cancellation of the running
+  execution with `SANDBOX_EXPIRED_LIFETIME`, then joins the ordinary serialized
+  teardown. The canceled execution ends `CANCELED` with that `cancel_reason`; a
+  completed outcome already observed still wins; queued requests are refused
+  `expired_lifetime`.
+
+An execution's cancellation handle is published before its row, and the row is
+inserted only while the sandbox is still `READY`, in one transaction with the start
+activity. So a lifetime expiry or Delete whose intent commits first makes the insert
+refuse, and one that commits after always finds the execution to cancel.
+`deletion_reason` is written with the delete intent, only while null, and never
+changes; a user Delete records `requested`, and a Delete of an expired row succeeds
+as a follower and shows its expiry. At most `--max-concurrent-expiry-deletes` (4)
+removals run at once, and they use no client RPC permit; every intent publishes at
+once, so a mass expiry refuses new work immediately while the backend sees a bounded
+number of removals. A failed removal leaves the row `DELETING` and charged, retried
+with backoff from 5 s to 5 min; `HealthResponse.lifecycle` reports expiries, pending
+and failed expiry deletes, and one pending longer than `--expiry-degraded-after-secs`
+(600) makes Health `DEGRADED`. A crash after an intent commits is completed at
+startup like any `DELETING` row, keeping its reason. At shutdown the sweeper stops
+scheduling; removals already running are tracked operations and drain, and ones
+still waiting for a permit stop and are completed at the next startup.
+
 ## Concurrency
 
 Both kilnd and its helper use tokio's current-thread runtime. The daemon
@@ -462,8 +583,9 @@ one `IMMEDIATE` transaction, so concurrent creates and external SQLite writers
 cannot split admission from durable ownership.
 
 Each sandbox has a stable slot holding an async exec lock, an outstanding
-request semaphore (one running plus the configured queue capacity), and the
-running execution's cancellation handle. The registry stores weak references:
+request semaphore (one running plus the configured queue capacity), an admission
+gate (a short synchronous lock idle expiry and Exec admission share; see
+[Sandbox expiry](#sandbox-expiry)), and the running execution's cancellation handle. The registry stores weak references:
 a live slot is never replaced under queued requests, while dead entries are
 pruned on later slot access so create/delete churn does not grow memory. Client
 disconnect, delete, and shutdown all record a first-wins reason through that
@@ -557,6 +679,17 @@ new inserts allocate the next sequence in their INSERT under the connection
 mutex. Newer schemas are refused. Full internal lists for reconciliation also
 use this order.
 
+Schema v11 adds the expiry policy (`expiry_lifetime_ms`, `expiry_idle_ms`, null for
+never), the `READY` and last-activity anchors in wall time and boottime with their
+`clock_boot_id`, `activity_seq` and `deletion_reason` to `sandboxes`, `cancel_reason`
+to `executions`, and a partial index on rows with a policy in a live or `DELETING`
+state. Triggers keep the policy immutable, write `deletion_reason` once and only with
+`DELETING` or `DELETED`, keep `activity_seq` increasing and move a `READY` anchor only
+together with its boot ID, and write `cancel_reason` once. None of these columns enters
+the reservation digest or the fenced identity triggers: they are lifecycle data, not
+reservation membership. History migrates with nulls and sequence 0, which means never
+expires and reason unknown.
+
 Schema v3 adds nullable command termination kind/value/core and bounded JSON
 runtime diagnostics. Persistence caps messages at 2048 UTF-8 bytes and native
 codes at 128 UTF-8 bytes, annotating native-code truncation in the message and
@@ -636,6 +769,9 @@ metadata result alive and enforces an RSS increase below 32 MiB.
 | Malformed token, filter mismatch or oversized page size | `INVALID_ARGUMENT` |
 | List exceeds legacy bounds or one item cannot fit | `RESOURCE_EXHAUSTED` |
 | New create/Exec during shutdown | `UNAVAILABLE` |
+| Exec or RenewSandbox on a sandbox that is not `READY` | `FAILED_PRECONDITION` with a `kilnd-reason` trailer and token prefix |
+| Expiry policy below 10 s or above the node maximum | `INVALID_ARGUMENT`, before anything is prepared |
+| RenewSandbox on a foreign or unknown ID | `NOT_FOUND`, no trailer |
 
 ## Shutdown and restarts
 
@@ -691,6 +827,15 @@ namespace, mount, quota, network, ownership and cleanup capabilities.
 | Health probe timeout | 2 s | `--health-probe-timeout-secs` |
 | Health success / failure cache | 5 s / 1 s | `--health-success-cache-secs`, `--health-failure-cache-secs` |
 | Sandbox defaults | alpine, 512 MiB, 1 CPU, 128 pids, 1 GiB disk, no network | (code) |
+| Maximum sandbox lifetime / idle timeout a create may ask for (0: no cap) | 7 d / 24 h | `--max-sandbox-lifetime-secs`, `--max-sandbox-idle-secs` |
+| Lifetime / idle for a zero field of a present expiry policy (0: never; never applies without a policy) | 0 / 0 | `--default-sandbox-lifetime-secs`, `--default-sandbox-idle-secs` |
+| Minimum lifetime and idle timeout | 10 s | (code) |
+| Idle expiry grace after startup | 60 s | `--expiry-restart-grace-secs` |
+| Pending expiry delete age that degrades Health | 600 s | `--expiry-degraded-after-secs` |
+| Expiry sweeper rescan | 30 s (1 to 300) | `--expiry-rescan-secs` |
+| Expiry removals at once | 4 (1 to 16) | `--max-concurrent-expiry-deletes` |
+| Renew write coalescing; expiry retry backoff | 1 s; 5 s to 5 min | (code) |
+| Expiry timer queue | one entry per durable reservation, at most `max(--max-sandboxes, reservations at startup)`, 96 B each | (derived) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
 
 Startup validates limits before opening state or binding: required counts,
@@ -700,6 +845,8 @@ milliseconds fit `u32`. Checked arithmetic enforces request capacity at least
 stdin + argv + 64 KiB and response capacity at least twice retained output +
 maximum argv + 64 KiB. List bytes cannot exceed response bytes, and pages are
 at most 1000. Each node budget must hold at least one default sandbox.
+Nonzero expiry maxima and defaults are at least 10 s, and a nonzero default is at
+most its nonzero maximum.
 These are finite capacity bounds, not a hard-real-time guarantee: synchronous
 SQLite/filesystem work may block, slow clients may deny availability until
 disconnected, and authorized callers can monopolize capacity without tenant

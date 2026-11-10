@@ -396,6 +396,97 @@ pub struct Sandbox {
     /// Rows older than schema 7 belong to root.
     pub owner_uid: u32,
     pub accounting: SandboxAccounting,
+    /// Expiry policy, its clock anchors and why the row was deleted (schema 11).
+    pub lifecycle: SandboxLifecycle,
+}
+
+/// An effective expiry policy, fixed at create. `None` never expires that way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExpiryPolicy {
+    pub max_lifetime_ms: Option<u64>,
+    pub idle_timeout_ms: Option<u64>,
+}
+
+impl ExpiryPolicy {
+    pub fn expires(&self) -> bool {
+        self.max_lifetime_ms.is_some() || self.idle_timeout_ms.is_some()
+    }
+}
+
+/// Why a row is DELETING or DELETED. Written once, with the delete intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeletionReason {
+    Requested,
+    ExpiredIdle,
+    ExpiredLifetime,
+}
+
+impl DeletionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::ExpiredIdle => "expired_idle",
+            Self::ExpiredLifetime => "expired_lifetime",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "requested" => Self::Requested,
+            "expired_idle" => Self::ExpiredIdle,
+            "expired_lifetime" => Self::ExpiredLifetime,
+            _ => return None,
+        })
+    }
+}
+
+/// Lifecycle data that is not reservation membership: it never enters the
+/// reservation digest or the fenced identity triggers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SandboxLifecycle {
+    pub expiry: ExpiryPolicy,
+    /// Wall time of the first READY publication; display and cross-boot rebase only.
+    pub ready_at_ms: Option<i64>,
+    /// `CLOCK_BOOTTIME` of the first READY, in the boot `clock_boot_id` names.
+    pub ready_boottime_ms: Option<i64>,
+    /// Wall time of the last activity (READY counts as the first).
+    pub activity_at_ms: Option<i64>,
+    pub activity_boottime_ms: Option<i64>,
+    /// The one boot both boottime anchors belong to; they only change together.
+    pub clock_boot_id: Option<String>,
+    /// Bumped by every activity; the idle-expiry compare-and-set guard.
+    pub activity_seq: i64,
+    pub deletion_reason: Option<DeletionReason>,
+}
+
+/// Why a CANCELED execution was canceled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelReason {
+    ClientDisconnected,
+    SandboxDeleted,
+    DaemonShutdown,
+    SandboxExpiredLifetime,
+}
+
+impl CancelReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientDisconnected => "client_disconnected",
+            Self::SandboxDeleted => "sandbox_deleted",
+            Self::DaemonShutdown => "daemon_shutdown",
+            Self::SandboxExpiredLifetime => "sandbox_expired_lifetime",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "client_disconnected" => Self::ClientDisconnected,
+            "sandbox_deleted" => Self::SandboxDeleted,
+            "daemon_shutdown" => Self::DaemonShutdown,
+            "sandbox_expired_lifetime" => Self::SandboxExpiredLifetime,
+            _ => return None,
+        })
+    }
 }
 
 impl Sandbox {
@@ -462,6 +553,8 @@ pub struct Execution {
     /// None for historical rows and for executions with no reuse evidence.
     pub sandbox_reusable: Option<bool>,
     pub cleanup_evidence: CleanupEvidence,
+    /// Set only on CANCELED rows written since schema 11.
+    pub cancel_reason: Option<CancelReason>,
 }
 
 pub fn now_ms() -> i64 {

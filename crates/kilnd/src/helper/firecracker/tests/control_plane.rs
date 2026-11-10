@@ -2115,6 +2115,7 @@ async fn b3r_01_real_manager_paused_after_c1_keeps_an_exact_path_past_a_prefence
                     read_only_root: false,
                     writable_paths: vec![],
                     labels: BTreeMap::new(),
+                    expiry: None,
                 })
                 .await
         })

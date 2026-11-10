@@ -929,6 +929,7 @@ fn runtime_claims_cannot_outrun_their_evidence_on_a_fenced_row() {
                 "",
             )
         },
+        lifecycle: Default::default(),
     };
     let outcome = |finish, disposition, cleanup| ExecOutcome {
         finish,
@@ -2066,6 +2067,7 @@ async fn b7_a_historical_kiln_row_stays_deleting_and_charged_under_a_fenced_back
         create_certainty: CreateCertainty::AllocationAmbiguous,
         owner_uid: 0,
         accounting: SandboxAccounting::legacy(&session.spec, ""),
+        lifecycle: Default::default(),
     };
     m.store.insert_sandbox(&historical).unwrap();
     let error = m.delete(&historical.id).await.unwrap_err();

@@ -8,9 +8,12 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::admission::{ConnectionLane, RpcClass, RpcPermit};
-use crate::manager::{CreateRequest, Error, ExecRequest, Manager};
+use crate::manager::{
+    CreateRequest, Error, ExecRequest, ExpiryView, Feature, Limits, Manager, Refusal,
+};
 use crate::model::{
-    Captured, Execution, ExecutionState, Network, Sandbox, SandboxSpec, SandboxState,
+    CancelReason, Captured, DeletionReason, Execution, ExecutionState, Network, Sandbox,
+    SandboxSpec, SandboxState,
 };
 use crate::runtime::Runtime;
 use crate::server::PeerIdentity;
@@ -59,7 +62,19 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             running_executions: h.running_executions,
             admission: Some(admission_pb(h.admission)),
             node_resources: Some(node_resources_pb(h.node_resources)),
-            runtime_capabilities: Some(runtime_capabilities_pb(h.capabilities)),
+            runtime_capabilities: Some(runtime_capabilities_pb(
+                h.capabilities,
+                &h.features,
+                self.manager.limits(),
+            )),
+            lifecycle: Some(pb::LifecycleStats {
+                expired_idle: h.lifecycle.expired_idle,
+                expired_lifetime: h.lifecycle.expired_lifetime,
+                pending_expiry_deletes: h.lifecycle.pending_expiry_deletes,
+                failed_expiry_deletes: h.lifecycle.failed_expiry_deletes,
+                create_retries_answered: 0,
+                request_ids_released: 0,
+            }),
         }))
     }
 
@@ -69,14 +84,18 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
     ) -> Result<Response<pb::CreateSandboxResponse>, Status> {
         let uid = caller_uid(&req)?;
         let _permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
-        let spec = req.into_inner().spec.unwrap_or_default();
+        let req = req.into_inner();
+        let expiry = req.expiry.map(|e| crate::expiry::RequestedExpiry {
+            max_lifetime_ms: e.max_lifetime_ms,
+            idle_timeout_ms: e.idle_timeout_ms,
+        });
         let sandbox = self
             .manager
-            .create_owned(create_request(spec)?, uid)
+            .create_owned(create_request(req.spec.unwrap_or_default(), expiry)?, uid)
             .await
             .map_err(status)?;
         Ok(Response::new(pb::CreateSandboxResponse {
-            sandbox: Some(sandbox_pb(sandbox)),
+            sandbox: Some(self.sandbox_out(sandbox)),
         }))
     }
 
@@ -93,7 +112,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             .get(&req.id, req.execution_limit)
             .map_err(status)?;
         Ok(Response::new(pb::GetSandboxResponse {
-            sandbox: Some(sandbox_pb(sandbox)),
+            sandbox: Some(self.sandbox_out(sandbox)),
             recent_executions: executions.into_iter().map(execution_pb).collect(),
         }))
     }
@@ -140,7 +159,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         let mut last_returned = None;
         for (index, row) in page.rows.into_iter().enumerate() {
             let seq = row.list_seq;
-            response.sandboxes.push(sandbox_pb(row.sandbox));
+            response.sandboxes.push(self.sandbox_out(row.sandbox));
             let has_more = page.has_more || index + 1 < total;
             response.next_page_token = if paginated && has_more {
                 page_token(req.include_deleted, uid, page.upper_seq, seq)
@@ -178,7 +197,21 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         self.manager.authorize(&id, uid).map_err(status)?;
         let sandbox = self.manager.delete(&id).await.map_err(status)?;
         Ok(Response::new(pb::DeleteSandboxResponse {
-            sandbox: Some(sandbox_pb(sandbox)),
+            sandbox: Some(self.sandbox_out(sandbox)),
+        }))
+    }
+
+    async fn renew_sandbox(
+        &self,
+        req: Request<pb::RenewSandboxRequest>,
+    ) -> Result<Response<pb::RenewSandboxResponse>, Status> {
+        let uid = caller_uid(&req)?;
+        let _permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
+        let id = req.into_inner().id;
+        self.manager.authorize(&id, uid).map_err(status)?;
+        let sandbox = self.manager.renew(&id).map_err(status)?;
+        Ok(Response::new(pb::RenewSandboxResponse {
+            sandbox: Some(self.sandbox_out(sandbox)),
         }))
     }
 
@@ -228,6 +261,14 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
 }
 
 impl<R: Runtime> Service<R> {
+    /// A row as the API shows it, with its live expiry view.
+    fn sandbox_out(&self, sandbox: Sandbox) -> pb::Sandbox {
+        let view = self.manager.expiry_view(&sandbox);
+        let mut out = sandbox_pb(sandbox);
+        out.expiry = Some(expiry_status_pb(view));
+        out
+    }
+
     /// The caller's RPC permit (B7, B6-BI-03). A connection on a reserved slot or the
     /// root slot serves only Health and cleanup; an ordinary RPC needs a global permit
     /// within the UID's share, and a cleanup RPC may fall back to the cleanup lane (and
@@ -285,8 +326,54 @@ fn admission_pb(s: crate::admission::AdmissionSnapshot) -> pb::AdmissionStats {
     }
 }
 
-fn runtime_capabilities_pb(c: crate::runtime::RuntimeCapabilities) -> pb::RuntimeCapabilities {
+fn feature_pb(f: Feature) -> pb::Feature {
+    match f {
+        Feature::SandboxExpiry => pb::Feature::SandboxExpiry,
+        Feature::IdempotentCreate => pb::Feature::IdempotentCreate,
+        Feature::ExecCwd => pb::Feature::ExecCwd,
+        Feature::ExecEnv => pb::Feature::ExecEnv,
+        Feature::SandboxDefaultEnv => pb::Feature::SandboxDefaultEnv,
+        Feature::ExecStream => pb::Feature::ExecStream,
+        Feature::TypedReasons => pb::Feature::TypedReasons,
+        Feature::RequestIdRelease => pb::Feature::RequestIdRelease,
+    }
+}
+
+/// Every cap, minimum and default a client could hit (design section 7). Fields of
+/// features this daemon does not list are zero.
+fn api_limits_pb(l: &Limits) -> pb::ApiLimits {
+    let ms = |d: std::time::Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
+    pb::ApiLimits {
+        max_sandbox_lifetime_ms: l.expiry.max_lifetime_ms,
+        max_sandbox_idle_ms: l.expiry.max_idle_ms,
+        default_sandbox_lifetime_ms: l.expiry.default_lifetime_ms,
+        default_sandbox_idle_ms: l.expiry.default_idle_ms,
+        create_request_retention_ms: 0,
+        max_cwd_bytes: 0,
+        max_env_entries: 0,
+        max_env_name_bytes: 0,
+        max_env_value_bytes: 0,
+        max_env_total_bytes: 0,
+        default_exec_timeout_ms: ms(l.default_timeout),
+        max_exec_timeout_ms: ms(l.max_timeout),
+        default_stream_timeout_ms: 0,
+        max_stream_timeout_ms: 0,
+        max_output_bytes: l.max_output_bytes as u64,
+        stream_chunk_bytes: 0,
+        stream_buffer_bytes: 0,
+        min_sandbox_lifetime_ms: crate::expiry::MIN_EXPIRY_MS,
+        min_sandbox_idle_ms: crate::expiry::MIN_EXPIRY_MS,
+    }
+}
+
+fn runtime_capabilities_pb(
+    c: crate::runtime::RuntimeCapabilities,
+    features: &[Feature],
+    limits: &Limits,
+) -> pb::RuntimeCapabilities {
     pb::RuntimeCapabilities {
+        features: features.iter().map(|f| feature_pb(*f).into()).collect(),
+        limits: Some(api_limits_pb(limits)),
         network_modes: c
             .network_modes
             .iter()
@@ -404,7 +491,7 @@ fn status(e: Error) -> Status {
     match e {
         Error::InvalidArgument(m) => Status::invalid_argument(m),
         Error::NotFound(m) => Status::not_found(format!("{m} not found")),
-        Error::FailedPrecondition(m) => Status::failed_precondition(m),
+        Error::FailedPrecondition(r) => refusal(tonic::Code::FailedPrecondition, r),
         Error::ResourceExhausted(m) => Status::resource_exhausted(m),
         Error::DeadlineExceeded(m) => Status::deadline_exceeded(m),
         Error::ShuttingDown => Status::unavailable("kilnd is shutting down"),
@@ -416,7 +503,30 @@ fn status(e: Error) -> Status {
     }
 }
 
-fn create_request(spec: pb::SandboxSpec) -> Result<CreateRequest, Status> {
+/// A refusal as gRPC sends it: the code is unchanged, and a typed one gains the
+/// `kilnd-reason` trailer and its token as the message prefix (design section 1).
+fn refusal(code: tonic::Code, r: Refusal) -> Status {
+    let message = r.to_string();
+    match r.reason() {
+        Some(reason) => {
+            let mut metadata = tonic::metadata::MetadataMap::new();
+            metadata.insert(
+                REASON_KEY,
+                tonic::metadata::MetadataValue::from_static(reason),
+            );
+            Status::with_metadata(code, message, metadata)
+        }
+        None => Status::new(code, message),
+    }
+}
+
+/// The reason trailer's key: ASCII metadata, matched by clients instead of prose.
+pub const REASON_KEY: &str = "kilnd-reason";
+
+fn create_request(
+    spec: pb::SandboxSpec,
+    expiry: Option<crate::expiry::RequestedExpiry>,
+) -> Result<CreateRequest, Status> {
     let limits = spec.limits.unwrap_or_default();
     let net = spec.network.unwrap_or_default();
     let mode = pb::NetworkMode::try_from(net.mode)
@@ -443,6 +553,7 @@ fn create_request(spec: pb::SandboxSpec) -> Result<CreateRequest, Status> {
         read_only_root: spec.read_only_root,
         writable_paths: spec.writable_paths,
         labels: spec.labels.into_iter().collect::<BTreeMap<_, _>>(),
+        expiry,
     })
 }
 
@@ -481,7 +592,24 @@ pub fn sandbox_pb(s: Sandbox) -> pb::Sandbox {
         SandboxState::Quarantined => pb::SandboxState::Quarantined,
     };
     let reservation = s.accounting.reservation;
+    let deletion_reason = match s.lifecycle.deletion_reason {
+        None => pb::DeletionReason::Unspecified,
+        Some(DeletionReason::Requested) => pb::DeletionReason::Requested,
+        Some(DeletionReason::ExpiredIdle) => pb::DeletionReason::ExpiredIdle,
+        Some(DeletionReason::ExpiredLifetime) => pb::DeletionReason::ExpiredLifetime,
+    };
+    let policy = s.lifecycle.expiry;
+    let expiry = pb::ExpiryStatus {
+        effective: Some(pb::ExpiryPolicy {
+            max_lifetime_ms: policy.max_lifetime_ms.unwrap_or(0),
+            idle_timeout_ms: policy.idle_timeout_ms.unwrap_or(0),
+        }),
+        last_activity_at_unix_ms: s.lifecycle.activity_at_ms.unwrap_or(0),
+        ..Default::default()
+    };
     pb::Sandbox {
+        deletion_reason: deletion_reason.into(),
+        expiry: Some(expiry),
         id: s.id,
         state: state.into(),
         spec: Some(spec_pb(s.spec)),
@@ -502,6 +630,19 @@ pub fn sandbox_pb(s: Sandbox) -> pb::Sandbox {
         }),
         runtime_profile: s.accounting.runtime_profile,
         runtime_artifact_digest: s.accounting.runtime_artifact_digest,
+    }
+}
+
+fn expiry_status_pb(v: ExpiryView) -> pb::ExpiryStatus {
+    pb::ExpiryStatus {
+        effective: Some(pb::ExpiryPolicy {
+            max_lifetime_ms: v.policy.max_lifetime_ms.unwrap_or(0),
+            idle_timeout_ms: v.policy.idle_timeout_ms.unwrap_or(0),
+        }),
+        lifetime_expires_at_unix_ms: v.lifetime_expires_at_ms.unwrap_or(0),
+        idle_expires_at_unix_ms: v.idle_expires_at_ms.unwrap_or(0),
+        last_activity_at_unix_ms: v.last_activity_at_ms.unwrap_or(0),
+        idle_paused: v.idle_paused,
     }
 }
 
@@ -560,6 +701,14 @@ pub fn execution_pb(e: Execution) -> pb::Execution {
             crate::model::CleanupEvidence::NoChildStarted => pb::CleanupEvidence::NoChildStarted,
             crate::model::CleanupEvidence::RuntimeDrained => pb::CleanupEvidence::RuntimeDrained,
             crate::model::CleanupEvidence::SandboxStopped => pb::CleanupEvidence::SandboxStopped,
+        }
+        .into(),
+        cancel_reason: match e.cancel_reason {
+            None => pb::CancelReason::Unspecified,
+            Some(CancelReason::ClientDisconnected) => pb::CancelReason::ClientDisconnected,
+            Some(CancelReason::SandboxDeleted) => pb::CancelReason::SandboxDeleted,
+            Some(CancelReason::DaemonShutdown) => pb::CancelReason::DaemonShutdown,
+            Some(CancelReason::SandboxExpiredLifetime) => pb::CancelReason::SandboxExpiredLifetime,
         }
         .into(),
     }
@@ -653,7 +802,10 @@ mod tests {
         ];
         for spec in invalid {
             let error = service
-                .create_sandbox(as_root(pb::CreateSandboxRequest { spec: Some(spec) }))
+                .create_sandbox(as_root(pb::CreateSandboxRequest {
+                    spec: Some(spec),
+                    expiry: None,
+                }))
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
@@ -1247,7 +1399,10 @@ mod tests {
         let handler = tokio::spawn(async move {
             KilndService::create_sandbox(
                 service.as_ref(),
-                as_root(pb::CreateSandboxRequest { spec: None }),
+                as_root(pb::CreateSandboxRequest {
+                    spec: None,
+                    expiry: None,
+                }),
             )
             .await
         });
@@ -2071,6 +2226,7 @@ mod tests {
                                     .collect(),
                                 ..Default::default()
                             }),
+                            expiry: None,
                         },
                         uid,
                     ))
@@ -2262,3 +2418,6 @@ mod tests {
         assert!(list_pages_as(&service, 1002, true, 1).await.is_empty());
     }
 }
+
+#[cfg(test)]
+mod m1_tests;
