@@ -593,6 +593,8 @@ async fn exec_cycle(
                     argv: vec!["sleep".into()],
                     stdin: vec![b'x'; 1 << 20],
                     timeout_ms: 2_000,
+                    cwd: String::new(),
+                    env: Vec::new(),
                 })
                 .await
         }));
@@ -701,6 +703,7 @@ async fn admission_resource_bounds_plateau_and_recover() {
             spec: None,
             expiry: None,
             request_id: String::new(),
+            default_env: Vec::new(),
         })
         .await
         .unwrap()
@@ -726,6 +729,8 @@ async fn admission_resource_bounds_plateau_and_recover() {
             argv: vec!["spew-both".into(), (1 << 20).to_string()],
             stdin: Vec::new(),
             timeout_ms: 1_000,
+            cwd: String::new(),
+            env: Vec::new(),
         })
         .await
         .unwrap()

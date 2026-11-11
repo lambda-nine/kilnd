@@ -147,6 +147,8 @@ async fn received_peer_flag_mutation_cannot_stall_listener_or_deadline() {
             argv: vec!["true".into()],
             stdin_bytes: 32,
             max_output: 1024,
+            cwd: None,
+            env: Vec::new(),
         }),
     };
     write_frame(&mut control, &request).await.unwrap();
