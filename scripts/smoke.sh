@@ -464,8 +464,12 @@ assert first == b"first\n" and rest == b"second\n", (first, rest)
 assert at < 1.5, f"the first line took {at:.2f} s"
 assert b"err" in err and code == 3, (err, code)
 PY
-[ "$(ctl exec --stream "$streamed" -- sh -c 'head -c 3000000 /dev/zero | wc -c')" = 3000000 ] \
+[ "$(ctl exec --stream "$streamed" -- sh -c 'head -c 3000000 /dev/zero | wc -c' 2>"$api_tmp/stream.err")" = 3000000 ] \
     || fail "streamed output"
+# A clean stream leaves no notes: nothing lost, totals exact.
+[ ! -s "$api_tmp/stream.err" ] || fail "a clean stream printed notes: $(cat "$api_tmp/stream.err")"
+out=$(ctl exec --stream "$streamed" -- head -c 5000000 /dev/zero | wc -c)
+[ "$out" -le 5000000 ] || fail "streamed more than was written: $out"
 ctl execution "$(ctl get "$streamed" | awk '/^ *ex-/{print $1; exit}')" 2>&1 \
     | grep -q '^mode: *stream' || fail "stream mode not shown"
 ctl rm "$streamed" >/dev/null

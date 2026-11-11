@@ -815,11 +815,20 @@ async fn exec_streamed(
                 let e = finished
                     .execution
                     .context("ExecFinished has no execution")?;
-                // The bytes went out live; only the notes and the outcome remain.
+                // The bytes went out live; only the notes and the outcome remain. The
+                // retained prefix is not printed again, so its truncation is no news;
+                // an unknown total still is.
+                let notes_only = |o: &Option<pb::Output>| {
+                    o.as_ref().map(|o| pb::Output {
+                        data: Vec::new(),
+                        truncated: false,
+                        ..o.clone()
+                    })
+                };
                 write_execution_streams(
                     &pb::Execution {
-                        stdout: None,
-                        stderr: None,
+                        stdout: notes_only(&e.stdout),
+                        stderr: notes_only(&e.stderr),
                         ..e.clone()
                     },
                     &mut std::io::sink(),
