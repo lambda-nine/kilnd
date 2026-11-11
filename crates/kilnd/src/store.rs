@@ -1884,6 +1884,19 @@ impl Store {
         Ok(())
     }
 
+    /// A read decision: one snapshot, audited first, then `read`. It commits on
+    /// success, so a full verification the audit ran (its stamp and the quarantine
+    /// it rebuilt, both temp-only) is kept and the next read stays bounded (M2 fix
+    /// review); on an error everything it did rolls back together.
+    fn audited_read<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let mut connection = self.conn();
+        let tx = connection.transaction()?;
+        audit_accounting(&tx)?;
+        let value = read(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     fn conn(&self) -> MutexGuard<'_, Connection> {
         // A panic while holding the lock can't leave SQLite inconsistent;
         // each statement is atomic.
@@ -2051,30 +2064,29 @@ impl Store {
         owner_uid: u32,
         request_id: &str,
     ) -> Result<Option<(Digest, Sandbox)>> {
-        let mut connection = self.conn();
-        let conn = connection.transaction()?;
-        audit_accounting(&conn)?;
-        let record: Option<(String, String)> = conn
-            .query_row(
-                "SELECT request_sha256, sandbox_id FROM create_requests WHERE owner_uid = ?1 AND request_id = ?2",
-                params![owner_uid, request_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((sha256, sandbox_id)) = record else {
-            return Ok(None);
-        };
-        let sha256 = Digest::parse(&sha256).map_err(anyhow::Error::msg)?;
-        let sandbox = conn
-            .query_row(
-                &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
-                [&sandbox_id],
-                sandbox_row,
-            )
-            .optional()?
-            .transpose()?
-            .with_context(|| format!("create request record names missing sandbox {sandbox_id}"))?;
-        Ok(Some((sha256, sandbox)))
+        self.audited_read(|conn| {
+            let record: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT request_sha256, sandbox_id FROM create_requests WHERE owner_uid = ?1 AND request_id = ?2",
+                    params![owner_uid, request_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((sha256, sandbox_id)) = record else {
+                return Ok(None);
+            };
+            let sha256 = Digest::parse(&sha256).map_err(anyhow::Error::msg)?;
+            let sandbox = conn
+                .query_row(
+                    &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
+                    [&sandbox_id],
+                    sandbox_row,
+                )
+                .optional()?
+                .transpose()?
+                .with_context(|| format!("create request record names missing sandbox {sandbox_id}"))?;
+            Ok(Some((sha256, sandbox)))
+        })
     }
 
     /// Durable request records on the node and of `owner_uid`.
@@ -2120,13 +2132,18 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        match deleted {
-            None => return Ok(ReleaseRequestId::NoSandbox),
-            Some(false) => return Ok(ReleaseRequestId::NotDeleted),
-            Some(true) => {}
-        }
-        if remove_request_records(&tx, RecordRemoval::Release { sandbox_id })? == 0 {
-            return Ok(ReleaseRequestId::NoRecord);
+        // Every answer commits: the audit's and the settling's bookkeeping is kept.
+        let answer = match deleted {
+            None => Some(ReleaseRequestId::NoSandbox),
+            Some(false) => Some(ReleaseRequestId::NotDeleted),
+            Some(true) if remove_request_records(&tx, RecordRemoval::Release { sandbox_id })? == 0 => {
+                Some(ReleaseRequestId::NoRecord)
+            }
+            Some(true) => None,
+        };
+        if let Some(answer) = answer {
+            tx.commit()?;
+            return Ok(answer);
         }
         tx.execute(
             "UPDATE sandboxes SET request_id_released_at_ms = ?2 WHERE id = ?1",
@@ -2165,16 +2182,15 @@ impl Store {
     /// deliberately narrower than reservations: ambiguous FAILED has no ID,
     /// while compensated FAILED has an ID but proved it absent.
     pub fn owned_backend_ids(&self, backend: &str) -> Result<Vec<String>> {
-        let mut connection = self.conn();
-        let conn = connection.transaction()?;
-        audit_accounting(&conn)?;
-        let mut statement = conn.prepare(&format!(
-            "SELECT backend_id FROM sandboxes
-             WHERE backend = ?1 AND backend_id IS NOT NULL AND ({OWNED_BACKEND_WHERE} OR id IN (SELECT id FROM temp.accounting_quarantine))"
-        ))?;
-        let rows = statement.query_map([backend], |row| row.get(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        self.audited_read(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT backend_id FROM sandboxes
+                 WHERE backend = ?1 AND backend_id IS NOT NULL AND ({OWNED_BACKEND_WHERE} OR id IN (SELECT id FROM temp.accounting_quarantine))"
+            ))?;
+            let rows = statement.query_map([backend], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
     }
 
     /// Moves a sandbox to `state`. `backend_id` is only written when given;
@@ -2315,9 +2331,11 @@ impl Store {
             .transpose()
         };
         let Some(row) = read(&tx)? else {
+            tx.commit()?;
             return Ok(None);
         };
         if row.state != SandboxState::Ready {
+            tx.commit()?;
             return Ok(Some((row, false)));
         }
         let recent = row
@@ -2419,16 +2437,15 @@ impl Store {
     /// Rows the expiry queue may need an entry for, read through the partial index:
     /// a policy and a live or DELETING state. Bounded by durable reservations.
     pub fn expiry_rows(&self) -> Result<Vec<Sandbox>> {
-        let mut connection = self.conn();
-        let conn = connection.transaction()?;
-        audit_accounting(&conn)?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {SANDBOX_COLUMNS} FROM sandboxes INDEXED BY sandboxes_expiry
-             WHERE state IN ('ready', 'lost', 'quarantined', 'deleting')
-               AND (expiry_lifetime_ms IS NOT NULL OR expiry_idle_ms IS NOT NULL)"
-        ))?;
-        let rows = stmt.query_map([], sandbox_row)?;
-        rows.map(|r| r?).collect()
+        self.audited_read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SANDBOX_COLUMNS} FROM sandboxes INDEXED BY sandboxes_expiry
+                 WHERE state IN ('ready', 'lost', 'quarantined', 'deleting')
+                   AND (expiry_lifetime_ms IS NOT NULL OR expiry_idle_ms IS NOT NULL)"
+            ))?;
+            let rows = stmt.query_map([], sandbox_row)?;
+            rows.map(|r| r?).collect()
+        })
     }
 
     /// Moves a sandbox to `state` only when its current state still matches
@@ -2735,33 +2752,31 @@ impl Store {
     }
 
     pub fn sandbox(&self, id: &str) -> Result<Option<Sandbox>> {
-        let mut connection = self.conn();
-        let conn = connection.transaction()?;
-        audit_accounting(&conn)?;
-        conn.query_row(
-            &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
-            [id],
-            sandbox_row,
-        )
-        .optional()?
-        .transpose()
+        self.audited_read(|conn| {
+            conn.query_row(
+                &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
+                [id],
+                sandbox_row,
+            )
+            .optional()?
+            .transpose()
+        })
     }
 
     /// Newest first.
     pub fn sandboxes(&self, include_deleted: bool) -> Result<Vec<Sandbox>> {
-        let mut connection = self.conn();
-        let conn = connection.transaction()?;
-        audit_accounting(&conn)?;
-        let filter = if include_deleted {
-            ""
-        } else {
-            "WHERE (state != 'deleted' OR id IN (SELECT id FROM temp.accounting_quarantine))"
-        };
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {SANDBOX_COLUMNS} FROM sandboxes {filter} ORDER BY list_seq DESC"
-        ))?;
-        let rows = stmt.query_map([], sandbox_row)?;
-        rows.map(|r| r?).collect()
+        self.audited_read(|conn| {
+            let filter = if include_deleted {
+                ""
+            } else {
+                "WHERE (state != 'deleted' OR id IN (SELECT id FROM temp.accounting_quarantine))"
+            };
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SANDBOX_COLUMNS} FROM sandboxes {filter} ORDER BY list_seq DESC"
+            ))?;
+            let rows = stmt.query_map([], sandbox_row)?;
+            rows.map(|r| r?).collect()
+        })
     }
 
     /// Every owner's sandboxes, as root sees them.
@@ -2786,63 +2801,61 @@ impl Store {
         limit: u32,
         owner: Option<u32>,
     ) -> Result<SandboxPage> {
-        let mut connection = self.conn();
-        let conn = connection.transaction()?;
-        audit_accounting(&conn)?;
-        let filter = if include_deleted {
-            ""
-        } else {
-            "(state != 'deleted' OR id IN (SELECT id FROM temp.accounting_quarantine)) AND "
-        };
-        let owned = if owner.is_some() {
-            "owner_uid = ?1 AND "
-        } else {
-            "?1 IS NULL AND "
-        };
-        let upper_seq = match upper_seq {
-            Some(upper) => upper,
-            None => conn.query_row(
-                &format!("SELECT COALESCE(MAX(list_seq), 0) FROM sandboxes WHERE {filter}{owned}1"),
-                [owner],
-                |row| row.get(0),
-            )?,
-        };
-        let before = if before_seq.is_some() {
-            "AND list_seq < ?3"
-        } else {
-            "AND ?3 IS NULL"
-        };
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {SANDBOX_COLUMNS}, list_seq FROM sandboxes
-            WHERE {filter}{owned}list_seq <= ?2 {before} ORDER BY list_seq DESC LIMIT ?4"
-        ))?;
-        let rows = stmt.query_map(
-            params![owner, upper_seq, before_seq, i64::from(limit) + 1],
-            |row| {
-                let list_seq = row.get(SANDBOX_COLUMN_COUNT)?;
-                Ok(sandbox_row(row)?.map(|sandbox| SandboxPageRow { sandbox, list_seq }))
-            },
-        )?;
-        let mut rows: Vec<_> = rows.map(|row| row?).collect::<Result<_>>()?;
-        let limit = usize::try_from(limit)?;
-        let has_more = rows.len() > limit;
-        rows.truncate(limit);
-        Ok(SandboxPage {
-            rows,
-            upper_seq,
-            has_more,
+        self.audited_read(|conn| {
+            let filter = if include_deleted {
+                ""
+            } else {
+                "(state != 'deleted' OR id IN (SELECT id FROM temp.accounting_quarantine)) AND "
+            };
+            let owned = if owner.is_some() {
+                "owner_uid = ?1 AND "
+            } else {
+                "?1 IS NULL AND "
+            };
+            let upper_seq = match upper_seq {
+                Some(upper) => upper,
+                None => conn.query_row(
+                    &format!("SELECT COALESCE(MAX(list_seq), 0) FROM sandboxes WHERE {filter}{owned}1"),
+                    [owner],
+                    |row| row.get(0),
+                )?,
+            };
+            let before = if before_seq.is_some() {
+                "AND list_seq < ?3"
+            } else {
+                "AND ?3 IS NULL"
+            };
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SANDBOX_COLUMNS}, list_seq FROM sandboxes
+                WHERE {filter}{owned}list_seq <= ?2 {before} ORDER BY list_seq DESC LIMIT ?4"
+            ))?;
+            let rows = stmt.query_map(
+                params![owner, upper_seq, before_seq, i64::from(limit) + 1],
+                |row| {
+                    let list_seq = row.get(SANDBOX_COLUMN_COUNT)?;
+                    Ok(sandbox_row(row)?.map(|sandbox| SandboxPageRow { sandbox, list_seq }))
+                },
+            )?;
+            let mut rows: Vec<_> = rows.map(|row| row?).collect::<Result<_>>()?;
+            let limit = usize::try_from(limit)?;
+            let has_more = rows.len() > limit;
+            rows.truncate(limit);
+            Ok(SandboxPage {
+                rows,
+                upper_seq,
+                has_more,
+            })
         })
     }
 
     pub fn count_active_sandboxes(&self) -> Result<u32> {
-        let mut connection = self.conn();
-        let conn = connection.transaction()?;
-        audit_accounting(&conn)?;
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM sandboxes WHERE state IN ('creating', 'ready', 'deleting', 'quarantined') OR id IN (SELECT id FROM temp.accounting_quarantine)",
-            [],
-            |r| r.get(0),
-        )?)
+        self.audited_read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM sandboxes WHERE state IN ('creating', 'ready', 'deleting', 'quarantined') OR id IN (SELECT id FROM temp.accounting_quarantine)",
+                [],
+                |r| r.get(0),
+            )?)
+        })
     }
 
     /// Inserts a RUNNING execution only while its sandbox is READY, with the start
@@ -9600,6 +9613,72 @@ mod tests {
                     && !line.contains("USING INDEX sandboxes_charged")
             };
             assert!(!plan.lines().any(table_scan), "{sql}\n{plan}");
+        }
+    }
+
+    /// M2 fix re-review: after one benign commit by another connection, only the
+    /// first decision verifies all history; it commits its stamp even when it only
+    /// reads (a keyed lookup that finds nothing or a record) or refuses, so later
+    /// lookups and refusals stay bounded.
+    #[test]
+    fn one_external_commit_costs_one_full_verification() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        store.set_clock(std::sync::Arc::new(crate::expiry::ManualClock::default()));
+        let mut history = Vec::new();
+        for i in 0..200 {
+            let row = keyed_row(&format!("old-{i}"), 1000);
+            store
+                .reserve_keyed_sandbox(&row, roomy_budgets(), Some(&admission(4096, 4096)))
+                .unwrap();
+            for state in [SandboxState::Ready, SandboxState::Deleting, SandboxState::Deleted] {
+                let backend = (state == SandboxState::Ready).then(|| format!("b-old-{i}"));
+                store.set_sandbox_state(&row.id, state, backend.as_deref(), None).unwrap();
+            }
+            history.push(row);
+        }
+        store.prune(&Retention::default(), now_ms()).unwrap();
+        let hashed = |f: &mut dyn FnMut()| {
+            let before = MEMBERSHIP_ROWS_HASHED.with(|n| n.get());
+            f();
+            MEMBERSHIP_ROWS_HASHED.with(|n| n.get()) - before
+        };
+        let lookup = |key: &str| store.create_request(1000, key).unwrap().is_some();
+        assert_eq!(hashed(&mut || assert!(!lookup("none"))), 0);
+
+        Connection::open(tmp.path().join("kilnd.db"))
+            .unwrap()
+            .execute(
+                "UPDATE sandboxes SET updated_at_ms = updated_at_ms + 1 WHERE id = ?1",
+                [&history[0].id],
+            )
+            .unwrap();
+        // The first decision after it verifies everything; the rest do not.
+        assert!(hashed(&mut || assert!(!lookup("none"))) >= 200);
+        for _ in 0..3 {
+            assert_eq!(hashed(&mut || assert!(!lookup("none"))), 0);
+            assert_eq!(hashed(&mut || assert!(lookup("old-7"))), 0);
+            let taken = hashed(&mut || {
+                assert!(matches!(
+                    store
+                        .reserve_keyed_sandbox(&keyed_row("old-7", 1000), roomy_budgets(), Some(&admission(4096, 4096)))
+                        .unwrap(),
+                    ReserveSandbox::RequestIdTaken
+                ))
+            });
+            assert_eq!(taken, 0);
+            let full = hashed(&mut || {
+                assert!(matches!(
+                    store
+                        .reserve_keyed_sandbox(&keyed_row("over", 1000), roomy_budgets(), Some(&admission(200, 4096)))
+                        .unwrap(),
+                    ReserveSandbox::RequestQuota(_)
+                ))
+            });
+            assert_eq!(full, 0);
+            assert!(store.sandbox(&history[0].id).unwrap().is_some());
+            assert_eq!(store.sandboxes(true).unwrap().len(), 200);
         }
     }
 

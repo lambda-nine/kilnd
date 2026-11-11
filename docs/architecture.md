@@ -734,7 +734,10 @@ index, `sandboxes_charged`, finds charged rows without a scan.
   writer past the triggers) it verifies everything, as every decision used to: every
   row against the stored total, the partition, the request counters against the
   records, and every fenced release's evidence. A row lost or released behind
-  kilnd's back is therefore caught by the next decision.
+  kilnd's back is therefore caught by the next decision. Read decisions commit their
+  snapshot too, so the stamp of that verification and the quarantine it rebuilt
+  (both in temporary tables) are kept: one external commit costs one full
+  verification, not one per later lookup or refusal.
 - Write decisions (admission, refusals included, an insert, a release) move the
   unsettled rows they have just verified into the settled aggregate. A released row is
   hashed only until the next write decision, so a decision's cost is bounded by the
