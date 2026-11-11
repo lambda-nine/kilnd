@@ -623,6 +623,18 @@ fn rpc_deadline<T>(req: &Request<T>, headers: Option<HeadersReceived>) -> Option
     at.checked_add(timeout.saturating_sub(margin))
 }
 
+/// A request whose headers carry a `grpc-timeout` [`parse_grpc_timeout`] rejects:
+/// `INVALID_ARGUMENT` with `kilnd-reason: invalid_grpc_timeout`, before dispatch.
+pub(crate) fn invalid_grpc_timeout() -> Status {
+    refusal(
+        tonic::Code::InvalidArgument,
+        Refusal::typed(
+            "invalid_grpc_timeout",
+            "grpc-timeout must be 1 to 8 ASCII digits and one of H M S m u n",
+        ),
+    )
+}
+
 /// gRPC's `TimeoutValue TimeoutUnit`: 1 to 8 ASCII digits and one of H M S m u n.
 pub(crate) fn parse_grpc_timeout(value: &str) -> Option<std::time::Duration> {
     use std::time::Duration;

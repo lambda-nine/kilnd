@@ -2285,6 +2285,14 @@ impl<R: Runtime> Manager<R> {
         match created {
             Ok(created) => {
                 let backend_id = created.backend_id;
+                // Design 4.1: a sandbox whose defaults only reach kiln through exec
+                // options is published only with its runtime's proof of them. A failed
+                // or older probe removes the backend and settles the create FAILED.
+                if let Some(why) = unproven_default_env(&sandbox, created.exec_features) {
+                    return Err(self
+                        .compensate_unproven_features(&sandbox.id, &backend_id, &why)
+                        .await);
+                }
                 // Design 4.1: the runtime's exec feature bits, recorded with READY.
                 if let Err(e) = self.store.publish_legacy_ready(
                     &sandbox.id,
@@ -2400,9 +2408,19 @@ impl<R: Runtime> Manager<R> {
                 Error::Backend(format!("create sandbox {id}: {reason}"))
             }
         };
+        let mut probe_failed = false;
         let reason = match joined {
-            Ok(Ok(created)) => match ready_receipt_mismatch(&binding, &created) {
-                None => {
+            Ok(Ok(created)) => match (
+                ready_receipt_mismatch(&binding, &created),
+                unproven_default_env(&sandbox, created.exec_features),
+            ) {
+                // Design 4.1, as for a legacy create: no READY without the proof its
+                // defaults need. The allocation settles below like any failed create.
+                (None, Some(why)) => {
+                    probe_failed = true;
+                    format!("{SANDBOX_FEATURE_PROBE_FAILED}: {why}")
+                }
+                (None, None) => {
                     if let Err(e) =
                         self.store
                             .publish_fenced_ready(&id, &created)
@@ -2419,7 +2437,7 @@ impl<R: Runtime> Manager<R> {
                     info!(sandbox = %id, backend_id = %created.backend_id, "sandbox ready");
                     return self.load(&id);
                 }
-                Some(why) => format!("backend create returned {why}"),
+                (Some(why), _) => format!("backend create returned {why}"),
             },
             Ok(Err(failure)) => {
                 let reason = failure.error().to_string();
@@ -2458,6 +2476,9 @@ impl<R: Runtime> Manager<R> {
         let row = self.load(&id)?;
         if let Err(error) = self.settle_fenced(&row, SandboxState::Failed, None).await {
             warn!(sandbox = %id, error = %error, "allocation stays charged; retry through Delete or reconciliation");
+        }
+        if probe_failed {
+            return Err(feature_probe_refusal(&id));
         }
         Err(refused(reason))
     }
@@ -2520,21 +2541,68 @@ impl<R: Runtime> Manager<R> {
         backend_id: &str,
         publication: anyhow::Error,
     ) -> Error {
+        let publication_reason = format!("record ready state failed: {publication:#}");
+        match self
+            .compensate_legacy_create(sandbox_id, backend_id, &publication_reason)
+            .await
+        {
+            Ok(()) => {
+                warn!(sandbox = %sandbox_id, backend_id = %backend_id, "ready publication failed; removed backend sandbox");
+                Error::Internal(publication)
+            }
+            Err(reason) => {
+                warn!(sandbox = %sandbox_id, backend_id = %backend_id, "ready publication and compensation failed");
+                Error::Internal(anyhow::anyhow!("{reason}"))
+            }
+        }
+    }
+
+    /// Design 4.1: the new sandbox did not prove the exec options its default env
+    /// needs, so it is never READY. Its backend is removed as for a failed publication,
+    /// and the create answers with a typed, retryable refusal; a keyed create's
+    /// original and retries answer with the FAILED row instead.
+    async fn compensate_unproven_features(
+        &self,
+        sandbox_id: &str,
+        backend_id: &str,
+        why: &str,
+    ) -> Error {
+        let reason = format!("{SANDBOX_FEATURE_PROBE_FAILED}: {why}");
+        warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %reason, "sandbox creation failed");
+        if let Err(cleanup) = self
+            .compensate_legacy_create(sandbox_id, backend_id, &reason)
+            .await
+        {
+            // Left DELETING and charged, which Delete or reconciliation retries.
+            warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %cleanup, "unproven sandbox could not be removed");
+        }
+        feature_probe_refusal(sandbox_id)
+    }
+
+    /// A legacy create's compensation once its backend exists: cleanup intent as
+    /// DELETING with `reason`, removal, then FAILED (which releases the reservation and
+    /// clears the default env). A failed removal stays DELETING and charged, and its
+    /// recorded reason is the error.
+    async fn compensate_legacy_create(
+        &self,
+        sandbox_id: &str,
+        backend_id: &str,
+        reason: &str,
+    ) -> std::result::Result<(), String> {
         let slot = self.slot(sandbox_id);
         let _guard = slot.exec_lock.lock().await;
-        let publication_reason = format!("record ready state failed: {publication:#}");
         if let Err(e) = self.store.set_sandbox_state(
             sandbox_id,
             SandboxState::Deleting,
             Some(backend_id),
-            Some(&publication_reason),
+            Some(reason),
         ) {
             warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %format!("{e:#}"), "could not record create compensation intent");
         }
 
         match self.remove_legacy(backend_id).await {
             Ok(()) => {
-                let reason = format!("{publication_reason}; backend removed");
+                let reason = format!("{reason}; backend removed");
                 if let Err(e) = self.store.set_sandbox_state(
                     sandbox_id,
                     SandboxState::Failed,
@@ -2543,11 +2611,10 @@ impl<R: Runtime> Manager<R> {
                 ) {
                     warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %format!("{e:#}"), "backend removed but create failure could not be finalized");
                 }
-                warn!(sandbox = %sandbox_id, backend_id = %backend_id, "ready publication failed; removed backend sandbox");
-                Error::Internal(publication)
+                Ok(())
             }
             Err(cleanup) => {
-                let reason = format!("{publication_reason}; cleanup failed: {cleanup}");
+                let reason = format!("{reason}; cleanup failed: {cleanup}");
                 if let Err(e) = self.store.set_sandbox_state(
                     sandbox_id,
                     SandboxState::Deleting,
@@ -2556,10 +2623,7 @@ impl<R: Runtime> Manager<R> {
                 ) {
                     warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %format!("{e:#}"), "create compensation failure could not be recorded");
                 }
-                warn!(sandbox = %sandbox_id, backend_id = %backend_id, error = %cleanup, "ready publication and compensation failed");
-                Error::Internal(anyhow::anyhow!(
-                    "{publication_reason}; cleanup failed: {cleanup}"
-                ))
+                Err(reason)
             }
         }
     }
@@ -4132,6 +4196,40 @@ fn fenced_context(sandbox: &Sandbox, binding: &AllocationBinding) -> CreateConte
 }
 
 /// Why a create result cannot publish this allocation, if any.
+/// The typed reason a create whose new sandbox did not prove exec options for its
+/// default env fails with (design 4.1). Retryable: the next create probes again.
+const SANDBOX_FEATURE_PROBE_FAILED: &str = "sandbox_feature_probe_failed";
+
+/// Why a new sandbox with a default env may not become READY, if it may not: its
+/// runtime's post-create probe failed (`None`) or did not advertise exec options.
+fn unproven_default_env(sandbox: &Sandbox, exec_features: Option<u32>) -> Option<String> {
+    let bit = crate::exec_env::FEATURE_EXEC_OPTIONS;
+    if sandbox.lifecycle.default_env_names.is_empty() {
+        return None;
+    }
+    match exec_features {
+        Some(bits) if bits & bit != 0 => None,
+        Some(bits) => Some(format!(
+            "the new sandbox's runtime advertised features {bits:#x} without {bit:#x}, which its default_env needs"
+        )),
+        None => Some(format!(
+            "the new sandbox's runtime did not answer its feature probe, so feature {bit:#x}, which its default_env needs, is unproven"
+        )),
+    }
+}
+
+fn feature_probe_refusal(sandbox_id: &str) -> Error {
+    Error::Refused(
+        RefusalCode::Unavailable,
+        Refusal::typed(
+            SANDBOX_FEATURE_PROBE_FAILED,
+            format!(
+                "sandbox {sandbox_id} did not prove the exec options its default_env needs and was not made ready; retry the create"
+            ),
+        ),
+    )
+}
+
 fn ready_receipt_mismatch(
     binding: &AllocationBinding,
     created: &CreatedSandbox,

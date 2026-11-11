@@ -42,7 +42,8 @@ impl KilnRuntime {
 impl KilnRuntime {
     /// What the new sandbox's PID 1 advertises, read once after create for its row's
     /// `exec_features`. A failed probe records nothing, so the sandbox takes no exec
-    /// options; it is still a usable sandbox.
+    /// options; it is still a usable sandbox unless its create carried a default env,
+    /// which the manager then fails as `sandbox_feature_probe_failed` (design 4.1).
     async fn sandbox_exec_features(&self, backend_id: &str) -> Option<u32> {
         let deadline = Instant::now() + SANDBOX_FEATURES_TIMEOUT;
         match self

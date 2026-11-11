@@ -287,13 +287,20 @@ async fn a_sandbox_without_the_exec_options_bit_is_refused_before_any_row() {
             .execute_for_test("DELETE FROM executions WHERE sandbox_id = ?1", &sandbox.id)
             .unwrap();
     }
-    // A sandbox with defaults whose runtime lacks the bit refuses every Exec.
+    // A sandbox with defaults whose runtime lacks the bit is never READY (break-it
+    // M3b MEDIUM)...
     fake.state().create_exec_features = Some(0x1f);
-    let sandbox = m.create(with_default_env(&[("A", "1")])).await.unwrap();
-    let error = m
-        .exec(exec_req(&sandbox.id, &["true"], "", &[]))
-        .await
-        .unwrap_err();
+    let error = m.create(with_default_env(&[("A", "1")])).await.unwrap_err();
+    assert_eq!(reason(&error), Some("sandbox_feature_probe_failed"));
+    // ...and a row that somehow had defaults without the bit would refuse every Exec.
+    // (The store records the bits once, so the row is altered in memory only.)
+    fake.state().create_exec_features = Some(0x3f);
+    let mut sandbox = m.create(with_default_env(&[("A", "1")])).await.unwrap();
+    sandbox.lifecycle.exec_features = Some(0x1f);
+    let Err(error) = m.resolve_exec_options(&exec_req(&sandbox.id, &["true"], "", &[]), &sandbox)
+    else {
+        panic!("options resolved for a sandbox without bit 0x20");
+    };
     assert_eq!(reason(&error), Some("sandbox_unsupported:exec_env"));
 }
 
@@ -461,6 +468,179 @@ async fn default_env_values_are_cleared_at_failed_and_deleted_and_never_return()
         )
         .unwrap();
     assert_eq!(values, 0);
+}
+
+fn failure_reason_of(m: &Manager<FakeRuntime>, id: &str) -> String {
+    m.store
+        .query_for_test("SELECT failure_reason FROM sandboxes WHERE id = ?1", [id])
+        .unwrap()
+}
+
+fn legacy_release_of(m: &Manager<FakeRuntime>, id: &str) -> Option<String> {
+    m.store
+        .query_for_test("SELECT legacy_release FROM sandboxes WHERE id = ?1", [id])
+        .unwrap()
+}
+
+/// The only row: its ID, after a create that left no other.
+fn only_row(m: &Manager<FakeRuntime>) -> Sandbox {
+    let rows = m.list(true).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    rows.into_iter().next().unwrap()
+}
+
+/// Break-it M3b MEDIUM: a create with a default env whose new sandbox's post-create
+/// probe fails, or answers without bit 0x20, is never READY. Its backend is removed,
+/// its reservation released and its defaults cleared, and it answers with a typed,
+/// retryable refusal. Without the check it came back READY with `exec_features`
+/// NULL, refusing every Exec as `sandbox_unsupported:exec_env` until deleted.
+#[tokio::test]
+async fn a_default_env_create_without_per_sandbox_proof_fails_and_is_compensated() {
+    for bits in [None, Some(0x1f)] {
+        let (m, fake) = proven().await;
+        fake.state().create_exec_features = bits;
+        let error = m
+            .create(with_default_env(&[("SECRET", "value")]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Refused(RefusalCode::Unavailable, _)),
+            "{error:?}"
+        );
+        assert_eq!(reason(&error), Some("sandbox_feature_probe_failed"));
+        assert!(!error.to_string().contains("value"), "{error}");
+        let row = only_row(&m);
+        assert_eq!(row.state, SandboxState::Failed);
+        assert_eq!(fake.state().removed, [row.backend_id.clone().unwrap()]);
+        assert!(fake.state().sandboxes.is_empty());
+        let recorded = failure_reason_of(&m, &row.id);
+        assert!(
+            recorded.starts_with("sandbox_feature_probe_failed: ")
+                && recorded.ends_with("; backend removed"),
+            "{recorded}"
+        );
+        assert_eq!(
+            legacy_release_of(&m, &row.id).as_deref(),
+            Some("compensated")
+        );
+        assert_eq!(stored_default_env(&m, &row.id), None);
+        assert_eq!(row.lifecycle.default_env_names, ["SECRET"]);
+        // Retryable: once the probe answers, the same create is READY and usable.
+        fake.state().create_exec_features = Some(0x3f);
+        let sandbox = m
+            .create(with_default_env(&[("SECRET", "value")]))
+            .await
+            .unwrap();
+        assert_eq!(sandbox.state, SandboxState::Ready);
+        assert_eq!(sandbox.lifecycle.exec_features, Some(0x3f));
+        let e = m
+            .exec(exec_req(&sandbox.id, &["true"], "", &[]))
+            .await
+            .unwrap();
+        assert_eq!(e.state, ExecutionState::Exited);
+    }
+}
+
+/// A create without a default env keeps today's behaviour: a failed probe records no
+/// bits and the sandbox is READY for operation-4 Execs.
+#[tokio::test]
+async fn a_create_without_default_env_is_ready_whatever_its_probe_answered() {
+    let (m, fake) = proven().await;
+    fake.state().create_exec_features = None;
+    let sandbox = m.create(CreateRequest::default()).await.unwrap();
+    assert_eq!(sandbox.state, SandboxState::Ready);
+    assert_eq!(sandbox.lifecycle.exec_features, None);
+    assert!(fake.state().removed.is_empty());
+    let e = m
+        .exec(exec_req(&sandbox.id, &["true"], "", &[]))
+        .await
+        .unwrap();
+    assert_eq!(e.state, ExecutionState::Exited);
+}
+
+/// A removal that fails leaves the row DELETING and charged (Delete or reconciliation
+/// retries it), and the create still answers with the typed refusal, never READY.
+#[tokio::test]
+async fn an_unproven_default_env_create_whose_removal_fails_stays_deleting() {
+    let (m, fake) = proven().await;
+    fake.state().create_exec_features = None;
+    fake.state().fail_remove = true;
+    let error = m.create(with_default_env(&[("A", "1")])).await.unwrap_err();
+    assert_eq!(reason(&error), Some("sandbox_feature_probe_failed"));
+    let row = only_row(&m);
+    assert_eq!(row.state, SandboxState::Deleting);
+    assert!(
+        failure_reason_of(&m, &row.id).contains("; cleanup failed: "),
+        "{row:?}"
+    );
+    assert_eq!(legacy_release_of(&m, &row.id), None);
+    fake.state().fail_remove = false;
+    assert_eq!(
+        m.delete(&row.id).await.unwrap().state,
+        SandboxState::Deleted
+    );
+    assert_eq!(stored_default_env(&m, &row.id), None);
+}
+
+/// The keyed create (design 3.1) stores the failure like any settled one: the
+/// original and every retry answer OK with the same FAILED row, and nothing reruns.
+#[tokio::test]
+async fn a_keyed_default_env_create_without_proof_settles_failed_for_every_retry() {
+    let (m, fake) = proven().await;
+    fake.state().create_exec_features = None;
+    let digest = crate::idempotency::request_digest(&pb_request(&[("A", "1")]));
+    let key = || CreateKey {
+        request_id: "k".into(),
+        sha256: digest,
+    };
+    let first = m
+        .create_keyed(Ok(with_default_env(&[("A", "1")])), 0, key(), None)
+        .await
+        .unwrap();
+    assert_eq!(first.state, SandboxState::Failed);
+    assert!(
+        first
+            .failure_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("sandbox_feature_probe_failed: ")),
+        "{first:?}"
+    );
+    assert_eq!(stored_default_env(&m, &first.id), None);
+    fake.state().create_exec_features = Some(0x3f);
+    let retry = m
+        .create_keyed(Ok(with_default_env(&[("A", "1")])), 0, key(), None)
+        .await
+        .unwrap();
+    assert_eq!(retry.id, first.id);
+    assert_eq!(retry.state, SandboxState::Failed);
+    assert_eq!(retry.failure_reason, first.failure_reason);
+    assert_eq!(fake.state().created.len(), 1, "the retry created nothing");
+}
+
+/// The fenced path holds the same rule if a fenced backend ever proved the default
+/// env feature: an allocation without per-sandbox proof settles FAILED by its token.
+#[tokio::test]
+async fn a_fenced_default_env_create_without_proof_is_never_ready() {
+    let fake = FakeRuntime::fenced();
+    let m = manager_on(fake.clone(), limits());
+    m.health().await.unwrap();
+    m.dynamic_features.lock().unwrap().0 = OPTION_FEATURES.to_vec();
+    let error = m.create(with_default_env(&[("A", "1")])).await.unwrap_err();
+    assert!(
+        matches!(error, Error::Refused(RefusalCode::Unavailable, _)),
+        "{error:?}"
+    );
+    assert_eq!(reason(&error), Some("sandbox_feature_probe_failed"));
+    let row = only_row(&m);
+    assert_eq!(row.state, SandboxState::Failed);
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("sandbox_feature_probe_failed: ")),
+        "{row:?}"
+    );
+    assert_eq!(fake.state().removed.len(), 1);
+    assert_eq!(stored_default_env(&m, &row.id), None);
 }
 
 #[tokio::test]

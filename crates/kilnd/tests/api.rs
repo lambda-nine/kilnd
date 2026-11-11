@@ -1422,6 +1422,76 @@ async fn create_in_flight_survives_a_delayed_request_body() {
         connection.abort();
     }
 
+    // Break-it M3b LOW 1: tonic's parser takes a leading `+`, so `+300m` started a
+    // 300 ms transport timer that kilnd's strict parser never saw, and the retry got a
+    // generic CANCELLED. A header kilnd rejects is now INVALID_ARGUMENT with a typed
+    // reason before dispatch, as is every other malformed one.
+    for value in [
+        "+300m",
+        "300",
+        "m",
+        "123456789m",
+        "3x",
+        "-1m",
+        " 300m",
+        "3.0S",
+    ] {
+        let stream = UnixStream::connect(&socket).await.unwrap();
+        let (sender, connection) = h2::client::handshake(stream).await.unwrap();
+        let connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut sender = sender.ready().await.unwrap();
+        let headers = http::Request::builder()
+            .method("POST")
+            .uri("http://kilnd.invalid/kilnd.v1.KilndService/CreateSandbox")
+            .version(http::Version::HTTP_2)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("grpc-timeout", value)
+            .body(())
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let (response, mut send) = sender.send_request(headers, false).unwrap();
+        send.send_data(body.clone(), true).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("no response headers")
+            .unwrap();
+        let (parts, mut response_body) = response.into_parts();
+        let mut fields = parts.headers;
+        if !response_body.is_end_stream() {
+            while let Some(chunk) = response_body.data().await {
+                chunk.unwrap();
+            }
+            if let Some(trailers) = response_body.trailers().await.unwrap() {
+                fields.extend(trailers);
+            }
+        }
+        let elapsed = started.elapsed();
+        let field = |name: &str| fields.get(name).map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            field("grpc-status").as_deref(),
+            Some("3"),
+            "{value:?}: {fields:?}"
+        );
+        assert_eq!(
+            field("kilnd-reason").as_deref(),
+            Some("invalid_grpc_timeout"),
+            "{value:?}: {fields:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "{value:?}: {elapsed:?}"
+        );
+        assert_eq!(
+            fake.state().created.len(),
+            1,
+            "{value:?} reached the manager"
+        );
+        connection.abort();
+    }
+
     gate.release();
     let original = original.await.unwrap();
     assert_eq!(original.request_id, "delayed-body");

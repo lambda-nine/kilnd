@@ -43,7 +43,8 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// derived from it must start there and use that value too: not the handler's time
 /// after a slow body (break-it M2 MEDIUM 1), and not request metadata, which tonic
 /// merges with the request's trailers (M2 recheck MEDIUM 1). `timeout` is `None` when
-/// the headers had none, or a malformed one. Clients cannot set the extension.
+/// the headers had none; a malformed one is refused before dispatch. Clients cannot
+/// set the extension.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HeadersReceived {
     pub(crate) at: tokio::time::Instant,
@@ -56,11 +57,20 @@ pub(crate) struct HeadersReceived {
 fn stamp_headers_received(
     mut request: tonic::Request<()>,
 ) -> Result<tonic::Request<()>, tonic::Status> {
-    let timeout = request
-        .metadata()
-        .get("grpc-timeout")
-        .and_then(|value| value.to_str().ok())
-        .and_then(crate::service::parse_grpc_timeout);
+    // A header kilnd's strict parser rejects is refused here, before dispatch: tonic's
+    // own parser is laxer (it takes `+300m`), so it would start a transport timer that
+    // kilnd's typed deadlines never saw (break-it M3b LOW 1).
+    let timeout = match request.metadata().get("grpc-timeout") {
+        None => None,
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(crate::service::parse_grpc_timeout)
+        {
+            Some(timeout) => Some(timeout),
+            None => return Err(crate::service::invalid_grpc_timeout()),
+        },
+    };
     request.extensions_mut().insert(HeadersReceived {
         at: tokio::time::Instant::now(),
         timeout,

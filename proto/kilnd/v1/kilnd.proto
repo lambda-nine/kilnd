@@ -457,7 +457,10 @@ message CreateSandboxRequest {
   // env. Same rules as ExecRequest.env. The values are kept in kilnd's database,
   // in plaintext, while the sandbox is live and cleared when it becomes FAILED or
   // DELETED; they are never returned. Do not send secrets. Needs
-  // FEATURE_SANDBOX_DEFAULT_ENV.
+  // FEATURE_SANDBOX_DEFAULT_ENV. A new sandbox whose runtime does not prove exec
+  // options is removed and the create fails UNAVAILABLE
+  // (sandbox_feature_probe_failed, retryable); a keyed create's original and
+  // retries return its FAILED row.
   repeated EnvVar default_env = 4;
 }
 

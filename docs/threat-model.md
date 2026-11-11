@@ -175,7 +175,8 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   enters it only after closing every inherited descriptor, so `/proc/self/fd/N`
   cannot name a host directory). History keeps the cwd, the override names and
   `env_sha256`; the in-memory env type's `Debug` redacts values and errors name entries
-  by position. The hash is an unkeyed integrity fingerprint that clients recompute, not
+  by position. The helper logs a malformed request frame by parse category and
+  position only, since serde's own message quotes the frame's values. The hash is an unkeyed integrity fingerprint that clients recompute, not
   confidentiality: a low-entropy value can be guessed from it, as from a create
   request digest that covers default env. Options never run without their gate: an
   unproven backend is `backend_unsupported`, a sandbox whose PID 1 lacks bit `0x20` is

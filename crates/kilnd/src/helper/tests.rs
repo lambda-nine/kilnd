@@ -120,6 +120,35 @@ fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
     }
 }
 
+/// Break-it M3b LOW 2: serde's parse error quotes the frame's values, and the serve
+/// loop logged it verbatim. The error it logs now names only the category and position.
+#[test]
+fn a_malformed_frame_error_never_quotes_its_values() {
+    let canary = "CANARY-malformed-helper-env";
+    let frames = [
+        format!(
+            r#"{{"version":3,"timeout_ms":1000,"deadline_ns":1,"operation":{{"kiln":{{"exec":{{"id":"ab","argv":["true"],"stdin_bytes":0,"max_output":1,"env":["{canary}"]}}}}}}}}"#
+        ),
+        format!(r#"{{"version":3,"{canary}":1}}"#),
+        format!(r#"{{"version":"{canary}"}}"#),
+    ];
+    for frame in frames {
+        // serde's own text quotes it: what the serve loop used to log.
+        let detail = serde_json::from_str::<Request>(&frame)
+            .unwrap_err()
+            .to_string();
+        assert!(detail.contains(canary), "{detail}");
+        let logged = super::server::parse_request_for_test(frame.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(!logged.contains(canary), "{logged}");
+        assert!(
+            logged.starts_with("malformed helper request frame: "),
+            "{logged}"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn received_peer_flag_mutation_cannot_stall_listener_or_deadline() {

@@ -251,15 +251,44 @@ pub(super) async fn handoff_stdio(stream: &mut Socket) -> io::Result<[Socket; 3]
     Ok([Socket(input), Socket(output), Socket(error)])
 }
 
+async fn read_request(stream: &mut Socket) -> io::Result<Request> {
+    parse_request(&super::read_frame_bytes(stream).await?)
+}
+
 /// Parses a frame. A Firecracker frame must also be strict JSON as a whole, so a
 /// duplicate key inside labels cannot pass; a kiln frame parses exactly as before.
-async fn read_request(stream: &mut Socket) -> io::Result<Request> {
-    let bytes = super::read_frame_bytes(stream).await?;
-    let request: Request = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+/// The error the serve loop logs names only the failure's category and position:
+/// serde's own text quotes the frame's values, an env value among them (break-it M3b
+/// LOW 2). Tests also print the detail.
+fn parse_request(bytes: &[u8]) -> io::Result<Request> {
+    let request: Request = serde_json::from_slice(bytes).map_err(|error| {
+        #[cfg(test)]
+        eprintln!("helper request frame detail: {error}");
+        let category = match error.classify() {
+            serde_json::error::Category::Io => "unreadable",
+            serde_json::error::Category::Syntax => "not JSON",
+            serde_json::error::Category::Data => "not a valid request",
+            serde_json::error::Category::Eof => "truncated",
+        };
+        io::Error::other(format!(
+            "malformed helper request frame: {category} at line {} column {}",
+            error.line(),
+            error.column()
+        ))
+    })?;
     if matches!(request.operation, Operation::Firecracker(_)) {
-        crate::firecracker::strict_json(&bytes).map_err(io::Error::other)?;
+        crate::firecracker::strict_json(bytes).map_err(|_error| {
+            #[cfg(test)]
+            eprintln!("helper request frame detail: {_error}");
+            io::Error::other("malformed helper request frame: not strict JSON")
+        })?;
     }
     Ok(request)
+}
+
+#[cfg(test)]
+pub(super) fn parse_request_for_test(bytes: &[u8]) -> io::Result<Request> {
+    parse_request(bytes)
 }
 
 /// One Firecracker request: no descriptors cross in either direction except B5 Exec's

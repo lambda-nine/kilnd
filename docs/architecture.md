@@ -493,7 +493,12 @@ existed" stay distinguishable while the row is retained. Idempotent create adds
 `create_in_flight` (`DEADLINE_EXCEEDED`) and `create_unsettled` (`UNAVAILABLE`). Exec
 cwd and env add `backend_unsupported:<feature>` (`UNIMPLEMENTED`: `exec_cwd`,
 `exec_env`, `sandbox_default_env`) and `sandbox_unsupported:<feature>`
-(`FAILED_PRECONDITION`: `exec_cwd`, `exec_env`). `execution_start_raced`
+(`FAILED_PRECONDITION`: `exec_cwd`, `exec_env`), and `sandbox_feature_probe_failed`
+(`UNAVAILABLE`, retryable) for a create with a default env whose new sandbox did not
+prove exec options. A `grpc-timeout` header kilnd's parser rejects (anything but 1 to
+8 ASCII digits and one of `H M S m u n`; tonic's own parser also takes a leading `+`)
+is `INVALID_ARGUMENT invalid_grpc_timeout` before dispatch, on every RPC.
+`execution_start_raced`
 (`FAILED_PRECONDITION`, like `sandbox_not_ready`) means the conditional execution
 insert saw the sandbox leave `READY` and a reload found it `READY` again: nothing ran,
 retry.
@@ -841,7 +846,14 @@ exec feature bits, what its PID 1 advertises (the creating CLI's build), in
 `sandboxes.exec_features`, once. An Exec that needs options (a cwd, env, or a sandbox
 default env) on a sandbox without bit `0x20` there, or with none recorded (every row
 from before schema 13), is refused `FAILED_PRECONDITION sandbox_unsupported:exec_cwd`
-(or `exec_env`) before an execution row. A sandbox with default env needs
+(or `exec_env`) before an execution row. A create with a default env is published
+`READY` only if that probe recorded bit `0x20`: a failed probe or a missing bit removes
+the backend (cleanup intent as `DELETING`, then `FAILED`, which releases the
+reservation and clears the defaults; a failed removal stays `DELETING` and charged)
+and the create is `UNAVAILABLE sandbox_feature_probe_failed`, retryable, with the
+row's `failure_reason` starting with that token. A keyed create stores it like any
+settled failure. The fenced path holds the same rule, though Firecracker proves no
+options and refuses a default env before `prepare`. A sandbox with default env needs
 `EXEC_ENV` for every Exec, so after an operator downgrade its commands are refused
 rather than run without their defaults. The per-exec checks stay the authority: the
 helper requires bit `0x20` from both the installed CLI and the sandbox's PID 1 before

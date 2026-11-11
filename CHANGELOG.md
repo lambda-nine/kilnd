@@ -42,6 +42,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   (goldens added). Schema 13 adds the columns and their triggers. kilndctl gains
   `exec --cwd DIR --env NAME[=VALUE]` and `create --default-env NAME[=VALUE]` (a bare
   `NAME` passes kilndctl's own value), refused unless Health lists the feature.
+- Fix the M3b break-it findings. A create with `default_env` whose new sandbox's
+  post-create feature probe failed, or answered without bit `0x20`, came back `READY`
+  with `exec_features` null, refusing every Exec; it now removes the backend, settles
+  `FAILED` (reservation released, defaults cleared) and fails `UNAVAILABLE
+  sandbox_feature_probe_failed`, retryable, and a keyed create stores that `FAILED`
+  row. A `grpc-timeout` header kilnd's strict parser rejects, such as tonic's
+  accepted `+300m`, is now `INVALID_ARGUMENT invalid_grpc_timeout` before dispatch
+  rather than an untyped `CANCELLED` that skipped the typed deadline. The helper's log
+  of a malformed request frame names only the parse category and position, never
+  serde's text, which quoted the frame's values.
 - Fix the M2 recheck's MEDIUM 1: a `grpc-timeout` in request trailers replaced the
   deadline the create handler reparsed from merged metadata, so a waiting keyed retry
   got tonic's untyped `Timeout expired` instead of `create_in_flight`. The interceptor
