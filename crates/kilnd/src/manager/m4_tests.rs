@@ -516,6 +516,58 @@ async fn a_client_that_never_reads_only_loses_live_bytes_and_gets_its_permits_ba
     assert_eq!(next, total);
 }
 
+/// Design 5.1's handoff, pinned (from the M4 break-it's controls): permits end when the
+/// final message is handed over, so completed but unread streams are not counted by the
+/// stream caps. Each keeps its whole stored Execution (up to two retained outputs) in
+/// its final slot until it is read or dropped; what bounds them is the transport (eight
+/// HTTP/2 streams per connection and the connection caps), as for an unread unary
+/// ExecResponse.
+#[tokio::test]
+async fn unread_finals_outlive_their_permits_and_keep_the_whole_row() {
+    let (m, _) = proven_with(
+        &[Feature::ExecStream],
+        Limits {
+            max_exec_streams: 2,
+            max_exec_streams_per_uid: 1,
+            max_concurrent_execs: 8,
+            ..limits()
+        },
+    )
+    .await;
+    let sandbox = m.create(CreateRequest::default()).await.unwrap();
+    let mut unread = Vec::new();
+
+    for _ in 0..20 {
+        let start = stream(&m, req(&sandbox.id, &["stream", "64", "16384", "0"]))
+            .await
+            .unwrap();
+        let execution = terminal(&m, &start.execution_id).await;
+        assert_eq!(execution.stdout.data.len(), 1 << 20);
+        permits_released(&m).await;
+        unread.push(start);
+    }
+
+    let admission = m.admission.snapshot();
+    assert_eq!(admission.streams.current, 0);
+    assert_eq!(admission.streams.max, 2);
+    assert_eq!(
+        unread.len(),
+        20,
+        "ten times the node stream cap, all completed"
+    );
+
+    let mut bytes_retained_in_final_slots = 0usize;
+    for mut start in unread {
+        let events = drain(&mut start.handle).await;
+        let (execution, _, _) = finished(&events);
+        bytes_retained_in_final_slots += execution.stdout.data.len() + execution.stderr.data.len();
+    }
+    assert!(
+        bytes_retained_in_final_slots >= 20 << 20,
+        "each unread final retained at least its 1 MiB stdout BLOB"
+    );
+}
+
 /// Design 8: a helper that dies after an EAGAIN drop and before settlement. The
 /// interior gap is exact; the tail is not, so the delivery says so.
 #[tokio::test]
@@ -636,4 +688,39 @@ async fn an_interrupted_stream_row_keeps_its_mode() {
     let after = m.execution(&running.id).unwrap();
     assert_eq!(after.state, ExecutionState::Interrupted);
     assert_eq!(after.mode, Some(ExecutionMode::Stream));
+}
+
+/// Deviation 6, fault-injected (a residual gap from the M4 break-it): the terminal row
+/// is published, but the read that builds `ExecFinished` fails. The stream ends with
+/// that error instead of a final message, every permit still comes back, and
+/// GetExecution reads the published row afterwards.
+#[tokio::test]
+async fn a_failed_read_after_publication_ends_the_stream_with_its_error() {
+    let (m, _) = streaming().await;
+    let sandbox = m.create(CreateRequest::default()).await.unwrap();
+    // Nothing reads an execution row until the command ends. Then the supervisor's own
+    // reload after publication is the first read, and the read for ExecFinished the
+    // second.
+    m.store
+        .fail_execution_read
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let mut start = stream(&m, req(&sandbox.id, &["echo", "published"]))
+        .await
+        .unwrap();
+    let events = drain(&mut start.handle).await;
+    let Some(LiveEvent::Finished { execution, .. }) = events.last() else {
+        panic!("no final event: {events:?}");
+    };
+    let error = execution.as_ref().as_ref().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected execution read failure"),
+        "{error}"
+    );
+    permits_released(&m).await;
+    let row = m.execution(&start.execution_id).unwrap();
+    assert_eq!(row.state, ExecutionState::Exited);
+    assert_eq!(row.stdout.data, b"published\n");
+    assert_eq!(row.mode, Some(ExecutionMode::Stream));
 }

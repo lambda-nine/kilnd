@@ -322,6 +322,14 @@ pub async fn read_live(fd: OwnedFd, tap: Arc<dyn LiveTap>) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    struct Noop;
+
+    #[cfg(target_os = "linux")]
+    impl LiveTap for Noop {
+        fn offer(&self, _: LiveStream, _: u64, _: &[u8]) {}
+    }
+
     #[test]
     fn messages_are_exact_and_strict() {
         let message = encode(LiveStream::Stderr, 0x0102_0304_0506_0708, b"hi");
@@ -453,5 +461,78 @@ mod tests {
         let recording = Arc::new(Recording::default());
         assert!(read_live(receiver, recording.clone()).await.is_err());
         assert_eq!(recording.0.lock().unwrap().len(), 1);
+    }
+
+    /// From the M4 break-it: two producers keep the live socket readable without pause;
+    /// the reader still yields, so a sibling task on the same current-thread runtime runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn continuously_readable_live_socket_does_not_monopolize_the_runtime() {
+        use std::os::fd::FromRawFd;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let (sender, receiver) = pair().unwrap();
+        let receiver = live_socket(receiver, unsafe { libc::geteuid() }).unwrap();
+        let duplicate = unsafe { libc::dup(sender.as_raw_fd()) };
+        assert!(duplicate >= 0);
+        let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = |fd: OwnedFd, stream: LiveStream, stop: Arc<AtomicBool>| {
+            std::thread::spawn(move || {
+                let mut offset = 0u64;
+                let mut message = vec![0u8; MAX_LIVE_MESSAGE];
+                message[0] = stream.code();
+                while !stop.load(Ordering::Relaxed) {
+                    message[1..HEADER_BYTES].copy_from_slice(&offset.to_be_bytes());
+                    let rc = unsafe {
+                        libc::send(
+                            fd.as_raw_fd(),
+                            message.as_ptr().cast(),
+                            message.len(),
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        )
+                    };
+                    if rc == message.len() as isize {
+                        offset += MAX_LIVE_DATA as u64;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            })
+        };
+        let a = producer(sender, LiveStream::Stdout, stop.clone());
+        let b = producer(duplicate, LiveStream::Stderr, stop.clone());
+        std::thread::sleep(Duration::from_millis(20));
+
+        let beats = Arc::new(AtomicU64::new(0));
+        let heartbeat = {
+            let beats = beats.clone();
+            tokio::spawn(async move {
+                loop {
+                    beats.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        tokio::task::yield_now().await;
+        let before = beats.load(Ordering::Relaxed);
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        read_live(receiver, Arc::new(Noop)).await.unwrap();
+        let after = beats.load(Ordering::Relaxed);
+        heartbeat.abort();
+        stopper.join().unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
+        assert!(
+            after > before,
+            "the live reader monopolized the current-thread runtime for the entire flood"
+        );
     }
 }

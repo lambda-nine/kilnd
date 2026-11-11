@@ -1176,9 +1176,12 @@ is `unary`; rows from before it have none (`EXECUTION_MODE_UNSPECIFIED`).
   Darwin has no `SOCK_SEQPACKET` Unix sockets, so there the helper proves no live
   output.
 - *kilnd's queue* (`exec_stream.rs`). The helper client reads the live socket into a
-  per-execution queue bounded by `--exec-stream-buffer-bytes` (256 KiB, counting 64
-  bytes of overhead per entry, so one-byte writes cannot exceed it). An offer that
-  does not fit is dropped whole; contiguous bytes coalesce into chunks of at most
+  per-execution queue bounded by `--exec-stream-buffer-bytes` (256 KiB). The bound
+  counts what is allocated, not what is used: each entry's payload capacity, 64 bytes
+  of overhead per entry (so one-byte writes cannot exceed it) and every deque slot.
+  Coalescing grows an entry's payload geometrically up to one chunk and charges the
+  new capacity, or exactly when only that fits. An offer that does not fit is dropped
+  whole; contiguous bytes coalesce into chunks of at most
   `--exec-stream-chunk-bytes` (32 KiB). The RPC's response body drains the queue at
   whatever pace the transport polls it. Gaps are derived from offsets and take no
   queue space, and `ExecFinished` has its own slot, so neither is ever dropped. The

@@ -195,7 +195,8 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   their tap cannot fail, await or block, so capture evidence is the same with or
   without a stream. The helper sends each read on its own `SOCK_SEQPACKET` socket with
   `MSG_DONTWAIT` and drops it when the socket is full; kilnd's per-execution queue is
-  bounded (256 KiB with per-entry overhead) and drops what does not fit. A client that
+  bounded (256 KiB of allocated capacity, per-entry overhead and deque slots) and
+  drops what does not fit. A client that
   stops reading loses live bytes only; its permits come back when the final message is
   handed to the transport, which may then hold it at the bound of a unary response a
   peer refuses to read. Streams are capped per node (16) and per uid (8, below the

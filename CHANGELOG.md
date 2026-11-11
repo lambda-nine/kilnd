@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix the M4 break-it finding (MEDIUM M4-B1): the ExecStream live queue charged an
+  entry's logical length, so coalescing let `Vec` growth hold up to about twice
+  `--exec-stream-buffer-bytes` of payload capacity. The queue now charges allocated
+  capacity (growth geometric up to one chunk, or exact when only that fits), the
+  64-byte per-entry overhead and every deque slot, and shrinks the deque after a
+  drain; a regression and a churn test check the charge never drifts or passes the
+  bound. The break-it's own controls are adopted as tests (a continuously readable
+  live socket does not monopolize the runtime; unread finished streams hold no
+  permit and keep their whole row), and a fault hook now covers the post-publication
+  row-read failure.
 - Add milestone 4 of the kilnd API additions: `rpc ExecStream`, Exec with live
   output, additive within `kilnd.v1`; every existing request and response is
   byte-identical. The request wraps an `ExecRequest` and runs the same validation,

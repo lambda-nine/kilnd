@@ -21,9 +21,12 @@ pub use kilnd_exec_core::live::{LiveStream, LiveTap};
 
 use crate::model::Execution;
 
-/// What each queued entry costs beyond its bytes: the deque slot and the allocation, so
-/// a command writing one byte at a time cannot hold more memory than the buffer allows.
+/// What each queued entry costs beyond its payload allocation: the allocator's own
+/// bookkeeping and the entry's share of the queue, so a command writing one byte at a
+/// time cannot hold more memory than the buffer allows.
 pub const ENTRY_OVERHEAD: usize = 64;
+/// One deque slot. The deque's whole capacity, live or not, is charged at this size.
+const SLOT_BYTES: usize = std::mem::size_of::<Entry>();
 /// `--exec-stream-buffer-bytes` and `--exec-stream-chunk-bytes` defaults (design 7).
 pub const DEFAULT_BUFFER_BYTES: usize = 256 * 1024;
 pub const DEFAULT_CHUNK_BYTES: usize = 32 * 1024;
@@ -112,7 +115,8 @@ impl Entry {
 #[derive(Default)]
 struct QueueState {
     entries: VecDeque<Entry>,
-    /// Accounted bytes: data plus [`ENTRY_OVERHEAD`] per entry.
+    /// Charged payload: each entry's allocated capacity (never just its length) plus
+    /// [`ENTRY_OVERHEAD`]. Kept equal to that sum at every step (break-it M4-B1).
     queued: usize,
     /// Per stream, the end of the last offer seen; an offer starting before it is a
     /// source fault and is dropped, so offsets the consumer sees only increase.
@@ -129,6 +133,87 @@ pub struct LiveQueue {
     buffer: StreamBuffer,
     state: Mutex<QueueState>,
     disconnect: CancellationToken,
+}
+
+impl QueueState {
+    /// Everything the queue holds: the payload charge and every deque slot allocated.
+    fn charged(&self) -> usize {
+        self.queued + self.entries.capacity() * SLOT_BYTES
+    }
+
+    /// Grows `entry`'s payload so `extra` more bytes fit, charging the capacity it
+    /// actually allocates. Amortized: it asks for twice the capacity (at most `chunk`),
+    /// or exactly what fits if that is over `limit`. False, with nothing changed, when
+    /// even the exact growth would pass `limit`.
+    fn grow(
+        data: &mut Vec<u8>,
+        queued: &mut usize,
+        slots: usize,
+        extra: usize,
+        chunk: usize,
+        limit: usize,
+    ) -> bool {
+        let need = data.len() + extra;
+        if need <= data.capacity() {
+            return true;
+        }
+        let doubled = need.max(data.capacity().saturating_mul(2)).min(chunk);
+        for target in [doubled, need] {
+            // `queued` includes this entry's current capacity, so this cannot underflow.
+            let others = *queued - data.capacity();
+            if others + target + slots > limit {
+                continue;
+            }
+            data.reserve_exact(target - data.len());
+            *queued = others + data.capacity();
+            if *queued + slots <= limit {
+                return true;
+            }
+            // The allocator gave more than was asked for: give it back, charging
+            // whatever it keeps.
+            data.shrink_to(data.len());
+            *queued = others + data.capacity();
+        }
+        false
+    }
+
+    /// Room for one more entry in the deque, charging every slot it allocates.
+    fn reserve_slot(&mut self, extra: usize, limit: usize) -> bool {
+        let (len, cap) = (self.entries.len(), self.entries.capacity());
+        if len < cap {
+            return self.queued + extra + cap * SLOT_BYTES <= limit;
+        }
+        for target in [cap.saturating_mul(2).max(4), cap + 1] {
+            if self.queued + extra + target * SLOT_BYTES > limit {
+                continue;
+            }
+            self.entries.reserve_exact(target - len);
+            if self.charged() + extra <= limit {
+                return true;
+            }
+            self.entries.shrink_to(len);
+        }
+        false
+    }
+
+    /// Releases deque slots once most are idle, so a drained burst does not keep its
+    /// peak allocation (amortized: it shrinks to twice the live entries).
+    fn shrink_slots(&mut self) {
+        let (len, cap) = (self.entries.len(), self.entries.capacity());
+        if cap > 8 && len * 4 <= cap {
+            self.entries.shrink_to((len * 2).max(4));
+        }
+    }
+
+    /// Recomputes the charge from scratch (tests only).
+    #[cfg(test)]
+    fn audit(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|e| e.data.capacity() + ENTRY_OVERHEAD)
+            .sum::<usize>()
+            + self.entries.capacity() * SLOT_BYTES
+    }
 }
 
 fn index(stream: LiveStream) -> usize {
@@ -187,9 +272,10 @@ impl LiveQueue {
         }
     }
 
-    /// Accounted bytes queued now (for tests and Health-like checks).
+    /// Bytes the queue holds now, as charged against its bound: payload capacity,
+    /// per-entry overhead and every deque slot.
     pub fn queued_bytes(&self) -> usize {
-        self.state().queued
+        self.state().charged()
     }
 
     /// Bytes the queue dropped per stream (stdout, stderr).
@@ -223,34 +309,50 @@ impl LiveTap for LiveQueue {
             return;
         }
         state.offered_end[i] = offset + bytes.len() as u64;
-        let capacity = self.buffer.buffer_bytes;
+        let limit = self.buffer.buffer_bytes;
         let chunk = self.buffer.chunk_bytes;
         let mut accepted = false;
         for (n, piece) in bytes.chunks(chunk).enumerate() {
             let at = offset + (n * chunk) as u64;
-            // Contiguous bytes of the same stream join the last entry, up to one chunk.
             let state = &mut *state;
+            // Contiguous bytes of the same stream join the last entry, up to one chunk.
+            // Its growth is charged as allocated capacity (break-it M4-B1).
+            let slots = state.entries.capacity() * SLOT_BYTES;
             if let Some(last) = state.entries.back_mut()
                 && last.stream == stream
                 && last.end() == at
                 && last.data.len() + piece.len() <= chunk
-                && state.queued + piece.len() <= capacity
+                && QueueState::grow(
+                    &mut last.data,
+                    &mut state.queued,
+                    slots,
+                    piece.len(),
+                    chunk,
+                    limit,
+                )
             {
                 last.data.extend_from_slice(piece);
-                state.queued += piece.len();
                 accepted = true;
                 continue;
             }
-            if state.queued + piece.len() + ENTRY_OVERHEAD > capacity {
+            // A new entry: an exactly sized payload, its overhead, and any deque growth.
+            if !state.reserve_slot(piece.len() + ENTRY_OVERHEAD, limit) {
                 state.queue_dropped[i] += piece.len() as u64;
                 continue;
             }
+            let mut data = Vec::with_capacity(piece.len());
+            data.extend_from_slice(piece);
+            let cost = data.capacity() + ENTRY_OVERHEAD;
+            if state.charged() + cost > limit {
+                state.queue_dropped[i] += piece.len() as u64;
+                continue;
+            }
+            state.queued += cost;
             state.entries.push_back(Entry {
                 stream,
                 offset: at,
-                data: piece.to_vec(),
+                data,
             });
-            state.queued += piece.len() + ENTRY_OVERHEAD;
             accepted = true;
         }
         if accepted && let Some(waker) = state.waker.take() {
@@ -308,16 +410,21 @@ impl StreamHandle {
             let whole = front.data.len() <= room;
             let (stream, offset) = (front.stream, front.offset);
             let piece = if whole {
-                state.queued -= front.data.len() + ENTRY_OVERHEAD;
+                state.queued -= front.data.capacity() + ENTRY_OVERHEAD;
                 std::mem::take(&mut front.data)
             } else {
-                state.queued -= room;
+                // The front keeps an exactly sized remainder; the original allocation
+                // leaves with the piece.
+                let before = front.data.capacity();
                 let rest = front.data.split_off(room);
                 front.offset += room as u64;
-                std::mem::replace(&mut front.data, rest)
+                let piece = std::mem::replace(&mut front.data, rest);
+                state.queued = state.queued - before + front.data.capacity();
+                piece
             };
             if whole {
                 state.entries.pop_front();
+                state.shrink_slots();
             }
             match &mut out {
                 Some(out) => out.data.extend_from_slice(&piece),
@@ -528,13 +635,17 @@ mod tests {
         expected.extend([2; 60]);
         expected.extend([4; 250]);
         assert_eq!(stdout, expected);
-        assert_eq!(queue.queued_bytes(), 0);
+        // Drained: no payload is charged, only the deque's few idle slots.
+        let state = queue.state();
+        assert_eq!(state.queued, 0);
+        assert_eq!(state.charged(), state.entries.capacity() * SLOT_BYTES);
+        assert_eq!(state.charged(), state.audit());
     }
 
     #[tokio::test]
     async fn a_full_queue_drops_and_the_next_chunk_reports_an_exact_gap_first() {
-        // Room for one 100-byte entry and its overhead, no more.
-        let queue = small(100 + ENTRY_OVERHEAD, 100);
+        // Room for one 100-byte entry, its overhead and the deque's first four slots.
+        let queue = small(100 + ENTRY_OVERHEAD + 4 * SLOT_BYTES, 100);
         let mut handle = queue.handle();
         queue.offer(LiveStream::Stdout, 0, &[0; 100]);
         queue.offer(LiveStream::Stdout, 100, &[0; 50]);
@@ -615,6 +726,101 @@ mod tests {
         }
         assert!(queue.queued_bytes() <= 16 * 1024);
         assert!(queue.state().entries.len() <= 16 * 1024 / (ENTRY_OVERHEAD + 1));
+    }
+
+    /// Break-it M4-B1: coalescing used to charge logical length while `Vec` growth
+    /// doubled the allocation, so fifteen 16 KiB entries each extended by one byte held
+    /// 491,520 bytes of payload capacity behind a 262,144-byte bound. Allocated capacity,
+    /// the per-entry overhead and every deque slot are now charged, and the recomputed
+    /// sum never passes the bound.
+    #[test]
+    fn coalescing_growth_is_charged_as_allocated_capacity() {
+        let queue = small(DEFAULT_BUFFER_BYTES, DEFAULT_CHUNK_BYTES);
+        let mut next = [0u64; 2];
+        for n in 0..15 {
+            let stream = if n % 2 == 0 {
+                LiveStream::Stdout
+            } else {
+                LiveStream::Stderr
+            };
+            let i = index(stream);
+            queue.offer(stream, next[i], &[0; 16 * 1024]);
+            queue.offer(stream, next[i] + 16 * 1024, &[0]);
+            next[i] += 16 * 1024 + 1;
+            let state = queue.state();
+            assert_eq!(
+                state.charged(),
+                state.audit(),
+                "charge drifted at entry {n}"
+            );
+            assert!(
+                state.audit() <= DEFAULT_BUFFER_BYTES,
+                "over the bound at entry {n}"
+            );
+        }
+        let state = queue.state();
+        let payload: usize = state.entries.iter().map(|e| e.data.capacity()).sum();
+        let total =
+            payload + state.entries.len() * ENTRY_OVERHEAD + state.entries.capacity() * SLOT_BYTES;
+        eprintln!(
+            "entries={} payload capacity={payload} total={total} bound={DEFAULT_BUFFER_BYTES} dropped={:?}",
+            state.entries.len(),
+            state.queue_dropped
+        );
+        assert!(total <= DEFAULT_BUFFER_BYTES);
+    }
+
+    /// Any mix of offers (contiguous, gapped, both streams, one byte to several chunks)
+    /// and partial drains keeps the charge equal to what is allocated and within the
+    /// bound, through `take_chunk`'s split path and deque shrinking.
+    #[test]
+    fn the_charge_never_drifts_or_passes_the_bound_under_churn() {
+        for (buffer_bytes, chunk_bytes) in [
+            (65_664, 32 * 1024),
+            (DEFAULT_BUFFER_BYTES, 1000),
+            (4096, 100),
+        ] {
+            let queue = small(buffer_bytes, chunk_bytes);
+            let handle = queue.handle();
+            let mut next = [0u64; 2];
+            let mut seed = 0x2545_f491_4f6c_dd1du64;
+            let mut rand = |n: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % n
+            };
+            let data = vec![7u8; 3 * chunk_bytes];
+            for step in 0..20_000 {
+                let i = rand(2) as usize;
+                let stream = [LiveStream::Stdout, LiveStream::Stderr][i];
+                let len = match rand(4) {
+                    0 => 1,
+                    1 => 1 + rand(64) as usize,
+                    2 => 1 + rand(chunk_bytes as u64) as usize,
+                    _ => 1 + rand(3 * chunk_bytes as u64) as usize,
+                };
+                next[i] += rand(3) * rand(50);
+                queue.offer(stream, next[i], &data[..len]);
+                next[i] += len as u64;
+                if rand(3) == 0 {
+                    let mut state = queue.state();
+                    for _ in 0..1 + rand(3) {
+                        handle.take_chunk(&mut state);
+                    }
+                }
+                let state = queue.state();
+                assert_eq!(state.charged(), state.audit(), "drift at step {step}");
+                assert!(
+                    state.audit() <= buffer_bytes,
+                    "over the bound at step {step}"
+                );
+            }
+            let mut state = queue.state();
+            while handle.take_chunk(&mut state).is_some() {}
+            assert_eq!(state.queued, 0);
+            assert_eq!(state.charged(), state.audit());
+        }
     }
 
     #[tokio::test]

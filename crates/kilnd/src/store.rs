@@ -1119,6 +1119,10 @@ pub struct Store {
     /// state just before it: the execution_start_raced path.
     #[cfg(test)]
     pub(crate) lose_execution_starts: AtomicBool,
+    /// When nonzero, the `n`th following `execution` read fails once: the ExecStream
+    /// post-publication read-failure path.
+    #[cfg(test)]
+    pub(crate) fail_execution_read: std::sync::atomic::AtomicU32,
 }
 
 /// How an execution ended, written in one transaction with what it means for its
@@ -1825,6 +1829,8 @@ impl Store {
             before_request_commit: Mutex::new(None),
             #[cfg(test)]
             lose_execution_starts: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_execution_read: std::sync::atomic::AtomicU32::new(0),
         };
         store.initialize()?;
         Ok(store)
@@ -3294,6 +3300,22 @@ impl Store {
     }
 
     pub fn execution(&self, id: &str) -> Result<Option<Execution>> {
+        #[cfg(test)]
+        {
+            let mut n = self.fail_execution_read.load(Ordering::SeqCst);
+            while n > 0 {
+                match self.fail_execution_read.compare_exchange(
+                    n,
+                    n - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(1) => bail!("injected execution read failure"),
+                    Ok(_) => break,
+                    Err(current) => n = current,
+                }
+            }
+        }
         self.conn()
             .query_row(
                 &format!("SELECT {EXECUTION_COLUMNS} FROM executions WHERE id = ?1"),

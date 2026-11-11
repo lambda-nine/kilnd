@@ -467,3 +467,49 @@ async fn a_peer_withholding_window_updates_gets_its_permits_back_at_handoff() {
     assert_eq!(next, total);
     daemon.stop().await;
 }
+
+/// Design 5.1's handoff over the wire (from the M4 break-it's controls): completed,
+/// unread response bodies hold no stream permit, so three connections can keep more of
+/// them than the node stream cap; each still delivers its whole final row when read.
+/// They are bounded by the transport's per-connection streams and connection caps.
+#[tokio::test]
+async fn unread_finished_wire_streams_hold_no_stream_permit() {
+    let daemon = Daemon::start(&[Feature::ExecStream], Limits::default()).await;
+    let sandbox = daemon.sandbox().await;
+    let mut clients = [
+        daemon.client().await,
+        daemon.client().await,
+        daemon.client().await,
+    ];
+    let mut unread = Vec::new();
+
+    for i in 0..17 {
+        let client = i % clients.len();
+        let response = clients[client]
+            .exec_stream(exec(&sandbox, &["stream", "64", "16384", "0"]))
+            .await
+            .unwrap();
+        unread.push(response.into_inner());
+        let _ = wait_released(&daemon).await;
+    }
+
+    let snapshot = daemon.admission().await;
+    assert_eq!(snapshot.current_exec_streams, 0);
+    assert_eq!(snapshot.max_exec_streams, 16);
+    assert_eq!(
+        unread.len(),
+        17,
+        "more unread finals than the node stream cap"
+    );
+
+    let mut final_blob_bytes = 0usize;
+    for stream in &mut unread {
+        let messages = collect(stream).await;
+        let (_, finished) = check_order(&messages);
+        let execution = finished.execution.as_ref().unwrap();
+        final_blob_bytes += execution.stdout.as_ref().unwrap().data.len();
+        final_blob_bytes += execution.stderr.as_ref().unwrap().data.len();
+    }
+    assert!(final_blob_bytes >= 17 << 20);
+    daemon.stop().await;
+}
