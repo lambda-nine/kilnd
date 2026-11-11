@@ -1277,7 +1277,7 @@ sys.exit(125)
         assert_eq!(outcome.stdout.total_bytes, 100_000);
         assert!(outcome.stdout.total_bytes_known && outcome.stdout.truncated());
         assert_eq!(outcome.stdout.data.len(), 1000);
-        let seen = recording.0.lock().unwrap();
+        let seen = std::mem::take(&mut *recording.0.lock().unwrap());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         for (stream, offset, bytes) in seen.iter() {

@@ -907,14 +907,14 @@ async fn exec_stream_stress_client() {
             for _ in 0..9 {
                 sandboxes.push(own_sandbox(&mut control).await);
             }
-            // One connection, eight HTTP/2 streams, 64 KiB of window for all of them.
-            let stalled = stream_client(socket.clone(), 64 * 1024).await;
+            // A connection per stream with a 64 KiB window, so one stream's unread
+            // chunks cannot hold back the next stream's ExecStarted.
             let flood = STREAM_FLOOD_MS.to_string();
             let mut held = Vec::new();
             let mut ids = Vec::new();
             for sandbox in &sandboxes[..8] {
+                let mut stalled = stream_client(socket.clone(), 64 * 1024).await;
                 let mut stream = stalled
-                    .clone()
                     .exec_stream(stream_request(sandbox, &["flood", &flood]))
                     .await
                     .unwrap()
@@ -924,7 +924,7 @@ async fn exec_stream_stress_client() {
                     panic!("no ExecStarted");
                 };
                 ids.push(started.execution_id);
-                held.push(stream);
+                held.push((stream, stalled));
             }
             let status = control
                 .exec_stream(stream_request(&sandboxes[8], &["true"]))
@@ -1205,9 +1205,10 @@ async fn exec_stream_resources_bound_and_recover() {
         peak_rss <= baseline_rss + bound,
         "stream RSS exceeded its bound: baseline={baseline_rss} peak={peak_rss} bound={bound}"
     );
-    // At most one extra descriptor per stream on the daemon side, plus the connections.
+    // The fake backend adds no descriptor per stream; the clients hold 19 connections
+    // (a control connection and one per stream for each holder, and the probe's).
     assert!(
-        peak_fds <= baseline_fds + 16 + 8,
+        peak_fds <= baseline_fds + 16 + 19 + 4,
         "stream descriptors exceeded their bound: baseline={baseline_fds} peak={peak_fds}"
     );
     std::fs::write(root.join("clients/release"), b"").unwrap();

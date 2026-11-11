@@ -385,7 +385,7 @@ mod tests {
         sender.close();
         let recording = Arc::new(Recording::default());
         read_live(receiver, recording.clone()).await.unwrap();
-        let seen = recording.0.lock().unwrap();
+        let seen = std::mem::take(&mut *recording.0.lock().unwrap());
         let mut last = 0;
         let mut stdout = 0;
         for (stream, at, bytes) in seen.iter() {
