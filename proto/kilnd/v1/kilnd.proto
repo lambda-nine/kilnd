@@ -63,6 +63,12 @@ service KilndService {
   // FAILED_PRECONDITION with a kilnd-reason trailer (sandbox_not_ready,
   // sandbox_failed, sandbox_lost, sandbox_quarantined, sandbox_deleted,
   // expired_idle or expired_lifetime), and the message starts with that token.
+  // FAILED_PRECONDITION execution_start_raced means the sandbox changed state
+  // while the execution was being recorded and is READY again: nothing ran, retry.
+  // cwd or env (or the sandbox's default_env) on a backend that has not proven
+  // them fails UNIMPLEMENTED backend_unsupported:exec_cwd or :exec_env, and on a
+  // sandbox whose runtime predates them FAILED_PRECONDITION
+  // sandbox_unsupported:exec_cwd or :exec_env, both before any execution row.
   rpc Exec(ExecRequest) returns (ExecResponse);
 
   // Returns one execution, including its captured output.
@@ -129,8 +135,13 @@ enum Feature {
   // CreateSandboxRequest.request_id, Sandbox.request_id, the create request
   // counts in AdmissionStats and ApiLimits.create_request_retention_ms.
   FEATURE_IDEMPOTENT_CREATE = 2;
+  // ExecRequest.cwd and Execution.cwd.
   FEATURE_EXEC_CWD = 3;
+  // ExecRequest.env, Execution.env_names and env_sha256.
   FEATURE_EXEC_ENV = 4;
+  // CreateSandboxRequest.default_env, Sandbox.default_env_names and
+  // default_env_sha256. These three are dynamic: listed only while the backend
+  // proves it can deliver them (for kiln, a CLI with exec options, bit 0x20).
   FEATURE_SANDBOX_DEFAULT_ENV = 5;
   FEATURE_EXEC_STREAM = 6;
   // Refusals carry a `kilnd-reason: <token>` trailer, and their message starts
@@ -376,7 +387,12 @@ message Sandbox {
   // The create's request_id; empty for an unkeyed create. Kept after its
   // record is released or pruned.
   string request_id = 16;
-  // Fields 17 and 18 are reserved for sandbox default env.
+  // The names of CreateSandboxRequest.default_env, sorted by name bytes. Their
+  // values are never returned (FEATURE_SANDBOX_DEFAULT_ENV).
+  repeated string default_env_names = 17;
+  // Lowercase hex SHA-256 of default_env in Execution.env_sha256's encoding;
+  // empty when there is none.
+  string default_env_sha256 = 18;
   // The create request record was given up through release_request_id: a new
   // create with request_id makes a new sandbox.
   bool request_id_released = 19;
@@ -437,6 +453,20 @@ message CreateSandboxRequest {
   string request_id = 2;
   // Absent: never expires. Needs FEATURE_SANDBOX_EXPIRY.
   ExpiryPolicy expiry = 3;
+  // Environment overrides for every Exec in this sandbox, under each Exec's own
+  // env. Same rules as ExecRequest.env. The values are kept in kilnd's database,
+  // in plaintext, while the sandbox is live and cleared when it becomes FAILED or
+  // DELETED; they are never returned. Do not send secrets. Needs
+  // FEATURE_SANDBOX_DEFAULT_ENV.
+  repeated EnvVar default_env = 4;
+}
+
+// One environment variable.
+message EnvVar {
+  // 1-128 bytes matching [A-Za-z_][A-Za-z0-9_]*.
+  string name = 1;
+  // At most 4096 UTF-8 bytes without NUL; empty is allowed.
+  string value = 2;
 }
 
 message CreateSandboxResponse {
@@ -503,6 +533,24 @@ message ExecRequest {
   // Queue-inclusive budget. Zero means the daemon's default; values above
   // its maximum are refused. Cleanup and finalization may finish later.
   uint32 timeout_ms = 4;
+  // The command's working directory inside the sandbox. Empty: "/", as before.
+  // Otherwise it starts with '/', is at most ApiLimits.max_cwd_bytes and has no
+  // NUL. It is not normalized: ".." and symlinks resolve inside the sandbox. One
+  // that cannot be entered is a successful RPC whose execution is FAILED with
+  // LAUNCH_FAILED, RUNTIME_STAGE_CWD, the errno name (ENOENT, ENOTDIR, EACCES,
+  // ELOOP, ENAMETOOLONG) as native_code and a failure_reason starting
+  // "cwd_not_found"; nothing falls back to "/". Needs FEATURE_EXEC_CWD.
+  string cwd = 5;
+  // Environment overrides, over the sandbox's default_env (this list wins by
+  // name), over the base every command gets: HOME=/root,
+  // PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin and
+  // TERM=xterm. Explicit entries win, PATH included, and drive the program
+  // lookup. At most ApiLimits.max_env_entries entries, each name once; the
+  // sum of len(name) + len(value) + 2 is at most max_env_total_bytes, for this
+  // list, for default_env and for their merge. There is no unset. Values are
+  // never stored in history or returned; the execution records the names and a
+  // hash. Do not send secrets. Needs FEATURE_EXEC_ENV.
+  repeated EnvVar env = 6;
 }
 
 message ExecResponse {
@@ -570,6 +618,14 @@ message Execution {
   // Set when state is EXITED: the command's exit code, or 128 + the signal
   // number if a signal killed it.
   optional int32 exit_code = 5;
+  // Why it was not EXITED, for operators. With cwd or env overrides a FAILED
+  // execution's reason can start with a token and ": ": cwd_not_found (see
+  // ExecRequest.cwd); exec_options_unconfirmed (the sandbox's runtime did not
+  // answer its capability check in time; nothing started; retry);
+  // exec_options_unsupported (the installed backend or this sandbox's runtime
+  // lacks exec options, after an operator downgrade; nothing started); or
+  // exec_options_unavailable (this host cannot hand the options over; nothing
+  // started). The command never runs without the options it was given.
   string failure_reason = 6;
   int64 started_at_unix_ms = 7;
   // Zero while running.
@@ -584,7 +640,17 @@ message Execution {
   // cannot take another call, even when this RPC succeeded.
   optional bool sandbox_reusable = 15;
   CleanupEvidence cleanup_evidence = 16;
-  // Fields 17-19 are reserved for exec cwd and env.
+  // ExecRequest.cwd as given; empty when none was sent.
+  string cwd = 17;
+  // The names of the effective overrides (the sandbox's default_env overlaid by
+  // ExecRequest.env), sorted by name bytes. No values.
+  repeated string env_names = 18;
+  // Lowercase hex SHA-256 over "kilnd.v1.exec-env.1", one zero byte, then each
+  // effective override sorted by name as u32be len, name, u32be len, value.
+  // Empty when there are none. An unkeyed integrity fingerprint, so a client can
+  // check what ran against what it sent; low-entropy values can be guessed from
+  // it, so it is not confidentiality.
+  string env_sha256 = 19;
   // Why a CANCELED execution was canceled; unspecified otherwise and on history.
   CancelReason cancel_reason = 20;
 }
@@ -640,6 +706,8 @@ enum RuntimeStage {
   RUNTIME_STAGE_REPORT = 11;
   RUNTIME_STAGE_CAPTURE = 12;
   RUNTIME_STAGE_HANDSHAKE = 13;
+  // The working directory (ExecRequest.cwd) could not be entered.
+  RUNTIME_STAGE_CWD = 14;
 }
 
 message RuntimeDiagnostic {

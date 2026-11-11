@@ -46,6 +46,8 @@ fn kiln() -> KilnRuntime {
 
 fn exec(id: &str, argv: &[&str], timeout_ms: u32) -> ExecRequest {
     ExecRequest {
+        cwd: String::new(),
+        env: Vec::new(),
         sandbox_id: id.into(),
         argv: argv.iter().map(|s| s.to_string()).collect(),
         stdin: vec![],
@@ -1303,4 +1305,158 @@ async fn real_kiln_keyed_creates_answer_retries_and_release_frees_the_key() {
     let gone = second.backend_id.clone().unwrap();
     m.delete_releasing(&second.id, true).await.unwrap();
     assert!(!listed_ids(&m).await.contains(&gone));
+}
+
+/// API additions M3b against the real kiln (design 8): cwd and env reach the command
+/// through operation 5, a relative script resolves in the cwd (the harness's
+/// `./fib.sh`), `env` without options prints exactly the base three, a host-only cwd is
+/// `ENOENT` inside the sandbox, defaults apply and the request wins, and defaults are
+/// cleared at DELETED. With a kiln that lacks exec options (bit 0x20) it checks only
+/// that the daemon proves none and refuses them before any execution row.
+#[tokio::test]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn real_kiln_exec_cwd_and_env() {
+    use kilnd::exec_env::EnvVar;
+    use kilnd::manager::Feature;
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (limits, small) = one_small_sandbox();
+    // Two small sandboxes at once.
+    let limits = Limits {
+        max_sandboxes: 2,
+        max_node_memory_bytes: limits.max_node_memory_bytes * 2,
+        max_node_pids: limits.max_node_pids * 2,
+        max_node_disk_bytes: limits.max_node_disk_bytes * 2,
+        ..limits
+    };
+    let m = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        limits,
+    ));
+    m.reconcile().await.unwrap();
+    assert!(m.health().await.unwrap().serving);
+    let with = |argv: &[&str], cwd: &str, env: &[(&str, &str)]| ExecRequest {
+        cwd: cwd.into(),
+        env: env.iter().map(|(n, v)| EnvVar::new(*n, *v)).collect(),
+        ..exec("", argv, 30_000)
+    };
+    if !m.has_feature(Feature::ExecEnv) {
+        eprintln!("the installed kiln lacks exec options (bit 0x20): checking refusals only");
+        let plain = m.create(small.clone()).await.unwrap();
+        let refused = m
+            .exec(ExecRequest {
+                sandbox_id: plain.id.clone(),
+                ..with(&["true"], "/workspace", &[])
+            })
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().starts_with("backend_unsupported:exec_cwd"), "{refused}");
+        m.delete(&plain.id).await.unwrap();
+        return;
+    }
+    let on = |id: &str, req: ExecRequest| ExecRequest {
+        sandbox_id: id.into(),
+        ..req
+    };
+    let stdout = |e: &kilnd::model::Execution| String::from_utf8(e.stdout.data.clone()).unwrap();
+    let plain = m.create(small.clone()).await.unwrap();
+    assert!(
+        plain
+            .lifecycle
+            .exec_features
+            .is_some_and(|bits| bits & 0x20 != 0)
+    );
+    // No options: today's operation 4 and exactly the base environment.
+    let e = m.exec(on(&plain.id, with(&["env"], "", &[]))).await.unwrap();
+    let printed = stdout(&e);
+    let mut base: Vec<&str> = printed.lines().collect();
+    base.sort_unstable();
+    assert_eq!(
+        base,
+        [
+            "HOME=/root",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM=xterm"
+        ]
+    );
+    let script = "printf '%s\\n' '#!/bin/sh' 'a=0 b=1 i=0' \
+        'while [ $i -lt $1 ]; do t=$((a + b)); a=$b; b=$t; i=$((i + 1)); done' 'echo $a' \
+        >/workspace/fib.sh && chmod +x /workspace/fib.sh";
+    let made = m.exec(on(&plain.id, with(&["sh", "-c", script], "", &[]))).await.unwrap();
+    assert_eq!(made.state, ExecutionState::Exited, "{made:?}");
+    let fib = m
+        .exec(on(&plain.id, with(&["./fib.sh", "10"], "/workspace", &[])))
+        .await
+        .unwrap();
+    assert_eq!((fib.state, stdout(&fib).as_str()), (ExecutionState::Exited, "55\n"), "{fib:?}");
+    assert_eq!(fib.cwd.as_deref(), Some("/workspace"));
+    // Overrides win, PATH included, and PATH drives the program lookup.
+    let e = m
+        .exec(on(
+            &plain.id,
+            with(&["fib.sh", "7"], "/", &[("PATH", "/workspace:/usr/bin:/bin")]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stdout(&e), "13\n", "{e:?}");
+    let e = m
+        .exec(on(
+            &plain.id,
+            with(&["sh", "-c", "pwd; echo \"$A|$TERM\""], "/workspace/..", &[("A", "1"), ("TERM", "dumb")]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stdout(&e), "/\n1|dumb\n", "{e:?}");
+    assert_eq!(e.env_names, ["A", "TERM"]);
+    // A host-only path is not there inside the sandbox; nothing falls back to "/".
+    for cwd in ["/var/lib/kilnd-helper", "/no/such/dir"] {
+        let e = m
+            .exec(on(&plain.id, with(&["true"], cwd, &[])))
+            .await
+            .unwrap();
+        assert_eq!(e.state, ExecutionState::Failed, "{e:?}");
+        let d = e.runtime_error.as_ref().unwrap();
+        assert_eq!((d.kind, d.stage), (RuntimeErrorKind::LaunchFailed, RuntimeStage::Cwd));
+        assert_eq!(d.native_code.as_deref(), Some("ENOENT"));
+        assert!(e.failure_reason.as_deref().unwrap().starts_with("cwd_not_found"));
+        assert_eq!(e.sandbox_reusable, Some(true));
+    }
+    let e = m
+        .exec(on(&plain.id, with(&["true"], "/etc/passwd", &[])))
+        .await
+        .unwrap();
+    assert_eq!(e.runtime_error.unwrap().native_code.as_deref(), Some("ENOTDIR"));
+    // The sandbox is still usable after the failures.
+    let e = m.exec(on(&plain.id, with(&["true"], "", &[]))).await.unwrap();
+    assert_eq!(e.state, ExecutionState::Exited);
+
+    // Sandbox defaults: every Exec gets them; the request wins by name.
+    let defaults = m
+        .create(CreateRequest {
+            default_env: vec![EnvVar::new("D", "from-create"), EnvVar::new("E", "e")],
+            ..small.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(defaults.lifecycle.default_env_names, ["D", "E"]);
+    let e = m
+        .exec(on(&defaults.id, with(&["sh", "-c", "echo \"$D $E\""], "", &[])))
+        .await
+        .unwrap();
+    assert_eq!(stdout(&e), "from-create e\n");
+    let e = m
+        .exec(on(&defaults.id, with(&["sh", "-c", "echo \"$D $E\""], "", &[("D", "exec")])))
+        .await
+        .unwrap();
+    assert_eq!(stdout(&e), "exec e\n");
+    assert_eq!(e.env_names, ["D", "E"]);
+    m.delete(&defaults.id).await.unwrap();
+    m.delete(&plain.id).await.unwrap();
+    let after = m.get(&defaults.id, 10).unwrap().0;
+    assert_eq!(after.state, SandboxState::Deleted);
+    assert_eq!(after.lifecycle.default_env_names, ["D", "E"]);
 }

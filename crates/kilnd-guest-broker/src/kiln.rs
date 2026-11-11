@@ -120,6 +120,7 @@ impl Kiln {
                     stdin: b"",
                     deadline: deadline.min(Instant::now() + SMOKE_BUDGET),
                     max_output: 4096,
+                    options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
                 },
                 &cancel,
             )

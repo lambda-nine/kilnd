@@ -23,6 +23,8 @@ fn manager_with(limits: Limits) -> (Arc<Manager<FakeRuntime>>, FakeRuntime) {
 
 fn exec_req(id: &str, argv: &[&str]) -> ExecRequest {
     ExecRequest {
+        cwd: String::new(),
+        env: Vec::new(),
         sandbox_id: id.into(),
         argv: argv.iter().map(|s| s.to_string()).collect(),
         stdin: vec![],
@@ -1619,6 +1621,8 @@ async fn exec_accepts_exact_boundaries_and_preserves_literal_argv() {
     let literal = vec!["echo".into(), "雪\n--timeout=1".into(), String::new()];
     let execution = m
         .exec(ExecRequest {
+            cwd: String::new(),
+            env: Vec::new(),
             sandbox_id: sandbox.id.clone(),
             argv: literal.clone(),
             stdin: Vec::new(),
@@ -1638,6 +1642,8 @@ async fn exec_accepts_exact_boundaries_and_preserves_literal_argv() {
         8192
     );
     m.exec(ExecRequest {
+        cwd: String::new(),
+        env: Vec::new(),
         sandbox_id: sandbox.id.clone(),
         argv: exact,
         stdin: Vec::new(),
@@ -1649,6 +1655,8 @@ async fn exec_accepts_exact_boundaries_and_preserves_literal_argv() {
     let mut max_count = vec!["echo".into()];
     max_count.extend(std::iter::repeat_n(String::new(), 4095));
     m.exec(ExecRequest {
+        cwd: String::new(),
+        env: Vec::new(),
         sandbox_id: sandbox.id,
         argv: max_count,
         stdin: Vec::new(),
@@ -2425,6 +2433,8 @@ async fn output_policy_keeps_live_reply_but_discards_durable_bytes() {
         let sandbox = manager.create(Default::default()).await.unwrap();
         let live = manager
             .exec(ExecRequest {
+                cwd: String::new(),
+                env: Vec::new(),
                 sandbox_id: sandbox.id,
                 argv: vec!["echo".into(), "secret".into()],
                 stdin: vec![],

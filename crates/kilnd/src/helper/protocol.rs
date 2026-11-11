@@ -7,6 +7,7 @@ use crate::validation::{
     MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, validate_allowlist_entry, validate_argv,
     validate_image_name, validate_writable_path,
 };
+use kilnd_exec_core::exec_options::{EnvLimits, EnvVar, ExecOptions, MAX_CWD_BYTES};
 use serde::{Deserialize, Serialize};
 
 pub const VERSION: u8 = 3;
@@ -43,7 +44,7 @@ impl KilnRequest {
     pub fn is_recovery(&self) -> bool {
         matches!(
             self,
-            Self::Capabilities { .. } | Self::Rm { .. } | Self::Gc { .. }
+            Self::Capabilities { .. } | Self::Features { .. } | Self::Rm { .. } | Self::Gc { .. }
         )
     }
 }
@@ -57,11 +58,25 @@ pub enum KilnRequest {
     Create {
         spec: SandboxSpec,
     },
+    /// API additions design 4.1: `cwd` and `env` are sandbox-interior data, never host
+    /// paths, flags or environment, and are omitted when empty, so a request without
+    /// them is byte-identical to before. `env` is the effective overrides, strictly
+    /// ascending by name; values are redacted from `Debug`.
     Exec {
         id: String,
         argv: Vec<String>,
         stdin_bytes: usize,
         max_output: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<EnvVar>,
+    },
+    /// The exec features the installed CLI (`id: null`) or one sandbox's PID 1 proves
+    /// now, and whether this helper can deliver exec options to it. New in M3b; an
+    /// older helper closes the connection on it.
+    Features {
+        id: Option<String>,
     },
     Ls,
     Rm {
@@ -100,12 +115,16 @@ impl Request {
             return Err("wrong descriptor count".into());
         }
         match op {
-            KilnRequest::Capabilities { id: Some(id) } | KilnRequest::Rm { id } => {
+            KilnRequest::Capabilities { id: Some(id) }
+            | KilnRequest::Features { id: Some(id) }
+            | KilnRequest::Rm { id } => {
                 if !crate::runtime::kiln_direct::valid_kiln_id(id) {
                     return Err("invalid backend ID".into());
                 }
             }
-            KilnRequest::Capabilities { id: None } | KilnRequest::Ls => {}
+            KilnRequest::Capabilities { id: None }
+            | KilnRequest::Features { id: None }
+            | KilnRequest::Ls => {}
             KilnRequest::Gc { ids } => {
                 if ids.len() > MAX_GC_IDS
                     || ids
@@ -124,6 +143,8 @@ impl Request {
                 argv,
                 stdin_bytes,
                 max_output,
+                cwd,
+                env,
             } => {
                 if !crate::runtime::kiln_direct::valid_kiln_id(id)
                     || *stdin_bytes > MAX_STDIN
@@ -133,6 +154,13 @@ impl Request {
                     return Err("invalid exec bounds".into());
                 }
                 validate_argv(argv, MAX_ARGV)?;
+                // The same shared validators as the daemon, at the code ceilings, in
+                // the one strict form kiln accepts: sorted, unique, bounded.
+                ExecOptions {
+                    cwd: cwd.clone(),
+                    env: env.clone(),
+                }
+                .validate_strict(&EnvLimits::CEILINGS, MAX_CWD_BYTES)?;
             }
             KilnRequest::Create { spec } => validate_spec(spec)?,
         }
@@ -939,6 +967,12 @@ pub enum Response {
         status: Option<CommandStatus>,
         stdout: CaptureInfo,
         stderr: CaptureInfo,
+    },
+    /// The answer to `features`: the advertised kiln feature bits, and whether the
+    /// helper can deliver exec options (bit 0x20 and a host whose memfds kiln accepts).
+    Features {
+        features: u32,
+        exec_options: bool,
     },
     Error {
         error: WireError,

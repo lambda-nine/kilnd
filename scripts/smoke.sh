@@ -417,5 +417,31 @@ ctl get "$keyed" | grep -q "^request id: *$key\$" || fail "request id not shown"
 ctl rm --release-request-id "$keyed" >/dev/null
 ctl get "$keyed" | grep -q "^request id: *$key (released)" || fail "release not shown"
 
+echo "16. Exec cwd and env (needs kiln with exec options, bit 0x20)"
+if ctl health | grep -q '^features: .*exec_env'; then
+    opts=$(ctl create --memory 64M --disk 16M --default-env "SMOKE_DEFAULT=from-create")
+    created+=("$opts")
+    ctl get "$opts" | grep -q '^env: *SMOKE_DEFAULT (sha256 [0-9a-f]\{64\})' || fail "default env names not shown"
+    # A relative script resolves in the cwd (the harness's fib.sh case).
+    ctl exec "$opts" -- sh -c 'printf "%s\n" "#!/bin/sh" "a=0 b=1 i=0" "while [ \$i -lt \$1 ]; do t=\$((a + b)); a=\$b; b=\$t; i=\$((i + 1)); done" "echo \$a" >/workspace/fib.sh && chmod +x /workspace/fib.sh'
+    [ "$(ctl exec --cwd /workspace "$opts" -- ./fib.sh 10)" = 55 ] || fail "./fib.sh in /workspace"
+    out=$(ctl exec --cwd /workspace --env SMOKE_EXEC=from-exec \
+        --env SMOKE_DEFAULT=overridden "$opts" -- sh -c 'pwd; echo "$SMOKE_DEFAULT $SMOKE_EXEC"')
+    [ "$out" = "$(printf '/workspace\noverridden from-exec')" ] || fail "cwd and env: $out"
+    [ "$(ctl exec "$opts" -- sh -c 'echo "$SMOKE_DEFAULT"; pwd')" = "$(printf 'from-create\n/')" ] \
+        || fail "default env without options"
+    if ctl exec --cwd /var/lib/kilnd-helper "$opts" -- true 2>"$api_tmp/launch.err"; then
+        fail "a host-only cwd was entered"
+    fi
+    grep -q 'cwd_not_found' "$api_tmp/launch.err" || fail "missing cwd not typed: $(cat "$api_tmp/launch.err")"
+    ctl rm "$opts" >/dev/null
+else
+    echo "   (kiln lacks exec options; checking that kilndctl refuses them)"
+    plain=$(ctl create --memory 64M --disk 16M)
+    created+=("$plain")
+    if ctl exec --cwd /workspace "$plain" -- true 2>/dev/null; then fail "cwd sent without exec_cwd"; fi
+    ctl rm "$plain" >/dev/null
+fi
+
 ctl health | grep -q '^active sandboxes: *0' || fail "smoke test left active sandboxes"
 echo "PASS"

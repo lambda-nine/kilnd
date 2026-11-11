@@ -30,7 +30,7 @@ use crate::model::{
 use crate::retention::{OutputStorage, Pruned, Retention};
 use crate::runtime::{CreatedSandbox, FencedAbsence, RuntimeReceipt};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -501,6 +501,41 @@ WHEN ((OLD.accounting_kind = 'legacy' AND OLD.legacy_release IS NULL) OR (OLD.ac
     AND NOT ((NEW.accounting_kind = 'legacy' AND NEW.legacy_release IS NULL) OR (NEW.accounting_kind = 'fenced' AND NEW.release_evidence_id IS NULL))
 BEGIN INSERT OR IGNORE INTO reservation_unsettled VALUES (NEW.id); END;
 PRAGMA user_version = 12;";
+
+// Schema 13 (API additions design 4.2): exec cwd and env. A sandbox's default env
+// values are plaintext while it is live, by design, and set to null in the same
+// statement that moves the row to FAILED or DELETED; the CHECK makes a FAILED or
+// DELETED row with values impossible. Their names and digest, and an execution's cwd,
+// names and digest, are fixed at insert; history never holds a value.
+// `exec_features` is the sandbox runtime's feature bits, recorded once at READY. None
+// of this is reservation membership.
+const MIGRATE_V13: &str = "
+ALTER TABLE sandboxes ADD COLUMN default_env_names TEXT CHECK (default_env_names IS NULL OR (typeof(default_env_names) = 'text' AND json_valid(default_env_names) AND json_type(default_env_names) = 'array' AND json_array_length(default_env_names) BETWEEN 1 AND 64));
+ALTER TABLE sandboxes ADD COLUMN default_env_sha256 TEXT CHECK ((default_env_sha256 IS NULL) = (default_env_names IS NULL) AND (default_env_sha256 IS NULL OR (typeof(default_env_sha256) = 'text' AND length(default_env_sha256) = 64 AND default_env_sha256 NOT GLOB '*[^0-9a-f]*')));
+ALTER TABLE sandboxes ADD COLUMN default_env TEXT CHECK (default_env IS NULL OR (typeof(default_env) = 'text' AND default_env_names IS NOT NULL AND state NOT IN ('failed', 'deleted')));
+ALTER TABLE sandboxes ADD COLUMN exec_features INTEGER CHECK (exec_features IS NULL OR (typeof(exec_features) = 'integer' AND exec_features BETWEEN 0 AND 4294967295));
+ALTER TABLE executions ADD COLUMN cwd TEXT CHECK (cwd IS NULL OR (typeof(cwd) = 'text' AND substr(cwd, 1, 1) = '/' AND length(CAST(cwd AS BLOB)) <= 4096));
+ALTER TABLE executions ADD COLUMN env_names TEXT CHECK (env_names IS NULL OR (typeof(env_names) = 'text' AND json_valid(env_names) AND json_type(env_names) = 'array' AND json_array_length(env_names) BETWEEN 1 AND 64));
+ALTER TABLE executions ADD COLUMN env_sha256 TEXT CHECK ((env_sha256 IS NULL) = (env_names IS NULL) AND (env_sha256 IS NULL OR (typeof(env_sha256) = 'text' AND length(env_sha256) = 64 AND env_sha256 NOT GLOB '*[^0-9a-f]*')));
+CREATE TRIGGER sandboxes_default_env_insert BEFORE INSERT ON sandboxes
+WHEN (NEW.default_env IS NOT NULL OR NEW.default_env_names IS NOT NULL) AND NEW.state != 'creating'
+BEGIN SELECT RAISE(ABORT, 'a default env is inserted with its CREATING sandbox'); END;
+CREATE TRIGGER sandboxes_default_env_fixed BEFORE UPDATE ON sandboxes
+WHEN NEW.default_env_names IS NOT OLD.default_env_names OR NEW.default_env_sha256 IS NOT OLD.default_env_sha256
+    OR (NEW.default_env IS NOT OLD.default_env AND NEW.default_env IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'a default env is fixed at insert; its values are only cleared'); END;
+CREATE TRIGGER sandboxes_exec_features_once BEFORE UPDATE ON sandboxes
+WHEN OLD.exec_features IS NOT NULL AND NEW.exec_features IS NOT OLD.exec_features
+BEGIN SELECT RAISE(ABORT, 'exec features are recorded once'); END;
+CREATE TRIGGER executions_env_fixed BEFORE UPDATE ON executions
+WHEN NEW.cwd IS NOT OLD.cwd OR NEW.env_names IS NOT OLD.env_names OR NEW.env_sha256 IS NOT OLD.env_sha256
+BEGIN SELECT RAISE(ABORT, 'an execution cwd and env names and digest are fixed at insert'); END;
+PRAGMA user_version = 13;";
+
+/// Clears a sandbox's default env values in the statement that moves it to `?2`, when
+/// that is FAILED or DELETED (schema 13's CHECK requires it).
+const DEFAULT_ENV_TRANSITION: &str =
+    "default_env = CASE WHEN ?2 IN ('failed', 'deleted') THEN NULL ELSE default_env END";
 
 // The immutable reservation and identity columns of a sandbox row: its membership.
 // Lifecycle transitions and release references are not membership.
@@ -1069,6 +1104,10 @@ pub struct Store {
     /// tests use it to stand for a pause (suspend, SIGSTOP, a stall) at that point.
     #[cfg(test)]
     pub(crate) before_request_commit: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Makes the next `start_execution` insert nothing, as if the sandbox changed
+    /// state just before it: the execution_start_raced path.
+    #[cfg(test)]
+    pub(crate) lose_execution_starts: AtomicBool,
 }
 
 /// How an execution ended, written in one transaction with what it means for its
@@ -1317,6 +1356,12 @@ fn i64_amount(value: u64, what: &str) -> Result<i64> {
 }
 
 fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
+    insert_sandbox_env(conn, sandbox, None)
+}
+
+/// [`insert_sandbox`] with the sandbox's default env values, the stored form of
+/// `exec_env::encode_stored`; its names and digest come from the row itself.
+fn insert_sandbox_env(conn: &Connection, sandbox: &Sandbox, default_env: Option<&str>) -> Result<()> {
     let accounting = &sandbox.accounting;
     let lifecycle = &sandbox.lifecycle;
     let reservation = accounting.reservation;
@@ -1347,9 +1392,9 @@ fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
             host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest, disposition, boot_id, legacy_release,
             node_id, instance_id, allocation_id, plan_version, plan_digest, plan, release_evidence_id, last_helper_generation,
             expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, ready_boottime_ms, activity_at_ms, activity_boottime_ms, clock_boot_id,
-            activity_seq, deletion_reason, request_id, list_seq)
+            activity_seq, deletion_reason, request_id, default_env, default_env_names, default_env_sha256, exec_features, list_seq)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33,
-            ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, (SELECT value FROM history_sequence WHERE id = 1))",
+            ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, (SELECT value FROM history_sequence WHERE id = 1))",
         params![
             sandbox.id,
             sandbox.backend,
@@ -1405,9 +1450,27 @@ fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
             lifecycle.activity_seq,
             lifecycle.deletion_reason.map(DeletionReason::as_str),
             lifecycle.request_id,
+            default_env,
+            names_column(&lifecycle.default_env_names)?,
+            lifecycle.default_env_sha256,
+            lifecycle.exec_features,
         ],
     )?;
     Ok(())
+}
+
+/// A names column: a JSON array, or null for none.
+fn names_column(names: &[String]) -> Result<Option<String>> {
+    Ok((!names.is_empty())
+        .then(|| serde_json::to_string(names))
+        .transpose()?)
+}
+
+fn parse_names(text: Option<String>, what: &str) -> Result<Vec<String>> {
+    match text {
+        None => Ok(Vec::new()),
+        Some(text) => serde_json::from_str(&text).with_context(|| format!("bad {what}")),
+    }
 }
 
 /// A schema 8-10 row, for migration tests of those schemas.
@@ -1749,6 +1812,8 @@ impl Store {
             reject_evidence_commits: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             before_request_commit: Mutex::new(None),
+            #[cfg(test)]
+            lose_execution_starts: AtomicBool::new(false),
         };
         store.initialize()?;
         Ok(store)
@@ -1855,7 +1920,10 @@ impl Store {
             drop(stmt);
             tx.execute_batch(MIGRATE_V9)?;
         }
-        if version < 10 {
+        if version >= 12 {
+            // Schema 12's aggregates are audited as they stand below, after the one
+            // additive step: the schema 13 columns are not membership.
+        } else if version < 10 {
             // Schema 10 introduces the membership marker: seed it from the rows
             // this one transaction has just migrated.
             tx.execute_batch(MIGRATE_V10)?;
@@ -1876,8 +1944,11 @@ impl Store {
         }
         // The marker verified above (or just written from the migrated rows) is
         // replaced by schema 12's aggregates, seeded from the same rows.
-        tx.execute_batch(MIGRATE_V12)?;
-        refresh_membership(&tx)?;
+        if version < 12 {
+            tx.execute_batch(MIGRATE_V12)?;
+            refresh_membership(&tx)?;
+        }
+        tx.execute_batch(MIGRATE_V13)?;
         audit_accounting_full(&tx)?;
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
@@ -1968,6 +2039,28 @@ impl Store {
         budgets: SandboxBudgets,
         request: Option<&RequestAdmission>,
     ) -> Result<ReserveSandbox> {
+        self.reserve_sandbox_with_env(s, budgets, request, &[])
+    }
+
+    /// As [`Self::reserve_keyed_sandbox`], inserting the sandbox's default env values
+    /// with its row (design 4.2). Their names and digest must be the row's own.
+    pub fn reserve_sandbox_with_env(
+        &self,
+        s: &Sandbox,
+        budgets: SandboxBudgets,
+        request: Option<&RequestAdmission>,
+        default_env: &[crate::exec_env::EnvVar],
+    ) -> Result<ReserveSandbox> {
+        let stored = if default_env.is_empty() {
+            None
+        } else {
+            if s.lifecycle.default_env_names != crate::exec_env::env_names(default_env)
+                || s.lifecycle.default_env_sha256 != crate::exec_env::env_sha256(default_env)
+            {
+                bail!("sandbox {}: default env names or digest do not match its values", s.id);
+            }
+            Some(crate::exec_env::encode_stored(default_env)?)
+        };
         // A keyed create needs the boot clock to anchor its record: refuse before
         // anything is written if there is none. This reading is display only.
         let reading = match request {
@@ -2023,7 +2116,7 @@ impl Store {
             tx.commit()?;
             return Ok(ReserveSandbox::Exhausted(exhausted));
         }
-        insert_sandbox(&tx, s)?;
+        insert_sandbox_env(&tx, s, stored.as_deref())?;
         if let (Some(request), Some(now)) = (request, &reading) {
             tx.execute(
                 "INSERT INTO create_requests (owner_uid, request_id, request_sha256, sandbox_id, created_at_ms)
@@ -2210,7 +2303,8 @@ impl Store {
         let n = tx.execute(
             &format!(
                 "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
-                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION}
+                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION},
+                 {DEFAULT_ENV_TRANSITION}
              WHERE id = ?1"
             ),
             params![id, state.as_str(), backend_id, failure_reason, now, deleted_at],
@@ -2221,6 +2315,63 @@ impl Store {
         stamp_first_ready(&tx, id, &reading)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// A legacy create's READY publication (design 4.1): `set_sandbox_state` to READY
+    /// with the backend ID, recording the sandbox runtime's exec feature bits in the
+    /// same statement. A row that already has them keeps them.
+    pub fn publish_legacy_ready(
+        &self,
+        id: &str,
+        backend_id: &str,
+        exec_features: Option<u32>,
+    ) -> Result<()> {
+        let now = now_ms();
+        let reading = self.clock_reading()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = tx.execute(
+            &format!(
+                "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
+                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION},
+                 exec_features = COALESCE(exec_features, ?7)
+             WHERE id = ?1"
+            ),
+            params![
+                id,
+                SandboxState::Ready.as_str(),
+                backend_id,
+                Option::<&str>::None,
+                now,
+                Option::<i64>::None,
+                exec_features
+            ],
+        )?;
+        if n != 1 {
+            bail!("sandbox {id} not found");
+        }
+        stamp_first_ready(&tx, id, &reading)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A sandbox's default env values (design 4.2), for one execution: empty when it has
+    /// none, or when they were cleared at FAILED or DELETED. A stored list that does not
+    /// decode is an error, so an execution never runs without its defaults.
+    pub fn sandbox_default_env(&self, id: &str) -> Result<Vec<crate::exec_env::EnvVar>> {
+        let stored: Option<Option<String>> = self
+            .conn()
+            .query_row(
+                "SELECT default_env FROM sandboxes WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match stored.with_context(|| format!("sandbox {id} not found"))? {
+            None => Ok(Vec::new()),
+            Some(text) => crate::exec_env::decode_stored(&text)
+                .with_context(|| format!("sandbox {id}")),
+        }
     }
 
     /// The clocks lifecycle anchors use. The manager installs its own before serving.
@@ -2260,7 +2411,7 @@ impl Store {
             &format!(
                 "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
                  updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION},
-                 deletion_reason = COALESCE(deletion_reason, ?8)
+                 {DEFAULT_ENV_TRANSITION}, deletion_reason = COALESCE(deletion_reason, ?8)
              WHERE id = ?1 AND state = ?7"
             ),
             params![
@@ -2467,7 +2618,8 @@ impl Store {
         let n = tx.execute(
             &format!(
                 "UPDATE sandboxes SET state = ?2, backend_id = COALESCE(?3, backend_id), failure_reason = ?4,
-                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION}
+                 updated_at_ms = ?5, deleted_at_ms = COALESCE(?6, deleted_at_ms), {LEGACY_TRANSITION},
+                 {DEFAULT_ENV_TRANSITION}
              WHERE id = ?1 AND state = ?7"
             ),
             params![
@@ -2493,7 +2645,7 @@ impl Store {
     pub fn fail_create_definitely(&self, id: &str, failure_reason: &str) -> Result<()> {
         let n = self.conn().execute(
             "UPDATE sandboxes SET state = 'failed', create_certainty = ?2, failure_reason = ?3, updated_at_ms = ?4,
-                 legacy_release = 'definitely_not_created'
+                 legacy_release = 'definitely_not_created', default_env = NULL
              WHERE id = ?1 AND state = 'creating' AND backend_id IS NULL AND accounting_kind = 'legacy'",
             params![
                 id,
@@ -2662,9 +2814,12 @@ impl Store {
         let now = now_ms();
         let deleted_at = (state == SandboxState::Deleted).then_some(now);
         tx.execute(
-            "UPDATE sandboxes SET state = ?2, release_evidence_id = ?3, failure_reason = COALESCE(?4, failure_reason),
-                 updated_at_ms = ?5, deleted_at_ms = COALESCE(deleted_at_ms, ?6), last_helper_generation = ?7
-             WHERE id = ?1",
+            &format!(
+                "UPDATE sandboxes SET state = ?2, release_evidence_id = ?3, failure_reason = COALESCE(?4, failure_reason),
+                 updated_at_ms = ?5, deleted_at_ms = COALESCE(deleted_at_ms, ?6), last_helper_generation = ?7,
+                 {DEFAULT_ENV_TRANSITION}
+             WHERE id = ?1"
+            ),
             params![
                 id,
                 state.as_str(),
@@ -2865,9 +3020,17 @@ impl Store {
         let reading = self.clock_reading()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        #[cfg(test)]
+        if self.lose_execution_starts.swap(false, Ordering::SeqCst) {
+            // Stands for a state change between the manager's READY check and this
+            // insert that a reload then sees undone (execution_start_raced).
+            return Ok(false);
+        }
         let n = tx.execute(
-            "INSERT INTO executions (id, sandbox_id, argv, state, timeout_ms, stdin_bytes, started_at_ms)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS (SELECT 1 FROM sandboxes WHERE id = ?2 AND state = 'ready')",
+            "INSERT INTO executions (id, sandbox_id, argv, state, timeout_ms, stdin_bytes, started_at_ms,
+                 cwd, env_names, env_sha256)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+             WHERE EXISTS (SELECT 1 FROM sandboxes WHERE id = ?2 AND state = 'ready')",
             params![
                 e.id,
                 e.sandbox_id,
@@ -2875,7 +3038,10 @@ impl Store {
                 e.state.as_str(),
                 e.timeout_ms,
                 e.stdin_bytes as i64,
-                e.started_at_ms
+                e.started_at_ms,
+                e.cwd,
+                names_column(&e.env_names)?,
+                e.env_sha256,
             ],
         )?;
         if n == 1 {
@@ -3190,6 +3356,60 @@ impl Store {
              BEGIN SELECT RAISE(FAIL, 'injected failed publication failure'); END;",
         )?;
         Ok(())
+    }
+
+    /// Every `table.column` of every row, temp tables included, whose text or bytes
+    /// contain `needle`: the canary tests' logical-column scan (design 8, L1). WAL and
+    /// free pages are deliberately not read.
+    #[cfg(test)]
+    pub(crate) fn columns_containing_for_test(&self, needle: &[u8]) -> Vec<String> {
+        let conn = self.conn();
+        let mut tables: Vec<(String, String)> = Vec::new();
+        for schema in ["main", "temp"] {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT name FROM {schema}.sqlite_master WHERE type = 'table'"
+                ))
+                .unwrap();
+            let names: Vec<String> = stmt
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            tables.extend(names.into_iter().map(|n| (schema.to_string(), n)));
+        }
+        let mut hits = Vec::new();
+        for (schema, table) in tables {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {schema}.\"{table}\""))
+                .unwrap();
+            let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                for (i, column) in columns.iter().enumerate() {
+                    let bytes = match row.get_ref(i).unwrap() {
+                        rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => b.to_vec(),
+                        _ => continue,
+                    };
+                    if bytes.windows(needle.len()).any(|w| w == needle) {
+                        hits.push(format!("{table}.{column}"));
+                    }
+                }
+            }
+        }
+        hits.sort();
+        hits.dedup();
+        hits
+    }
+
+    /// One test query on the live connection.
+    #[cfg(test)]
+    pub(crate) fn query_for_test<T: rusqlite::types::FromSql>(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> rusqlite::Result<T> {
+        self.conn().query_row(sql, params, |r| r.get(0))
     }
 
     #[cfg(test)]
@@ -3732,8 +3952,9 @@ const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_rea
     CASE WHEN plan IS NULL OR release_evidence_id IS NULL THEN plan ELSE x'' END, release_evidence_id, last_helper_generation,
     id IN (SELECT id FROM temp.accounting_quarantine),
     expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, ready_boottime_ms, activity_at_ms, activity_boottime_ms,
-    clock_boot_id, activity_seq, deletion_reason, request_id, request_id_released_at_ms";
-const SANDBOX_COLUMN_COUNT: usize = 45;
+    clock_boot_id, activity_seq, deletion_reason, request_id, request_id_released_at_ms,
+    default_env_names, default_env_sha256, exec_features";
+const SANDBOX_COLUMN_COUNT: usize = 48;
 
 /// Row decoding errors are reported per row rather than as SQLite errors.
 fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
@@ -3767,6 +3988,9 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
     let deletion_reason: Option<String> = row.get(42)?;
     let request_id: Option<String> = row.get(43)?;
     let request_id_released_at_ms: Option<i64> = row.get(44)?;
+    let default_env_names: Option<String> = row.get(45)?;
+    let default_env_sha256: Option<String> = row.get(46)?;
+    let exec_features: Option<i64> = row.get(47)?;
     Ok((|| {
         let bad = |what: &str, why: String| anyhow::anyhow!("sandbox {id}: bad {what}: {why}");
         let amount = |index: usize| {
@@ -3876,6 +4100,13 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
                     .transpose()?,
                 request_id,
                 request_id_released_at_ms,
+                default_env_names: parse_names(default_env_names, "default env names")
+                    .with_context(|| format!("sandbox {id}"))?,
+                default_env_sha256,
+                exec_features: exec_features
+                    .map(u32::try_from)
+                    .transpose()
+                    .map_err(|e| bad("exec features", e.to_string()))?,
             },
             id: id.clone(),
         };
@@ -3994,14 +4225,14 @@ const EXECUTION_COLUMNS: &str =
     started_at_ms, finished_at_ms, stdout, stdout_bytes, stdout_truncated, stdout_total_bytes_known,
     stderr, stderr_bytes, stderr_truncated, stderr_total_bytes_known,
     command_status_kind, command_status_value, command_core_dumped, runtime_error,
-    sandbox_reusable, cleanup_evidence, cancel_reason";
+    sandbox_reusable, cleanup_evidence, cancel_reason, cwd, env_names, env_sha256";
 
 const EXECUTION_METADATA_COLUMNS: &str =
     "id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
     started_at_ms, finished_at_ms, x'', stdout_bytes, stdout_truncated, stdout_total_bytes_known,
     x'', stderr_bytes, stderr_truncated, stderr_total_bytes_known,
     command_status_kind, command_status_value, command_core_dumped, runtime_error,
-    sandbox_reusable, cleanup_evidence, cancel_reason";
+    sandbox_reusable, cleanup_evidence, cancel_reason, cwd, env_names, env_sha256";
 
 fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
     let id: String = row.get(0)?;
@@ -4009,6 +4240,9 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
     let state: String = row.get(3)?;
     let cleanup_evidence: String = row.get(23)?;
     let cancel_reason: Option<String> = row.get(24)?;
+    let cwd: Option<String> = row.get(25)?;
+    let env_names: Option<String> = row.get(26)?;
+    let env_sha256: Option<String> = row.get(27)?;
     Ok((|| {
         Ok(Execution {
             sandbox_id: row.get(1)?,
@@ -4066,6 +4300,10 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
                 })
                 .transpose()?,
             id: id.clone(),
+            cwd,
+            env_names: parse_names(env_names, "env names")
+                .with_context(|| format!("execution {id}"))?,
+            env_sha256,
         })
     })())
 }
@@ -4572,6 +4810,9 @@ mod tests {
             sandbox_reusable: None,
             cleanup_evidence: CleanupEvidence::Unknown,
             cancel_reason: None,
+            cwd: None,
+            env_names: Vec::new(),
+            env_sha256: None,
         }
     }
 
@@ -5309,6 +5550,7 @@ mod tests {
                 helper_generation: 3,
                 boot_id: "boot-1".into(),
             }),
+            exec_features: None,
         };
         assert!(store.publish_fenced_ready(&fenced.id, &created).unwrap());
         let e = execution(&fenced.id);
@@ -6941,8 +7183,8 @@ mod tests {
             let upgraded = Store::open(tmp.path());
             if valid {
                 let store = upgraded.unwrap();
-                // Schemas 11 and 12 append lifecycle columns; history gets their nulls,
-                // seq 0 and no request ID.
+                // Schemas 11, 12 and 13 append lifecycle columns; history gets their
+                // nulls, seq 0, no request ID, no default env and no exec features.
                 let after = table_snapshot(&store.conn(), "sandboxes");
                 assert_eq!(after.len(), before.len());
                 for (after, before) in after.iter().zip(&before) {
@@ -6959,6 +7201,10 @@ mod tests {
                             Null,
                             Null,
                             Integer(0),
+                            Null,
+                            Null,
+                            Null,
+                            Null,
                             Null,
                             Null,
                             Null,
@@ -7057,6 +7303,7 @@ mod tests {
         let legacy_created = CreatedSandbox {
             backend_id: binding.backend_id(),
             receipt: RuntimeReceipt::Legacy,
+            exec_features: None,
         };
         assert!(
             store
@@ -7074,6 +7321,7 @@ mod tests {
                 helper_generation: 3,
                 boot_id: "boot-1".into(),
             }),
+            exec_features: None,
         };
         assert!(store.publish_fenced_ready(&row.id, &created).unwrap());
         assert!(
@@ -7150,6 +7398,7 @@ mod tests {
         CreatedSandbox {
             backend_id: row.accounting.allocation.as_ref().unwrap().backend_id(),
             receipt: RuntimeReceipt::Ready(ready_for(row, generation)),
+            exec_features: None,
         }
     }
 
@@ -7177,6 +7426,7 @@ mod tests {
         let wrong = |receipt: crate::runtime::ReadyReceipt| CreatedSandbox {
             backend_id: backend_id.clone(),
             receipt: RuntimeReceipt::Ready(receipt),
+            exec_features: None,
         };
         // None of these goes through the manager's own check.
         for (case, created) in [
@@ -7241,6 +7491,7 @@ mod tests {
                 CreatedSandbox {
                     backend_id: format!("fc-{}", Id128::random()),
                     receipt: RuntimeReceipt::Ready(good.clone()),
+                    exec_features: None,
                 },
             ),
             (
@@ -7248,6 +7499,7 @@ mod tests {
                 CreatedSandbox {
                     backend_id: backend_id.clone(),
                     receipt: RuntimeReceipt::Legacy,
+                    exec_features: None,
                 },
             ),
         ] {
@@ -9149,7 +9401,7 @@ mod tests {
     /// Schema 12 reached from 9, 10 and 11 is the fresh schema; history has no
     /// request ID and no record, and an existing integrity marker is kept as is.
     #[test]
-    fn schema12_from_9_10_and_11_matches_fresh() {
+    fn schema13_from_9_10_11_and_12_matches_fresh() {
         let schema_sql = |conn: &Connection| -> Vec<(String, String)> {
             conn.prepare(
                 "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name",
@@ -9163,7 +9415,7 @@ mod tests {
         let fresh = Store::open_in_memory().unwrap();
         let expected = schema_sql(&fresh.conn());
         assert!(expected.iter().any(|(name, _)| name == "create_requests"));
-        for version in [9, 10, 11] {
+        for version in [9, 10, 11, 12] {
             let tmp = tempfile::tempdir().unwrap();
             let mut conn = disk_database_at(tmp.path(), 7);
             register_receipt_validator(&conn).unwrap();
@@ -9180,8 +9432,12 @@ mod tests {
             if version >= 10 {
                 refresh_reservation_integrity(&tx).unwrap();
             }
-            if version == 11 {
+            if version >= 11 {
                 tx.execute_batch(MIGRATE_V11).unwrap();
+            }
+            if version == 12 {
+                tx.execute_batch(MIGRATE_V12).unwrap();
+                refresh_membership(&tx).unwrap();
             }
             tx.commit().unwrap();
             release_database(conn, tmp.path());
@@ -9260,6 +9516,104 @@ mod tests {
         assert_eq!(
             store.release_request_id("sb-0000000000000000").unwrap(),
             ReleaseRequestId::NoSandbox
+        );
+    }
+
+    /// Schema 13 (design 4.2): default env values only on a live row and only cleared;
+    /// names, digests and exec features fixed; history never takes a value afterwards.
+    #[test]
+    fn schema13_keeps_default_env_values_only_while_live() {
+        use crate::exec_env::EnvVar;
+        let store = Store::open_in_memory().unwrap();
+        let env = vec![EnvVar::new("B", "2"), EnvVar::new("A", "1")];
+        let mut row = sandbox();
+        row.lifecycle.default_env_names = crate::exec_env::env_names(&env);
+        row.lifecycle.default_env_sha256 = crate::exec_env::env_sha256(&env);
+        // Names and digest must be the values' own.
+        let mut wrong = row.clone();
+        wrong.id = new_id("sb");
+        wrong.lifecycle.default_env_names = vec!["A".into()];
+        assert!(
+            store
+                .reserve_sandbox_with_env(&wrong, roomy_budgets(), None, &env)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .reserve_sandbox_with_env(&row, roomy_budgets(), None, &env)
+                .unwrap(),
+            ReserveSandbox::Inserted
+        );
+        assert_eq!(
+            store.sandbox_default_env(&row.id).unwrap(),
+            crate::exec_env::sorted_env(&env)
+        );
+        let conn = store.conn();
+        for sql in [
+            // Names, digest and values are fixed at insert; values may only be cleared.
+            "UPDATE sandboxes SET default_env_names = '[\"A\"]' WHERE id = ?1",
+            "UPDATE sandboxes SET default_env_sha256 = NULL, default_env_names = NULL WHERE id = ?1",
+            "UPDATE sandboxes SET default_env = '[[\"A\",\"x\"]]' WHERE id = ?1",
+            // FAILED or DELETED with values is impossible.
+            "UPDATE sandboxes SET state = 'failed' WHERE id = ?1",
+        ] {
+            assert!(conn.execute(sql, [&row.id]).is_err(), "{sql}");
+        }
+        drop(conn);
+        store
+            .publish_legacy_ready(&row.id, "b-13", Some(0x3f))
+            .unwrap();
+        assert_eq!(
+            store.sandbox(&row.id).unwrap().unwrap().lifecycle.exec_features,
+            Some(0x3f)
+        );
+        // Recorded once: a later READY (a recovered row) keeps the first.
+        store.publish_legacy_ready(&row.id, "b-13", Some(0x0f)).unwrap();
+        assert_eq!(
+            store.sandbox(&row.id).unwrap().unwrap().lifecycle.exec_features,
+            Some(0x3f)
+        );
+        assert!(
+            store
+                .conn()
+                .execute("UPDATE sandboxes SET exec_features = 1 WHERE id = ?1", [&row.id])
+                .is_err()
+        );
+        // An execution's cwd and names are fixed at insert.
+        let mut e = execution(&row.id);
+        e.cwd = Some("/w".into());
+        e.env_names = vec!["A".into()];
+        e.env_sha256 = Some("ab".repeat(32));
+        assert!(store.start_execution(&e).unwrap());
+        let stored = store.execution(&e.id).unwrap().unwrap();
+        assert_eq!((stored.cwd, stored.env_names), (e.cwd.clone(), e.env_names.clone()));
+        for sql in [
+            "UPDATE executions SET cwd = '/x' WHERE id = ?1",
+            "UPDATE executions SET env_names = NULL, env_sha256 = NULL WHERE id = ?1",
+        ] {
+            assert!(store.conn().execute(sql, [&e.id]).is_err(), "{sql}");
+        }
+        // Moving to DELETED clears the values in the same statement.
+        store
+            .set_sandbox_state(&row.id, SandboxState::Deleting, None, None)
+            .unwrap();
+        assert!(store.sandbox_default_env(&row.id).unwrap().len() == 2);
+        store
+            .set_sandbox_state(&row.id, SandboxState::Deleted, None, None)
+            .unwrap();
+        assert!(store.sandbox_default_env(&row.id).unwrap().is_empty());
+        let kept = store.sandbox(&row.id).unwrap().unwrap();
+        assert_eq!(kept.lifecycle.default_env_names, ["A", "B"]);
+        // A row can't be inserted past CREATING with values, or with values but no names.
+        let mut late = sandbox();
+        late.state = SandboxState::Ready;
+        late.backend_id = Some("late".into());
+        late.lifecycle.default_env_names = vec!["A".into()];
+        late.lifecycle.default_env_sha256 = crate::exec_env::env_sha256(&env[1..]);
+        assert!(
+            store
+                .reserve_sandbox_with_env(&late, roomy_budgets(), None, &env[1..])
+                .is_err()
         );
     }
 

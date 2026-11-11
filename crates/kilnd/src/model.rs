@@ -462,6 +462,13 @@ pub struct SandboxLifecycle {
     pub request_id: Option<String>,
     /// When `release_request_id` dropped the record, from a DELETED row.
     pub request_id_released_at_ms: Option<i64>,
+    /// `CreateSandboxRequest.default_env`'s names and digest (schema 13), fixed at
+    /// insert. The values are only in the store, read for executions, and never here.
+    pub default_env_names: Vec<String>,
+    pub default_env_sha256: Option<String>,
+    /// The exec runtime feature bits recorded at READY publication (design 4.1);
+    /// `None` before READY, on rows from before schema 13 and when unknown.
+    pub exec_features: Option<u32>,
 }
 
 /// Why a CANCELED execution was canceled.
@@ -560,6 +567,12 @@ pub struct Execution {
     pub cleanup_evidence: CleanupEvidence,
     /// Set only on CANCELED rows written since schema 11.
     pub cancel_reason: Option<CancelReason>,
+    /// `ExecRequest.cwd` as given (schema 13); `None` when none was sent.
+    pub cwd: Option<String>,
+    /// The effective env overrides' names, sorted by bytes. Never their values.
+    pub env_names: Vec<String>,
+    /// [`crate::exec_env::env_sha256`] of the effective overrides; `None` for none.
+    pub env_sha256: Option<String>,
 }
 
 pub fn now_ms() -> i64 {

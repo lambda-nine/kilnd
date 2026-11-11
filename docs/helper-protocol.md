@@ -67,25 +67,57 @@ capture/cleanup barriers. This transport does not promise live output streaming.
 | --- | --- |
 | `capabilities {id: null}` | Negotiate installed CLI capabilities and scoped `gc --help` |
 | `capabilities {id}` | Validate exact live backend, or prove absence using probe/list/cgroup evidence |
+| `features {id}` | The feature bits the installed CLI (`id: null`) or that sandbox's PID 1 advertises, and whether exec options can reach it: `{features, exec_options}` |
 | `create {spec}` | Validated `kiln create --require-exec-protocol=1` with fixed flag mapping |
-| `exec {id, argv, stdin_bytes, max_output}` | Validated literal argv after `--`, persistent-exec v1 |
+| `exec {id, argv, stdin_bytes, max_output[, cwd][, env]}` | Validated literal argv after `--`, persistent-exec v1; with `cwd` or `env`, the options in a sealed memfd (below) |
 | `ls` | Complete, bounded, strictly parsed `kiln ls` |
 | `rm {id}` | Exact removal plus authoritative absence checks |
 | `gc {ids}` | Scoped collection only; empty IDs never invokes global GC |
+
+**Exec options (API additions M3b).** `exec` takes two optional fields, `cwd` (a
+string) and `env` (`[[name, value], ...]`), omitted from the JSON when empty, so a
+request without them is byte-identical to before and still runs kiln's operation 4.
+They are sandbox-interior data, never host paths, flags or environment: the kiln CLI's
+own environment stays the helper's cleared one. The helper revalidates them with the
+daemon's validators at the code ceilings (cwd absolute, at most 4,096 bytes, no NUL;
+at most 64 entries, names `[A-Za-z_][A-Za-z0-9_]*` of at most 128 bytes, values UTF-8
+without NUL of at most 4,096 bytes, `name + value + 2` totalling at most 32,768) and in
+kiln's one strict form, entries strictly ascending by name bytes; anything else closes
+the connection unanswered, as any invalid request does. It encodes kiln's options frame
+(`KILNOPT\0`, version 1; see kiln's `docs/exec-protocol-v1.md`) into a memfd created
+with `MFD_ALLOW_SEALING|MFD_CLOEXEC`, adding `MFD_EXEC` when `vm.memfd_noexec` is 1 so
+the kernel adds no `F_SEAL_EXEC`, writes it, seals it with exactly
+`F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE` and verifies the seals; it never
+uses `MFD_NOEXEC_SEAL`. Under `vm.memfd_noexec=2` no acceptable memfd exists: `features`
+reports `exec_options: false`, and an `exec` with options fails
+`Unavailable`/`Prepare` with no child. The memfd is passed as the helper's own
+descriptor number in `--exec-options-fd=N`, the only new flag; nothing else
+caller-derived is on the root command line but the argv after `--`. Before starting
+the CLI, the helper requires bit `0x20` from both the installed CLI and the sandbox's
+PID 1 (the existing per-exec probes), else `Incompatible`/`Handshake` with no child;
+the CLI probes PID 1 again itself. Values never appear in a reply: the helper's reply
+types carry none, and the request's `Debug` redacts them.
+
+`features {id}` is a recovery request, like `capabilities`. An older helper closes the
+connection on it, so a daemon paired with one lists no dynamic features and its Health
+is not serving: daemon and helper are upgraded together. Its reply,
+`{"features": {"features": N, "exec_options": B}}`, is a new variant; every existing
+reply is byte-identical.
 
 The helper reuses the API's image, allowlist, path, argv and backend-ID
 validators. It independently checks labels, resource ceilings, descriptor
 counts and sizes before any backend invocation. Hard ceilings are 8 GiB memory,
 8 CPUs, 4096 PIDs, 32 GiB disk, 64 allowlist entries, 16 writable paths,
-32 labels, 4096 argv entries / 256 KiB argv, 1 MiB stdin and 1 MiB retained
-output per stream. GC has at most 1024 unique IDs per call; the daemon chunks
+32 labels, 4096 argv entries / 256 KiB argv, 1 MiB stdin, 1 MiB retained
+output per stream, a 4,096-byte cwd, 64 env entries / 32 KiB env and a 40 KiB options
+memfd. GC has at most 1024 unique IDs per call; the daemon chunks
 larger scopes. Exec deadlines are at most one hour; control requests at most
 120 seconds. Header/body and output transfer have two second bounds.
 
 Connections and operations have separate bounds. At most 128 connections can be
 reading their frame, each for at most two seconds, and only a framed, classified
 request takes an operation slot. There are 64 operation slots: 60 for anything and
-4 reserved for recovery, which are kiln capabilities, `rm` and `gc` and Firecracker
+4 reserved for recovery, which are kiln `capabilities`, `features`, `rm` and `gc` and Firecracker
 `capabilities`, `inspect` and `fence_absent`. A normal operation, legacy or not, can
 never take a reserved slot; a kiln request with no slot closes without a reply, as
 before, and a group request answers `resource_exhausted`. Slow clients consume only

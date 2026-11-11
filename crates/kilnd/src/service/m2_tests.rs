@@ -162,17 +162,35 @@ fn grpc_timeouts_parse_strictly() {
         assert_eq!(parse_grpc_timeout(bad), None, "{bad:?}");
     }
     let start = tokio::time::Instant::now();
-    let mut req = Request::new(());
-    req.metadata_mut()
-        .insert("grpc-timeout", "1000m".parse().unwrap());
+    let headers = |timeout| {
+        Some(crate::server::HeadersReceived {
+            at: start,
+            timeout,
+        })
+    };
+    let req = Request::new(());
     assert_eq!(
-        rpc_deadline(&req, start),
+        rpc_deadline(&req, headers(Some(Duration::from_millis(1000)))),
         Some(start + Duration::from_millis(950))
     );
-    req.metadata_mut().insert("grpc-timeout", "1H".parse().unwrap());
     assert_eq!(
-        rpc_deadline(&req, start),
+        rpc_deadline(&req, headers(Some(Duration::from_secs(3600)))),
         Some(start + Duration::from_secs(3600) - Duration::from_millis(250))
     );
-    assert_eq!(rpc_deadline(&Request::new(()), start), None);
+    assert_eq!(rpc_deadline(&req, headers(None)), None);
+    // M2 recheck MEDIUM 1: only the headers' timeout counts once the server saw them;
+    // metadata (where tonic merges trailers) is never reparsed.
+    let mut merged = Request::new(());
+    merged
+        .metadata_mut()
+        .insert("grpc-timeout", "10000m".parse().unwrap());
+    assert_eq!(rpc_deadline(&merged, headers(None)), None);
+    assert_eq!(
+        rpc_deadline(&merged, headers(Some(Duration::from_millis(200)))),
+        Some(start + Duration::from_millis(190))
+    );
+    // A direct call that never passed the server reads its own metadata, from now.
+    let direct = rpc_deadline(&merged, None).unwrap();
+    assert!(direct >= start + Duration::from_millis(9750));
+    assert_eq!(rpc_deadline(&Request::new(()), None), None);
 }

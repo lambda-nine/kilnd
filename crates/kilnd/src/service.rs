@@ -103,12 +103,9 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
     ) -> Result<Response<pb::CreateSandboxResponse>, Status> {
         // The deadline runs from the headers, like tonic's own timeout; a request
         // that never passed the server (a direct test call) starts now.
-        let received_at = req
-            .extensions()
-            .get::<HeadersReceived>()
-            .map_or_else(tokio::time::Instant::now, |h| h.0);
+        let headers = req.extensions().get::<HeadersReceived>().copied();
         let uid = caller_uid(&req)?;
-        let deadline = rpc_deadline(&req, received_at);
+        let deadline = rpc_deadline(&req, headers);
         let _permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
         let req = req.into_inner();
         if req.request_id.is_empty() {
@@ -119,7 +116,10 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             });
             let sandbox = self
                 .manager
-                .create_owned(create_request(req.spec.unwrap_or_default(), expiry)?, uid)
+                .create_owned(
+                    create_request(req.spec.unwrap_or_default(), expiry, req.default_env)?,
+                    uid,
+                )
                 .await
                 .map_err(status)?;
             return Ok(Response::new(pb::CreateSandboxResponse {
@@ -138,7 +138,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             max_lifetime_ms: e.max_lifetime_ms,
             idle_timeout_ms: e.idle_timeout_ms,
         });
-        let converted = create_request(req.spec.unwrap_or_default(), expiry)
+        let converted = create_request(req.spec.unwrap_or_default(), expiry, req.default_env)
             .map_err(|s| s.message().to_string());
         let sandbox = self
             .manager
@@ -290,6 +290,8 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
                     argv: req.argv,
                     stdin: req.stdin,
                     timeout_ms: req.timeout_ms,
+                    cwd: req.cwd,
+                    env: env_vars(req.env),
                 },
                 received_at,
             )
@@ -399,8 +401,12 @@ fn feature_pb(f: Feature) -> pb::Feature {
 
 /// Every cap, minimum and default a client could hit (design section 7). Fields of
 /// features this daemon does not list are zero.
-fn api_limits_pb(l: &Limits) -> pb::ApiLimits {
+fn api_limits_pb(l: &Limits, features: &[Feature]) -> pb::ApiLimits {
     let ms = |d: std::time::Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
+    let listed = |f: Feature| features.contains(&f);
+    let cwd = listed(Feature::ExecCwd);
+    let env = listed(Feature::ExecEnv) || listed(Feature::SandboxDefaultEnv);
+    let env_limit = |n: usize| if env { n as u32 } else { 0 };
     pb::ApiLimits {
         max_sandbox_lifetime_ms: l.expiry.max_lifetime_ms,
         max_sandbox_idle_ms: l.expiry.max_idle_ms,
@@ -410,11 +416,11 @@ fn api_limits_pb(l: &Limits) -> pb::ApiLimits {
             .retention
             .create_request_retention_secs
             .saturating_mul(1000),
-        max_cwd_bytes: 0,
-        max_env_entries: 0,
-        max_env_name_bytes: 0,
-        max_env_value_bytes: 0,
-        max_env_total_bytes: 0,
+        max_cwd_bytes: if cwd { l.max_exec_cwd_bytes as u32 } else { 0 },
+        max_env_entries: env_limit(l.exec_env.max_entries),
+        max_env_name_bytes: env_limit(l.exec_env.max_name_bytes),
+        max_env_value_bytes: env_limit(l.exec_env.max_value_bytes),
+        max_env_total_bytes: env_limit(l.exec_env.max_total_bytes),
         default_exec_timeout_ms: ms(l.default_timeout),
         max_exec_timeout_ms: ms(l.max_timeout),
         default_stream_timeout_ms: 0,
@@ -434,7 +440,7 @@ fn runtime_capabilities_pb(
 ) -> pb::RuntimeCapabilities {
     pb::RuntimeCapabilities {
         features: features.iter().map(|f| feature_pb(*f).into()).collect(),
-        limits: Some(api_limits_pb(limits)),
+        limits: Some(api_limits_pb(limits, features)),
         network_modes: c
             .network_modes
             .iter()
@@ -563,6 +569,7 @@ fn status(e: Error) -> Status {
                 RefusalCode::ResourceExhausted => tonic::Code::ResourceExhausted,
                 RefusalCode::DeadlineExceeded => tonic::Code::DeadlineExceeded,
                 RefusalCode::Unavailable => tonic::Code::Unavailable,
+                RefusalCode::Unimplemented => tonic::Code::Unimplemented,
             },
             r,
         ),
@@ -599,17 +606,25 @@ pub const REASON_KEY: &str = "kilnd-reason";
 
 /// The caller's own deadline, from its `grpc-timeout` header, a little early so the
 /// typed `create_in_flight` answer reaches it before its transport gives up: 5 % of
-/// the timeout, at most 250 ms. `received_at` is when the request's headers arrived,
-/// where tonic starts that same timeout, however late its body follows. No header,
-/// or a malformed one: no deadline.
-fn rpc_deadline<T>(req: &Request<T>, received_at: tokio::time::Instant) -> Option<tokio::time::Instant> {
-    let timeout = parse_grpc_timeout(req.metadata().get("grpc-timeout")?.to_str().ok()?)?;
+/// the timeout, at most 250 ms. Both the timeout and its start are what the server's
+/// interceptor saw on the request's headers, where tonic starts that same timeout,
+/// however late its body follows and whatever its trailers say (M2 recheck MEDIUM 1).
+/// No header, or a malformed one: no deadline. A request that never passed the server
+/// (a direct test call) has no trailers, so its metadata is the headers, from now.
+fn rpc_deadline<T>(req: &Request<T>, headers: Option<HeadersReceived>) -> Option<tokio::time::Instant> {
+    let (at, timeout) = match headers {
+        Some(headers) => (headers.at, headers.timeout?),
+        None => (
+            tokio::time::Instant::now(),
+            parse_grpc_timeout(req.metadata().get("grpc-timeout")?.to_str().ok()?)?,
+        ),
+    };
     let margin = (timeout / 20).min(std::time::Duration::from_millis(250));
-    received_at.checked_add(timeout.saturating_sub(margin))
+    at.checked_add(timeout.saturating_sub(margin))
 }
 
 /// gRPC's `TimeoutValue TimeoutUnit`: 1 to 8 ASCII digits and one of H M S m u n.
-fn parse_grpc_timeout(value: &str) -> Option<std::time::Duration> {
+pub(crate) fn parse_grpc_timeout(value: &str) -> Option<std::time::Duration> {
     use std::time::Duration;
     let (digits, unit) = value.split_at(value.len().checked_sub(1)?);
     if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -627,9 +642,17 @@ fn parse_grpc_timeout(value: &str) -> Option<std::time::Duration> {
     })
 }
 
+/// API env entries as the manager's, which keep values out of `Debug`.
+fn env_vars(env: Vec<pb::EnvVar>) -> Vec<crate::exec_env::EnvVar> {
+    env.into_iter()
+        .map(|e| crate::exec_env::EnvVar::new(e.name, e.value))
+        .collect()
+}
+
 fn create_request(
     spec: pb::SandboxSpec,
     expiry: Option<crate::expiry::RequestedExpiry>,
+    default_env: Vec<pb::EnvVar>,
 ) -> Result<CreateRequest, Status> {
     let limits = spec.limits.unwrap_or_default();
     let net = spec.network.unwrap_or_default();
@@ -658,6 +681,7 @@ fn create_request(
         writable_paths: spec.writable_paths,
         labels: spec.labels.into_iter().collect::<BTreeMap<_, _>>(),
         expiry,
+        default_env: env_vars(default_env),
     })
 }
 
@@ -712,6 +736,8 @@ pub fn sandbox_pb(s: Sandbox) -> pb::Sandbox {
         ..Default::default()
     };
     pb::Sandbox {
+        default_env_names: s.lifecycle.default_env_names.clone(),
+        default_env_sha256: s.lifecycle.default_env_sha256.clone().unwrap_or_default(),
         request_id: s.lifecycle.request_id.clone().unwrap_or_default(),
         request_id_released: s.lifecycle.request_id_released_at_ms.is_some(),
         deletion_reason: deletion_reason.into(),
@@ -771,6 +797,9 @@ pub fn execution_pb(e: Execution) -> pb::Execution {
         ExecutionState::Interrupted => pb::ExecutionState::Interrupted,
     };
     pb::Execution {
+        cwd: e.cwd.unwrap_or_default(),
+        env_names: e.env_names,
+        env_sha256: e.env_sha256.unwrap_or_default(),
         id: e.id,
         sandbox_id: e.sandbox_id,
         argv: e.argv,
@@ -850,6 +879,7 @@ fn runtime_diagnostic_pb(d: crate::model::RuntimeDiagnostic) -> pb::RuntimeDiagn
         S::Report => pb::RuntimeStage::Report,
         S::Capture => pb::RuntimeStage::Capture,
         S::Handshake => pb::RuntimeStage::Handshake,
+        S::Cwd => pb::RuntimeStage::Cwd,
     };
     pb::RuntimeDiagnostic {
         kind: kind.into(),
@@ -908,7 +938,7 @@ mod tests {
         ];
         for spec in invalid {
             let error = service
-                .create_sandbox(as_root(pb::CreateSandboxRequest { request_id: String::new(),
+                .create_sandbox(as_root(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
                     spec: Some(spec),
                     expiry: None,
                 }))
@@ -1477,6 +1507,8 @@ mod tests {
         let filler = "x".repeat(max_argv - fixed - 1);
         let response = Service::new(manager)
             .exec(as_root(pb::ExecRequest {
+                cwd: String::new(),
+                env: Vec::new(),
                 sandbox_id: sandbox.id,
                 argv: vec![command.into(), count, filler],
                 stdin: vec![],
@@ -1505,7 +1537,7 @@ mod tests {
         let handler = tokio::spawn(async move {
             KilndService::create_sandbox(
                 service.as_ref(),
-                as_root(pb::CreateSandboxRequest { request_id: String::new(),
+                as_root(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
                     spec: None,
                     expiry: None,
                 }),
@@ -1590,6 +1622,8 @@ mod tests {
 
         let next = manager
             .exec(ExecRequest {
+                cwd: String::new(),
+                env: Vec::new(),
                 sandbox_id: sandbox.id,
                 argv: vec!["echo".into(), "usable".into()],
                 stdin: vec![],
@@ -2117,6 +2151,8 @@ mod tests {
         let sandbox = manager.create(Default::default()).await.unwrap();
         let execution = manager
             .exec(ExecRequest {
+                cwd: String::new(),
+                env: Vec::new(),
                 sandbox_id: sandbox.id.clone(),
                 argv: vec!["echo".into()],
                 stdin: vec![],
@@ -2325,7 +2361,7 @@ mod tests {
             async move {
                 service
                     .create_sandbox(as_uid(
-                        pb::CreateSandboxRequest { request_id: String::new(),
+                        pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
                             spec: Some(pb::SandboxSpec {
                                 labels: (0..labels)
                                     .map(|n| (format!("label{n}"), "x".repeat(200)))
@@ -2530,3 +2566,6 @@ mod m1_tests;
 
 #[cfg(test)]
 mod m2_tests;
+
+#[cfg(test)]
+mod m3_tests;

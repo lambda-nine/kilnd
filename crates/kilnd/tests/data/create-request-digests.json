@@ -1,5 +1,5 @@
 {
-  "comment": "Golden digests for CreateSandboxRequest.request_id (kilnd API additions design section 3). request_sha256 = SHA-256(\"kilnd.v1.create-request.1\" || 0x00 || canonical_json). request_id is not hashed. Clients that recompute digests test against this file.",
+  "comment": "Golden digests for CreateSandboxRequest.request_id (kilnd API additions design section 3). request_sha256 = SHA-256(\"kilnd.v1.create-request.1\" || 0x00 || canonical_json). request_id is not hashed. default_env is [name, value] pairs sorted by name bytes, then value bytes. Clients that recompute digests test against this file.",
   "domain": "kilnd.v1.create-request.1",
   "cases": [
     {
@@ -165,6 +165,76 @@
       },
       "canonical_json": "{\"default_env\":[],\"expiry\":null,\"spec\":{\"image\":\"\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":99},\"read_only_root\":false,\"writable_paths\":[]}}",
       "request_sha256": "81ded3da55f1fac67d8d37e572fa92b49c55ab593e8fde21161bf04ea5912a59"
+    },
+    {
+      "name": "default env, sorted by name bytes",
+      "request": {
+        "request_id": "k",
+        "default_env": [
+          [
+            "PATH",
+            "/opt/bin:/usr/bin"
+          ],
+          [
+            "A0",
+            "x"
+          ],
+          [
+            "A",
+            ""
+          ],
+          [
+            "_u",
+            "y"
+          ]
+        ]
+      },
+      "canonical_json": "{\"default_env\":[[\"A\",\"\"],[\"A0\",\"x\"],[\"PATH\",\"/opt/bin:/usr/bin\"],[\"_u\",\"y\"]],\"expiry\":null,\"spec\":{\"image\":\"\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":0},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "ba5680e9b85fa7a37f2cc514c0bfbc6081873ffa92b5d2d6506388916c4a8d68"
+    },
+    {
+      "name": "default env in another order hashes the same",
+      "request": {
+        "request_id": "k",
+        "default_env": [
+          [
+            "_u",
+            "y"
+          ],
+          [
+            "A",
+            ""
+          ],
+          [
+            "PATH",
+            "/opt/bin:/usr/bin"
+          ],
+          [
+            "A0",
+            "x"
+          ]
+        ]
+      },
+      "canonical_json": "{\"default_env\":[[\"A\",\"\"],[\"A0\",\"x\"],[\"PATH\",\"/opt/bin:/usr/bin\"],[\"_u\",\"y\"]],\"expiry\":null,\"spec\":{\"image\":\"\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":0},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "ba5680e9b85fa7a37f2cc514c0bfbc6081873ffa92b5d2d6506388916c4a8d68"
+    },
+    {
+      "name": "default env values escaped like labels",
+      "request": {
+        "request_id": "k",
+        "default_env": [
+          [
+            "Q",
+            "say \"hi\"\\n"
+          ],
+          [
+            "U",
+            "caf\u00e9 \ud83d\ude00"
+          ]
+        ]
+      },
+      "canonical_json": "{\"default_env\":[[\"Q\",\"say \\\"hi\\\"\\\\n\"],[\"U\",\"caf\\u00e9 \\ud83d\\ude00\"]],\"expiry\":null,\"spec\":{\"image\":\"\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":0},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "de62f0733e06e19f3dd975fbd4d272d6100dfc1daadee4d9cbcddce35697e302"
     }
   ]
 }

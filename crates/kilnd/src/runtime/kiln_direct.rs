@@ -209,6 +209,28 @@ impl DirectKilnRuntime {
         Ok(removed)
     }
 
+    /// The feature bits the installed CLI (`None`) or one sandbox's PID 1 advertises,
+    /// and whether exec options can reach it: bit 0x20 and a host whose memfds kiln
+    /// accepts (API additions design 4.1).
+    pub(crate) async fn exec_features(
+        &self,
+        id: Option<&str>,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(u32, bool), RuntimeError> {
+        let caps = match id {
+            None => self.capabilities(None, deadline, cancel).await?,
+            Some(id) => {
+                self.core()
+                    .validate_sandbox_capabilities(id, deadline, cancel)
+                    .await?
+            }
+        };
+        let exec_options = caps.features & kilnd_exec_core::exec_options::FEATURE_EXEC_OPTIONS != 0
+            && kilnd_exec_core::runtime::kiln_process::options_memfd_supported();
+        Ok((caps.features, exec_options))
+    }
+
     /// The helper's wire exec has no execution context, so its dispatch uses this
     /// directly. The cleanup contract is unchanged; disposition only names it.
     pub(crate) async fn exec_direct(
@@ -252,6 +274,15 @@ impl Runtime for DirectKilnRuntime {
         ))
     }
 
+    async fn proven_features(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<crate::manager::ProvenFeatures, RuntimeError> {
+        let (_, exec_options) = self.exec_features(None, deadline, cancel).await?;
+        Ok(super::kiln::exec_option_features(exec_options))
+    }
+
     async fn validate_sandbox(
         &self,
         id: &str,
@@ -278,12 +309,21 @@ impl Runtime for DirectKilnRuntime {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<CreatedSandbox, CreateFailure> {
-        self.create_until(prepared.spec(), deadline, cancel)
+        let backend_id = self.create_until(prepared.spec(), deadline, cancel).await?;
+        let exec_features = self
+            .exec_features(
+                Some(&backend_id),
+                Instant::now() + super::kiln::SANDBOX_FEATURES_TIMEOUT,
+                &CancellationToken::new(),
+            )
             .await
-            .map(|backend_id| CreatedSandbox {
-                backend_id,
-                receipt: RuntimeReceipt::Legacy,
-            })
+            .ok()
+            .map(|(features, _)| features);
+        Ok(CreatedSandbox {
+            backend_id,
+            receipt: RuntimeReceipt::Legacy,
+            exec_features,
+        })
     }
 
     async fn inspect_allocation(
@@ -755,6 +795,8 @@ mod tests {
             assert_eq!(sandbox.state, SandboxState::Ready);
             let outcome = manager
                 .exec(ExecRequest {
+                    cwd: String::new(),
+                    env: Vec::new(),
                     sandbox_id: sandbox.id.clone(),
                     argv: vec!["must-not-launch".into()],
                     stdin: vec![],
@@ -961,6 +1003,8 @@ mod tests {
             let outcome = tokio::time::timeout(
                 Duration::from_secs(2),
                 manager.exec(ExecRequest {
+                    cwd: String::new(),
+                    env: Vec::new(),
                     sandbox_id: sandbox.id.clone(),
                     argv: vec!["must-not-launch".into()],
                     stdin: vec![],
@@ -1057,6 +1101,7 @@ mod tests {
                     stdin: b"",
                     deadline: Instant::now() + Duration::from_secs(5),
                     max_output: 1024,
+                    options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
                 },
                 &CancellationToken::new(),
             )
@@ -1112,6 +1157,7 @@ mod tests {
                 stdin: b"",
                 deadline: Instant::now() + Duration::from_secs(if timeout { 1 } else { 5 }),
                 max_output: 1024,
+                options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
             };
             let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
                 wait_marker(&marker).await;
@@ -1160,6 +1206,7 @@ mod tests {
                 stdin: b"",
                 deadline: Instant::now() + Duration::from_secs(if timeout { 1 } else { 5 }),
                 max_output: 1024,
+                options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
             };
             let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
                 wait_marker(&marker).await;
@@ -1204,6 +1251,7 @@ mod tests {
                 stdin: b"",
                 deadline: Instant::now() + Duration::from_secs(5),
                 max_output: 1024,
+                options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
             };
             let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
                 wait_marker(&marker).await;
@@ -1232,6 +1280,7 @@ mod tests {
             stdin: b"",
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 1024,
+            options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
         };
         let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
             wait_marker(&marker).await;
@@ -1418,6 +1467,7 @@ mod tests {
             stdin: b"",
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 1,
+            options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
         };
         assert_eq!(
             runtime.exec_direct("abcd", &spec, &cancel).await.finish,
@@ -1982,6 +2032,7 @@ mod tests {
                 stdin: b"",
                 deadline: Instant::now() + Duration::from_secs(30),
                 max_output: 1024,
+                options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
             };
             runtime.exec_direct("abcd", &spec, &task_cancel).await
         });

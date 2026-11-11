@@ -69,6 +69,8 @@ fn policy(lifetime_s: u64, idle_s: u64) -> CreateRequest {
 
 fn exec_req(id: &str, argv: &[&str]) -> ExecRequest {
     ExecRequest {
+        cwd: String::new(),
+        env: Vec::new(),
         sandbox_id: id.into(),
         argv: argv.iter().map(|s| s.to_string()).collect(),
         stdin: vec![],
@@ -1037,6 +1039,9 @@ async fn exec_refuses_a_sandbox_that_left_ready_before_its_row() {
         sandbox_reusable: None,
         cleanup_evidence: CleanupEvidence::Unknown,
         cancel_reason: None,
+        cwd: None,
+        env_names: Vec::new(),
+        env_sha256: None,
     };
     assert!(
         m.store
@@ -1364,6 +1369,9 @@ fn running_execution(sandbox_id: &str) -> Execution {
         sandbox_reusable: None,
         cleanup_evidence: CleanupEvidence::Unknown,
         cancel_reason: None,
+        cwd: None,
+        env_names: Vec::new(),
+        env_sha256: None,
     }
 }
 

@@ -175,6 +175,23 @@ struct Args {
     /// Create request records the node holds at once.
     #[arg(long, default_value_t = 32_768)]
     max_create_requests: u64,
+    /// The longest ExecRequest.cwd, in bytes (1 to 4096).
+    #[arg(long, default_value_t = 4096)]
+    max_exec_cwd_bytes: usize,
+    /// Most entries in one env list: an Exec's, a sandbox's default_env and their
+    /// merge (1 to 64).
+    #[arg(long, default_value_t = 64)]
+    max_exec_env_entries: usize,
+    /// The longest env name, in bytes (1 to 128).
+    #[arg(long, default_value_t = 128)]
+    max_exec_env_name_bytes: usize,
+    /// The longest env value, in bytes (0 to 4096).
+    #[arg(long, default_value_t = 4096)]
+    max_exec_env_value_bytes: usize,
+    /// The most bytes one env list may total, counting len(name) + len(value) + 2 per
+    /// entry (1 to 32768).
+    #[arg(long, default_value_t = 32_768)]
+    max_exec_env_total_bytes: usize,
     /// On SIGTERM, how long running requests may finish before executions are
     /// canceled, in seconds.
     #[arg(long, default_value_t = 30)]
@@ -590,6 +607,13 @@ fn validated_limits(args: &Args) -> Result<Limits> {
             max_per_uid: args.max_create_requests_per_uid,
             max_node: args.max_create_requests,
         },
+        max_exec_cwd_bytes: args.max_exec_cwd_bytes,
+        exec_env: kilnd::exec_env::EnvLimits {
+            max_entries: args.max_exec_env_entries,
+            max_name_bytes: args.max_exec_env_name_bytes,
+            max_value_bytes: args.max_exec_env_value_bytes,
+            max_total_bytes: args.max_exec_env_total_bytes,
+        },
         default_timeout: Duration::from_secs(args.default_timeout_secs),
         max_timeout: Duration::from_secs(args.max_timeout_secs),
         max_output_bytes: args.max_output_bytes,
@@ -636,6 +660,7 @@ fn validated_limits(args: &Args) -> Result<Limits> {
     };
     validate_expiry(&limits.expiry, args)?;
     validate_create_requests(&limits, args)?;
+    validate_exec_options(&limits)?;
     for (name, value) in [
         ("max-connections", limits.max_connections),
         ("reserved-connections", limits.reserved_connections),
@@ -811,6 +836,28 @@ fn validate_create_requests(limits: &Limits, args: &Args) -> Result<()> {
     }
     if i64::try_from(caps.max_node).is_err() {
         bail!("--max-create-requests exceeds the stored range");
+    }
+    Ok(())
+}
+
+/// Design section 7: the exec cwd and env flags may lower their code ceilings, which
+/// are also the helper's, never raise them.
+fn validate_exec_options(limits: &Limits) -> Result<()> {
+    if !(1..=kilnd::exec_env::MAX_CWD_BYTES).contains(&limits.max_exec_cwd_bytes) {
+        bail!(
+            "--max-exec-cwd-bytes must be 1 to {}",
+            kilnd::exec_env::MAX_CWD_BYTES
+        );
+    }
+    if !limits.exec_env.within_ceilings() {
+        let c = kilnd::exec_env::EnvLimits::CEILINGS;
+        bail!(
+            "--max-exec-env-entries, -name-bytes, -value-bytes and -total-bytes must be at most {}, {}, {} and {} (and all but -value-bytes nonzero)",
+            c.max_entries,
+            c.max_name_bytes,
+            c.max_value_bytes,
+            c.max_total_bytes
+        );
     }
     Ok(())
 }
@@ -1058,6 +1105,35 @@ mod tests {
                 ],
                 true,
             ),
+        ] {
+            let mut full = vec!["kilnd"];
+            full.extend_from_slice(argv);
+            let args = Args::try_parse_from(full).unwrap();
+            assert_eq!(validated_limits(&args).is_ok(), ok, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn exec_option_flags_default_to_the_ceilings_and_only_lower_them() {
+        let args = Args::try_parse_from(["kilnd"]).unwrap();
+        let limits = validated_limits(&args).unwrap();
+        assert_eq!(limits.max_exec_cwd_bytes, 4096);
+        assert_eq!(limits.exec_env, kilnd::exec_env::EnvLimits::CEILINGS);
+        for (argv, ok) in [
+            (&["--max-exec-cwd-bytes", "4096"][..], true),
+            (&["--max-exec-cwd-bytes", "4097"], false),
+            (&["--max-exec-cwd-bytes", "0"], false),
+            (&["--max-exec-cwd-bytes", "64"], true),
+            (&["--max-exec-env-entries", "65"], false),
+            (&["--max-exec-env-entries", "0"], false),
+            (&["--max-exec-env-entries", "8"], true),
+            (&["--max-exec-env-name-bytes", "129"], false),
+            (&["--max-exec-env-name-bytes", "0"], false),
+            (&["--max-exec-env-value-bytes", "4097"], false),
+            (&["--max-exec-env-value-bytes", "0"], true),
+            (&["--max-exec-env-total-bytes", "32769"], false),
+            (&["--max-exec-env-total-bytes", "0"], false),
+            (&["--max-exec-env-total-bytes", "1024"], true),
         ] {
             let mut full = vec!["kilnd"];
             full.extend_from_slice(argv);

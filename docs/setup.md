@@ -44,7 +44,13 @@ including `40d9aa5003205d4c171e1b3eca61e9868064e98b` and
 before kilnd, or kilnd refuses to start. Sandboxes those revisions already
 started keep working; only the installed CLI needs the new feature.
 The tested Phase 0 companion is `00d61c546db7aa67ad283d10c2ca6165ca5f8166`: install, integration, smoke and every
-kilnd regression script passed against that immutable pin.
+kilnd regression script passed against that immutable pin. Exec cwd and env
+(`ExecRequest.cwd` and `env`, `CreateSandboxRequest.default_env`) also need kiln's exec
+options, capability bit `0x20`, first in `5cada841edd0bbe112550816fad221dfb1db6a47`, the
+tested companion for them: install that revision instead to use them. With an older
+kiln, kilnd works as before and Health lists no `EXEC_CWD`, `EXEC_ENV` or
+`SANDBOX_DEFAULT_ENV`; sandboxes created before the upgrade keep refusing options
+(`sandbox_unsupported`), because their PID 1 predates them.
 Install a compatible artifact, then check `kiln capabilities --protocol=1`
 (binary output) and `kiln gc --help` (usage must advertise `[ID]...`). kilnd
 checks both interfaces before reconciliation and workload launch rather than

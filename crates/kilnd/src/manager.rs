@@ -96,6 +96,10 @@ pub struct Limits {
     pub expiry: ExpiryLimits,
     /// Create request record caps (design 3.3); retention is in `retention`.
     pub create_requests: CreateRequestLimits,
+    /// `--max-exec-cwd-bytes` (design 7), at most the 4,096-byte ceiling.
+    pub max_exec_cwd_bytes: usize,
+    /// `--max-exec-env-*`, for a request's env, a sandbox's default env and their merge.
+    pub exec_env: crate::exec_env::EnvLimits,
 }
 
 /// `--max-create-requests-per-uid` and `--max-create-requests`.
@@ -160,6 +164,8 @@ impl Default for Limits {
             health_failure_cache: Duration::from_secs(1),
             expiry: ExpiryLimits::default(),
             create_requests: CreateRequestLimits::default(),
+            max_exec_cwd_bytes: crate::exec_env::MAX_CWD_BYTES,
+            exec_env: crate::exec_env::EnvLimits::CEILINGS,
         }
     }
 }
@@ -178,6 +184,8 @@ pub struct CreateRequest {
     pub labels: BTreeMap<String, String>,
     /// `CreateSandboxRequest.expiry` if sent; `None` never expires (decision 2).
     pub expiry: Option<RequestedExpiry>,
+    /// `CreateSandboxRequest.default_env` as sent; values are redacted from `Debug`.
+    pub default_env: Vec<crate::exec_env::EnvVar>,
 }
 
 /// A keyed create's identity within its owner's scope (design 3).
@@ -195,6 +203,18 @@ pub struct ExecRequest {
     pub stdin: Vec<u8>,
     /// Zero means the default.
     pub timeout_ms: u32,
+    /// Empty: `/`, kiln's operation 4 as before (design 4).
+    pub cwd: String,
+    /// Overrides over the sandbox's default env; values never leave this request.
+    pub env: Vec<crate::exec_env::EnvVar>,
+}
+
+/// One admitted execution's options (design 4): what kiln gets, and what history
+/// keeps instead of the values.
+struct ResolvedOptions {
+    options: crate::exec_env::ExecOptions,
+    env_names: Vec<String>,
+    env_sha256: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -232,6 +252,8 @@ pub enum RefusalCode {
     ResourceExhausted,
     DeadlineExceeded,
     Unavailable,
+    /// `backend_unsupported:<feature>` (design section 1).
+    Unimplemented,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -559,7 +581,7 @@ enum KeyedAdmit {
     Registered {
         guard: InFlightGuard,
         pending: PendingSlot,
-        req: CreateRequest,
+        req: Box<CreateRequest>,
     },
 }
 
@@ -802,6 +824,11 @@ impl<R: Runtime> Manager<R> {
         self.store
             .retire_sandbox(id, disposition, "retired by a test")
             .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_for_test(&self) -> &Store {
+        &self.store
     }
 
     #[cfg(test)]
@@ -1330,6 +1357,7 @@ impl<R: Runtime> Manager<R> {
                     let created = CreatedSandbox {
                         backend_id: fenced_binding(&sandbox)?.backend_id(),
                         receipt: RuntimeReceipt::Ready(receipt.clone()),
+                        exec_features: None,
                     };
                     self.store.publish_fenced_ready(&id, &created)?;
                     out.recovered.push(id);
@@ -1915,7 +1943,7 @@ impl<R: Runtime> Manager<R> {
                                 guard,
                                 pending,
                                 req,
-                            } => break (guard, pending, req),
+                            } => break (guard, pending, *req),
                         },
                     }
                 };
@@ -2008,6 +2036,7 @@ impl<R: Runtime> Manager<R> {
         let req = req.clone().map_err(Error::InvalidArgument)?;
         crate::expiry::resolve_expiry(req.expiry, &self.limits.expiry)
             .map_err(Error::InvalidArgument)?;
+        self.check_default_env(&req.default_env)?;
         self.resolve_spec(req.clone())?;
         self.check_serving()?;
         let durable = self.store.create_request_counts(owner_uid)?;
@@ -2049,7 +2078,7 @@ impl<R: Runtime> Manager<R> {
         Ok(KeyedAdmit::Registered {
             guard,
             pending,
-            req,
+            req: Box::new(req),
         })
     }
 
@@ -2089,7 +2118,7 @@ impl<R: Runtime> Manager<R> {
 
     async fn create_supervised(
         self: Arc<Self>,
-        req: CreateRequest,
+        mut req: CreateRequest,
         owner_uid: u32,
         mut keyed: Option<KeyedOperation>,
         committed: &OnceLock<String>,
@@ -2103,6 +2132,10 @@ impl<R: Runtime> Manager<R> {
         // Resolved once, before preparation: an invalid policy allocates nothing.
         let expiry = crate::expiry::resolve_expiry(req.expiry, &self.limits.expiry)
             .map_err(Error::InvalidArgument)?;
+        // Design 6: an unproven default env is refused here, before prepare (which on
+        // Firecracker issues a token) and before any row.
+        let default_env = std::mem::take(&mut req.default_env);
+        let (default_env_names, default_env_sha256) = self.check_default_env(&default_env)?;
         let spec = self.resolve_spec(req)?;
         // Design 9.1 (B7): preparation names no allocation. A fenced backend's
         // authority issues the token inside its preflight (RTC-2).
@@ -2169,6 +2202,8 @@ impl<R: Runtime> Manager<R> {
             lifecycle: SandboxLifecycle {
                 expiry,
                 request_id: keyed.as_ref().map(|k| k.request_id.clone()),
+                default_env_names,
+                default_env_sha256,
                 ..SandboxLifecycle::default()
             },
         };
@@ -2181,9 +2216,13 @@ impl<R: Runtime> Manager<R> {
         // trace for reconciliation. Count and every resource sum are checked with
         // this insert in one SQLite transaction; for a keyed create, so are the
         // durable request records, and the record commits with the row.
-        let reserved =
-            self.store
-                .reserve_keyed_sandbox(&sandbox, self.sandbox_budgets(), admission.as_ref());
+        let reserved = self.store.reserve_sandbox_with_env(
+            &sandbox,
+            self.sandbox_budgets(),
+            admission.as_ref(),
+            &default_env,
+        );
+        drop(default_env);
         // The durable count now holds whatever this transaction did.
         if let Some(keyed) = keyed.as_mut() {
             drop(keyed.pending.take());
@@ -2246,11 +2285,11 @@ impl<R: Runtime> Manager<R> {
         match created {
             Ok(created) => {
                 let backend_id = created.backend_id;
-                if let Err(e) = self.store.set_sandbox_state(
+                // Design 4.1: the runtime's exec feature bits, recorded with READY.
+                if let Err(e) = self.store.publish_legacy_ready(
                     &sandbox.id,
-                    SandboxState::Ready,
-                    Some(&backend_id),
-                    None,
+                    &backend_id,
+                    created.exec_features,
                 ) {
                     return Err(self
                         .compensate_failed_publication(&sandbox.id, &backend_id, e)
@@ -2871,6 +2910,9 @@ impl<R: Runtime> Manager<R> {
             .ok_or_else(|| Error::InvalidArgument("timeout deadline overflow".into()))?;
         let sandbox = self.load(&req.sandbox_id)?;
         ready(&sandbox)?;
+        // Design 4.1 and 6: every exec-options refusal precedes admission, so nothing
+        // is allocated: no ticket, no row and no backend call.
+        let resolved = self.resolve_exec_options(&req, &sandbox)?;
         let slot = self.slot(&sandbox.id);
         let global = self.admission.try_exec().map_err(|_| {
             Error::ResourceExhausted(format!(
@@ -2915,7 +2957,7 @@ impl<R: Runtime> Manager<R> {
         let sandbox_id = sandbox.id.clone();
         self.operations.spawn(async move {
             Arc::clone(&manager)
-                .supervise_exec(req, result_tx, slot, timeout, deadline, ticket)
+                .supervise_exec(req, resolved, result_tx, slot, timeout, deadline, ticket)
                 .await;
             // The ticket is released: finishing the last admitted request resumes the
             // idle timer from its finish activity (design 2.1).
@@ -2926,9 +2968,11 @@ impl<R: Runtime> Manager<R> {
         })?
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn supervise_exec(
         self: Arc<Self>,
         req: ExecRequest,
+        resolved: ResolvedOptions,
         mut reply: oneshot::Sender<Result<Execution>>,
         slot: Arc<Slot>,
         timeout: Duration,
@@ -2936,7 +2980,7 @@ impl<R: Runtime> Manager<R> {
         _ticket: ExecTicket,
     ) {
         let Some(result) = self
-            .exec_owned(req, &mut reply, slot, timeout, deadline)
+            .exec_owned(req, resolved, &mut reply, slot, timeout, deadline)
             .await
         else {
             return;
@@ -2960,6 +3004,7 @@ impl<R: Runtime> Manager<R> {
     async fn exec_owned(
         self: &Arc<Self>,
         req: ExecRequest,
+        resolved: ResolvedOptions,
         reply: &mut oneshot::Sender<Result<Execution>>,
         slot: Arc<Slot>,
         timeout: Duration,
@@ -3029,7 +3074,11 @@ impl<R: Runtime> Manager<R> {
             sandbox_reusable: None,
             cleanup_evidence: CleanupEvidence::Unknown,
             cancel_reason: None,
+            cwd: resolved.options.cwd.clone(),
+            env_names: resolved.env_names,
+            env_sha256: resolved.env_sha256,
         };
+        let with_options = !resolved.options.is_empty();
         if Instant::now() >= deadline {
             return Some(Err(Error::DeadlineExceeded(
                 "Exec deadline expired before row insertion".into(),
@@ -3048,9 +3097,11 @@ impl<R: Runtime> Manager<R> {
                     match self.load(&req.sandbox_id).and_then(|s| ready(&s)) {
                         Err(error) => error,
                         // The insert saw a non-READY row; only a startup recovery makes one
-                        // READY again, so this is a retryable race, never a run.
+                        // READY again, so this is a retryable race, never a run. Its own
+                        // token: the sandbox is READY now, so sandbox_not_ready would
+                        // misdescribe it.
                         Ok(()) => Error::FailedPrecondition(Refusal::typed(
-                            "sandbox_not_ready",
+                            "execution_start_raced",
                             format!(
                                 "sandbox {} changed while the execution was starting; retry",
                                 req.sandbox_id
@@ -3064,7 +3115,7 @@ impl<R: Runtime> Manager<R> {
                 return Some(Err(error.into()));
             }
         }
-        info!(sandbox = %sandbox.id, execution = %execution.id, argc = execution.argv.len(), "exec started");
+        info!(sandbox = %sandbox.id, execution = %execution.id, argc = execution.argv.len(), env_overrides = execution.env_names.len(), cwd_set = execution.cwd.is_some(), "exec started");
 
         // The backend future lives in its own task so both construction-time
         // and polling-time panics become a result the supervisor can record.
@@ -3075,6 +3126,7 @@ impl<R: Runtime> Manager<R> {
         let stdin = req.stdin;
         let max_output = self.limits.max_output_bytes;
         let backend_cancel = cancel.clone();
+        let options = resolved.options;
         let execution_context = ExecutionContext {
             execution_id: execution.id.clone(),
             execution_token: Id128::random(),
@@ -3095,6 +3147,7 @@ impl<R: Runtime> Manager<R> {
                 stdin: &stdin,
                 deadline,
                 max_output,
+                options: &options,
             };
             backend_manager
                 .runtime
@@ -3177,7 +3230,11 @@ impl<R: Runtime> Manager<R> {
                     .map_or("backend canceled execution", ExecCancelReason::message);
                 (ExecutionState::Canceled, None, Some(why.to_string()))
             }
-            Err(e) => (ExecutionState::Failed, None, Some(e.message.clone())),
+            Err(e) => (
+                ExecutionState::Failed,
+                None,
+                Some(exec_failure_reason(e, with_options)),
+            ),
         };
         let (stdout, stderr) = (&outcome.stdout, &outcome.stderr);
         let disposition_reason = match disposition {
@@ -3815,7 +3872,21 @@ impl<R: Runtime> Manager<R> {
     }
 
     fn check_exec(&self, req: &ExecRequest) -> Result<Duration> {
+        // Design 6: an option this backend has not proven is refused first, the first
+        // in Feature order (cwd, then env), before its value is even looked at.
+        if !req.cwd.is_empty() {
+            self.require_feature(Feature::ExecCwd)?;
+        }
+        if !req.env.is_empty() {
+            self.require_feature(Feature::ExecEnv)?;
+        }
         validate_argv(&req.argv, self.limits.max_argv_bytes).map_err(Error::InvalidArgument)?;
+        if !req.cwd.is_empty() {
+            crate::exec_env::validate_cwd(&req.cwd, self.limits.max_exec_cwd_bytes)
+                .map_err(Error::InvalidArgument)?;
+        }
+        crate::exec_env::validate_env(&req.env, &self.limits.exec_env, "env")
+            .map_err(Error::InvalidArgument)?;
         if req.stdin.len() > self.limits.max_stdin_bytes {
             return Err(Error::InvalidArgument(format!(
                 "stdin is {} bytes; the limit is {}",
@@ -3835,6 +3906,104 @@ impl<R: Runtime> Manager<R> {
             )));
         }
         Ok(timeout)
+    }
+
+    /// `backend_unsupported:<feature>` (design section 1) unless the backend lists it now.
+    fn require_feature(&self, feature: Feature) -> Result<()> {
+        if self.has_feature(feature) {
+            return Ok(());
+        }
+        let (reason, field) = match feature {
+            Feature::ExecCwd => ("backend_unsupported:exec_cwd", "cwd"),
+            Feature::ExecEnv => ("backend_unsupported:exec_env", "env"),
+            Feature::SandboxDefaultEnv => {
+                ("backend_unsupported:sandbox_default_env", "default_env")
+            }
+            _ => ("backend_unsupported", "this field"),
+        };
+        Err(Error::Refused(
+            RefusalCode::Unimplemented,
+            Refusal::typed(
+                reason,
+                format!(
+                    "the {} backend has not proven {field} support; read Health's features before setting it",
+                    self.runtime.name()
+                ),
+            ),
+        ))
+    }
+
+    /// A create's default env (design 4): the feature gate, then the same bounds as an
+    /// Exec's env. Returns its names and digest for the row.
+    fn check_default_env(
+        &self,
+        default_env: &[crate::exec_env::EnvVar],
+    ) -> Result<(Vec<String>, Option<String>)> {
+        if default_env.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        self.require_feature(Feature::SandboxDefaultEnv)?;
+        crate::exec_env::validate_env(default_env, &self.limits.exec_env, "default_env")
+            .map_err(Error::InvalidArgument)?;
+        Ok((
+            crate::exec_env::env_names(default_env),
+            crate::exec_env::env_sha256(default_env),
+        ))
+    }
+
+    /// One Exec's effective options (design 4): the sandbox's default env overlaid by
+    /// the request's, within the same bounds, refused before admission unless the
+    /// backend proves them now and the sandbox's runtime recorded bit 0x20 at READY.
+    fn resolve_exec_options(&self, req: &ExecRequest, sandbox: &Sandbox) -> Result<ResolvedOptions> {
+        let defaults = if sandbox.lifecycle.default_env_names.is_empty() {
+            Vec::new()
+        } else {
+            // The defaults reach kiln only through exec options: an operator downgrade
+            // after create refuses here rather than running without them.
+            self.require_feature(Feature::ExecEnv)?;
+            let values = self.store.sandbox_default_env(&sandbox.id)?;
+            if crate::exec_env::env_names(&values) != sandbox.lifecycle.default_env_names {
+                // Cleared by a FAILED or DELETED transition since the row was read.
+                ready(&self.load(&sandbox.id)?)?;
+                return Err(Error::Internal(anyhow::anyhow!(
+                    "sandbox {}: stored default env does not match its names",
+                    sandbox.id
+                )));
+            }
+            values
+        };
+        let env = crate::exec_env::merge_env(&defaults, &req.env);
+        crate::exec_env::validate_env(&env, &self.limits.exec_env, "the merged env (default_env overlaid by env)")
+            .map_err(Error::InvalidArgument)?;
+        let options = crate::exec_env::ExecOptions {
+            cwd: (!req.cwd.is_empty()).then(|| req.cwd.clone()),
+            env,
+        };
+        if !options.is_empty()
+            && sandbox
+                .lifecycle
+                .exec_features
+                .is_none_or(|bits| bits & crate::exec_env::FEATURE_EXEC_OPTIONS == 0)
+        {
+            let reason = if options.cwd.is_some() {
+                "sandbox_unsupported:exec_cwd"
+            } else {
+                "sandbox_unsupported:exec_env"
+            };
+            return Err(Error::FailedPrecondition(Refusal::typed(
+                reason,
+                format!(
+                    "sandbox {}'s runtime predates exec options (it did not advertise feature {:#x} when it became ready); create a new sandbox",
+                    sandbox.id,
+                    crate::exec_env::FEATURE_EXEC_OPTIONS
+                ),
+            )));
+        }
+        Ok(ResolvedOptions {
+            env_names: crate::exec_env::env_names(&options.env),
+            env_sha256: crate::exec_env::env_sha256(&options.env),
+            options,
+        })
     }
 
     fn resolve_spec(&self, req: CreateRequest) -> Result<SandboxSpec> {
@@ -3987,6 +4156,31 @@ fn ready_receipt_mismatch(
 /// only `Unknown` cleanup, like an adapter panic, leaves reusability unknown. An
 /// absence-fenced session is reusable only after a completed result, or with proof
 /// that no child started. Anything weaker is quarantined.
+/// A FAILED execution's `failure_reason`: the runtime's message, with a typed token
+/// first for the exec-options outcomes the API names (design 4.1; `kilnd.proto`'s
+/// `Execution.failure_reason`). None of these started a child but `cwd_not_found`,
+/// whose child failed before its command ran.
+fn exec_failure_reason(d: &RuntimeDiagnostic, with_options: bool) -> String {
+    let token = match (d.kind, d.stage) {
+        (RuntimeErrorKind::LaunchFailed, RuntimeStage::Cwd) => Some("cwd_not_found"),
+        _ if !with_options => None,
+        (RuntimeErrorKind::Unavailable, RuntimeStage::Handshake) => {
+            Some("exec_options_unconfirmed")
+        }
+        (RuntimeErrorKind::Incompatible, RuntimeStage::Handshake) => {
+            Some("exec_options_unsupported")
+        }
+        (RuntimeErrorKind::Unavailable, RuntimeStage::Prepare) => {
+            Some("exec_options_unavailable")
+        }
+        _ => None,
+    };
+    match token {
+        Some(token) => format!("{token}: {}", d.message),
+        None => d.message.clone(),
+    }
+}
+
 fn settled_exec_evidence(
     sandbox: &Sandbox,
     outcome: &ExecOutcome,
@@ -4099,3 +4293,6 @@ mod expiry_tests;
 
 #[cfg(test)]
 mod m2_tests;
+
+#[cfg(test)]
+mod m3_tests;

@@ -167,6 +167,8 @@ pub enum RuntimeStage {
     Report,
     Capture,
     Handshake,
+    /// kiln's stage 14 `Chdir`: the command's working directory could not be entered.
+    Cwd,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

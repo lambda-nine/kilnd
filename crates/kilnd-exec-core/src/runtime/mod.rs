@@ -44,6 +44,8 @@ pub struct ExecSpec<'a> {
     pub deadline: Instant,
     /// Bytes kept per output stream.
     pub max_output: usize,
+    /// The cwd and effective env overrides; `ExecOptions::EMPTY` is today's operation 4.
+    pub options: &'a crate::exec_options::ExecOptions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

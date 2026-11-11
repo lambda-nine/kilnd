@@ -2156,6 +2156,7 @@ async fn b7_crash_a_restored_stale_daemon_db_after_compaction_releases_by_synthe
     let copy = fixture.root.join("daemon-copy");
     private_dir(&copy);
     let request = || CreateRequest {
+        default_env: Vec::new(),
         image: "alpine".into(),
         memory_bytes: 512 * MIB,
         cpu_millis: 1000,

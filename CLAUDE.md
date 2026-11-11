@@ -40,7 +40,9 @@ through its CLI. Read [README.md](README.md),
   `sudo python3 -I scripts/phase0-regressions.py`, `scripts/smoke.sh` and, for
   anything touching expiry, the manager's delete path or the clocks,
   `scripts/expiry-regressions.sh`, and for anything touching create, request
-  records or retention, `scripts/idempotent-create-regressions.sh`. Changes to
+  records or retention, `scripts/idempotent-create-regressions.sh`. Exec cwd and env
+  need a kiln with exec options (bit `0x20`, kiln `5cada84` or later) installed for the
+  integration, smoke and phase 0 checks to run their positive cases. Changes to
   `install.sh`, `add-instance.sh`, `upgrade.sh`, `kilnd-maintenance.py` or the units also run
   `sudo python3 -I scripts/deployment-regressions.py` between two builds, and its
   `--reboot-arm` and `--reboot-verify` around a real reboot of the VM.

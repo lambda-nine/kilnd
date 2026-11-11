@@ -164,6 +164,31 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   reservation however fast callers renew or run commands. Health and the
   `kilnd-reason` trailer reveal only node aggregates and the caller's own rows'
   reasons.
+- **Exec cwd and env never reach a host command line, a log or history as values.**
+  The root helper hands them to kiln in a sealed memfd (exactly
+  `F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE`) named by descriptor number, so
+  no value is in any process's `/proc/*/cmdline`, and the kiln CLI's environment stays
+  the helper's cleared one; nothing caller-derived but argv after `--` is on the root
+  command line. They are validated in kilnd, again in the helper at its ceilings and
+  again in kiln; the cwd is interior to the sandbox (`..` and symlinks resolve inside
+  its root, a host-only path such as `/var/lib/kilnd-helper` is `ENOENT`, and kiln
+  enters it only after closing every inherited descriptor, so `/proc/self/fd/N`
+  cannot name a host directory). History keeps the cwd, the override names and
+  `env_sha256`; the in-memory env type's `Debug` redacts values and errors name entries
+  by position. The hash is an unkeyed integrity fingerprint that clients recompute, not
+  confidentiality: a low-entropy value can be guessed from it, as from a create
+  request digest that covers default env. Options never run without their gate: an
+  unproven backend is `backend_unsupported`, a sandbox whose PID 1 lacks bit `0x20` is
+  `sandbox_unsupported`, and an operator downgrade that slips past both fails the
+  execution before any child starts.
+- **Sandbox default env is plaintext in `kilnd.db` while the sandbox is live,** by
+  design (decision 1 of the API additions): executions after a restart still need it.
+  It is set to null in the statement that moves the row to `FAILED` or `DELETED`, and a
+  `CHECK` makes a terminal row with values impossible, but clearing is logical: SQLite,
+  its WAL, free pages and backups may keep the bytes until overwritten, as for output.
+  The contract is that callers send no secrets in env or default env; a command that
+  prints its environment puts the values in its own output, which is stored like any
+  output.
 - **No request-owned exec work.** After an execution row is recorded, a
   daemon supervisor owns backend cleanup, pipe capture and finalization even
   if the RPC disappears. kiln places each command in an execution cgroup;
@@ -348,8 +373,9 @@ sandbox compromises the host.
   are refused before reconciliation, even with an empty database; a live PID 1
   only needs the execution bits. Complete `gc --help` usage supplements the protocol capability
   frame; compatibility validation never invokes global garbage collection.
-  The tested Phase 0 companion is kiln `00d61c546db7aa67ad283d10c2ca6165ca5f8166`; see setup for the immutable
-  installation pin.
+  The tested Phase 0 companion is kiln `00d61c546db7aa67ad283d10c2ca6165ca5f8166`; exec cwd and env
+  need kiln's capability bit `0x20`, first in kiln `5cada841edd0bbe112550816fad221dfb1db6a47`, the
+  tested companion for them. See setup for the immutable installation pins.
 - **A daemon crash during `kiln create`** can leave a kiln sandbox whose
   backend ID was never returned to kilnd. So can a CLI that dies or misreports
   after allocating. Reconciliation records the crashed row as an

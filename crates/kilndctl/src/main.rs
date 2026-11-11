@@ -137,6 +137,12 @@ struct CreateArgs {
     /// without spaces, private to your uid. Needs a kilnd that lists idempotent_create.
     #[arg(long, value_name = "ID")]
     request_id: Option<String>,
+    /// Default environment variable for every command in the sandbox, NAME=VALUE, or
+    /// NAME to pass kilndctl's own value without putting it on a command line
+    /// (repeatable). kilnd keeps the values while the sandbox lives and never shows
+    /// them. Needs a kilnd that lists sandbox_default_env.
+    #[arg(long, value_name = "NAME[=VALUE]")]
+    default_env: Vec<String>,
 }
 
 #[derive(Args)]
@@ -150,6 +156,36 @@ struct ExecOpts {
     /// Print the execution's ID and state to stderr.
     #[arg(long, short)]
     verbose: bool,
+    /// The command's working directory inside the sandbox, an absolute path. Needs a
+    /// kilnd that lists exec_cwd.
+    #[arg(long, value_name = "DIR")]
+    cwd: Option<String>,
+    /// Environment variable for the command, NAME=VALUE, or NAME to pass kilndctl's own
+    /// value without putting it on a command line (repeatable). Needs a kilnd that
+    /// lists exec_env.
+    #[arg(long = "env", value_name = "NAME[=VALUE]")]
+    env: Vec<String>,
+}
+
+/// `--env NAME=VALUE`, or `NAME` for this process's own value of NAME.
+fn parse_env(entries: &[String]) -> Result<Vec<pb::EnvVar>> {
+    entries
+        .iter()
+        .map(|entry| match entry.split_once('=') {
+            Some((name, value)) => Ok(pb::EnvVar {
+                name: name.into(),
+                value: value.into(),
+            }),
+            None => {
+                let value = std::env::var(entry)
+                    .with_context(|| format!("--env {entry}: kilndctl's environment has no such UTF-8 variable"))?;
+                Ok(pb::EnvVar {
+                    name: entry.clone(),
+                    value,
+                })
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -377,6 +413,12 @@ async fn run(cli: Cli) -> Result<u8> {
             eprintln!("id:       {}", e.id);
             eprintln!("sandbox:  {}", e.sandbox_id);
             eprintln!("argv:     {}", shell_words(&e.argv));
+            if !e.cwd.is_empty() {
+                eprintln!("cwd:      {}", e.cwd);
+            }
+            if !e.env_names.is_empty() {
+                eprintln!("env:      {} (sha256 {})", e.env_names.join(" "), e.env_sha256);
+            }
             eprintln!("state:    {}", execution_state(e.state));
             if let Some(code) = e.exit_code {
                 eprintln!("exit:     {code}");
@@ -537,6 +579,11 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
         )
         .await?;
     }
+    let default_env = parse_env(&a.default_env)?;
+    if !default_env.is_empty() {
+        // An older daemon would ignore it and run every command without it.
+        require_feature(client, pb::Feature::SandboxDefaultEnv, "--default-env").await?;
+    }
     let request_id = a.request_id.unwrap_or_default();
     if !request_id.is_empty() {
         // An older daemon ignores request_id and would create a second sandbox on a
@@ -566,6 +613,7 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
     };
     client
         .create_sandbox(pb::CreateSandboxRequest {
+            default_env,
             spec: Some(spec),
             expiry,
             request_id,
@@ -637,8 +685,19 @@ async fn exec(
         .map(parse_duration_ms)
         .transpose()?
         .unwrap_or(0);
+    let cwd = opts.cwd.clone().unwrap_or_default();
+    if !cwd.is_empty() {
+        // An older daemon would ignore it and run the command in "/".
+        require_feature(client, pb::Feature::ExecCwd, "--cwd").await?;
+    }
+    let env = parse_env(&opts.env)?;
+    if !env.is_empty() {
+        require_feature(client, pb::Feature::ExecEnv, "--env").await?;
+    }
     let response = client
         .exec(pb::ExecRequest {
+            cwd,
+            env,
             sandbox_id: id,
             argv,
             stdin,
@@ -788,6 +847,13 @@ fn print_sandbox(s: &pb::Sandbox) {
             } else {
                 ""
             }
+        );
+    }
+    if !s.default_env_names.is_empty() {
+        println!(
+            "env:        {} (sha256 {})",
+            s.default_env_names.join(" "),
+            s.default_env_sha256
         );
     }
     if let Some(e) = &s.expiry {
@@ -1089,6 +1155,37 @@ fn time(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_flags_take_values_or_inherit_them_and_parse_with_run() {
+        // SAFETY: a test-only variable no other test reads.
+        unsafe { std::env::set_var("KILNDCTL_TEST_INHERITED", "from-env") };
+        let env = parse_env(&[
+            "A=1".into(),
+            "B=".into(),
+            "C=x=y".into(),
+            "KILNDCTL_TEST_INHERITED".into(),
+        ])
+        .unwrap();
+        let pairs: Vec<_> = env.iter().map(|e| (e.name.as_str(), e.value.as_str())).collect();
+        assert_eq!(
+            pairs,
+            [("A", "1"), ("B", ""), ("C", "x=y"), ("KILNDCTL_TEST_INHERITED", "from-env")]
+        );
+        assert!(parse_env(&["KILNDCTL_TEST_UNSET_VARIABLE".into()]).is_err());
+        // run takes both a sandbox --default-env and a command --env.
+        let cli = Cli::try_parse_from([
+            "kilndctl", "run", "--default-env", "D=1", "--env", "E=2", "--cwd", "/w", "--", "env",
+        ])
+        .unwrap();
+        let Command::Run { create, opts, argv } = cli.command else {
+            panic!("not run");
+        };
+        assert_eq!(create.default_env, ["D=1"]);
+        assert_eq!(opts.env, ["E=2"]);
+        assert_eq!(opts.cwd.as_deref(), Some("/w"));
+        assert_eq!(argv, ["env"]);
+    }
 
     #[test]
     fn every_state_writes_binary_captures_before_typed_diagnostics() {

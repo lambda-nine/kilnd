@@ -208,6 +208,10 @@ pub struct FakeState {
     pub remove_targets: Vec<String>,
     /// Commands whose backend execution was entered, in order.
     pub exec_calls: Vec<Vec<String>>,
+    /// The exec options each entered execution was given, in order.
+    pub exec_options: Vec<kilnd_exec_core::exec_options::ExecOptions>,
+    /// What a legacy create reports as the new sandbox's exec feature bits.
+    pub create_exec_features: Option<u32>,
     pub exec_deadlines: Vec<tokio::time::Instant>,
     pub version_calls: u32,
     pub active_version_calls: u32,
@@ -273,6 +277,8 @@ impl Default for FakeState {
             remove_attempts: Vec::new(),
             remove_targets: Vec::new(),
             exec_calls: Vec::new(),
+            exec_options: Vec::new(),
+            create_exec_features: Some(0x3f),
             exec_deadlines: Vec::new(),
             version_calls: 0,
             active_version_calls: 0,
@@ -470,6 +476,7 @@ impl FakeRuntime {
                     return Ok(CreatedSandbox {
                         backend_id,
                         receipt: RuntimeReceipt::Ready(receipt),
+                        exec_features: None,
                     });
                 }
                 return Err(RuntimeError::Backend(format!(
@@ -568,6 +575,7 @@ impl FakeRuntime {
         Ok(CreatedSandbox {
             backend_id: format!("fc-{allocation_id}"),
             receipt: RuntimeReceipt::Ready(receipt),
+            exec_features: None,
         })
     }
 
@@ -946,9 +954,11 @@ impl Runtime for FakeRuntime {
         if let Some(gate) = after {
             gate.hold().await;
         }
+        let exec_features = self.state().create_exec_features;
         Ok(CreatedSandbox {
             backend_id: id,
             receipt: RuntimeReceipt::Legacy,
+            exec_features,
         })
     }
 
@@ -1108,6 +1118,7 @@ impl Runtime for FakeRuntime {
         let (gate, panic_exec) = {
             let mut state = self.state();
             state.exec_calls.push(spec.argv.to_vec());
+            state.exec_options.push(spec.options.clone());
             state.exec_deadlines.push(spec.deadline);
             state.active_execs += 1;
             (state.exec_before_run.take(), state.panic_exec)
@@ -1127,6 +1138,41 @@ impl Runtime for FakeRuntime {
                 spec.max_output,
             ),
             "cat" => exited(0, spec.stdin.to_vec(), spec.max_output),
+            // kiln's operation 5 environment: the base overlaid by the overrides.
+            "env" => {
+                let mut env: BTreeMap<String, String> = [
+                    ("HOME", "/root"),
+                    ("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+                    ("TERM", "xterm"),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+                for e in &spec.options.env {
+                    env.insert(e.name.clone(), e.value.clone());
+                }
+                let text: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+                exited(0, text.into_bytes(), spec.max_output)
+            }
+            // kiln's chdir: a cwd under /missing cannot be entered.
+            "pwd" => match spec.options.cwd.as_deref() {
+                Some(cwd) if cwd.starts_with("/missing") => ExecOutcome {
+                    finish: Err(RuntimeDiagnostic {
+                        native_code: Some("ENOENT".into()),
+                        ..RuntimeDiagnostic::new(
+                            RuntimeErrorKind::LaunchFailed,
+                            RuntimeStage::Cwd,
+                            "chdir: No such file or directory",
+                        )
+                    }),
+                    command_status: None,
+                    stdout: Captured::known_empty(),
+                    stderr: Captured::known_empty(),
+                    disposition: SandboxDisposition::Reusable,
+                    cleanup: CleanupEvidence::RuntimeDrained,
+                },
+                cwd => exited(0, format!("{}\n", cwd.unwrap_or("/")).into_bytes(), spec.max_output),
+            },
             "exit" => exited(
                 args.first().and_then(|a| a.parse().ok()).unwrap_or(1),
                 vec![],

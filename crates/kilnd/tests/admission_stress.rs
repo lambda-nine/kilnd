@@ -331,6 +331,9 @@ fn metadata_history_rss_child() {
             sandbox_reusable: None,
             cleanup_evidence: CleanupEvidence::Unknown,
             cancel_reason: None,
+            cwd: None,
+            env_names: Vec::new(),
+            env_sha256: None,
         };
         store.insert_execution(&execution).unwrap();
         store

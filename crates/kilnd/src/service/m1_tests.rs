@@ -51,7 +51,7 @@ fn service(
 
 async fn create(s: &Service<FakeRuntime>, expiry: Option<pb::ExpiryPolicy>) -> pb::Sandbox {
     s.create_sandbox(as_uid(
-        pb::CreateSandboxRequest { request_id: String::new(), spec: None, expiry },
+        pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(), spec: None, expiry },
         1000,
     ))
     .await
@@ -350,7 +350,7 @@ async fn create_reports_the_effective_policy_and_both_deadlines() {
     assert!(!expiry.idle_paused);
     let refused = s
         .create_sandbox(as_uid(
-            pb::CreateSandboxRequest { request_id: String::new(),
+            pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
                 spec: None,
                 expiry: Some(pb::ExpiryPolicy {
                     max_lifetime_ms: 9_999,

@@ -22,6 +22,7 @@ use super::{
     kiln_process::{self, OwnedExec, Stop},
     kiln_protocol as protocol,
 };
+use crate::exec_options::FEATURE_EXEC_OPTIONS;
 use crate::model::{Captured, CleanupEvidence, Network, SandboxDisposition, SandboxSpec};
 use crate::model::{RuntimeDiagnostic, RuntimeErrorKind as Kind, RuntimeStage as Stage};
 use crate::process::{self, Finish};
@@ -299,14 +300,29 @@ impl<'a> DirectKiln<'a> {
         if let Some(finish) = stopped() {
             return empty(Ok(finish));
         }
+        let with_options = !spec.options.is_empty();
         for global in [true, false] {
             let validation = if global {
-                self.capabilities(None, spec.deadline, cancel)
-                    .await
-                    .map(|_| ())
+                self.capabilities(None, spec.deadline, cancel).await
             } else {
-                self.validate_sandbox(id, spec.deadline, cancel).await
-            };
+                self.validate_sandbox_capabilities(id, spec.deadline, cancel)
+                    .await
+            }
+            .and_then(|caps| {
+                // API additions design 4.1: options reach only a CLI and a PID 1 that
+                // both advertise bit 0x20, checked here before the CLI starts; the
+                // CLI's own probe then checks PID 1 again. Never a run without them.
+                if with_options && caps.features & FEATURE_EXEC_OPTIONS == 0 {
+                    return Err(RuntimeError::Incompatible(format!(
+                        "{} lacks exec options (feature {FEATURE_EXEC_OPTIONS:#x}); observed {:#x} ({} {})",
+                        if global { "the installed kiln CLI".to_string() } else { format!("sandbox {id}'s PID 1") },
+                        caps.features,
+                        caps.package,
+                        caps.provenance
+                    )));
+                }
+                Ok(())
+            });
             if let Err(e) = validation {
                 if let Some(finish) = stopped() {
                     return empty(Ok(finish));
@@ -324,6 +340,13 @@ impl<'a> DirectKiln<'a> {
         }
         if let Some(finish) = stopped() {
             return empty(Ok(finish));
+        }
+        if with_options && !kiln_process::options_memfd_supported() {
+            return empty(Err(RuntimeDiagnostic::new(
+                Kind::Unavailable,
+                Stage::Prepare,
+                kiln_process::MEMFD_NOEXEC_ENFORCED,
+            )));
         }
         let mut owner = match OwnedExec::spawn(self.bin, id, spec) {
             Ok(owner) => owner,
@@ -406,6 +429,21 @@ impl<'a> DirectKiln<'a> {
                 )),
             },
         };
+        // kiln M3a: with options, the CLI probes PID 1 on its own connection first, with
+        // a two-second deadline; PID 1 still serving another control connection fails
+        // that probe as Protocol/Handshake with no child started. That is a busy peer,
+        // retryable, not a broken protocol.
+        if with_options
+            && !host_protocol_failure
+            && let Err(d) = &mut finish
+            && d.kind == Kind::Protocol
+            && d.stage == Stage::Handshake
+            && decoded
+                .as_ref()
+                .is_ok_and(|out| out.cleanup == protocol::Cleanup::NoChildStarted)
+        {
+            d.kind = Kind::Unavailable;
+        }
         if let Some(e) = reap_error {
             finish = Err(RuntimeDiagnostic::new(Kind::Io, Stage::Wait, e.to_string()));
         }
@@ -475,9 +513,21 @@ impl<'a> DirectKiln<'a> {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<(), RuntimeError> {
+        self.validate_sandbox_capabilities(id, deadline, cancel)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::validate_sandbox`], returning the capabilities its PID 1 advertised.
+    pub async fn validate_sandbox_capabilities(
+        &self,
+        id: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<protocol::Capabilities, RuntimeError> {
         check_id(id)?;
         match self.capabilities(Some(id), deadline, cancel).await {
-            Ok(_) => Ok(()),
+            Ok(caps) => Ok(caps),
             Err(probe_error) => {
                 if cancel.is_cancelled() || Instant::now() >= deadline {
                     return Err(RuntimeError::Incompatible(format!(

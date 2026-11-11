@@ -1788,7 +1788,7 @@ mod tests {
             ),
         ];
         // (file, literal, why). Each must still occur.
-        const LITERALS: [(&str, &str, &str); 7] = [
+        const LITERALS: [(&str, &str, &str); 8] = [
             (
                 "kilnd/src/expiry.rs",
                 "/proc/sys/kernel/random/boot_id",
@@ -1823,6 +1823,12 @@ mod tests {
                 "kilnd-exec-core/src/runtime/kiln_direct.rs",
                 "exec/cgroup.events",
                 "reads kiln's own exec scope events; never written",
+            ),
+            (
+                "kilnd-exec-core/src/runtime/kiln_process.rs",
+                "/proc/sys/vm/memfd_noexec",
+                "the helper reads the memfd exec policy once per exec-options memfd \
+                 (API additions design 4.1); read-only",
             ),
             (
                 "kilnd/src/helper/firecracker/workers.rs",

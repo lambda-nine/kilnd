@@ -262,6 +262,7 @@ where
                 stdin: &stdin,
                 deadline,
                 max_output: request.max_output as usize,
+                options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
             },
             cancel,
         )

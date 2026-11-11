@@ -1553,6 +1553,7 @@ async fn exit2_real_manager_publishes_charged_failure_and_only_a_fence_releases_
     // a visibly FAILED charged row and return no success.
     fixture.fault("L.fence.sync_fail");
     let request = CreateRequest {
+        default_env: Vec::new(),
         image: "alpine".into(),
         memory_bytes: 512 * MIB,
         cpu_millis: 1000,
@@ -4548,6 +4549,8 @@ fn exit1_legacy_kiln_request_and_reply_bytes_are_unchanged() {
         ),
         (
             KilnRequest::Exec {
+                cwd: None,
+                env: Vec::new(),
                 id: "abcd".into(),
                 argv: vec!["true".into()],
                 stdin_bytes: 1,

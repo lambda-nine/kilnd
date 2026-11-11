@@ -9,6 +9,8 @@
 //! crate has no gRPC, SQLite or helper server; see the B5 move audit in
 //! `docs/design/phase1b-firecracker.md`.
 
+/// Exec cwd and env (API additions design 4): validation, the merge and kiln's frame.
+pub mod exec_options;
 pub mod model;
 pub mod process;
 pub mod runtime;

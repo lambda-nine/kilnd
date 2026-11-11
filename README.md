@@ -58,10 +58,14 @@ code, the test suite and `CHANGELOG.md`.
   fields it doesn't know), refusals carry a machine-readable `kilnd-reason` trailer,
   and a create may ask to expire after a maximum lifetime or an idle timeout
   ([docs/architecture.md](docs/architecture.md#sandbox-expiry)); without a policy a
-  sandbox never expires. A create with a `request_id` is idempotent: a retry gets
+  sandbox never expires, and an expired one passes through `DELETING` before
+  `DELETED`, as after a Delete. A create with a `request_id` is idempotent: a retry gets
   the same sandbox in whatever state it settled, for at least a day measured on the
   boot clock, or until the client releases the key on delete
-  ([docs/architecture.md](docs/architecture.md#idempotent-create)).
+  ([docs/architecture.md](docs/architecture.md#idempotent-create)). An Exec may name
+  a working directory and environment overrides, over defaults the create set; history
+  keeps the names and a hash, never the values
+  ([docs/architecture.md](docs/architecture.md#exec-cwd-and-env)).
 - **Runtime adapter trait** ([crates/kilnd/src/runtime/mod.rs](crates/kilnd/src/runtime/mod.rs)).
   The kiln implementation calls a private root helper, which runs the installed `kiln` CLI with argument vectors
   (never a shell), a cleared environment, timeouts and bounded output. kiln's
@@ -180,7 +184,10 @@ running, and reconciliation picks them up again.
 
 kilnd requires persistent-exec protocol v1 in both the installed kiln CLI and
 each sandbox PID 1, plus CLI support for scoped `gc ID...` and persistent-create
-certainty (capability feature `0x10`, minimum kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`). It checks
+certainty (capability feature `0x10`, minimum kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`).
+Exec cwd and env also need exec options (feature `0x20`, kiln
+`5cada841edd0bbe112550816fad221dfb1db6a47`); without them kilnd lists none of those
+features and works as before. It checks
 capabilities and complete `gc --help` usage before reconciliation, Create and
 Exec. Sandboxes whose PID 1 predates `0x10` keep working;
 older sandbox instances without protocol v1 require explicit recreation. Command bytes use private
@@ -218,6 +225,7 @@ sudo kilndctl health
 id=$(sudo kilndctl create --memory 256M --pids 64 --disk 256M --label owner=me)
 sudo kilndctl exec "$id" -- sh -c 'echo hello >/workspace/note; uname -a'
 sudo kilndctl exec --timeout 5s "$id" -- sleep 60; echo "exit $?"   # 124
+sudo kilndctl exec --cwd /workspace --env GREETING=hi "$id" -- sh -c 'pwd; echo $GREETING'  # kiln 5cada84 or later
 sudo kilndctl get "$id"
 sudo kilndctl ls
 sudo kilndctl rm "$id"

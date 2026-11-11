@@ -32,8 +32,9 @@ pub fn validate_request_id(request_id: &str) -> Result<(), String> {
 /// The canonical JSON the digest covers: the request *as sent*, before any default,
 /// with `request_id` itself left out. An object with exactly three keys:
 ///
-/// - `default_env`: `[name, value]` pairs sorted by name. Always empty until the
-///   sandbox default env exists (milestone 3), so today's digests stay valid then.
+/// - `default_env`: `[name, value]` pairs sorted by name bytes (then value bytes, so
+///   even an invalid list with a repeated name has one form). Empty when none was
+///   sent, so digests from before the sandbox default env existed stay valid.
 /// - `expiry`: `null` when the message is absent, else both fields. Absent and
 ///   present-with-zeros mean different things, so they hash differently.
 /// - `spec`: every `SandboxSpec` field, labels as an object, the network mode as its
@@ -58,8 +59,18 @@ pub fn canonical_request(req: &pb::CreateSandboxRequest) -> Vec<u8> {
             "max_lifetime_ms": e.max_lifetime_ms,
         }),
     };
+    let mut default_env: Vec<(&str, &str)> = req
+        .default_env
+        .iter()
+        .map(|e| (e.name.as_str(), e.value.as_str()))
+        .collect();
+    default_env.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.as_bytes().cmp(b.1.as_bytes())));
+    let default_env: Vec<Value> = default_env
+        .into_iter()
+        .map(|(name, value)| json!([name, value]))
+        .collect();
     let value = json!({
-        "default_env": Value::Array(Vec::new()),
+        "default_env": Value::Array(default_env),
         "expiry": expiry,
         "spec": {
             "image": spec.image,
@@ -140,10 +151,24 @@ mod tests {
             max_lifetime_ms: e["max_lifetime_ms"].as_u64().unwrap_or(0),
             idle_timeout_ms: e["idle_timeout_ms"].as_u64().unwrap_or(0),
         });
+        let default_env = r
+            .get("default_env")
+            .and_then(Value::as_array)
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|p| pb::EnvVar {
+                        name: p[0].as_str().unwrap().into(),
+                        value: p[1].as_str().unwrap().into(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         pb::CreateSandboxRequest {
             spec,
             expiry,
             request_id: r["request_id"].as_str().unwrap_or("").into(),
+            default_env,
         }
     }
 
@@ -152,7 +177,7 @@ mod tests {
         let goldens: Value = serde_json::from_str(GOLDENS).unwrap();
         assert_eq!(goldens["domain"], "kilnd.v1.create-request.1");
         let cases = goldens["cases"].as_array().unwrap();
-        assert!(cases.len() >= 8);
+        assert!(cases.len() >= 13);
         for case in cases {
             let name = case["name"].as_str().unwrap();
             let req = request(case);

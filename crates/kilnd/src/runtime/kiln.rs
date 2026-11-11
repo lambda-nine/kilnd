@@ -39,6 +39,46 @@ impl KilnRuntime {
         }
     }
 }
+impl KilnRuntime {
+    /// What the new sandbox's PID 1 advertises, read once after create for its row's
+    /// `exec_features`. A failed probe records nothing, so the sandbox takes no exec
+    /// options; it is still a usable sandbox.
+    async fn sandbox_exec_features(&self, backend_id: &str) -> Option<u32> {
+        let deadline = Instant::now() + SANDBOX_FEATURES_TIMEOUT;
+        match self
+            .call(
+                KilnRequest::Features {
+                    id: Some(backend_id.into()),
+                },
+                deadline,
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(Response::Features { features, .. }) => Some(features),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(backend_id, %error, "new sandbox's exec features are unknown; it takes no exec options");
+                None
+            }
+        }
+    }
+}
+/// The post-create feature probe's budget: the probe itself is bounded at two seconds.
+pub(crate) const SANDBOX_FEATURES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The dynamic features exec options prove (design section 1).
+pub(crate) fn exec_option_features(exec_options: bool) -> crate::manager::ProvenFeatures {
+    use crate::manager::Feature;
+    crate::manager::ProvenFeatures(if exec_options {
+        vec![
+            Feature::ExecCwd,
+            Feature::ExecEnv,
+            Feature::SandboxDefaultEnv,
+        ]
+    } else {
+        Vec::new()
+    })
+}
 fn unexpected() -> RuntimeError {
     RuntimeError::Backend("unexpected root helper response".into())
 }
@@ -59,6 +99,22 @@ impl Runtime for KilnRuntime {
             .await?
         {
             Response::Version(s) => Ok(s),
+            _ => Err(unexpected()),
+        }
+    }
+    /// API additions design 1: the installed CLI's bit 0x20, through the helper, proves
+    /// exec cwd, env and sandbox default env. An older helper closes the connection on
+    /// the request, which is an error: no dynamic feature, and Health not serving.
+    async fn proven_features(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<crate::manager::ProvenFeatures, RuntimeError> {
+        match self
+            .call(KilnRequest::Features { id: None }, deadline, cancel)
+            .await?
+        {
+            Response::Features { exec_options, .. } => Ok(exec_option_features(exec_options)),
             _ => Err(unexpected()),
         }
     }
@@ -109,10 +165,14 @@ impl Runtime for KilnRuntime {
             )
             .await?
         {
-            Response::Created(backend_id) => Ok(CreatedSandbox {
-                backend_id,
-                receipt: RuntimeReceipt::Legacy,
-            }),
+            Response::Created(backend_id) => {
+                let exec_features = self.sandbox_exec_features(&backend_id).await;
+                Ok(CreatedSandbox {
+                    backend_id,
+                    receipt: RuntimeReceipt::Legacy,
+                    exec_features,
+                })
+            }
             Response::Error {
                 error,
                 definitely_not_created: true,

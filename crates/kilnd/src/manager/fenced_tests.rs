@@ -32,6 +32,8 @@ fn state_dir() -> (tempfile::TempDir, std::path::PathBuf) {
 
 fn exec_req(id: &str, argv: &[&str], timeout_ms: u32) -> ExecRequest {
     ExecRequest {
+        cwd: String::new(),
+        env: Vec::new(),
         sandbox_id: id.into(),
         argv: argv.iter().map(|s| s.to_string()).collect(),
         stdin: vec![],

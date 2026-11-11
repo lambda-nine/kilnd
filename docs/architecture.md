@@ -94,8 +94,11 @@ coexist in kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`. Older artifacts, inc
 GC, are refused. CLI capability validation
 also requires complete, bounded `gc --help` output advertising `gc [ID]...`,
 within the caller's deadline. It never invokes global GC to test compatibility.
-That is the minimum revision. Privileged verification uses the tested companion, kiln
-`00d61c546db7aa67ad283d10c2ca6165ca5f8166`, which setup pins.
+That is the minimum revision for everything but exec options. Privileged verification
+uses the tested companions, which setup pins: kiln
+`00d61c546db7aa67ad283d10c2ca6165ca5f8166` for everything else, and kiln
+`5cada841edd0bbe112550816fad221dfb1db6a47`, the first with exec options (capability
+bit `0x20`), for exec cwd and env (see [Exec cwd and env](#exec-cwd-and-env)).
 Both installed CLI and sandbox PID 1 capabilities are checked before each
 execution, within its existing deadline. A live PID 1 is only asked for the
 execution bits: it never allocates, so a sandbox started by an older CLI stays
@@ -463,9 +466,12 @@ client could hit; a feature that is not listed has zero limits. Features come in
 two sets. The static set is fixed by the code and flags: `SANDBOX_EXPIRY`,
 `IDEMPOTENT_CREATE`, `TYPED_REASONS` and `REQUEST_ID_RELEASE` today. The dynamic set is what the backend proves in the shared
 Health probe (`Runtime::proven_features`): it is empty at startup, replaced by each
-successful probe and cleared by any failed or timed-out one, so it fails closed. No
-backend proves a dynamic feature yet (exec cwd, env and streaming come later); the
-create-time and Exec-time gates will read the same set Health publishes. An older
+successful probe and cleared by any failed or timed-out one, so it fails closed. The
+kiln backend proves `EXEC_CWD`, `EXEC_ENV` and `SANDBOX_DEFAULT_ENV` together when the
+helper's `features` probe finds the installed CLI's bit `0x20` and a host whose memfds
+kiln accepts; Firecracker proves none, and streaming comes later. The create-time and
+Exec-time gates read the same set Health publishes, so Health never lists an option
+the daemon would refuse. An older
 daemon lists no features and ignores unknown request fields, so a client sets a
 field only when its feature is listed in a `SERVING` response, and re-reads the
 list after every reconnect. `kilndctl` does this itself: `create` with an expiry
@@ -484,7 +490,13 @@ retained `DELETED` row its deletion reason: `expired_idle`, `expired_lifetime` o
 foreign or pruned ID stays `NOT_FOUND` with no trailer, so "expired" and "never
 existed" stay distinguishable while the row is retained. Idempotent create adds
 `request_id_conflict` (`ALREADY_EXISTS`), `request_id_quota` (`RESOURCE_EXHAUSTED`),
-`create_in_flight` (`DEADLINE_EXCEEDED`) and `create_unsettled` (`UNAVAILABLE`).
+`create_in_flight` (`DEADLINE_EXCEEDED`) and `create_unsettled` (`UNAVAILABLE`). Exec
+cwd and env add `backend_unsupported:<feature>` (`UNIMPLEMENTED`: `exec_cwd`,
+`exec_env`, `sandbox_default_env`) and `sandbox_unsupported:<feature>`
+(`FAILED_PRECONDITION`: `exec_cwd`, `exec_env`). `execution_start_raced`
+(`FAILED_PRECONDITION`, like `sandbox_not_ready`) means the conditional execution
+insert saw the sandbox leave `READY` and a reload found it `READY` again: nothing ran,
+retry.
 
 ## Sandbox expiry
 
@@ -611,7 +623,8 @@ own), and echoed as `Sandbox.request_id`, which history keeps.
 
 **The request digest** is SHA-256 over `kilnd.v1.create-request.1`, one zero byte and
 the canonical JSON of the request *as sent*, before any default: an object with
-exactly `default_env` (always `[]` until sandbox default env exists), `expiry`
+exactly `default_env` (`[name, value]` pairs sorted by name bytes, then value bytes;
+`[]` when none was sent, so digests from before default env are unchanged), `expiry`
 (`null` when absent, else both fields, so absent and present-with-zeros differ) and
 `spec` (every field, labels as an object, the network mode as its enum number), with
 `request_id` left out. It uses the same canonical JSON contract and encoder as the spec
@@ -776,6 +789,107 @@ After release a create with the key makes a new sandbox; the client takes that
 duplicate risk, because kilnd's retry protection for the key has ended. SQLite
 orders a concurrent retry and the release: a retry that reads the record first
 returns the `DELETED` row, one that reads after creates afresh.
+
+## Exec cwd and env
+
+`ExecRequest.cwd` and `ExecRequest.env`, and `CreateSandboxRequest.default_env` for
+sandbox-wide defaults, are additive: with all three empty an Exec runs exactly as
+before, through the same code and kiln's operation 4. kiln's half is its operation 5,
+the `kiln exec --exec-options-fd` flag, stage 14 `Chdir` and capability bit `0x20`,
+first in kiln `5cada841edd0bbe112550816fad221dfb1db6a47`; an older kiln keeps working
+for everything else and simply proves no exec options.
+
+**Validation**, in kilnd, again in the root helper at the code ceilings, and again in
+kiln's CLI and PID 1; `INVALID_ARGUMENT` before anything is allocated. A cwd starts
+with `/`, is at most `--max-exec-cwd-bytes` (4,096) and has no NUL; it is not
+normalized, so `..` and symlinks resolve inside the sandbox's own root. An env list
+has at most `--max-exec-env-entries` (64) entries; names match
+`[A-Za-z_][A-Za-z0-9_]*` within `--max-exec-env-name-bytes` (128); values are UTF-8
+without NUL within `--max-exec-env-value-bytes` (4,096); `len(name) + len(value) + 2`
+totals at most `--max-exec-env-total-bytes` (32,768). A name given twice is refused,
+not resolved. The same bounds hold for the request's env, the sandbox's default env
+and their merge. Flags may lower each ceiling, never raise it.
+
+**The merge.** kilnd overlays the sandbox's default env with the request's (the
+request wins by name) and sends the effective overrides, sorted by name bytes, with
+the cwd. kiln builds the command's environment from the fixed base every command gets
+under kilnd (`HOME=/root`,
+`PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `TERM=xterm`)
+overlaid by the overrides, so explicit entries win, `PATH` included, and drive the
+program lookup; a relative program like `./fib.sh` resolves in the cwd. There is no
+unset; an empty value is allowed.
+
+**Through the privilege boundary.** The helper's kiln `exec` request gains `cwd` and
+`env`, omitted when empty, so a request without options is byte-identical to before
+(the B2 goldens pin it). The helper revalidates them in the one strict form kiln
+accepts (env strictly ascending by name), writes kiln's options frame into a memfd
+created `MFD_ALLOW_SEALING|MFD_CLOEXEC` (plus `MFD_EXEC` under `vm.memfd_noexec=1`),
+seals it with exactly `F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE`, checks the
+seals, and passes it to `kiln exec --protocol=1 ... --exec-options-fd=N` as its own
+descriptor number. Nothing caller-derived reaches the root command line but the argv
+after `--`, as before, so options never appear in `/proc/*/cmdline`. Under
+`vm.memfd_noexec=2` every memfd carries `F_SEAL_EXEC`, which kiln refuses: the helper
+proves no exec options there, and an Exec that still gets through fails
+`exec_options_unavailable` with no child.
+
+**Gates.** An option the backend has not proven is refused
+`UNIMPLEMENTED backend_unsupported:<feature>`, the first in `Feature` order (cwd
+before env), before its value is looked at and before any row, ticket, prepare call
+or helper call; a create's default env is refused before `prepare`, so Firecracker's
+token pointer does not move. At `READY` publication kilnd records the new sandbox's
+exec feature bits, what its PID 1 advertises (the creating CLI's build), in
+`sandboxes.exec_features`, once. An Exec that needs options (a cwd, env, or a sandbox
+default env) on a sandbox without bit `0x20` there, or with none recorded (every row
+from before schema 13), is refused `FAILED_PRECONDITION sandbox_unsupported:exec_cwd`
+(or `exec_env`) before an execution row. A sandbox with default env needs
+`EXEC_ENV` for every Exec, so after an operator downgrade its commands are refused
+rather than run without their defaults. The per-exec checks stay the authority: the
+helper requires bit `0x20` from both the installed CLI and the sandbox's PID 1 before
+starting the CLI, and the CLI probes PID 1 again; a downgrade that slips past the gate
+is a `FAILED` execution with `INCOMPATIBLE`/`HANDSHAKE`, no child started and a
+`failure_reason` starting `exec_options_unsupported`, never a run without the options.
+The CLI's own probe has a two-second deadline; a PID 1 still busy with another control
+connection fails it as `Protocol`/`Handshake`, which kilnd reports as
+`UNAVAILABLE`/`HANDSHAKE`, `exec_options_unconfirmed`, no child started, retryable.
+
+**A missing cwd** is a successful RPC whose execution is `FAILED`: `LAUNCH_FAILED`,
+`RUNTIME_STAGE_CWD`, the errno name as `native_code` (`ENOENT`, `ENOTDIR`, `EACCES`,
+`ELOOP`, `ENAMETOOLONG`), a `failure_reason` starting `cwd_not_found`,
+`RUNTIME_DRAINED` and `sandbox_reusable`. Nothing falls back to `/`. A host-only path
+such as `/var/lib/kilnd-helper` is `ENOENT` inside the sandbox.
+
+**History keeps names and a hash, never values.** An execution records `cwd` as given
+(a path, not a value), `env_names` (the effective overrides' names, sorted) and
+`env_sha256`: lowercase hex SHA-256 of `kilnd.v1.exec-env.1`, a zero byte, then each
+override sorted by name as `u32be len, name, u32be len, value`. A client recomputes it
+to check that what ran is what it sent. It is an unkeyed integrity fingerprint, not
+confidentiality: a low-entropy value can be guessed from it. Values are in no
+execution row, response, helper reply or log line; the in-memory env type's `Debug`
+redacts them, validation errors name entries by position, and a canary test checks
+logs, every response and every logical database column.
+
+**Sandbox defaults** are not in `SandboxSpec`, which Get and List echo and the spec
+digests cover. Their names and hash are `Sandbox.default_env_names` and
+`default_env_sha256` (the same encoding); the values are stored in
+`sandboxes.default_env`, so executions after a restart still get them, and set to null
+in the same statement that moves the row to `FAILED` or `DELETED`; a `CHECK` makes a
+`FAILED` or `DELETED` row with values impossible. So the values are plaintext in
+`kilnd.db` while the sandbox is live, by design. Clearing is logical: SQLite, its WAL
+and free pages may keep the bytes until they are overwritten, as for output, and no
+byte erasure is promised. The API's contract is that callers send no secrets.
+
+**Store: schema 13.** `sandboxes` gains `default_env`, `default_env_names`,
+`default_env_sha256` and `exec_features`; `executions` gains `cwd`, `env_names` and
+`env_sha256`. Triggers fix the names, hashes and an execution's cwd at insert, record
+`exec_features` once, allow default env values only on a `CREATING` insert and only
+ever clear them. None of it is reservation membership. A schema 12 database migrates
+in one transaction, its aggregates audited after.
+
+**Admission.** Env bytes ride in the request that already holds a global Exec ticket,
+so retained env memory is bounded by 32 tickets × 64 KiB (request plus default env),
+2 MiB, with no new budget. `kilndctl exec --cwd DIR --env NAME[=VALUE]` and
+`create --default-env NAME[=VALUE]` (a bare `NAME` passes kilndctl's own value, off
+its command line) read Health first and refuse unless it lists the feature.
 
 ## Concurrency
 
@@ -1055,6 +1169,9 @@ namespace, mount, quota, network, ownership and cleanup capabilities.
 | Create request record retention, on the boot clock (at least 1 d; pruning waits a further 0.1 %) | 86,400 s | `--create-request-retention-secs` |
 | Create request records per uid / per node (per uid below node) | 4,096 / 32,768 | `--max-create-requests-per-uid`, `--max-create-requests` |
 | `request_id` | 1-64 bytes, `0x21`-`0x7e` | (code) |
+| Exec cwd (ceiling 4,096) | 4,096 bytes | `--max-exec-cwd-bytes` |
+| Env entries / name / value / total per list (ceilings; also for default env and the merge) | 64 / 128 / 4,096 / 32,768 bytes | `--max-exec-env-entries`, `--max-exec-env-name-bytes`, `--max-exec-env-value-bytes`, `--max-exec-env-total-bytes` |
+| Exec options memfd | at most 40 KiB (largest frame 37,272 bytes) | (code) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
 
 Startup validates limits before opening state or binding: required counts,
@@ -1066,7 +1183,8 @@ maximum argv + 64 KiB. List bytes cannot exceed response bytes, and pages are
 at most 1000. Each node budget must hold at least one default sandbox.
 Nonzero expiry maxima and defaults are at least 10 s, and a nonzero default is at
 most its nonzero maximum. Create request retention is at least a day, and both
-record caps are nonzero with the per-uid cap below the node's.
+record caps are nonzero with the per-uid cap below the node's. The exec cwd and env
+flags are at most their ceilings, and all but the value bound are nonzero.
 These are finite capacity bounds, not a hard-real-time guarantee: synchronous
 SQLite/filesystem work may block, slow clients may deny availability until
 disconnected, and authorized callers can monopolize capacity without tenant

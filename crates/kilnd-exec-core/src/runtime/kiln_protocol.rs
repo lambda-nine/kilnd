@@ -29,7 +29,7 @@ impl Outcome {
                 .expect("validated command")
                 .legacy_projection(),
             Some(d) if d.kind == RuntimeErrorKind::LaunchFailed => match d.stage {
-                RuntimeStage::Admission | RuntimeStage::Stdio => 126,
+                RuntimeStage::Admission | RuntimeStage::Stdio | RuntimeStage::Cwd => 126,
                 RuntimeStage::Exec => 127,
                 _ => 125,
             },
@@ -174,6 +174,7 @@ pub fn outcome(frame: &[u8]) -> Result<Outcome, String> {
         11 => Some(RuntimeStage::Report),
         12 => Some(RuntimeStage::Capture),
         13 => Some(RuntimeStage::Handshake),
+        14 => Some(RuntimeStage::Cwd),
         _ => return Err("unknown failure stage".into()),
     };
     let errno = i32_at(p, 12);
@@ -195,7 +196,7 @@ pub fn outcome(frame: &[u8]) -> Result<Outcome, String> {
             kind: kind.unwrap(),
             stage: stage.unwrap(),
             message: message.into(),
-            native_code: (errno != 0).then(|| format!("errno:{errno}")),
+            native_code: (errno != 0).then(|| native_code(stage.unwrap(), errno)),
             message_truncated: p[3] & 2 != 0,
         }),
         _ => return Err("invalid or contradictory outcome".into()),
@@ -205,6 +206,29 @@ pub fn outcome(frame: &[u8]) -> Result<Outcome, String> {
         cleanup,
         diagnostic,
     })
+}
+
+/// A runtime failure's errno as `native_code`. A cwd failure names it (`ENOENT`, as the
+/// API promises for `RUNTIME_STAGE_CWD`); every other stage keeps `errno:N`, as before.
+/// The numbers are Linux's, where kiln runs, whatever host decodes the frame.
+fn native_code(stage: RuntimeStage, errno: i32) -> String {
+    let name = match errno {
+        1 => "EPERM",
+        2 => "ENOENT",
+        5 => "EIO",
+        12 => "ENOMEM",
+        13 => "EACCES",
+        14 => "EFAULT",
+        20 => "ENOTDIR",
+        36 => "ENAMETOOLONG",
+        40 => "ELOOP",
+        _ => "",
+    };
+    if stage == RuntimeStage::Cwd && !name.is_empty() {
+        name.to_string()
+    } else {
+        format!("errno:{errno}")
+    }
 }
 
 pub fn capabilities(frame: &[u8]) -> Result<Capabilities, String> {
@@ -328,7 +352,7 @@ pub(super) mod tests {
             (19, 4),
             (21, 255),
             (24, 12),
-            (26, 14),
+            (26, 15),
             (28, 255),
             (32, 1),
             (36, 1),
@@ -347,6 +371,54 @@ pub(super) mod tests {
         let mut frame = caps();
         frame[16] = 7;
         assert!(capabilities(&frame).unwrap().require_v1().is_err());
+    }
+
+    #[test]
+    fn chdir_is_stage_14_with_named_errnos_and_projection_126() {
+        // kiln's LaunchFailed/Chdir/ENOENT payload begins 02000200 00000000 0600 0e00 02000000.
+        let mut frame = exit125();
+        frame[16..32].copy_from_slice(&hex("02000200 00000000 0600 0e00 02000000"));
+        let out = outcome(&frame).unwrap();
+        let d = out.diagnostic.as_ref().unwrap();
+        assert_eq!(
+            (d.kind, d.stage),
+            (RuntimeErrorKind::LaunchFailed, RuntimeStage::Cwd)
+        );
+        assert_eq!(d.native_code.as_deref(), Some("ENOENT"));
+        assert_eq!(out.cleanup, Cleanup::Drained);
+        assert_eq!(out.projection(), 126);
+        for (errno, name) in [
+            (20u8, "ENOTDIR"),
+            (13, "EACCES"),
+            (40, "ELOOP"),
+            (36, "ENAMETOOLONG"),
+            (99, "errno:99"),
+        ] {
+            frame[28] = errno;
+            assert_eq!(
+                outcome(&frame)
+                    .unwrap()
+                    .diagnostic
+                    .unwrap()
+                    .native_code
+                    .as_deref(),
+                Some(name)
+            );
+        }
+        // Other stages keep the numeric form.
+        frame[26] = 8;
+        frame[28] = 2;
+        assert_eq!(
+            outcome(&frame)
+                .unwrap()
+                .diagnostic
+                .unwrap()
+                .native_code
+                .as_deref(),
+            Some("errno:2")
+        );
+        frame[26] = 15;
+        assert!(outcome(&frame).is_err());
     }
 
     #[test]

@@ -386,6 +386,14 @@ async fn dispatch(
             .await
             .map(Response::Version)
             .unwrap_or_else(|e| error(e.into())),
+        KilnRequest::Features { id } => runtime
+            .exec_features(id.as_deref(), deadline, cancel)
+            .await
+            .map(|(features, exec_options)| Response::Features {
+                features,
+                exec_options,
+            })
+            .unwrap_or_else(|e| error(e.into())),
         KilnRequest::Capabilities { id: Some(id) } => runtime
             .validate_sandbox(&id, deadline, cancel)
             .await
@@ -430,6 +438,8 @@ async fn dispatch(
             argv,
             stdin_bytes,
             max_output,
+            cwd,
+            env,
         } => {
             let [mut input, mut stdout, mut stderr] =
                 stdio.ok_or_else(|| io::Error::other("missing helper stdio"))?;
@@ -448,11 +458,13 @@ async fn dispatch(
                     stdin.len()
                 )));
             }
+            let options = kilnd_exec_core::exec_options::ExecOptions { cwd, env };
             let spec = ExecSpec {
                 argv: &argv,
                 stdin: &stdin,
                 deadline,
                 max_output,
+                options: &options,
             };
             let outcome = runtime.exec_direct(&id, &spec, cancel).await;
             // No stdio bytes appear in the control protocol, only evidence.
@@ -531,6 +543,7 @@ mod tests {
         // Health and cleanup are the legacy requests that keep the reserve.
         for (request, reserved) in [
             (KilnRequest::Capabilities { id: None }, true),
+            (KilnRequest::Features { id: None }, true),
             (KilnRequest::Rm { id: "ab".into() }, true),
             (KilnRequest::Gc { ids: vec![] }, true),
             (KilnRequest::Ls, false),

@@ -236,6 +236,94 @@ fn pair(parent_shutdown: Shutdown, child_shutdown: Shutdown) -> io::Result<(Unix
     Ok((UnixStream::from_std(parent)?, child.into()))
 }
 
+/// Why no options memfd could be made: `vm.memfd_noexec=2` seals every memfd against
+/// execution, and kiln accepts only the exact four seals (no `F_SEAL_EXEC`).
+pub const MEMFD_NOEXEC_ENFORCED: &str = "exec options need vm.memfd_noexec 0 or 1; this host enforces 2, which adds F_SEAL_EXEC to every memfd";
+
+/// The seals kiln requires, exactly: `F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE`.
+#[cfg(target_os = "linux")]
+const OPTIONS_SEALS: libc::c_int =
+    libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+
+/// `vm.memfd_noexec`, or 0 on a kernel without it (before Linux 6.3).
+#[cfg(target_os = "linux")]
+fn memfd_noexec() -> io::Result<u8> {
+    match std::fs::read_to_string("/proc/sys/vm/memfd_noexec") {
+        Ok(text) => match text.trim() {
+            "0" => Ok(0),
+            "1" => Ok(1),
+            "2" => Ok(2),
+            other => Err(io::Error::other(format!(
+                "unexpected vm.memfd_noexec {other:?}"
+            ))),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether this host can make the memfd kiln accepts (design 4.1).
+pub fn options_memfd_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(memfd_noexec(), Ok(0 | 1))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// One options frame in a fresh memfd, CLOEXEC and sealed with exactly kiln's four
+/// seals. `MFD_NOEXEC_SEAL` is never used: it adds `F_SEAL_EXEC`, which kiln refuses.
+/// Under `vm.memfd_noexec=1` the kernel would add it by default, so `MFD_EXEC` keeps
+/// it off; under 2 nothing can, and this fails closed with [`MEMFD_NOEXEC_ENFORCED`].
+#[cfg(target_os = "linux")]
+pub fn options_memfd(frame: &[u8]) -> io::Result<OwnedFd> {
+    use std::io::Write;
+    if frame.len() > crate::exec_options::MAX_FRAME_BYTES {
+        return Err(io::Error::other(
+            "exec options frame above kiln's read bound",
+        ));
+    }
+    let mut flags = libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC;
+    match memfd_noexec()? {
+        0 => {}
+        1 => flags |= libc::MFD_EXEC,
+        _ => return Err(io::Error::other(MEMFD_NOEXEC_ENFORCED)),
+    }
+    // SAFETY: a static NUL-terminated name; memfd_create returns a new owned descriptor.
+    let fd = unsafe { libc::memfd_create(c"kilnd-exec-options".as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create succeeded and nothing else owns this descriptor.
+    let fd = above_stdio(unsafe { OwnedFd::from_raw_fd(fd) })?;
+    let mut file = std::fs::File::from(fd);
+    file.write_all(frame)?;
+    let fd = OwnedFd::from(file);
+    // SAFETY: F_ADD_SEALS and F_GET_SEALS only change and read this descriptor's seals.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, OPTIONS_SEALS) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals != OPTIONS_SEALS {
+        return Err(io::Error::other(format!(
+            "exec options memfd has seals {seals:#x}, not exactly {OPTIONS_SEALS:#x}"
+        )));
+    }
+    Ok(fd)
+}
+
+/// Exec options need Linux memfds.
+#[cfg(not(target_os = "linux"))]
+pub fn options_memfd(_frame: &[u8]) -> io::Result<OwnedFd> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "exec options need a Linux memfd",
+    ))
+}
+
 fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
     if fd.as_raw_fd() >= 3 {
         return Ok(fd);
@@ -259,12 +347,20 @@ impl OwnedExec {
         let (mut stdin, stdin_child) = pair(Shutdown::Read, Shutdown::Write)?;
         let (stdout, stdout_child) = pair(Shutdown::Write, Shutdown::Read)?;
         let (stderr, stderr_child) = pair(Shutdown::Write, Shutdown::Read)?;
+        // Exec options travel only in a sealed memfd: nothing caller-derived reaches the
+        // root command line but argv after `--`, as before (API additions design 4.1).
+        let options = if spec.options.is_empty() {
+            None
+        } else {
+            Some(options_memfd(&spec.options.encode_frame())?)
+        };
         let fds = [
             status_child.as_raw_fd(),
             stdin_child.as_raw_fd(),
             stdout_child.as_raw_fd(),
             stderr_child.as_raw_fd(),
         ];
+        let options_fd = options.as_ref().map(AsRawFd::as_raw_fd);
         let expected_parent = unsafe { libc::getpid() };
         let mut cmd = Command::new(program);
         cmd.arg("exec")
@@ -272,8 +368,11 @@ impl OwnedExec {
             .arg(format!("--status-fd={}", fds[0]))
             .arg(format!("--stdin-fd={}", fds[1]))
             .arg(format!("--stdout-fd={}", fds[2]))
-            .arg(format!("--stderr-fd={}", fds[3]))
-            .arg(id)
+            .arg(format!("--stderr-fd={}", fds[3]));
+        if let Some(fd) = options_fd {
+            cmd.arg(format!("--exec-options-fd={fd}"));
+        }
+        cmd.arg(id)
             .arg("--")
             .args(spec.argv)
             .env_clear()
@@ -285,7 +384,7 @@ impl OwnedExec {
         // SAFETY: only async-signal-safe descriptor/child setup operations run after fork.
         unsafe {
             cmd.pre_exec(move || {
-                for fd in fds {
+                for fd in fds.into_iter().chain(options_fd) {
                     if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
@@ -297,7 +396,13 @@ impl OwnedExec {
         // The guard holds nothing on Linux, where this drop is only a no-op.
         #[allow(clippy::drop_non_drop)]
         drop(spawning);
-        drop((status_child, stdin_child, stdout_child, stderr_child));
+        drop((
+            status_child,
+            stdin_child,
+            stdout_child,
+            stderr_child,
+            options,
+        ));
         let stdout_state = Arc::new(Mutex::new(StreamState::default()));
         let stderr_state = Arc::new(Mutex::new(StreamState::default()));
         let cli_stdout = Arc::new(Mutex::new(StreamState::default()));
@@ -618,6 +723,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             stdin: b"",
             deadline: Instant::now() + Duration::from_secs(10),
             max_output: 3,
+            options: &crate::exec_options::ExecOptions::EMPTY,
         };
         let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         assert!(matches!(
@@ -655,6 +761,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             stdin: b"",
             deadline: Instant::now() + Duration::from_secs(10),
             max_output: 1024,
+            options: &crate::exec_options::ExecOptions::EMPTY,
         };
         let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         assert!(matches!(
@@ -762,6 +869,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             stdin: b"",
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 100,
+            options: &crate::exec_options::ExecOptions::EMPTY,
         };
         let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         let pid = owner.child.id().unwrap();
@@ -795,6 +903,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                 stdin: b"",
                 deadline: Instant::now() + Duration::from_secs(5),
                 max_output: 1024,
+                options: &crate::exec_options::ExecOptions::EMPTY,
             };
             let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -840,6 +949,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             stdin: b"",
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 3,
+            options: &crate::exec_options::ExecOptions::EMPTY,
         };
         let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         assert!(matches!(
@@ -915,6 +1025,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                                 stdin: b"",
                                 deadline,
                                 max_output: 16,
+                                options: &crate::exec_options::ExecOptions::EMPTY,
                             };
                             let mut owner =
                                 OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec)
@@ -981,6 +1092,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                 stdin: b"binary\0input",
                 deadline: Instant::now() + Duration::from_secs(5),
                 max_output: 3,
+                options: &crate::exec_options::ExecOptions::EMPTY,
             };
             let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
             let _ = wait_for_cli(&mut owner, spec.deadline, &CancellationToken::new()).await;

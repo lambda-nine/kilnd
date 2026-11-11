@@ -712,6 +712,7 @@ impl FirecrackerRuntime {
                     return Ok(CreatedSandbox {
                         backend_id: format!("fc-{}", context.allocation_id),
                         receipt: RuntimeReceipt::Ready(receipt),
+                        exec_features: None,
                     });
                 }
                 Ok(InspectReply::PresentBusy { phase, .. }) if booting(&phase) => {

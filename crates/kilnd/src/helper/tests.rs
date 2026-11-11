@@ -96,6 +96,8 @@ fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
     });
     assert!(req.validate(0).is_err());
     req.operation = Operation::Kiln(KilnRequest::Exec {
+        cwd: None,
+        env: Vec::new(),
         id: "ab".into(),
         argv: vec!["sh\0".into()],
         stdin_bytes: 0,
@@ -103,6 +105,8 @@ fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
     });
     assert!(req.validate(0).is_err());
     req.operation = Operation::Kiln(KilnRequest::Exec {
+        cwd: None,
+        env: Vec::new(),
         id: "ab".into(),
         argv: vec!["true".into()],
         stdin_bytes: 32,
@@ -376,6 +380,7 @@ sys.exit(125)
         stdin: &input,
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
         max_output: 64,
+        options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
     };
     let outcome = tokio::time::timeout(
         Duration::from_secs(8),
@@ -408,6 +413,7 @@ async fn pre_canceled_or_expired_exec_never_connects_to_helper() {
         stdin: b"",
         deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         max_output: 1024,
+        options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
     };
     let result = client.exec("abcd", &spec, &cancel).await;
     assert_eq!(result.finish, Ok(ExecFinish::Canceled));
@@ -444,6 +450,7 @@ async fn an_unconfirmed_helper_exec_quarantines_the_sandbox() {
         stdin: b"",
         deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         max_output: 1024,
+        options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
     };
     let result = client
         .exec("abcd", &spec, &tokio_util::sync::CancellationToken::new())
@@ -765,6 +772,7 @@ async fn b6_firecracker_exec_carries_stdio_and_keeps_a_completed_session_reusabl
         stdin: b"input",
         deadline: tokio::time::Instant::now() + Duration::from_secs(10),
         max_output: 1024,
+        options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
     };
     let request = fc_exec_request();
     let outcome = client
@@ -829,6 +837,7 @@ async fn b6_a_timed_out_firecracker_exec_retires_the_session_with_host_proof() {
         stdin: b"input",
         deadline: tokio::time::Instant::now() + Duration::from_secs(10),
         max_output: 1024,
+        options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
     };
     let outcome = client
         .firecracker_exec(
@@ -854,6 +863,7 @@ fn b6_firecracker_replies_are_reusable_only_with_their_own_evidence() {
         stdin: b"",
         deadline: tokio::time::Instant::now() + Duration::from_secs(10),
         max_output: 8,
+        options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
     };
     let cancel = tokio_util::sync::CancellationToken::new();
     let reply = |reusable, cleanup| ExecReply {
@@ -947,6 +957,7 @@ async fn b6_an_unconfirmed_firecracker_exec_quarantines_the_sandbox() {
         stdin: b"",
         deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         max_output: 1024,
+        options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
     };
     let outcome = client
         .firecracker_exec(
@@ -961,4 +972,129 @@ async fn b6_an_unconfirmed_firecracker_exec_quarantines_the_sandbox() {
     );
     assert_eq!(outcome.disposition, SandboxDisposition::Quarantined);
     assert_eq!(outcome.cleanup, CleanupEvidence::Unknown);
+}
+
+/// API additions M3b (design 4.1): the exec options fields and the features probe on
+/// the helper wire. A request without options stays byte-identical (the B2 goldens in
+/// `firecracker::tests` pin it); with them, the helper accepts only the one strict form.
+mod exec_options {
+    use super::*;
+    use kilnd_exec_core::exec_options::{EnvVar, MAX_CWD_BYTES};
+
+    fn exec(cwd: Option<&str>, env: Vec<EnvVar>) -> Request {
+        Request {
+            version: VERSION,
+            timeout_ms: 1000,
+            deadline_ns: 5,
+            operation: Operation::Kiln(KilnRequest::Exec {
+                id: "abcd".into(),
+                argv: vec!["true".into()],
+                stdin_bytes: 0,
+                max_output: 1,
+                cwd: cwd.map(Into::into),
+                env,
+            }),
+        }
+    }
+
+    #[test]
+    fn options_frames_and_the_features_probe_have_fixed_encodings() {
+        let golden = |r: &Request| serde_json::to_string(r).unwrap();
+        assert_eq!(
+            golden(&exec(
+                Some("/w"),
+                vec![EnvVar::new("A", ""), EnvVar::new("B", "2")]
+            )),
+            r#"{"version":3,"timeout_ms":1000,"deadline_ns":5,"operation":{"kiln":{"exec":{"id":"abcd","argv":["true"],"stdin_bytes":0,"max_output":1,"cwd":"/w","env":[["A",""],["B","2"]]}}}}"#
+        );
+        assert_eq!(
+            golden(&exec(None, vec![EnvVar::new("A", "1")])),
+            r#"{"version":3,"timeout_ms":1000,"deadline_ns":5,"operation":{"kiln":{"exec":{"id":"abcd","argv":["true"],"stdin_bytes":0,"max_output":1,"env":[["A","1"]]}}}}"#
+        );
+        // Empty options are the B2 bytes exactly.
+        assert_eq!(
+            golden(&exec(None, vec![])),
+            r#"{"version":3,"timeout_ms":1000,"deadline_ns":5,"operation":{"kiln":{"exec":{"id":"abcd","argv":["true"],"stdin_bytes":0,"max_output":1}}}}"#
+        );
+        for (request, json) in [
+            (
+                KilnRequest::Features { id: None },
+                r#"{"features":{"id":null}}"#,
+            ),
+            (
+                KilnRequest::Features {
+                    id: Some("abcd".into()),
+                },
+                r#"{"features":{"id":"abcd"}}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&request).unwrap(), json);
+            assert!(request.is_recovery());
+        }
+        assert_eq!(
+            serde_json::to_string(&Response::Features {
+                features: 0x3f,
+                exec_options: true
+            })
+            .unwrap(),
+            r#"{"features":{"features":63,"exec_options":true}}"#
+        );
+        assert!(
+            Request {
+                operation: Operation::Kiln(KilnRequest::Features {
+                    id: Some("../x".into())
+                }),
+                ..exec(None, vec![])
+            }
+            .validate(0)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_helper_revalidates_options_at_its_ceilings_in_one_strict_form() {
+        exec(Some("/"), vec![EnvVar::new("A", ""), EnvVar::new("A0", "")])
+            .validate(0)
+            .unwrap();
+        let max_cwd = format!("/{}", "c".repeat(MAX_CWD_BYTES - 1));
+        exec(Some(&max_cwd), vec![]).validate(0).unwrap();
+        let entries = |n: usize| {
+            (0..n)
+                .map(|i| EnvVar::new(format!("V{i:02}"), ""))
+                .collect()
+        };
+        exec(None, entries(64)).validate(0).unwrap();
+        for bad in [
+            exec(Some(""), vec![]),
+            exec(Some("relative"), vec![]),
+            exec(Some(&format!("{max_cwd}c")), vec![]),
+            exec(Some("/a\0b"), vec![]),
+            exec(None, entries(65)),
+            exec(None, vec![EnvVar::new("B", ""), EnvVar::new("A", "")]),
+            exec(None, vec![EnvVar::new("A", ""), EnvVar::new("A", "")]),
+            exec(None, vec![EnvVar::new("1A", "")]),
+            exec(None, vec![EnvVar::new("A", "x\0")]),
+            exec(None, vec![EnvVar::new("A", "v".repeat(4097))]),
+        ] {
+            assert!(bad.validate(0).is_err(), "{bad:?}");
+        }
+        // Unknown fields are still refused, and an entry is exactly a pair.
+        for text in [
+            r#"{"version":3,"timeout_ms":1000,"deadline_ns":5,"operation":{"kiln":{"exec":{"id":"abcd","argv":["true"],"stdin_bytes":0,"max_output":1,"cwd":"/w","flags":["-x"]}}}}"#,
+            r#"{"version":3,"timeout_ms":1000,"deadline_ns":5,"operation":{"kiln":{"exec":{"id":"abcd","argv":["true"],"stdin_bytes":0,"max_output":1,"env":[["A","1","x"]]}}}}"#,
+        ] {
+            assert!(serde_json::from_str::<Request>(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn request_debug_never_shows_an_env_value() {
+        let request = exec(
+            Some("/w"),
+            vec![EnvVar::new("TOKEN", "CANARY-helper-debug")],
+        );
+        let debug = format!("{request:?}");
+        assert!(debug.contains("TOKEN") && debug.contains("/w"), "{debug}");
+        assert!(!debug.contains("CANARY"), "{debug}");
+    }
 }

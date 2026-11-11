@@ -134,7 +134,9 @@ impl Client {
         let allowance = match &operation {
             Operation::Kiln(KilnRequest::Exec { .. }) => Duration::from_secs(70),
             Operation::Kiln(KilnRequest::Create { .. }) => Duration::from_secs(5),
-            Operation::Kiln(KilnRequest::Capabilities { .. }) => Duration::from_secs(1),
+            Operation::Kiln(KilnRequest::Capabilities { .. } | KilnRequest::Features { .. }) => {
+                Duration::from_secs(1)
+            }
             Operation::Firecracker(request) => match request.operation {
                 FirecrackerOperation::Create { .. } => Duration::from_secs(5),
                 FirecrackerOperation::Capabilities => Duration::from_secs(1),
@@ -241,6 +243,8 @@ impl Client {
             argv: spec.argv.to_vec(),
             stdin_bytes: spec.stdin.len(),
             max_output: spec.max_output,
+            cwd: spec.options.cwd.clone(),
+            env: spec.options.env.clone(),
         };
         let observed = Observed::default();
         let operation = async {

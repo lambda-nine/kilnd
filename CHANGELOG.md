@@ -6,6 +6,53 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone 3b of the kilnd API additions: exec cwd and env, additive within
+  `kilnd.v1`; with none of the new fields set an Exec runs exactly as before, through
+  kiln's operation 4. `ExecRequest.cwd` and `ExecRequest.env`, and
+  `CreateSandboxRequest.default_env` for sandbox-wide defaults (the request wins by
+  name), reach kiln's operation 5 (kiln `5cada84`, capability bit `0x20`). Validation
+  in kilnd, again in the root helper at the code ceilings and again in kiln: a cwd is
+  absolute, at most 4,096 bytes, without NUL and not normalized; an env list has at
+  most 64 entries, names `[A-Za-z_][A-Za-z0-9_]*` of at most 128 bytes given once,
+  values of at most 4,096 bytes without NUL and at most 32,768 bytes in all, for the
+  request, the defaults and their merge (`--max-exec-cwd-bytes` and
+  `--max-exec-env-*` may lower each). The helper's kiln `exec` request gains `cwd` and
+  `env`, omitted when empty so other requests stay byte-identical; it writes kiln's
+  options frame into a memfd sealed with exactly `F_SEAL_SEAL|SHRINK|GROW|WRITE`
+  (`MFD_EXEC` under `vm.memfd_noexec=1`; under 2 it proves no options) and passes
+  only its descriptor number, so no value reaches a host command line. A new helper
+  `features` probe proves `EXEC_CWD`, `EXEC_ENV` and `SANDBOX_DEFAULT_ENV` from the
+  installed CLI's bit `0x20`; an unproven option is `UNIMPLEMENTED
+  backend_unsupported:<feature>` before any row, ticket, prepare or helper call
+  (Firecracker proves none), and a sandbox whose PID 1 did not advertise the bit at
+  `READY` (recorded once in `sandboxes.exec_features`; null on older rows) is
+  `FAILED_PRECONDITION sandbox_unsupported:<feature>` before an execution row. After an
+  operator downgrade the per-exec probes refuse with no child started
+  (`exec_options_unsupported`); kiln's own probe of a busy PID 1 is the retryable
+  `exec_options_unconfirmed`. A cwd that cannot be entered is a `FAILED` execution with
+  `RUNTIME_STAGE_CWD` (14), the errno name (`ENOENT`, ...) as `native_code` and
+  `cwd_not_found`, never a fallback to `/`. History keeps `Execution.cwd`, `env_names`
+  and `env_sha256` (SHA-256 over `kilnd.v1.exec-env.1`, a zero byte and each override
+  sorted by name as `u32be len, name, u32be len, value`: an integrity fingerprint, not
+  confidentiality), and `Sandbox.default_env_names` and `default_env_sha256`; the
+  default values are plaintext in `sandboxes.default_env` while the sandbox is live and
+  set to null in the statement that makes it `FAILED` or `DELETED`. Values are kept out
+  of `Debug`, errors and logs; a canary test checks logs, every response and every
+  logical database column. The create request digest now covers `default_env`
+  (goldens added). Schema 13 adds the columns and their triggers. kilndctl gains
+  `exec --cwd DIR --env NAME[=VALUE]` and `create --default-env NAME[=VALUE]` (a bare
+  `NAME` passes kilndctl's own value), refused unless Health lists the feature.
+- Fix the M2 recheck's MEDIUM 1: a `grpc-timeout` in request trailers replaced the
+  deadline the create handler reparsed from merged metadata, so a waiting keyed retry
+  got tonic's untyped `Timeout expired` instead of `create_in_flight`. The interceptor
+  now captures the headers' timeout with their arrival, and only that counts.
+- Exec refuses a lost conditional execution insert whose reload shows the sandbox
+  `READY` again with its own retryable token, `execution_start_raced`
+  (`FAILED_PRECONDITION`), instead of the overloaded `sandbox_not_ready`.
+- Docs: an expired sandbox passes through `DELETING` before `DELETED`; kiln `5cada84`
+  is the tested companion for exec options and `e48f0e7` stays the minimum for
+  everything else.
+
 - Fix Daybreak's break-it findings on API additions milestone 2. HIGH 1: a create
   request record's retention anchor was read before its admitting transaction began,
   so a pause before the commit (suspend, `SIGSTOP`, a stall) shortened the guaranteed

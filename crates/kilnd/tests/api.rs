@@ -34,6 +34,9 @@ fn signal_number_is_uint32_in_generated_types_schema_and_wire() {
         status
     );
     let execution = kilnd::model::Execution {
+        cwd: None,
+        env_names: Vec::new(),
+        env_sha256: None,
         id: "ex-signal".into(),
         sandbox_id: "sb-signal".into(),
         argv: vec![],
@@ -373,7 +376,7 @@ async fn every_rpc_over_the_socket() {
         ..Default::default()
     };
     let sandbox = c
-        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
             spec: Some(spec),
             expiry: None,
         })
@@ -391,6 +394,8 @@ async fn every_rpc_over_the_socket() {
 
     let e = c
         .exec(pb::ExecRequest {
+            cwd: String::new(),
+            env: Vec::new(),
             sandbox_id: sandbox.id.clone(),
             argv: vec!["echo".into(), "hi".into()],
             stdin: vec![],
@@ -528,7 +533,7 @@ async fn every_rpc_over_the_socket() {
         ..Default::default()
     };
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
             spec: Some(mixed),
             expiry: None,
         })
@@ -537,7 +542,7 @@ async fn every_rpc_over_the_socket() {
     assert_eq!(err.code(), Code::InvalidArgument);
     fake.state().fail_create = Some("no image".into());
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -562,7 +567,7 @@ async fn every_rpc_over_the_socket() {
         backend.fail_create_definitely = Some("image missing".into());
     }
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -635,7 +640,7 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
     ));
     let mut c = client(path).await;
     let oversize = c
-        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
             spec: Some(pb::SandboxSpec {
                 labels: [("test".into(), "x".repeat(256))].into(),
                 ..Default::default()
@@ -650,7 +655,7 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
     // The response cap can fail only after a successful owned operation.
     // Its durable result is still inspectable and is not compensated away.
     let response = c
-        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
             spec: Some(pb::SandboxSpec {
                 labels: [("test".into(), "x".repeat(70))].into(),
                 ..Default::default()
@@ -699,7 +704,7 @@ async fn ownership_comes_from_the_kernel_credentials_of_the_socket() {
     let mut c = client(socket.clone()).await;
 
     let mine = c
-        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -747,6 +752,8 @@ async fn ownership_comes_from_the_kernel_credentials_of_the_socket() {
         .unwrap();
     let foreign_execution = manager
         .exec(kilnd::manager::ExecRequest {
+            cwd: String::new(),
+            env: Vec::new(),
             sandbox_id: foreign.id.clone(),
             argv: vec!["echo".into(), "theirs".into()],
             stdin: vec![],
@@ -964,7 +971,7 @@ async fn graceful_shutdown_drains_a_create_after_its_rpc_disconnects() {
     ));
     let mut c = client(socket.clone()).await;
     let request = tokio::spawn(async move {
-        c.create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
+        c.create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -1350,6 +1357,67 @@ async fn create_in_flight_survives_a_delayed_request_body() {
             field("kilnd-reason").as_deref(),
             Some("create_in_flight"),
             "delay {delay_ms} ms: {fields:?}"
+        );
+        connection.abort();
+    }
+
+    // M2 recheck MEDIUM 1: tonic merges request trailers into the metadata the handler
+    // sees, while its transport timer keeps the headers' value. A trailer naming a much
+    // longer grpc-timeout (or a malformed one, or a shorter one) must not move the
+    // typed deadline: only the headers' timeout, captured by the interceptor, counts.
+    for trailer in ["10000m", "bogus", "1m"] {
+        let stream = UnixStream::connect(&socket).await.unwrap();
+        let (sender, connection) = h2::client::handshake(stream).await.unwrap();
+        let connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut sender = sender.ready().await.unwrap();
+        let headers = http::Request::builder()
+            .method("POST")
+            .uri("http://kilnd.invalid/kilnd.v1.KilndService/CreateSandbox")
+            .version(http::Version::HTTP_2)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("grpc-timeout", "300m")
+            .body(())
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let (response, mut send) = sender.send_request(headers, false).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send.send_data(body.clone(), false).unwrap();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-timeout", trailer.parse().unwrap());
+        send.send_trailers(trailers).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("no response headers")
+            .unwrap();
+        let (parts, mut response_body) = response.into_parts();
+        let mut fields = parts.headers;
+        if !response_body.is_end_stream() {
+            while let Some(chunk) = response_body.data().await {
+                chunk.unwrap();
+            }
+            if let Some(trailers) = response_body.trailers().await.unwrap() {
+                fields.extend(trailers);
+            }
+        }
+        let elapsed = started.elapsed();
+        let field = |name: &str| fields.get(name).map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            field("grpc-status").as_deref(),
+            Some("4"),
+            "trailer {trailer}: {fields:?}"
+        );
+        assert_eq!(
+            field("kilnd-reason").as_deref(),
+            Some("create_in_flight"),
+            "trailer {trailer}: {fields:?}"
+        );
+        // The headers' 300 ms less its 15 ms margin, from the headers' arrival.
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_millis(1500),
+            "trailer {trailer}: {elapsed:?}"
         );
         connection.abort();
     }

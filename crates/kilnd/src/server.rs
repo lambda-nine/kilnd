@@ -37,22 +37,34 @@ use crate::sys::socket::{
 const FINAL_WAIT: Duration = Duration::from_secs(10);
 const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// When a request's HTTP/2 headers reached the service, attached by the server before
-/// any of its body is read or decoded. tonic starts the caller's `grpc-timeout` at
-/// the same point, so deadlines derived from it must start here too, not when the
-/// handler runs after a slow body (break-it M2 MEDIUM 1). Clients cannot set it.
+/// When a request's HTTP/2 headers reached the service, and the `grpc-timeout` those
+/// headers carried, attached by the server before any of its body is read or decoded.
+/// tonic starts the caller's timeout at that point from those headers, so deadlines
+/// derived from it must start there and use that value too: not the handler's time
+/// after a slow body (break-it M2 MEDIUM 1), and not request metadata, which tonic
+/// merges with the request's trailers (M2 recheck MEDIUM 1). `timeout` is `None` when
+/// the headers had none, or a malformed one. Clients cannot set the extension.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct HeadersReceived(pub(crate) tokio::time::Instant);
+pub(crate) struct HeadersReceived {
+    pub(crate) at: tokio::time::Instant,
+    pub(crate) timeout: Option<Duration>,
+}
 
 // An interceptor runs when the server calls the service for a request: on its
-// headers, with its body still unread.
+// headers, with its body still unread and its trailers not yet merged.
 #[allow(clippy::result_large_err)]
 fn stamp_headers_received(
     mut request: tonic::Request<()>,
 ) -> Result<tonic::Request<()>, tonic::Status> {
-    request
-        .extensions_mut()
-        .insert(HeadersReceived(tokio::time::Instant::now()));
+    let timeout = request
+        .metadata()
+        .get("grpc-timeout")
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::service::parse_grpc_timeout);
+    request.extensions_mut().insert(HeadersReceived {
+        at: tokio::time::Instant::now(),
+        timeout,
+    });
     Ok(request)
 }
 
@@ -1077,6 +1089,8 @@ mod tests {
             async move {
                 manager
                     .exec(ExecRequest {
+                        cwd: String::new(),
+                        env: Vec::new(),
                         sandbox_id: sandbox.id,
                         argv: vec!["sleep".into()],
                         stdin: vec![],
@@ -1144,6 +1158,8 @@ mod tests {
             async move {
                 manager
                     .exec(ExecRequest {
+                        cwd: String::new(),
+                        env: Vec::new(),
                         sandbox_id,
                         argv: vec!["echo".into(), "completed".into()],
                         stdin: vec![],

@@ -532,6 +532,11 @@ pub enum RuntimeReceipt {
 pub struct CreatedSandbox {
     pub backend_id: String,
     pub receipt: RuntimeReceipt,
+    /// The new sandbox's exec runtime feature bits (kiln: what its PID 1 advertises, the
+    /// creating CLI's build), recorded at READY publication and checked before an
+    /// execution with exec options (API additions design 4.1). `None`: unknown, so no
+    /// options; every Firecracker sandbox.
+    pub exec_features: Option<u32>,
 }
 
 /// One allocation-token lookup. `Unsupported` and `Unknown` are not absence.
@@ -656,8 +661,9 @@ pub trait Runtime: Send + Sync + 'static {
 
     /// The dynamic API features (design section 1) the installed backend proves now,
     /// read in the shared Health probe. An error, or any result short of fresh proof,
-    /// withdraws every dynamic feature until the next success. No backend proves any
-    /// before exec options and live output exist.
+    /// withdraws every dynamic feature until the next success. kiln proves exec cwd,
+    /// env and sandbox default env together when its CLI advertises exec options (bit
+    /// 0x20) and the helper can deliver them; Firecracker proves none.
     fn proven_features(
         &self,
         _deadline: Instant,
