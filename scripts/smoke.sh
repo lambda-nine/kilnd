@@ -48,7 +48,7 @@ cleanup() {
     if [[ -n "$api_tmp" && -d "$api_tmp" ]]; then
         rm -f "$api_tmp/exit125.out" "$api_tmp/exit125.err" \
             "$api_tmp/signal15.out" "$api_tmp/signal15.err" \
-            "$api_tmp/launch.out" "$api_tmp/launch.err"
+            "$api_tmp/launch.out" "$api_tmp/launch.err" "$api_tmp/stream.err"
         rmdir "$api_tmp"
     fi
 }
@@ -470,8 +470,10 @@ PY
 [ ! -s "$api_tmp/stream.err" ] || fail "a clean stream printed notes: $(cat "$api_tmp/stream.err")"
 out=$(ctl exec --stream "$streamed" -- head -c 5000000 /dev/zero | wc -c)
 [ "$out" -le 5000000 ] || fail "streamed more than was written: $out"
-ctl execution "$(ctl get "$streamed" | awk '/^ *ex-/{print $1; exit}')" 2>&1 \
-    | grep -q '^mode: *stream' || fail "stream mode not shown"
+# Only the metadata (stderr): the stored output is binary zeros. Captured whole, so
+# grep -q exiting early cannot fail the pipeline under pipefail.
+meta=$(ctl execution "$(ctl get "$streamed" | awk '/^ *ex-/{print $1; exit}')" 2>&1 >/dev/null)
+grep -q '^mode: *stream' <<<"$meta" || fail "stream mode not shown: $meta"
 ctl rm "$streamed" >/dev/null
 
 ctl health | grep -q '^active sandboxes: *0' || fail "smoke test left active sandboxes"
