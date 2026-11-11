@@ -28,3 +28,4 @@ pub mod helper;
 
 /// Phase 1b frozen byte and execution-spec contract; production launch is disabled.
 pub mod firecracker;
+pub mod idempotency;

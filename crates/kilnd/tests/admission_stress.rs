@@ -694,7 +694,11 @@ async fn admission_resource_bounds_plateau_and_recover() {
 
     let mut create_client = client.clone();
     let sandbox_id = create_client
-        .create_sandbox(pb::CreateSandboxRequest { spec: None, expiry: None })
+        .create_sandbox(pb::CreateSandboxRequest {
+            spec: None,
+            expiry: None,
+            request_id: String::new(),
+        })
         .await
         .unwrap()
         .into_inner()
@@ -756,7 +760,10 @@ async fn admission_resource_bounds_plateau_and_recover() {
     assert!(stats.rejected_sandbox_execs >= 25);
     client
         .clone()
-        .delete_sandbox(pb::DeleteSandboxRequest { id: sandbox_id })
+        .delete_sandbox(pb::DeleteSandboxRequest {
+            id: sandbox_id,
+            release_request_id: false,
+        })
         .await
         .unwrap();
     drop(client);

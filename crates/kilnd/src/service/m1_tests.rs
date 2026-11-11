@@ -51,7 +51,7 @@ fn service(
 
 async fn create(s: &Service<FakeRuntime>, expiry: Option<pb::ExpiryPolicy>) -> pb::Sandbox {
     s.create_sandbox(as_uid(
-        pb::CreateSandboxRequest { spec: None, expiry },
+        pb::CreateSandboxRequest { request_id: String::new(), spec: None, expiry },
         1000,
     ))
     .await
@@ -121,7 +121,9 @@ async fn health_lists_static_features_and_every_m1_limit() {
         caps.features,
         vec![
             pb::Feature::SandboxExpiry as i32,
-            pb::Feature::TypedReasons as i32
+            pb::Feature::IdempotentCreate as i32,
+            pb::Feature::TypedReasons as i32,
+            pb::Feature::RequestIdRelease as i32
         ]
     );
     let limits = caps.limits.unwrap();
@@ -134,8 +136,9 @@ async fn health_lists_static_features_and_every_m1_limit() {
     assert_eq!(limits.default_exec_timeout_ms, 60_000);
     assert_eq!(limits.max_exec_timeout_ms, 3_600_000);
     assert_eq!(limits.max_output_bytes, 1 << 20);
+    // Milestone 2 lists idempotent create, so its retention is advertised.
+    assert_eq!(limits.create_request_retention_ms, 86_400_000);
     // Features this daemon does not list have zero limits.
-    assert_eq!(limits.create_request_retention_ms, 0);
     assert_eq!(limits.max_env_entries, 0);
     assert_eq!(limits.max_stream_timeout_ms, 0);
     let lifecycle = health.lifecycle.unwrap();
@@ -347,7 +350,7 @@ async fn create_reports_the_effective_policy_and_both_deadlines() {
     assert!(!expiry.idle_paused);
     let refused = s
         .create_sandbox(as_uid(
-            pb::CreateSandboxRequest {
+            pb::CreateSandboxRequest { request_id: String::new(),
                 spec: None,
                 expiry: Some(pb::ExpiryPolicy {
                     max_lifetime_ms: 9_999,
@@ -403,7 +406,7 @@ async fn an_old_client_sees_no_behavior_change() {
     assert_eq!(fake.state().removed.len(), 0);
     let deleted = s
         .delete_sandbox(as_uid(
-            pb::DeleteSandboxRequest { id: old.id.clone() },
+            pb::DeleteSandboxRequest { release_request_id: false, id: old.id.clone() },
             1000,
         ))
         .await

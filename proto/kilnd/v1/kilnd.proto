@@ -20,8 +20,15 @@ service KilndService {
   // SANDBOX_STATE_DELETING so deletion can be retried. Canceling or timing out
   // the RPC only stops waiting: an accepted create continues to READY or
   // compensates its backend resource. Retrying is not idempotent and may
-  // create another sandbox. An expiry policy, if sent, is resolved once here and
-  // never changes; without one the sandbox never expires.
+  // create another sandbox, unless request_id is set (FEATURE_IDEMPOTENT_CREATE):
+  // then the original call and every retry with the same request_id and an equal
+  // request return OK with the same sandbox, in whatever state it has settled,
+  // FAILED and DELETED included. A different request under a used request_id
+  // fails ALREADY_EXISTS (kilnd-reason request_id_conflict); a retry whose
+  // deadline passes while the original is still running fails DEADLINE_EXCEEDED
+  // (create_in_flight); a caller at its request-record cap fails
+  // RESOURCE_EXHAUSTED (request_id_quota). An expiry policy, if sent, is
+  // resolved once here and never changes; without one the sandbox never expires.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
   // Returns one sandbox and its most recent executions.
@@ -34,7 +41,9 @@ service KilndService {
 
   // Removes a sandbox. A running execution in it is canceled first.
   // Deleting a deleted sandbox succeeds, including one that expired; the
-  // first delete intent's deletion_reason is kept.
+  // first delete intent's deletion_reason is kept. With release_request_id
+  // (FEATURE_REQUEST_ID_RELEASE), a sandbox that ends DELETED also gives up its
+  // create request record, irreversibly.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
   // Runs a command in a ready sandbox and waits for it. Executions in one
@@ -101,9 +110,9 @@ message LifecycleStats {
   uint32 pending_expiry_deletes = 3;
   // Expiry removal attempts that failed and will be retried.
   uint64 failed_expiry_deletes = 4;
-  // Reserved for idempotent create; zero until FEATURE_IDEMPOTENT_CREATE.
+  // Keyed creates answered from an existing request record.
   uint64 create_retries_answered = 5;
-  // Reserved for request-ID release; zero until FEATURE_REQUEST_ID_RELEASE.
+  // Request records given up through DeleteSandboxRequest.release_request_id.
   uint64 request_ids_released = 6;
 }
 
@@ -117,6 +126,8 @@ enum Feature {
   // CreateSandboxRequest.expiry, RenewSandbox, Sandbox.expiry and
   // deletion_reason, Execution.cancel_reason.
   FEATURE_SANDBOX_EXPIRY = 1;
+  // CreateSandboxRequest.request_id, Sandbox.request_id, the create request
+  // counts in AdmissionStats and ApiLimits.create_request_retention_ms.
   FEATURE_IDEMPOTENT_CREATE = 2;
   FEATURE_EXEC_CWD = 3;
   FEATURE_EXEC_ENV = 4;
@@ -125,6 +136,7 @@ enum Feature {
   // Refusals carry a `kilnd-reason: <token>` trailer, and their message starts
   // with the same token and ": ". Match the trailer, not the prose.
   FEATURE_TYPED_REASONS = 7;
+  // DeleteSandboxRequest.release_request_id and Sandbox.request_id_released.
   FEATURE_REQUEST_ID_RELEASE = 8;
 }
 
@@ -138,6 +150,8 @@ message ApiLimits {
   // Used only for a zero field of a present ExpiryPolicy. 0: never expires.
   uint64 default_sandbox_lifetime_ms = 3;
   uint64 default_sandbox_idle_ms = 4;
+  // The least time a create request record is kept, measured on the boot clock.
+  // A record whose sandbox is not DELETED or released FAILED is kept longer.
   uint64 create_request_retention_ms = 5;
   uint32 max_cwd_bytes = 6;
   uint32 max_env_entries = 7;
@@ -237,6 +251,15 @@ message AdmissionStats {
   uint64 rejected_stdin = 15;
   uint64 max_queued_execs_per_sandbox = 16;
   uint64 rejected_sandbox_execs = 17;
+  // Fields 18-20 are reserved for ExecStream admission.
+  // Retained create request records (FEATURE_IDEMPOTENT_CREATE): the node cap and
+  // count, the per-uid cap and the calling uid's own count, and keyed creates
+  // refused request_id_quota since startup.
+  uint64 max_create_requests = 21;
+  uint64 current_create_requests = 22;
+  uint64 max_create_requests_per_uid = 23;
+  uint64 caller_create_requests = 24;
+  uint64 rejected_create_requests = 25;
 }
 
 enum SandboxState {
@@ -350,6 +373,13 @@ message Sandbox {
   ExpiryStatus expiry = 14;
   // Why it is DELETING or DELETED. Unspecified on history from before expiry.
   DeletionReason deletion_reason = 15;
+  // The create's request_id; empty for an unkeyed create. Kept after its
+  // record is released or pruned.
+  string request_id = 16;
+  // Fields 17 and 18 are reserved for sandbox default env.
+  // The create request record was given up through release_request_id: a new
+  // create with request_id makes a new sandbox.
+  bool request_id_released = 19;
 }
 
 // Sent: each nonzero field is used as given; it must be at least 10 s
@@ -399,7 +429,12 @@ message RenewSandboxResponse {
 
 message CreateSandboxRequest {
   SandboxSpec spec = 1;
-  // Field 2 is reserved for idempotent create.
+  // Empty: not idempotent, as before. Otherwise 1-64 bytes, each 0x21-0x7e
+  // (printable ASCII, no space), scoped to the caller's uid. The record is kept
+  // at least ApiLimits.create_request_retention_ms after the create, and for as
+  // long as its sandbox is not DELETED or released FAILED. Needs
+  // FEATURE_IDEMPOTENT_CREATE.
+  string request_id = 2;
   // Absent: never expires. Needs FEATURE_SANDBOX_EXPIRY.
   ExpiryPolicy expiry = 3;
 }
@@ -423,7 +458,9 @@ message GetSandboxResponse {
 }
 
 message ListSandboxesRequest {
-  // Also return DELETED sandboxes.
+  // Also return DELETED sandboxes. An expired or deleted sandbox leaves the
+  // default listing only once its removal completes: while DELETING it is still
+  // listed.
   bool include_deleted = 1;
   // Absent preserves complete-list semantics; present zero uses the default.
   optional uint32 page_size = 2;
@@ -438,6 +475,14 @@ message ListSandboxesResponse {
 message DeleteSandboxRequest {
   // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string id = 1;
+  // Drop the create request record if the sandbox ends DELETED, in the same
+  // transaction that sees it DELETED; otherwise nothing is released and nothing
+  // is remembered, so repeat the call. Irreversible: it ends retry protection
+  // for the key, and a later create with it makes a new sandbox. Set it only
+  // while holding the create response for that key, with no create retry
+  // pending or to come. No record (unkeyed, released or pruned): a no-op.
+  // Needs FEATURE_REQUEST_ID_RELEASE.
+  bool release_request_id = 2;
 }
 
 message DeleteSandboxResponse {

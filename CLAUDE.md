@@ -39,7 +39,8 @@ through its CLI. Read [README.md](README.md),
   `scripts/state-path-regressions.sh`,
   `sudo python3 -I scripts/phase0-regressions.py`, `scripts/smoke.sh` and, for
   anything touching expiry, the manager's delete path or the clocks,
-  `scripts/expiry-regressions.sh`. Changes to
+  `scripts/expiry-regressions.sh`, and for anything touching create, request
+  records or retention, `scripts/idempotent-create-regressions.sh`. Changes to
   `install.sh`, `add-instance.sh`, `upgrade.sh`, `kilnd-maintenance.py` or the units also run
   `sudo python3 -I scripts/deployment-regressions.py` between two builds, and its
   `--reboot-arm` and `--reboot-verify` around a real reboot of the VM.

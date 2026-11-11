@@ -984,8 +984,10 @@ async fn dynamic_features_fail_closed_and_return_only_after_a_fresh_probe() {
         health.features,
         vec![
             Feature::SandboxExpiry,
+            Feature::IdempotentCreate,
             Feature::ExecCwd,
-            Feature::TypedReasons
+            Feature::TypedReasons,
+            Feature::RequestIdRelease
         ]
     );
     assert!(m.has_feature(Feature::ExecCwd));

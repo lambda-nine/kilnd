@@ -127,7 +127,7 @@ async fn many_socket_clients_share_one_serialized_delete() {
     let first_id = sandbox_id.clone();
     let first = tokio::spawn(async move {
         first_client
-            .delete_sandbox(pb::DeleteSandboxRequest { id: first_id })
+            .delete_sandbox(pb::DeleteSandboxRequest { release_request_id: false, id: first_id })
             .await
             .unwrap()
             .into_inner()
@@ -142,7 +142,7 @@ async fn many_socket_clients_share_one_serialized_delete() {
         let id = sandbox_id.clone();
         queued.push(tokio::spawn(async move {
             delete_client
-                .delete_sandbox(pb::DeleteSandboxRequest { id })
+                .delete_sandbox(pb::DeleteSandboxRequest { release_request_id: false, id })
                 .await
                 .unwrap()
                 .into_inner()
@@ -373,7 +373,7 @@ async fn every_rpc_over_the_socket() {
         ..Default::default()
     };
     let sandbox = c
-        .create_sandbox(pb::CreateSandboxRequest {
+        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
             spec: Some(spec),
             expiry: None,
         })
@@ -442,7 +442,7 @@ async fn every_rpc_over_the_socket() {
     assert_eq!(listed.sandboxes.len(), 1);
 
     let deleted = c
-        .delete_sandbox(pb::DeleteSandboxRequest {
+        .delete_sandbox(pb::DeleteSandboxRequest { release_request_id: false,
             id: sandbox.id.clone(),
         })
         .await
@@ -528,7 +528,7 @@ async fn every_rpc_over_the_socket() {
         ..Default::default()
     };
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest {
+        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
             spec: Some(mixed),
             expiry: None,
         })
@@ -537,7 +537,7 @@ async fn every_rpc_over_the_socket() {
     assert_eq!(err.code(), Code::InvalidArgument);
     fake.state().fail_create = Some("no image".into());
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest {
+        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -562,7 +562,7 @@ async fn every_rpc_over_the_socket() {
         backend.fail_create_definitely = Some("image missing".into());
     }
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest {
+        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -591,7 +591,7 @@ async fn every_rpc_over_the_socket() {
         .unwrap()
         .id;
     let deleted = c
-        .delete_sandbox(pb::DeleteSandboxRequest { id })
+        .delete_sandbox(pb::DeleteSandboxRequest { release_request_id: false, id })
         .await
         .unwrap()
         .into_inner()
@@ -635,7 +635,7 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
     ));
     let mut c = client(path).await;
     let oversize = c
-        .create_sandbox(pb::CreateSandboxRequest {
+        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
             spec: Some(pb::SandboxSpec {
                 labels: [("test".into(), "x".repeat(256))].into(),
                 ..Default::default()
@@ -650,7 +650,7 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
     // The response cap can fail only after a successful owned operation.
     // Its durable result is still inspectable and is not compensated away.
     let response = c
-        .create_sandbox(pb::CreateSandboxRequest {
+        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
             spec: Some(pb::SandboxSpec {
                 labels: [("test".into(), "x".repeat(70))].into(),
                 ..Default::default()
@@ -699,7 +699,7 @@ async fn ownership_comes_from_the_kernel_credentials_of_the_socket() {
     let mut c = client(socket.clone()).await;
 
     let mine = c
-        .create_sandbox(pb::CreateSandboxRequest {
+        .create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -797,7 +797,7 @@ async fn ownership_comes_from_the_kernel_credentials_of_the_socket() {
             Code::NotFound
         );
         assert_eq!(
-            c.delete_sandbox(pb::DeleteSandboxRequest {
+            c.delete_sandbox(pb::DeleteSandboxRequest { release_request_id: false,
                 id: foreign.id.clone()
             })
             .await
@@ -964,7 +964,7 @@ async fn graceful_shutdown_drains_a_create_after_its_rpc_disconnects() {
     ));
     let mut c = client(socket.clone()).await;
     let request = tokio::spawn(async move {
-        c.create_sandbox(pb::CreateSandboxRequest {
+        c.create_sandbox(pb::CreateSandboxRequest { request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -1253,4 +1253,168 @@ fn socket_cleanup_leaves_a_replacement_inode_untouched() {
     );
     assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
     drop(replacement);
+}
+
+fn reason(status: &tonic::Status) -> Option<String> {
+    status
+        .metadata()
+        .get("kilnd-reason")
+        .map(|v| v.to_str().unwrap().to_string())
+}
+
+/// API additions M2 over a real socket: the client's own gRPC deadline reaches the
+/// handler, so a retry of a create still in flight is told `create_in_flight` before
+/// its transport gives up; a retry without one waits and gets the original's answer;
+/// release frees the key.
+#[tokio::test]
+async fn idempotent_create_over_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = tmp.path().join("run/kilnd.sock");
+    let fake = FakeRuntime::default();
+    let manager = Arc::new(Manager::new(
+        fake.clone(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        Limits::default(),
+    ));
+    let listener = kilnd::server::bind(&socket, None).await.unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(kilnd::server::serve(
+        manager,
+        listener,
+        async {
+            let _ = stop_rx.await;
+        },
+        Duration::from_millis(200),
+    ));
+    let request = |labels: &[(&str, &str)]| pb::CreateSandboxRequest {
+        request_id: "run-1/task-2".into(),
+        spec: Some(pb::SandboxSpec {
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let gate = FakeGate::default();
+    fake.state().create_after_allocation = Some(gate.clone());
+    let mut original_client = client(socket.clone()).await;
+    let original_request = request(&[("a", "1"), ("b", "2")]);
+    let original = tokio::spawn(async move {
+        original_client
+            .create_sandbox(original_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .sandbox
+            .unwrap()
+    });
+    gate.entered().await;
+
+    let mut c = client(socket.clone()).await;
+    let mut timed = tonic::Request::new(request(&[("b", "2"), ("a", "1")]));
+    timed.set_timeout(Duration::from_millis(400));
+    let late = c.create_sandbox(timed).await.unwrap_err();
+    assert_eq!(late.code(), Code::DeadlineExceeded, "{late:?}");
+    assert_eq!(reason(&late).as_deref(), Some("create_in_flight"));
+    assert!(late.message().starts_with("create_in_flight: "));
+
+    let conflict = c
+        .create_sandbox(request(&[("a", "other")]))
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), Code::AlreadyExists);
+    assert_eq!(reason(&conflict).as_deref(), Some("request_id_conflict"));
+
+    let mut waiting_client = client(socket.clone()).await;
+    let waiting = tokio::spawn(async move {
+        waiting_client
+            .create_sandbox(request(&[("a", "1"), ("b", "2")]))
+            .await
+            .unwrap()
+            .into_inner()
+            .sandbox
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.release();
+    let original = original.await.unwrap();
+    let waited = waiting.await.unwrap();
+    assert_eq!(original.request_id, "run-1/task-2");
+    assert_eq!(waited.id, original.id);
+    assert_eq!(fake.state().created.len(), 1);
+
+    let invalid = c
+        .create_sandbox(pb::CreateSandboxRequest {
+            request_id: "has space".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(invalid.code(), Code::InvalidArgument);
+
+    let health = c
+        .health(pb::HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let admission = health.admission.unwrap();
+    assert_eq!(
+        (
+            admission.max_create_requests,
+            admission.current_create_requests,
+            admission.max_create_requests_per_uid,
+            admission.caller_create_requests,
+            admission.rejected_create_requests
+        ),
+        (32_768, 1, 4096, 1, 0)
+    );
+    let lifecycle = health.lifecycle.unwrap();
+    assert_eq!(lifecycle.create_retries_answered, 1);
+    let capabilities = health.runtime_capabilities.unwrap();
+    assert!(
+        capabilities
+            .features
+            .contains(&(pb::Feature::IdempotentCreate as i32))
+    );
+    assert!(
+        capabilities
+            .features
+            .contains(&(pb::Feature::RequestIdRelease as i32))
+    );
+    assert_eq!(
+        capabilities.limits.unwrap().create_request_retention_ms,
+        86_400_000
+    );
+
+    let released = c
+        .delete_sandbox(pb::DeleteSandboxRequest {
+            id: original.id.clone(),
+            release_request_id: true,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_eq!(released.state, pb::SandboxState::Deleted as i32);
+    assert!(released.request_id_released);
+    assert_eq!(released.request_id, "run-1/task-2");
+    let fresh = c
+        .create_sandbox(request(&[("a", "1"), ("b", "2")]))
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_ne!(fresh.id, original.id);
+    assert!(!fresh.request_id_released);
+    let health = c.health(pb::HealthRequest {}).await.unwrap().into_inner();
+    assert_eq!(health.lifecycle.unwrap().request_ids_released, 1);
+
+    drop(c);
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
 }

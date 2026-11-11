@@ -164,6 +164,17 @@ struct Args {
     /// that follow one (1 to 16).
     #[arg(long, default_value_t = 4)]
     max_concurrent_expiry_deletes: usize,
+    /// The least time a create request record is kept, measured on the boot clock, in
+    /// seconds (at least 86400). A record whose sandbox is not DELETED or released
+    /// FAILED is kept longer, and pruning waits a further 0.1 %.
+    #[arg(long, default_value_t = 86_400)]
+    create_request_retention_secs: u64,
+    /// Create request records one uid may hold at once (below --max-create-requests).
+    #[arg(long, default_value_t = 4096)]
+    max_create_requests_per_uid: u64,
+    /// Create request records the node holds at once.
+    #[arg(long, default_value_t = 32_768)]
+    max_create_requests: u64,
     /// On SIGTERM, how long running requests may finish before executions are
     /// canceled, in seconds.
     #[arg(long, default_value_t = 30)]
@@ -410,6 +421,13 @@ async fn serve_with<R: Runtime>(
     if rebased != 0 {
         info!(rows = rebased, "rebased expiry clocks from an earlier boot");
     }
+    // Design 3.3 R2: before admission, any prune and any keyed lookup.
+    let rebased = manager
+        .rebase_create_requests()
+        .context("rebase create request records from an earlier boot")?;
+    if rebased != 0 {
+        info!(records = rebased, "gave create request records from an earlier boot a fresh retention window");
+    }
     manager.prune().context("startup history prune")?;
     let expiry_task = manager.start_expiry().context("start the expiry sweeper")?;
     let prune_manager = manager.clone();
@@ -566,6 +584,11 @@ fn validated_limits(args: &Args) -> Result<Limits> {
             sandbox_max_count: args.deleted_sandbox_max_count,
             prune_interval_secs: args.prune_interval_secs,
             output_storage: args.output_storage,
+            create_request_retention_secs: args.create_request_retention_secs,
+        },
+        create_requests: kilnd::manager::CreateRequestLimits {
+            max_per_uid: args.max_create_requests_per_uid,
+            max_node: args.max_create_requests,
         },
         default_timeout: Duration::from_secs(args.default_timeout_secs),
         max_timeout: Duration::from_secs(args.max_timeout_secs),
@@ -612,6 +635,7 @@ fn validated_limits(args: &Args) -> Result<Limits> {
         ..Limits::default()
     };
     validate_expiry(&limits.expiry, args)?;
+    validate_create_requests(&limits, args)?;
     for (name, value) in [
         ("max-connections", limits.max_connections),
         ("reserved-connections", limits.reserved_connections),
@@ -767,6 +791,30 @@ fn secs_ms(secs: u64, name: &str) -> Result<u64> {
 }
 
 /// Design section 7's expiry rules, checked before any state is opened.
+/// Design section 7: retention at least a day, measured with its margin in a signed
+/// millisecond range; nonzero caps, the per-uid cap below the node's.
+fn validate_create_requests(limits: &Limits, args: &Args) -> Result<()> {
+    let min = kilnd::retention::MIN_CREATE_REQUEST_RETENTION_SECS;
+    if args.create_request_retention_secs < min {
+        bail!("--create-request-retention-secs must be at least {min}");
+    }
+    if kilnd::retention::create_request_prune_age_ms(args.create_request_retention_secs).is_none()
+    {
+        bail!("--create-request-retention-secs exceeds the boot clock range");
+    }
+    let caps = limits.create_requests;
+    if caps.max_per_uid == 0 || caps.max_node == 0 {
+        bail!("--max-create-requests-per-uid and --max-create-requests must be nonzero");
+    }
+    if caps.max_per_uid >= caps.max_node {
+        bail!("--max-create-requests-per-uid must be below --max-create-requests");
+    }
+    if i64::try_from(caps.max_node).is_err() {
+        bail!("--max-create-requests exceeds the stored range");
+    }
+    Ok(())
+}
+
 fn validate_expiry(e: &kilnd::expiry::ExpiryLimits, args: &Args) -> Result<()> {
     let min = kilnd::expiry::MIN_EXPIRY_MS;
     for (name, max, default) in [
@@ -969,6 +1017,46 @@ mod tests {
             (
                 &["--max-sandbox-lifetime-secs", "18446744073709551615"],
                 false,
+            ),
+        ] {
+            let mut full = vec!["kilnd"];
+            full.extend_from_slice(argv);
+            let args = Args::try_parse_from(full).unwrap();
+            assert_eq!(validated_limits(&args).is_ok(), ok, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn create_request_flags_default_to_the_design_and_are_validated_before_state() {
+        let args = Args::try_parse_from(["kilnd"]).unwrap();
+        let limits = validated_limits(&args).unwrap();
+        assert_eq!(limits.retention.create_request_retention_secs, 86_400);
+        assert_eq!(
+            limits.create_requests,
+            kilnd::manager::CreateRequestLimits {
+                max_per_uid: 4096,
+                max_node: 32_768,
+            }
+        );
+        for (argv, ok) in [
+            (&["--create-request-retention-secs", "86399"][..], false),
+            (&["--create-request-retention-secs", "604800"], true),
+            (
+                &["--create-request-retention-secs", "18446744073709551615"],
+                false,
+            ),
+            (&["--max-create-requests-per-uid", "0"], false),
+            (&["--max-create-requests", "0"], false),
+            (&["--max-create-requests-per-uid", "32768"], false),
+            (&["--max-create-requests-per-uid", "32767"], true),
+            (
+                &[
+                    "--max-create-requests-per-uid",
+                    "20480",
+                    "--max-create-requests",
+                    "65536",
+                ],
+                true,
             ),
         ] {
             let mut full = vec!["kilnd"];

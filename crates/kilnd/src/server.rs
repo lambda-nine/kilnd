@@ -928,7 +928,7 @@ mod tests {
             .await
             .unwrap();
         reserved
-            .delete_sandbox(pb::DeleteSandboxRequest { id })
+            .delete_sandbox(pb::DeleteSandboxRequest { release_request_id: false, id })
             .await
             .unwrap();
         // The UID's share and its reserved slot are both held: the next is closed.

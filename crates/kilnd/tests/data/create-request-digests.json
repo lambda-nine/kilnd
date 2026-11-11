@@ -1,0 +1,170 @@
+{
+  "comment": "Golden digests for CreateSandboxRequest.request_id (kilnd API additions design section 3). request_sha256 = SHA-256(\"kilnd.v1.create-request.1\" || 0x00 || canonical_json). request_id is not hashed. Clients that recompute digests test against this file.",
+  "domain": "kilnd.v1.create-request.1",
+  "cases": [
+    {
+      "name": "empty request",
+      "request": {
+        "request_id": "k"
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":null,\"spec\":{\"image\":\"\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":0},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "916e07019c62a39442216862b6506e7226386ecfb5219e61e77d9cca14b9b975"
+    },
+    {
+      "name": "empty request, different request_id",
+      "request": {
+        "request_id": "another-key"
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":null,\"spec\":{\"image\":\"\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":0},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "916e07019c62a39442216862b6506e7226386ecfb5219e61e77d9cca14b9b975"
+    },
+    {
+      "name": "present all-zero expiry",
+      "request": {
+        "request_id": "k",
+        "expiry": {}
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":{\"idle_timeout_ms\":0,\"max_lifetime_ms\":0},\"spec\":{\"image\":\"\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":0},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "04cd1606810098caeffcde06a51e7c5d460113d9801d826d3cc1d574d4293f8f"
+    },
+    {
+      "name": "harness create, network none, no expiry",
+      "request": {
+        "request_id": "run-7f3a/task-12/attempt-1",
+        "spec": {
+          "image": "alpine",
+          "limits": {
+            "memory_bytes": 536870912,
+            "cpu_millis": 1000,
+            "pids": 128,
+            "disk_bytes": 1073741824
+          },
+          "network": {
+            "mode": 1
+          },
+          "read_only_root": false,
+          "writable_paths": [],
+          "labels": {
+            "kiln-harness.run": "run-7f3a",
+            "kiln-harness.task": "task-12"
+          }
+        }
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":null,\"spec\":{\"image\":\"alpine\",\"labels\":{\"kiln-harness.run\":\"run-7f3a\",\"kiln-harness.task\":\"task-12\"},\"limits\":{\"cpu_millis\":1000,\"disk_bytes\":1073741824,\"memory_bytes\":536870912,\"pids\":128},\"network\":{\"allow\":[],\"mode\":1},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "ea204f08849a589f236121efee673a8ca2ae7e015ec79f0bd3f44a99e6fb0eb1"
+    },
+    {
+      "name": "harness create with both expiry fields",
+      "request": {
+        "request_id": "run-7f3a/task-12/attempt-1",
+        "spec": {
+          "image": "alpine",
+          "limits": {
+            "memory_bytes": 536870912,
+            "cpu_millis": 1000,
+            "pids": 128,
+            "disk_bytes": 1073741824
+          },
+          "network": {
+            "mode": 1
+          },
+          "read_only_root": false,
+          "writable_paths": [],
+          "labels": {
+            "kiln-harness.run": "run-7f3a",
+            "kiln-harness.task": "task-12"
+          }
+        },
+        "expiry": {
+          "max_lifetime_ms": 3600000,
+          "idle_timeout_ms": 600000
+        }
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":{\"idle_timeout_ms\":600000,\"max_lifetime_ms\":3600000},\"spec\":{\"image\":\"alpine\",\"labels\":{\"kiln-harness.run\":\"run-7f3a\",\"kiln-harness.task\":\"task-12\"},\"limits\":{\"cpu_millis\":1000,\"disk_bytes\":1073741824,\"memory_bytes\":536870912,\"pids\":128},\"network\":{\"allow\":[],\"mode\":1},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "1c1256ab3bfc410dfe829b1d9b6c6a9070a0ab772c4556571416f9a706b3a498"
+    },
+    {
+      "name": "allowlist network keeps allow order",
+      "request": {
+        "request_id": "k",
+        "spec": {
+          "image": "alpine",
+          "network": {
+            "mode": 3,
+            "allow": [
+              "pypi.org:443",
+              "files.pythonhosted.org:443"
+            ]
+          }
+        }
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":null,\"spec\":{\"image\":\"alpine\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[\"pypi.org:443\",\"files.pythonhosted.org:443\"],\"mode\":3},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "455c876473f248aad55e570278a441e5f6489b33e038935f49f9078a078b9de1"
+    },
+    {
+      "name": "read-only root with writable paths in order",
+      "request": {
+        "request_id": "k",
+        "spec": {
+          "image": "alpine",
+          "read_only_root": true,
+          "writable_paths": [
+            "/work",
+            "/tmp"
+          ]
+        }
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":null,\"spec\":{\"image\":\"alpine\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":0},\"read_only_root\":true,\"writable_paths\":[\"/work\",\"/tmp\"]}}",
+      "request_sha256": "4fd4d96c06efa63c54427a4f2fed1078cd11b720488a33f60dae5ca20d45105a"
+    },
+    {
+      "name": "labels sorted, escapes for control, non-ASCII and astral",
+      "request": {
+        "request_id": "k",
+        "spec": {
+          "labels": {
+            "z": "line\nnext\ttab\"q\\b/",
+            "a": "caf\u00e9",
+            "m": "\ud83d\ude00",
+            "ctl": "\u0001"
+          }
+        }
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":null,\"spec\":{\"image\":\"\",\"labels\":{\"a\":\"caf\\u00e9\",\"ctl\":\"\\u0001\",\"m\":\"\\ud83d\\ude00\",\"z\":\"line\\nnext\\ttab\\\"q\\\\b/\"},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":0},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "8037b8397af5349d12911e230d775192d5b8948ef01ffe187f5951c40d68bc82"
+    },
+    {
+      "name": "integer bounds",
+      "request": {
+        "request_id": "k",
+        "spec": {
+          "limits": {
+            "memory_bytes": 18446744073709551615,
+            "cpu_millis": 4294967295,
+            "pids": 4294967295,
+            "disk_bytes": 0
+          }
+        },
+        "expiry": {
+          "max_lifetime_ms": 18446744073709551615,
+          "idle_timeout_ms": 10000
+        }
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":{\"idle_timeout_ms\":10000,\"max_lifetime_ms\":18446744073709551615},\"spec\":{\"image\":\"\",\"labels\":{},\"limits\":{\"cpu_millis\":4294967295,\"disk_bytes\":0,\"memory_bytes\":18446744073709551615,\"pids\":4294967295},\"network\":{\"allow\":[],\"mode\":0},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "589c4cc40d37b464ec925c02483d5239c8de403884a88f578d7d9b96c2514236"
+    },
+    {
+      "name": "unknown network mode is hashed as sent",
+      "request": {
+        "request_id": "k",
+        "spec": {
+          "network": {
+            "mode": 99
+          }
+        }
+      },
+      "canonical_json": "{\"default_env\":[],\"expiry\":null,\"spec\":{\"image\":\"\",\"labels\":{},\"limits\":{\"cpu_millis\":0,\"disk_bytes\":0,\"memory_bytes\":0,\"pids\":0},\"network\":{\"allow\":[],\"mode\":99},\"read_only_root\":false,\"writable_paths\":[]}}",
+      "request_sha256": "81ded3da55f1fac67d8d37e572fa92b49c55ab593e8fde21161bf04ea5912a59"
+    }
+  ]
+}

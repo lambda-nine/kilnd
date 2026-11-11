@@ -94,7 +94,8 @@ coexist in kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`. Older artifacts, inc
 GC, are refused. CLI capability validation
 also requires complete, bounded `gc --help` output advertising `gc [ID]...`,
 within the caller's deadline. It never invokes global GC to test compatibility.
-Privileged verification uses kiln `e48f0e785ad484d0b2947897f6d48d0756059d7e`; setup pins that tested companion.
+That is the minimum revision. Privileged verification uses the tested companion, kiln
+`00d61c546db7aa67ad283d10c2ca6165ca5f8166`, which setup pins.
 Both installed CLI and sandbox PID 1 capabilities are checked before each
 execution, within its existing deadline. A live PID 1 is only asked for the
 execution bits: it never allocates, so a sandbox started by an older CLI stays
@@ -459,8 +460,8 @@ Running it again changes nothing.
 `Health.runtime_capabilities.features` lists what this daemon supports, and
 `limits` (`ApiLimits`) every cap, minimum and default from the API additions design a
 client could hit; a feature that is not listed has zero limits. Features come in
-two sets. The static set is fixed by the code and flags: `SANDBOX_EXPIRY` and
-`TYPED_REASONS` today. The dynamic set is what the backend proves in the shared
+two sets. The static set is fixed by the code and flags: `SANDBOX_EXPIRY`,
+`IDEMPOTENT_CREATE`, `TYPED_REASONS` and `REQUEST_ID_RELEASE` today. The dynamic set is what the backend proves in the shared
 Health probe (`Runtime::proven_features`): it is empty at startup, replaced by each
 successful probe and cleared by any failed or timed-out one, so it fails closed. No
 backend proves a dynamic feature yet (exec cwd, env and streaming come later); the
@@ -469,7 +470,9 @@ daemon lists no features and ignores unknown request fields, so a client sets a
 field only when its feature is listed in a `SERVING` response, and re-reads the
 list after every reconnect. `kilndctl` does this itself: `create` with an expiry
 option and `renew` first read Health and refuse, sending nothing, unless it is
-`SERVING` and lists `SANDBOX_EXPIRY`; a plain `create` sends no Health request.
+`SERVING` and lists `SANDBOX_EXPIRY`; `create --request-id` and
+`rm --release-request-id` do the same for `IDEMPOTENT_CREATE` and
+`REQUEST_ID_RELEASE`; a plain `create` sends no Health request.
 
 Refusals defined by the additions, and the existing "is X, not ready" refusals of
 Exec and RenewSandbox, carry a `kilnd-reason: <token>` metadata entry, and their
@@ -479,7 +482,9 @@ and so is the rest of the message. The tokens are `sandbox_not_ready` (CREATING)
 retained `DELETED` row its deletion reason: `expired_idle`, `expired_lifetime` or
 `sandbox_deleted` (requested, or history from before schema 11). A never-existing,
 foreign or pruned ID stays `NOT_FOUND` with no trailer, so "expired" and "never
-existed" stay distinguishable while the row is retained.
+existed" stay distinguishable while the row is retained. Idempotent create adds
+`request_id_conflict` (`ALREADY_EXISTS`), `request_id_quota` (`RESOURCE_EXHAUSTED`),
+`create_in_flight` (`DEADLINE_EXCEEDED`) and `create_unsettled` (`UNAVAILABLE`).
 
 ## Sandbox expiry
 
@@ -590,6 +595,133 @@ grants a stale delete a fresh window. A crash after an intent commits is complet
 startup like any `DELETING` row, keeping its reason. At shutdown the sweeper stops
 scheduling; removals already running are tracked operations and drain, and waiting
 ones are completed at the next startup.
+
+An expired sandbox leaves the default listing (`ListSandboxes` with
+`include_deleted = false`) only once its removal completes, not at the moment it
+expires: it first passes through `DELETING`, which that listing still shows, and
+disappears from it on reaching `DELETED`. A client that checks absence by listing
+waits for that, as it would after its own Delete.
+
+## Idempotent create
+
+`CreateSandboxRequest.request_id` makes a create retryable. Empty is today's create,
+which is never idempotent. Otherwise it is 1 to 64 bytes, each printable ASCII
+without space (`0x21`-`0x7e`), scoped to the caller's kernel uid (root's are root's
+own), and echoed as `Sandbox.request_id`, which history keeps.
+
+**The request digest** is SHA-256 over `kilnd.v1.create-request.1`, one zero byte and
+the canonical JSON of the request *as sent*, before any default: an object with
+exactly `default_env` (always `[]` until sandbox default env exists), `expiry`
+(`null` when absent, else both fields, so absent and present-with-zeros differ) and
+`spec` (every field, labels as an object, the network mode as its enum number), with
+`request_id` left out. It uses the same canonical JSON contract and encoder as the spec
+digests (sorted keys, fixed escapes, integers only). Hashing the request rather than
+the effective spec keeps a retry matching after an operator changes a node default.
+Proto3 cannot tell an unset scalar or message from its zero value, so neither can
+the digest. `crates/kilnd/tests/data/create-request-digests.json` holds the golden
+cases clients test their own digest code against.
+
+**Order of checks** (`Manager::create_keyed`). The in-flight map, keyed by
+`(owner_uid, request_id)`, holds each registered create's digest and a watch that
+closes when its operation has fully finished: `READY` published, or `FAILED`
+published *and* its fence or compensation done (Firecracker publishes `FAILED`
+before the fence). Steps 2 to 5 run under one mutex with no await between them.
+
+1. The RPC permit, the `request_id` grammar (`INVALID_ARGUMENT`) and the digest.
+2. An in-flight entry: an unequal digest is `ALREADY_EXISTS request_id_conflict`
+   at once; an equal one waits on the watch within the caller's own gRPC deadline
+   (its `grpc-timeout`, less 5 % and at most 250 ms so the typed answer arrives
+   first), else `DEADLINE_EXCEEDED create_in_flight`, then looks again. A waiter
+   holds only a watch subscription; a canceled RPC drops it and leaves nothing.
+3. A stored record, read with its row in one snapshot: an unequal digest is
+   `ALREADY_EXISTS`; an equal one returns the row in its state, `FAILED` and `DELETED`
+   included. A `CREATING` row here has no live operation (only a failed store write
+   mid-create leaves one, which the next start's reconciliation settles) and is
+   `UNAVAILABLE create_unsettled`, never a fresh create. Steps 2 and 3 are answered
+   during shutdown too.
+4. Validation of the converted request (`INVALID_ARGUMENT`), the serving check, and
+   the pending quota: durable records plus keyed creates holding a pending slot must
+   be below both caps, else `RESOURCE_EXHAUSTED request_id_quota`. The slot is an
+   RAII guard returned on every exit, cancellation included, once the admitting
+   transaction has run. It bounds concurrent keyed creates and reserves no ID.
+5. Registration in the in-flight map.
+6. `prepare`, then the existing `IMMEDIATE` admission transaction, which also
+   recounts the durable per-uid and node records (refusing `request_id_quota` at a
+   cap), refuses a key another create already recorded, and inserts the record with
+   the `CREATING` row: both commit or neither does.
+
+Lookup precedes validation, so a retry finds an accepted request even if a node
+limit changed since. A refusal before step 6 commits leaves no record, so a retry is a
+fresh attempt. On Firecracker a retry never reaches `prepare` and takes no helper
+token. If two attempts ever reached the transaction together, the loser would drop
+its plan, which allocated nothing, and answer from step 2.
+
+**The same answer.** Once a keyed create's row commits, the original call and every
+retry return `OK` with the settled row: `READY`, or `FAILED` with its
+`failure_reason` (an unkeyed create still turns a failure after the commit into an
+RPC error, as before). The ID is reserved in the commit that inserts `CREATING`, so a
+crash before it leaves neither and a retry creates normally. After it the result
+depends on the backend. Firecracker binds the allocation to the request, so
+reconciliation finds the VM (`READY`) or proves it absent through the helper ledger
+(a released `FAILED`); a retry returns that row and Delete works. **Legacy kiln**
+ignores the create context, so a row that crashed before its backend ID was
+published has no recoverable identity: reconciliation makes it an ambiguous
+`FAILED`, still charged, which Delete refuses, as for any unkeyed create, and every
+retry returns it. Deleting it would release nothing; the charge stays until an
+operator reconciles the backend. A client may move on with a new request ID, which
+keeps kilnd's accounting right (the charge stays counted) but may leave an orphaned
+kiln sandbox, so it should report the case rather than retry silently. A
+request-bound kiln identity is later work. A crash during compensation leaves
+`DELETING`, completed at startup.
+
+**Records and retention (schema 12).** `create_requests` holds `owner_uid`,
+`request_id`, `request_sha256`, `sandbox_id` (unique, referencing its row),
+`created_at_ms` (display only), `retain_boot_id` and `retain_from_boottime_ms`, with
+the primary key `(owner_uid, request_id)`. Triggers refuse a replace on either key, a
+record for anything but its own new `CREATING` row, any update except the cross-boot
+rebase of the two retention columns, deleting a record whose row is not `DELETED` or
+released `FAILED`, and deleting a row its record pins, even on a connection with
+foreign keys off. `sandboxes` gains `request_id` (fixed at insert) and
+`request_id_released_at_ms` (written once, from `DELETED`, after the record is gone).
+With R = `--create-request-retention-secs` (at least a day):
+
+- A record's retention anchor is this boot's ID and `CLOCK_BOOTTIME` at insert.
+- After reconciliation and before admission, any prune or any keyed lookup, one
+  `IMMEDIATE` transaction gives every record anchored in another boot the current
+  boot and boottime: a fresh, full window, never a wall-clock estimate.
+- Prune deletes a record only if it is anchored in this boot, its row is `DELETED`
+  or released `FAILED`, and R + ⌈R/1000⌉ of boottime has passed. Boottime never steps,
+  counts suspend and runs within NTP's 500 ppm slew, so that takes more than R of real
+  time; a record from another boot cannot be selected until the rebase, which happens
+  later than its create. No step reads the wall clock, so no wall step can shorten or
+  stretch retention, and count caps never prune a record.
+- A row with a record is outside the ordinary age and count prune; it can go only
+  after its record. Release and prune are the only deletes, through one store
+  function that rechecks the row in its own `IMMEDIATE` transaction.
+
+So within R a retry always finds its record and real row and never creates a second
+sandbox. A live, `LOST` or charged row's record is kept however old.
+`--max-create-requests-per-uid` (4,096) and `--max-create-requests` (32,768) bound the
+records; `AdmissionStats` reports the node cap and count, the per-uid cap, the
+caller's own count and quota refusals, `ApiLimits.create_request_retention_ms` is R,
+and `HealthResponse.lifecycle` counts retries answered from a record and releases.
+
+**Opt-in release.** `DeleteSandboxRequest.release_request_id` lets a client give up a
+key it is done with, so records track live work rather than a day of history. Delete
+runs exactly as without it. Only if the row it leaves is `DELETED` does one
+`IMMEDIATE` transaction that sees it `DELETED` delete the record through the prune-safe
+path and stamp `request_id_released_at_ms`, shown as `Sandbox.request_id_released`;
+the row then follows ordinary retention and keeps its `request_id`. A row left
+`DELETING` (a failed removal, or a follower that returned early) releases nothing and
+nothing is remembered: the client repeats the call once absence is confirmed. No
+record (never keyed, already released or pruned) is a no-op, and a row a prune already
+removed is `NOT_FOUND`, which is absence. Owner or root only, like Delete.
+**The contract:** a client sets it only while holding the create response for that
+key, with no retry of that create pending or to come, and after confirming absence.
+After release a create with the key makes a new sandbox; the client takes that
+duplicate risk, because kilnd's retry protection for the key has ended. SQLite
+orders a concurrent retry and the release: a retry that reads the record first
+returns the `DELETED` row, one that reads after creates afresh.
 
 ## Concurrency
 
@@ -864,6 +996,9 @@ namespace, mount, quota, network, ownership and cleanup capabilities.
 | Expiry removals at once | 4 (1 to 16) | `--max-concurrent-expiry-deletes` |
 | Renew write coalescing; expiry retry backoff | 1 s; 5 s to 5 min | (code) |
 | Expiry timer queue | one entry per durable reservation, at most `max(--max-sandboxes, reservations at startup)`, 96 B each | (derived) |
+| Create request record retention, on the boot clock (at least 1 d; pruning waits a further 0.1 %) | 86,400 s | `--create-request-retention-secs` |
+| Create request records per uid / per node (per uid below node) | 4,096 / 32,768 | `--max-create-requests-per-uid`, `--max-create-requests` |
+| `request_id` | 1-64 bytes, `0x21`-`0x7e` | (code) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
 
 Startup validates limits before opening state or binding: required counts,
@@ -874,12 +1009,13 @@ stdin + argv + 64 KiB and response capacity at least twice retained output +
 maximum argv + 64 KiB. List bytes cannot exceed response bytes, and pages are
 at most 1000. Each node budget must hold at least one default sandbox.
 Nonzero expiry maxima and defaults are at least 10 s, and a nonzero default is at
-most its nonzero maximum.
+most its nonzero maximum. Create request retention is at least a day, and both
+record caps are nonzero with the per-uid cap below the node's.
 These are finite capacity bounds, not a hard-real-time guarantee: synchronous
 SQLite/filesystem work may block, slow clients may deny availability until
 disconnected, and authorized callers can monopolize capacity without tenant
 fairness or isolation. Terminal history has age/count retention. Pruning never removes a charged or
-nonterminal sandbox, or an unfinished execution; deleting sandbox history
+nonterminal sandbox, a sandbox pinned by a create request record, or an unfinished execution; deleting sandbox history
 removes only terminal children. Zero age/count expires all eligible rows.
 Freed pages are reused, not securely erased. Schema 6 adds a durable listing
 sequence counter so pruning cannot make new inserts reuse an old page watermark.

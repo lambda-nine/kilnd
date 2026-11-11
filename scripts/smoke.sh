@@ -406,5 +406,16 @@ ctl get "$expiring" | grep -q '^expiry: *lifetime 7200 s, idle 3600 s' || fail "
 ctl rm "$expiring" >/dev/null
 ctl get "$expiring" | grep -q '^deleted by: *requested' || fail "user delete reason not shown"
 
+echo "15. Idempotent create (scripts/idempotent-create-regressions.sh covers crashes)"
+ctl health | grep -q '^features: .*idempotent_create' || fail "no idempotent_create feature"
+key="smoke-$$-$(date +%s)"
+keyed=$(ctl create --memory 64M --disk 16M --request-id "$key" --idle-timeout 1h)
+created+=("$keyed")
+[ "$(ctl create --memory 64M --disk 16M --request-id "$key" --idle-timeout 1h)" = "$keyed" ] \
+    || fail "a keyed retry created another sandbox"
+ctl get "$keyed" | grep -q "^request id: *$key\$" || fail "request id not shown"
+ctl rm --release-request-id "$keyed" >/dev/null
+ctl get "$keyed" | grep -q "^request id: *$key (released)" || fail "release not shown"
+
 ctl health | grep -q '^active sandboxes: *0' || fail "smoke test left active sandboxes"
 echo "PASS"

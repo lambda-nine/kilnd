@@ -14,6 +14,7 @@ the shared contract at that boundary; invalid API values return gRPC
 | Writable paths | Only with a read-only root; at most 16 absolute UTF-8 paths of at most 1024 bytes |
 | Labels | At most 32 entries; keys are 1–63 ASCII bytes and use alphanumeric, `-`, `_`, `.`, or `/`; values are at most 256 UTF-8 bytes and contain no controls |
 | Argv | 1–4096 UTF-8 arguments; `argv[0]` is nonempty; NUL is forbidden |
+| Create `request_id` | Empty (an unkeyed create) or 1–64 bytes, each printable ASCII without space (`0x21`–`0x7e`); checked before any lookup. The rest of a keyed create is validated after its request record lookup, so an accepted key is answered even if a node limit changed since |
 
 Hostnames use ASCII labels of 1–63 bytes, begin and end with an alphanumeric
 byte, and contain only alphanumeric bytes or interior hyphens. They have at

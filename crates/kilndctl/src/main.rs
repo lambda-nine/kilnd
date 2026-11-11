@@ -67,7 +67,14 @@ enum Command {
     /// Show one execution, with its output.
     Execution { id: String },
     /// Delete a sandbox.
-    Rm { id: String },
+    Rm {
+        id: String,
+        /// If the sandbox ends DELETED, also give up its create request ID, so a later
+        /// create with that ID makes a new sandbox. Irreversible; use it only when no
+        /// retry of that create is pending. Needs a kilnd that lists request_id_release.
+        #[arg(long)]
+        release_request_id: bool,
+    },
     /// Record activity on a ready sandbox, restarting its idle timeout.
     Renew { id: String },
     /// Create a sandbox, run one command in it, and delete it.
@@ -125,6 +132,11 @@ struct CreateArgs {
     /// --idle-timeout not given. Without these flags the sandbox never expires.
     #[arg(long)]
     expiry_defaults: bool,
+    /// Make the create idempotent: retrying with the same ID and options returns the
+    /// same sandbox, in whatever state it settled. 1-64 printable ASCII characters
+    /// without spaces, private to your uid. Needs a kilnd that lists idempotent_create.
+    #[arg(long, value_name = "ID")]
+    request_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -237,6 +249,26 @@ async fn run(cli: Cli) -> Result<u8> {
                     l.pending_expiry_deletes,
                     l.failed_expiry_deletes
                 );
+            }
+            let keyed = h.runtime_capabilities.as_ref().is_some_and(|c| {
+                c.features
+                    .contains(&(pb::Feature::IdempotentCreate as i32))
+            });
+            if let (true, Some(a)) = (keyed, &h.admission) {
+                println!(
+                    "create requests:    node {}/{}, yours {}/{}, {} refused at a cap",
+                    a.current_create_requests,
+                    a.max_create_requests,
+                    a.caller_create_requests,
+                    a.max_create_requests_per_uid,
+                    a.rejected_create_requests
+                );
+                if let Some(l) = &h.lifecycle {
+                    println!(
+                        "                    {} retries answered, {} IDs released",
+                        l.create_retries_answered, l.request_ids_released
+                    );
+                }
             }
             if let Some(capabilities) = h.runtime_capabilities {
                 println!(
@@ -388,9 +420,24 @@ async fn run(cli: Cli) -> Result<u8> {
             println!("{} {}", s.id, sandbox_state(s.state));
             Ok(0)
         }
-        Command::Rm { id } => {
+        Command::Rm {
+            id,
+            release_request_id,
+        } => {
+            if release_request_id {
+                // An older daemon would ignore the flag and keep the record.
+                require_feature(
+                    &mut client,
+                    pb::Feature::RequestIdRelease,
+                    "--release-request-id",
+                )
+                .await?;
+            }
             let s = client
-                .delete_sandbox(pb::DeleteSandboxRequest { id })
+                .delete_sandbox(pb::DeleteSandboxRequest {
+                    id,
+                    release_request_id,
+                })
                 .await
                 .map_err(rpc)?
                 .into_inner()
@@ -413,7 +460,10 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             let result = exec(&mut client, sandbox.id.clone(), argv, &opts).await;
             client
-                .delete_sandbox(pb::DeleteSandboxRequest { id: sandbox.id })
+                .delete_sandbox(pb::DeleteSandboxRequest {
+                    id: sandbox.id,
+                    release_request_id: false,
+                })
                 .await
                 .map_err(rpc)?;
             result
@@ -487,6 +537,12 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
         )
         .await?;
     }
+    let request_id = a.request_id.unwrap_or_default();
+    if !request_id.is_empty() {
+        // An older daemon ignores request_id and would create a second sandbox on a
+        // retry, so discover first.
+        require_feature(client, pb::Feature::IdempotentCreate, "--request-id").await?;
+    }
     let spec = pb::SandboxSpec {
         image: a.image.unwrap_or_default(),
         limits: Some(pb::ResourceLimits {
@@ -512,6 +568,7 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
         .create_sandbox(pb::CreateSandboxRequest {
             spec: Some(spec),
             expiry,
+            request_id,
         })
         .await
         .map_err(rpc)?
@@ -721,6 +778,17 @@ fn print_sandbox(s: &pb::Sandbox) {
     }
     if s.deletion_reason != pb::DeletionReason::Unspecified as i32 {
         println!("deleted by: {}", deletion_reason(s.deletion_reason));
+    }
+    if !s.request_id.is_empty() {
+        println!(
+            "request id: {}{}",
+            s.request_id,
+            if s.request_id_released {
+                " (released)"
+            } else {
+                ""
+            }
+        );
     }
     if let Some(e) = &s.expiry {
         let policy = e.effective.unwrap_or_default();
@@ -1151,6 +1219,27 @@ mod tests {
         };
         check_feature(&current, pb::Feature::SandboxExpiry, "--max-lifetime").unwrap();
         assert!(check_feature(&current, pb::Feature::ExecEnv, "--env").is_err());
+        // M2: an M1 daemon lists neither request-ID feature, so both options refuse.
+        let error = check_feature(&current, pb::Feature::IdempotentCreate, "--request-id")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("idempotent_create"), "{error}");
+        assert!(
+            check_feature(&current, pb::Feature::RequestIdRelease, "--release-request-id")
+                .is_err()
+        );
+        let m2 = pb::HealthResponse {
+            runtime_capabilities: Some(pb::RuntimeCapabilities {
+                features: vec![
+                    pb::Feature::IdempotentCreate as i32,
+                    pb::Feature::RequestIdRelease as i32,
+                ],
+                ..Default::default()
+            }),
+            ..current.clone()
+        };
+        check_feature(&m2, pb::Feature::IdempotentCreate, "--request-id").unwrap();
+        check_feature(&m2, pb::Feature::RequestIdRelease, "--release-request-id").unwrap();
         for status in [
             pb::health_response::Status::Degraded,
             pb::health_response::Status::ShuttingDown,

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -29,7 +29,10 @@ use crate::runtime::{
     ExecSpec, ExecutionContext, FencedAbsence, MAX_BACKEND_PLAN_BYTES, NodeTotals, PreparedCreate,
     Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt,
 };
-use crate::store::{ExecutionResult, ReserveSandbox, SandboxBudgets, SandboxResources, Store};
+use crate::store::{
+    ExecutionResult, ReleaseRequestId, RequestAdmission, ReserveSandbox, SandboxBudgets,
+    SandboxResources, Store,
+};
 use crate::validation::{
     MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, validate_allowlist_entry, validate_argv,
     validate_image_name, validate_writable_path,
@@ -91,6 +94,24 @@ pub struct Limits {
     pub health_failure_cache: Duration,
     /// Sandbox expiry flags (API additions design, section 7).
     pub expiry: ExpiryLimits,
+    /// Create request record caps (design 3.3); retention is in `retention`.
+    pub create_requests: CreateRequestLimits,
+}
+
+/// `--max-create-requests-per-uid` and `--max-create-requests`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateRequestLimits {
+    pub max_per_uid: u64,
+    pub max_node: u64,
+}
+
+impl Default for CreateRequestLimits {
+    fn default() -> Self {
+        Self {
+            max_per_uid: 4096,
+            max_node: 32_768,
+        }
+    }
 }
 
 impl Default for Limits {
@@ -138,6 +159,7 @@ impl Default for Limits {
             health_success_cache: Duration::from_secs(5),
             health_failure_cache: Duration::from_secs(1),
             expiry: ExpiryLimits::default(),
+            create_requests: CreateRequestLimits::default(),
         }
     }
 }
@@ -156,6 +178,15 @@ pub struct CreateRequest {
     pub labels: BTreeMap<String, String>,
     /// `CreateSandboxRequest.expiry` if sent; `None` never expires (decision 2).
     pub expiry: Option<RequestedExpiry>,
+}
+
+/// A keyed create's identity within its owner's scope (design 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateKey {
+    /// Already checked by `idempotency::validate_request_id`.
+    pub request_id: String,
+    /// `idempotency::request_digest` of the request as sent.
+    pub sha256: Digest,
 }
 
 pub struct ExecRequest {
@@ -182,8 +213,25 @@ pub enum Error {
     ShuttingDown,
     #[error("{0}")]
     Backend(String),
+    /// A typed refusal with a code other than FAILED_PRECONDITION (design section 1).
+    #[error("{1}")]
+    Refused(RefusalCode, Refusal),
+    /// Two keyed attempts reached the admitting transaction together and this one lost
+    /// on the primary key; it answers again from the in-flight lookup. Never leaves
+    /// the manager.
+    #[error("another create recorded this request ID first")]
+    RequestIdTaken,
     #[error("internal error: {0:#}")]
     Internal(#[from] anyhow::Error),
+}
+
+/// The gRPC code of an [`Error::Refused`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalCode {
+    AlreadyExists,
+    ResourceExhausted,
+    DeadlineExceeded,
+    Unavailable,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -263,7 +311,12 @@ pub fn not_ready_reason(s: &Sandbox) -> &'static str {
 }
 
 /// Features this daemon's code and flags provide, fixed for the process.
-pub const STATIC_FEATURES: [Feature; 2] = [Feature::SandboxExpiry, Feature::TypedReasons];
+pub const STATIC_FEATURES: [Feature; 4] = [
+    Feature::SandboxExpiry,
+    Feature::IdempotentCreate,
+    Feature::TypedReasons,
+    Feature::RequestIdRelease,
+];
 
 /// An optional API part, in `kilnd.v1.Feature` order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -424,8 +477,110 @@ pub struct Manager<R> {
     /// The dynamic feature set: empty at startup, set by a successful probe and
     /// cleared by any other result (design section 1, fail closed).
     dynamic_features: Mutex<ProvenFeatures>,
+    /// Keyed creates in flight and their pending quota slots (design 3.1).
+    keyed: Arc<Mutex<KeyedCreates>>,
+    create_retries_answered: AtomicU64,
+    request_ids_released: AtomicU64,
+    rejected_create_requests: AtomicU64,
     #[cfg(test)]
     idle_commit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+/// The in-flight map keyed by `(owner_uid, request_id)`, and the keyed creates that
+/// hold a pending quota slot. One mutex, never held across an await.
+#[derive(Default)]
+struct KeyedCreates {
+    in_flight: HashMap<(u32, String), InFlight>,
+    pending_node: u64,
+    pending_by_uid: HashMap<u32, u64>,
+}
+
+/// One registered keyed create: its digest and a watch that closes when the create
+/// operation has fully finished (READY published, or FAILED published and its fence or
+/// compensation done).
+struct InFlight {
+    sha256: Digest,
+    /// Retries subscribe; removing the entry drops it and closes every subscription.
+    done: watch::Sender<()>,
+}
+
+/// Held by the create operation: dropping it removes the in-flight entry, which
+/// closes the watch, so a woken waiter's next lookup sees the settled record.
+struct InFlightGuard {
+    keyed: Arc<Mutex<KeyedCreates>>,
+    key: (u32, String),
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let entry = self
+            .keyed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_flight
+            .remove(&self.key);
+        drop(entry);
+    }
+}
+
+/// A pending keyed-create quota slot (design 3.1 step 4). It bounds concurrent keyed
+/// creates and reserves no ID; it is returned on every exit, cancellation included,
+/// once the admitting transaction has recounted the durable records.
+struct PendingSlot {
+    keyed: Arc<Mutex<KeyedCreates>>,
+    uid: u32,
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        let mut keyed = self.keyed.lock().unwrap_or_else(|e| e.into_inner());
+        keyed.pending_node = keyed.pending_node.saturating_sub(1);
+        if let Some(count) = keyed.pending_by_uid.get_mut(&self.uid) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                keyed.pending_by_uid.remove(&self.uid);
+            }
+        }
+    }
+}
+
+/// What a keyed create carries into its supervised operation.
+struct KeyedOperation {
+    request_id: String,
+    sha256: Digest,
+    pending: Option<PendingSlot>,
+}
+
+/// What steps 3 to 5 decided for a keyed create.
+enum KeyedAdmit {
+    /// A stored record with an equal digest: its settled row.
+    Answered(Box<Sandbox>),
+    /// A fresh attempt, registered and holding a pending slot.
+    Registered {
+        guard: InFlightGuard,
+        pending: PendingSlot,
+        req: CreateRequest,
+    },
+}
+
+fn request_id_conflict(request_id: &str) -> Error {
+    Error::Refused(
+        RefusalCode::AlreadyExists,
+        Refusal::typed(
+            "request_id_conflict",
+            format!("request_id {request_id:?} was used for a different create request"),
+        ),
+    )
+}
+
+/// `AdmissionStats` fields 21-25.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CreateRequestStats {
+    pub max_node: u64,
+    pub node: u64,
+    pub max_per_uid: u64,
+    pub caller: u64,
+    pub rejected: u64,
 }
 
 /// The sweeper's state: the queue, delete retries and the restart grace.
@@ -521,6 +676,8 @@ pub struct LifecycleSnapshot {
     pub expired_lifetime: u64,
     pub pending_expiry_deletes: u32,
     pub failed_expiry_deletes: u64,
+    pub create_retries_answered: u64,
+    pub request_ids_released: u64,
 }
 
 /// Where a Health report's node totals came from.
@@ -604,6 +761,10 @@ impl<R: Runtime> Manager<R> {
             expired_lifetime: AtomicU64::new(0),
             failed_expiry_deletes: AtomicU64::new(0),
             dynamic_features: Mutex::new(ProvenFeatures::default()),
+            keyed: Arc::new(Mutex::new(KeyedCreates::default())),
+            create_retries_answered: AtomicU64::new(0),
+            request_ids_released: AtomicU64::new(0),
+            rejected_create_requests: AtomicU64::new(0),
             #[cfg(test)]
             idle_commit_hook: Mutex::new(None),
             clock,
@@ -1703,7 +1864,9 @@ impl<R: Runtime> Manager<R> {
         let (result_tx, result_rx) = oneshot::channel();
         let manager = Arc::clone(self);
         self.operations.spawn(async move {
-            let result = Arc::clone(&manager).create_supervised(req, owner_uid).await;
+            let result = Arc::clone(&manager)
+                .create_supervised(req, owner_uid, None, &OnceLock::new())
+                .await;
             if let Ok(sandbox) = &result {
                 manager.expiry_refresh(&sandbox.id);
             }
@@ -1721,10 +1884,215 @@ impl<R: Runtime> Manager<R> {
         })?
     }
 
+    /// A keyed create (design 3.1). `req` is the converted request, or why it is
+    /// invalid: validation runs only after the lookups, so a retry finds an accepted
+    /// request even if a node limit changed since. `deadline` is the RPC's own, from
+    /// `grpc-timeout`. Once the create's row commits, the original call and every retry
+    /// return `OK` with the settled row, whatever its state.
+    pub async fn create_keyed(
+        self: &Arc<Self>,
+        req: std::result::Result<CreateRequest, String>,
+        owner_uid: u32,
+        key: CreateKey,
+        deadline: Option<Instant>,
+    ) -> Result<Sandbox> {
+        let map_key = (owner_uid, key.request_id.clone());
+        loop {
+            let (guard, pending, admitted) = loop {
+                // Steps 2 to 5 run under one lock with no await, so a lookup that
+                // finds nothing is followed by this attempt's registration before any
+                // other attempt can look.
+                let mut done = {
+                    let mut keyed = self.keyed.lock().unwrap();
+                    match keyed.in_flight.get(&map_key) {
+                        Some(entry) if entry.sha256 != key.sha256 => {
+                            return Err(request_id_conflict(&key.request_id));
+                        }
+                        Some(entry) => entry.done.subscribe(),
+                        None => match self.admit_keyed(&mut keyed, &req, owner_uid, &key)? {
+                            KeyedAdmit::Answered(sandbox) => return Ok(*sandbox),
+                            KeyedAdmit::Registered {
+                                guard,
+                                pending,
+                                req,
+                            } => break (guard, pending, req),
+                        },
+                    }
+                };
+                // Step 2: wait for the original within this retry's own deadline, then
+                // look again. The watch closes when the operation has fully finished;
+                // dropping this future (a canceled RPC) leaves nothing behind.
+                let finished = done.changed();
+                match deadline {
+                    Some(deadline) => {
+                        if tokio::time::timeout_at(deadline, finished).await.is_err() {
+                            return Err(Error::Refused(
+                                RefusalCode::DeadlineExceeded,
+                                Refusal::typed(
+                                    "create_in_flight",
+                                    format!(
+                                        "the create with request_id {:?} is still running; retry to get its result",
+                                        key.request_id
+                                    ),
+                                ),
+                            ));
+                        }
+                    }
+                    None => {
+                        let _ = finished.await;
+                    }
+                }
+            };
+            let (result_tx, result_rx) = oneshot::channel();
+            let manager = Arc::clone(self);
+            let keyed = KeyedOperation {
+                request_id: key.request_id.clone(),
+                sha256: key.sha256,
+                pending: Some(pending),
+            };
+            self.operations.spawn(async move {
+                let committed = OnceLock::new();
+                let result = Arc::clone(&manager)
+                    .create_supervised(admitted, owner_uid, Some(keyed), &committed)
+                    .await;
+                // The same answer for the original and every retry: once the row
+                // committed, the settled row, never the error the backend gave.
+                let result = match committed.get() {
+                    Some(id) => manager.load(id).and_then(|row| manager.settled_keyed(row)),
+                    None => result,
+                };
+                if let Ok(sandbox) = &result {
+                    manager.expiry_refresh(&sandbox.id);
+                }
+                // The operation has fully finished: send waiters to the store.
+                drop(guard);
+                if let Err(result) = result_tx.send(result) {
+                    match result {
+                        Ok(sandbox) => info!(sandbox = %sandbox.id, "create RPC stopped waiting; keyed operation completed"),
+                        Err(error) => warn!(error = %error, "create RPC stopped waiting; keyed operation failed"),
+                    }
+                }
+            });
+            match result_rx.await.map_err(|_| {
+                Error::Internal(anyhow::anyhow!("create supervisor stopped without a result"))
+            })? {
+                // Design 3.1: the loser of a primary-key race allocated nothing and
+                // answers from step 2, which now finds the winner's record.
+                Err(Error::RequestIdTaken) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    /// Design 3.1 steps 3 to 5, under the keyed lock: the stored record, then the
+    /// feature gates, validation, serving check and pending quota, then registration.
+    fn admit_keyed(
+        &self,
+        keyed: &mut KeyedCreates,
+        req: &std::result::Result<CreateRequest, String>,
+        owner_uid: u32,
+        key: &CreateKey,
+    ) -> Result<KeyedAdmit> {
+        // Step 3. Answered during shutdown too.
+        if let Some((sha256, row)) = self.store.create_request(owner_uid, &key.request_id)? {
+            if sha256 != key.sha256 {
+                return Err(request_id_conflict(&key.request_id));
+            }
+            self.create_retries_answered
+                .fetch_add(1, Ordering::Relaxed);
+            return self
+                .settled_keyed(row)
+                .map(|row| KeyedAdmit::Answered(Box::new(row)));
+        }
+        // Step 4: a fresh attempt.
+        let req = req.clone().map_err(Error::InvalidArgument)?;
+        crate::expiry::resolve_expiry(req.expiry, &self.limits.expiry)
+            .map_err(Error::InvalidArgument)?;
+        self.resolve_spec(req.clone())?;
+        self.check_serving()?;
+        let durable = self.store.create_request_counts(owner_uid)?;
+        let limits = self.limits.create_requests;
+        let pending_uid = keyed.pending_by_uid.get(&owner_uid).copied().unwrap_or(0);
+        let refused = if durable.uid.saturating_add(pending_uid) >= limits.max_per_uid {
+            Some(("uid", durable.uid.saturating_add(pending_uid), limits.max_per_uid))
+        } else if durable.node.saturating_add(keyed.pending_node) >= limits.max_node {
+            Some((
+                "node",
+                durable.node.saturating_add(keyed.pending_node),
+                limits.max_node,
+            ))
+        } else {
+            None
+        };
+        if let Some((scope, count, limit)) = refused {
+            return Err(self.request_quota_error(scope, count, limit));
+        }
+        keyed.pending_node += 1;
+        *keyed.pending_by_uid.entry(owner_uid).or_insert(0) += 1;
+        let pending = PendingSlot {
+            keyed: Arc::clone(&self.keyed),
+            uid: owner_uid,
+        };
+        // Step 5.
+        let map_key = (owner_uid, key.request_id.clone());
+        keyed.in_flight.insert(
+            map_key.clone(),
+            InFlight {
+                sha256: key.sha256,
+                done: watch::Sender::new(()),
+            },
+        );
+        let guard = InFlightGuard {
+            keyed: Arc::clone(&self.keyed),
+            key: map_key,
+        };
+        Ok(KeyedAdmit::Registered {
+            guard,
+            pending,
+            req,
+        })
+    }
+
+    /// A keyed row as the original and its retries return it. A CREATING row with no
+    /// live operation (only if a store write failed mid-create; reconciliation settles
+    /// it at the next start) is never answered as a fresh create.
+    fn settled_keyed(&self, row: Sandbox) -> Result<Sandbox> {
+        if row.state == SandboxState::Creating {
+            warn!(sandbox = %row.id, "keyed create row is CREATING with no live create operation");
+            return Err(Error::Refused(
+                RefusalCode::Unavailable,
+                Refusal::typed(
+                    "create_unsettled",
+                    format!(
+                        "sandbox {} is still CREATING with no live create; it settles at the next kilnd start",
+                        row.id
+                    ),
+                ),
+            ));
+        }
+        Ok(row)
+    }
+
+    fn request_quota_error(&self, scope: &str, count: u64, limit: u64) -> Error {
+        self.rejected_create_requests
+            .fetch_add(1, Ordering::Relaxed);
+        Error::Refused(
+            RefusalCode::ResourceExhausted,
+            Refusal::typed(
+                "request_id_quota",
+                format!(
+                    "create request records at the {scope} cap: {count} retained or pending of {limit}; release or wait for retention"
+                ),
+            ),
+        )
+    }
+
     async fn create_supervised(
         self: Arc<Self>,
         req: CreateRequest,
         owner_uid: u32,
+        mut keyed: Option<KeyedOperation>,
+        committed: &OnceLock<String>,
     ) -> Result<Sandbox> {
         self.check_serving()?;
         if self.admission_blocked.load(Ordering::Relaxed) {
@@ -1800,17 +2168,34 @@ impl<R: Runtime> Manager<R> {
             },
             lifecycle: SandboxLifecycle {
                 expiry,
+                request_id: keyed.as_ref().map(|k| k.request_id.clone()),
                 ..SandboxLifecycle::default()
             },
         };
+        let admission = keyed.as_ref().map(|k| RequestAdmission {
+            sha256: k.sha256,
+            max_per_uid: self.limits.create_requests.max_per_uid,
+            max_node: self.limits.create_requests.max_node,
+        });
         // C1: recorded before the backend runs, so a crash mid-create leaves a
         // trace for reconciliation. Count and every resource sum are checked with
-        // this insert in one SQLite transaction.
-        match self
-            .store
-            .reserve_sandbox(&sandbox, self.sandbox_budgets())?
-        {
-            ReserveSandbox::Inserted => {}
+        // this insert in one SQLite transaction; for a keyed create, so are the
+        // durable request records, and the record commits with the row.
+        let reserved =
+            self.store
+                .reserve_keyed_sandbox(&sandbox, self.sandbox_budgets(), admission.as_ref());
+        // The durable count now holds whatever this transaction did.
+        if let Some(keyed) = keyed.as_mut() {
+            drop(keyed.pending.take());
+        }
+        match reserved? {
+            ReserveSandbox::Inserted => {
+                let _ = committed.set(sandbox.id.clone());
+            }
+            ReserveSandbox::RequestQuota(quota) => {
+                return Err(self.request_quota_error(quota.scope, quota.count, quota.limit));
+            }
+            ReserveSandbox::RequestIdTaken => return Err(Error::RequestIdTaken),
             ReserveSandbox::Exhausted(exhausted) => {
                 self.node_resource_rejections
                     .fetch_add(1, Ordering::Relaxed);
@@ -2303,6 +2688,27 @@ impl<R: Runtime> Manager<R> {
                     sandbox = self.load(id)?;
                 }
             }
+        }
+    }
+
+    /// DeleteSandbox with `release_request_id` (design 3.4). Delete runs exactly as
+    /// without it. Only if the row it leaves is DELETED does one transaction that sees
+    /// it DELETED drop the create request record; a DELETING row (a failed removal or
+    /// a follower that returned early) releases nothing and remembers nothing.
+    pub async fn delete_releasing(self: &Arc<Self>, id: &str, release: bool) -> Result<Sandbox> {
+        let sandbox = self.delete(id).await?;
+        if !release || sandbox.state != SandboxState::Deleted {
+            return Ok(sandbox);
+        }
+        match self.store.release_request_id(id)? {
+            ReleaseRequestId::Released => {
+                self.request_ids_released.fetch_add(1, Ordering::Relaxed);
+                info!(sandbox = %id, request_id = ?sandbox.lifecycle.request_id, "request ID released");
+                self.load(id)
+            }
+            ReleaseRequestId::NoRecord | ReleaseRequestId::NotDeleted => Ok(sandbox),
+            // A prune won the race: absence, like any pruned ID.
+            ReleaseRequestId::NoSandbox => Err(Error::NotFound(format!("sandbox {id}"))),
         }
     }
 
@@ -2891,6 +3297,8 @@ impl<R: Runtime> Manager<R> {
             expired_lifetime: self.expired_lifetime.load(Ordering::Relaxed),
             pending_expiry_deletes: u32::try_from(pending).unwrap_or(u32::MAX),
             failed_expiry_deletes: self.failed_expiry_deletes.load(Ordering::Relaxed),
+            create_retries_answered: self.create_retries_answered.load(Ordering::Relaxed),
+            request_ids_released: self.request_ids_released.load(Ordering::Relaxed),
         }
     }
 
@@ -2939,6 +3347,33 @@ impl<R: Runtime> Manager<R> {
     /// the sweeper, admission or any prune.
     pub fn rebase_expiry_clocks(&self) -> Result<usize> {
         Ok(self.store.rebase_clocks()?)
+    }
+
+    /// The request-record rebase (design 3.3 R2). Run once after reconciliation and
+    /// before admission, any prune or any keyed lookup.
+    pub fn rebase_create_requests(&self) -> Result<usize> {
+        Ok(self.store.rebase_create_requests()?)
+    }
+
+    /// `AdmissionStats` fields 21-25 for `caller` (Health is open to every caller; a
+    /// caller sees only its own count besides the node's).
+    pub fn create_request_stats(&self, caller: Option<u32>) -> Result<CreateRequestStats> {
+        let counts = self.store.create_request_counts(caller.unwrap_or(0))?;
+        Ok(CreateRequestStats {
+            max_node: self.limits.create_requests.max_node,
+            node: counts.node,
+            max_per_uid: self.limits.create_requests.max_per_uid,
+            caller: caller.map_or(0, |_| counts.uid),
+            rejected: self.rejected_create_requests.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Keyed creates registered now, and pending quota slots (tests).
+    #[cfg(test)]
+    pub(crate) fn keyed_in_flight(&self) -> (usize, u64, usize) {
+        let keyed = self.keyed.lock().unwrap();
+        let receivers = keyed.in_flight.values().map(|e| e.done.receiver_count()).sum();
+        (keyed.in_flight.len(), keyed.pending_node, receivers)
     }
 
     /// Rebuilds the timer queue from the store, one entry per qualifying row, and
@@ -3661,3 +4096,6 @@ mod fenced_tests;
 
 #[cfg(test)]
 mod expiry_tests;
+
+#[cfg(test)]
+mod m2_tests;

@@ -1249,3 +1249,58 @@ async fn real_kiln_sandboxes_expire_by_idle_and_lifetime() {
     assert_eq!((stats.expired_idle, stats.expired_lifetime), (1, 1));
     assert_eq!(stats.pending_expiry_deletes, 0);
 }
+
+/// API additions M2: a keyed create against real kiln. Retries return the one real
+/// sandbox without reaching kiln; a release after its removal frees the key, and the
+/// next create with it is a second real sandbox.
+#[tokio::test]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn real_kiln_keyed_creates_answer_retries_and_release_frees_the_key() {
+    use kilnd::manager::CreateKey;
+    use kilnd::model::Digest;
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (limits, small) = one_small_sandbox();
+    let m = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        limits,
+    ));
+    m.reconcile().await.unwrap();
+    m.rebase_create_requests().unwrap();
+    let key = || CreateKey {
+        request_id: "integration/keyed-1".into(),
+        sha256: Digest::of(b"integration request"),
+    };
+    let first = m
+        .create_keyed(Ok(small.clone()), 0, key(), None)
+        .await
+        .unwrap();
+    assert_eq!(first.state, SandboxState::Ready);
+    let backend = first.backend_id.clone().unwrap();
+    let before = listed_ids(&m).await;
+    for _ in 0..3 {
+        let again = m
+            .create_keyed(Ok(small.clone()), 0, key(), None)
+            .await
+            .unwrap();
+        assert_eq!(again.id, first.id);
+    }
+    assert_eq!(listed_ids(&m).await, before, "a retry reached kiln");
+    let released = m.delete_releasing(&first.id, true).await.unwrap();
+    assert_eq!(released.state, SandboxState::Deleted);
+    assert!(released.lifecycle.request_id_released_at_ms.is_some());
+    assert!(!listed_ids(&m).await.contains(&backend), "backend survived");
+    let second = m
+        .create_keyed(Ok(small.clone()), 0, key(), None)
+        .await
+        .unwrap();
+    assert_ne!(second.id, first.id);
+    assert_ne!(second.backend_id, first.backend_id);
+    let gone = second.backend_id.clone().unwrap();
+    m.delete_releasing(&second.id, true).await.unwrap();
+    assert!(!listed_ids(&m).await.contains(&gone));
+}

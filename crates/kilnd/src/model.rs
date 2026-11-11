@@ -457,6 +457,11 @@ pub struct SandboxLifecycle {
     /// Bumped by every activity; the idle-expiry compare-and-set guard.
     pub activity_seq: i64,
     pub deletion_reason: Option<DeletionReason>,
+    /// The keyed create's request ID (schema 12), fixed at insert and kept after its
+    /// record is released or pruned. `None` for an unkeyed create.
+    pub request_id: Option<String>,
+    /// When `release_request_id` dropped the record, from a DELETED row.
+    pub request_id_released_at_ms: Option<i64>,
 }
 
 /// Why a CANCELED execution was canceled.

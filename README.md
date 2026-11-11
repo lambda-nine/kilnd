@@ -58,7 +58,10 @@ code, the test suite and `CHANGELOG.md`.
   fields it doesn't know), refusals carry a machine-readable `kilnd-reason` trailer,
   and a create may ask to expire after a maximum lifetime or an idle timeout
   ([docs/architecture.md](docs/architecture.md#sandbox-expiry)); without a policy a
-  sandbox never expires.
+  sandbox never expires. A create with a `request_id` is idempotent: a retry gets
+  the same sandbox in whatever state it settled, for at least a day measured on the
+  boot clock, or until the client releases the key on delete
+  ([docs/architecture.md](docs/architecture.md#idempotent-create)).
 - **Runtime adapter trait** ([crates/kilnd/src/runtime/mod.rs](crates/kilnd/src/runtime/mod.rs)).
   The kiln implementation calls a private root helper, which runs the installed `kiln` CLI with argument vectors
   (never a shell), a cleared environment, timeouts and bounded output. kiln's
@@ -243,6 +246,7 @@ scripts/state-path-regressions.sh # hostile state ancestors/files fail before re
 sudo python3 -I scripts/phase0-regressions.py # real UID ownership, helper, privilege and retention checks
 scripts/smoke.sh              # kilndctl → socket → service → kiln, checked through the API
 scripts/expiry-regressions.sh # real idle and lifetime expiry, grace, renew and restart (about 3 min)
+scripts/idempotent-create-regressions.sh # keyed retries, release and a kill mid-create (about 1 min)
 ```
 
 ## Layout
@@ -281,7 +285,10 @@ Terminal executions have a seven day / 10,000 row limit (`--execution-max-age-se
 seven day / 1,000 row limit (`--deleted-sandbox-max-age-secs`,
 `--deleted-sandbox-max-count`). The first limit reached expires history; zero
 age/count keeps none of the eligible history. Reserved or nonterminal sandbox
-rows and unfinished executions never expire. Removing sandbox history removes
+rows and unfinished executions never expire, and neither does a row pinned by a
+create request record: that record is kept at least `--create-request-retention-secs`
+(a day) on the boot clock, and for as long as its sandbox is not `DELETED` or a
+released failed create. Removing sandbox history removes
 its terminal execution history too. SQLite reuses freed pages; pruning does not
 securely erase old bytes from the DB, WAL, backups or storage.
 

@@ -30,7 +30,7 @@ use crate::model::{
 use crate::retention::{OutputStorage, Pruned, Retention};
 use crate::runtime::{CreatedSandbox, FencedAbsence, RuntimeReceipt};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -399,6 +399,60 @@ WHEN OLD.cancel_reason IS NOT NULL AND NEW.cancel_reason IS NOT OLD.cancel_reaso
 BEGIN SELECT RAISE(ABORT, 'a cancel reason is written once'); END;
 PRAGMA user_version = 11;";
 
+// Schema 12 (API additions design 3.2 and 3.3): create request records for idempotent
+// create. A record names its sandbox, which it pins: the row is deleted only after the
+// record. A record changes only in the startup cross-boot retention rebase, and is
+// deleted only once its sandbox is DELETED or released FAILED (by prune or release).
+// `sandboxes.request_id` is fixed at insert, so history keeps it after its record is
+// gone; `request_id_released_at_ms` is written once, after its record, from DELETED.
+// None of this enters the reservation digest: it is lifecycle data, not membership.
+const MIGRATE_V12: &str = "
+CREATE TABLE create_requests (
+    owner_uid INTEGER NOT NULL CHECK (typeof(owner_uid) = 'integer' AND owner_uid BETWEEN 0 AND 4294967295),
+    request_id TEXT NOT NULL CHECK (typeof(request_id) = 'text' AND length(CAST(request_id AS BLOB)) BETWEEN 1 AND 64 AND request_id NOT GLOB '*[^!-~]*'),
+    request_sha256 TEXT NOT NULL CHECK (typeof(request_sha256) = 'text' AND length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'),
+    sandbox_id TEXT NOT NULL UNIQUE REFERENCES sandboxes (id),
+    created_at_ms INTEGER NOT NULL CHECK (typeof(created_at_ms) = 'integer'),
+    retain_boot_id TEXT NOT NULL CHECK (typeof(retain_boot_id) = 'text' AND length(retain_boot_id) BETWEEN 1 AND 64),
+    retain_from_boottime_ms INTEGER NOT NULL CHECK (typeof(retain_from_boottime_ms) = 'integer'),
+    PRIMARY KEY (owner_uid, request_id)
+) WITHOUT ROWID;
+ALTER TABLE sandboxes ADD COLUMN request_id TEXT CHECK (request_id IS NULL OR (typeof(request_id) = 'text' AND length(CAST(request_id AS BLOB)) BETWEEN 1 AND 64 AND request_id NOT GLOB '*[^!-~]*'));
+ALTER TABLE sandboxes ADD COLUMN request_id_released_at_ms INTEGER CHECK (request_id_released_at_ms IS NULL OR typeof(request_id_released_at_ms) = 'integer');
+CREATE TRIGGER create_requests_no_replace BEFORE INSERT ON create_requests
+WHEN EXISTS (SELECT 1 FROM create_requests
+    WHERE (owner_uid = NEW.owner_uid AND request_id = NEW.request_id) OR sandbox_id = NEW.sandbox_id)
+BEGIN SELECT RAISE(ABORT, 'a create request record cannot be replaced'); END;
+CREATE TRIGGER create_requests_own_sandbox BEFORE INSERT ON create_requests
+WHEN NOT EXISTS (SELECT 1 FROM sandboxes WHERE id = NEW.sandbox_id AND owner_uid = NEW.owner_uid
+    AND request_id = NEW.request_id AND state = 'creating')
+BEGIN SELECT RAISE(ABORT, 'a create request record is inserted with its own CREATING sandbox'); END;
+CREATE TRIGGER create_requests_fixed BEFORE UPDATE ON create_requests
+WHEN NEW.owner_uid IS NOT OLD.owner_uid OR NEW.request_id IS NOT OLD.request_id
+    OR NEW.request_sha256 IS NOT OLD.request_sha256 OR NEW.sandbox_id IS NOT OLD.sandbox_id
+    OR NEW.created_at_ms IS NOT OLD.created_at_ms
+    OR (NEW.retain_from_boottime_ms IS NOT OLD.retain_from_boottime_ms AND NEW.retain_boot_id IS OLD.retain_boot_id)
+BEGIN SELECT RAISE(ABORT, 'a create request record changes only in the cross-boot retention rebase'); END;
+CREATE TRIGGER create_requests_settled_delete BEFORE DELETE ON create_requests
+WHEN NOT EXISTS (SELECT 1 FROM sandboxes WHERE id = OLD.sandbox_id AND (state = 'deleted'
+    OR (state = 'failed' AND NOT ((accounting_kind = 'legacy' AND legacy_release IS NULL)
+        OR (accounting_kind = 'fenced' AND release_evidence_id IS NULL)))))
+BEGIN SELECT RAISE(ABORT, 'a create request record is kept until its sandbox is DELETED or released FAILED'); END;
+CREATE TRIGGER sandboxes_pinned_by_request BEFORE DELETE ON sandboxes
+WHEN EXISTS (SELECT 1 FROM create_requests WHERE sandbox_id = OLD.id)
+BEGIN SELECT RAISE(ABORT, 'a sandbox with a create request record cannot be deleted'); END;
+CREATE TRIGGER sandboxes_request_id_fixed BEFORE UPDATE ON sandboxes
+WHEN NEW.request_id IS NOT OLD.request_id
+    OR (OLD.request_id_released_at_ms IS NOT NULL AND NEW.request_id_released_at_ms IS NOT OLD.request_id_released_at_ms)
+    OR (OLD.request_id_released_at_ms IS NULL AND NEW.request_id_released_at_ms IS NOT NULL
+        AND (NEW.state != 'deleted' OR NEW.request_id IS NULL
+            OR EXISTS (SELECT 1 FROM create_requests WHERE sandbox_id = NEW.id)))
+BEGIN SELECT RAISE(ABORT, 'a request ID is fixed at create and released once, after its record, from DELETED'); END;
+CREATE TRIGGER sandboxes_request_insert BEFORE INSERT ON sandboxes
+WHEN NEW.request_id_released_at_ms IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a request ID is released only after its sandbox is DELETED'); END;
+PRAGMA user_version = 12;";
+
 fn reservation_digest(conn: &Connection) -> Result<Vec<u8>> {
     // Include all immutable reservation/identity data; lifecycle transitions and
     // release references intentionally do not change this membership fingerprint.
@@ -751,6 +805,94 @@ pub struct BudgetExhausted {
 pub enum ReserveSandbox {
     Inserted,
     Exhausted(BudgetExhausted),
+    /// The request records are at a cap (design 3.3): nothing was inserted.
+    RequestQuota(RequestQuota),
+    /// Another create already recorded this key: nothing was inserted.
+    RequestIdTaken,
+}
+
+/// What a keyed create's admitting transaction checks and records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestAdmission {
+    pub sha256: Digest,
+    pub max_per_uid: u64,
+    pub max_node: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestQuota {
+    /// `uid` or `node`.
+    pub scope: &'static str,
+    pub count: u64,
+    pub limit: u64,
+}
+
+/// Durable create request records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RequestCounts {
+    pub node: u64,
+    pub uid: u64,
+}
+
+/// What `release_request_id` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseRequestId {
+    Released,
+    /// The sandbox is DELETED and has no record: never keyed, released or pruned.
+    NoRecord,
+    /// Not DELETED (or quarantined): nothing is released and nothing remembered.
+    NotDeleted,
+    NoSandbox,
+}
+
+fn request_counts(conn: &Connection, owner_uid: u32) -> Result<RequestCounts> {
+    let (node, uid): (i64, i64) = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM create_requests), (SELECT COUNT(*) FROM create_requests WHERE owner_uid = ?1)",
+        [owner_uid],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(RequestCounts {
+        node: u64::try_from(node)?,
+        uid: u64::try_from(uid)?,
+    })
+}
+
+/// Which create request records [`remove_request_records`] may delete.
+enum RecordRemoval<'a> {
+    /// R3: this boot's records retained at least to `cutoff_boottime_ms`.
+    Prune {
+        boot_id: &'a str,
+        cutoff_boottime_ms: i64,
+    },
+    /// Design 3.4: one sandbox's record.
+    Release { sandbox_id: &'a str },
+}
+
+/// R5: the only path that deletes create request records. In the caller's IMMEDIATE
+/// transaction, after `audit_accounting`, it rechecks each record's sandbox: DELETED
+/// or released FAILED for prune, DELETED for release, never a quarantined row. A
+/// trigger refuses any other delete.
+fn remove_request_records(tx: &Connection, removal: RecordRemoval<'_>) -> Result<usize> {
+    Ok(match removal {
+        RecordRemoval::Prune {
+            boot_id,
+            cutoff_boottime_ms,
+        } => tx.execute(
+            &format!(
+                "DELETE FROM create_requests WHERE retain_boot_id = ?1 AND retain_from_boottime_ms <= ?2
+                 AND sandbox_id IN (SELECT id FROM sandboxes
+                     WHERE id NOT IN (SELECT id FROM temp.accounting_quarantine)
+                       AND (state = 'deleted' OR (state = 'failed' AND NOT ({RESERVED_SANDBOX_WHERE}))))"
+            ),
+            params![boot_id, cutoff_boottime_ms],
+        )?,
+        RecordRemoval::Release { sandbox_id } => tx.execute(
+            "DELETE FROM create_requests WHERE sandbox_id = ?1
+             AND sandbox_id IN (SELECT id FROM sandboxes WHERE id = ?1 AND state = 'deleted'
+                 AND id NOT IN (SELECT id FROM temp.accounting_quarantine))",
+            [sandbox_id],
+        )?,
+    })
 }
 
 fn i64_amount(value: u64, what: &str) -> Result<i64> {
@@ -788,9 +930,9 @@ fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
             host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest, disposition, boot_id, legacy_release,
             node_id, instance_id, allocation_id, plan_version, plan_digest, plan, release_evidence_id, last_helper_generation,
             expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, ready_boottime_ms, activity_at_ms, activity_boottime_ms, clock_boot_id,
-            activity_seq, deletion_reason, list_seq)
+            activity_seq, deletion_reason, request_id, list_seq)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33,
-            ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, (SELECT value FROM history_sequence WHERE id = 1))",
+            ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, (SELECT value FROM history_sequence WHERE id = 1))",
         params![
             sandbox.id,
             sandbox.backend,
@@ -845,6 +987,7 @@ fn insert_sandbox(conn: &Connection, sandbox: &Sandbox) -> Result<()> {
             lifecycle.clock_boot_id,
             lifecycle.activity_seq,
             lifecycle.deletion_reason.map(DeletionReason::as_str),
+            lifecycle.request_id,
         ],
     )?;
     Ok(())
@@ -1294,15 +1437,20 @@ impl Store {
             tx.execute_batch(MIGRATE_V10)?;
             refresh_reservation_integrity(&tx)?;
         } else {
-            // Break-it MEDIUM 3: a schema 10 database already has a marker. Audit it
-            // as it stands, before anything else changes, and never rewrite it: the
-            // schema 11 columns are not membership. A mismatch refuses startup and
-            // rolls the whole migration back, leaving the evidence at schema 10.
-            audit_accounting(&tx).context(
-                "schema 10 reservation integrity does not match; refusing to migrate to schema 11",
-            )?;
+            // Break-it MEDIUM 3: a schema 10 or 11 database already has a marker.
+            // Audit it as it stands, before anything else changes, and never rewrite
+            // it: the schema 11 and 12 columns are not membership. A mismatch refuses
+            // startup and rolls the whole migration back, leaving the old schema.
+            audit_accounting(&tx).with_context(|| {
+                format!(
+                    "schema {version} reservation integrity does not match; refusing to migrate to schema {SCHEMA_VERSION}"
+                )
+            })?;
         }
-        tx.execute_batch(MIGRATE_V11)?;
+        if version < 11 {
+            tx.execute_batch(MIGRATE_V11)?;
+        }
+        tx.execute_batch(MIGRATE_V12)?;
         audit_accounting(&tx)?;
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
@@ -1362,10 +1510,59 @@ impl Store {
     /// CREATING row. The IMMEDIATE transaction makes the sum-and-insert one
     /// decision even if another SQLite writer ignores kilnd's instance lock.
     pub fn reserve_sandbox(&self, s: &Sandbox, budgets: SandboxBudgets) -> Result<ReserveSandbox> {
+        self.reserve_keyed_sandbox(s, budgets, None)
+    }
+
+    /// As [`Self::reserve_sandbox`], and for a keyed create (design 3.1 step 6) the
+    /// same transaction recounts the durable request records against both caps,
+    /// refuses a key another create already holds, and inserts the record with this
+    /// boot's retention anchor: the CREATING row and its record commit together.
+    pub fn reserve_keyed_sandbox(
+        &self,
+        s: &Sandbox,
+        budgets: SandboxBudgets,
+        request: Option<&RequestAdmission>,
+    ) -> Result<ReserveSandbox> {
+        let reading = match request {
+            Some(_) => Some(self.clock_reading()?),
+            None => None,
+        };
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if audit_accounting(&tx)? {
             bail!("degraded accounting: quarantined release evidence; admission disabled");
+        }
+        if let Some(request) = request {
+            let request_id = s
+                .lifecycle
+                .request_id
+                .as_deref()
+                .context("a keyed create's row names its request ID")?;
+            let taken: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM create_requests WHERE owner_uid = ?1 AND request_id = ?2)",
+                params![s.owner_uid, request_id],
+                |r| r.get(0),
+            )?;
+            if taken {
+                return Ok(ReserveSandbox::RequestIdTaken);
+            }
+            let counts = request_counts(&tx, s.owner_uid)?;
+            if counts.uid >= request.max_per_uid {
+                return Ok(ReserveSandbox::RequestQuota(RequestQuota {
+                    scope: "uid",
+                    count: counts.uid,
+                    limit: request.max_per_uid,
+                }));
+            }
+            if counts.node >= request.max_node {
+                return Ok(ReserveSandbox::RequestQuota(RequestQuota {
+                    scope: "node",
+                    count: counts.node,
+                    limit: request.max_node,
+                }));
+            }
+        } else if s.lifecycle.request_id.is_some() {
+            bail!("an unkeyed create cannot name a request ID");
         }
         let reserved = sandbox_resources(&tx)?;
         let requested = SandboxResources::for_reservation(&s.accounting.reservation);
@@ -1373,9 +1570,111 @@ impl Store {
             return Ok(ReserveSandbox::Exhausted(exhausted));
         }
         insert_sandbox(&tx, s)?;
+        if let (Some(request), Some(now)) = (request, &reading) {
+            tx.execute(
+                "INSERT INTO create_requests (owner_uid, request_id, request_sha256, sandbox_id, created_at_ms, retain_boot_id, retain_from_boottime_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    s.owner_uid,
+                    s.lifecycle.request_id,
+                    request.sha256.to_string(),
+                    s.id,
+                    now.wall_ms,
+                    now.boot_id,
+                    now.boottime_ms,
+                ],
+            )?;
+        }
         refresh_reservation_integrity(&tx)?;
         tx.commit()?;
         Ok(ReserveSandbox::Inserted)
+    }
+
+    /// Design 3.1 step 3: the caller's record for `request_id` and its sandbox, read in
+    /// one snapshot, so the answer and the record it came from are one observation.
+    pub fn create_request(
+        &self,
+        owner_uid: u32,
+        request_id: &str,
+    ) -> Result<Option<(Digest, Sandbox)>> {
+        let mut connection = self.conn();
+        let conn = connection.transaction()?;
+        audit_accounting(&conn)?;
+        let record: Option<(String, String)> = conn
+            .query_row(
+                "SELECT request_sha256, sandbox_id FROM create_requests WHERE owner_uid = ?1 AND request_id = ?2",
+                params![owner_uid, request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((sha256, sandbox_id)) = record else {
+            return Ok(None);
+        };
+        let sha256 = Digest::parse(&sha256).map_err(anyhow::Error::msg)?;
+        let sandbox = conn
+            .query_row(
+                &format!("SELECT {SANDBOX_COLUMNS} FROM sandboxes WHERE id = ?1"),
+                [&sandbox_id],
+                sandbox_row,
+            )
+            .optional()?
+            .transpose()?
+            .with_context(|| format!("create request record names missing sandbox {sandbox_id}"))?;
+        Ok(Some((sha256, sandbox)))
+    }
+
+    /// Durable request records on the node and of `owner_uid`.
+    pub fn create_request_counts(&self, owner_uid: u32) -> Result<RequestCounts> {
+        request_counts(&self.conn(), owner_uid)
+    }
+
+    /// Design 3.3 R2: after reconciliation and before admission, any prune or any keyed
+    /// lookup, one IMMEDIATE transaction gives every record anchored in another boot
+    /// this boot's ID and current boottime, a fresh full retention window, never a
+    /// wall-clock estimate. A crash leaves every record rebased or still foreign, and
+    /// a foreign record is never pruned. Returns how many it rebased.
+    pub fn rebase_create_requests(&self) -> Result<usize> {
+        let now = self.clock_reading()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rebased = tx.execute(
+            "UPDATE create_requests SET retain_boot_id = ?1, retain_from_boottime_ms = ?2 WHERE retain_boot_id != ?1",
+            params![now.boot_id, now.boottime_ms],
+        )?;
+        tx.commit()?;
+        Ok(rebased)
+    }
+
+    /// Design 3.4: if the sandbox is DELETED, in one IMMEDIATE transaction that sees
+    /// it DELETED, drop its create request record through the prune-safe path and
+    /// stamp `request_id_released_at_ms`. Anything else changes nothing.
+    pub fn release_request_id(&self, sandbox_id: &str) -> Result<ReleaseRequestId> {
+        let now = now_ms();
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        audit_accounting(&tx)?;
+        let deleted: Option<bool> = tx
+            .query_row(
+                "SELECT state = 'deleted' AND id NOT IN (SELECT id FROM temp.accounting_quarantine)
+                 FROM sandboxes WHERE id = ?1",
+                [sandbox_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match deleted {
+            None => return Ok(ReleaseRequestId::NoSandbox),
+            Some(false) => return Ok(ReleaseRequestId::NotDeleted),
+            Some(true) => {}
+        }
+        if remove_request_records(&tx, RecordRemoval::Release { sandbox_id })? == 0 {
+            return Ok(ReleaseRequestId::NoRecord);
+        }
+        tx.execute(
+            "UPDATE sandboxes SET request_id_released_at_ms = ?2 WHERE id = ?1",
+            params![sandbox_id, now],
+        )?;
+        tx.commit()?;
+        Ok(ReleaseRequestId::Released)
     }
 
     /// Reservations survive daemon restart because they are stored with the
@@ -2258,6 +2557,11 @@ impl Store {
         };
         let execution_cutoff = cutoff(policy.execution_max_age_secs)?;
         let sandbox_cutoff = cutoff(policy.sandbox_max_age_secs)?;
+        // Without the boot clock no record is pruned: its age is unknowable.
+        let request_cutoff = self.clock_reading().ok().and_then(|now| {
+            crate::retention::create_request_prune_age_ms(policy.create_request_retention_secs)
+                .map(|age| (now.boottime_ms.saturating_sub(age), now.boot_id))
+        });
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         audit_accounting(&tx)?;
@@ -2268,12 +2572,26 @@ impl Store {
                 FROM executions WHERE {terminal}) WHERE finished_at_ms <= ?1 OR n > ?2)"),
                 params![execution_cutoff, policy.execution_max_count])?,
             sandboxes: 0,
+            create_requests: 0,
         };
+        // Design 3.3 R3, before the age and count prune so a row whose record ends
+        // here follows ordinary retention from now on.
+        if let Some((cutoff, boot_id)) = &request_cutoff {
+            result.create_requests = remove_request_records(
+                &tx,
+                RecordRemoval::Prune {
+                    boot_id,
+                    cutoff_boottime_ms: *cutoff,
+                },
+            )?;
+        }
         tx.execute_batch("CREATE TEMP TABLE retention_sandboxes (id TEXT PRIMARY KEY);")?;
+        // R4: a row with a record is pinned, outside both the age and the count.
         tx.execute(&format!("INSERT INTO retention_sandboxes
             SELECT id FROM (SELECT id, updated_at_ms, ROW_NUMBER() OVER (ORDER BY updated_at_ms DESC, list_seq DESC) AS n
             FROM sandboxes WHERE state IN ('deleted','failed') AND NOT ({RESERVED_SANDBOX_WHERE})
             AND id NOT IN (SELECT id FROM temp.accounting_quarantine)
+            AND NOT EXISTS (SELECT 1 FROM create_requests WHERE sandbox_id = sandboxes.id)
             AND NOT EXISTS (SELECT 1 FROM executions WHERE sandbox_id = sandboxes.id AND NOT ({terminal})))
             WHERE updated_at_ms <= ?1 OR n > ?2"), params![sandbox_cutoff, policy.sandbox_max_count])?;
         result.executions += tx.execute(
@@ -2910,8 +3228,8 @@ const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_rea
     CASE WHEN plan IS NULL OR release_evidence_id IS NULL THEN plan ELSE x'' END, release_evidence_id, last_helper_generation,
     id IN (SELECT id FROM temp.accounting_quarantine),
     expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, ready_boottime_ms, activity_at_ms, activity_boottime_ms,
-    clock_boot_id, activity_seq, deletion_reason";
-const SANDBOX_COLUMN_COUNT: usize = 43;
+    clock_boot_id, activity_seq, deletion_reason, request_id, request_id_released_at_ms";
+const SANDBOX_COLUMN_COUNT: usize = 45;
 
 /// Row decoding errors are reported per row rather than as SQLite errors.
 fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
@@ -2943,6 +3261,8 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
     let clock_boot_id: Option<String> = row.get(40)?;
     let activity_seq: i64 = row.get(41)?;
     let deletion_reason: Option<String> = row.get(42)?;
+    let request_id: Option<String> = row.get(43)?;
+    let request_id_released_at_ms: Option<i64> = row.get(44)?;
     Ok((|| {
         let bad = |what: &str, why: String| anyhow::anyhow!("sandbox {id}: bad {what}: {why}");
         let amount = |index: usize| {
@@ -3050,6 +3370,8 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
                         })
                     })
                     .transpose()?,
+                request_id,
+                request_id_released_at_ms,
             },
             id: id.clone(),
         };
@@ -6078,7 +6400,8 @@ mod tests {
             let upgraded = Store::open(tmp.path());
             if valid {
                 let store = upgraded.unwrap();
-                // Schema 11 appends lifecycle columns; history gets their nulls and seq 0.
+                // Schemas 11 and 12 append lifecycle columns; history gets their nulls,
+                // seq 0 and no request ID.
                 let after = table_snapshot(&store.conn(), "sandboxes");
                 assert_eq!(after.len(), before.len());
                 for (after, before) in after.iter().zip(&before) {
@@ -6086,7 +6409,21 @@ mod tests {
                     use rusqlite::types::Value::{Integer, Null};
                     assert_eq!(
                         &after[before.len()..],
-                        &[Null, Null, Null, Null, Null, Null, Null, Integer(0), Null, Null, Null]
+                        &[
+                            Null,
+                            Null,
+                            Null,
+                            Null,
+                            Null,
+                            Null,
+                            Null,
+                            Integer(0),
+                            Null,
+                            Null,
+                            Null,
+                            Null,
+                            Null
+                        ]
                     );
                 }
                 assert_eq!(table_snapshot(&store.conn(), "release_evidence"), evidence);
@@ -8251,5 +8588,257 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+    }
+
+    fn keyed_row(request_id: &str, owner_uid: u32) -> Sandbox {
+        let mut row = sandbox();
+        row.owner_uid = owner_uid;
+        row.lifecycle.request_id = Some(request_id.into());
+        row
+    }
+
+    fn admission(per_uid: u64, node: u64) -> RequestAdmission {
+        RequestAdmission {
+            sha256: Digest::of(b"request"),
+            max_per_uid: per_uid,
+            max_node: node,
+        }
+    }
+
+    /// Schema 12 reached from 9, 10 and 11 is the fresh schema; history has no
+    /// request ID and no record, and an existing integrity marker is kept as is.
+    #[test]
+    fn schema12_from_9_10_and_11_matches_fresh() {
+        let schema_sql = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        let fresh = Store::open_in_memory().unwrap();
+        let expected = schema_sql(&fresh.conn());
+        assert!(expected.iter().any(|(name, _)| name == "create_requests"));
+        for version in [9, 10, 11] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut conn = disk_database_at(tmp.path(), 7);
+            register_receipt_validator(&conn).unwrap();
+            let tx = conn.transaction().unwrap();
+            migrate_v8(&tx).unwrap();
+            tx.execute_batch(MIGRATE_V9).unwrap();
+            if version >= 10 {
+                tx.execute_batch(MIGRATE_V10).unwrap();
+            }
+            let mut history = sandbox();
+            history.state = SandboxState::Ready;
+            history.backend_id = Some(format!("old-{version}"));
+            insert_sandbox_before_v11(&tx, &history).unwrap();
+            if version >= 10 {
+                refresh_reservation_integrity(&tx).unwrap();
+            }
+            if version == 11 {
+                tx.execute_batch(MIGRATE_V11).unwrap();
+            }
+            tx.commit().unwrap();
+            let marker = (version >= 10).then(|| table_snapshot(&conn, "reservation_integrity"));
+            release_database(conn, tmp.path());
+            let store = Store::reopen_after_restart(tmp.path());
+            assert_eq!(schema_sql(&store.conn()), expected, "v{version}");
+            if let Some(marker) = marker {
+                assert_eq!(table_snapshot(&store.conn(), "reservation_integrity"), marker);
+            }
+            let row = store.sandbox(&history.id).unwrap().unwrap();
+            assert_eq!(row.lifecycle, SandboxLifecycle::default(), "v{version}");
+            assert_eq!(store.create_request_counts(0).unwrap(), RequestCounts::default());
+        }
+    }
+
+    #[test]
+    fn keyed_reservation_commits_the_row_and_record_together() {
+        let store = Store::open_in_memory().unwrap();
+        let row = keyed_row("k", 1000);
+        assert_eq!(
+            store
+                .reserve_keyed_sandbox(&row, roomy_budgets(), Some(&admission(4, 8)))
+                .unwrap(),
+            ReserveSandbox::Inserted
+        );
+        let (digest, found) = store.create_request(1000, "k").unwrap().unwrap();
+        assert_eq!(digest, Digest::of(b"request"));
+        assert_eq!(found.id, row.id);
+        assert_eq!(found.lifecycle.request_id.as_deref(), Some("k"));
+        assert!(store.create_request(1001, "k").unwrap().is_none(), "per uid");
+        // An exhausted node budget inserts neither.
+        let exhausted = keyed_row("other", 1000);
+        let mut tight = roomy_budgets();
+        tight.sandboxes = 1;
+        assert!(matches!(
+            store
+                .reserve_keyed_sandbox(&exhausted, tight, Some(&admission(4, 8)))
+                .unwrap(),
+            ReserveSandbox::Exhausted(_)
+        ));
+        assert!(store.sandbox(&exhausted.id).unwrap().is_none());
+        assert!(store.create_request(1000, "other").unwrap().is_none());
+        // A keyed row needs its admission, and an unkeyed one may not carry a key.
+        assert!(store.reserve_sandbox(&keyed_row("x", 1), roomy_budgets()).is_err());
+        assert_eq!(store.create_request_counts(1000).unwrap(), RequestCounts { node: 1, uid: 1 });
+    }
+
+    /// Release and prune are the only deletes, and both recheck the row in their
+    /// own IMMEDIATE transaction.
+    #[test]
+    fn release_requires_deleted_and_runs_once() {
+        let store = Store::open_in_memory().unwrap();
+        let row = keyed_row("k", 1000);
+        store
+            .reserve_keyed_sandbox(&row, roomy_budgets(), Some(&admission(4, 8)))
+            .unwrap();
+        assert_eq!(store.release_request_id(&row.id).unwrap(), ReleaseRequestId::NotDeleted);
+        store
+            .set_sandbox_state(&row.id, SandboxState::Ready, Some("b-1"), None)
+            .unwrap();
+        assert_eq!(store.release_request_id(&row.id).unwrap(), ReleaseRequestId::NotDeleted);
+        store
+            .set_sandbox_state(&row.id, SandboxState::Deleting, None, None)
+            .unwrap();
+        assert_eq!(store.release_request_id(&row.id).unwrap(), ReleaseRequestId::NotDeleted);
+        store
+            .set_sandbox_state(&row.id, SandboxState::Deleted, None, None)
+            .unwrap();
+        assert_eq!(store.release_request_id(&row.id).unwrap(), ReleaseRequestId::Released);
+        let released = store.sandbox(&row.id).unwrap().unwrap();
+        assert!(released.lifecycle.request_id_released_at_ms.is_some());
+        assert_eq!(released.lifecycle.request_id.as_deref(), Some("k"));
+        assert_eq!(store.release_request_id(&row.id).unwrap(), ReleaseRequestId::NoRecord);
+        assert_eq!(
+            store.sandbox(&row.id).unwrap().unwrap(),
+            released,
+            "a repeat changes nothing"
+        );
+        assert_eq!(
+            store.release_request_id("sb-0000000000000000").unwrap(),
+            ReleaseRequestId::NoSandbox
+        );
+    }
+
+    /// The schema 12 triggers hold even on a connection with foreign keys, recursive
+    /// triggers and CHECK constraints off.
+    #[test]
+    fn schema12_triggers_defend_records_on_a_defenseless_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let live = keyed_row("live", 1000);
+        store
+            .reserve_keyed_sandbox(&live, roomy_budgets(), Some(&admission(4, 8)))
+            .unwrap();
+        let conn = defenseless_connection(tmp.path());
+        let refused = |sql: &str| {
+            let error = conn.execute_batch(sql).unwrap_err().to_string();
+            assert!(
+                error.contains("create request")
+                    || error.contains("request ID")
+                    || error.contains("sandbox"),
+                "{sql}: {error}"
+            );
+        };
+        let id = &live.id;
+        // No replace, in either key; no record for a foreign or non-CREATING row.
+        refused(&format!(
+            "INSERT OR REPLACE INTO create_requests VALUES (1000, 'live', '{}', '{id}', 1, 'b', 1)",
+            "0".repeat(64)
+        ));
+        refused(&format!(
+            "INSERT OR REPLACE INTO create_requests VALUES (1000, 'other', '{}', '{id}', 1, 'b', 1)",
+            "0".repeat(64)
+        ));
+        refused(&format!(
+            "INSERT INTO create_requests VALUES (1001, 'other', '{}', '{id}', 1, 'b', 1)",
+            "0".repeat(64)
+        ));
+        // A record changes only in the cross-boot rebase.
+        refused(&format!(
+            "UPDATE create_requests SET request_sha256 = '{}' WHERE sandbox_id = '{id}'",
+            "1".repeat(64)
+        ));
+        refused(&format!(
+            "UPDATE create_requests SET retain_from_boottime_ms = 0 WHERE sandbox_id = '{id}'"
+        ));
+        conn.execute_batch(&format!(
+            "UPDATE create_requests SET retain_boot_id = 'boot-z', retain_from_boottime_ms = 0 WHERE sandbox_id = '{id}'"
+        ))
+        .unwrap();
+        // Neither a live record nor its pinned row can be deleted.
+        refused(&format!("DELETE FROM create_requests WHERE sandbox_id = '{id}'"));
+        refused(&format!("DELETE FROM sandboxes WHERE id = '{id}'"));
+        // The request ID is fixed, and released only from DELETED, after its record.
+        refused(&format!("UPDATE sandboxes SET request_id = 'changed' WHERE id = '{id}'"));
+        refused(&format!("UPDATE sandboxes SET request_id = NULL WHERE id = '{id}'"));
+        refused(&format!(
+            "UPDATE sandboxes SET request_id_released_at_ms = 1 WHERE id = '{id}'"
+        ));
+        drop(conn);
+        store
+            .set_sandbox_state(id, SandboxState::Deleted, None, None)
+            .unwrap();
+        let conn = defenseless_connection(tmp.path());
+        let refused = |sql: &str| assert!(conn.execute_batch(sql).is_err(), "{sql}");
+        refused(&format!(
+            "UPDATE sandboxes SET request_id_released_at_ms = 1 WHERE id = '{id}'"
+        ));
+        // A DELETED row's record may go; then the stamp may be written, once.
+        conn.execute_batch(&format!("DELETE FROM create_requests WHERE sandbox_id = '{id}'"))
+            .unwrap();
+        conn.execute_batch(&format!(
+            "UPDATE sandboxes SET request_id_released_at_ms = 1 WHERE id = '{id}'"
+        ))
+        .unwrap();
+        refused(&format!(
+            "UPDATE sandboxes SET request_id_released_at_ms = 2 WHERE id = '{id}'"
+        ));
+    }
+
+    #[test]
+    fn rebase_gives_foreign_records_this_boot_and_keeps_ours() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = crate::expiry::ManualClock::default();
+        store.set_clock(std::sync::Arc::new(clock.clone()));
+        let first = keyed_row("first", 1);
+        store
+            .reserve_keyed_sandbox(&first, roomy_budgets(), Some(&admission(4, 8)))
+            .unwrap();
+        let anchor = |store: &Store, id: &str| -> (String, i64) {
+            store
+                .conn()
+                .query_row(
+                    "SELECT retain_boot_id, retain_from_boottime_ms FROM create_requests WHERE sandbox_id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(anchor(&store, &first.id), ("boot-a".into(), 1_000_000));
+        assert_eq!(store.rebase_create_requests().unwrap(), 0);
+        clock.reboot("boot-b", 7_000, 1_000);
+        let second = keyed_row("second", 1);
+        store
+            .reserve_keyed_sandbox(&second, roomy_budgets(), Some(&admission(4, 8)))
+            .unwrap();
+        clock.advance(500);
+        assert_eq!(store.rebase_create_requests().unwrap(), 1);
+        assert_eq!(anchor(&store, &first.id), ("boot-b".into(), 7_500));
+        assert_eq!(anchor(&store, &second.id), ("boot-b".into(), 7_000));
+    }
+
+    #[test]
+    fn prune_age_is_r_plus_a_thousandth_rounded_up() {
+        use crate::retention::create_request_prune_age_ms;
+        assert_eq!(create_request_prune_age_ms(86_400), Some(86_400_000 + 86_400));
+        assert_eq!(create_request_prune_age_ms(86_401), Some(86_401_000 + 86_401));
+        assert_eq!(create_request_prune_age_ms(u64::MAX), None);
     }
 }

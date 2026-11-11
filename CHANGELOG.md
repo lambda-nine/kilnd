@@ -6,6 +6,42 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone 2 of the kilnd API additions: idempotent create, additive within
+  `kilnd.v1`; a client that sets none of the new fields gets exactly the earlier
+  behavior. `CreateSandboxRequest.request_id` (1-64 printable ASCII bytes, scoped to
+  the caller's uid, echoed as `Sandbox.request_id`) makes a create retryable: the
+  original and every retry with an equal request digest return `OK` with the same
+  sandbox in whatever state it settled, `FAILED` and `DELETED` included. A different
+  request under the key is `ALREADY_EXISTS request_id_conflict`; a retry while the
+  original runs waits for it within its own gRPC deadline, else
+  `DEADLINE_EXCEEDED create_in_flight`; a CREATING record with no live create is
+  `UNAVAILABLE create_unsettled`, never a fresh create. The digest is SHA-256 over
+  `kilnd.v1.create-request.1`, a zero byte and the canonical JSON of the request as
+  sent; `crates/kilnd/tests/data/create-request-digests.json` holds shared goldens.
+  An in-flight map, consulted first, lives until the create and its compensation have
+  fully finished. A cancel-safe pending slot before `prepare` and a recount in the
+  admitting transaction enforce `--max-create-requests-per-uid` (4,096) and
+  `--max-create-requests` (32,768) as `RESOURCE_EXHAUSTED request_id_quota`; the
+  record commits with the `CREATING` row. Records are kept at least
+  `--create-request-retention-secs` (a day) measured on `CLOCK_BOOTTIME` plus 0.1 %,
+  get a fresh window after a reboot (one startup rebase), are never pruned while their
+  sandbox is live or charged, and pin their row against ordinary retention, so a
+  wall-clock step cannot free a key early (Daybreak's design review HIGH 1).
+  `DeleteSandboxRequest.release_request_id` drops a record only in the transaction
+  that sees the row `DELETED`, through the prune-safe path, shown as
+  `Sandbox.request_id_released`; the client takes the duplicate risk after it. Health
+  lists the static features `IDEMPOTENT_CREATE` and `REQUEST_ID_RELEASE`, reports the
+  node and caller record counts in `AdmissionStats` (fields 21-25), retries answered
+  and releases in `LifecycleStats`, and the retention in `ApiLimits`. On legacy kiln a
+  create crashed before its backend ID was published stays an ambiguous, charged
+  `FAILED` that every retry returns (documented). Schema 12 adds `create_requests`
+  and the sandbox's `request_id` and `request_id_released_at_ms`, with triggers.
+  `kilndctl` gains `create --request-id` and `rm --release-request-id`, refused
+  unless Health lists the feature, and shows request IDs and record counts;
+  `scripts/idempotent-create-regressions.sh` checks keyed creates, release and a
+  daemon killed mid-create against the installed daemon. The docs now say an
+  expired sandbox leaves the default listing only once its removal reaches
+  `DELETED`.
 - Add milestone 1 of the kilnd API additions for the harness: capability discovery,
   typed refusal reasons and sandbox expiry, all additive within `kilnd.v1`; a client
   that sets none of the new fields gets exactly the earlier behavior.

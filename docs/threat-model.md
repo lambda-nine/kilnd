@@ -117,6 +117,20 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   [B2 storage design](design/phase1b-firecracker.md#84-schema-ownership-and-history-protection). Receipts are private,
   trusted backend evidence bounded to 16 KiB, never caller strings or guest assertions,
   and the API exposes none of them.
+- **A retried create never makes a second sandbox within its retention, and a
+  key never crosses uids.** A `request_id` is scoped to the caller's kernel uid, so
+  another caller can neither read nor take over a key, and a foreign sandbox stays
+  `NOT_FOUND` to release. The record commits with its `CREATING` row, ages only on
+  `CLOCK_BOOTTIME` with a 0.1 % margin and a fresh window after a reboot, and pins its
+  row, so no wall-clock step, crash or prune frees a key early. Records are bounded
+  per uid and per node; at a cap new keyed creates are refused, never earlier records
+  pruned, so one caller filling its share cannot evict another's retry protection
+  (it can fill the node cap, as it can fill `--max-sandboxes`). Release is explicit,
+  owner-authorized, irreversible and effective only in the transaction that sees the
+  row `DELETED`; the duplicate risk after it is the client's by contract. The request
+  digest is an unkeyed hash of the request the caller itself sent, returned to no
+  one. Legacy kiln's crashed creates stay charged and are never released by a retry
+  or a release.
 - **Expiry deletes only through the ordinary delete path, and only what a policy
   asked for.** A sandbox expires only if its own create sent an expiry policy: an
   absent policy never expires, whatever the node defaults, so a client that predates

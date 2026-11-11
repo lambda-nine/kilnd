@@ -9,7 +9,8 @@ use tonic::{Request, Response, Status};
 
 use crate::admission::{ConnectionLane, RpcClass, RpcPermit};
 use crate::manager::{
-    CreateRequest, Error, ExecRequest, ExpiryView, Feature, Limits, Manager, Refusal,
+    CreateKey, CreateRequest, Error, ExecRequest, ExpiryView, Feature, Limits, Manager, Refusal,
+    RefusalCode,
 };
 use crate::model::{
     CancelReason, Captured, DeletionReason, Execution, ExecutionState, Network, Sandbox,
@@ -44,6 +45,24 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             .try_health(uid)
             .map_err(|_| Status::resource_exhausted("Health RPC capacity reached"))?;
         let h = self.manager.health().await.map_err(status)?;
+        // The node's request records and the caller's own (design 3.3).
+        let requests = self
+            .manager
+            .create_request_stats(uid)
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %format!("{error:#}"), "read create request counts");
+                crate::manager::CreateRequestStats {
+                    max_node: self.manager.limits().create_requests.max_node,
+                    max_per_uid: self.manager.limits().create_requests.max_per_uid,
+                    ..Default::default()
+                }
+            });
+        let mut admission = admission_pb(h.admission);
+        admission.max_create_requests = requests.max_node;
+        admission.current_create_requests = requests.node;
+        admission.max_create_requests_per_uid = requests.max_per_uid;
+        admission.caller_create_requests = requests.caller;
+        admission.rejected_create_requests = requests.rejected;
         let status = if h.shutting_down {
             pb::health_response::Status::ShuttingDown
         } else if h.serving {
@@ -60,7 +79,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             started_at_unix_ms: h.started_at_ms,
             active_sandboxes: h.active_sandboxes,
             running_executions: h.running_executions,
-            admission: Some(admission_pb(h.admission)),
+            admission: Some(admission),
             node_resources: Some(node_resources_pb(h.node_resources)),
             runtime_capabilities: Some(runtime_capabilities_pb(
                 h.capabilities,
@@ -72,8 +91,8 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
                 expired_lifetime: h.lifecycle.expired_lifetime,
                 pending_expiry_deletes: h.lifecycle.pending_expiry_deletes,
                 failed_expiry_deletes: h.lifecycle.failed_expiry_deletes,
-                create_retries_answered: 0,
-                request_ids_released: 0,
+                create_retries_answered: h.lifecycle.create_retries_answered,
+                request_ids_released: h.lifecycle.request_ids_released,
             }),
         }))
     }
@@ -82,16 +101,43 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         &self,
         req: Request<pb::CreateSandboxRequest>,
     ) -> Result<Response<pb::CreateSandboxResponse>, Status> {
+        let received_at = tokio::time::Instant::now();
         let uid = caller_uid(&req)?;
+        let deadline = rpc_deadline(&req, received_at);
         let _permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
         let req = req.into_inner();
+        if req.request_id.is_empty() {
+            // Unkeyed: exactly the path before idempotent create.
+            let expiry = req.expiry.map(|e| crate::expiry::RequestedExpiry {
+                max_lifetime_ms: e.max_lifetime_ms,
+                idle_timeout_ms: e.idle_timeout_ms,
+            });
+            let sandbox = self
+                .manager
+                .create_owned(create_request(req.spec.unwrap_or_default(), expiry)?, uid)
+                .await
+                .map_err(status)?;
+            return Ok(Response::new(pb::CreateSandboxResponse {
+                sandbox: Some(self.sandbox_out(sandbox)),
+            }));
+        }
+        // Design 3.1 step 1: the grammar and the digest of the request as sent. Its
+        // conversion errors are validation, reported only after the lookups.
+        crate::idempotency::validate_request_id(&req.request_id)
+            .map_err(Status::invalid_argument)?;
+        let key = CreateKey {
+            sha256: crate::idempotency::request_digest(&req),
+            request_id: req.request_id.clone(),
+        };
         let expiry = req.expiry.map(|e| crate::expiry::RequestedExpiry {
             max_lifetime_ms: e.max_lifetime_ms,
             idle_timeout_ms: e.idle_timeout_ms,
         });
+        let converted = create_request(req.spec.unwrap_or_default(), expiry)
+            .map_err(|s| s.message().to_string());
         let sandbox = self
             .manager
-            .create_owned(create_request(req.spec.unwrap_or_default(), expiry)?, uid)
+            .create_keyed(converted, uid, key, deadline)
             .await
             .map_err(status)?;
         Ok(Response::new(pb::CreateSandboxResponse {
@@ -193,9 +239,14 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
     ) -> Result<Response<pb::DeleteSandboxResponse>, Status> {
         let uid = caller_uid(&req)?;
         let _permit = self.rpc_permit(&req, RpcClass::Cleanup, uid)?;
-        let id = req.into_inner().id;
+        let req = req.into_inner();
+        let id = req.id;
         self.manager.authorize(&id, uid).map_err(status)?;
-        let sandbox = self.manager.delete(&id).await.map_err(status)?;
+        let sandbox = self
+            .manager
+            .delete_releasing(&id, req.release_request_id)
+            .await
+            .map_err(status)?;
         Ok(Response::new(pb::DeleteSandboxResponse {
             sandbox: Some(self.sandbox_out(sandbox)),
         }))
@@ -323,6 +374,8 @@ fn admission_pb(s: crate::admission::AdmissionSnapshot) -> pb::AdmissionStats {
         rejected_stdin: s.stdin.rejected,
         max_queued_execs_per_sandbox: s.max_queued_execs_per_sandbox,
         rejected_sandbox_execs: s.rejected_sandbox_execs,
+        // Filled by Health from the store, for the caller.
+        ..Default::default()
     }
 }
 
@@ -348,7 +401,10 @@ fn api_limits_pb(l: &Limits) -> pb::ApiLimits {
         max_sandbox_idle_ms: l.expiry.max_idle_ms,
         default_sandbox_lifetime_ms: l.expiry.default_lifetime_ms,
         default_sandbox_idle_ms: l.expiry.default_idle_ms,
-        create_request_retention_ms: 0,
+        create_request_retention_ms: l
+            .retention
+            .create_request_retention_secs
+            .saturating_mul(1000),
         max_cwd_bytes: 0,
         max_env_entries: 0,
         max_env_name_bytes: 0,
@@ -496,6 +552,19 @@ fn status(e: Error) -> Status {
         Error::DeadlineExceeded(m) => Status::deadline_exceeded(m),
         Error::ShuttingDown => Status::unavailable("kilnd is shutting down"),
         Error::Backend(m) => Status::internal(m),
+        Error::Refused(code, r) => refusal(
+            match code {
+                RefusalCode::AlreadyExists => tonic::Code::AlreadyExists,
+                RefusalCode::ResourceExhausted => tonic::Code::ResourceExhausted,
+                RefusalCode::DeadlineExceeded => tonic::Code::DeadlineExceeded,
+                RefusalCode::Unavailable => tonic::Code::Unavailable,
+            },
+            r,
+        ),
+        Error::RequestIdTaken => {
+            tracing::error!("a request-ID race escaped the manager");
+            Status::internal("internal error; see the kilnd log")
+        }
         Error::Internal(e) => {
             tracing::error!(error = %format!("{e:#}"), "internal error");
             Status::internal("internal error; see the kilnd log")
@@ -522,6 +591,34 @@ fn refusal(code: tonic::Code, r: Refusal) -> Status {
 
 /// The reason trailer's key: ASCII metadata, matched by clients instead of prose.
 pub const REASON_KEY: &str = "kilnd-reason";
+
+/// The caller's own deadline, from its `grpc-timeout` header, a little early so the
+/// typed `create_in_flight` answer reaches it before its transport gives up: 5 % of
+/// the timeout, at most 250 ms. No header, or a malformed one: no deadline.
+fn rpc_deadline<T>(req: &Request<T>, received_at: tokio::time::Instant) -> Option<tokio::time::Instant> {
+    let timeout = parse_grpc_timeout(req.metadata().get("grpc-timeout")?.to_str().ok()?)?;
+    let margin = (timeout / 20).min(std::time::Duration::from_millis(250));
+    received_at.checked_add(timeout.saturating_sub(margin))
+}
+
+/// gRPC's `TimeoutValue TimeoutUnit`: 1 to 8 ASCII digits and one of H M S m u n.
+fn parse_grpc_timeout(value: &str) -> Option<std::time::Duration> {
+    use std::time::Duration;
+    let (digits, unit) = value.split_at(value.len().checked_sub(1)?);
+    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    Some(match unit {
+        "H" => Duration::from_secs(n.checked_mul(3600)?),
+        "M" => Duration::from_secs(n.checked_mul(60)?),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    })
+}
 
 fn create_request(
     spec: pb::SandboxSpec,
@@ -608,6 +705,8 @@ pub fn sandbox_pb(s: Sandbox) -> pb::Sandbox {
         ..Default::default()
     };
     pb::Sandbox {
+        request_id: s.lifecycle.request_id.clone().unwrap_or_default(),
+        request_id_released: s.lifecycle.request_id_released_at_ms.is_some(),
         deletion_reason: deletion_reason.into(),
         expiry: Some(expiry),
         id: s.id,
@@ -802,7 +901,7 @@ mod tests {
         ];
         for spec in invalid {
             let error = service
-                .create_sandbox(as_root(pb::CreateSandboxRequest {
+                .create_sandbox(as_root(pb::CreateSandboxRequest { request_id: String::new(),
                     spec: Some(spec),
                     expiry: None,
                 }))
@@ -1030,7 +1129,7 @@ mod tests {
                 .unwrap();
             service
                 .delete_sandbox(on_lane(
-                    pb::DeleteSandboxRequest {
+                    pb::DeleteSandboxRequest { release_request_id: false,
                         id: victim.id.clone(),
                     },
                     uid,
@@ -1098,7 +1197,7 @@ mod tests {
             .unwrap();
         service
             .delete_sandbox(on_lane(
-                pb::DeleteSandboxRequest {
+                pb::DeleteSandboxRequest { release_request_id: false,
                     id: sandbox.id.clone(),
                 },
                 0,
@@ -1399,7 +1498,7 @@ mod tests {
         let handler = tokio::spawn(async move {
             KilndService::create_sandbox(
                 service.as_ref(),
-                as_root(pb::CreateSandboxRequest {
+                as_root(pb::CreateSandboxRequest { request_id: String::new(),
                     spec: None,
                     expiry: None,
                 }),
@@ -1858,7 +1957,7 @@ mod tests {
                 .await
                 .unwrap_err();
             let delete = service
-                .delete_sandbox(as_uid(pb::DeleteSandboxRequest { id: id.into() }, uid))
+                .delete_sandbox(as_uid(pb::DeleteSandboxRequest { release_request_id: false, id: id.into() }, uid))
                 .await
                 .unwrap_err();
             for error in [get, exec, invalid_exec, delete] {
@@ -1936,7 +2035,7 @@ mod tests {
             assert_eq!(read.stdout.unwrap().data, b"secret\n");
             let deleted = service
                 .delete_sandbox(as_uid(
-                    pb::DeleteSandboxRequest {
+                    pb::DeleteSandboxRequest { release_request_id: false,
                         id: sandbox.id.clone(),
                     },
                     uid,
@@ -1995,7 +2094,7 @@ mod tests {
         assert_eq!(row.owner_uid, 1001);
         assert_eq!(
             service
-                .delete_sandbox(as_uid(pb::DeleteSandboxRequest { id: row.id }, 1002))
+                .delete_sandbox(as_uid(pb::DeleteSandboxRequest { release_request_id: false, id: row.id }, 1002))
                 .await
                 .unwrap_err()
                 .code(),
@@ -2067,7 +2166,7 @@ mod tests {
                     .unwrap_err(),
                 service
                     .delete_sandbox(identified(
-                        pb::DeleteSandboxRequest {
+                        pb::DeleteSandboxRequest { release_request_id: false,
                             id: sandbox.id.clone(),
                         },
                         peer,
@@ -2219,7 +2318,7 @@ mod tests {
             async move {
                 service
                     .create_sandbox(as_uid(
-                        pb::CreateSandboxRequest {
+                        pb::CreateSandboxRequest { request_id: String::new(),
                             spec: Some(pb::SandboxSpec {
                                 labels: (0..labels)
                                     .map(|n| (format!("label{n}"), "x".repeat(200)))
@@ -2421,3 +2520,6 @@ mod tests {
 
 #[cfg(test)]
 mod m1_tests;
+
+#[cfg(test)]
+mod m2_tests;
