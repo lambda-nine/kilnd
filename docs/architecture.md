@@ -725,23 +725,30 @@ trigger notes in `reservation_unsettled` every row that leaves the charged set, 
 update or anyone's; it records only the ID, so it cannot vouch for a row. A partial
 index, `sandboxes_charged`, finds charged rows without a scan.
 
-- Every accounting decision (admission, keyed lookup, reads, release, Health) hashes
-  only the live rows, the charged ones and those unsettled since the last full audit,
-  and requires settled + live = all. A charged row lost, or released past the
-  triggers, behind kilnd's back is caught by the next decision, as before. Its cost is
-  bounded by reservations and by releases since the last prune, not by history.
-- The full audit rehashes every row against the stored total, re-derives the settled
-  aggregate and the release-evidence quarantine, clears the unsettled list and checks
-  the request counters against the records. It runs at startup (a mismatch refuses
-  it) and at the start of every prune; a mismatch there fails the prune and latches
-  the connection degraded, so admission, pruning and accounting reads refuse until a
-  restart, which refuses too. A settled row lost behind kilnd's back changes no
-  reservation, so it is caught there, within one prune interval (60 s by default)
-  rather than at the next decision. With a very long `--prune-interval-secs` the
-  unsettled list, and so a decision's cost, grows with the releases since the last
-  prune.
+- Every accounting decision (admission, keyed lookup, reads, release, Health) first
+  reads SQLite's `PRAGMA data_version`. kilnd writes only through its one connection,
+  so if no other connection has committed since this one last verified everything,
+  all state since then is kilnd's own writing, and the decision hashes only the live
+  rows (the charged ones and those unsettled since) and their release evidence, and
+  requires settled + live = all. Otherwise (an operator's `sqlite3`, a restore, a
+  writer past the triggers) it verifies everything, as every decision used to: every
+  row against the stored total, the partition, the request counters against the
+  records, and every fenced release's evidence. A row lost or released behind
+  kilnd's back is therefore caught by the next decision.
+- Write decisions (admission, refusals included, an insert, a release) move the
+  unsettled rows they have just verified into the settled aggregate. A released row is
+  hashed only until the next write decision, so a decision's cost is bounded by the
+  charged rows and the releases since the last write, never by retained history or
+  the prune interval.
+- The full audit, at startup (a mismatch refuses it) and at the start of every prune,
+  verifies everything the same way, including the partition, so it never folds a
+  bypassed release into settled history; then it re-derives the settled aggregate and
+  clears the unsettled list. A mismatch fails the prune and latches the connection
+  degraded, so admission, pruning and accounting reads refuse until a restart, which
+  refuses too.
 - Like the marker it replaces, the aggregate detects accidental or missing
-  membership, not a writer with file authority who rewrites both.
+  membership, not a writer with file authority who rewrites both, nor edits to the
+  file that bypass SQLite (which `data_version` cannot see).
 
 So within R a retry always finds its record and real row and never creates a second
 sandbox. A live, `LOST` or charged row's record is kept however old.

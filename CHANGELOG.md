@@ -23,10 +23,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   32,768 records took seconds; schema 12 replaces the membership marker (verified
   during the upgrade) with O(1)-updatable aggregates, the request quota reads
   trigger-kept counters, and each decision checks only the charged and recently
-  released rows, through a partial index. Startup and every prune rehash all history
-  and the counters; a mismatch there latches admission off. Admission cost no longer
-  grows with retained history (a 4,096/32,768-record scale test checks it). Each
-  finding has a regression.
+  released rows, through a partial index; write decisions settle the releases they
+  verified. The first decision after any other connection commits (SQLite's
+  `data_version`), startup and every prune verify everything, including that settled
+  and live rows add up and every fenced release's evidence; a failed prune latches
+  admission off. Admission cost no longer grows with retained history or releases
+  between prunes (4,096/32,768-record and create/delete-cycle tests check it; at the
+  default caps the review's 32-way last-slot race took 0.04 s on the installed daemon,
+  from 5.19 s). Each finding has a regression.
 - Add milestone 2 of the kilnd API additions: idempotent create, additive within
   `kilnd.v1`; a client that sets none of the new fields gets exactly the earlier
   behavior. `CreateSandboxRequest.request_id` (1-64 printable ASCII bytes, scoped to

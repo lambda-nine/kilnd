@@ -805,17 +805,7 @@ const FENCED_RELEASE_COLUMNS: &str = "s.id, s.node_id, s.instance_id, s.allocati
 const FENCED_RELEASE_WHERE: &str =
     "s.accounting_kind = 'fenced' AND (s.release_evidence_id IS NOT NULL OR s.state = 'deleted')";
 
-// Call inside the same transaction/snapshot as every accounting decision. Decode
-// in Rust, independently of whichever SQL function an external writer registered.
-// Quarantine is a read projection: retain the corrupt reference for investigation.
-//
-// Bounded (break-it M2 MEDIUM 2): it hashes and checks only the live rows. The
-// settled aggregate, written by the last full audit, stands for the rest, so a
-// charged row lost (or released) behind kilnd's back is still caught here, by
-// every decision. Settled history, which cannot change any reservation, is
-// rehashed and its release evidence rechecked by the full audit, at startup and
-// before every prune; a failed full audit latches this connection degraded.
-fn audit_accounting(conn: &Connection) -> Result<bool> {
+fn latched_lost(conn: &Connection) -> Result<()> {
     let lost: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM temp.membership_lost)",
         [],
@@ -824,13 +814,100 @@ fn audit_accounting(conn: &Connection) -> Result<bool> {
     if lost {
         bail!("{MEMBERSHIP_MISMATCH}");
     }
-    let (all, settled) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
-    let live = membership_of(
+    Ok(())
+}
+
+// SQLite's count of commits by *other* connections, as this connection's snapshot
+// sees it. kilnd writes only through its one connection, so an unchanged value means
+// every byte of state since the last full verification is kilnd's own writing.
+fn data_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
+}
+
+fn live_membership(conn: &Connection) -> Result<Membership> {
+    membership_of(
         conn,
         &format!("SELECT {MEMBERSHIP_COLUMNS} FROM sandboxes WHERE id IN ({})", live_ids()),
         [],
+    )
+}
+
+fn quarantined(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM temp.accounting_quarantine)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Everything, without rewriting anything durable: every row's membership against
+/// the stored total, the partition (settled + live = all, so a charged row released
+/// or lost past the triggers is caught, break-it review MEDIUM 1 of the fix), the
+/// quota counters against the records, and every fenced release's evidence, from
+/// which the quarantine is rebuilt. O(N). Stamps the data version it verified.
+fn verify_membership(conn: &Connection) -> Result<bool> {
+    latched_lost(conn)?;
+    let (all, settled) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
+    if all_membership(conn)? != all || settled.plus(live_membership(conn)?) != all {
+        bail!("{MEMBERSHIP_MISMATCH}");
+    }
+    // The quota counters against the records they count: no uid missing, none
+    // extra, the node total their sum.
+    let miscounted: bool = conn.query_row(
+        "WITH actual(owner_uid, records) AS (
+             SELECT owner_uid, COUNT(*) FROM create_requests GROUP BY owner_uid
+             UNION ALL SELECT -1, COUNT(*) FROM create_requests)
+         SELECT EXISTS (SELECT owner_uid, records FROM actual EXCEPT SELECT owner_uid, records FROM create_request_counts)
+             OR EXISTS (SELECT owner_uid, records FROM create_request_counts EXCEPT SELECT owner_uid, records FROM actual)",
+        [],
+        |r| r.get(0),
     )?;
-    if settled.plus(live) != all {
+    if miscounted {
+        bail!("degraded accounting: create request counters do not match the records; admission and pruning disabled");
+    }
+    conn.execute_batch("DELETE FROM temp.accounting_quarantine;")?;
+    fenced_release_checks(
+        conn,
+        &format!(
+            "SELECT {FENCED_RELEASE_COLUMNS} FROM sandboxes s
+             LEFT JOIN release_evidence e ON e.receipt_id = s.release_evidence_id WHERE {FENCED_RELEASE_WHERE}"
+        ),
+    )?;
+    // In the caller's transaction with the quarantine it rebuilt: if that rolls
+    // back, so does the stamp, and the next decision verifies again.
+    conn.execute(
+        "INSERT INTO temp.membership_verified VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET data_version = excluded.data_version",
+        [data_version(conn)?],
+    )?;
+    quarantined(conn)
+}
+
+// Call inside the same transaction/snapshot as every accounting decision. Decode
+// in Rust, independently of whichever SQL function an external writer registered.
+// Quarantine is a read projection: retain the corrupt reference for investigation.
+//
+// Bounded (break-it M2 MEDIUM 2). If any other connection has committed since this
+// one last verified everything (`PRAGMA data_version`: an operator's sqlite3, a
+// restore, an attacker past the triggers), the decision verifies everything again,
+// as every decision used to. Otherwise all state since that verification is kilnd's
+// own writing, so it checks only the live rows: their membership against the
+// aggregates and their release evidence. A charged row lost or released behind
+// kilnd's back is caught by the next decision either way.
+fn audit_accounting(conn: &Connection) -> Result<bool> {
+    latched_lost(conn)?;
+    let (all, settled) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
+    let verified: Option<i64> = conn
+        .query_row(
+            "SELECT data_version FROM temp.membership_verified WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if verified != Some(data_version(conn)?) {
+        return verify_membership(conn);
+    }
+    if settled.plus(live_membership(conn)?) != all {
         bail!("{MEMBERSHIP_MISMATCH}");
     }
     conn.execute(
@@ -849,45 +926,42 @@ fn audit_accounting(conn: &Connection) -> Result<bool> {
             live_ids()
         ),
     )?;
-    Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM temp.accounting_quarantine)",
-        [],
-        |r| r.get(0),
-    )?)
+    quarantined(conn)
 }
 
-/// The full audit: every row's membership against the stored aggregate, then the
-/// settled aggregate and the quarantine rebuilt from the rows as they stand. O(N);
-/// only at startup and before each prune, in a write transaction.
-fn audit_accounting_full(conn: &Connection) -> Result<bool> {
-    let (all, _) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
-    if all_membership(conn)? != all {
-        bail!("{MEMBERSHIP_MISMATCH}");
-    }
-    // The quota counters against the records they count: no uid missing, none
-    // extra, the node total their sum.
-    let miscounted: bool = conn.query_row(
-        "WITH actual(owner_uid, records) AS (
-             SELECT owner_uid, COUNT(*) FROM create_requests GROUP BY owner_uid
-             UNION ALL SELECT -1, COUNT(*) FROM create_requests)
-         SELECT EXISTS (SELECT owner_uid, records FROM actual EXCEPT SELECT owner_uid, records FROM create_request_counts)
-             OR EXISTS (SELECT owner_uid, records FROM create_request_counts EXCEPT SELECT owner_uid, records FROM actual)",
-        [],
-        |r| r.get(0),
-    )?;
-    if miscounted {
-        bail!("degraded accounting: create request counters do not match the records; admission and pruning disabled");
-    }
-    store_membership(conn, all, settled_membership(conn)?)?;
-    conn.execute("DELETE FROM reservation_unsettled", [])?;
-    conn.execute_batch("DELETE FROM temp.accounting_quarantine;")?;
-    fenced_release_checks(
+/// In a write decision's transaction, after its audit verified the partition: move
+/// every unsettled row into the settled aggregate. Each released row is then hashed
+/// by decisions only until the next write decision, not until the next prune
+/// (break-it review MEDIUM 2 of the fix): a decision's cost is bounded by the charged
+/// rows and the releases since the last committed write.
+fn settle_unsettled(conn: &Connection) -> Result<()> {
+    let unsettled = membership_of(
         conn,
         &format!(
-            "SELECT {FENCED_RELEASE_COLUMNS} FROM sandboxes s
-             LEFT JOIN release_evidence e ON e.receipt_id = s.release_evidence_id WHERE {FENCED_RELEASE_WHERE}"
+            "SELECT {MEMBERSHIP_COLUMNS} FROM sandboxes WHERE id IN (SELECT id FROM reservation_unsettled)
+             AND NOT ({RESERVED_SANDBOX_WHERE})"
         ),
-    )
+        [],
+    )?;
+    if unsettled.count == 0 {
+        conn.execute("DELETE FROM reservation_unsettled", [])?;
+        return Ok(());
+    }
+    let (all, settled) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
+    store_membership(conn, all, settled.plus(unsettled))?;
+    conn.execute("DELETE FROM reservation_unsettled", [])?;
+    Ok(())
+}
+
+/// The full audit: [`verify_membership`], then the settled aggregate rebuilt from the
+/// rows as they stand and the unsettled list cleared. O(N); only at startup and
+/// before each prune, in a write transaction.
+fn audit_accounting_full(conn: &Connection) -> Result<bool> {
+    let degraded = verify_membership(conn)?;
+    let (all, _) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
+    store_membership(conn, all, settled_membership(conn)?)?;
+    conn.execute("DELETE FROM reservation_unsettled", [])?;
+    Ok(degraded)
 }
 
 // The explicit legacy tag and reuse state for an update binding ?2 = new state and
@@ -1690,7 +1764,8 @@ impl Store {
         }
         conn.execute_batch(
             "CREATE TEMP TABLE accounting_quarantine (id TEXT PRIMARY KEY);
-             CREATE TEMP TABLE membership_lost (id INTEGER PRIMARY KEY CHECK (id = 1));",
+             CREATE TEMP TABLE membership_lost (id INTEGER PRIMARY KEY CHECK (id = 1));
+             CREATE TEMP TABLE membership_verified (id INTEGER PRIMARY KEY CHECK (id = 1), data_version INTEGER NOT NULL);",
         )?;
         // Evidence references depend on this, and SQLite ignores it inside a
         // transaction and defaults it off per connection. Set and verify it first.
@@ -1852,6 +1927,7 @@ impl Store {
         if audit_accounting(&tx)? {
             bail!("degraded accounting: quarantined release evidence");
         }
+        settle_unsettled(&tx)?;
         insert_sandbox(&tx, s)?;
         note_inserted_sandbox(&tx, &s.id)?;
         tx.commit()?;
@@ -1890,6 +1966,9 @@ impl Store {
         if audit_accounting(&tx)? {
             bail!("degraded accounting: quarantined release evidence; admission disabled");
         }
+        // A refusal below commits too, so the settling (and a fresh verification's
+        // stamp) is kept: refusals at a cap never pile up rehashing.
+        settle_unsettled(&tx)?;
         if let Some(request) = request {
             let request_id = s
                 .lifecycle
@@ -1902,10 +1981,12 @@ impl Store {
                 |r| r.get(0),
             )?;
             if taken {
+                tx.commit()?;
                 return Ok(ReserveSandbox::RequestIdTaken);
             }
             let counts = request_counts(&tx, s.owner_uid)?;
             if counts.uid >= request.max_per_uid {
+                tx.commit()?;
                 return Ok(ReserveSandbox::RequestQuota(RequestQuota {
                     scope: "uid",
                     count: counts.uid,
@@ -1913,6 +1994,7 @@ impl Store {
                 }));
             }
             if counts.node >= request.max_node {
+                tx.commit()?;
                 return Ok(ReserveSandbox::RequestQuota(RequestQuota {
                     scope: "node",
                     count: counts.node,
@@ -1925,6 +2007,7 @@ impl Store {
         let reserved = sandbox_resources(&tx)?;
         let requested = SandboxResources::for_reservation(&s.accounting.reservation);
         if let Some(exhausted) = exhausted_budget(reserved, requested, budgets)? {
+            tx.commit()?;
             return Ok(ReserveSandbox::Exhausted(exhausted));
         }
         insert_sandbox(&tx, s)?;
@@ -2028,6 +2111,7 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         audit_accounting(&tx)?;
+        settle_unsettled(&tx)?;
         let deleted: Option<bool> = tx
             .query_row(
                 "SELECT state = 'deleted' AND id NOT IN (SELECT id FROM temp.accounting_quarantine)
@@ -6225,7 +6309,7 @@ mod tests {
     fn trusted_reads_validate_all_receipt_fields_and_missing_evidence() {
         // Start with a real release, then model out-of-scope file authority.
         // Every side column, encoded field and the row's generation is checked.
-        for attack in [
+        for (attack, settled) in [
             "DELETE FROM release_evidence",
             "UPDATE release_evidence SET receipt=x'00'",
             "UPDATE release_evidence SET receipt=x''",
@@ -6239,7 +6323,12 @@ mod tests {
             "UPDATE release_evidence SET kind='other'",
             "UPDATE sandboxes SET last_helper_generation=8",
             "UPDATE sandboxes SET release_evidence_id=NULL",
-        ] {
+        ]
+        .into_iter()
+        // M2 fix review MEDIUM 3: also once a retaining prune has settled the row,
+        // so its evidence is outside the live set when it is corrupted.
+        .flat_map(|attack| [(attack, false), (attack, true)])
+        {
             let tmp = tempfile::tempdir().unwrap();
             std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let store = Store::open(tmp.path()).unwrap();
@@ -6248,6 +6337,10 @@ mod tests {
             store
                 .release_fenced(&row.id, SandboxState::Deleted, &receipt_for(&row), None)
                 .unwrap();
+            if settled {
+                store.prune(&Retention::default(), now_ms()).unwrap();
+                assert!(!store.accounting_snapshot().unwrap().1);
+            }
             let external = Connection::open(tmp.path().join("kilnd.db")).unwrap();
             external
                 .set_db_config(
@@ -6259,8 +6352,15 @@ mod tests {
                 .execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
                 .unwrap();
             external.execute(attack, []).unwrap();
+            if settled && attack.contains("release_evidence_id=NULL") {
+                // Charged again behind kilnd's back while settled: the partition no
+                // longer adds up, which refuses outright rather than quarantining.
+                let error = store.sandbox_resources().unwrap_err().to_string();
+                assert!(error.contains("reservation integrity"), "{attack}: {error}");
+                continue;
+            }
             assert_quarantined_reads(&store, &row);
-            assert!(store.accounting_snapshot().unwrap().1, "{attack}");
+            assert!(store.accounting_snapshot().unwrap().1, "{attack} settled={settled}");
             assert_eq!(
                 store
                     .prune(
@@ -9353,63 +9453,72 @@ mod tests {
         conn
     }
 
-    /// Break-it M2 MEDIUM 2: every decision still catches a charged row that is
-    /// lost, or released past the triggers, behind kilnd's back; a settled row lost
-    /// the same way changes no reservation and is caught by the next full audit
-    /// (prune), which latches admission off; a restart refuses it too.
+    /// Break-it M2 MEDIUM 2: after any other connection commits, the next decision
+    /// verifies everything, as every decision used to: a lost settled row, a lost
+    /// charged row and a charged row released past the triggers are each caught
+    /// there. A prune or a restart that comes first refuses too, and never folds a
+    /// bypassed release into settled history (fix review MEDIUM 1); prune latches.
     #[test]
-    fn bounded_audit_catches_charged_loss_and_the_full_audit_settled_loss() {
-        let (tmp, dir) = {
+    fn external_changes_are_caught_by_the_next_decision_prune_or_restart() {
+        // What happens first after the external change.
+        #[derive(Clone, Copy, Debug)]
+        enum First {
+            Decision,
+            Prune,
+            Restart,
+        }
+        for (change, first) in ["lose settled", "lose charged", "release charged"]
+            .into_iter()
+            .flat_map(|c| [(c, First::Decision), (c, First::Prune), (c, First::Restart)])
+        {
             let tmp = tempfile::tempdir().unwrap();
             std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let dir = tmp.path().join("state");
-            (tmp, dir)
-        };
-        let store = Store::open(&dir).unwrap();
-        let charged = sandbox();
-        store.insert_sandbox(&charged).unwrap();
-        let settled = sandbox();
-        store.insert_sandbox(&settled).unwrap();
-        for state in [SandboxState::Ready, SandboxState::Deleting, SandboxState::Deleted] {
-            let backend = (state == SandboxState::Ready).then_some("b-settled");
-            store.set_sandbox_state(&settled.id, state, backend, None).unwrap();
-        }
-        // Settle it: the prune's full audit moves it out of the live set.
-        store.prune(&Retention { sandbox_max_count: 1_000, ..Retention::default() }, now_ms()).unwrap();
-        assert!(store.sandbox_resources().is_ok());
-
-        // A charged row released past the triggers: caught by the next decision.
-        let outside = trigger_free_connection(&dir);
-        outside
-            .execute("UPDATE sandboxes SET legacy_release = 'deleted', state = 'deleted' WHERE id = ?1", [&charged.id])
+            let store = Store::open(&dir).unwrap();
+            let charged = sandbox();
+            store.insert_sandbox(&charged).unwrap();
+            let settled = sandbox();
+            store.insert_sandbox(&settled).unwrap();
+            for state in [SandboxState::Ready, SandboxState::Deleting, SandboxState::Deleted] {
+                let backend = (state == SandboxState::Ready).then_some("b-settled");
+                store.set_sandbox_state(&settled.id, state, backend, None).unwrap();
+            }
+            store.prune(&Retention::default(), now_ms()).unwrap();
+            assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+            let outside = trigger_free_connection(&dir);
+            match change {
+                "lose settled" => outside.execute("DELETE FROM sandboxes WHERE id = ?1", [&settled.id]),
+                "lose charged" => outside.execute("DELETE FROM sandboxes WHERE id = ?1", [&charged.id]),
+                _ => outside.execute(
+                    "UPDATE sandboxes SET legacy_release = 'deleted', state = 'deleted' WHERE id = ?1",
+                    [&charged.id],
+                ),
+            }
             .unwrap();
-        let error = store.sandbox_resources().unwrap_err().to_string();
-        assert!(error.contains("reservation integrity"), "{error}");
-        outside
-            .execute("UPDATE sandboxes SET legacy_release = NULL, state = 'creating' WHERE id = ?1", [&charged.id])
-            .unwrap();
-        assert!(store.sandbox_resources().is_ok());
-
-        // A settled row lost past the triggers: no reservation changes, so the
-        // bounded audit passes; the full audit before the next prune does not.
-        outside.execute("DELETE FROM sandboxes WHERE id = ?1", [&settled.id]).unwrap();
-        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
-        let error = store.prune(&Retention::default(), now_ms()).unwrap_err().to_string();
-        assert!(error.contains("reservation integrity"), "{error}");
-        for error in [
-            store.sandbox_resources().unwrap_err(),
-            match store.reserve_sandbox(&sandbox(), roomy_budgets()) {
-                Err(error) => error,
-                Ok(_) => panic!("admission latched off"),
-            },
-            store.prune(&Retention::default(), now_ms()).unwrap_err(),
-        ] {
-            assert!(error.to_string().contains("reservation integrity"), "{error}");
+            drop(outside);
+            let label = format!("{change}, then {first:?}");
+            let refused = |error: anyhow::Error| {
+                let error = format!("{error:#}");
+                assert!(error.contains("reservation integrity"), "{label}: {error}");
+            };
+            match first {
+                First::Decision => {
+                    refused(store.sandbox_resources().unwrap_err());
+                    match store.reserve_sandbox(&sandbox(), roomy_budgets()) {
+                        Err(error) => refused(error),
+                        Ok(_) => panic!("{label}: admitted"),
+                    }
+                }
+                First::Prune => {
+                    refused(store.prune(&Retention::default(), now_ms()).unwrap_err());
+                    refused(store.sandbox_resources().unwrap_err());
+                    refused(store.prune(&Retention::default(), now_ms()).unwrap_err());
+                }
+                First::Restart => {}
+            }
+            drop(store);
+            refused(Store::open(&dir).err().expect("startup refuses"));
         }
-        drop((outside, store));
-        let error = Store::open(&dir).err().expect("startup refuses").to_string();
-        assert!(error.contains("reservation integrity"), "{error}");
-        drop(tmp);
     }
 
     /// The request quota reads trigger-kept counters, not a count over the records;
@@ -9492,6 +9601,36 @@ mod tests {
             };
             assert!(!plan.lines().any(table_scan), "{sql}\n{plan}");
         }
+    }
+
+    /// M2 fix review MEDIUM 2: filling the quota by ordinary keyed create and
+    /// delete, with no prune in between (and no fixture reseed), keeps each
+    /// admission's work flat: a write decision settles the releases before it.
+    #[test]
+    fn create_and_delete_without_a_prune_keeps_admission_flat() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_clock(std::sync::Arc::new(crate::expiry::ManualClock::default()));
+        let caps = admission(4096, 32_768);
+        let mut most = 0;
+        let mut last = 0;
+        for i in 0..2048 {
+            let row = keyed_row(&format!("fill-{i}"), 1000);
+            let before = MEMBERSHIP_ROWS_HASHED.with(|n| n.get());
+            assert!(store.create_request(1000, &format!("fill-{i}")).unwrap().is_none());
+            assert!(matches!(
+                store.reserve_keyed_sandbox(&row, roomy_budgets(), Some(&caps)).unwrap(),
+                ReserveSandbox::Inserted
+            ));
+            last = MEMBERSHIP_ROWS_HASHED.with(|n| n.get()) - before;
+            most = most.max(last);
+            for state in [SandboxState::Ready, SandboxState::Deleting, SandboxState::Deleted] {
+                let backend = (state == SandboxState::Ready).then(|| format!("b-fill-{i}"));
+                store.set_sandbox_state(&row.id, state, backend.as_deref(), None).unwrap();
+            }
+        }
+        assert_eq!(store.create_request_counts(1000).unwrap().uid, 2048);
+        println!("rows hashed per admission over 2,048 create/delete cycles: at most {most}, last {last}");
+        assert!(most <= 8, "{most}");
     }
 
     /// Break-it M2 MEDIUM 2 scale regression: keyed admission at the request caps

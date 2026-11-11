@@ -105,7 +105,10 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   kilnd user; it never frees capacity or host resources without its own ABSENT
   receipt, whatever the daemon DB says. B2 has no implemented node ledger yet.
   Every trusted accounting read independently decodes referenced FencedAbsence
-  receipts in Rust and matches their complete binding and generation. Invalid or
+  receipts in Rust and matches their complete binding and generation: those of the
+  live rows each time, and all of them whenever another connection has committed
+  since kilnd last checked (SQLite's `data_version`; kilnd's own writes never change
+  a receipt), at startup and at every prune. Invalid or
   missing evidence remains charged and is projected QUARANTINED; Health is degraded,
   admission refuses, and prune retains it. Store connections set and verify
   trusted_schema=OFF, and the trigger validator is deterministic/innocuous.
@@ -113,12 +116,14 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   updated only by trusted insert/prune code in the same transaction; schema 12
   verifies it and replaces it with additive aggregates (all rows, and the rows
   settled at the last full audit) so checks stay bounded as history grows. Every
-  accounting read rehashes the charged and recently released rows against them, and
-  startup and every prune rehash all history; missing/changed membership refuses
-  reads/admission/prune as degraded with unknown totals, never free capacity. A lost
-  charged row is caught by the next decision; a lost settled row, which frees nothing,
-  by the next prune (default 60 s), which then latches admission off. It cannot detect
-  pre-migration loss or coordinated rewriting of both data and aggregates. See the
+  accounting read rehashes the charged and recently released rows against them; the
+  first read after any other connection commits, startup and every prune rehash all
+  history and check that settled plus live rows add up, so a row lost or released
+  past the triggers is caught by the next decision. Missing/changed membership
+  refuses reads/admission/prune as degraded with unknown totals, never free capacity,
+  and a failed prune latches admission off. It cannot detect pre-migration loss,
+  coordinated rewriting of both data and aggregates, or edits to the file that
+  bypass SQLite. See the
   [B2 storage design](design/phase1b-firecracker.md#84-schema-ownership-and-history-protection). Receipts are private,
   trusted backend evidence bounded to 16 KiB, never caller strings or guest assertions,
   and the API exposes none of them.

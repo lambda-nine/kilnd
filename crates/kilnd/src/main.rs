@@ -426,7 +426,7 @@ async fn serve_with<R: Runtime>(
         .rebase_create_requests()
         .context("rebase create request records from an earlier boot")?;
     if rebased != 0 {
-        info!(records = rebased, "gave create request records from an earlier boot a fresh retention window");
+        info!(records = rebased, "gave create request records from an earlier boot, or left unanchored, a fresh retention window");
     }
     manager.prune().context("startup history prune")?;
     let expiry_task = manager.start_expiry().context("start the expiry sweeper")?;
