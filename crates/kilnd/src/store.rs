@@ -401,11 +401,23 @@ PRAGMA user_version = 11;";
 
 // Schema 12 (API additions design 3.2 and 3.3): create request records for idempotent
 // create. A record names its sandbox, which it pins: the row is deleted only after the
-// record. A record changes only in the startup cross-boot retention rebase, and is
+// record. A record is inserted unanchored (both retention columns null, never
+// prunable) and gets its retention anchor only in a later transaction, after the one
+// that inserted it committed (break-it HIGH 1: no pause before the commit can shorten
+// the window). After that it changes only in the startup cross-boot rebase, and is
 // deleted only once its sandbox is DELETED or released FAILED (by prune or release).
 // `sandboxes.request_id` is fixed at insert, so history keeps it after its record is
 // gone; `request_id_released_at_ms` is written once, after its record, from DELETED.
-// None of this enters the reservation digest: it is lifecycle data, not membership.
+// None of this enters the reservation membership: it is lifecycle data.
+//
+// Break-it M2 MEDIUM 2: schema 12 replaces the schema 10 marker, one hash over all
+// history that every accounting decision recomputed, with `reservation_membership`:
+// O(1)-updatable aggregates of every row and of the rows settled (uncharged) at the
+// last full audit. A row that leaves the charged set is noted in
+// `reservation_unsettled` by the one trigger that can see every such update, kilnd's
+// or anyone's; it only notes the ID, so it cannot vouch for a row. The partial index
+// finds the charged rows without a scan. Only Store transactions write the
+// aggregates, after verifying the older marker in the migration.
 const MIGRATE_V12: &str = "
 CREATE TABLE create_requests (
     owner_uid INTEGER NOT NULL CHECK (typeof(owner_uid) = 'integer' AND owner_uid BETWEEN 0 AND 4294967295),
@@ -413,8 +425,9 @@ CREATE TABLE create_requests (
     request_sha256 TEXT NOT NULL CHECK (typeof(request_sha256) = 'text' AND length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'),
     sandbox_id TEXT NOT NULL UNIQUE REFERENCES sandboxes (id),
     created_at_ms INTEGER NOT NULL CHECK (typeof(created_at_ms) = 'integer'),
-    retain_boot_id TEXT NOT NULL CHECK (typeof(retain_boot_id) = 'text' AND length(retain_boot_id) BETWEEN 1 AND 64),
-    retain_from_boottime_ms INTEGER NOT NULL CHECK (typeof(retain_from_boottime_ms) = 'integer'),
+    retain_boot_id TEXT CHECK (retain_boot_id IS NULL OR (typeof(retain_boot_id) = 'text' AND length(retain_boot_id) BETWEEN 1 AND 64)),
+    retain_from_boottime_ms INTEGER CHECK (retain_from_boottime_ms IS NULL OR typeof(retain_from_boottime_ms) = 'integer'),
+    CHECK ((retain_boot_id IS NULL) = (retain_from_boottime_ms IS NULL)),
     PRIMARY KEY (owner_uid, request_id)
 ) WITHOUT ROWID;
 ALTER TABLE sandboxes ADD COLUMN request_id TEXT CHECK (request_id IS NULL OR (typeof(request_id) = 'text' AND length(CAST(request_id AS BLOB)) BETWEEN 1 AND 64 AND request_id NOT GLOB '*[^!-~]*'));
@@ -427,12 +440,17 @@ CREATE TRIGGER create_requests_own_sandbox BEFORE INSERT ON create_requests
 WHEN NOT EXISTS (SELECT 1 FROM sandboxes WHERE id = NEW.sandbox_id AND owner_uid = NEW.owner_uid
     AND request_id = NEW.request_id AND state = 'creating')
 BEGIN SELECT RAISE(ABORT, 'a create request record is inserted with its own CREATING sandbox'); END;
+CREATE INDEX create_requests_unanchored ON create_requests (sandbox_id) WHERE retain_boot_id IS NULL;
+CREATE TRIGGER create_requests_unanchored_insert BEFORE INSERT ON create_requests
+WHEN NEW.retain_boot_id IS NOT NULL OR NEW.retain_from_boottime_ms IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a create request record is inserted unanchored and anchored only after it commits'); END;
 CREATE TRIGGER create_requests_fixed BEFORE UPDATE ON create_requests
 WHEN NEW.owner_uid IS NOT OLD.owner_uid OR NEW.request_id IS NOT OLD.request_id
     OR NEW.request_sha256 IS NOT OLD.request_sha256 OR NEW.sandbox_id IS NOT OLD.sandbox_id
     OR NEW.created_at_ms IS NOT OLD.created_at_ms
+    OR (OLD.retain_boot_id IS NOT NULL AND NEW.retain_boot_id IS NULL)
     OR (NEW.retain_from_boottime_ms IS NOT OLD.retain_from_boottime_ms AND NEW.retain_boot_id IS OLD.retain_boot_id)
-BEGIN SELECT RAISE(ABORT, 'a create request record changes only in the cross-boot retention rebase'); END;
+BEGIN SELECT RAISE(ABORT, 'a create request record changes only when anchored or in the cross-boot retention rebase'); END;
 CREATE TRIGGER create_requests_settled_delete BEFORE DELETE ON create_requests
 WHEN NOT EXISTS (SELECT 1 FROM sandboxes WHERE id = OLD.sandbox_id AND (state = 'deleted'
     OR (state = 'failed' AND NOT ((accounting_kind = 'legacy' AND legacy_release IS NULL)
@@ -451,48 +469,89 @@ BEGIN SELECT RAISE(ABORT, 'a request ID is fixed at create and released once, af
 CREATE TRIGGER sandboxes_request_insert BEFORE INSERT ON sandboxes
 WHEN NEW.request_id_released_at_ms IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'a request ID is released only after its sandbox is DELETED'); END;
+CREATE TABLE create_request_counts (
+    owner_uid INTEGER PRIMARY KEY CHECK (typeof(owner_uid) = 'integer' AND owner_uid BETWEEN -1 AND 4294967295),
+    records INTEGER NOT NULL CHECK (typeof(records) = 'integer' AND records >= 0)
+);
+INSERT INTO create_request_counts VALUES (-1, 0);
+CREATE TRIGGER create_requests_count_insert AFTER INSERT ON create_requests
+BEGIN
+    INSERT INTO create_request_counts VALUES (NEW.owner_uid, 1)
+        ON CONFLICT(owner_uid) DO UPDATE SET records = records + 1;
+    UPDATE create_request_counts SET records = records + 1 WHERE owner_uid = -1;
+END;
+CREATE TRIGGER create_requests_count_delete AFTER DELETE ON create_requests
+BEGIN
+    UPDATE create_request_counts SET records = records - 1 WHERE owner_uid IN (OLD.owner_uid, -1);
+    DELETE FROM create_request_counts WHERE owner_uid = OLD.owner_uid AND records = 0;
+END;
+DROP TABLE reservation_integrity;
+CREATE TABLE reservation_membership (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    row_count INTEGER NOT NULL CHECK (typeof(row_count) = 'integer' AND row_count >= 0),
+    row_sum BLOB NOT NULL CHECK (typeof(row_sum) = 'blob' AND length(row_sum) = 32),
+    settled_count INTEGER NOT NULL CHECK (typeof(settled_count) = 'integer' AND settled_count >= 0),
+    settled_sum BLOB NOT NULL CHECK (typeof(settled_sum) = 'blob' AND length(settled_sum) = 32)
+);
+CREATE TABLE reservation_unsettled (id TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE INDEX sandboxes_charged ON sandboxes (id)
+WHERE ((accounting_kind = 'legacy' AND legacy_release IS NULL) OR (accounting_kind = 'fenced' AND release_evidence_id IS NULL));
+CREATE TRIGGER sandboxes_released_unsettled AFTER UPDATE ON sandboxes
+WHEN ((OLD.accounting_kind = 'legacy' AND OLD.legacy_release IS NULL) OR (OLD.accounting_kind = 'fenced' AND OLD.release_evidence_id IS NULL))
+    AND NOT ((NEW.accounting_kind = 'legacy' AND NEW.legacy_release IS NULL) OR (NEW.accounting_kind = 'fenced' AND NEW.release_evidence_id IS NULL))
+BEGIN INSERT OR IGNORE INTO reservation_unsettled VALUES (NEW.id); END;
 PRAGMA user_version = 12;";
 
-fn reservation_digest(conn: &Connection) -> Result<Vec<u8>> {
-    // Include all immutable reservation/identity data; lifecycle transitions and
-    // release references intentionally do not change this membership fingerprint.
-    let mut stmt = conn.prepare(
-        "SELECT id, list_seq, backend, spec, created_at_ms, owner_uid,
+// The immutable reservation and identity columns of a sandbox row: its membership.
+// Lifecycle transitions and release references are not membership.
+const MEMBERSHIP_COLUMNS: &str = "id, list_seq, backend, spec, created_at_ms, owner_uid,
         accounting_kind, reserved_memory_bytes, reserved_disk_bytes, reserved_pids,
         reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids,
         host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest,
-        node_id, instance_id, allocation_id, plan_version, plan_digest, plan
-        FROM sandboxes ORDER BY id COLLATE BINARY",
-    )?;
+        node_id, instance_id, allocation_id, plan_version, plan_digest, plan";
+
+/// The schema 10 and 11 encoding of one row's membership columns, kept by schema 12.
+fn hash_membership_row(hash: &mut Sha256, row: &rusqlite::Row<'_>) -> Result<()> {
+    hash.update(b"row");
+    for i in 0..23 {
+        use rusqlite::types::ValueRef;
+        match row.get_ref(i)? {
+            ValueRef::Null => hash.update([0]),
+            ValueRef::Integer(n) => {
+                hash.update([1]);
+                hash.update(n.to_le_bytes());
+            }
+            ValueRef::Real(_) => bail!("degraded accounting: real in immutable reservation"),
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                hash.update([if matches!(row.get_ref(i)?, ValueRef::Text(_)) {
+                    2
+                } else {
+                    3
+                }]);
+                hash.update((bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Schemas 10 and 11: one hash over every row's membership in ID order. Schema 12
+/// keeps it only to verify such a marker before it migrates (break-it MEDIUM 3).
+fn reservation_digest(conn: &Connection) -> Result<Vec<u8>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MEMBERSHIP_COLUMNS} FROM sandboxes ORDER BY id COLLATE BINARY"
+    ))?;
     let mut rows = stmt.query([])?;
     let mut hash = Sha256::new();
     hash.update(b"kilnd-reservation-membership-v1");
     while let Some(row) = rows.next()? {
-        hash.update(b"row");
-        for i in 0..23 {
-            use rusqlite::types::ValueRef;
-            match row.get_ref(i)? {
-                ValueRef::Null => hash.update([0]),
-                ValueRef::Integer(n) => {
-                    hash.update([1]);
-                    hash.update(n.to_le_bytes());
-                }
-                ValueRef::Real(_) => bail!("degraded accounting: real in immutable reservation"),
-                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
-                    hash.update([if matches!(row.get_ref(i)?, ValueRef::Text(_)) {
-                        2
-                    } else {
-                        3
-                    }]);
-                    hash.update((bytes.len() as u64).to_le_bytes());
-                    hash.update(bytes);
-                }
-            }
-        }
+        hash_membership_row(&mut hash, row)?;
     }
     Ok(hash.finalize().to_vec())
 }
 
+/// Schemas 10 and 11's marker, written only where an older schema is built.
 fn refresh_reservation_integrity(conn: &Connection) -> Result<()> {
     conn.execute(
         "INSERT INTO reservation_integrity (id, digest) VALUES (1, ?1)
@@ -502,10 +561,8 @@ fn refresh_reservation_integrity(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-// Call inside the same transaction/snapshot as every accounting decision. Decode
-// in Rust, independently of whichever SQL function an external writer registered.
-// Quarantine is a read projection: retain the corrupt reference for investigation.
-fn audit_accounting(conn: &Connection) -> Result<bool> {
+/// Schemas 10 and 11: the marker must match the rows exactly.
+fn audit_reservation_integrity_v1(conn: &Connection) -> Result<()> {
     let expected: Option<Vec<u8>> = conn
         .query_row(
             "SELECT digest FROM reservation_integrity WHERE id = 1",
@@ -514,19 +571,185 @@ fn audit_accounting(conn: &Connection) -> Result<bool> {
         )
         .optional()?;
     if expected.as_deref() != Some(reservation_digest(conn)?.as_slice()) {
-        bail!(
-            "degraded accounting: reservation integrity mismatch (missing or changed rows); admission and pruning disabled"
-        );
+        bail!("{MEMBERSHIP_MISMATCH}");
     }
-    conn.execute_batch("DELETE FROM temp.accounting_quarantine;")?;
-    let mut stmt = conn.prepare(
-        "SELECT s.id, s.node_id, s.instance_id, s.allocation_id,
-        s.plan_digest, s.release_evidence_id, s.last_helper_generation,
-        e.receipt_id, e.node_id, e.instance_id, e.allocation_id, e.plan_digest,
-        e.helper_generation, e.kind, e.receipt, s.state
-        FROM sandboxes s LEFT JOIN release_evidence e ON e.receipt_id = s.release_evidence_id
-        WHERE s.accounting_kind = 'fenced' AND (s.release_evidence_id IS NOT NULL OR s.state = 'deleted')",
+    Ok(())
+}
+
+const MEMBERSHIP_MISMATCH: &str = "degraded accounting: reservation integrity mismatch (missing or changed rows); admission and pruning disabled";
+
+/// A multiset of rows' membership (schema 12, break-it M2 MEDIUM 2): their number
+/// and the sum, modulo 2^256, of each row's own SHA-256. Adding or removing one row
+/// is O(1), so admission never rehashes history. Like the schema 10 marker it
+/// detects accidental or missing membership, not a hostile writer with file
+/// authority (who could rewrite either).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Membership {
+    count: i64,
+    /// Little-endian.
+    sum: [u8; 32],
+}
+
+impl Membership {
+    fn add_row(&mut self, row: &rusqlite::Row<'_>) -> Result<()> {
+        let mut hash = Sha256::new();
+        hash.update(b"kilnd-reservation-membership-v2");
+        hash_membership_row(&mut hash, row)?;
+        let digest: [u8; 32] = hash.finalize().into();
+        *self = self.plus(Membership {
+            count: 1,
+            sum: digest,
+        });
+        Ok(())
+    }
+
+    fn plus(self, other: Membership) -> Membership {
+        let mut sum = [0u8; 32];
+        let mut carry = 0u16;
+        for (i, out) in sum.iter_mut().enumerate() {
+            let total = u16::from(self.sum[i]) + u16::from(other.sum[i]) + carry;
+            *out = total as u8;
+            carry = total >> 8;
+        }
+        Membership {
+            count: self.count.wrapping_add(other.count),
+            sum,
+        }
+    }
+
+    fn minus(self, other: Membership) -> Membership {
+        let mut sum = [0u8; 32];
+        let mut borrow = 0i16;
+        for (i, out) in sum.iter_mut().enumerate() {
+            let mut total = i16::from(self.sum[i]) - i16::from(other.sum[i]) - borrow;
+            borrow = i16::from(total < 0);
+            if total < 0 {
+                total += 256;
+            }
+            *out = total as u8;
+        }
+        Membership {
+            count: self.count.wrapping_sub(other.count),
+            sum,
+        }
+    }
+}
+
+/// The membership of the sandbox rows a query selects. `select` returns
+/// MEMBERSHIP_COLUMNS, in order, of distinct rows.
+fn membership_of(conn: &Connection, select: &str, params: impl rusqlite::Params) -> Result<Membership> {
+    let mut stmt = conn.prepare(select)?;
+    let mut rows = stmt.query(params)?;
+    let mut membership = Membership::default();
+    while let Some(row) = rows.next()? {
+        membership.add_row(row)?;
+        #[cfg(test)]
+        MEMBERSHIP_ROWS_HASHED.with(|n| n.set(n.get() + 1));
+    }
+    Ok(membership)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many rows this thread has hashed for membership: the scale tests' measure
+    /// of how much history an admission reads.
+    pub(crate) static MEMBERSHIP_ROWS_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The stored aggregates: every row, and the rows settled at the last full audit.
+fn stored_membership(conn: &Connection) -> Result<Option<(Membership, Membership)>> {
+    let row: Option<(i64, Vec<u8>, i64, Vec<u8>)> = conn
+        .query_row(
+            "SELECT row_count, row_sum, settled_count, settled_sum FROM reservation_membership WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((count, sum, settled_count, settled_sum)) = row else {
+        return Ok(None);
+    };
+    let array = |bytes: Vec<u8>| -> Result<[u8; 32]> {
+        bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("{MEMBERSHIP_MISMATCH}"))
+    };
+    Ok(Some((
+        Membership {
+            count,
+            sum: array(sum)?,
+        },
+        Membership {
+            count: settled_count,
+            sum: array(settled_sum)?,
+        },
+    )))
+}
+
+fn store_membership(conn: &Connection, all: Membership, settled: Membership) -> Result<()> {
+    conn.execute(
+        "INSERT INTO reservation_membership (id, row_count, row_sum, settled_count, settled_sum)
+         VALUES (1, ?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET row_count = excluded.row_count, row_sum = excluded.row_sum,
+             settled_count = excluded.settled_count, settled_sum = excluded.settled_sum",
+        params![all.count, &all.sum[..], settled.count, &settled.sum[..]],
     )?;
+    Ok(())
+}
+
+fn all_membership(conn: &Connection) -> Result<Membership> {
+    membership_of(conn, &format!("SELECT {MEMBERSHIP_COLUMNS} FROM sandboxes"), [])
+}
+
+fn settled_membership(conn: &Connection) -> Result<Membership> {
+    membership_of(
+        conn,
+        &format!("SELECT {MEMBERSHIP_COLUMNS} FROM sandboxes WHERE NOT ({RESERVED_SANDBOX_WHERE})"),
+        [],
+    )
+}
+
+/// Trusted (re)seeding from the rows as they stand: the schema 12 migration, after
+/// it verified the older marker, and test fixtures modelling a trusted writer.
+fn refresh_membership(conn: &Connection) -> Result<()> {
+    store_membership(conn, all_membership(conn)?, settled_membership(conn)?)?;
+    conn.execute("DELETE FROM reservation_unsettled", [])?;
+    Ok(())
+}
+
+/// Every Store insert of a sandbox row, in its transaction: add the row to the
+/// aggregate, and note it unsettled if it is inserted uncharged. O(1) in history.
+fn note_inserted_sandbox(conn: &Connection, id: &str) -> Result<()> {
+    let (all, settled) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
+    let added = membership_of(
+        conn,
+        &format!("SELECT {MEMBERSHIP_COLUMNS} FROM sandboxes WHERE id = ?1"),
+        [id],
+    )?;
+    if added.count != 1 {
+        bail!("sandbox {id} was not inserted");
+    }
+    store_membership(conn, all.plus(added), settled)?;
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO reservation_unsettled
+             SELECT id FROM sandboxes WHERE id = ?1 AND NOT ({RESERVED_SANDBOX_WHERE})"
+        ),
+        [id],
+    )?;
+    Ok(())
+}
+
+// The rows an accounting decision depends on: every charged row (through the
+// partial index), and every row released or inserted uncharged since the last full
+// audit. Bounded by reservations and recent activity, never by retained history.
+fn live_ids() -> String {
+    format!(
+        "SELECT id FROM sandboxes WHERE {RESERVED_SANDBOX_WHERE} UNION SELECT id FROM reservation_unsettled"
+    )
+}
+
+fn fenced_release_checks(conn: &Connection, rows: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(rows)?;
     let mut rows = stmt.query([])?;
     let mut degraded = false;
     while let Some(row) = rows.next()? {
@@ -567,12 +790,104 @@ fn audit_accounting(conn: &Connection) -> Result<bool> {
         if !valid {
             degraded = true;
             conn.execute(
-                "INSERT INTO temp.accounting_quarantine VALUES (?1)",
+                "INSERT OR IGNORE INTO temp.accounting_quarantine VALUES (?1)",
                 [row.get::<_, String>(0)?],
             )?;
         }
     }
     Ok(degraded)
+}
+
+const FENCED_RELEASE_COLUMNS: &str = "s.id, s.node_id, s.instance_id, s.allocation_id,
+        s.plan_digest, s.release_evidence_id, s.last_helper_generation,
+        e.receipt_id, e.node_id, e.instance_id, e.allocation_id, e.plan_digest,
+        e.helper_generation, e.kind, e.receipt, s.state";
+const FENCED_RELEASE_WHERE: &str =
+    "s.accounting_kind = 'fenced' AND (s.release_evidence_id IS NOT NULL OR s.state = 'deleted')";
+
+// Call inside the same transaction/snapshot as every accounting decision. Decode
+// in Rust, independently of whichever SQL function an external writer registered.
+// Quarantine is a read projection: retain the corrupt reference for investigation.
+//
+// Bounded (break-it M2 MEDIUM 2): it hashes and checks only the live rows. The
+// settled aggregate, written by the last full audit, stands for the rest, so a
+// charged row lost (or released) behind kilnd's back is still caught here, by
+// every decision. Settled history, which cannot change any reservation, is
+// rehashed and its release evidence rechecked by the full audit, at startup and
+// before every prune; a failed full audit latches this connection degraded.
+fn audit_accounting(conn: &Connection) -> Result<bool> {
+    let lost: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM temp.membership_lost)",
+        [],
+        |r| r.get(0),
+    )?;
+    if lost {
+        bail!("{MEMBERSHIP_MISMATCH}");
+    }
+    let (all, settled) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
+    let live = membership_of(
+        conn,
+        &format!("SELECT {MEMBERSHIP_COLUMNS} FROM sandboxes WHERE id IN ({})", live_ids()),
+        [],
+    )?;
+    if settled.plus(live) != all {
+        bail!("{MEMBERSHIP_MISMATCH}");
+    }
+    conn.execute(
+        &format!(
+            "DELETE FROM temp.accounting_quarantine WHERE id IN ({})",
+            live_ids()
+        ),
+        [],
+    )?;
+    fenced_release_checks(
+        conn,
+        &format!(
+            "SELECT {FENCED_RELEASE_COLUMNS} FROM sandboxes s
+             LEFT JOIN release_evidence e ON e.receipt_id = s.release_evidence_id
+             WHERE s.id IN ({}) AND {FENCED_RELEASE_WHERE}",
+            live_ids()
+        ),
+    )?;
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM temp.accounting_quarantine)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// The full audit: every row's membership against the stored aggregate, then the
+/// settled aggregate and the quarantine rebuilt from the rows as they stand. O(N);
+/// only at startup and before each prune, in a write transaction.
+fn audit_accounting_full(conn: &Connection) -> Result<bool> {
+    let (all, _) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
+    if all_membership(conn)? != all {
+        bail!("{MEMBERSHIP_MISMATCH}");
+    }
+    // The quota counters against the records they count: no uid missing, none
+    // extra, the node total their sum.
+    let miscounted: bool = conn.query_row(
+        "WITH actual(owner_uid, records) AS (
+             SELECT owner_uid, COUNT(*) FROM create_requests GROUP BY owner_uid
+             UNION ALL SELECT -1, COUNT(*) FROM create_requests)
+         SELECT EXISTS (SELECT owner_uid, records FROM actual EXCEPT SELECT owner_uid, records FROM create_request_counts)
+             OR EXISTS (SELECT owner_uid, records FROM create_request_counts EXCEPT SELECT owner_uid, records FROM actual)",
+        [],
+        |r| r.get(0),
+    )?;
+    if miscounted {
+        bail!("degraded accounting: create request counters do not match the records; admission and pruning disabled");
+    }
+    store_membership(conn, all, settled_membership(conn)?)?;
+    conn.execute("DELETE FROM reservation_unsettled", [])?;
+    conn.execute_batch("DELETE FROM temp.accounting_quarantine;")?;
+    fenced_release_checks(
+        conn,
+        &format!(
+            "SELECT {FENCED_RELEASE_COLUMNS} FROM sandboxes s
+             LEFT JOIN release_evidence e ON e.receipt_id = s.release_evidence_id WHERE {FENCED_RELEASE_WHERE}"
+        ),
+    )
 }
 
 // The explicit legacy tag and reuse state for an update binding ?2 = new state and
@@ -676,6 +991,10 @@ pub struct Store {
     reject_execution_finishes: Arc<AtomicBool>,
     #[cfg(test)]
     reject_evidence_commits: Arc<AtomicBool>,
+    /// Runs inside a keyed create's admission transaction, just before it commits:
+    /// tests use it to stand for a pause (suspend, SIGSTOP, a stall) at that point.
+    #[cfg(test)]
+    pub(crate) before_request_commit: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// How an execution ended, written in one transaction with what it means for its
@@ -845,9 +1164,13 @@ pub enum ReleaseRequestId {
     NoSandbox,
 }
 
+// From the counters the record triggers keep (break-it M2 MEDIUM 2): two primary-key
+// reads, never a count over the records. The full audit checks them against the
+// records themselves.
 fn request_counts(conn: &Connection, owner_uid: u32) -> Result<RequestCounts> {
     let (node, uid): (i64, i64) = conn.query_row(
-        "SELECT (SELECT COUNT(*) FROM create_requests), (SELECT COUNT(*) FROM create_requests WHERE owner_uid = ?1)",
+        "SELECT (SELECT records FROM create_request_counts WHERE owner_uid = -1),
+                COALESCE((SELECT records FROM create_request_counts WHERE owner_uid = ?1), 0)",
         [owner_uid],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -893,6 +1216,26 @@ fn remove_request_records(tx: &Connection, removal: RecordRemoval<'_>) -> Result
             [sandbox_id],
         )?,
     })
+}
+
+/// Design 3.3 R1 (break-it HIGH 1): give every unanchored create request record
+/// this boot's ID and current boottime, in an IMMEDIATE transaction of its own that
+/// reads the clocks only once it holds the write lock. Every record it can see was
+/// committed before then, so each anchor is no earlier than its record's commit.
+fn anchor_create_requests(conn: &mut Connection, clock: &dyn Clock) -> Result<usize> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let anchored = anchor_unanchored(&tx, clock)?;
+    tx.commit()?;
+    Ok(anchored)
+}
+
+/// As [`anchor_create_requests`], in the caller's IMMEDIATE transaction.
+fn anchor_unanchored(tx: &Connection, clock: &dyn Clock) -> Result<usize> {
+    let now = ClockReading::now(clock);
+    Ok(tx.execute(
+        "UPDATE create_requests SET retain_boot_id = ?1, retain_from_boottime_ms = ?2 WHERE retain_boot_id IS NULL",
+        params![now.boot_id, now.boottime_ms],
+    )?)
 }
 
 fn i64_amount(value: u64, what: &str) -> Result<i64> {
@@ -1121,7 +1464,8 @@ fn sandbox_resources(conn: &Connection) -> Result<SandboxResources> {
     // bundle or a formula cannot reprice an existing commitment.
     let mut statement = conn.prepare(&format!(
         "SELECT id, reserved_memory_bytes, reserved_disk_bytes, reserved_pids, reserved_host_cpu_millis, reserved_virtual_cpu_slots, reserved_host_pids
-         FROM sandboxes WHERE {RESERVED_SANDBOX_WHERE} OR id IN (SELECT id FROM temp.accounting_quarantine)"
+         FROM sandboxes WHERE id IN (SELECT id FROM sandboxes WHERE {RESERVED_SANDBOX_WHERE}
+             UNION SELECT id FROM temp.accounting_quarantine)"
     ))?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -1329,6 +1673,8 @@ impl Store {
             reject_execution_finishes: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             reject_evidence_commits: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            before_request_commit: Mutex::new(None),
         };
         store.initialize()?;
         Ok(store)
@@ -1342,7 +1688,10 @@ impl Store {
         if trusted != 0 {
             bail!("SQLite refused trusted_schema=OFF");
         }
-        conn.execute_batch("CREATE TEMP TABLE accounting_quarantine (id TEXT PRIMARY KEY);")?;
+        conn.execute_batch(
+            "CREATE TEMP TABLE accounting_quarantine (id TEXT PRIMARY KEY);
+             CREATE TEMP TABLE membership_lost (id INTEGER PRIMARY KEY CHECK (id = 1));",
+        )?;
         // Evidence references depend on this, and SQLite ignores it inside a
         // transaction and defaults it off per connection. Set and verify it first.
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -1358,7 +1707,7 @@ impl Store {
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == SCHEMA_VERSION {
             let tx = conn.transaction()?;
-            audit_accounting(&tx)?;
+            audit_accounting_full(&tx)?;
             tx.commit()?;
             return Ok(());
         }
@@ -1438,10 +1787,10 @@ impl Store {
             refresh_reservation_integrity(&tx)?;
         } else {
             // Break-it MEDIUM 3: a schema 10 or 11 database already has a marker.
-            // Audit it as it stands, before anything else changes, and never rewrite
-            // it: the schema 11 and 12 columns are not membership. A mismatch refuses
-            // startup and rolls the whole migration back, leaving the old schema.
-            audit_accounting(&tx).with_context(|| {
+            // Audit it as it stands, before anything else changes: the schema 11 and
+            // 12 columns are not membership. A mismatch refuses startup and rolls the
+            // whole migration back, leaving the old schema and its marker untouched.
+            audit_reservation_integrity_v1(&tx).with_context(|| {
                 format!(
                     "schema {version} reservation integrity does not match; refusing to migrate to schema {SCHEMA_VERSION}"
                 )
@@ -1450,8 +1799,11 @@ impl Store {
         if version < 11 {
             tx.execute_batch(MIGRATE_V11)?;
         }
+        // The marker verified above (or just written from the migrated rows) is
+        // replaced by schema 12's aggregates, seeded from the same rows.
         tx.execute_batch(MIGRATE_V12)?;
-        audit_accounting(&tx)?;
+        refresh_membership(&tx)?;
+        audit_accounting_full(&tx)?;
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
         Ok(())
@@ -1501,7 +1853,7 @@ impl Store {
             bail!("degraded accounting: quarantined release evidence");
         }
         insert_sandbox(&tx, s)?;
-        refresh_reservation_integrity(&tx)?;
+        note_inserted_sandbox(&tx, &s.id)?;
         tx.commit()?;
         Ok(())
     }
@@ -1515,14 +1867,20 @@ impl Store {
 
     /// As [`Self::reserve_sandbox`], and for a keyed create (design 3.1 step 6) the
     /// same transaction recounts the durable request records against both caps,
-    /// refuses a key another create already holds, and inserts the record with this
-    /// boot's retention anchor: the CREATING row and its record commit together.
+    /// refuses a key another create already holds, and inserts the record: the
+    /// CREATING row and its record commit together. The record commits unanchored,
+    /// so no prune can select it, and gets this boot's retention anchor in a second
+    /// transaction that reads the boot clock only after the first committed (design
+    /// 3.3 R1; break-it HIGH 1). No pause anywhere before that commit can eat into
+    /// the window, which therefore starts no earlier than the commit.
     pub fn reserve_keyed_sandbox(
         &self,
         s: &Sandbox,
         budgets: SandboxBudgets,
         request: Option<&RequestAdmission>,
     ) -> Result<ReserveSandbox> {
+        // A keyed create needs the boot clock to anchor its record: refuse before
+        // anything is written if there is none. This reading is display only.
         let reading = match request {
             Some(_) => Some(self.clock_reading()?),
             None => None,
@@ -1572,21 +1930,34 @@ impl Store {
         insert_sandbox(&tx, s)?;
         if let (Some(request), Some(now)) = (request, &reading) {
             tx.execute(
-                "INSERT INTO create_requests (owner_uid, request_id, request_sha256, sandbox_id, created_at_ms, retain_boot_id, retain_from_boottime_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO create_requests (owner_uid, request_id, request_sha256, sandbox_id, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     s.owner_uid,
                     s.lifecycle.request_id,
                     request.sha256.to_string(),
                     s.id,
                     now.wall_ms,
-                    now.boot_id,
-                    now.boottime_ms,
                 ],
             )?;
         }
-        refresh_reservation_integrity(&tx)?;
+        note_inserted_sandbox(&tx, &s.id)?;
+        #[cfg(test)]
+        if let (Some(_), Some(pause)) = (request, &*self.before_request_commit.lock().unwrap()) {
+            pause();
+        }
         tx.commit()?;
+        if request.is_some() {
+            // The row and its record are committed: whatever happens here, the create
+            // goes on. A record left unanchored is never pruned; the next prune or the
+            // startup rebase anchors it, later still.
+            let anchored = self
+                .clock_source()
+                .and_then(|clock| anchor_create_requests(&mut conn, &*clock));
+            if let Err(error) = anchored {
+                tracing::warn!(sandbox = %s.id, error = %format!("{error:#}"), "create request record left unanchored until the next prune");
+            }
+        }
         Ok(ReserveSandbox::Inserted)
     }
 
@@ -1633,12 +2004,16 @@ impl Store {
     /// this boot's ID and current boottime, a fresh full retention window, never a
     /// wall-clock estimate. A crash leaves every record rebased or still foreign, and
     /// a foreign record is never pruned. Returns how many it rebased.
+    /// An unanchored record (its create's anchor transaction never ran) is
+    /// anchored the same way. The clocks are read inside the transaction, after
+    /// every record it can see committed.
     pub fn rebase_create_requests(&self) -> Result<usize> {
-        let now = self.clock_reading()?;
+        let clock = self.clock_source()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = ClockReading::now(&*clock);
         let rebased = tx.execute(
-            "UPDATE create_requests SET retain_boot_id = ?1, retain_from_boottime_ms = ?2 WHERE retain_boot_id != ?1",
+            "UPDATE create_requests SET retain_boot_id = ?1, retain_from_boottime_ms = ?2 WHERE retain_boot_id IS NOT ?1",
             params![now.boot_id, now.boottime_ms],
         )?;
         tx.commit()?;
@@ -1754,8 +2129,13 @@ impl Store {
     }
 
     fn clock_reading(&self) -> Result<ClockReading> {
+        Ok(ClockReading::now(&*self.clock_source()?))
+    }
+
+    /// The installed clock, to read later: inside a transaction, after a commit.
+    fn clock_source(&self) -> Result<std::sync::Arc<dyn Clock>> {
         match &*self.clock.read().unwrap_or_else(|e| e.into_inner()) {
-            Some(clock) => Ok(ClockReading::now(&**clock)),
+            Some(clock) => Ok(clock.clone()),
             None => bail!("the kernel boot ID could not be read, so no clock anchor can be stamped"),
         }
     }
@@ -2562,9 +2942,23 @@ impl Store {
             crate::retention::create_request_prune_age_ms(policy.create_request_retention_secs)
                 .map(|age| (now.boottime_ms.saturating_sub(age), now.boot_id))
         });
+        let clock = self.clock_source().ok();
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        audit_accounting(&tx)?;
+        // The full audit (MEDIUM 2): all history against the aggregate. A mismatch
+        // latches this connection degraded, so admission stops too, as it did when
+        // every decision rehashed history.
+        if let Err(error) = audit_accounting_full(&tx) {
+            drop(tx);
+            conn.execute("INSERT OR IGNORE INTO temp.membership_lost VALUES (1)", [])?;
+            return Err(error);
+        }
+        // A record whose own anchor transaction failed is anchored now, from a
+        // reading taken under the write lock: after its commit, so never early. The
+        // cutoff above was read before this, so it cannot select one it anchors.
+        if let Some(clock) = &clock {
+            anchor_unanchored(&tx, &**clock)?;
+        }
         let terminal = "state IN ('exited','timed_out','canceled','failed','interrupted') AND finished_at_ms IS NOT NULL";
         let mut result = Pruned {
             executions: tx.execute(&format!("DELETE FROM executions WHERE id IN (
@@ -2598,12 +2992,25 @@ impl Store {
             "DELETE FROM executions WHERE sandbox_id IN (SELECT id FROM retention_sandboxes)",
             [],
         )?;
+        // Every row pruned is uncharged, so settled since the full audit above:
+        // it leaves both aggregates.
+        let removed = membership_of(
+            &tx,
+            &format!(
+                "SELECT {MEMBERSHIP_COLUMNS} FROM sandboxes WHERE id IN (SELECT id FROM retention_sandboxes)"
+            ),
+            [],
+        )?;
         result.sandboxes = tx.execute(
             "DELETE FROM sandboxes WHERE id IN (SELECT id FROM retention_sandboxes)",
             [],
         )?;
+        if i64::try_from(result.sandboxes)? != removed.count {
+            bail!("prune removed a sandbox row it did not account for");
+        }
         tx.execute_batch("DROP TABLE retention_sandboxes;")?;
-        refresh_reservation_integrity(&tx)?;
+        let (all, settled) = stored_membership(&tx)?.context(MEMBERSHIP_MISMATCH)?;
+        store_membership(&tx, all.minus(removed), settled.minus(removed))?;
         tx.commit()?;
         Ok(result)
     }
@@ -4675,7 +5082,7 @@ mod tests {
             tx.commit().unwrap();
             conn.execute_batch("CREATE TEMP TABLE accounting_quarantine (id TEXT PRIMARY KEY);")
                 .unwrap();
-            assert!(audit_accounting(&conn).is_ok(), "{corruption}: intact first");
+            assert!(audit_reservation_integrity_v1(&conn).is_ok(), "{corruption}: intact first");
             match corruption {
                 "missing charged row" => {
                     // Membership lost after v10 last wrote its marker, past the triggers.
@@ -4695,7 +5102,7 @@ mod tests {
                     .unwrap();
                 }
             }
-            assert!(audit_accounting(&conn).is_err(), "{corruption}: v10 detects it");
+            assert!(audit_reservation_integrity_v1(&conn).is_err(), "{corruption}: v10 detects it");
             let rows = table_snapshot(&conn, "sandboxes");
             let marker = table_snapshot(&conn, "reservation_integrity");
             release_database(conn, tmp.path());
@@ -4719,10 +5126,11 @@ mod tests {
         }
     }
 
-    /// MEDIUM 3: an intact schema 10 upgrades without rewriting its marker, since
-    /// the schema 11 columns are not reservation membership.
+    /// MEDIUM 3: an intact schema 10 marker is verified as it stands (the schema 11
+    /// columns are not membership); schema 12 then replaces it with aggregates
+    /// seeded from the same rows (M2 MEDIUM 2).
     #[test]
-    fn schema11_upgrade_keeps_an_intact_v10_marker_unchanged() {
+    fn schema12_upgrade_verifies_an_intact_v10_marker_and_seeds_membership() {
         let tmp = tempfile::tempdir().unwrap();
         let mut conn = disk_database_at(tmp.path(), 7);
         register_receipt_validator(&conn).unwrap();
@@ -4736,11 +5144,31 @@ mod tests {
         insert_sandbox_before_v11(&tx, &charged).unwrap();
         refresh_reservation_integrity(&tx).unwrap();
         tx.commit().unwrap();
-        let marker = table_snapshot(&conn, "reservation_integrity");
         release_database(conn, tmp.path());
         let store = Store::open(tmp.path()).unwrap();
-        assert_eq!(table_snapshot(&store.conn(), "reservation_integrity"), marker);
+        assert_seeded_membership(&store.conn(), 1, 0);
         assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+    }
+
+    /// Schema 12's aggregates match the rows as they stand: `rows` in all, `settled`
+    /// of them uncharged, nothing unsettled, and no schema 10 marker left.
+    fn assert_seeded_membership(conn: &Connection, rows: i64, settled: i64) {
+        let (all, settled_stored) = stored_membership(conn).unwrap().unwrap();
+        assert_eq!(all, all_membership(conn).unwrap());
+        assert_eq!(settled_stored, settled_membership(conn).unwrap());
+        assert_eq!((all.count, settled_stored.count), (rows, settled));
+        let unsettled: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reservation_unsettled", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unsettled, 0);
+        let old: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'reservation_integrity')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!old);
     }
 
     /// MEDIUM 2: both startup publications of a terminal execution record the
@@ -5998,7 +6426,7 @@ mod tests {
             .execute("DELETE FROM sandboxes WHERE id=?1", [&retired.id])
             .unwrap();
         // Fixture-only trusted deletion models Store::prune's atomic marker update.
-        refresh_reservation_integrity(&store.conn()).unwrap();
+        refresh_membership(&store.conn()).unwrap();
         let other_fence = receipt_for(&fenced_sandbox());
         insert_evidence(
             &store.conn(),
@@ -6939,7 +7367,7 @@ mod tests {
             // A legacy row has none, and a fenced row must have one.
             let legacy = sandbox();
             insert_sandbox(&conn, &legacy).unwrap();
-            refresh_reservation_integrity(&conn).unwrap();
+            refresh_membership(&conn).unwrap();
             assert!(
                 conn.execute(
                     "UPDATE sandboxes SET last_helper_generation = 1 WHERE id = ?1",
@@ -8643,13 +9071,10 @@ mod tests {
                 tx.execute_batch(MIGRATE_V11).unwrap();
             }
             tx.commit().unwrap();
-            let marker = (version >= 10).then(|| table_snapshot(&conn, "reservation_integrity"));
             release_database(conn, tmp.path());
             let store = Store::reopen_after_restart(tmp.path());
             assert_eq!(schema_sql(&store.conn()), expected, "v{version}");
-            if let Some(marker) = marker {
-                assert_eq!(table_snapshot(&store.conn(), "reservation_integrity"), marker);
-            }
+            assert_seeded_membership(&store.conn(), 1, 0);
             let row = store.sandbox(&history.id).unwrap().unwrap();
             assert_eq!(row.lifecycle, SandboxLifecycle::default(), "v{version}");
             assert_eq!(store.create_request_counts(0).unwrap(), RequestCounts::default());
@@ -8772,6 +9197,11 @@ mod tests {
             "UPDATE create_requests SET retain_boot_id = 'boot-z', retain_from_boottime_ms = 0 WHERE sandbox_id = '{id}'"
         ))
         .unwrap();
+        // An anchored record is never unanchored (HIGH 1: anchors are written only
+        // after the inserting commit, so an insert carrying one is refused above).
+        refused(&format!(
+            "UPDATE create_requests SET retain_boot_id = NULL, retain_from_boottime_ms = NULL WHERE sandbox_id = '{id}'"
+        ));
         // Neither a live record nor its pinned row can be deleted.
         refused(&format!("DELETE FROM create_requests WHERE sandbox_id = '{id}'"));
         refused(&format!("DELETE FROM sandboxes WHERE id = '{id}'"));
@@ -8832,6 +9262,324 @@ mod tests {
         assert_eq!(store.rebase_create_requests().unwrap(), 1);
         assert_eq!(anchor(&store, &first.id), ("boot-b".into(), 7_500));
         assert_eq!(anchor(&store, &second.id), ("boot-b".into(), 7_000));
+    }
+
+    fn record_anchor(store: &Store, id: &str) -> (Option<String>, Option<i64>) {
+        store
+            .conn()
+            .query_row(
+                "SELECT retain_boot_id, retain_from_boottime_ms FROM create_requests WHERE sandbox_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// Break-it HIGH 1 regression: a pause inside the admission transaction, just
+    /// before it commits, is not counted against the window. The record commits
+    /// unanchored and is anchored from a reading taken after the commit.
+    #[test]
+    fn a_pause_before_the_admission_commit_does_not_shorten_retention() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = crate::expiry::ManualClock::default();
+        store.set_clock(std::sync::Arc::new(clock.clone()));
+        let paused = clock.clone();
+        *store.before_request_commit.lock().unwrap() =
+            Some(Box::new(move || paused.advance(3_600_000)));
+        let row = keyed_row("paused", 1);
+        store
+            .reserve_keyed_sandbox(&row, roomy_budgets(), Some(&admission(4, 8)))
+            .unwrap();
+        assert_eq!(
+            record_anchor(&store, &row.id),
+            (Some("boot-a".into()), Some(1_000_000 + 3_600_000)),
+            "anchored at the boottime after the pause, not before it"
+        );
+    }
+
+    /// A record whose anchor transaction never ran (the daemon died between the
+    /// two) stays unanchored and is never pruned as such; the next prune anchors it
+    /// from a reading under its write lock, or the startup rebase does: a full
+    /// window from then, never earlier.
+    #[test]
+    fn an_unanchored_record_is_anchored_late_never_early() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = crate::expiry::ManualClock::default();
+        store.set_clock(std::sync::Arc::new(clock.clone()));
+        for (name, by_prune) in [("by-prune", true), ("by-rebase", false)] {
+            let row = keyed_row(name, 1);
+            store
+                .reserve_keyed_sandbox(&row, roomy_budgets(), Some(&admission(4, 8)))
+                .unwrap();
+            {
+                let conn = store.conn();
+                conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
+                    .unwrap();
+                conn.execute(
+                    "UPDATE create_requests SET retain_boot_id = NULL, retain_from_boottime_ms = NULL WHERE sandbox_id = ?1",
+                    [&row.id],
+                )
+                .unwrap();
+                conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, true)
+                    .unwrap();
+            }
+            for state in [SandboxState::Ready, SandboxState::Deleting, SandboxState::Deleted] {
+                let backend = (state == SandboxState::Ready).then(|| format!("b-{name}"));
+                store
+                    .set_sandbox_state(&row.id, state, backend.as_deref(), None)
+                    .unwrap();
+            }
+            clock.advance(10 * 86_400_000);
+            let anchored_at = clock.boottime_ms();
+            if by_prune {
+                let pruned = store.prune(&Retention::default(), now_ms()).unwrap();
+                assert_eq!(pruned.create_requests, 0, "{name}: never pruned unanchored");
+            } else {
+                assert_eq!(store.rebase_create_requests().unwrap(), 1, "{name}");
+            }
+            assert_eq!(
+                record_anchor(&store, &row.id),
+                (Some("boot-a".into()), Some(anchored_at)),
+                "{name}"
+            );
+        }
+    }
+
+    /// A connection that ignores kilnd's triggers: an operator's sqlite3 past them.
+    fn trigger_free_connection(dir: &Path) -> Connection {
+        let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
+            .unwrap();
+        conn
+    }
+
+    /// Break-it M2 MEDIUM 2: every decision still catches a charged row that is
+    /// lost, or released past the triggers, behind kilnd's back; a settled row lost
+    /// the same way changes no reservation and is caught by the next full audit
+    /// (prune), which latches admission off; a restart refuses it too.
+    #[test]
+    fn bounded_audit_catches_charged_loss_and_the_full_audit_settled_loss() {
+        let (tmp, dir) = {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let dir = tmp.path().join("state");
+            (tmp, dir)
+        };
+        let store = Store::open(&dir).unwrap();
+        let charged = sandbox();
+        store.insert_sandbox(&charged).unwrap();
+        let settled = sandbox();
+        store.insert_sandbox(&settled).unwrap();
+        for state in [SandboxState::Ready, SandboxState::Deleting, SandboxState::Deleted] {
+            let backend = (state == SandboxState::Ready).then_some("b-settled");
+            store.set_sandbox_state(&settled.id, state, backend, None).unwrap();
+        }
+        // Settle it: the prune's full audit moves it out of the live set.
+        store.prune(&Retention { sandbox_max_count: 1_000, ..Retention::default() }, now_ms()).unwrap();
+        assert!(store.sandbox_resources().is_ok());
+
+        // A charged row released past the triggers: caught by the next decision.
+        let outside = trigger_free_connection(&dir);
+        outside
+            .execute("UPDATE sandboxes SET legacy_release = 'deleted', state = 'deleted' WHERE id = ?1", [&charged.id])
+            .unwrap();
+        let error = store.sandbox_resources().unwrap_err().to_string();
+        assert!(error.contains("reservation integrity"), "{error}");
+        outside
+            .execute("UPDATE sandboxes SET legacy_release = NULL, state = 'creating' WHERE id = ?1", [&charged.id])
+            .unwrap();
+        assert!(store.sandbox_resources().is_ok());
+
+        // A settled row lost past the triggers: no reservation changes, so the
+        // bounded audit passes; the full audit before the next prune does not.
+        outside.execute("DELETE FROM sandboxes WHERE id = ?1", [&settled.id]).unwrap();
+        assert_eq!(store.sandbox_resources().unwrap().sandboxes, 1);
+        let error = store.prune(&Retention::default(), now_ms()).unwrap_err().to_string();
+        assert!(error.contains("reservation integrity"), "{error}");
+        for error in [
+            store.sandbox_resources().unwrap_err(),
+            match store.reserve_sandbox(&sandbox(), roomy_budgets()) {
+                Err(error) => error,
+                Ok(_) => panic!("admission latched off"),
+            },
+            store.prune(&Retention::default(), now_ms()).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("reservation integrity"), "{error}");
+        }
+        drop((outside, store));
+        let error = Store::open(&dir).err().expect("startup refuses").to_string();
+        assert!(error.contains("reservation integrity"), "{error}");
+        drop(tmp);
+    }
+
+    /// The request quota reads trigger-kept counters, not a count over the records;
+    /// the full audit checks them against the records and refuses a mismatch.
+    #[test]
+    fn request_counters_follow_the_records_and_the_full_audit_checks_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::open(&dir).unwrap();
+        store.set_clock(std::sync::Arc::new(crate::expiry::ManualClock::default()));
+        let mut rows = Vec::new();
+        for (key, uid) in [("a", 1000), ("b", 1000), ("c", 1001)] {
+            let row = keyed_row(key, uid);
+            store
+                .reserve_keyed_sandbox(&row, roomy_budgets(), Some(&admission(8, 8)))
+                .unwrap();
+            rows.push(row);
+        }
+        let counts = |uid| store.create_request_counts(uid).unwrap();
+        assert_eq!((counts(1000).node, counts(1000).uid, counts(1001).uid, counts(7).uid), (3, 2, 1, 0));
+        for state in [SandboxState::Ready, SandboxState::Deleting, SandboxState::Deleted] {
+            let backend = (state == SandboxState::Ready).then_some("b-c");
+            store.set_sandbox_state(&rows[2].id, state, backend, None).unwrap();
+        }
+        assert_eq!(store.release_request_id(&rows[2].id).unwrap(), ReleaseRequestId::Released);
+        assert_eq!((counts(1000).node, counts(1001).uid), (2, 0));
+        let leftover: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM create_request_counts WHERE owner_uid = 1001", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(leftover, 0, "a uid with no records has no counter");
+        store.prune(&Retention::default(), now_ms()).unwrap();
+
+        let outside = trigger_free_connection(&dir);
+        outside
+            .execute("UPDATE create_request_counts SET records = 0 WHERE owner_uid = 1000", [])
+            .unwrap();
+        let error = store.prune(&Retention::default(), now_ms()).unwrap_err().to_string();
+        assert!(error.contains("counters"), "{error}");
+        assert!(store.sandbox_resources().is_err(), "latched off");
+        drop((outside, store));
+        let error = Store::open(&dir).err().expect("startup refuses").to_string();
+        assert!(error.contains("counters"), "{error}");
+    }
+
+    /// The bounded audit and the reservation sum read only live rows: SQLite finds
+    /// the charged ones through the partial index, never by scanning history.
+    #[test]
+    fn live_set_queries_use_the_charged_index() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for sql in [
+            format!("SELECT {MEMBERSHIP_COLUMNS} FROM sandboxes WHERE id IN ({})", live_ids()),
+            format!(
+                "SELECT {FENCED_RELEASE_COLUMNS} FROM sandboxes s
+                 LEFT JOIN release_evidence e ON e.receipt_id = s.release_evidence_id
+                 WHERE s.id IN ({}) AND {FENCED_RELEASE_WHERE}",
+                live_ids()
+            ),
+            format!(
+                "SELECT id FROM sandboxes WHERE id IN (SELECT id FROM sandboxes WHERE {RESERVED_SANDBOX_WHERE}
+                 UNION SELECT id FROM temp.accounting_quarantine)"
+            ),
+        ] {
+            let plan = plan(&sql);
+            assert!(plan.contains("sandboxes_charged"), "{sql}\n{plan}");
+            // Every pass over the sandboxes table goes through the charged index.
+            let table_scan = |line: &str| {
+                (line == "SCAN s" || line.starts_with("SCAN s ") || line.starts_with("SCAN sandboxes"))
+                    && !line.contains("USING INDEX sandboxes_charged")
+            };
+            assert!(!plan.lines().any(table_scan), "{sql}\n{plan}");
+        }
+    }
+
+    /// Break-it M2 MEDIUM 2 scale regression: keyed admission at the request caps
+    /// (4,096 records for one uid, 32,768 on the node, all retained DELETED history)
+    /// hashes no history, and costs about what it does on an empty node.
+    #[test]
+    fn keyed_admission_cost_does_not_grow_with_retained_history() {
+        fn seed(store: &Store, per_uid: usize, node: usize) {
+            let mut conn = store.conn();
+            let tx = conn.transaction().unwrap();
+            for i in 0..node {
+                let uid = if i < per_uid { 1000 } else { 2000 };
+                let row = keyed_row(&format!("seed-{i}"), uid);
+                insert_sandbox(&tx, &row).unwrap();
+                tx.execute(
+                    "INSERT INTO create_requests (owner_uid, request_id, request_sha256, sandbox_id, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, 1)",
+                    params![uid, row.lifecycle.request_id, "0".repeat(64), row.id],
+                )
+                .unwrap();
+                tx.execute(
+                    &format!(
+                        "UPDATE sandboxes SET state = ?2, deleted_at_ms = 1, {LEGACY_TRANSITION} WHERE id = ?1"
+                    ),
+                    params![row.id, "deleted", Option::<String>::None],
+                )
+                .unwrap();
+            }
+            anchor_unanchored(&tx, &crate::expiry::ManualClock::default()).unwrap();
+            // The trusted writer's own account of what it inserted, then settled.
+            refresh_membership(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        // One admission: the keyed lookup, then the admitting transaction, which
+        // refuses at a cap or inserts.
+        fn admit(store: &Store, uid: u32, key: &str, caps: &RequestAdmission) -> (Duration, u64) {
+            let hashed = MEMBERSHIP_ROWS_HASHED.with(|n| n.get());
+            let started = std::time::Instant::now();
+            assert!(store.create_request(uid, key).unwrap().is_none());
+            store
+                .reserve_keyed_sandbox(&keyed_row(key, uid), roomy_budgets(), Some(caps))
+                .unwrap();
+            (started.elapsed(), MEMBERSHIP_ROWS_HASHED.with(|n| n.get()) - hashed)
+        }
+        fn median(mut samples: Vec<Duration>) -> Duration {
+            samples.sort();
+            samples[samples.len() / 2]
+        }
+        use std::time::Duration;
+        let roomy = admission(1 << 20, 1 << 20);
+        let measure = |per_uid: usize, node: usize| -> (Duration, Duration, u64) {
+            let store = Store::open_in_memory().unwrap();
+            store.set_clock(std::sync::Arc::new(crate::expiry::ManualClock::default()));
+            seed(&store, per_uid, node);
+            let mut most_hashed = 0;
+            // Thirty-two refusals at the caps (the review's last-slot race, in turn).
+            let mut refused = Vec::new();
+            for k in 0..32 {
+                let (took, hashed) = admit(&store, 2000, &format!("late-{k}"), &admission(per_uid as u64, node as u64));
+                refused.push(took);
+                most_hashed = most_hashed.max(hashed);
+            }
+            // Thirty-two admitted creates under caps with room, each one more live row.
+            let mut admitted = Vec::new();
+            for k in 0..32 {
+                let (took, hashed) = admit(&store, 3000, &format!("new-{k}"), &roomy);
+                admitted.push(took);
+                most_hashed = most_hashed.max(hashed);
+            }
+            (median(refused), median(admitted), most_hashed)
+        };
+        let (small_refused, small_admitted, small_hashed) = measure(64, 128);
+        let (big_refused, big_admitted, big_hashed) = measure(4_096, 32_768);
+        println!(
+            "keyed admission, median of 32: 128 records: refused {small_refused:?}, admitted {small_admitted:?}; \
+             32,768 records (4,096 for one uid): refused {big_refused:?}, admitted {big_admitted:?}; \
+             most rows hashed by one admission: {small_hashed} and {big_hashed}"
+        );
+        // Deterministic: an admission hashes its live rows (here at most the 32
+        // charged creates of this test and the one it inserts, three times), never
+        // the 32,768 retained ones.
+        assert!(big_hashed <= 3 * 33 + 1, "{big_hashed}");
+        assert_eq!(small_hashed, big_hashed);
+        // And in time, with room for a loaded machine: before the fix one admission
+        // at this size hashed the whole history three times.
+        for (small, big) in [(small_refused, big_refused), (small_admitted, big_admitted)] {
+            assert!(big < small * 8 + Duration::from_millis(20), "{small:?} -> {big:?}");
+        }
     }
 
     #[test]

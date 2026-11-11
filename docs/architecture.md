@@ -631,7 +631,10 @@ before the fence). Steps 2 to 5 run under one mutex with no await between them.
 2. An in-flight entry: an unequal digest is `ALREADY_EXISTS request_id_conflict`
    at once; an equal one waits on the watch within the caller's own gRPC deadline
    (its `grpc-timeout`, less 5 % and at most 250 ms so the typed answer arrives
-   first), else `DEADLINE_EXCEEDED create_in_flight`, then looks again. A waiter
+   first), else `DEADLINE_EXCEEDED create_in_flight`, then looks again. The deadline
+   runs from when the request's headers reached the server, stamped by an interceptor
+   before any body is read: tonic starts its own `grpc-timeout` clock there, so a body
+   that arrives late cannot push the typed answer past tonic's untyped `CANCELLED`. A waiter
    holds only a watch subscription; a canceled RPC drops it and leaves nothing.
 3. A stored record, read with its row in one snapshot: an unequal digest is
    `ALREADY_EXISTS`; an equal one returns the row in its state, `FAILED` and `DELETED`
@@ -648,7 +651,9 @@ before the fence). Steps 2 to 5 run under one mutex with no await between them.
 6. `prepare`, then the existing `IMMEDIATE` admission transaction, which also
    recounts the durable per-uid and node records (refusing `request_id_quota` at a
    cap), refuses a key another create already recorded, and inserts the record with
-   the `CREATING` row: both commit or neither does.
+   the `CREATING` row: both commit or neither does. The record commits unanchored and
+   a second transaction anchors it (below). The counts are two primary-key reads of
+   `create_request_counts`, which triggers on `create_requests` keep.
 
 Lookup precedes validation, so a retry finds an accepted request even if a node
 limit changed since. A refusal before step 6 commits leaves no record, so a retry is a
@@ -685,10 +690,19 @@ foreign keys off. `sandboxes` gains `request_id` (fixed at insert) and
 `request_id_released_at_ms` (written once, from `DELETED`, after the record is gone).
 With R = `--create-request-retention-secs` (at least a day):
 
-- A record's retention anchor is this boot's ID and `CLOCK_BOOTTIME` at insert.
+- A record commits unanchored (both retention columns null; a trigger refuses an
+  insert with an anchor) and no prune can select it. Its anchor, this boot's ID and
+  `CLOCK_BOOTTIME`, is written by a second `IMMEDIATE` transaction that reads the
+  clocks only once it holds the write lock, after the inserting commit. So no pause
+  before that commit (suspend, `SIGSTOP`, a stall, a VM pause) is counted against the
+  window, which starts no earlier than the commit (Daybreak's M2 break-it HIGH 1). If
+  that transaction fails or the daemon dies first, the record stays unanchored and
+  unprunable until the next prune anchors it from a reading under its own write lock,
+  or the startup rebase does: later, never earlier. An anchor is never removed.
 - After reconciliation and before admission, any prune or any keyed lookup, one
-  `IMMEDIATE` transaction gives every record anchored in another boot the current
-  boot and boottime: a fresh, full window, never a wall-clock estimate.
+  `IMMEDIATE` transaction gives every record anchored in another boot, or unanchored,
+  the current boot and boottime, read inside it: a fresh, full window, never a
+  wall-clock estimate.
 - Prune deletes a record only if it is anchored in this boot, its row is `DELETED`
   or released `FAILED`, and R + ⌈R/1000⌉ of boottime has passed. Boottime never steps,
   counts suspend and runs within NTP's 500 ppm slew, so that takes more than R of real
@@ -698,6 +712,36 @@ With R = `--create-request-retention-secs` (at least a day):
 - A row with a record is outside the ordinary age and count prune; it can go only
   after its record. Release and prune are the only deletes, through one store
   function that rechecks the row in its own `IMMEDIATE` transaction.
+
+**Bounded integrity checks (schema 12).** Schemas 10 and 11 kept one SHA-256 over
+every sandbox row's immutable membership, and every accounting decision recomputed
+it, so with retained request history (up to 32,768 pinned rows) admission and quota
+fill were O(N) per create and could starve a node (Daybreak's M2 break-it MEDIUM 2).
+Schema 12 verifies that marker during the upgrade, then replaces it with
+`reservation_membership`: the count and the sum modulo 2^256 of each row's own
+SHA-256, for all rows and for the rows settled (uncharged) at the last full audit.
+Inserting a row adds its hash; prune subtracts the rows it deletes. An `AFTER UPDATE`
+trigger notes in `reservation_unsettled` every row that leaves the charged set, kilnd's
+update or anyone's; it records only the ID, so it cannot vouch for a row. A partial
+index, `sandboxes_charged`, finds charged rows without a scan.
+
+- Every accounting decision (admission, keyed lookup, reads, release, Health) hashes
+  only the live rows, the charged ones and those unsettled since the last full audit,
+  and requires settled + live = all. A charged row lost, or released past the
+  triggers, behind kilnd's back is caught by the next decision, as before. Its cost is
+  bounded by reservations and by releases since the last prune, not by history.
+- The full audit rehashes every row against the stored total, re-derives the settled
+  aggregate and the release-evidence quarantine, clears the unsettled list and checks
+  the request counters against the records. It runs at startup (a mismatch refuses
+  it) and at the start of every prune; a mismatch there fails the prune and latches
+  the connection degraded, so admission, pruning and accounting reads refuse until a
+  restart, which refuses too. A settled row lost behind kilnd's back changes no
+  reservation, so it is caught there, within one prune interval (60 s by default)
+  rather than at the next decision. With a very long `--prune-interval-secs` the
+  unsettled list, and so a decision's cost, grows with the releases since the last
+  prune.
+- Like the marker it replaces, the aggregate detects accidental or missing
+  membership, not a writer with file authority who rewrites both.
 
 So within R a retry always finds its record and real row and never creates a second
 sandbox. A live, `LOST` or charged row's record is kept however old.
@@ -845,10 +889,12 @@ intent anchors only with an expiry reason and never on insert, and write
 `cancel_reason` once. None of these columns enters the reservation digest or the
 fenced identity triggers: they are lifecycle data, not reservation membership.
 History migrates with nulls and sequence 0, which means never expires and reason
-unknown. So the upgrade never rewrites a schema 10 membership marker: it audits the
-marker as it stands before any change, and a mismatch refuses startup and rolls the
-whole migration back, leaving the database at schema 10 with its evidence intact.
-Only an upgrade from below 10 seeds a marker. Both paths audit again before commit.
+unknown. So the upgrade never rewrites a schema 10 membership marker before it
+audits it: it audits the marker as it stands before any change, and a mismatch
+refuses startup and rolls the whole migration back, leaving the database at schema 10
+with its evidence intact. Only an upgrade from below 10 seeds a marker. Schema 12 then
+replaces the verified marker with aggregates seeded from the same rows, and every
+path runs the full audit before commit.
 
 Schema v3 adds nullable command termination kind/value/core and bounded JSON
 runtime diagnostics. Persistence caps messages at 2048 UTF-8 bytes and native

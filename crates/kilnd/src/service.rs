@@ -17,7 +17,7 @@ use crate::model::{
     SandboxSpec, SandboxState,
 };
 use crate::runtime::Runtime;
-use crate::server::PeerIdentity;
+use crate::server::{HeadersReceived, PeerIdentity};
 
 pub struct Service<R> {
     manager: Arc<Manager<R>>,
@@ -101,7 +101,12 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         &self,
         req: Request<pb::CreateSandboxRequest>,
     ) -> Result<Response<pb::CreateSandboxResponse>, Status> {
-        let received_at = tokio::time::Instant::now();
+        // The deadline runs from the headers, like tonic's own timeout; a request
+        // that never passed the server (a direct test call) starts now.
+        let received_at = req
+            .extensions()
+            .get::<HeadersReceived>()
+            .map_or_else(tokio::time::Instant::now, |h| h.0);
         let uid = caller_uid(&req)?;
         let deadline = rpc_deadline(&req, received_at);
         let _permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
@@ -594,7 +599,9 @@ pub const REASON_KEY: &str = "kilnd-reason";
 
 /// The caller's own deadline, from its `grpc-timeout` header, a little early so the
 /// typed `create_in_flight` answer reaches it before its transport gives up: 5 % of
-/// the timeout, at most 250 ms. No header, or a malformed one: no deadline.
+/// the timeout, at most 250 ms. `received_at` is when the request's headers arrived,
+/// where tonic starts that same timeout, however late its body follows. No header,
+/// or a malformed one: no deadline.
 fn rpc_deadline<T>(req: &Request<T>, received_at: tokio::time::Instant) -> Option<tokio::time::Instant> {
     let timeout = parse_grpc_timeout(req.metadata().get("grpc-timeout")?.to_str().ok()?)?;
     let margin = (timeout / 20).min(std::time::Duration::from_millis(250));

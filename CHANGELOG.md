@@ -6,6 +6,27 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix Daybreak's break-it findings on API additions milestone 2. HIGH 1: a create
+  request record's retention anchor was read before its admitting transaction began,
+  so a pause before the commit (suspend, `SIGSTOP`, a stall) shortened the guaranteed
+  window; the review's PoC freed a key 58 min 33.6 s early and created a second
+  sandbox. The record now commits unanchored and unprunable, and a second
+  transaction anchors it from `CLOCK_BOOTTIME` read under its write lock, after the
+  commit; a record left unanchored by a crash or error is anchored later by the next
+  prune or the startup rebase, never earlier. A trigger refuses an anchored insert
+  and un-anchoring. MEDIUM 1: the `create_in_flight` deadline ran from when the
+  handler started, after the request body was decoded, while tonic's own
+  `grpc-timeout` runs from the headers, so a late body turned the typed
+  `DEADLINE_EXCEEDED` into tonic's untyped `CANCELLED`; an interceptor now stamps
+  header arrival and the deadline runs from it. MEDIUM 2: every accounting decision
+  rehashed all retained history, so quota fill was quadratic and keyed admission at
+  32,768 records took seconds; schema 12 replaces the membership marker (verified
+  during the upgrade) with O(1)-updatable aggregates, the request quota reads
+  trigger-kept counters, and each decision checks only the charged and recently
+  released rows, through a partial index. Startup and every prune rehash all history
+  and the counters; a mismatch there latches admission off. Admission cost no longer
+  grows with retained history (a 4,096/32,768-record scale test checks it). Each
+  finding has a regression.
 - Add milestone 2 of the kilnd API additions: idempotent create, additive within
   `kilnd.v1`; a client that sets none of the new fields gets exactly the earlier
   behavior. `CreateSandboxRequest.request_id` (1-64 printable ASCII bytes, scoped to

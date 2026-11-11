@@ -7,13 +7,41 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
-use crate::expiry::ManualClock;
+use crate::expiry::{Clock, ManualClock};
 use crate::runtime::fake::{FakeGate, FakePhase, FakeRuntime};
 
 const SEC: i64 = 1000;
 const DAY: i64 = 86_400 * SEC;
 /// R + ceil(R / 1000) for the default one-day retention.
 const PRUNE_AGE: i64 = DAY + DAY / 1000;
+
+/// Break-it HIGH 1's PoC clock: stands for a long suspend or scheduler stall right
+/// after the first boot ID read, which on the vulnerable commit was the retention
+/// anchor's read before the admission transaction.
+#[derive(Clone)]
+struct PauseAfterAnchorClock {
+    clock: ManualClock,
+    pause_ms: i64,
+    paused: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Clock for PauseAfterAnchorClock {
+    fn wall_ms(&self) -> i64 {
+        self.clock.wall_ms()
+    }
+
+    fn boottime_ms(&self) -> i64 {
+        self.clock.boottime_ms()
+    }
+
+    fn boot_id(&self) -> String {
+        let id = self.clock.boot_id();
+        if !self.paused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.clock.advance(self.pause_ms);
+        }
+        id
+    }
+}
 
 fn limits() -> Limits {
     Limits {
@@ -510,6 +538,66 @@ async fn retention_ignores_wall_steps_and_holds_for_r_plus_the_margin() {
     let fresh = keyed(&m, 1000, "k", "a").await.unwrap();
     assert_ne!(fresh.id, first.id);
     assert_eq!(fake.state().created.len(), 2);
+}
+
+/// Break-it HIGH 1 regression (the review's PoC, inverted): an hour's pause after a
+/// clock read that precedes the admission commit no longer eats into the window. At
+/// 23 h 1 min 26.4 s after the commit the record stays and a retry returns the same
+/// row; it goes only at R + ceil(R/1000) after the commit.
+#[tokio::test]
+async fn precommit_pause_does_not_free_a_request_id_inside_its_window() {
+    const PRECOMMIT_PAUSE: i64 = 60 * 60 * SEC;
+
+    let mut limits = limits();
+    limits.retention.sandbox_max_count = 0;
+    let fake = FakeRuntime::default();
+    let clock = ManualClock::default();
+    let m = Arc::new(Manager::with_clock(
+        fake.clone(),
+        Store::open_in_memory().unwrap(),
+        limits,
+        Arc::new(PauseAfterAnchorClock {
+            clock: clock.clone(),
+            pause_ms: PRECOMMIT_PAUSE,
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }),
+    ));
+
+    let first = keyed(&m, 1000, "precommit-pause", "a").await.unwrap();
+    m.delete(&first.id).await.unwrap();
+    clock.advance(PRUNE_AGE - PRECOMMIT_PAUSE);
+    let pruned = m.prune().unwrap();
+    assert_eq!((pruned.create_requests, pruned.sandboxes), (0, 0));
+    assert_eq!(keyed(&m, 1000, "precommit-pause", "a").await.unwrap().id, first.id);
+    assert_eq!(fake.state().created.len(), 1);
+    clock.advance(PRECOMMIT_PAUSE - 1);
+    assert_eq!(m.prune().unwrap().create_requests, 0, "one ms short of the window");
+    clock.advance(1);
+    assert_eq!(m.prune().unwrap().create_requests, 1);
+    assert_ne!(keyed(&m, 1000, "precommit-pause", "a").await.unwrap().id, first.id);
+    assert_eq!(fake.state().created.len(), 2);
+}
+
+/// The same pause injected inside the admission transaction itself, just before
+/// it commits (where moving the read later would still lose): the window starts
+/// after the pause.
+#[tokio::test]
+async fn a_pause_just_before_the_admission_commit_is_not_counted() {
+    const PAUSE: i64 = 60 * 60 * SEC;
+    let mut limits = limits();
+    limits.retention.sandbox_max_count = 0;
+    let (m, fake, clock) = clocked(limits);
+    let paused = clock.clone();
+    *m.store.before_request_commit.lock().unwrap() = Some(Box::new(move || paused.advance(PAUSE)));
+    let first = keyed(&m, 1000, "commit-pause", "a").await.unwrap();
+    *m.store.before_request_commit.lock().unwrap() = None;
+    m.delete(&first.id).await.unwrap();
+    clock.advance(PRUNE_AGE - 1);
+    assert_eq!(m.prune().unwrap().create_requests, 0);
+    assert_eq!(keyed(&m, 1000, "commit-pause", "a").await.unwrap().id, first.id);
+    clock.advance(1);
+    assert_eq!(m.prune().unwrap().create_requests, 1);
+    assert_eq!(fake.state().created.len(), 1);
 }
 
 /// Pruning interplay: a live, LOST or charged FAILED row keeps its record however

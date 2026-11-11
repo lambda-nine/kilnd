@@ -110,10 +110,15 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   admission refuses, and prune retains it. Store connections set and verify
   trusted_schema=OFF, and the trigger validator is deterministic/innocuous.
   Schema 10 also stores a SHA-256 marker of immutable reservation membership,
-  updated only by trusted insert/prune code in the same transaction. Startup and
-  accounting reads compare it; missing/changed membership refuses reads/admission/
-  prune as degraded with unknown totals, never free capacity. It cannot detect
-  pre-migration loss or coordinated rewriting of both data and marker. See the
+  updated only by trusted insert/prune code in the same transaction; schema 12
+  verifies it and replaces it with additive aggregates (all rows, and the rows
+  settled at the last full audit) so checks stay bounded as history grows. Every
+  accounting read rehashes the charged and recently released rows against them, and
+  startup and every prune rehash all history; missing/changed membership refuses
+  reads/admission/prune as degraded with unknown totals, never free capacity. A lost
+  charged row is caught by the next decision; a lost settled row, which frees nothing,
+  by the next prune (default 60 s), which then latches admission off. It cannot detect
+  pre-migration loss or coordinated rewriting of both data and aggregates. See the
   [B2 storage design](design/phase1b-firecracker.md#84-schema-ownership-and-history-protection). Receipts are private,
   trusted backend evidence bounded to 16 KiB, never caller strings or guest assertions,
   and the API exposes none of them.
@@ -121,8 +126,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   key never crosses uids.** A `request_id` is scoped to the caller's kernel uid, so
   another caller can neither read nor take over a key, and a foreign sandbox stays
   `NOT_FOUND` to release. The record commits with its `CREATING` row, ages only on
-  `CLOCK_BOOTTIME` with a 0.1 % margin and a fresh window after a reboot, and pins its
-  row, so no wall-clock step, crash or prune frees a key early. Records are bounded
+  `CLOCK_BOOTTIME` from an anchor read after that commit (so no pause before it
+  counts), with a 0.1 % margin and a fresh window after a reboot, and pins its row,
+  so no wall-clock step, pause, crash or prune frees a key early. Records are bounded
   per uid and per node; at a cap new keyed creates are refused, never earlier records
   pruned, so one caller filling its share cannot evict another's retry protection
   (it can fill the node cap, as it can fill `--max-sandboxes`). Release is explicit,

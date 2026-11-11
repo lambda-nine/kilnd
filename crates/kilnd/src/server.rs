@@ -37,6 +37,25 @@ use crate::sys::socket::{
 const FINAL_WAIT: Duration = Duration::from_secs(10);
 const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// When a request's HTTP/2 headers reached the service, attached by the server before
+/// any of its body is read or decoded. tonic starts the caller's `grpc-timeout` at
+/// the same point, so deadlines derived from it must start here too, not when the
+/// handler runs after a slow body (break-it M2 MEDIUM 1). Clients cannot set it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeadersReceived(pub(crate) tokio::time::Instant);
+
+// An interceptor runs when the server calls the service for a request: on its
+// headers, with its body still unread.
+#[allow(clippy::result_large_err)]
+fn stamp_headers_received(
+    mut request: tonic::Request<()>,
+) -> Result<tonic::Request<()>, tonic::Status> {
+    request
+        .extensions_mut()
+        .insert(HeadersReceived(tokio::time::Instant::now()));
+    Ok(request)
+}
+
 /// Who the kernel says connected, attached to every request on the connection.
 /// Clients cannot set request extensions, and `None` means the kernel gave no
 /// answer: the service refuses such a caller rather than assuming an identity.
@@ -478,6 +497,9 @@ async fn serve_with_final_wait<R: Runtime>(
     });
     let stop = CancellationToken::new();
     let server = tonic::transport::Server::builder()
+        // Break-it M2 MEDIUM 1: stamp each request when its headers arrive, the
+        // instant tonic's own `grpc-timeout` clock starts, before any body is read.
+        .layer(tonic::service::InterceptorLayer::new(stamp_headers_received))
         .max_concurrent_streams(Some(
             u32::try_from(max_streams).expect("validated stream count fits u32"),
         ))

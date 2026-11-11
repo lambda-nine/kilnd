@@ -1255,6 +1255,113 @@ fn socket_cleanup_leaves_a_replacement_inode_untouched() {
     drop(replacement);
 }
 
+/// Break-it M2 MEDIUM 1 regression: tonic starts the caller's `grpc-timeout` when the
+/// headers arrive, so the typed `create_in_flight` deadline must too. A raw HTTP/2
+/// retry of a create still in flight, with `grpc-timeout: 100m`, sends its body 0 or
+/// 50 ms after its headers; both get `DEADLINE_EXCEEDED` with the reason, never
+/// tonic's untyped `CANCELLED` "Timeout expired", and the backend sees one create.
+#[tokio::test]
+async fn create_in_flight_survives_a_delayed_request_body() {
+    use tonic::codegen::{Bytes, http};
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = tmp.path().join("run/kilnd.sock");
+    let fake = FakeRuntime::default();
+    let manager = Arc::new(Manager::new(
+        fake.clone(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        Limits::default(),
+    ));
+    let listener = kilnd::server::bind(&socket, None).await.unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(kilnd::server::serve(
+        manager,
+        listener,
+        async {
+            let _ = stop_rx.await;
+        },
+        Duration::from_millis(200),
+    ));
+    let request = pb::CreateSandboxRequest {
+        request_id: "delayed-body".into(),
+        ..Default::default()
+    };
+    let gate = FakeGate::default();
+    fake.state().create_after_allocation = Some(gate.clone());
+    let mut original_client = client(socket.clone()).await;
+    let original_request = request.clone();
+    let original = tokio::spawn(async move {
+        original_client
+            .create_sandbox(original_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .sandbox
+            .unwrap()
+    });
+    gate.entered().await;
+
+    let mut body = Vec::with_capacity(request.encoded_len() + 5);
+    body.push(0);
+    body.extend_from_slice(&u32::try_from(request.encoded_len()).unwrap().to_be_bytes());
+    request.encode(&mut body).unwrap();
+    let body = Bytes::from(body);
+    for delay_ms in [0, 50] {
+        let stream = UnixStream::connect(&socket).await.unwrap();
+        let (sender, connection) = h2::client::handshake(stream).await.unwrap();
+        let connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut sender = sender.ready().await.unwrap();
+        let headers = http::Request::builder()
+            .method("POST")
+            .uri("http://kilnd.invalid/kilnd.v1.KilndService/CreateSandbox")
+            .version(http::Version::HTTP_2)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("grpc-timeout", "100m")
+            .body(())
+            .unwrap();
+        let (response, mut send) = sender.send_request(headers, false).unwrap();
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        send.send_data(body.clone(), true).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("no response headers")
+            .unwrap();
+        let (parts, mut response_body) = response.into_parts();
+        let mut fields = parts.headers;
+        if !response_body.is_end_stream() {
+            while let Some(chunk) = response_body.data().await {
+                chunk.unwrap();
+            }
+            if let Some(trailers) = response_body.trailers().await.unwrap() {
+                fields.extend(trailers);
+            }
+        }
+        let field = |name: &str| fields.get(name).map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            field("grpc-status").as_deref(),
+            Some("4"),
+            "delay {delay_ms} ms: {fields:?}"
+        );
+        assert_eq!(
+            field("kilnd-reason").as_deref(),
+            Some("create_in_flight"),
+            "delay {delay_ms} ms: {fields:?}"
+        );
+        connection.abort();
+    }
+
+    gate.release();
+    let original = original.await.unwrap();
+    assert_eq!(original.request_id, "delayed-body");
+    assert_eq!(fake.state().created.len(), 1);
+    stop_tx.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
 fn reason(status: &tonic::Status) -> Option<String> {
     status
         .metadata()
