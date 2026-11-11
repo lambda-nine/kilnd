@@ -165,6 +165,12 @@ struct ExecOpts {
     /// lists exec_env.
     #[arg(long = "env", value_name = "NAME[=VALUE]")]
     env: Vec<String>,
+    /// Stream the command's output as it runs (ExecStream). Live output is lossy: bytes
+    /// a slow terminal could not take are reported on stderr as gaps, and the command
+    /// is never slowed. The timeout uses kilnd's stream limits. Needs a kilnd that
+    /// lists exec_stream.
+    #[arg(long)]
+    stream: bool,
 }
 
 /// `--env NAME=VALUE`, or `NAME` for this process's own value of NAME.
@@ -306,6 +312,16 @@ async fn run(cli: Cli) -> Result<u8> {
                     );
                 }
             }
+            let streams = h
+                .runtime_capabilities
+                .as_ref()
+                .is_some_and(|c| c.features.contains(&(pb::Feature::ExecStream as i32)));
+            if let (true, Some(a)) = (streams, &h.admission) {
+                println!(
+                    "exec streams:       {}/{}, {} refused at a cap",
+                    a.current_exec_streams, a.max_exec_streams, a.rejected_exec_streams
+                );
+            }
             if let Some(capabilities) = h.runtime_capabilities {
                 println!(
                     "interruption:        {}",
@@ -428,6 +444,9 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             if e.cancel_reason != pb::CancelReason::Unspecified as i32 {
                 eprintln!("canceled: {}", cancel_reason(e.cancel_reason));
+            }
+            if e.mode != pb::ExecutionMode::Unspecified as i32 {
+                eprintln!("mode:     {}", execution_mode(e.mode));
             }
             eprintln!("reusable: {}", sandbox_reusable(e.sandbox_reusable));
             eprintln!("cleanup:  {}", cleanup_evidence(e.cleanup_evidence));
@@ -694,16 +713,20 @@ async fn exec(
     if !env.is_empty() {
         require_feature(client, pb::Feature::ExecEnv, "--env").await?;
     }
-    let response = client
-        .exec(pb::ExecRequest {
-            cwd,
-            env,
-            sandbox_id: id,
-            argv,
-            stdin,
-            timeout_ms,
-        })
-        .await;
+    let request = pb::ExecRequest {
+        cwd,
+        env,
+        sandbox_id: id,
+        argv,
+        stdin,
+        timeout_ms,
+    };
+    if opts.stream {
+        // An older daemon answers UNIMPLEMENTED, but say why before sending anything.
+        require_feature(client, pb::Feature::ExecStream, "--stream").await?;
+        return exec_streamed(client, request, opts).await;
+    }
+    let response = client.exec(request).await;
     let response = match response {
         Ok(response) => response,
         Err(status) if status.code() == tonic::Code::DeadlineExceeded => {
@@ -721,6 +744,95 @@ async fn exec(
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     )?;
+    Ok(report_execution(&e, opts))
+}
+
+/// `exec --stream`: live bytes as they come, gaps on stderr, then the same report and
+/// exit code as a unary Exec. The final retained output is not printed again.
+async fn exec_streamed(
+    client: &mut KilndServiceClient<Channel>,
+    request: pb::ExecRequest,
+    opts: &ExecOpts,
+) -> Result<u8> {
+    use pb::exec_stream_response::Event;
+    let response = client
+        .exec_stream(pb::ExecStreamRequest {
+            exec: Some(request),
+        })
+        .await;
+    let mut stream = match response {
+        Ok(response) => response.into_inner(),
+        Err(status) if status.code() == tonic::Code::DeadlineExceeded => {
+            eprintln!("kilndctl: deadline_exceeded: {}", status.message());
+            return Ok(EXIT_TIMED_OUT);
+        }
+        Err(status) => return Err(rpc(status)),
+    };
+    let mut next_seq = 0u64;
+    while let Some(message) = stream.message().await.map_err(rpc)? {
+        if message.seq != next_seq {
+            bail!(
+                "stream message {} arrived where {next_seq} was due",
+                message.seq
+            );
+        }
+        next_seq += 1;
+        match message.event.context("stream message has no event")? {
+            Event::Started(started) => {
+                if opts.verbose {
+                    eprintln!("kilndctl: execution {} started", started.execution_id);
+                }
+            }
+            Event::Chunk(chunk) => {
+                if chunk.stream == pb::OutputStream::Stderr as i32 {
+                    let mut err = std::io::stderr().lock();
+                    err.write_all(&chunk.data)?;
+                    err.flush()?;
+                } else {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(&chunk.data)?;
+                    out.flush()?;
+                }
+            }
+            Event::Gap(gap) => {
+                let name = if gap.stream == pb::OutputStream::Stderr as i32 {
+                    "stderr"
+                } else {
+                    "stdout"
+                };
+                eprintln!(
+                    "kilndctl: live {name} lost {}{} bytes at offset {}",
+                    if gap.dropped_bytes_known {
+                        ""
+                    } else {
+                        "at least "
+                    },
+                    gap.dropped_bytes,
+                    gap.offset
+                );
+            }
+            Event::Finished(finished) => {
+                let e = finished
+                    .execution
+                    .context("ExecFinished has no execution")?;
+                // The bytes went out live; only the notes and the outcome remain.
+                write_execution_streams(
+                    &pb::Execution {
+                        stdout: None,
+                        stderr: None,
+                        ..e.clone()
+                    },
+                    &mut std::io::sink(),
+                    &mut std::io::stderr().lock(),
+                )?;
+                return Ok(report_execution(&e, opts));
+            }
+        }
+    }
+    bail!("the stream ended without ExecFinished; see kilndctl execution for its outcome")
+}
+
+fn report_execution(e: &pb::Execution, opts: &ExecOpts) -> u8 {
     let state = pb::ExecutionState::try_from(e.state).unwrap_or(pb::ExecutionState::Unspecified);
     if opts.verbose || state != pb::ExecutionState::Exited {
         let reason = if e.failure_reason.is_empty() {
@@ -734,11 +846,11 @@ async fn exec(
             execution_state(e.state)
         );
     }
-    Ok(match state {
+    match state {
         pb::ExecutionState::Exited => e.exit_code.unwrap_or(1).clamp(0, 255) as u8,
         pb::ExecutionState::TimedOut => EXIT_TIMED_OUT,
         _ => EXIT_FAILED,
-    })
+    }
 }
 
 fn write_execution_streams(
@@ -957,6 +1069,16 @@ fn deletion_reason(v: i32) -> String {
         .map(|r| {
             r.as_str_name()
                 .trim_start_matches("DELETION_REASON_")
+                .to_lowercase()
+        })
+        .unwrap_or_else(|_| format!("unknown({v})"))
+}
+
+fn execution_mode(v: i32) -> String {
+    pb::ExecutionMode::try_from(v)
+        .map(|m| {
+            m.as_str_name()
+                .trim_start_matches("EXECUTION_MODE_")
                 .to_lowercase()
         })
         .unwrap_or_else(|_| format!("unknown({v})"))
@@ -1185,6 +1307,33 @@ mod tests {
         assert_eq!(opts.env, ["E=2"]);
         assert_eq!(opts.cwd.as_deref(), Some("/w"));
         assert_eq!(argv, ["env"]);
+        assert!(!opts.stream);
+    }
+
+    #[test]
+    fn exec_stream_flag_parses_and_modes_print_by_name() {
+        let cli = Cli::try_parse_from([
+            "kilndctl",
+            "exec",
+            "--stream",
+            "--timeout",
+            "2m",
+            "sb-0000000000000000",
+            "--",
+            "make",
+            "-j8",
+        ])
+        .unwrap();
+        let Command::Exec { opts, id, argv } = cli.command else {
+            panic!("not exec");
+        };
+        assert!(opts.stream);
+        assert_eq!(opts.timeout.as_deref(), Some("2m"));
+        assert_eq!(id, "sb-0000000000000000");
+        assert_eq!(argv, ["make", "-j8"]);
+        assert_eq!(execution_mode(pb::ExecutionMode::Stream as i32), "stream");
+        assert_eq!(execution_mode(pb::ExecutionMode::Unary as i32), "unary");
+        assert_eq!(execution_mode(9), "unknown(9)");
     }
 
     #[test]

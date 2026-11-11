@@ -192,6 +192,25 @@ struct Args {
     /// entry (1 to 32768).
     #[arg(long, default_value_t = 32_768)]
     max_exec_env_total_bytes: usize,
+    /// An ExecStream's timeout when its request sends 0, in seconds.
+    #[arg(long, default_value_t = 1800)]
+    default_stream_timeout_secs: u64,
+    /// The longest ExecStream timeout, in seconds (at most the helper's 14400).
+    #[arg(long, default_value_t = 7200)]
+    max_stream_timeout_secs: u64,
+    /// ExecStreams admitted at once on the node (below --max-concurrent-execs).
+    #[arg(long, default_value_t = 16)]
+    max_exec_streams: usize,
+    /// ExecStreams one uid may hold at once (below --max-exec-streams).
+    #[arg(long, default_value_t = 8)]
+    max_exec_streams_per_uid: usize,
+    /// One ExecStream's live queue, in bytes (at least two chunks); a full queue drops
+    /// live output and reports the gap.
+    #[arg(long, default_value_t = 256 * 1024)]
+    exec_stream_buffer_bytes: usize,
+    /// The most data one ExecStream OutputChunk carries, in bytes (1 to 65536).
+    #[arg(long, default_value_t = 32 * 1024)]
+    exec_stream_chunk_bytes: usize,
     /// On SIGTERM, how long running requests may finish before executions are
     /// canceled, in seconds.
     #[arg(long, default_value_t = 30)]
@@ -616,6 +635,14 @@ fn validated_limits(args: &Args) -> Result<Limits> {
         },
         default_timeout: Duration::from_secs(args.default_timeout_secs),
         max_timeout: Duration::from_secs(args.max_timeout_secs),
+        default_stream_timeout: Duration::from_secs(args.default_stream_timeout_secs),
+        max_stream_timeout: Duration::from_secs(args.max_stream_timeout_secs),
+        max_exec_streams: args.max_exec_streams,
+        max_exec_streams_per_uid: args.max_exec_streams_per_uid,
+        exec_stream: kilnd::exec_stream::StreamBuffer {
+            buffer_bytes: args.exec_stream_buffer_bytes,
+            chunk_bytes: args.exec_stream_chunk_bytes,
+        },
         max_output_bytes: args.max_output_bytes,
         max_sandboxes: args.max_sandboxes,
         max_node_memory_bytes: args.max_node_memory_bytes,
@@ -661,6 +688,7 @@ fn validated_limits(args: &Args) -> Result<Limits> {
     validate_expiry(&limits.expiry, args)?;
     validate_create_requests(&limits, args)?;
     validate_exec_options(&limits)?;
+    validate_exec_streams(&limits)?;
     for (name, value) in [
         ("max-connections", limits.max_connections),
         ("reserved-connections", limits.reserved_connections),
@@ -836,6 +864,55 @@ fn validate_create_requests(limits: &Limits, args: &Args) -> Result<()> {
     }
     if i64::try_from(caps.max_node).is_err() {
         bail!("--max-create-requests exceeds the stored range");
+    }
+    Ok(())
+}
+
+/// Design sections 5.1 and 7: stream timeouts within the helper's four-hour live
+/// ceiling; a per-uid stream cap below the node's, and the node's below the global Exec
+/// tickets, so streams never take every Exec slot; a queue of at least two chunks.
+fn validate_exec_streams(limits: &Limits) -> Result<()> {
+    let helper = Duration::from_millis(u64::from(kilnd::exec_stream::MAX_LIVE_EXEC_MS));
+    if limits.default_stream_timeout.is_zero() || limits.max_stream_timeout.is_zero() {
+        bail!("--default-stream-timeout-secs and --max-stream-timeout-secs must be nonzero");
+    }
+    if limits.max_stream_timeout > helper {
+        bail!(
+            "--max-stream-timeout-secs exceeds the helper's live maximum of {}",
+            helper.as_secs()
+        );
+    }
+    if limits.default_stream_timeout > limits.max_stream_timeout {
+        bail!("--default-stream-timeout-secs is above --max-stream-timeout-secs");
+    }
+    if limits.max_exec_streams == 0 || limits.max_exec_streams_per_uid == 0 {
+        bail!("--max-exec-streams and --max-exec-streams-per-uid must be nonzero");
+    }
+    if limits.max_exec_streams_per_uid >= limits.max_exec_streams {
+        bail!("--max-exec-streams-per-uid must be below --max-exec-streams");
+    }
+    if limits.max_exec_streams >= limits.max_concurrent_execs {
+        bail!(
+            "--max-exec-streams must be below --max-concurrent-execs, so streams never take every Exec slot"
+        );
+    }
+    if limits.max_exec_streams > tokio::sync::Semaphore::MAX_PERMITS {
+        bail!("--max-exec-streams exceeds semaphore capacity");
+    }
+    let stream = limits.exec_stream;
+    if !(1..=kilnd::exec_stream::MAX_CHUNK_BYTES).contains(&stream.chunk_bytes) {
+        bail!(
+            "--exec-stream-chunk-bytes must be 1 to {}",
+            kilnd::exec_stream::MAX_CHUNK_BYTES
+        );
+    }
+    if stream.buffer_bytes / 2 < stream.chunk_bytes + kilnd::exec_stream::ENTRY_OVERHEAD
+        || u32::try_from(stream.buffer_bytes).is_err()
+    {
+        bail!(
+            "--exec-stream-buffer-bytes must hold at least two chunks with their overhead ({} bytes) and fit u32",
+            2 * (stream.chunk_bytes + kilnd::exec_stream::ENTRY_OVERHEAD)
+        );
     }
     Ok(())
 }
@@ -1105,6 +1182,63 @@ mod tests {
                 ],
                 true,
             ),
+        ] {
+            let mut full = vec!["kilnd"];
+            full.extend_from_slice(argv);
+            let args = Args::try_parse_from(full).unwrap();
+            assert_eq!(validated_limits(&args).is_ok(), ok, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn exec_stream_flags_default_to_the_design_and_refuse_unfair_caps() {
+        let args = Args::try_parse_from(["kilnd"]).unwrap();
+        let limits = validated_limits(&args).unwrap();
+        assert_eq!(limits.default_stream_timeout, Duration::from_secs(1800));
+        assert_eq!(limits.max_stream_timeout, Duration::from_secs(7200));
+        assert_eq!(
+            (limits.max_exec_streams, limits.max_exec_streams_per_uid),
+            (16, 8)
+        );
+        assert_eq!(
+            limits.exec_stream,
+            kilnd::exec_stream::StreamBuffer::default()
+        );
+        assert_eq!(limits.exec_stream.buffer_bytes, 256 * 1024);
+        assert_eq!(limits.exec_stream.chunk_bytes, 32 * 1024);
+        for (argv, ok) in [
+            (&["--max-stream-timeout-secs", "14400"][..], true),
+            (&["--max-stream-timeout-secs", "14401"], false),
+            (&["--max-stream-timeout-secs", "0"], false),
+            (&["--default-stream-timeout-secs", "0"], false),
+            (&["--default-stream-timeout-secs", "7201"], false),
+            (
+                &[
+                    "--default-stream-timeout-secs",
+                    "60",
+                    "--max-stream-timeout-secs",
+                    "60",
+                ],
+                true,
+            ),
+            // The per-uid cap at or above the node cap is refused, as for connections.
+            (&["--max-exec-streams-per-uid", "16"], false),
+            (&["--max-exec-streams-per-uid", "15"], true),
+            (&["--max-exec-streams-per-uid", "0"], false),
+            (&["--max-exec-streams", "0"], false),
+            // The node cap at or above the global Exec tickets is refused.
+            (&["--max-exec-streams", "32"], false),
+            (&["--max-exec-streams", "31"], true),
+            (
+                &["--max-exec-streams", "40", "--max-concurrent-execs", "41"],
+                true,
+            ),
+            (&["--exec-stream-chunk-bytes", "65536"], true),
+            (&["--exec-stream-chunk-bytes", "65537"], false),
+            (&["--exec-stream-chunk-bytes", "0"], false),
+            (&["--exec-stream-buffer-bytes", "65663"], false),
+            (&["--exec-stream-buffer-bytes", "65664"], true),
+            (&["--exec-stream-buffer-bytes", "4294967296"], false),
         ] {
             let mut full = vec!["kilnd"];
             full.extend_from_slice(argv);

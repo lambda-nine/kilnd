@@ -280,7 +280,10 @@ impl Runtime for DirectKilnRuntime {
         cancel: &CancellationToken,
     ) -> Result<crate::manager::ProvenFeatures, RuntimeError> {
         let (_, exec_options) = self.exec_features(None, deadline, cancel).await?;
-        Ok(super::kiln::exec_option_features(exec_options))
+        Ok(super::kiln::probed_features(
+            exec_options,
+            crate::helper::live::supported(),
+        ))
     }
 
     async fn validate_sandbox(
@@ -1102,6 +1105,7 @@ mod tests {
                     deadline: Instant::now() + Duration::from_secs(5),
                     max_output: 1024,
                     options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+                    live: None,
                 },
                 &CancellationToken::new(),
             )
@@ -1158,6 +1162,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(if timeout { 1 } else { 5 }),
                 max_output: 1024,
                 options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+                live: None,
             };
             let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
                 wait_marker(&marker).await;
@@ -1207,6 +1212,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(if timeout { 1 } else { 5 }),
                 max_output: 1024,
                 options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+                live: None,
             };
             let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
                 wait_marker(&marker).await;
@@ -1252,6 +1258,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(5),
                 max_output: 1024,
                 options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+                live: None,
             };
             let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
                 wait_marker(&marker).await;
@@ -1281,6 +1288,7 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 1024,
             options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+            live: None,
         };
         let (out, ()) = tokio::join!(runtime.exec_direct("abcd", &spec, &cancel), async {
             wait_marker(&marker).await;
@@ -1468,6 +1476,7 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 1,
             options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+            live: None,
         };
         assert_eq!(
             runtime.exec_direct("abcd", &spec, &cancel).await.finish,
@@ -2033,6 +2042,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(30),
                 max_output: 1024,
                 options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+                live: None,
             };
             runtime.exec_direct("abcd", &spec, &task_cancel).await
         });

@@ -469,7 +469,8 @@ Health probe (`Runtime::proven_features`): it is empty at startup, replaced by e
 successful probe and cleared by any failed or timed-out one, so it fails closed. The
 kiln backend proves `EXEC_CWD`, `EXEC_ENV` and `SANDBOX_DEFAULT_ENV` together when the
 helper's `features` probe finds the installed CLI's bit `0x20` and a host whose memfds
-kiln accepts; Firecracker proves none, and streaming comes later. The create-time and
+kiln accepts, and `EXEC_STREAM` when the helper reports it can carry live output
+(`exec_stream` in the same probe; Linux only); Firecracker proves none. The create-time and
 Exec-time gates read the same set Health publishes, so Health never lists an option
 the daemon would refuse. An older
 daemon lists no features and ignores unknown request fields, so a client sets a
@@ -501,7 +502,8 @@ is `INVALID_ARGUMENT invalid_grpc_timeout` before dispatch, on every RPC.
 `execution_start_raced`
 (`FAILED_PRECONDITION`, like `sandbox_not_ready`) means the conditional execution
 insert saw the sandbox leave `READY` and a reload found it `READY` again: nothing ran,
-retry.
+retry. ExecStream adds `backend_unsupported:exec_stream` (`UNIMPLEMENTED`) and
+`exec_stream_limit` (`RESOURCE_EXHAUSTED`).
 
 ## Sandbox expiry
 
@@ -1138,6 +1140,109 @@ leftover shims. Both units have NoNewPrivileges and ProtectSystem=strict; the
 daemon has an empty capability set and the helper has only kiln's required
 namespace, mount, quota, network, ownership and cleanup capabilities.
 
+## ExecStream
+
+`rpc ExecStream(ExecStreamRequest) returns (stream ExecStreamResponse)` is Exec with
+live output. The request wraps an ordinary `ExecRequest` (argv, the same bounded
+up-front stdin, cwd, env). Validation, feature gates, sandbox checks and admission run
+in the same order as Exec, through the same function; every refusal before the
+execution row is an RPC error with no message sent, and nothing was allocated. Once
+the row exists the stream carries `ExecStarted` (`seq` 0, with the execution ID), then
+`OutputChunk` and `OutputGap` messages, then exactly one `ExecFinished`. `seq` numbers
+every message from 0 with no gaps: bytes may be lost, messages never are.
+
+**Parity.** `ExecFinished.execution` is the stored row, read after terminal
+publication by the same function GetExecution uses and converted by the same
+function, so it equals GetExecution for that ID byte for byte, `mode` and both
+retained outputs included. The row's `mode` (schema 14) is `stream`; a unary Exec's
+is `unary`; rows from before it have none (`EXECUTION_MODE_UNSPECIFIED`).
+
+**The live path never slows the command.**
+
+- *Capture tap* (`kilnd-exec-core::live`). Each capture reader counts and retains a
+  read first, then offers the same bytes, at the offset it observed, to an optional
+  `LiveTap`. `offer` cannot fail, await or block; a panic inside it disables the tap
+  for that reader instead of unwinding. The readers stay the only count authority: a
+  tap that refuses or panics on every offer leaves the capture evidence byte-identical
+  (a required test). The CLI's own diagnostics are never offered.
+- *Helper live channel.* The helper's kiln `exec` request gains `live: bool` (omitted
+  when false, so unary requests stay byte-identical). With it the descriptor envelope
+  carries a fourth descriptor, kilnd's end of an anonymous `SOCK_SEQPACKET` pair. The
+  helper's tap sends each read as one message `[stream u8][offset u64be][bytes]`, at
+  most 16 KiB of data, with `MSG_DONTWAIT`, and drops it on `EAGAIN`; the message
+  boundary makes a drop atomic, so offsets alone tell kilnd what is missing. The helper
+  shuts the channel down after the execution settles and before its reply. The
+  retained-prefix transfer after settlement is unchanged and stays authoritative.
+  Darwin has no `SOCK_SEQPACKET` Unix sockets, so there the helper proves no live
+  output.
+- *kilnd's queue* (`exec_stream.rs`). The helper client reads the live socket into a
+  per-execution queue bounded by `--exec-stream-buffer-bytes` (256 KiB, counting 64
+  bytes of overhead per entry, so one-byte writes cannot exceed it). An offer that
+  does not fit is dropped whole; contiguous bytes coalesce into chunks of at most
+  `--exec-stream-chunk-bytes` (32 KiB). The RPC's response body drains the queue at
+  whatever pace the transport polls it. Gaps are derived from offsets and take no
+  queue space, and `ExecFinished` has its own slot, so neither is ever dropped. The
+  reader that fills the queue never waits on it, so nothing on this path can stall
+  the capture readers, the cleanup barrier or terminal publication.
+
+**Gaps and their exactness.** Before the first chunk after an interior loss the
+stream carries an `OutputGap` with the stream, the first missing offset and
+`dropped_bytes`, exact by offset arithmetic. A tail loss (after the last delivered
+chunk) is known only from the authoritative capture total, so after publication each
+stream with missing tail bytes, or an inexact total, gets a tail `OutputGap` whose
+`dropped_bytes_known` is true only when `Output.total_bytes_known` is; otherwise its
+count is a lower bound. kilnd never synthesizes an exact tail from offsets: a helper
+that dies after an `EAGAIN` drop and before settlement reports
+`dropped_bytes_known = false`. `ExecFinished` reports each stream's `LiveDelivery`:
+bytes delivered, bytes reported in gaps and the same flag. Live drop counts belong to
+one delivery and are not stored.
+
+**Disconnect.** Dropping the response stream (the peer going away, a transport
+deadline) is a disconnect: the supervisor records `CLIENT_DISCONNECTED` first-wins and
+cancels exactly as for a unary Exec, and a queued stream that disconnects never runs.
+The final state is readable with GetExecution. A client that stays connected but stops
+reading is not disconnected; it only loses live bytes, and the command finishes on
+time.
+
+**Permits end at handoff.** After terminal publication kilnd reads the row, puts
+`ExecFinished` in the queue's final slot and releases the stream permit, the Exec
+ticket, the sandbox's outstanding permit and the RPC permit at once. It does not wait
+for the peer to take the message: tonic and hyper may hold it for HTTP/2 window
+without polling again. The held message is at most two retained outputs plus 64 KiB,
+the shape and bound of a unary `ExecResponse` a peer refuses to read, inside one of
+the connection's eight HTTP/2 streams. A daemon crash ends the stream without
+`ExecFinished`; after restart the row is `INTERRUPTED`, as for Exec.
+
+**Timeout.** `timeout_ms` is checked against the stream limits: zero is
+`--default-stream-timeout-secs` (30 min), above `--max-stream-timeout-secs` (2 h) is
+`INVALID_ARGUMENT`. The helper's ceiling for a live exec is 4 h; a unary exec's stays
+1 h. One absolute deadline is fixed when the request arrives, and every queue wait,
+helper call and kiln budget derives from it. Clients should set no gRPC deadline, or
+one longer than `timeout_ms` plus cleanup, because a transport deadline is a
+disconnect.
+
+**Admission.** A stream takes everything a unary Exec takes (an ordinary RPC permit
+within its uid's share, a global Exec ticket, the sandbox's outstanding permit and its
+stdin bytes) plus a stream permit: at most `--max-exec-streams` (16) on the node and
+`--max-exec-streams-per-uid` (8) for one uid, else `RESOURCE_EXHAUSTED
+exec_stream_limit`, checked first so a refused stream holds nothing. Startup refuses a
+per-uid cap at or above the node cap and a node cap at or above
+`--max-concurrent-execs`, so streams never take every Exec slot. Each admitted stream
+adds one descriptor in kilnd and one in the helper, at most its queue and, at the end,
+one final message, so 16 streams add at most about 37 MiB. Health's `AdmissionStats`
+reports the cap, the current count and rejections; `kilndctl health` prints them.
+
+**Backends.** The kiln backend proves `EXEC_STREAM` through the helper's `features`
+probe; an M3b helper does not report it, so a daemon paired with one lists no stream.
+Firecracker refuses with `UNIMPLEMENTED backend_unsupported:exec_stream` before any
+row, ticket, prepare call or helper call; it needs broker live frames first.
+
+**Store: schema 14.** `executions.mode` (`unary` or `stream`, `CHECK`ed, fixed at
+insert by a trigger); null on history. Schemas 9 to 13 migrate in one transaction.
+`kilndctl exec --stream` prints live bytes as they arrive and gaps on stderr, then
+exits with the command's code; `kilndctl execution` shows the mode.
+
+
 ## Limits and defaults
 
 | Setting | Default | Flag |
@@ -1184,6 +1289,10 @@ namespace, mount, quota, network, ownership and cleanup capabilities.
 | Exec cwd (ceiling 4,096) | 4,096 bytes | `--max-exec-cwd-bytes` |
 | Env entries / name / value / total per list (ceilings; also for default env and the merge) | 64 / 128 / 4,096 / 32,768 bytes | `--max-exec-env-entries`, `--max-exec-env-name-bytes`, `--max-exec-env-value-bytes`, `--max-exec-env-total-bytes` |
 | Exec options memfd | at most 40 KiB (largest frame 37,272 bytes) | (code) |
+| ExecStream timeout (helper ceiling 4 h) | 30 min, max 2 h | `--default-stream-timeout-secs`, `--max-stream-timeout-secs` |
+| ExecStreams on the node / per uid (per uid below node, node below Exec admissions) | 16 / 8 | `--max-exec-streams`, `--max-exec-streams-per-uid` |
+| ExecStream live queue / chunk (queue at least two chunks; chunk at most 64 KiB) | 256 KiB / 32 KiB | `--exec-stream-buffer-bytes`, `--exec-stream-chunk-bytes` |
+| Helper live message | 16 KiB data | (code) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
 
 Startup validates limits before opening state or binding: required counts,
@@ -1196,7 +1305,10 @@ at most 1000. Each node budget must hold at least one default sandbox.
 Nonzero expiry maxima and defaults are at least 10 s, and a nonzero default is at
 most its nonzero maximum. Create request retention is at least a day, and both
 record caps are nonzero with the per-uid cap below the node's. The exec cwd and env
-flags are at most their ceilings, and all but the value bound are nonzero.
+flags are at most their ceilings, and all but the value bound are nonzero. Stream
+timeouts are nonzero, the default at most the maximum and the maximum at most the
+helper's 4 h; the stream caps are nonzero, per uid below the node's and the node's
+below the Exec admissions; the live queue holds at least two chunks and fits `u32`.
 These are finite capacity bounds, not a hard-real-time guarantee: synchronous
 SQLite/filesystem work may block, slow clients may deny availability until
 disconnected, and authorized callers can monopolize capacity without tenant

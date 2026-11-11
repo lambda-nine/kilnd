@@ -11,6 +11,9 @@
 
 /// Exec cwd and env (API additions design 4): validation, the merge and kiln's frame.
 pub mod exec_options;
+/// The live output tap (API additions design 5.1): an observer the capture readers offer
+/// bytes to after counting them, which can never backpressure them.
+pub mod live;
 pub mod model;
 pub mod process;
 pub mod runtime;

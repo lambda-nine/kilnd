@@ -501,6 +501,30 @@ impl CancelReason {
     }
 }
 
+/// How an execution was requested (schema 14): unary Exec or ExecStream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Unary,
+    Stream,
+}
+
+impl ExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unary => "unary",
+            Self::Stream => "stream",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "unary" => Self::Unary,
+            "stream" => Self::Stream,
+            _ => return None,
+        })
+    }
+}
+
 impl Sandbox {
     pub fn is_fenced(&self) -> bool {
         self.accounting.regime == AccountingRegime::AbsenceFenced
@@ -573,6 +597,8 @@ pub struct Execution {
     pub env_names: Vec<String>,
     /// [`crate::exec_env::env_sha256`] of the effective overrides; `None` for none.
     pub env_sha256: Option<String>,
+    /// Unary Exec or ExecStream (schema 14); `None` on rows written before it.
+    pub mode: Option<ExecutionMode>,
 }
 
 pub fn now_ms() -> i64 {

@@ -21,7 +21,8 @@ The root surface and remaining trusted code are described in the
 ## 1. Control-plane features (next)
 
 - **Streaming exec:** a server-streaming `ExecStream` for long commands and
-  live output, alongside the bounded unary `Exec`.
+  live output, alongside the bounded unary `Exec` (API additions M4; kiln backend,
+  Linux helper; Firecracker needs broker live frames).
 - **Idempotent create:** a client request ID so a retried `CreateSandbox`
   doesn't make a second sandbox.
 - **Exec options:** working directory and environment. These need kiln

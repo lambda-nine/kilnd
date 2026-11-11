@@ -190,6 +190,21 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   The contract is that callers send no secrets in env or default env; a command that
   prints its environment puts the values in its own output, which is stored like any
   output.
+- **ExecStream's live output cannot slow a command or take more than its share.**
+  Live bytes are an observer's copy: the capture readers count and retain first, and
+  their tap cannot fail, await or block, so capture evidence is the same with or
+  without a stream. The helper sends each read on its own `SOCK_SEQPACKET` socket with
+  `MSG_DONTWAIT` and drops it when the socket is full; kilnd's per-execution queue is
+  bounded (256 KiB with per-entry overhead) and drops what does not fit. A client that
+  stops reading loses live bytes only; its permits come back when the final message is
+  handed to the transport, which may then hold it at the bound of a unary response a
+  peer refuses to read. Streams are capped per node (16) and per uid (8, below the
+  node's), and the node's cap is below the Exec admissions, so one uid cannot hold
+  every stream and streams cannot hold every Exec. The live socket carries only the
+  command's own output, never the CLI's diagnostics, and kilnd validates every
+  message's stream, size and offsets. Live output is lossy by contract; the retained
+  prefix and the totals in the final row stay the authority, and an inexact total is
+  never reported as an exact tail.
 - **No request-owned exec work.** After an execution row is recorded, a
   daemon supervisor owns backend cleanup, pipe capture and finalization even
   if the RPC disappears. kiln places each command in an execution cgroup;

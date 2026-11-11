@@ -6,6 +6,37 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone 4 of the kilnd API additions: `rpc ExecStream`, Exec with live
+  output, additive within `kilnd.v1`; every existing request and response is
+  byte-identical. The request wraps an `ExecRequest` and runs the same validation,
+  gates, sandbox checks and admission as Exec, in the same order, plus a stream permit
+  (`--max-exec-streams` 16, `--max-exec-streams-per-uid` 8; startup refuses a per-uid
+  cap at or above the node's and a node cap at or above `--max-concurrent-execs`);
+  refusals before the execution row are RPC errors with no message
+  (`backend_unsupported:exec_stream`, `exec_stream_limit`). After the row the stream
+  carries `ExecStarted` (seq 0), `OutputChunk`s of at most `--exec-stream-chunk-bytes`
+  (32 KiB) at the capture reader's offsets and `OutputGap`s before the next chunk,
+  then one `ExecFinished` whose execution is GetExecution's row byte for byte, with
+  per-stream `LiveDelivery`; a tail gap is exact only when the capture total is.
+  `kilnd-exec-core`'s capture readers gain a `LiveTap` that observes each read after
+  counting it and can never block or alter capture. The helper's kiln `exec` gains
+  `live` (omitted when false) and a fourth descriptor, a `SOCK_SEQPACKET` socket on
+  which it sends `[stream u8][offset u64be][bytes]` messages with `MSG_DONTWAIT`,
+  dropping on `EAGAIN`; its `features` reply gains `exec_stream`, which proves
+  `FEATURE_EXEC_STREAM` (Linux only). kilnd's per-execution queue is bounded by
+  `--exec-stream-buffer-bytes` (256 KiB) and drops what does not fit. Dropping the
+  stream cancels like Exec (`CLIENT_DISCONNECTED`); a client that only stops reading
+  loses live bytes, and every permit is released when the final message is handed to
+  the transport. Stream timeouts default to 30 minutes, at most
+  `--max-stream-timeout-secs` (2 h), within a 4-hour helper ceiling for live execs
+  (unary stays at 1 h), one deadline fixed on arrival. Schema 14 adds
+  `executions.mode` (`unary`, `stream`), returned as `Execution.mode`.
+  `AdmissionStats` fills fields 18-20 and `ApiLimits` the stream limits. Firecracker
+  refuses ExecStream before anything is allocated. kilndctl gains `exec --stream`,
+  `kilndctl execution` shows the mode and `kilndctl health` the stream counts; the
+  integration test runs a real long ExecStream and `admission_stress` a 16-stream,
+  three-uid resource phase.
+
 - Add milestone 3b of the kilnd API additions: exec cwd and env, additive within
   `kilnd.v1`; with none of the new fields set an Exec runs exactly as before, through
   kiln's operation 4. `ExecRequest.cwd` and `ExecRequest.env`, and

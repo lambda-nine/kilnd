@@ -67,18 +67,26 @@ impl KilnRuntime {
 }
 /// The post-create feature probe's budget: the probe itself is bounded at two seconds.
 pub(crate) const SANDBOX_FEATURES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// The dynamic features exec options prove (design section 1).
-pub(crate) fn exec_option_features(exec_options: bool) -> crate::manager::ProvenFeatures {
+/// The dynamic features one successful probe proves (design section 1): exec cwd, env
+/// and sandbox default env together from the CLI's exec options, and ExecStream from the
+/// helper's live output.
+pub(crate) fn probed_features(
+    exec_options: bool,
+    exec_stream: bool,
+) -> crate::manager::ProvenFeatures {
     use crate::manager::Feature;
-    crate::manager::ProvenFeatures(if exec_options {
-        vec![
+    let mut features = Vec::new();
+    if exec_options {
+        features.extend([
             Feature::ExecCwd,
             Feature::ExecEnv,
             Feature::SandboxDefaultEnv,
-        ]
-    } else {
-        Vec::new()
-    })
+        ]);
+    }
+    if exec_stream {
+        features.push(Feature::ExecStream);
+    }
+    crate::manager::ProvenFeatures(features)
 }
 fn unexpected() -> RuntimeError {
     RuntimeError::Backend("unexpected root helper response".into())
@@ -104,8 +112,10 @@ impl Runtime for KilnRuntime {
         }
     }
     /// API additions design 1: the installed CLI's bit 0x20, through the helper, proves
-    /// exec cwd, env and sandbox default env. An older helper closes the connection on
-    /// the request, which is an error: no dynamic feature, and Health not serving.
+    /// exec cwd, env and sandbox default env, and the helper's `exec_stream` proves
+    /// ExecStream (an M3b helper omits it: no stream). An older helper closes the
+    /// connection on the request, which is an error: no dynamic feature, and Health not
+    /// serving.
     async fn proven_features(
         &self,
         deadline: Instant,
@@ -115,7 +125,11 @@ impl Runtime for KilnRuntime {
             .call(KilnRequest::Features { id: None }, deadline, cancel)
             .await?
         {
-            Response::Features { exec_options, .. } => Ok(exec_option_features(exec_options)),
+            Response::Features {
+                exec_options,
+                exec_stream,
+                ..
+            } => Ok(probed_features(exec_options, exec_stream)),
             _ => Err(unexpected()),
         }
     }

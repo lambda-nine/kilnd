@@ -443,5 +443,32 @@ else
     ctl rm "$plain" >/dev/null
 fi
 
+echo "17. ExecStream (live output through the helper's live socket)"
+ctl health | grep -q '^features: .*exec_stream' || fail "no exec_stream feature"
+streamed=$(ctl create --memory 64M --disk 16M)
+created+=("$streamed")
+# Lines arrive as they are written, not when the command ends.
+python3 -I - "$streamed" <<'PY' || fail "stream output did not arrive live"
+import subprocess, sys, time
+sandbox = sys.argv[1]
+start = time.monotonic()
+p = subprocess.Popen(["sudo", "kilndctl", "exec", "--stream", sandbox, "--",
+                      "sh", "-c", "echo first; sleep 2; echo second; echo err >&2; exit 3"],
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+first = p.stdout.readline()
+at = time.monotonic() - start
+rest = p.stdout.read()
+err = p.stderr.read()
+code = p.wait()
+assert first == b"first\n" and rest == b"second\n", (first, rest)
+assert at < 1.5, f"the first line took {at:.2f} s"
+assert b"err" in err and code == 3, (err, code)
+PY
+[ "$(ctl exec --stream "$streamed" -- sh -c 'head -c 3000000 /dev/zero | wc -c')" = 3000000 ] \
+    || fail "streamed output"
+ctl execution "$(ctl get "$streamed" | awk '/^ *ex-/{print $1; exit}')" 2>&1 \
+    | grep -q '^mode: *stream' || fail "stream mode not shown"
+ctl rm "$streamed" >/dev/null
+
 ctl health | grep -q '^active sandboxes: *0' || fail "smoke test left active sandboxes"
 echo "PASS"

@@ -6,7 +6,7 @@ use crate::model::CreateCertainty;
 use crate::runtime::{ExecFinish, ExecSpec, Runtime, kiln_direct::DirectKilnRuntime};
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,13 +197,17 @@ async fn handle(
     // Only the opposite endpoints cross SCM_RIGHTS. Never share an open file
     // description for any endpoint on which the helper performs I/O.
     let mut stdio = None;
+    let mut live = None;
     timeout(Duration::from_secs(2), async {
-        if matches!(request, KilnRequest::Exec { .. }) {
-            stdio = Some(
-                handoff_stdio(&mut stream)
-                    .await
-                    .map_err(|e| super::io_stage("stdio handoff", e))?,
-            );
+        if let KilnRequest::Exec {
+            live: wants_live, ..
+        } = &request
+        {
+            let (sockets, sender) = handoff_stdio_with(&mut stream, *wants_live)
+                .await
+                .map_err(|e| super::io_stage("stdio handoff", e))?;
+            stdio = Some(sockets);
+            live = sender;
         } else {
             fds::send(&stream.0, &[]).await?;
         }
@@ -212,7 +216,7 @@ async fn handle(
     .await
     .map_err(io::Error::other)??;
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let operation = dispatch(request, stdio, &runtime, deadline, &cancel);
+    let operation = dispatch(request, stdio, live, &runtime, deadline, &cancel);
     tokio::pin!(operation);
     let response = tokio::select! {
         result = &mut operation => result?,
@@ -233,22 +237,34 @@ async fn handle(
 /// the receiver's copy. Retain the sent endpoints until an explicit receipt.
 /// No I/O is performed on these shared open file descriptions.
 pub(super) async fn handoff_stdio(stream: &mut Socket) -> io::Result<[Socket; 3]> {
+    Ok(handoff_stdio_with(stream, false).await?.0)
+}
+
+/// With `live` (ExecStream, design 5.1), a fourth descriptor: kilnd's end of a fresh
+/// `SOCK_SEQPACKET` pair, after the three stdio sockets. The helper keeps the sending
+/// end and, like the others, performs no I/O on it until the receipt.
+async fn handoff_stdio_with(
+    stream: &mut Socket,
+    live: bool,
+) -> io::Result<([Socket; 3], Option<OwnedFd>)> {
     let (input, input_peer) = UnixStream::pair()?;
     let (output, output_peer) = UnixStream::pair()?;
     let (error, error_peer) = UnixStream::pair()?;
-    fds::send(
-        &stream.0,
-        &[
-            input_peer.as_raw_fd(),
-            output_peer.as_raw_fd(),
-            error_peer.as_raw_fd(),
-        ],
-    )
-    .await?;
+    let live = live.then(super::live::pair).transpose()?;
+    let mut sent = vec![
+        input_peer.as_raw_fd(),
+        output_peer.as_raw_fd(),
+        error_peer.as_raw_fd(),
+    ];
+    sent.extend(live.as_ref().map(|(_, peer)| peer.as_raw_fd()));
+    fds::send(&stream.0, &sent).await?;
     if stream.read_u8().await? != STDIO_RECEIVED {
         return Err(io::Error::other("missing stdio receipt"));
     }
-    Ok([Socket(input), Socket(output), Socket(error)])
+    Ok((
+        [Socket(input), Socket(output), Socket(error)],
+        live.map(|(sender, _peer)| sender),
+    ))
 }
 
 async fn read_request(stream: &mut Socket) -> io::Result<Request> {
@@ -401,6 +417,7 @@ async fn hold_until_eof(reader: &mut (impl AsyncReadExt + Unpin)) {
 async fn dispatch(
     op: KilnRequest,
     stdio: Option<[Socket; 3]>,
+    live: Option<OwnedFd>,
     runtime: &DirectKilnRuntime,
     deadline: Instant,
     cancel: &CancellationToken,
@@ -421,6 +438,7 @@ async fn dispatch(
             .map(|(features, exec_options)| Response::Features {
                 features,
                 exec_options,
+                exec_stream: super::live::supported(),
             })
             .unwrap_or_else(|e| error(e.into())),
         KilnRequest::Capabilities { id: Some(id) } => runtime
@@ -469,9 +487,19 @@ async fn dispatch(
             max_output,
             cwd,
             env,
+            live: wants_live,
         } => {
             let [mut input, mut stdout, mut stderr] =
                 stdio.ok_or_else(|| io::Error::other("missing helper stdio"))?;
+            let live = match (wants_live, live) {
+                (true, Some(fd)) => Some(super::live::LiveSender::new(fd)),
+                (false, None) => None,
+                _ => {
+                    return Err(io::Error::other(
+                        "live descriptor does not match the request",
+                    ));
+                }
+            };
             let mut stdin = Vec::new();
             let mut bounded_input = (&mut input).take((MAX_STDIN + 1) as u64);
             tokio::select! {
@@ -494,8 +522,18 @@ async fn dispatch(
                 deadline,
                 max_output,
                 options: &options,
+                live: live
+                    .clone()
+                    .map(|live| live as std::sync::Arc<dyn crate::exec_stream::LiveTap>),
             };
             let outcome = runtime.exec_direct(&id, &spec, cancel).await;
+            // Every capture reader has settled: end the live channel before the reply,
+            // so kilnd has read every live message by the time it reads the result.
+            if let Some(live) = &live {
+                live.close();
+                let (sent, dropped) = live.counts();
+                tracing::debug!(sent, dropped, "live output channel closed");
+            }
             // No stdio bytes appear in the control protocol, only evidence.
             let response = Response::Executed {
                 finish: match outcome.finish {

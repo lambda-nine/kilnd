@@ -4555,6 +4555,7 @@ fn exit1_legacy_kiln_request_and_reply_bytes_are_unchanged() {
                 argv: vec!["true".into()],
                 stdin_bytes: 1,
                 max_output: 2,
+                live: false,
             },
             r#"{"exec":{"id":"abcd","argv":["true"],"stdin_bytes":1,"max_output":2}}"#,
         ),

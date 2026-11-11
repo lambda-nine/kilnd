@@ -2,6 +2,8 @@
 mod client;
 mod fds;
 pub mod firecracker;
+/// ExecStream's fourth descriptor (API additions design 5.1).
+pub mod live;
 pub(crate) mod protocol;
 mod server;
 mod socket;

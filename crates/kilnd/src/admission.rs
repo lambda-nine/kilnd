@@ -316,6 +316,8 @@ pub struct AdmissionSnapshot {
     /// UID 0's own Health and cleanup RPC permit.
     pub root_rpc: BudgetSnapshot,
     pub execs: BudgetSnapshot,
+    /// ExecStream permits (design 5.1): node-wide, each UID within its share.
+    pub streams: BudgetSnapshot,
     pub stdin: BudgetSnapshot,
     pub max_queued_execs_per_sandbox: u64,
     pub rejected_sandbox_execs: u64,
@@ -336,6 +338,8 @@ pub struct Admission {
     health: Budget,
     root_rpc: Budget,
     execs: Budget,
+    streams: Lane,
+    rejected_streams: AtomicU64,
     stdin: Budget,
     max_queued_execs_per_sandbox: usize,
     rejected_sandbox_execs: AtomicU64,
@@ -374,6 +378,11 @@ impl Admission {
             health: Budget::new(limits.max_concurrent_health),
             root_rpc: Budget::new(1),
             execs: Budget::new(limits.max_concurrent_execs),
+            streams: Lane::new(
+                limits.max_exec_streams,
+                limits.max_exec_streams_per_uid.max(1),
+            ),
+            rejected_streams: AtomicU64::new(0),
             stdin: Budget::new(limits.max_queued_exec_stdin_bytes),
             max_queued_execs_per_sandbox: limits.max_queued_execs_per_sandbox,
             rejected_sandbox_execs: AtomicU64::new(0),
@@ -452,6 +461,15 @@ impl Admission {
         self.execs.acquire(1)
     }
 
+    /// One ExecStream permit for `uid` (design 5.1), on top of everything a unary Exec
+    /// takes: node-wide `--max-exec-streams`, `--max-exec-streams-per-uid` each.
+    pub fn try_stream(&self, uid: ShareKey) -> Result<SharedPermit, TryAcquireError> {
+        self.streams.try_acquire(uid).map_err(|_| {
+            self.rejected_streams.fetch_add(1, Ordering::Relaxed);
+            TryAcquireError::NoPermits
+        })
+    }
+
     pub fn try_stdin(&self, bytes: usize) -> Result<Option<OwnedSemaphorePermit>, TryAcquireError> {
         if bytes == 0 {
             return Ok(None);
@@ -507,6 +525,11 @@ impl Admission {
             health: self.health.snapshot(),
             root_rpc: self.root_rpc.snapshot(),
             execs: self.execs.snapshot(),
+            streams: BudgetSnapshot {
+                max: count(self.streams.max),
+                current: count(self.streams.current()),
+                rejected: self.rejected_streams.load(Ordering::Relaxed),
+            },
             stdin: self.stdin.snapshot(),
             max_queued_execs_per_sandbox: count(self.max_queued_execs_per_sandbox),
             rejected_sandbox_execs: self.rejected_sandbox_execs.load(Ordering::Relaxed),

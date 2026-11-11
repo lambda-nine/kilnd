@@ -16,7 +16,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
+use kilnd_exec_core::live::LiveStream;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -759,6 +761,63 @@ fn exited(code: i32, stdout: Vec<u8>, max: usize) -> ExecOutcome {
     }
 }
 
+/// One fake output stream as a capture reader keeps it: counted, the prefix retained,
+/// then offered to the live tap.
+struct FakeCapture {
+    captured: Captured,
+    max: usize,
+}
+
+impl FakeCapture {
+    fn new(max: usize) -> Self {
+        Self {
+            captured: Captured::known_empty(),
+            max,
+        }
+    }
+
+    fn write(&mut self, spec: &ExecSpec<'_>, stream: LiveStream, bytes: &[u8]) {
+        let offset = self.captured.total_bytes;
+        self.captured.total_bytes += bytes.len() as u64;
+        let room = self.max.saturating_sub(self.captured.data.len());
+        self.captured.truncated |= bytes.len() > room;
+        self.captured
+            .data
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
+        if let Some(tap) = &spec.live {
+            tap.offer(stream, offset, bytes);
+        }
+    }
+
+    fn outcome(self, finish: ExecFinish, stderr: FakeCapture) -> ExecOutcome {
+        ExecOutcome {
+            command_status: (finish == ExecFinish::Completed).then_some(CommandStatus::Exited(0)),
+            finish: Ok(finish),
+            stdout: self.captured,
+            stderr: stderr.captured,
+            disposition: SandboxDisposition::Reusable,
+            cleanup: CleanupEvidence::RuntimeDrained,
+        }
+    }
+}
+
+/// Waits `pause` (yielding at least once), or stops for the deadline or cancellation.
+async fn fake_pause(
+    spec: &ExecSpec<'_>,
+    cancel: &CancellationToken,
+    pause: Duration,
+) -> Option<ExecFinish> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Some(ExecFinish::Canceled),
+        () = tokio::time::sleep_until(spec.deadline) => Some(ExecFinish::TimedOut),
+        () = async {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(pause).await;
+        } => None,
+    }
+}
+
 fn no_output(finish: Result<ExecFinish, RuntimeDiagnostic>) -> ExecOutcome {
     ExecOutcome {
         finish,
@@ -1131,7 +1190,72 @@ impl Runtime for FakeRuntime {
         }
         assert!(!panic_exec, "injected fake exec panic");
         let args = &spec.argv[1..];
+        let arg = |i: usize, default: u64| -> u64 {
+            args.get(i).and_then(|a| a.parse().ok()).unwrap_or(default)
+        };
+        let live_command = matches!(spec.argv[0].as_str(), "stream" | "flood" | "torn");
         let outcome = match spec.argv[0].as_str() {
+            // ExecStream (design 5): `stream CHUNKS BYTES MS` writes CHUNKS stdout chunks
+            // of BYTES (each the chunk number's byte) and a short stderr line each, MS
+            // apart, like a capture reader would offer them.
+            "stream" => {
+                let mut out = FakeCapture::new(spec.max_output);
+                let mut err = FakeCapture::new(spec.max_output);
+                let finish = 'run: {
+                    for i in 0..arg(0, 1) {
+                        out.write(spec, LiveStream::Stdout, &vec![i as u8; arg(1, 1) as usize]);
+                        err.write(spec, LiveStream::Stderr, format!("e{i}\n").as_bytes());
+                        if let Some(stop) =
+                            fake_pause(spec, cancel, Duration::from_millis(arg(2, 0))).await
+                        {
+                            break 'run stop;
+                        }
+                    }
+                    ExecFinish::Completed
+                };
+                out.outcome(finish, err)
+            }
+            // `flood MS`: 16 KiB stdout writes at full rate for MS, yielding between.
+            "flood" => {
+                let mut out = FakeCapture::new(spec.max_output);
+                let until = tokio::time::Instant::now() + Duration::from_millis(arg(0, 100));
+                let chunk = vec![b'f'; 16 * 1024];
+                let finish = loop {
+                    if tokio::time::Instant::now() >= until {
+                        break ExecFinish::Completed;
+                    }
+                    out.write(spec, LiveStream::Stdout, &chunk);
+                    if let Some(stop) = fake_pause(spec, cancel, Duration::ZERO).await {
+                        break stop;
+                    }
+                };
+                out.outcome(finish, FakeCapture::new(spec.max_output))
+            }
+            // `torn`: a helper that died after a live drop and before settlement. Bytes
+            // 0..10 and 30..33 reach the tap, the capture total is not known.
+            "torn" => {
+                if let Some(tap) = &spec.live {
+                    tap.offer(LiveStream::Stdout, 0, b"0123456789");
+                    tap.offer(LiveStream::Stdout, 30, b"abc");
+                }
+                ExecOutcome {
+                    finish: Err(RuntimeDiagnostic::new(
+                        RuntimeErrorKind::CleanupFailed,
+                        RuntimeStage::Cleanup,
+                        "helper execution/cleanup could not be confirmed: injected helper death",
+                    )),
+                    command_status: None,
+                    stdout: Captured {
+                        data: b"0123456789"[..10.min(spec.max_output)].to_vec(),
+                        total_bytes: 10,
+                        truncated: spec.max_output < 10,
+                        total_bytes_known: false,
+                    },
+                    stderr: Captured::default(),
+                    disposition: SandboxDisposition::Quarantined,
+                    cleanup: CleanupEvidence::Unknown,
+                }
+            }
             "echo" => exited(
                 0,
                 format!("{}\n", args.join(" ")).into_bytes(),
@@ -1275,6 +1399,28 @@ impl Runtime for FakeRuntime {
                 cleanup: CleanupEvidence::RuntimeDrained,
             },
         };
+        // Every other command's output reaches a live tap whole, after the fact, at the
+        // offsets a capture reader would give it.
+        if let Some(tap) = &spec.live
+            && !live_command
+        {
+            for (stream, captured) in [
+                (LiveStream::Stdout, &outcome.stdout),
+                (LiveStream::Stderr, &outcome.stderr),
+            ] {
+                let filler = captured.data.last().copied().unwrap_or(b'x');
+                let mut offset = 0u64;
+                for piece in captured.data.chunks(16 * 1024) {
+                    tap.offer(stream, offset, piece);
+                    offset += piece.len() as u64;
+                }
+                while offset < captured.total_bytes {
+                    let n = (captured.total_bytes - offset).min(16 * 1024) as usize;
+                    tap.offer(stream, offset, &vec![filler; n]);
+                    offset += n as u64;
+                }
+            }
+        }
         self.with_evidence(id, outcome)
     }
 

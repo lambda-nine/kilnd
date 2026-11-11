@@ -100,6 +100,16 @@ pub struct Limits {
     pub max_exec_cwd_bytes: usize,
     /// `--max-exec-env-*`, for a request's env, a sandbox's default env and their merge.
     pub exec_env: crate::exec_env::EnvLimits,
+    /// ExecStream (design 5.1 and 7): `--default-stream-timeout-secs` and
+    /// `--max-stream-timeout-secs`, both within the helper's four-hour live ceiling.
+    pub default_stream_timeout: Duration,
+    pub max_stream_timeout: Duration,
+    /// `--max-exec-streams` (below the global Exec tickets) and
+    /// `--max-exec-streams-per-uid` (below that).
+    pub max_exec_streams: usize,
+    pub max_exec_streams_per_uid: usize,
+    /// `--exec-stream-buffer-bytes` and `--exec-stream-chunk-bytes`.
+    pub exec_stream: crate::exec_stream::StreamBuffer,
 }
 
 /// `--max-create-requests-per-uid` and `--max-create-requests`.
@@ -166,6 +176,11 @@ impl Default for Limits {
             create_requests: CreateRequestLimits::default(),
             max_exec_cwd_bytes: crate::exec_env::MAX_CWD_BYTES,
             exec_env: crate::exec_env::EnvLimits::CEILINGS,
+            default_stream_timeout: Duration::from_secs(1800),
+            max_stream_timeout: Duration::from_secs(7200),
+            max_exec_streams: 16,
+            max_exec_streams_per_uid: 8,
+            exec_stream: crate::exec_stream::StreamBuffer::default(),
         }
     }
 }
@@ -387,6 +402,100 @@ impl Slot {
     /// An execution is running or an admitted request is queued.
     fn busy(&self) -> bool {
         self.outstanding_execs.available_permits() != self.capacity
+    }
+}
+
+/// How an admission is waited for, before the supervisor exists.
+enum Waiting {
+    Unary(oneshot::Sender<Result<Execution>>),
+    Stream {
+        start: oneshot::Sender<Result<StreamStart>>,
+        uid: u32,
+        rpc: Option<crate::admission::RpcPermit>,
+    },
+}
+
+/// Who waits for one admitted execution: a unary Exec's reply, or an ExecStream's start
+/// signal and then its live queue (design 5).
+enum ExecWaiter {
+    Unary(oneshot::Sender<Result<Execution>>),
+    Stream(StreamWaiter),
+}
+
+struct StreamWaiter {
+    /// Taken when the row exists; until then a refusal goes back through it.
+    start: Option<oneshot::Sender<Result<StreamStart>>>,
+    queue: Arc<crate::exec_stream::LiveQueue>,
+    /// The RPC permit and the stream permit, released with the ticket at handoff.
+    _permits: (
+        Option<crate::admission::RpcPermit>,
+        crate::admission::SharedPermit,
+    ),
+}
+
+/// An ExecStream whose execution row exists: what `ExecStarted` carries, and the handle
+/// the RPC drains. Dropping the handle is the client's disconnect.
+pub struct StreamStart {
+    pub execution_id: String,
+    pub sandbox_id: String,
+    pub started_at_ms: i64,
+    pub timeout_ms: u32,
+    pub handle: crate::exec_stream::StreamHandle,
+}
+
+impl ExecWaiter {
+    fn mode(&self) -> crate::model::ExecutionMode {
+        match self {
+            Self::Unary(_) => crate::model::ExecutionMode::Unary,
+            Self::Stream(_) => crate::model::ExecutionMode::Stream,
+        }
+    }
+
+    /// Resolves when the caller is gone: a unary waiter's receiver, a stream's start
+    /// receiver before its row, its handle after.
+    async fn closed(&mut self) {
+        match self {
+            Self::Unary(reply) => reply.closed().await,
+            Self::Stream(StreamWaiter {
+                start: Some(start), ..
+            }) => start.closed().await,
+            Self::Stream(StreamWaiter { queue, .. }) => queue.disconnected().await,
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Unary(reply) => reply.is_closed(),
+            Self::Stream(StreamWaiter {
+                start: Some(start), ..
+            }) => start.is_closed(),
+            Self::Stream(StreamWaiter { queue, .. }) => queue.is_disconnected(),
+        }
+    }
+
+    fn live(&self) -> Option<Arc<dyn crate::exec_stream::LiveTap>> {
+        match self {
+            Self::Unary(_) => None,
+            Self::Stream(stream) => {
+                Some(Arc::clone(&stream.queue) as Arc<dyn crate::exec_stream::LiveTap>)
+            }
+        }
+    }
+
+    /// The row exists: a stream's `ExecStarted`. If the RPC is already gone the start
+    /// (and its handle) is dropped here, which is the disconnect.
+    fn started(&mut self, execution: &Execution) {
+        if let Self::Stream(stream) = self
+            && let Some(start) = stream.start.take()
+        {
+            let _ = start.send(Ok(StreamStart {
+                execution_id: execution.id.clone(),
+                sandbox_id: execution.sandbox_id.clone(),
+                started_at_ms: execution.started_at_ms,
+                timeout_ms: execution.timeout_ms,
+                handle: stream.queue.handle(),
+            }));
+        }
     }
 }
 
@@ -2967,8 +3076,71 @@ impl<R: Runtime> Manager<R> {
         req: ExecRequest,
         received_at: Instant,
     ) -> Result<Execution> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.admit_exec(req, received_at, Waiting::Unary(result_tx))?;
+        result_rx.await.map_err(|_| {
+            Error::Internal(anyhow::anyhow!("exec supervisor stopped without a result"))
+        })?
+    }
+
+    /// ExecStream without an RPC permit, as `exec` is Exec without one (direct callers
+    /// and tests): everything else as [`Self::exec_stream_received`].
+    pub async fn exec_stream(self: &Arc<Self>, req: ExecRequest, uid: u32) -> Result<StreamStart> {
+        self.exec_stream_inner(req, Instant::now(), uid, None).await
+    }
+
+    /// ExecStream (design 5): the same validation, gates, sandbox checks and admission
+    /// as Exec, in the same order, plus a stream permit for `uid`. It returns once the
+    /// execution row exists; every refusal before that is an error and nothing was
+    /// allocated. The RPC permit is held, with the stream permit and the Exec ticket,
+    /// until the final message is handed to the transport.
+    pub(crate) async fn exec_stream_received(
+        self: &Arc<Self>,
+        req: ExecRequest,
+        received_at: Instant,
+        uid: u32,
+        rpc: crate::admission::RpcPermit,
+    ) -> Result<StreamStart> {
+        self.exec_stream_inner(req, received_at, uid, Some(rpc))
+            .await
+    }
+
+    async fn exec_stream_inner(
+        self: &Arc<Self>,
+        req: ExecRequest,
+        received_at: Instant,
+        uid: u32,
+        rpc: Option<crate::admission::RpcPermit>,
+    ) -> Result<StreamStart> {
+        let (start_tx, start_rx) = oneshot::channel();
+        self.admit_exec(
+            req,
+            received_at,
+            Waiting::Stream {
+                start: start_tx,
+                uid,
+                rpc,
+            },
+        )?;
+        start_rx.await.map_err(|_| {
+            Error::Internal(anyhow::anyhow!(
+                "exec stream supervisor stopped without starting"
+            ))
+        })?
+    }
+
+    /// Validation, feature gates, sandbox checks and admission, then the supervisor.
+    /// Nothing here awaits, so a refusal allocates nothing and shutdown cannot drain
+    /// the tracker between admission and registration.
+    fn admit_exec(
+        self: &Arc<Self>,
+        req: ExecRequest,
+        received_at: Instant,
+        waiting: Waiting,
+    ) -> Result<()> {
         self.check_serving()?;
-        let timeout = self.check_exec(&req)?;
+        let stream = matches!(waiting, Waiting::Stream { .. });
+        let timeout = self.check_exec(&req, stream)?;
         let deadline = received_at
             .checked_add(timeout)
             .ok_or_else(|| Error::InvalidArgument("timeout deadline overflow".into()))?;
@@ -2978,6 +3150,25 @@ impl<R: Runtime> Manager<R> {
         // is allocated: no ticket, no row and no backend call.
         let resolved = self.resolve_exec_options(&req, &sandbox)?;
         let slot = self.slot(&sandbox.id);
+        // A stream's own permit first, so a stream refused for the stream caps counts
+        // only there and holds nothing else (design 5.1).
+        let stream_permit = match &waiting {
+            Waiting::Stream { uid, .. } => {
+                Some(self.admission.try_stream(Some(*uid)).map_err(|_| {
+                    Error::Refused(
+                        RefusalCode::ResourceExhausted,
+                        Refusal::typed(
+                            "exec_stream_limit",
+                            format!(
+                                "ExecStream limit reached ({} on the node, {} per uid)",
+                                self.limits.max_exec_streams, self.limits.max_exec_streams_per_uid
+                            ),
+                        ),
+                    )
+                })?)
+            }
+            Waiting::Unary(_) => None,
+        };
         let global = self.admission.try_exec().map_err(|_| {
             Error::ResourceExhausted(format!(
                 "global Exec admission limit ({}) reached",
@@ -3013,23 +3204,28 @@ impl<R: Runtime> Manager<R> {
             _sandbox: outstanding,
             _stdin: stdin,
         };
+        let waiter = match waiting {
+            Waiting::Unary(reply) => ExecWaiter::Unary(reply),
+            Waiting::Stream { start, rpc, .. } => ExecWaiter::Stream(StreamWaiter {
+                start: Some(start),
+                queue: crate::exec_stream::LiveQueue::new(self.limits.exec_stream),
+                _permits: (rpc, stream_permit.expect("a stream took its permit")),
+            }),
+        };
         // No await separates the admission check from tracker registration.
         // On the daemon's current-thread runtime, shutdown cannot close and
         // finish draining the tracker between these two operations.
-        let (result_tx, result_rx) = oneshot::channel();
         let manager = Arc::clone(self);
         let sandbox_id = sandbox.id.clone();
         self.operations.spawn(async move {
             Arc::clone(&manager)
-                .supervise_exec(req, resolved, result_tx, slot, timeout, deadline, ticket)
+                .supervise_exec(req, resolved, waiter, slot, timeout, deadline, ticket)
                 .await;
             // The ticket is released: finishing the last admitted request resumes the
             // idle timer from its finish activity (design 2.1).
             manager.expiry_refresh(&sandbox_id);
         });
-        result_rx.await.map_err(|_| {
-            Error::Internal(anyhow::anyhow!("exec supervisor stopped without a result"))
-        })?
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3037,28 +3233,71 @@ impl<R: Runtime> Manager<R> {
         self: Arc<Self>,
         req: ExecRequest,
         resolved: ResolvedOptions,
-        mut reply: oneshot::Sender<Result<Execution>>,
+        mut waiter: ExecWaiter,
         slot: Arc<Slot>,
         timeout: Duration,
         deadline: Instant,
         _ticket: ExecTicket,
     ) {
         let Some(result) = self
-            .exec_owned(req, resolved, &mut reply, slot, timeout, deadline)
+            .exec_owned(req, resolved, &mut waiter, slot, timeout, deadline)
             .await
         else {
             return;
         };
-        if let Err(result) = reply.send(result) {
-            match result {
-                Ok(execution) => {
-                    info!(execution = %execution.id, state = execution.state.as_str(), "exec RPC stopped waiting; supervised operation completed")
+        let stream = match waiter {
+            ExecWaiter::Unary(reply) => {
+                if let Err(result) = reply.send(result) {
+                    match result {
+                        Ok(execution) => {
+                            info!(execution = %execution.id, state = execution.state.as_str(), "exec RPC stopped waiting; supervised operation completed")
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "exec RPC stopped waiting; supervised operation failed")
+                        }
+                    }
                 }
-                Err(error) => {
-                    warn!(error = %error, "exec RPC stopped waiting; supervised operation failed")
-                }
+                return;
             }
+            ExecWaiter::Stream(stream) => stream,
+        };
+        let StreamWaiter {
+            mut start,
+            queue,
+            _permits: permits,
+        } = stream;
+        if let Some(start) = start.take() {
+            // Refused before its row: an RPC error, and no message was sent.
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => Error::Internal(anyhow::anyhow!("stream finished without starting")),
+            };
+            let _ = start.send(Err(error));
+            return;
         }
+        let total = |c: &Captured| crate::exec_stream::CaptureTotal {
+            total_bytes: c.total_bytes,
+            known: c.total_bytes_known,
+        };
+        let last = match result {
+            // Parity (design 5): the stored row, read after terminal publication by the
+            // function GetExecution uses, with the authoritative capture totals.
+            Ok(execution) => crate::exec_stream::StreamFinal {
+                stdout: total(&execution.stdout),
+                stderr: total(&execution.stderr),
+                execution: self.execution(&execution.id),
+            },
+            Err(error) => crate::exec_stream::StreamFinal {
+                execution: Err(error),
+                stdout: Default::default(),
+                stderr: Default::default(),
+            },
+        };
+        // The handoff: the final message goes to the transport's slot, and the stream
+        // permit, the RPC permit (in `_permits`) and the Exec ticket are released as
+        // this returns, whether or not the peer ever reads it (design 5.1).
+        queue.finish(last);
+        drop(permits);
     }
 
     /// Returns `None` only when the waiter vanished before an execution row
@@ -3069,7 +3308,7 @@ impl<R: Runtime> Manager<R> {
         self: &Arc<Self>,
         req: ExecRequest,
         resolved: ResolvedOptions,
-        reply: &mut oneshot::Sender<Result<Execution>>,
+        waiter: &mut ExecWaiter,
         slot: Arc<Slot>,
         timeout: Duration,
         deadline: Instant,
@@ -3085,7 +3324,7 @@ impl<R: Runtime> Manager<R> {
         // when the lock and closure become ready in the same scheduler turn.
         let _guard = tokio::select! {
             biased;
-            () = reply.closed() => {
+            () = waiter.closed() => {
                 info!(sandbox = %sandbox.id, "queued exec RPC stopped waiting; discarding request");
                 return None;
             }
@@ -3093,7 +3332,7 @@ impl<R: Runtime> Manager<R> {
             () = tokio::time::sleep_until(deadline) => return Some(Err(Error::DeadlineExceeded("Exec deadline expired while queued".into()))),
             guard = slot.exec_lock.lock() => guard,
         };
-        if reply.is_closed() {
+        if waiter.is_closed() {
             info!(sandbox = %sandbox.id, "queued exec RPC stopped waiting; discarding request");
             return None;
         }
@@ -3141,6 +3380,7 @@ impl<R: Runtime> Manager<R> {
             cwd: resolved.options.cwd.clone(),
             env_names: resolved.env_names,
             env_sha256: resolved.env_sha256,
+            mode: Some(waiter.mode()),
         };
         let with_options = !resolved.options.is_empty();
         if Instant::now() >= deadline {
@@ -3179,7 +3419,10 @@ impl<R: Runtime> Manager<R> {
                 return Some(Err(error.into()));
             }
         }
-        info!(sandbox = %sandbox.id, execution = %execution.id, argc = execution.argv.len(), env_overrides = execution.env_names.len(), cwd_set = execution.cwd.is_some(), "exec started");
+        info!(sandbox = %sandbox.id, execution = %execution.id, argc = execution.argv.len(), env_overrides = execution.env_names.len(), cwd_set = execution.cwd.is_some(), mode = waiter.mode().as_str(), "exec started");
+        // ExecStream's first message carries the ID; from here the waiter is the
+        // stream's handle, and dropping it is the disconnect.
+        waiter.started(&execution);
 
         // The backend future lives in its own task so both construction-time
         // and polling-time panics become a result the supervisor can record.
@@ -3191,6 +3434,7 @@ impl<R: Runtime> Manager<R> {
         let max_output = self.limits.max_output_bytes;
         let backend_cancel = cancel.clone();
         let options = resolved.options;
+        let live = waiter.live();
         let execution_context = ExecutionContext {
             execution_id: execution.id.clone(),
             execution_token: Id128::random(),
@@ -3212,6 +3456,7 @@ impl<R: Runtime> Manager<R> {
                 deadline,
                 max_output,
                 options: &options,
+                live,
             };
             backend_manager
                 .runtime
@@ -3230,7 +3475,7 @@ impl<R: Runtime> Manager<R> {
         let joined = tokio::select! {
             biased;
             joined = &mut backend => joined,
-            () = reply.closed() => {
+            () = waiter.closed() => {
                 cancel.request(ExecCancelReason::ClientGone);
                 backend.await
             }
@@ -3935,14 +4180,17 @@ impl<R: Runtime> Manager<R> {
         }
     }
 
-    fn check_exec(&self, req: &ExecRequest) -> Result<Duration> {
+    fn check_exec(&self, req: &ExecRequest, stream: bool) -> Result<Duration> {
         // Design 6: an option this backend has not proven is refused first, the first
-        // in Feature order (cwd, then env), before its value is even looked at.
+        // in Feature order (cwd, env, then streaming), before its value is even looked at.
         if !req.cwd.is_empty() {
             self.require_feature(Feature::ExecCwd)?;
         }
         if !req.env.is_empty() {
             self.require_feature(Feature::ExecEnv)?;
+        }
+        if stream {
+            self.require_feature(Feature::ExecStream)?;
         }
         validate_argv(&req.argv, self.limits.max_argv_bytes).map_err(Error::InvalidArgument)?;
         if !req.cwd.is_empty() {
@@ -3958,15 +4206,24 @@ impl<R: Runtime> Manager<R> {
                 self.limits.max_stdin_bytes
             )));
         }
+        // A stream's own limits (decision 4): 30 minutes by default, two hours at most.
+        let (default, max) = if stream {
+            (
+                self.limits.default_stream_timeout,
+                self.limits.max_stream_timeout,
+            )
+        } else {
+            (self.limits.default_timeout, self.limits.max_timeout)
+        };
         let timeout = match req.timeout_ms {
-            0 => self.limits.default_timeout,
+            0 => default,
             ms => Duration::from_millis(ms.into()),
         };
-        if timeout > self.limits.max_timeout {
+        if timeout > max {
             return Err(Error::InvalidArgument(format!(
                 "timeout {} ms is above the limit of {} ms",
                 timeout.as_millis(),
-                self.limits.max_timeout.as_millis()
+                max.as_millis()
             )));
         }
         Ok(timeout)
@@ -3983,6 +4240,7 @@ impl<R: Runtime> Manager<R> {
             Feature::SandboxDefaultEnv => {
                 ("backend_unsupported:sandbox_default_env", "default_env")
             }
+            Feature::ExecStream => ("backend_unsupported:exec_stream", "ExecStream"),
             _ => ("backend_unsupported", "this field"),
         };
         Err(Error::Refused(
@@ -4394,3 +4652,6 @@ mod m2_tests;
 
 #[cfg(test)]
 mod m3_tests;
+
+#[cfg(test)]
+mod m4_tests;

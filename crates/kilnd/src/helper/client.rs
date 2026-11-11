@@ -15,6 +15,9 @@ use tokio::net::UnixStream;
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
+/// How long the live reader may still take to reach EOF after the exchange ends.
+const LIVE_DRAIN: Duration = Duration::from_secs(2);
+
 pub(crate) struct Client {
     pub path: PathBuf,
     pub expected_uid: u32,
@@ -152,6 +155,12 @@ impl Client {
         // The group answers at its deadline and closes, so a cancel byte can race that
         // close. Its reply decides the result, not a failed courtesy write.
         let group = matches!(operation, Operation::Firecracker(_));
+        // Three stdio sockets for an execution, and ExecStream's live socket fourth.
+        let expected_fds = match (&operation, stdio.is_some()) {
+            (_, false) => 0,
+            (Operation::Kiln(KilnRequest::Exec { live: true, .. }), true) => 4,
+            (_, true) => 3,
+        };
         let request = request_for(operation, deadline)?;
         let mut stream = timeout_at(
             deadline.min(Instant::now() + Duration::from_secs(2)),
@@ -176,7 +185,7 @@ impl Client {
                     let descriptors = fds::receive(reader.as_ref())
                         .await
                         .map_err(|e| super::io_stage("stdio envelope", e))?;
-                    if descriptors.len() != if stdio.is_some() { 3 } else { 0 } {
+                    if descriptors.len() != expected_fds {
                         return Err(io::Error::other("wrong helper descriptor count"));
                     }
                     if let Some(tx) = stdio {
@@ -238,6 +247,21 @@ impl Client {
         if let Some(outcome) = undispatched(spec, cancel) {
             return outcome;
         }
+        if spec.live.is_some() && !super::live::supported() {
+            // Never reached through the API: EXEC_STREAM is proven only where it works.
+            return ExecOutcome {
+                finish: Err(RuntimeDiagnostic::new(
+                    RuntimeErrorKind::Unavailable,
+                    RuntimeStage::Prepare,
+                    "live output needs Linux SOCK_SEQPACKET sockets",
+                )),
+                command_status: None,
+                stdout: Captured::known_empty(),
+                stderr: Captured::known_empty(),
+                disposition: SandboxDisposition::Reusable,
+                cleanup: CleanupEvidence::NoChildStarted,
+            };
+        }
         let request = KilnRequest::Exec {
             id: id.into(),
             argv: spec.argv.to_vec(),
@@ -245,6 +269,7 @@ impl Client {
             max_output: spec.max_output,
             cwd: spec.options.cwd.clone(),
             env: spec.options.env.clone(),
+            live: spec.live.is_some(),
         };
         let observed = Observed::default();
         let operation = async {
@@ -334,6 +359,7 @@ impl Client {
         observed: &Observed,
     ) -> io::Result<(Response, Vec<u8>, Vec<u8>)> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let (live_tx, live_rx) = tokio::sync::oneshot::channel();
         let exchange = self.exchange(operation, spec.deadline, cancel, Some(tx));
         let io_work = async {
             let descriptors = rx.await.map_err(io::Error::other)?;
@@ -349,6 +375,24 @@ impl Client {
             let mut input = next()?;
             let mut output = next()?;
             let mut error = next()?;
+            // ExecStream's live socket: read beside stdio into the execution's queue,
+            // which never waits (design 5.1). A broken channel only ends live output.
+            let live = match (&spec.live, streams.next()) {
+                (Some(tap), Some(fd)) => Some((
+                    super::live::live_socket(fd, self.expected_uid)
+                        .map_err(|e| super::io_stage("live socket", e))?,
+                    tap.clone(),
+                )),
+                (None, None) => None,
+                _ => {
+                    return Err(io::Error::other(
+                        "live descriptor does not match the request",
+                    ));
+                }
+            };
+            if let Some(live) = live {
+                let _ = live_tx.send(live);
+            }
             input
                 .write_all(spec.stdin)
                 .await
@@ -367,11 +411,35 @@ impl Client {
                     read_output(&mut error, spec.max_output, &observed.err)
                         .await
                         .map_err(|e| super::io_stage("stderr drain", e))
-                }
+                },
             )?;
             Ok::<_, io::Error>(())
         };
-        let (response, ()) = tokio::try_join!(exchange, io_work)?;
+        // The live reader runs beside the exchange but is not ended by its failure: a
+        // helper that dies mid-execution still leaves what it sent readable. Once the
+        // exchange is over it gets a short bound to reach EOF, which the helper sends
+        // before its reply (design 5.1).
+        let live_reader = async {
+            if let Ok((fd, tap)) = live_rx.await
+                && let Err(error) = super::live::read_live(fd, tap).await
+            {
+                tracing::warn!(%error, "live output channel ended early; the rest is a tail gap");
+            }
+        };
+        tokio::pin!(live_reader);
+        let main = async { tokio::try_join!(exchange, io_work) };
+        tokio::pin!(main);
+        let mut live_done = false;
+        let result = loop {
+            tokio::select! {
+                result = &mut main => break result,
+                () = &mut live_reader, if !live_done => live_done = true,
+            }
+        };
+        if !live_done {
+            let _ = tokio::time::timeout(LIVE_DRAIN, &mut live_reader).await;
+        }
+        let (response, ()) = result?;
         let out = observed.out.lock().unwrap().data.clone();
         let err = observed.err.lock().unwrap().data.clone();
         Ok((response, out, err))

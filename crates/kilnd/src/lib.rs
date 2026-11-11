@@ -5,6 +5,8 @@
 pub mod admission;
 pub mod attachment_check;
 pub mod exec_env;
+/// ExecStream's bounded live queue (API additions design 5.1).
+pub mod exec_stream;
 pub mod expiry;
 pub mod manager;
 pub mod model;

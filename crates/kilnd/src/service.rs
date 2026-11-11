@@ -13,8 +13,8 @@ use crate::manager::{
     RefusalCode,
 };
 use crate::model::{
-    CancelReason, Captured, DeletionReason, Execution, ExecutionState, Network, Sandbox,
-    SandboxSpec, SandboxState,
+    CancelReason, Captured, DeletionReason, Execution, ExecutionMode, ExecutionState, Network,
+    Sandbox, SandboxSpec, SandboxState,
 };
 use crate::runtime::Runtime;
 use crate::server::{HeadersReceived, PeerIdentity};
@@ -302,6 +302,41 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         }))
     }
 
+    type ExecStreamStream = ExecStreamBody;
+
+    /// Design 5: the order of Exec, then a stream permit; refusals before the execution
+    /// row are RPC errors with no message sent.
+    async fn exec_stream(
+        &self,
+        req: Request<pb::ExecStreamRequest>,
+    ) -> Result<Response<Self::ExecStreamStream>, Status> {
+        let received_at = tokio::time::Instant::now();
+        let uid = caller_uid(&req)?;
+        let permit = self.rpc_permit(&req, RpcClass::Ordinary, uid)?;
+        let req = req.into_inner().exec.unwrap_or_default();
+        self.manager
+            .authorize(&req.sandbox_id, uid)
+            .map_err(status)?;
+        let start = self
+            .manager
+            .exec_stream_received(
+                ExecRequest {
+                    sandbox_id: req.sandbox_id,
+                    argv: req.argv,
+                    stdin: req.stdin,
+                    timeout_ms: req.timeout_ms,
+                    cwd: req.cwd,
+                    env: env_vars(req.env),
+                },
+                received_at,
+                uid,
+                permit,
+            )
+            .await
+            .map_err(status)?;
+        Ok(Response::new(ExecStreamBody::new(start)))
+    }
+
     async fn get_execution(
         &self,
         req: Request<pb::GetExecutionRequest>,
@@ -315,6 +350,116 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         Ok(Response::new(pb::GetExecutionResponse {
             execution: Some(execution_pb(execution)),
         }))
+    }
+}
+
+/// One ExecStream's response body: `ExecStarted`, then the live events in order, each
+/// numbered. The transport polls it only as the peer's flow control allows; nothing
+/// waits on it. Dropping it, as the transport does when the peer goes away, is the
+/// disconnect.
+pub struct ExecStreamBody {
+    started: Option<pb::ExecStarted>,
+    handle: crate::exec_stream::StreamHandle,
+    seq: u64,
+}
+
+impl ExecStreamBody {
+    fn new(start: crate::manager::StreamStart) -> Self {
+        Self {
+            started: Some(pb::ExecStarted {
+                execution_id: start.execution_id,
+                sandbox_id: start.sandbox_id,
+                started_at_unix_ms: start.started_at_ms,
+                timeout_ms: start.timeout_ms,
+            }),
+            handle: start.handle,
+            seq: 0,
+        }
+    }
+
+    fn message(&mut self, event: pb::exec_stream_response::Event) -> pb::ExecStreamResponse {
+        let seq = self.seq;
+        self.seq += 1;
+        pb::ExecStreamResponse {
+            seq,
+            event: Some(event),
+        }
+    }
+}
+
+fn output_stream_pb(stream: crate::exec_stream::LiveStream) -> i32 {
+    match stream {
+        crate::exec_stream::LiveStream::Stdout => pb::OutputStream::Stdout,
+        crate::exec_stream::LiveStream::Stderr => pb::OutputStream::Stderr,
+    }
+    .into()
+}
+
+fn delivery_pb(d: crate::exec_stream::Delivery) -> pb::LiveDelivery {
+    pb::LiveDelivery {
+        delivered_bytes: d.delivered_bytes,
+        dropped_bytes: d.dropped_bytes,
+        dropped_bytes_known: d.dropped_bytes_known,
+    }
+}
+
+impl tokio_stream::Stream for ExecStreamBody {
+    type Item = Result<pb::ExecStreamResponse, Status>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use crate::exec_stream::LiveEvent;
+        use pb::exec_stream_response::Event;
+        use std::task::Poll;
+        let this = self.get_mut();
+        if let Some(started) = this.started.take() {
+            return Poll::Ready(Some(Ok(this.message(Event::Started(started)))));
+        }
+        let event = match this.handle.poll_event(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(Some(event)) => event,
+        };
+        let event = match event {
+            LiveEvent::Chunk {
+                stream,
+                offset,
+                data,
+            } => Event::Chunk(pb::OutputChunk {
+                stream: output_stream_pb(stream),
+                offset,
+                data,
+            }),
+            LiveEvent::Gap {
+                stream,
+                offset,
+                dropped_bytes,
+                dropped_bytes_known,
+            } => Event::Gap(pb::OutputGap {
+                stream: output_stream_pb(stream),
+                offset,
+                dropped_bytes,
+                dropped_bytes_known,
+            }),
+            LiveEvent::Finished {
+                execution,
+                stdout,
+                stderr,
+            } => match *execution {
+                // The same conversion GetExecution uses, of the row it reads.
+                Ok(execution) => Event::Finished(pb::ExecFinished {
+                    execution: Some(execution_pb(execution)),
+                    stdout: Some(delivery_pb(stdout)),
+                    stderr: Some(delivery_pb(stderr)),
+                }),
+                // The row could not be read after publication: the stream ends with the
+                // error; GetExecution reads it later.
+                Err(error) => return Poll::Ready(Some(Err(status(error)))),
+            },
+        };
+        Poll::Ready(Some(Ok(this.message(event))))
     }
 }
 
@@ -381,6 +526,9 @@ fn admission_pb(s: crate::admission::AdmissionSnapshot) -> pb::AdmissionStats {
         rejected_stdin: s.stdin.rejected,
         max_queued_execs_per_sandbox: s.max_queued_execs_per_sandbox,
         rejected_sandbox_execs: s.rejected_sandbox_execs,
+        max_exec_streams: s.streams.max,
+        current_exec_streams: s.streams.current,
+        rejected_exec_streams: s.streams.rejected,
         // Filled by Health from the store, for the caller.
         ..Default::default()
     }
@@ -405,6 +553,7 @@ fn api_limits_pb(l: &Limits, features: &[Feature]) -> pb::ApiLimits {
     let ms = |d: std::time::Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
     let listed = |f: Feature| features.contains(&f);
     let cwd = listed(Feature::ExecCwd);
+    let stream = listed(Feature::ExecStream);
     let env = listed(Feature::ExecEnv) || listed(Feature::SandboxDefaultEnv);
     let env_limit = |n: usize| if env { n as u32 } else { 0 };
     pb::ApiLimits {
@@ -423,11 +572,23 @@ fn api_limits_pb(l: &Limits, features: &[Feature]) -> pb::ApiLimits {
         max_env_total_bytes: env_limit(l.exec_env.max_total_bytes),
         default_exec_timeout_ms: ms(l.default_timeout),
         max_exec_timeout_ms: ms(l.max_timeout),
-        default_stream_timeout_ms: 0,
-        max_stream_timeout_ms: 0,
+        default_stream_timeout_ms: if stream {
+            ms(l.default_stream_timeout)
+        } else {
+            0
+        },
+        max_stream_timeout_ms: if stream { ms(l.max_stream_timeout) } else { 0 },
         max_output_bytes: l.max_output_bytes as u64,
-        stream_chunk_bytes: 0,
-        stream_buffer_bytes: 0,
+        stream_chunk_bytes: if stream {
+            l.exec_stream.chunk_bytes as u32
+        } else {
+            0
+        },
+        stream_buffer_bytes: if stream {
+            l.exec_stream.buffer_bytes as u64
+        } else {
+            0
+        },
         min_sandbox_lifetime_ms: crate::expiry::MIN_EXPIRY_MS,
         min_sandbox_idle_ms: crate::expiry::MIN_EXPIRY_MS,
     }
@@ -856,6 +1017,12 @@ pub fn execution_pb(e: Execution) -> pb::Execution {
             Some(CancelReason::SandboxDeleted) => pb::CancelReason::SandboxDeleted,
             Some(CancelReason::DaemonShutdown) => pb::CancelReason::DaemonShutdown,
             Some(CancelReason::SandboxExpiredLifetime) => pb::CancelReason::SandboxExpiredLifetime,
+        }
+        .into(),
+        mode: match e.mode {
+            None => pb::ExecutionMode::Unspecified,
+            Some(ExecutionMode::Unary) => pb::ExecutionMode::Unary,
+            Some(ExecutionMode::Stream) => pb::ExecutionMode::Stream,
         }
         .into(),
     }

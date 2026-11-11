@@ -30,7 +30,7 @@ use crate::model::{
 use crate::retention::{OutputStorage, Pruned, Retention};
 use crate::runtime::{CreatedSandbox, FencedAbsence, RuntimeReceipt};
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -531,6 +531,17 @@ CREATE TRIGGER executions_env_fixed BEFORE UPDATE ON executions
 WHEN NEW.cwd IS NOT OLD.cwd OR NEW.env_names IS NOT OLD.env_names OR NEW.env_sha256 IS NOT OLD.env_sha256
 BEGIN SELECT RAISE(ABORT, 'an execution cwd and env names and digest are fixed at insert'); END;
 PRAGMA user_version = 13;";
+
+// Schema 14 (API additions design 5): how an execution was requested, unary Exec or
+// ExecStream, fixed at insert. Rows written before it keep NULL, which the API shows as
+// EXECUTION_MODE_UNSPECIFIED; every new row names its mode. Live drop counts belong to
+// one delivery, not to the execution, and are not stored.
+const MIGRATE_V14: &str = "
+ALTER TABLE executions ADD COLUMN mode TEXT CHECK (mode IS NULL OR (typeof(mode) = 'text' AND mode IN ('unary', 'stream')));
+CREATE TRIGGER executions_mode_fixed BEFORE UPDATE ON executions
+WHEN NEW.mode IS NOT OLD.mode
+BEGIN SELECT RAISE(ABORT, 'an execution mode is fixed at insert'); END;
+PRAGMA user_version = 14;";
 
 /// Clears a sandbox's default env values in the statement that moves it to `?2`, when
 /// that is FAILED or DELETED (schema 13's CHECK requires it).
@@ -1921,8 +1932,8 @@ impl Store {
             tx.execute_batch(MIGRATE_V9)?;
         }
         if version >= 12 {
-            // Schema 12's aggregates are audited as they stand below, after the one
-            // additive step: the schema 13 columns are not membership.
+            // Schema 12's aggregates are audited as they stand below, after the
+            // additive steps: the schema 13 and 14 columns are not membership.
         } else if version < 10 {
             // Schema 10 introduces the membership marker: seed it from the rows
             // this one transaction has just migrated.
@@ -1948,7 +1959,10 @@ impl Store {
             tx.execute_batch(MIGRATE_V12)?;
             refresh_membership(&tx)?;
         }
-        tx.execute_batch(MIGRATE_V13)?;
+        if version < 13 {
+            tx.execute_batch(MIGRATE_V13)?;
+        }
+        tx.execute_batch(MIGRATE_V14)?;
         audit_accounting_full(&tx)?;
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
@@ -3028,8 +3042,8 @@ impl Store {
         }
         let n = tx.execute(
             "INSERT INTO executions (id, sandbox_id, argv, state, timeout_ms, stdin_bytes, started_at_ms,
-                 cwd, env_names, env_sha256)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                 cwd, env_names, env_sha256, mode)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
              WHERE EXISTS (SELECT 1 FROM sandboxes WHERE id = ?2 AND state = 'ready')",
             params![
                 e.id,
@@ -3042,6 +3056,7 @@ impl Store {
                 e.cwd,
                 names_column(&e.env_names)?,
                 e.env_sha256,
+                e.mode.map(crate::model::ExecutionMode::as_str),
             ],
         )?;
         if n == 1 {
@@ -4225,14 +4240,14 @@ const EXECUTION_COLUMNS: &str =
     started_at_ms, finished_at_ms, stdout, stdout_bytes, stdout_truncated, stdout_total_bytes_known,
     stderr, stderr_bytes, stderr_truncated, stderr_total_bytes_known,
     command_status_kind, command_status_value, command_core_dumped, runtime_error,
-    sandbox_reusable, cleanup_evidence, cancel_reason, cwd, env_names, env_sha256";
+    sandbox_reusable, cleanup_evidence, cancel_reason, cwd, env_names, env_sha256, mode";
 
 const EXECUTION_METADATA_COLUMNS: &str =
     "id, sandbox_id, argv, state, exit_code, failure_reason, timeout_ms, stdin_bytes,
     started_at_ms, finished_at_ms, x'', stdout_bytes, stdout_truncated, stdout_total_bytes_known,
     x'', stderr_bytes, stderr_truncated, stderr_total_bytes_known,
     command_status_kind, command_status_value, command_core_dumped, runtime_error,
-    sandbox_reusable, cleanup_evidence, cancel_reason, cwd, env_names, env_sha256";
+    sandbox_reusable, cleanup_evidence, cancel_reason, cwd, env_names, env_sha256, mode";
 
 fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
     let id: String = row.get(0)?;
@@ -4243,6 +4258,7 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
     let cwd: Option<String> = row.get(25)?;
     let env_names: Option<String> = row.get(26)?;
     let env_sha256: Option<String> = row.get(27)?;
+    let mode: Option<String> = row.get(28)?;
     Ok((|| {
         Ok(Execution {
             sandbox_id: row.get(1)?,
@@ -4304,6 +4320,12 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Result<Execution>> {
             env_names: parse_names(env_names, "env names")
                 .with_context(|| format!("execution {id}"))?,
             env_sha256,
+            mode: mode
+                .map(|mode| {
+                    crate::model::ExecutionMode::parse(&mode)
+                        .with_context(|| format!("execution {id}: unknown mode {mode:?}"))
+                })
+                .transpose()?,
         })
     })())
 }
@@ -4813,6 +4835,7 @@ mod tests {
             cwd: None,
             env_names: Vec::new(),
             env_sha256: None,
+            mode: None,
         }
     }
 
@@ -9401,7 +9424,7 @@ mod tests {
     /// Schema 12 reached from 9, 10 and 11 is the fresh schema; history has no
     /// request ID and no record, and an existing integrity marker is kept as is.
     #[test]
-    fn schema13_from_9_10_11_and_12_matches_fresh() {
+    fn schema14_from_9_through_13_matches_fresh() {
         let schema_sql = |conn: &Connection| -> Vec<(String, String)> {
             conn.prepare(
                 "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name",
@@ -9415,7 +9438,7 @@ mod tests {
         let fresh = Store::open_in_memory().unwrap();
         let expected = schema_sql(&fresh.conn());
         assert!(expected.iter().any(|(name, _)| name == "create_requests"));
-        for version in [9, 10, 11, 12] {
+        for version in [9, 10, 11, 12, 13] {
             let tmp = tempfile::tempdir().unwrap();
             let mut conn = disk_database_at(tmp.path(), 7);
             register_receipt_validator(&conn).unwrap();
@@ -9435,14 +9458,29 @@ mod tests {
             if version >= 11 {
                 tx.execute_batch(MIGRATE_V11).unwrap();
             }
-            if version == 12 {
+            if version >= 12 {
                 tx.execute_batch(MIGRATE_V12).unwrap();
                 refresh_membership(&tx).unwrap();
             }
+            if version == 13 {
+                tx.execute_batch(MIGRATE_V13).unwrap();
+            }
+            tx.execute(
+                "INSERT INTO executions (id, sandbox_id, argv, state, timeout_ms, stdin_bytes, started_at_ms)
+                 VALUES (?1, ?2, '[\"true\"]', 'exited', 1000, 0, 1)",
+                params![format!("ex-{version:016x}"), history.id],
+            )
+            .unwrap();
             tx.commit().unwrap();
             release_database(conn, tmp.path());
             let store = Store::reopen_after_restart(tmp.path());
             assert_eq!(schema_sql(&store.conn()), expected, "v{version}");
+            // Schema 14: history has no mode, which the API shows as unspecified.
+            let old = store
+                .execution(&format!("ex-{version:016x}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(old.mode, None, "v{version}");
             assert_seeded_membership(&store.conn(), 1, 0);
             let row = store.sandbox(&history.id).unwrap().unwrap();
             assert_eq!(row.lifecycle, SandboxLifecycle::default(), "v{version}");
@@ -9517,6 +9555,53 @@ mod tests {
             store.release_request_id("sb-0000000000000000").unwrap(),
             ReleaseRequestId::NoSandbox
         );
+    }
+
+    /// Schema 14 (design 5): every new row names its mode, which is fixed at insert and
+    /// limited to the two modes; reads return it.
+    #[test]
+    fn schema14_records_each_mode_once() {
+        use crate::model::ExecutionMode;
+        let store = Store::open_in_memory().unwrap();
+        let mut row = sandbox();
+        row.state = SandboxState::Ready;
+        insert_sandbox(&store.conn(), &row).unwrap();
+        for (i, mode) in [ExecutionMode::Unary, ExecutionMode::Stream]
+            .into_iter()
+            .enumerate()
+        {
+            let mut e = execution(&row.id);
+            e.id = format!("ex-{i:016x}");
+            e.mode = Some(mode);
+            assert!(store.start_execution(&e).unwrap());
+            assert_eq!(store.execution(&e.id).unwrap().unwrap().mode, Some(mode));
+            assert_eq!(
+                store
+                    .query_for_test::<String>("SELECT mode FROM executions WHERE id = ?1", [&e.id])
+                    .unwrap(),
+                mode.as_str()
+            );
+        }
+        for sql in [
+            "UPDATE executions SET mode = 'stream' WHERE id = 'ex-0000000000000000'",
+            "UPDATE executions SET mode = NULL WHERE id = 'ex-0000000000000001'",
+        ] {
+            let error = store.conn().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("fixed at insert"), "{sql}: {error}");
+        }
+        let error = store
+            .conn()
+            .execute(
+                "INSERT INTO executions (id, sandbox_id, argv, state, timeout_ms, stdin_bytes, started_at_ms, mode)
+                 VALUES ('ex-00000000000000ff', ?1, '[]', 'running', 1, 0, 1, 'detached')",
+                [&row.id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CHECK"), "{error}");
+        // Finishing an execution keeps its mode.
+        let first = store.execution("ex-0000000000000000").unwrap().unwrap();
+        assert_eq!(first.mode, Some(ExecutionMode::Unary));
     }
 
     /// Schema 13 (design 4.2): default env values only on a live row and only cleared;

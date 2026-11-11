@@ -1460,3 +1460,172 @@ async fn real_kiln_exec_cwd_and_env() {
     assert_eq!(after.state, SandboxState::Deleted);
     assert_eq!(after.lifecycle.default_env_names, ["D", "E"]);
 }
+
+/// API additions M4 (design 5 and 8): a real long ExecStream through kiln's capture
+/// readers. Output arrives while the command runs, offsets and the retained prefix
+/// agree, `ExecFinished` is the stored row; a non-reading stream of a fast writer
+/// finishes on time with exact accounting; a dropped stream cancels the real command
+/// and its cleanup barrier holds.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "privileged; run scripts/integration-test.sh in the VM"]
+async fn real_kiln_exec_stream() {
+    use kilnd::exec_stream::{LiveEvent, LiveStream, StreamHandle};
+    use kilnd::manager::Feature;
+    use kilnd::model::{CancelReason, ExecutionMode};
+    if !enabled() {
+        return;
+    }
+    async fn next(handle: &mut StreamHandle) -> Option<LiveEvent> {
+        std::future::poll_fn(|cx| handle.poll_event(cx)).await
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (limits, small) = one_small_sandbox();
+    let m = Arc::new(Manager::new(
+        kiln(),
+        Store::open(&tmp.path().join("state")).unwrap(),
+        limits,
+    ));
+    m.reconcile().await.unwrap();
+    assert!(m.health().await.unwrap().serving);
+    assert!(
+        m.has_feature(Feature::ExecStream),
+        "the direct runtime proves live output"
+    );
+    let sandbox = m.create(small).await.unwrap();
+    let on = |argv: &[&str], timeout_ms: u32| ExecRequest {
+        sandbox_id: sandbox.id.clone(),
+        ..exec("", argv, timeout_ms)
+    };
+
+    // A long command: a line every 100 ms for three seconds.
+    let started = Instant::now();
+    let mut stream = m
+        .exec_stream(
+            on(&["sh", "-c", "i=0; while [ $i -lt 30 ]; do echo line $i; i=$((i+1)); sleep 0.1; done; echo done >&2"], 60_000),
+            0,
+        )
+        .await
+        .unwrap();
+    let mut stdout = Vec::new();
+    let mut first_at = None;
+    let finished = loop {
+        match next(&mut stream.handle).await.expect("a final message") {
+            LiveEvent::Chunk {
+                stream: LiveStream::Stdout,
+                offset,
+                data,
+            } => {
+                first_at.get_or_insert_with(|| started.elapsed());
+                assert_eq!(offset, stdout.len() as u64);
+                stdout.extend_from_slice(&data);
+            }
+            LiveEvent::Chunk { .. } => {}
+            LiveEvent::Gap { .. } => panic!("a reading client lost live bytes"),
+            LiveEvent::Finished {
+                execution,
+                stdout: delivery,
+                ..
+            } => break ((*execution).unwrap(), delivery),
+        }
+    };
+    let total = started.elapsed();
+    let first = first_at.unwrap();
+    assert!(
+        first + Duration::from_millis(1500) < total,
+        "output did not arrive live: first chunk at {first:?}, finished at {total:?}"
+    );
+    let (execution, delivery) = finished;
+    assert_eq!(execution.state, ExecutionState::Exited, "{execution:?}");
+    assert_eq!(execution.mode, Some(ExecutionMode::Stream));
+    assert_eq!(execution, m.execution(&stream.execution_id).unwrap());
+    assert_eq!(stdout, execution.stdout.data);
+    assert_eq!(delivery.delivered_bytes, execution.stdout.total_bytes);
+    assert_eq!(
+        (delivery.dropped_bytes, delivery.dropped_bytes_known),
+        (0, true)
+    );
+    assert!(next(&mut stream.handle).await.is_none());
+    drop(stream);
+
+    // Nobody reads while the command writes 64 MiB as fast as it can.
+    let started = Instant::now();
+    let mut stream = m
+        .exec_stream(on(&["head", "-c", "67108864", "/dev/zero"], 60_000), 0)
+        .await
+        .unwrap();
+    let execution = loop {
+        let e = m.execution(&stream.execution_id).unwrap();
+        if e.state != ExecutionState::Running {
+            break e;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(45),
+            "a stalled stream slowed the command"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(execution.state, ExecutionState::Exited, "{execution:?}");
+    assert_eq!(execution.stdout.total_bytes, 64 << 20);
+    assert!(execution.stdout.total_bytes_known);
+    let mut accounted = 0u64;
+    let delivery = loop {
+        match next(&mut stream.handle).await.unwrap() {
+            LiveEvent::Chunk {
+                stream: LiveStream::Stdout,
+                offset,
+                data,
+            } => {
+                assert_eq!(offset, accounted);
+                accounted += data.len() as u64;
+            }
+            LiveEvent::Gap {
+                stream: LiveStream::Stdout,
+                offset,
+                dropped_bytes,
+                dropped_bytes_known,
+            } => {
+                assert_eq!(offset, accounted);
+                assert!(dropped_bytes_known);
+                accounted += dropped_bytes;
+            }
+            LiveEvent::Finished { stdout, .. } => break stdout,
+            _ => {}
+        }
+    };
+    assert_eq!(accounted, 64 << 20);
+    assert!(delivery.dropped_bytes > 0 && delivery.dropped_bytes_known);
+    drop(stream);
+
+    // A dropped stream cancels the real command, through the cleanup barrier.
+    let stream = m
+        .exec_stream(on(&["sleep", "30"], 60_000), 0)
+        .await
+        .unwrap();
+    let id = stream.execution_id.clone();
+    let backend_id = sandbox.backend_id.clone().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !exec_scope_populated(&backend_id) {
+        assert!(Instant::now() < deadline, "the command never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(stream);
+    let execution = loop {
+        let e = m.execution(&id).unwrap();
+        if e.state != ExecutionState::Running {
+            break e;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(execution.state, ExecutionState::Canceled, "{execution:?}");
+    assert_eq!(
+        execution.cancel_reason,
+        Some(CancelReason::ClientDisconnected)
+    );
+    assert_eq!(execution.sandbox_reusable, Some(true));
+    assert!(!exec_scope_populated(&backend_id));
+    let e = m.exec(on(&["true"], 10_000)).await.unwrap();
+    assert_eq!(e.state, ExecutionState::Exited);
+    assert_eq!(e.mode, Some(ExecutionMode::Unary));
+    m.delete(&sandbox.id).await.unwrap();
+}

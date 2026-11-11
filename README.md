@@ -65,7 +65,10 @@ code, the test suite and `CHANGELOG.md`.
   ([docs/architecture.md](docs/architecture.md#idempotent-create)). An Exec may name
   a working directory and environment overrides, over defaults the create set; history
   keeps the names and a hash, never the values
-  ([docs/architecture.md](docs/architecture.md#exec-cwd-and-env)).
+  ([docs/architecture.md](docs/architecture.md#exec-cwd-and-env)). `ExecStream` is
+  Exec with live output: lossy chunks with exact offsets and reported gaps, then the
+  stored execution, without ever slowing the command
+  ([docs/architecture.md](docs/architecture.md#execstream)).
 - **Runtime adapter trait** ([crates/kilnd/src/runtime/mod.rs](crates/kilnd/src/runtime/mod.rs)).
   The kiln implementation calls a private root helper, which runs the installed `kiln` CLI with argument vectors
   (never a shell), a cleared environment, timeouts and bounded output. kiln's

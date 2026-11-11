@@ -18,6 +18,10 @@ pub const MAX_STDIN: usize = 1 << 20;
 pub const MAX_OUTPUT: usize = 1 << 20;
 pub const MAX_ARGV: usize = 256 << 10;
 pub const MAX_GC_IDS: usize = 1024;
+/// A unary Exec's helper ceiling: one hour.
+pub const MAX_EXEC_MS: u32 = 3_600_000;
+/// A live (ExecStream) Exec's helper ceiling, decision 4: four hours.
+pub const MAX_LIVE_EXEC_MS: u32 = 14_400_000;
 /// The Firecracker group's own schema inside the v3 envelope.
 /// Group schema 2 (B7): helper-issued tokens, digests on Inspect, Remove and Gc, and
 /// the verified highest token on AttachInstance. Schema 1 daemons are refused.
@@ -71,6 +75,10 @@ pub enum KilnRequest {
         cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<EnvVar>,
+        /// ExecStream (design 5.1): a fourth descriptor, the live socket, and the
+        /// four-hour ceiling. Omitted when false, so unary requests are byte-identical.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        live: bool,
     },
     /// The exec features the installed CLI (`id: null`) or one sandbox's PID 1 proves
     /// now, and whether this helper can deliver exec options to it. New in M3b; an
@@ -104,11 +112,12 @@ impl Request {
                 return request.validate();
             }
         };
-        let exec = matches!(op, KilnRequest::Exec { .. });
-        if self.version != VERSION
-            || self.timeout_ms == 0
-            || self.timeout_ms > if exec { 3_600_000 } else { 120_000 }
-        {
+        let ceiling = match op {
+            KilnRequest::Exec { live: true, .. } => MAX_LIVE_EXEC_MS,
+            KilnRequest::Exec { .. } => MAX_EXEC_MS,
+            _ => 120_000,
+        };
+        if self.version != VERSION || self.timeout_ms == 0 || self.timeout_ms > ceiling {
             return Err("unsupported version or timeout".into());
         }
         if fds != 0 {
@@ -145,6 +154,7 @@ impl Request {
                 max_output,
                 cwd,
                 env,
+                live: _,
             } => {
                 if !crate::runtime::kiln_direct::valid_kiln_id(id)
                     || *stdin_bytes > MAX_STDIN
@@ -973,6 +983,10 @@ pub enum Response {
     Features {
         features: u32,
         exec_options: bool,
+        /// Whether this helper can carry ExecStream's live output (design 5.1). Omitted
+        /// when false, so the reply is byte-identical where it cannot.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        exec_stream: bool,
     },
     Error {
         error: WireError,

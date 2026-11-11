@@ -37,6 +37,7 @@ fn signal_number_is_uint32_in_generated_types_schema_and_wire() {
         cwd: None,
         env_names: Vec::new(),
         env_sha256: None,
+        mode: None,
         id: "ex-signal".into(),
         sandbox_id: "sb-signal".into(),
         argv: vec![],

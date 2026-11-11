@@ -19,6 +19,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use super::ExecSpec;
 use super::kiln_protocol::MAX_FRAME;
+use crate::live::{LiveStream, ReaderTap};
 use crate::model::Captured;
 use crate::process::{KilnArgs, KilnBinary, SAFE_PATH, prepare_child};
 
@@ -407,9 +408,26 @@ impl OwnedExec {
         let stderr_state = Arc::new(Mutex::new(StreamState::default()));
         let cli_stdout = Arc::new(Mutex::new(StreamState::default()));
         let cli_stderr = Arc::new(Mutex::new(StreamState::default()));
+        // ExecStream's tap sees only the command's own streams, after each read is
+        // counted and retained; the CLI's diagnostics are never live output.
+        let tap = |stream| {
+            spec.live
+                .clone()
+                .map(|tap| Arc::new(ReaderTap::new(tap, stream)))
+        };
         let readers = vec![
-            spawn_capture(stdout, spec.max_output, stdout_state.clone()),
-            spawn_capture(stderr, spec.max_output, stderr_state.clone()),
+            spawn_tapped_capture(
+                stdout,
+                spec.max_output,
+                stdout_state.clone(),
+                tap(LiveStream::Stdout),
+            ),
+            spawn_tapped_capture(
+                stderr,
+                spec.max_output,
+                stderr_state.clone(),
+                tap(LiveStream::Stderr),
+            ),
             spawn_capture(
                 child.stdout.take().expect("piped stdout"),
                 CLI_LIMIT,
@@ -592,15 +610,35 @@ fn spawn_capture<R: AsyncRead + Unpin + Send + 'static>(
     max: usize,
     state: Arc<Mutex<StreamState>>,
 ) -> AbortOnDropHandle<()> {
+    spawn_tapped_capture(pipe, max, state, None)
+}
+
+fn spawn_tapped_capture<R: AsyncRead + Unpin + Send + 'static>(
+    pipe: R,
+    max: usize,
+    state: Arc<Mutex<StreamState>>,
+    tap: Option<Arc<ReaderTap>>,
+) -> AbortOnDropHandle<()> {
     AbortOnDropHandle::new(tokio::spawn(async move {
-        if catch_poll(capture(pipe, max, &state)).await.is_err() {
+        if catch_poll(capture(pipe, max, &state, tap.as_deref()))
+            .await
+            .is_err()
+        {
             locked(&state).error = Some("capture reader panicked".into());
         }
     }))
 }
 
-async fn capture<R: AsyncRead + Unpin>(mut pipe: R, max: usize, state: &Mutex<StreamState>) {
-    let mut buf = [0; 16 * 1024];
+/// The largest single read, and so the largest live offer: one helper live message.
+pub const CAPTURE_READ_BYTES: usize = 16 * 1024;
+
+async fn capture<R: AsyncRead + Unpin>(
+    mut pipe: R,
+    max: usize,
+    state: &Mutex<StreamState>,
+    tap: Option<&ReaderTap>,
+) {
+    let mut buf = [0; CAPTURE_READ_BYTES];
     loop {
         match pipe.read(&mut buf).await {
             Ok(0) => {
@@ -610,11 +648,20 @@ async fn capture<R: AsyncRead + Unpin>(mut pipe: R, max: usize, state: &Mutex<St
                 return;
             }
             Ok(n) => {
-                let mut state = locked(state);
-                state.captured.total_bytes += n as u64;
-                let room = max.saturating_sub(state.captured.data.len());
-                state.captured.truncated |= n > room;
-                state.captured.data.extend_from_slice(&buf[..n.min(room)]);
+                let offset = {
+                    let mut state = locked(state);
+                    let offset = state.captured.total_bytes;
+                    state.captured.total_bytes += n as u64;
+                    let room = max.saturating_sub(state.captured.data.len());
+                    state.captured.truncated |= n > room;
+                    state.captured.data.extend_from_slice(&buf[..n.min(room)]);
+                    offset
+                };
+                // Counted and retained first; the tap only observes (design 5.1). It
+                // cannot fail, await or unwind into this reader.
+                if let Some(tap) = tap {
+                    tap.offer(offset, &buf[..n]);
+                }
             }
             Err(e) => {
                 locked(state).error = Some(e.to_string());
@@ -724,6 +771,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             deadline: Instant::now() + Duration::from_secs(10),
             max_output: 3,
             options: &crate::exec_options::ExecOptions::EMPTY,
+            live: None,
         };
         let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         assert!(matches!(
@@ -747,6 +795,101 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
         assert!(raw.stdout.eof && raw.stderr.eof);
     }
 
+    /// Records every offer; with `refuse` it counts and drops them.
+    #[derive(Default)]
+    struct TestTap {
+        refuse: bool,
+        panic: bool,
+        offers: std::sync::Mutex<Vec<(crate::live::LiveStream, u64, Vec<u8>)>>,
+    }
+
+    impl crate::live::LiveTap for TestTap {
+        fn offer(&self, stream: crate::live::LiveStream, offset: u64, bytes: &[u8]) {
+            assert!(!self.panic, "injected tap panic");
+            let kept = if self.refuse {
+                Vec::new()
+            } else {
+                bytes.to_vec()
+            };
+            self.offers.lock().unwrap().push((stream, offset, kept));
+        }
+    }
+
+    async fn run_tapped(bin: &std::path::Path, tap: Option<Arc<TestTap>>) -> RawResult {
+        let argv = vec!["ignored".into()];
+        let spec = ExecSpec {
+            argv: &argv,
+            stdin: b"",
+            deadline: Instant::now() + Duration::from_secs(10),
+            max_output: 1000,
+            options: &crate::exec_options::ExecOptions::EMPTY,
+            live: tap.map(|tap| tap as Arc<dyn crate::live::LiveTap>),
+        };
+        let mut owner =
+            OwnedExec::spawn(&KilnBinary::new(bin.to_path_buf()), "abcd", &spec).unwrap();
+        assert!(matches!(
+            wait_for_cli(&mut owner, spec.deadline, &CancellationToken::new()).await,
+            Stop::Exited
+        ));
+        owner.kill_reap().await.unwrap();
+        owner.settle().await
+    }
+
+    fn evidence(raw: &RawResult) -> Vec<(Captured, bool, Option<String>)> {
+        [&raw.stdout, &raw.stderr, &raw.cli_stdout, &raw.cli_stderr]
+            .into_iter()
+            .map(|s| (s.captured.clone(), s.eof, s.error.clone()))
+            .collect()
+    }
+
+    /// Design 5.1's required test: a tap that refuses everything, or panics, leaves the
+    /// capture evidence byte-identical to a capture without one. An accepting tap sees
+    /// exactly the command's bytes at the readers' offsets, at most one read each, and
+    /// never the CLI's own diagnostics.
+    #[tokio::test]
+    async fn a_refusing_or_panicking_live_tap_leaves_capture_evidence_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("kiln");
+        fixture(
+            &bin,
+            "data=bytes(range(256))*800\nfor i in range(0,len(data),7000):\n    os.write(OUT,data[i:i+7000])\n    os.write(ERR,data[i:i+3000])\nos.write(1,b'cli stdout')\nos.write(2,b'cli stderr')\nos.write(STATUS,EXIT125)\nsys.exit(125)",
+        );
+        let plain = evidence(&run_tapped(&bin, None).await);
+        for tap in [
+            TestTap {
+                refuse: true,
+                ..Default::default()
+            },
+            TestTap {
+                panic: true,
+                ..Default::default()
+            },
+        ] {
+            let tap = Arc::new(tap);
+            assert_eq!(evidence(&run_tapped(&bin, Some(tap.clone())).await), plain);
+        }
+        let tap = Arc::new(TestTap::default());
+        let raw = run_tapped(&bin, Some(tap.clone())).await;
+        assert_eq!(evidence(&raw), plain);
+        let offers = tap.offers.lock().unwrap();
+        for (stream, total) in [
+            (crate::live::LiveStream::Stdout, &raw.stdout),
+            (crate::live::LiveStream::Stderr, &raw.stderr),
+        ] {
+            let mut next = 0u64;
+            let mut seen = Vec::new();
+            for (_, offset, bytes) in offers.iter().filter(|(s, _, _)| *s == stream) {
+                assert_eq!(*offset, next, "offsets are the readers' own, gap-free");
+                assert!(bytes.len() <= CAPTURE_READ_BYTES);
+                next += bytes.len() as u64;
+                seen.extend_from_slice(bytes);
+            }
+            assert_eq!(next, total.captured.total_bytes);
+            assert_eq!(&seen[..1000], &total.captured.data[..]);
+        }
+        assert!(!offers.iter().any(|(_, _, b)| b.starts_with(b"cli ")));
+    }
+
     #[tokio::test]
     async fn readers_survive_cleanup_longer_than_generic_drain_grace() {
         let tmp = tempfile::tempdir().unwrap();
@@ -762,6 +905,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             deadline: Instant::now() + Duration::from_secs(10),
             max_output: 1024,
             options: &crate::exec_options::ExecOptions::EMPTY,
+            live: None,
         };
         let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         assert!(matches!(
@@ -870,6 +1014,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 100,
             options: &crate::exec_options::ExecOptions::EMPTY,
+            live: None,
         };
         let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         let pid = owner.child.id().unwrap();
@@ -904,6 +1049,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                 deadline: Instant::now() + Duration::from_secs(5),
                 max_output: 1024,
                 options: &crate::exec_options::ExecOptions::EMPTY,
+                live: None,
             };
             let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -950,6 +1096,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
             deadline: Instant::now() + Duration::from_secs(5),
             max_output: 3,
             options: &crate::exec_options::ExecOptions::EMPTY,
+            live: None,
         };
         let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
         assert!(matches!(
@@ -1026,6 +1173,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                                 deadline,
                                 max_output: 16,
                                 options: &crate::exec_options::ExecOptions::EMPTY,
+                                live: None,
                             };
                             let mut owner =
                                 OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec)
@@ -1093,6 +1241,7 @@ STATUS=fds['--status-fd']; IN=fds['--stdin-fd']; OUT=fds['--stdout-fd']; ERR=fds
                 deadline: Instant::now() + Duration::from_secs(5),
                 max_output: 3,
                 options: &crate::exec_options::ExecOptions::EMPTY,
+                live: None,
             };
             let mut owner = OwnedExec::spawn(&KilnBinary::new(bin.clone()), "abcd", &spec).unwrap();
             let _ = wait_for_cli(&mut owner, spec.deadline, &CancellationToken::new()).await;

@@ -46,6 +46,9 @@ pub struct ExecSpec<'a> {
     pub max_output: usize,
     /// The cwd and effective env overrides; `ExecOptions::EMPTY` is today's operation 4.
     pub options: &'a crate::exec_options::ExecOptions,
+    /// ExecStream's live tap (design 5.1); `None` for every unary execution. The capture
+    /// readers offer each read to it after counting it, and it can never block them.
+    pub live: Option<std::sync::Arc<dyn crate::live::LiveTap>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

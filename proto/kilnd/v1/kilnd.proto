@@ -79,6 +79,25 @@ service KilndService {
   // other state fails FAILED_PRECONDITION with a kilnd-reason trailer. Needs
   // FEATURE_SANDBOX_EXPIRY; an older daemon answers UNIMPLEMENTED.
   rpc RenewSandbox(RenewSandboxRequest) returns (RenewSandboxResponse);
+
+  // Exec with live output (FEATURE_EXEC_STREAM). The same validation, feature gates,
+  // sandbox checks, admission and execution row as Exec, in the same order, plus a
+  // stream permit: at most max_exec_streams on the node and fewer per uid, else
+  // RESOURCE_EXHAUSTED exec_stream_limit. Every refusal before the execution row is
+  // an RPC error with no message sent, and nothing was allocated; a backend without
+  // live output fails UNIMPLEMENTED backend_unsupported:exec_stream. Once the row
+  // exists the stream carries ExecStarted (seq 0), then OutputChunk and OutputGap
+  // messages, then exactly one ExecFinished, whose execution equals GetExecution for
+  // that ID. Live output is lossy and never slows the command: a client that stops
+  // reading loses live bytes, reported as gaps, and the command still finishes on
+  // time. Closing the stream before ExecFinished is a disconnect and cancels the
+  // execution (CANCEL_REASON_CLIENT_DISCONNECTED), as for Exec; its final state is
+  // readable with GetExecution. timeout_ms uses the stream limits
+  // (ApiLimits.default_stream_timeout_ms and max_stream_timeout_ms) and includes
+  // queueing. Set no gRPC deadline, or one longer than timeout_ms plus cleanup: a
+  // transport deadline is a disconnect. A daemon crash ends the stream without
+  // ExecFinished; after restart the execution is INTERRUPTED.
+  rpc ExecStream(ExecStreamRequest) returns (stream ExecStreamResponse);
 }
 
 message HealthRequest {}
@@ -262,7 +281,11 @@ message AdmissionStats {
   uint64 rejected_stdin = 15;
   uint64 max_queued_execs_per_sandbox = 16;
   uint64 rejected_sandbox_execs = 17;
-  // Fields 18-20 are reserved for ExecStream admission.
+  // ExecStream permits (FEATURE_EXEC_STREAM): the node cap, streams admitted now and
+  // streams refused exec_stream_limit since startup.
+  uint64 max_exec_streams = 18;
+  uint64 current_exec_streams = 19;
+  uint64 rejected_exec_streams = 20;
   // Retained create request records (FEATURE_IDEMPOTENT_CREATE): the node cap and
   // count, the per-uid cap and the calling uid's own count, and keyed creates
   // refused request_id_quota since startup.
@@ -656,6 +679,14 @@ message Execution {
   string env_sha256 = 19;
   // Why a CANCELED execution was canceled; unspecified otherwise and on history.
   CancelReason cancel_reason = 20;
+  // How it was requested; unspecified on executions recorded before ExecStream.
+  ExecutionMode mode = 21;
+}
+
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_UNARY = 1;
+  EXECUTION_MODE_STREAM = 2;
 }
 
 enum CancelReason {
@@ -719,4 +750,76 @@ message RuntimeDiagnostic {
   string message = 3;
   optional string native_code = 4;
   bool message_truncated = 5;
+}
+
+// ---- ExecStream (FEATURE_EXEC_STREAM) ----
+
+message ExecStreamRequest {
+  // An ordinary Exec request. timeout_ms is checked against the stream limits; zero
+  // is the stream default. Stream-only options get their own fields here.
+  ExecRequest exec = 1;
+}
+
+enum OutputStream {
+  OUTPUT_STREAM_UNSPECIFIED = 0;
+  OUTPUT_STREAM_STDOUT = 1;
+  OUTPUT_STREAM_STDERR = 2;
+}
+
+message ExecStreamResponse {
+  // 0, 1, 2, ... over every message of the stream, with no gaps: bytes may be lost,
+  // messages never are.
+  uint64 seq = 1;
+  oneof event {
+    // Always first, seq 0.
+    ExecStarted started = 2;
+    OutputChunk chunk = 3;
+    OutputGap gap = 4;
+    // Exactly once, last.
+    ExecFinished finished = 5;
+  }
+}
+
+message ExecStarted {
+  string execution_id = 1;
+  string sandbox_id = 2;
+  int64 started_at_unix_ms = 3;
+  uint32 timeout_ms = 4;
+}
+
+// Live bytes of one stream: at most ApiLimits.stream_chunk_bytes, starting at offset
+// (0-based, as the capture reader observed the stream). Bytes at offsets below the
+// retained length are also in the final Output.data.
+message OutputChunk {
+  OutputStream stream = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+}
+
+// Bytes from offset that were not delivered live. A gap is always reported before the
+// next chunk of its stream; interior gaps are exact. A tail gap (after the last chunk)
+// comes after capture settles: exact only when the final Output.total_bytes_known is
+// true, otherwise dropped_bytes is a lower bound and dropped_bytes_known is false.
+message OutputGap {
+  OutputStream stream = 1;
+  uint64 offset = 2;
+  uint64 dropped_bytes = 3;
+  bool dropped_bytes_known = 4;
+}
+
+// One stream's live delivery: bytes delivered, bytes reported in gaps, and whether
+// that count is exact.
+message LiveDelivery {
+  uint64 delivered_bytes = 1;
+  uint64 dropped_bytes = 2;
+  bool dropped_bytes_known = 3;
+}
+
+message ExecFinished {
+  // The stored execution, read after terminal publication: equal to GetExecution for
+  // this ID, field for field, including cwd, env_names, env_sha256, cancel_reason,
+  // mode and both retained outputs.
+  Execution execution = 1;
+  LiveDelivery stdout = 2;
+  LiveDelivery stderr = 3;
 }

@@ -1042,6 +1042,7 @@ async fn exec_refuses_a_sandbox_that_left_ready_before_its_row() {
         cwd: None,
         env_names: Vec::new(),
         env_sha256: None,
+        mode: None,
     };
     assert!(
         m.store
@@ -1372,6 +1373,7 @@ fn running_execution(sandbox_id: &str) -> Execution {
         cwd: None,
         env_names: Vec::new(),
         env_sha256: None,
+        mode: None,
     }
 }
 

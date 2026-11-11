@@ -334,6 +334,7 @@ fn metadata_history_rss_child() {
             cwd: None,
             env_names: Vec::new(),
             env_sha256: None,
+            mode: None,
         };
         store.insert_execution(&execution).unwrap();
         store
@@ -786,5 +787,449 @@ async fn admission_resource_bounds_plateau_and_recover() {
     assert!(
         (1..=2).contains(&version_calls),
         "concurrent Health calls did not share one probe per cache miss: {version_calls} calls"
+    );
+}
+
+// ---- ExecStream (API additions design 5.1 and 8): the dedicated-child stream phase ----
+
+const STREAM_DAEMON_ENV: &str = "KILND_EXEC_STREAM_STRESS_DAEMON";
+const STREAM_CLIENT_ENV: &str = "KILND_EXEC_STREAM_STRESS_CLIENT";
+const STREAM_ROOT_ENV: &str = "KILND_EXEC_STREAM_STRESS_ROOT";
+/// The socket's group, and the numeric uids of the two holders and the observer. No
+/// accounts are made; the kernel's credentials are all that admission sees.
+const STREAM_GID: u32 = 61_000;
+const STREAM_UIDS: [u32; 3] = [61_001, 61_002, 61_003];
+const STREAM_FLOOD_MS: u64 = 3_000;
+
+fn stream_limits() -> Limits {
+    Limits {
+        max_sandboxes: 40,
+        max_node_memory_bytes: 1 << 40,
+        max_node_pids: 1 << 20,
+        max_node_disk_bytes: 1 << 50,
+        // The defaults that matter here: 16 streams on the node, 8 per uid, 32 Exec
+        // tickets and a 256 KiB live queue each.
+        ..Limits::default()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "Linux child harness; run the parent ExecStream resource test"]
+async fn exec_stream_stress_daemon() {
+    if std::env::var_os(STREAM_DAEMON_ENV).is_none() {
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os(STREAM_ROOT_ENV).unwrap());
+    let fake = FakeRuntime::default();
+    fake.state().proven_features = Ok(vec![kilnd::manager::Feature::ExecStream]);
+    let manager = Arc::new(Manager::new(
+        fake,
+        Store::open(&root.join("state")).unwrap(),
+        stream_limits(),
+    ));
+    let socket = kilnd::server::bind(&root.join("run/kilnd.sock"), Some(STREAM_GID))
+        .await
+        .unwrap();
+    std::fs::write(root.join("ready"), b"").unwrap();
+    let stop = root.join("stop");
+    let shutdown = async {
+        while !stop.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    kilnd::server::serve(manager, socket, shutdown, Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+async fn stream_client(socket: PathBuf, window: u32) -> KilndServiceClient<Channel> {
+    let channel = Endpoint::try_from("http://kilnd.invalid")
+        .unwrap()
+        .initial_stream_window_size(window)
+        .initial_connection_window_size(window)
+        .http2_adaptive_window(false)
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let path = socket.clone();
+            async move { Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(path).await?)) }
+        }))
+        .await
+        .unwrap();
+    KilndServiceClient::new(channel).max_decoding_message_size(8 << 20)
+}
+
+async fn own_sandbox(client: &mut KilndServiceClient<Channel>) -> String {
+    client
+        .create_sandbox(pb::CreateSandboxRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap()
+        .id
+}
+
+fn stream_request(sandbox_id: &str, argv: &[&str]) -> pb::ExecStreamRequest {
+    pb::ExecStreamRequest {
+        exec: Some(pb::ExecRequest {
+            sandbox_id: sandbox_id.into(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            timeout_ms: 60_000,
+            ..Default::default()
+        }),
+    }
+}
+
+fn limit_reason(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::ResourceExhausted
+        && status
+            .metadata()
+            .get("kilnd-reason")
+            .is_some_and(|v| v.to_str().unwrap() == "exec_stream_limit")
+}
+
+/// One client process under its own uid. `hold` opens 8 streams that never read past
+/// `ExecStarted` while the command floods, checks a ninth is refused for its uid's share,
+/// and holds them until released; `probe` checks that with the node's streams all held,
+/// its Health and a unary Exec still get through and its stream is refused.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "Linux child harness; run the parent ExecStream resource test"]
+async fn exec_stream_stress_client() {
+    let Some(role) = std::env::var_os(STREAM_CLIENT_ENV) else {
+        return;
+    };
+    let root = PathBuf::from(std::env::var_os(STREAM_ROOT_ENV).unwrap());
+    let socket = root.join("run/kilnd.sock");
+    let uid = unsafe { libc::geteuid() };
+    let mut control = stream_client(socket.clone(), 1 << 20).await;
+    match role.to_str().unwrap() {
+        "hold" => {
+            let mut sandboxes = Vec::new();
+            for _ in 0..9 {
+                sandboxes.push(own_sandbox(&mut control).await);
+            }
+            // One connection, eight HTTP/2 streams, 64 KiB of window for all of them.
+            let stalled = stream_client(socket.clone(), 64 * 1024).await;
+            let flood = STREAM_FLOOD_MS.to_string();
+            let mut held = Vec::new();
+            let mut ids = Vec::new();
+            for sandbox in &sandboxes[..8] {
+                let mut stream = stalled
+                    .clone()
+                    .exec_stream(stream_request(sandbox, &["flood", &flood]))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let first = stream.message().await.unwrap().unwrap();
+                let Some(pb::exec_stream_response::Event::Started(started)) = first.event else {
+                    panic!("no ExecStarted");
+                };
+                ids.push(started.execution_id);
+                held.push(stream);
+            }
+            let status = control
+                .exec_stream(stream_request(&sandboxes[8], &["true"]))
+                .await
+                .map(drop)
+                .expect_err("a ninth stream for one uid");
+            assert!(limit_reason(&status), "{status:?}");
+            std::fs::write(root.join(format!("clients/held-{uid}")), ids.join("\n")).unwrap();
+            let release = root.join("clients/release");
+            while !release.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(held);
+        }
+        "probe" => {
+            let sandbox = own_sandbox(&mut control).await;
+            let health = control
+                .health(pb::HealthRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(health.status, pb::health_response::Status::Serving as i32);
+            assert_eq!(health.admission.unwrap().current_exec_streams, 16);
+            let status = control
+                .exec_stream(stream_request(&sandbox, &["true"]))
+                .await
+                .map(drop)
+                .expect_err("the node's streams are all held");
+            assert!(limit_reason(&status), "{status:?}");
+            let execution = control
+                .exec(pb::ExecRequest {
+                    sandbox_id: sandbox,
+                    argv: vec!["echo".into(), "through".into()],
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .execution
+                .unwrap();
+            assert_eq!(execution.exit_code, Some(0));
+            assert_eq!(execution.stdout.unwrap().data, b"through\n");
+            std::fs::write(root.join(format!("clients/probe-{uid}")), b"ok").unwrap();
+        }
+        other => panic!("unknown client role {other}"),
+    }
+}
+
+fn spawn_stream_child(
+    exe: &Path,
+    test: &str,
+    root: &Path,
+    env: (&str, &str),
+    uid: Option<u32>,
+) -> ChildGuard {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(exe);
+    command
+        .args(["--ignored", "--exact", test, "--nocapture"])
+        .env(env.0, env.1)
+        .env(STREAM_ROOT_ENV, root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(uid) = uid {
+        // SAFETY: only async-signal-safe credential calls run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setgid(STREAM_GID) != 0
+                    || libc::setuid(uid) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    ChildGuard(Some(command.spawn().unwrap()))
+}
+
+async fn wait_child(child: &mut ChildGuard, what: &str) {
+    let status = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what} did not finish"));
+    child.0.take();
+    assert!(status.success(), "{what} failed: {status}");
+}
+
+async fn stream_admission(observer: &KilndServiceClient<Channel>) -> pb::AdmissionStats {
+    observer
+        .clone()
+        .health(pb::HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .admission
+        .unwrap()
+}
+
+/// Design 8's `admission_stress` stream phase, as root so clients can hold distinct
+/// uids: 16 streams with non-reading clients while the commands write at full rate.
+/// The commands finish on time, every permit is back at handoff while the clients still
+/// hold their unread streams, RSS grows by at most 16 x (buffer + 2.07 MiB) + 16 MiB,
+/// descriptors return to their baseline, and another uid's Health and unary Exec get
+/// through while every stream is held.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "Linux /proc stress as root; run scripts/integration-test.sh in the VM"]
+async fn exec_stream_resources_bound_and_recover() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("SKIPPED exec_stream_resources_bound_and_recover: needs root for client uids");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir(root.join("clients")).unwrap();
+    std::fs::set_permissions(root.join("clients"), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let daemon = spawn_stream_child(
+        &exe,
+        "exec_stream_stress_daemon",
+        &root,
+        (STREAM_DAEMON_ENV, "1"),
+        None,
+    );
+    wait_for(&root.join("ready"), "stream daemon").await;
+    let pid = daemon.pid();
+    let observer = connect_client(root.join("run/kilnd.sock")).await;
+    assert_eq!(
+        observer
+            .clone()
+            .health(pb::HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .status,
+        pb::health_response::Status::Serving as i32
+    );
+    let execution_state = |id: String| {
+        let observer = observer.clone();
+        async move {
+            observer
+                .clone()
+                .get_execution(pb::GetExecutionRequest { id })
+                .await
+                .unwrap()
+                .into_inner()
+                .execution
+                .unwrap()
+        }
+    };
+    let held_ids = |uid: u32| -> Vec<String> {
+        std::fs::read_to_string(root.join(format!("clients/held-{uid}")))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    // A warm-up round: one uid's eight streams, run to the end and released.
+    {
+        let mut holder = spawn_stream_child(
+            &exe,
+            "exec_stream_stress_client",
+            &root,
+            (STREAM_CLIENT_ENV, "hold"),
+            Some(STREAM_UIDS[0]),
+        );
+        wait_for(
+            &root.join(format!("clients/held-{}", STREAM_UIDS[0])),
+            "warm-up streams",
+        )
+        .await;
+        for id in held_ids(STREAM_UIDS[0]) {
+            while execution_state(id.clone()).await.state == pb::ExecutionState::Running as i32 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        std::fs::write(root.join("clients/release"), b"").unwrap();
+        wait_child(&mut holder, "warm-up holder").await;
+        std::fs::remove_file(root.join("clients/release")).unwrap();
+        std::fs::remove_file(root.join(format!("clients/held-{}", STREAM_UIDS[0]))).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let baseline_fds = fd_count(pid);
+    let baseline_rss = rss_bytes(pid);
+
+    let started = std::time::Instant::now();
+    let mut holders: Vec<ChildGuard> = STREAM_UIDS[..2]
+        .iter()
+        .map(|uid| {
+            spawn_stream_child(
+                &exe,
+                "exec_stream_stress_client",
+                &root,
+                (STREAM_CLIENT_ENV, "hold"),
+                Some(*uid),
+            )
+        })
+        .collect();
+    let mut peak_rss = baseline_rss;
+    let mut peak_fds = baseline_fds;
+    for uid in &STREAM_UIDS[..2] {
+        let held = root.join(format!("clients/held-{uid}"));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !held.exists() {
+                peak_rss = peak_rss.max(rss_bytes(pid));
+                peak_fds = peak_fds.max(fd_count(pid));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("streams were not admitted");
+    }
+    let admission = stream_admission(&observer).await;
+    assert_eq!(
+        (admission.max_exec_streams, admission.current_exec_streams),
+        (16, 16)
+    );
+    // Another uid, while every stream is held.
+    let mut probe = spawn_stream_child(
+        &exe,
+        "exec_stream_stress_client",
+        &root,
+        (STREAM_CLIENT_ENV, "probe"),
+        Some(STREAM_UIDS[2]),
+    );
+    wait_child(&mut probe, "the other uid's probe").await;
+    // The commands finish on time with nobody reading.
+    let ids: Vec<String> = STREAM_UIDS[..2]
+        .iter()
+        .flat_map(|uid| held_ids(*uid))
+        .collect();
+    assert_eq!(ids.len(), 16);
+    for id in &ids {
+        loop {
+            peak_rss = peak_rss.max(rss_bytes(pid));
+            peak_fds = peak_fds.max(fd_count(pid));
+            let execution = execution_state(id.clone()).await;
+            if execution.state != pb::ExecutionState::Running as i32 {
+                assert_eq!(execution.state, pb::ExecutionState::Exited as i32, "{id}");
+                assert!(execution.stdout.unwrap().total_bytes_known);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(STREAM_FLOOD_MS) + Duration::from_secs(15),
+        "stalled clients slowed the commands: {elapsed:?}"
+    );
+    // Every permit is back while the clients still hold their unread streams.
+    let admission = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let a = stream_admission(&observer).await;
+            if a.current_exec_streams == 0 && a.current_execs == 0 {
+                break a;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("permits were not released at handoff");
+    assert!(admission.rejected_exec_streams >= 3);
+    peak_rss = peak_rss.max(rss_bytes(pid));
+    let buffer = 256 << 10;
+    let final_message = 2 * (1 << 20) + (64 << 10);
+    let bound = 16 * (buffer + final_message) + (16 << 20);
+    assert!(
+        peak_rss <= baseline_rss + bound,
+        "stream RSS exceeded its bound: baseline={baseline_rss} peak={peak_rss} bound={bound}"
+    );
+    // At most one extra descriptor per stream on the daemon side, plus the connections.
+    assert!(
+        peak_fds <= baseline_fds + 16 + 8,
+        "stream descriptors exceeded their bound: baseline={baseline_fds} peak={peak_fds}"
+    );
+    std::fs::write(root.join("clients/release"), b"").unwrap();
+    for (holder, uid) in holders.iter_mut().zip(STREAM_UIDS) {
+        wait_child(holder, &format!("holder {uid}")).await;
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fd_count(pid) > baseline_fds {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "descriptors did not return to their baseline: {} > {baseline_fds}",
+            fd_count(pid)
+        )
+    });
+    drop(observer);
+    std::fs::write(root.join("stop"), b"").unwrap();
+    daemon.wait_success().await;
+    println!(
+        "exec stream stress: baseline_rss={baseline_rss} peak_rss={peak_rss} bound={bound} baseline_fds={baseline_fds} peak_fds={peak_fds} elapsed={elapsed:?}"
     );
 }

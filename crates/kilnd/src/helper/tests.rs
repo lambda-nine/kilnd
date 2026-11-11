@@ -102,6 +102,7 @@ fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
         argv: vec!["sh\0".into()],
         stdin_bytes: 0,
         max_output: 1,
+        live: false,
     });
     assert!(req.validate(0).is_err());
     req.operation = Operation::Kiln(KilnRequest::Exec {
@@ -111,6 +112,7 @@ fn typed_requests_reject_unknown_fields_and_validate_before_dispatch() {
         argv: vec!["true".into()],
         stdin_bytes: 32,
         max_output: 1024,
+        live: false,
     });
     assert!(req.validate(0).is_ok());
     assert!(req.validate(3).is_err());
@@ -176,6 +178,7 @@ async fn received_peer_flag_mutation_cannot_stall_listener_or_deadline() {
             argv: vec!["true".into()],
             stdin_bytes: 32,
             max_output: 1024,
+            live: false,
             cwd: None,
             env: Vec::new(),
         }),
@@ -412,6 +415,7 @@ sys.exit(125)
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
         max_output: 64,
         options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+        live: None,
     };
     let outcome = tokio::time::timeout(
         Duration::from_secs(8),
@@ -445,6 +449,7 @@ async fn pre_canceled_or_expired_exec_never_connects_to_helper() {
         deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         max_output: 1024,
         options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+        live: None,
     };
     let result = client.exec("abcd", &spec, &cancel).await;
     assert_eq!(result.finish, Ok(ExecFinish::Canceled));
@@ -482,6 +487,7 @@ async fn an_unconfirmed_helper_exec_quarantines_the_sandbox() {
         deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         max_output: 1024,
         options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+        live: None,
     };
     let result = client
         .exec("abcd", &spec, &tokio_util::sync::CancellationToken::new())
@@ -804,6 +810,7 @@ async fn b6_firecracker_exec_carries_stdio_and_keeps_a_completed_session_reusabl
         deadline: tokio::time::Instant::now() + Duration::from_secs(10),
         max_output: 1024,
         options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+        live: None,
     };
     let request = fc_exec_request();
     let outcome = client
@@ -869,6 +876,7 @@ async fn b6_a_timed_out_firecracker_exec_retires_the_session_with_host_proof() {
         deadline: tokio::time::Instant::now() + Duration::from_secs(10),
         max_output: 1024,
         options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+        live: None,
     };
     let outcome = client
         .firecracker_exec(
@@ -895,6 +903,7 @@ fn b6_firecracker_replies_are_reusable_only_with_their_own_evidence() {
         deadline: tokio::time::Instant::now() + Duration::from_secs(10),
         max_output: 8,
         options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+        live: None,
     };
     let cancel = tokio_util::sync::CancellationToken::new();
     let reply = |reusable, cleanup| ExecReply {
@@ -989,6 +998,7 @@ async fn b6_an_unconfirmed_firecracker_exec_quarantines_the_sandbox() {
         deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         max_output: 1024,
         options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+        live: None,
     };
     let outcome = client
         .firecracker_exec(
@@ -1022,6 +1032,7 @@ mod exec_options {
                 argv: vec!["true".into()],
                 stdin_bytes: 0,
                 max_output: 1,
+                live: false,
                 cwd: cwd.map(Into::into),
                 env,
             }),
@@ -1065,7 +1076,8 @@ mod exec_options {
         assert_eq!(
             serde_json::to_string(&Response::Features {
                 features: 0x3f,
-                exec_options: true
+                exec_options: true,
+                exec_stream: false,
             })
             .unwrap(),
             r#"{"features":{"features":63,"exec_options":true}}"#
@@ -1127,5 +1139,263 @@ mod exec_options {
         let debug = format!("{request:?}");
         assert!(debug.contains("TOKEN") && debug.contains("/w"), "{debug}");
         assert!(!debug.contains("CANARY"), "{debug}");
+    }
+}
+
+/// ExecStream's helper surface (API additions design 5.1): the `live` flag, its fourth
+/// descriptor, its four-hour ceiling and the features probe's `exec_stream`.
+mod live_channel {
+    use super::*;
+
+    fn live_exec(live: bool, timeout_ms: u32) -> Request {
+        Request {
+            version: VERSION,
+            timeout_ms,
+            deadline_ns: 5,
+            operation: Operation::Kiln(KilnRequest::Exec {
+                id: "abcd".into(),
+                argv: vec!["true".into()],
+                stdin_bytes: 0,
+                max_output: 1,
+                cwd: None,
+                env: Vec::new(),
+                live,
+            }),
+        }
+    }
+
+    #[test]
+    fn live_is_omitted_when_false_and_raises_only_its_own_ceiling() {
+        assert_eq!(
+            serde_json::to_string(&live_exec(false, 1000)).unwrap(),
+            r#"{"version":3,"timeout_ms":1000,"deadline_ns":5,"operation":{"kiln":{"exec":{"id":"abcd","argv":["true"],"stdin_bytes":0,"max_output":1}}}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&live_exec(true, 1000)).unwrap(),
+            r#"{"version":3,"timeout_ms":1000,"deadline_ns":5,"operation":{"kiln":{"exec":{"id":"abcd","argv":["true"],"stdin_bytes":0,"max_output":1,"live":true}}}}"#
+        );
+        // Decision 4: a unary exec keeps its hour; a live one may run four.
+        assert!(live_exec(false, MAX_EXEC_MS).validate(0).is_ok());
+        assert!(live_exec(false, MAX_EXEC_MS + 1).validate(0).is_err());
+        assert!(live_exec(true, MAX_EXEC_MS + 1).validate(0).is_ok());
+        assert!(live_exec(true, MAX_LIVE_EXEC_MS).validate(0).is_ok());
+        assert!(live_exec(true, MAX_LIVE_EXEC_MS + 1).validate(0).is_err());
+        assert_eq!(MAX_LIVE_EXEC_MS, 4 * 3600 * 1000);
+        // A caller-supplied descriptor is still refused.
+        assert!(live_exec(true, 1000).validate(1).is_err());
+        assert_eq!(
+            serde_json::to_string(&Response::Features {
+                features: 0x3f,
+                exec_options: true,
+                exec_stream: true,
+            })
+            .unwrap(),
+            r#"{"features":{"features":63,"exec_options":true,"exec_stream":true}}"#
+        );
+        let old: Response =
+            serde_json::from_str(r#"{"features":{"features":63,"exec_options":true}}"#).unwrap();
+        assert!(matches!(
+            old,
+            Response::Features {
+                exec_stream: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("kiln");
+        std::fs::write(&bin, format!(r#"#!/usr/bin/python3
+import os,sys,socket,time
+CAPS=bytes.fromhex('4b494c4e45584f00010002001d0000001f000000010001000500080000000000302e312e306769742074657374')
+STATUS=bytes.fromhex('4b494c4e45584f000100010018000000010102007d00000000000000000000000000000000000000')
+if sys.argv[1]=='capabilities':
+    os.write(1,CAPS); sys.exit(0)
+if sys.argv[1:]==['gc','--help']:
+    print('Usage: kiln gc [ID]...'); sys.exit(0)
+fds={{a.split('=')[0]:int(a.split('=')[1]) for a in sys.argv[2:7]}}
+OUT=fds['--stdout-fd']; ERR=fds['--stderr-fd']
+{body}
+os.write(fds['--status-fd'],STATUS)
+sys.exit(125)
+"#)).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<(crate::exec_stream::LiveStream, u64, Vec<u8>)>>);
+
+    #[cfg(target_os = "linux")]
+    impl crate::exec_stream::LiveTap for Recording {
+        fn offer(&self, stream: crate::exec_stream::LiveStream, offset: u64, bytes: &[u8]) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((stream, offset, bytes.to_vec()));
+        }
+    }
+
+    /// The real helper's live path: the command's bytes reach kilnd's tap at the capture
+    /// readers' offsets, while the unary prefix transfer and totals are unchanged.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_live_exec_delivers_offsets_and_keeps_the_authoritative_prefix() {
+        use crate::exec_stream::LiveStream;
+        use crate::runtime::{ExecFinish, ExecSpec};
+        let temp = tempfile::tempdir().unwrap();
+        let bin = fixture(
+            temp.path(),
+            "for i in range(20):\n    os.write(OUT,bytes([i])*5000)\n    os.write(ERR,b'e%d' % i)\n    time.sleep(0.005)",
+        );
+        let path = temp.path().join("helper.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(serve(listener, uid, bin, stop.clone()));
+        let client = Client {
+            path,
+            expected_uid: uid,
+        };
+        let recording = std::sync::Arc::new(Recording::default());
+        let argv = vec!["ignored".into()];
+        let spec = ExecSpec {
+            argv: &argv,
+            stdin: b"",
+            deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+            max_output: 1000,
+            options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+            live: Some(recording.clone()),
+        };
+        let outcome = client
+            .exec("abcd", &spec, &tokio_util::sync::CancellationToken::new())
+            .await;
+        assert_eq!(outcome.finish, Ok(ExecFinish::Completed));
+        assert_eq!(outcome.stdout.total_bytes, 100_000);
+        assert!(outcome.stdout.total_bytes_known && outcome.stdout.truncated());
+        assert_eq!(outcome.stdout.data.len(), 1000);
+        let seen = recording.0.lock().unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        for (stream, offset, bytes) in seen.iter() {
+            let into = if *stream == LiveStream::Stdout {
+                &mut stdout
+            } else {
+                &mut stderr
+            };
+            // Nothing reads slowly here, so nothing was dropped.
+            assert_eq!(*offset, into.len() as u64);
+            into.extend_from_slice(bytes);
+        }
+        let expected: Vec<u8> = (0..20u8).flat_map(|i| [i; 5000]).collect();
+        assert_eq!(stdout, expected);
+        assert_eq!(&stdout[..1000], &outcome.stdout.data[..]);
+        assert_eq!(stderr.len() as u64, outcome.stderr.total_bytes);
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// Design 8: a helper that dies after an EAGAIN drop and before settlement. The
+    /// interior gap is exact by offsets, but the capture total is not known, so the
+    /// tail gap and the stream's delivery say `dropped_bytes_known = false`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_helper_that_dies_after_a_drop_leaves_the_tail_unknown() {
+        use crate::exec_stream::{CaptureTotal, LiveEvent, LiveQueue, LiveStream, StreamFinal};
+        use crate::runtime::ExecSpec;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("helper.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let helper = tokio::spawn(async move {
+            let (control, _) = listener.accept().await.unwrap();
+            assert!(fds::receive(&control).await.unwrap().is_empty());
+            let mut control = socket::Socket(control);
+            let _request = super::super::read_frame_bytes(&mut control).await.unwrap();
+            let (input, input_peer) = UnixStream::pair().unwrap();
+            let (output, output_peer) = UnixStream::pair().unwrap();
+            let (error, error_peer) = UnixStream::pair().unwrap();
+            let (sender, receiver) = live::pair().unwrap();
+            fds::send(
+                &control.0,
+                &[
+                    input_peer.as_raw_fd(),
+                    output_peer.as_raw_fd(),
+                    error_peer.as_raw_fd(),
+                    receiver.as_raw_fd(),
+                ],
+            )
+            .await
+            .unwrap();
+            use tokio::io::AsyncReadExt;
+            assert_eq!(control.read_u8().await.unwrap(), STDIO_RECEIVED);
+            let sender = live::LiveSender::new(sender);
+            use crate::exec_stream::LiveTap;
+            sender.offer(LiveStream::Stdout, 0, b"0123456789");
+            // Bytes 10..30 were dropped on EAGAIN.
+            sender.offer(LiveStream::Stdout, 30, b"abc");
+            let mut output = output;
+            output.write_all(b"0123456789").await.unwrap();
+            // The helper dies: no reply, no EOF on purpose, every descriptor closed.
+            drop((control, input, output, error, sender));
+        });
+        let client = Client {
+            path,
+            expected_uid: uid,
+        };
+        let queue = LiveQueue::new(Default::default());
+        let mut handle = queue.handle();
+        let argv = vec!["ignored".into()];
+        let spec = ExecSpec {
+            argv: &argv,
+            stdin: b"",
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            max_output: 1000,
+            options: &kilnd_exec_core::exec_options::ExecOptions::EMPTY,
+            live: Some(queue.clone()),
+        };
+        let outcome = client
+            .exec("abcd", &spec, &tokio_util::sync::CancellationToken::new())
+            .await;
+        helper.await.unwrap();
+        assert!(outcome.finish.is_err());
+        assert!(!outcome.stdout.total_bytes_known);
+        let total = |c: &crate::model::Captured| CaptureTotal {
+            total_bytes: c.total_bytes,
+            known: c.total_bytes_known,
+        };
+        queue.finish(StreamFinal {
+            execution: Err(crate::manager::Error::NotFound("test".into())),
+            stdout: total(&outcome.stdout),
+            stderr: total(&outcome.stderr),
+        });
+        let mut events = Vec::new();
+        while let Some(event) = std::future::poll_fn(|cx| handle.poll_event(cx)).await {
+            events.push(event);
+        }
+        let gaps: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                LiveEvent::Gap {
+                    stream: LiveStream::Stdout,
+                    offset,
+                    dropped_bytes,
+                    dropped_bytes_known,
+                } => Some((*offset, *dropped_bytes, *dropped_bytes_known)),
+                _ => None,
+            })
+            .collect();
+        // The interior gap is exact; the tail after byte 33 is not known.
+        assert_eq!(gaps[0], (10, 20, true));
+        assert_eq!(gaps[1].0, 33);
+        assert!(!gaps[1].2);
+        let Some(LiveEvent::Finished { stdout, .. }) = events.last() else {
+            panic!("no final message");
+        };
+        assert_eq!(stdout.delivered_bytes, 13);
+        assert!(!stdout.dropped_bytes_known);
     }
 }

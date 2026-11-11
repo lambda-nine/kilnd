@@ -27,7 +27,7 @@ including on rejection. No caller-selected fd is used for root I/O.
 
 After validating the request, the helper sends its own `0x4b` envelope: zero
 descriptors for other operations, exactly three for Exec in stdin/stdout/stderr
-order. The helper creates three anonymous connected AF_UNIX SOCK_STREAM pairs,
+order, and a fourth, the live socket, for an Exec with `live` (below). The helper creates three anonymous connected AF_UNIX SOCK_STREAM pairs,
 keeps one endpoint of each, and passes only the opposite endpoint to kilnd.
 The client acknowledges receipt with one byte `0x4b` on the control socket,
 after recvmsg installs all three descriptors. Until that receipt, the helper
@@ -59,7 +59,8 @@ JSON carries retained lengths, observed totals, certainty and truncation facts,
 command status and diagnostics, never stdout/stderr payloads. Both ends keep
 FD ownership through stdio completion; explicit output shutdown proves EOF. The
 existing runtime still handles kiln's four separate machine-protocol FDs and
-capture/cleanup barriers. This transport does not promise live output streaming.
+capture/cleanup barriers. Only an Exec with `live` carries live output, lossy and on
+its own socket (below); the settled transfer stays the authority.
 
 ## Operations and limits
 
@@ -69,7 +70,7 @@ capture/cleanup barriers. This transport does not promise live output streaming.
 | `capabilities {id}` | Validate exact live backend, or prove absence using probe/list/cgroup evidence |
 | `features {id}` | The feature bits the installed CLI (`id: null`) or that sandbox's PID 1 advertises, and whether exec options can reach it: `{features, exec_options}` |
 | `create {spec}` | Validated `kiln create --require-exec-protocol=1` with fixed flag mapping |
-| `exec {id, argv, stdin_bytes, max_output[, cwd][, env]}` | Validated literal argv after `--`, persistent-exec v1; with `cwd` or `env`, the options in a sealed memfd (below) |
+| `exec {id, argv, stdin_bytes, max_output[, cwd][, env][, live]}` | Validated literal argv after `--`, persistent-exec v1; with `cwd` or `env`, the options in a sealed memfd (below); with `live`, a fourth live-output descriptor (below) |
 | `ls` | Complete, bounded, strictly parsed `kiln ls` |
 | `rm {id}` | Exact removal plus authoritative absence checks |
 | `gc {ids}` | Scoped collection only; empty IDs never invokes global GC |
@@ -98,11 +99,31 @@ PID 1 (the existing per-exec probes), else `Incompatible`/`Handshake` with no ch
 the CLI probes PID 1 again itself. Values never appear in a reply: the helper's reply
 types carry none, and the request's `Debug` redacts them.
 
+**Live output (API additions M4).** `exec` takes `live: true`, omitted when false so
+every other request is byte-identical. Its envelope then carries a fourth descriptor
+after the three stdio sockets: one end of a fresh anonymous `AF_UNIX`
+`SOCK_SEQPACKET` pair, shut down for writing on kilnd's side and for reading on the
+helper's, retained without I/O until the stdio receipt like the others. The client
+requires exactly four descriptors for a live exec and three otherwise, and checks the
+fourth is an anonymous connected `SOCK_SEQPACKET` socket whose peer is root. The
+helper's capture readers offer each read, after counting and retaining it, to a tap
+that sends it as one message `[stream u8][offset u64be][bytes]` (stream 1 stdout, 2
+stderr; 1 to 16 KiB of data) with `MSG_DONTWAIT|MSG_NOSIGNAL`. `EAGAIN` drops that
+message and the reader moves on; a closed peer stops all further sends; nothing on
+this path waits, so a slow consumer cannot slow capture or cleanup. The helper shuts
+the channel down once the execution settles, before its reply. kilnd refuses a
+message with an unknown stream, no data, more than 16 KiB, an overflowing offset or
+an offset below the stream's last end, and treats the rest as a tail gap. A live exec
+may have a deadline of up to four hours; any other exec's ceiling stays one hour.
+Darwin has no `SOCK_SEQPACKET` Unix sockets, so a helper there reports no live output.
+
 `features {id}` is a recovery request, like `capabilities`. An older helper closes the
 connection on it, so a daemon paired with one lists no dynamic features and its Health
 is not serving: daemon and helper are upgraded together. Its reply,
 `{"features": {"features": N, "exec_options": B}}`, is a new variant; every existing
-reply is byte-identical.
+reply is byte-identical. Since M4 it adds `"exec_stream": true` when this helper can
+carry live output, omitted when false; an M3b daemon, which does not know the field,
+must be upgraded with its helper as always.
 
 The helper reuses the API's image, allowlist, path, argv and backend-ID
 validators. It independently checks labels, resource ceilings, descriptor
@@ -111,7 +132,7 @@ counts and sizes before any backend invocation. Hard ceilings are 8 GiB memory,
 32 labels, 4096 argv entries / 256 KiB argv, 1 MiB stdin, 1 MiB retained
 output per stream, a 4,096-byte cwd, 64 env entries / 32 KiB env and a 40 KiB options
 memfd. GC has at most 1024 unique IDs per call; the daemon chunks
-larger scopes. Exec deadlines are at most one hour; control requests at most
+larger scopes. Exec deadlines are at most one hour (four for a live exec); control requests at most
 120 seconds. Header/body and output transfer have two second bounds.
 
 Connections and operations have separate bounds. At most 128 connections can be

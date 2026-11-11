@@ -1,4 +1,5 @@
-//! SCM_RIGHTS envelope. Only anonymous Unix stream sockets may cross the boundary.
+//! SCM_RIGHTS envelope. Only anonymous Unix stream sockets, and ExecStream's one
+//! anonymous sequenced-packet socket, may cross the boundary.
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -21,7 +22,8 @@ pub async fn send(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
             if !fds.is_empty() {
-                if fds.len() > 3 {
+                // Three stdio sockets, and ExecStream's live socket.
+                if fds.len() > 4 {
                     return Err(io::Error::other("too many descriptors"));
                 }
                 msg.msg_control = control.as_mut_ptr().cast();
@@ -107,7 +109,7 @@ pub async fn receive(stream: &UnixStream) -> io::Result<Vec<OwnedFd>> {
                 || marker != MARKER
                 || unknown
                 || msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
-                || fds.len() > 3
+                || fds.len() > 4
             {
                 return Err(io::Error::other("invalid descriptor envelope"));
             }
