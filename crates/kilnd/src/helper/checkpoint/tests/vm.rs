@@ -411,7 +411,16 @@ async fn run() {
     let CaptureReply::Complete { evidence } = captured.as_ref() else {
         panic!("{reply:?}")
     };
-    let fact = evidence.verify_complete(&b).unwrap().clone();
+    let fact = evidence
+        .verify_complete(
+            &b,
+            crate::checkpoint::Dispatched {
+                helper_epoch: caps.helper_epoch.unwrap(),
+                boot_id: caps.boot_id.unwrap(),
+            },
+        )
+        .unwrap()
+        .clone();
     eprintln!(
         "C3 VM evidence {} charge {} logical {} allocated {} entries {}",
         evidence.id, fact.charge_bytes, fact.logical_bytes, fact.allocated_bytes, fact.entries

@@ -424,7 +424,7 @@ async fn a_complete_capture_certifies_exactly_its_binding_and_replays() {
     let CaptureReply::Complete { evidence } = captured(&reply) else {
         panic!("{reply:?}");
     };
-    let fact = evidence.verify_complete(&b).unwrap();
+    let fact = evidence.verify_complete_reply(&b, node.epoch()).unwrap();
     assert_eq!(fact.charge_bytes, 98304);
     assert_eq!(evidence.evidence.helper_epoch, node.epoch());
     assert_eq!(

@@ -437,12 +437,24 @@ pub struct SealedEvidence {
     pub id: Digest,
 }
 
-/// What the daemon expects a fact to be about.
+/// What the daemon expects a fact to be about, and who must have certified it: the
+/// helper epoch and boot the operation was dispatched under (C4 adversarial review
+/// HIGH 1). A fact about the right nonce from any other helper process or boot is not
+/// this dispatch's fact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Expected<'a> {
     pub target: &'a ArtifactTarget,
     pub operation: Id128,
     pub kind: &'static str,
+    pub helper_epoch: Id128,
+    pub boot_id: Id128,
+}
+
+/// The helper process and boot an operation was dispatched under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dispatched {
+    pub helper_epoch: Id128,
+    pub boot_id: Id128,
 }
 
 impl Evidence {
@@ -506,28 +518,81 @@ impl SealedEvidence {
     }
 
     /// Accepts this fact only for what the daemon dispatched: the same artifact,
-    /// generation, operation nonce and kind. Returns the canonical bytes to store.
+    /// generation, operation nonce and kind, certified by the helper epoch and boot it
+    /// was dispatched under. Returns the canonical bytes to store.
     pub fn verify(&self, expected: &Expected<'_>) -> Result<Vec<u8>, String> {
+        let bytes = self.verify_about(expected.target, expected.operation, expected.kind)?;
+        let e = &self.evidence;
+        if e.helper_epoch != expected.helper_epoch || e.boot_id != expected.boot_id {
+            return Err("checkpoint evidence from another helper epoch or boot".into());
+        }
+        Ok(bytes)
+    }
+
+    /// The runtime adapter's check of one reply (C3), which knows the helper epoch it
+    /// sent the request under but not the helper's boot: everything [`Self::verify`]
+    /// checks but the boot. Never enough to store a fact: the store binds both.
+    pub fn verify_reply(
+        &self,
+        target: &ArtifactTarget,
+        operation: Id128,
+        kind: &'static str,
+        helper_epoch: Id128,
+    ) -> Result<Vec<u8>, String> {
+        let bytes = self.verify_about(target, operation, kind)?;
+        if self.evidence.helper_epoch != helper_epoch {
+            return Err("checkpoint evidence from another helper epoch".into());
+        }
+        Ok(bytes)
+    }
+
+    fn verify_about(
+        &self,
+        target: &ArtifactTarget,
+        operation: Id128,
+        kind: &'static str,
+    ) -> Result<Vec<u8>, String> {
         let bytes = self.verify_shape()?;
         let e = &self.evidence;
-        if e.instance != expected.target.instance
-            || e.checkpoint != expected.target.checkpoint
-            || e.generation != expected.target.generation
-            || e.operation != expected.operation
-            || e.fact.kind() != expected.kind
+        if e.instance != target.instance
+            || e.checkpoint != target.checkpoint
+            || e.generation != target.generation
+            || e.operation != operation
+            || e.fact.kind() != kind
         {
             return Err("checkpoint evidence is about something else".into());
         }
         Ok(bytes)
     }
 
-    /// COMPLETE evidence for this exact binding (source and R included).
-    pub fn verify_complete(&self, binding: &CaptureBinding) -> Result<&CompleteFact, String> {
+    /// COMPLETE evidence for this exact binding (source and R included), from the
+    /// helper epoch and boot the capture was dispatched under.
+    pub fn verify_complete(
+        &self,
+        binding: &CaptureBinding,
+        dispatched: Dispatched,
+    ) -> Result<&CompleteFact, String> {
         self.verify(&Expected {
             target: &binding.target,
             operation: binding.operation,
             kind: "complete",
+            helper_epoch: dispatched.helper_epoch,
+            boot_id: dispatched.boot_id,
         })?;
+        self.complete_fact(binding)
+    }
+
+    /// The adapter's COMPLETE check: [`Self::verify_reply`] plus the binding's source and R.
+    pub fn verify_complete_reply(
+        &self,
+        binding: &CaptureBinding,
+        helper_epoch: Id128,
+    ) -> Result<&CompleteFact, String> {
+        self.verify_reply(&binding.target, binding.operation, "complete", helper_epoch)?;
+        self.complete_fact(binding)
+    }
+
+    fn complete_fact(&self, binding: &CaptureBinding) -> Result<&CompleteFact, String> {
         match &self.evidence.fact {
             Fact::Complete(fact)
                 if fact.source == binding.source && fact.limit_bytes == binding.limit_bytes =>

@@ -247,6 +247,7 @@ WHEN OLD.complete_evidence_id IS NULL AND (NEW.complete_evidence_id IS NOT NULL 
     OR NOT EXISTS (SELECT 1 FROM checkpoint_evidence e
         WHERE e.evidence_id = NEW.complete_evidence_id AND e.kind = 'complete' AND e.checkpoint_id = NEW.id
           AND e.generation = NEW.generation AND e.operation = NEW.capture_operation AND e.instance_id = NEW.instance_id
+          AND e.helper_epoch = NEW.capture_helper_epoch AND e.boot_id = NEW.capture_boot_id
           AND json_extract(CAST(e.evidence AS TEXT), '$.fact.complete.charge_bytes') IS NEW.charge_bytes
           AND json_extract(CAST(e.evidence AS TEXT), '$.fact.complete.limit_bytes') IS NEW.max_size_bytes
           AND json_extract(CAST(e.evidence AS TEXT), '$.fact.complete.logical_bytes') IS NEW.logical_bytes
@@ -259,7 +260,7 @@ WHEN OLD.complete_evidence_id IS NULL AND (NEW.complete_evidence_id IS NOT NULL 
           AND json_extract(CAST(e.evidence AS TEXT), '$.fact.complete.source') IS NEW.source_backend_id)
     OR NOT EXISTS (SELECT 1 FROM sandboxes WHERE id = NEW.source_sandbox_id AND state = 'ready'
         AND backend_id = NEW.source_backend_id))
-BEGIN SELECT RAISE(ABORT, 'a READY seal needs matching COMPLETE evidence, from CAPTURING, while its source is still READY'); END;
+BEGIN SELECT RAISE(ABORT, 'a READY seal needs matching COMPLETE evidence from the capture''s helper epoch and boot, from CAPTURING, while its source is still READY'); END;
 CREATE TRIGGER checkpoints_transition BEFORE UPDATE OF state ON checkpoints
 WHEN NEW.state IS NOT OLD.state AND (OLD.state, NEW.state) NOT IN (VALUES ('capturing', 'ready'),
     ('capturing', 'deleting'), ('capturing', 'failed'), ('capturing', 'quarantined'), ('ready', 'deleting'),
@@ -270,9 +271,10 @@ WHEN OLD.release_evidence_id IS NULL AND NEW.release_evidence_id IS NOT NULL AND
     NEW.state NOT IN ('failed', 'deleted') OR NEW.released_at_ms IS NULL
     OR NOT EXISTS (SELECT 1 FROM checkpoint_evidence e
         WHERE e.evidence_id = NEW.release_evidence_id AND e.kind = 'absent' AND e.checkpoint_id = NEW.id
-          AND e.generation = NEW.generation AND e.instance_id = NEW.instance_id AND e.operation = NEW.removal_operation)
+          AND e.generation = NEW.generation AND e.instance_id = NEW.instance_id AND e.operation = NEW.removal_operation
+          AND e.helper_epoch = NEW.removal_helper_epoch AND e.boot_id = NEW.removal_boot_id)
     OR EXISTS (SELECT 1 FROM checkpoint_pins WHERE checkpoint_id = NEW.id AND released_at_ms IS NULL))
-BEGIN SELECT RAISE(ABORT, 'a checkpoint charge is released only with ABSENT evidence of its own removal and no live pin'); END;
+BEGIN SELECT RAISE(ABORT, 'a checkpoint charge is released only with ABSENT evidence of its own removal, from its helper epoch and boot, and no live pin'); END;
 CREATE TRIGGER checkpoints_release_permanent BEFORE UPDATE ON checkpoints
 WHEN OLD.release_evidence_id IS NOT NULL AND (NEW.release_evidence_id IS NOT OLD.release_evidence_id
     OR NEW.released_at_ms IS NOT OLD.released_at_ms)
@@ -420,10 +422,12 @@ WHEN OLD.released_at_ms IS NULL AND NEW.released_at_ms IS NOT NULL AND NOT EXIST
     SELECT 1 FROM checkpoint_evidence e
     WHERE e.evidence_id = NEW.release_evidence_id AND e.checkpoint_id = NEW.checkpoint_id AND e.generation = NEW.generation
       AND ((NEW.released_by IN ('complete', 'not_started') AND e.kind = 'reader_ended' AND e.operation = NEW.reader_operation
+            AND e.helper_epoch = NEW.helper_epoch AND e.boot_id = NEW.boot_id
             AND json_extract(CAST(e.evidence AS TEXT), '$.fact.reader_ended.copy') IS NEW.released_by)
-        OR (NEW.released_by = 'absent' AND e.kind = 'absent'
-            AND e.operation = (SELECT removal_operation FROM checkpoints WHERE id = NEW.checkpoint_id))))
-BEGIN SELECT RAISE(ABORT, 'a pin is released only with its reader''s complete or not-started evidence, or its checkpoint''s ABSENT evidence'); END;
+        OR (NEW.released_by = 'absent' AND e.kind = 'absent' AND EXISTS (SELECT 1 FROM checkpoints c
+            WHERE c.id = NEW.checkpoint_id AND c.instance_id = e.instance_id AND c.removal_operation = e.operation
+              AND c.removal_helper_epoch = e.helper_epoch AND c.removal_boot_id = e.boot_id))))
+BEGIN SELECT RAISE(ABORT, 'a pin is released only with its reader''s complete or not-started evidence from the reader''s helper epoch and boot, or its checkpoint''s ABSENT evidence'); END;
 CREATE TRIGGER checkpoint_pins_no_live_delete BEFORE DELETE ON checkpoint_pins
 WHEN OLD.released_at_ms IS NULL
 BEGIN SELECT RAISE(ABORT, 'a live checkpoint pin cannot be deleted'); END;

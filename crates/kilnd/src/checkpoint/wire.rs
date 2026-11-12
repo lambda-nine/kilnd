@@ -2,8 +2,8 @@
 //! design sections 4.3, 10 and 10.1). Replies are on their own `Response::Checkpoint`
 //! branch, so every kiln and Firecracker frame stays byte-identical.
 use super::{
-    ArtifactRecord, ArtifactTarget, CaptureBinding, CheckpointId, CopyOutcome, Expected, Fact,
-    Reason, SealedEvidence,
+    ArtifactRecord, ArtifactTarget, CaptureBinding, CheckpointId, CopyOutcome, Fact, Reason,
+    SealedEvidence,
 };
 use crate::helper::protocol::validate_spec;
 use crate::model::{Digest, Id128, SandboxSpec};
@@ -374,13 +374,12 @@ impl CheckpointResponse {
                 Err("a checkpoint reply from another helper epoch".to_string())
             }
         };
+        let replying =
+            || epoch.ok_or_else(|| "a checkpoint fact without a helper epoch".to_string());
         let fact = |evidence: &SealedEvidence, target, operation, kind| {
-            evidence.verify(&Expected {
-                target,
-                operation,
-                kind,
-            })?;
-            epoch_is(evidence.evidence.helper_epoch)
+            evidence
+                .verify_reply(target, operation, kind, replying()?)
+                .map(drop)
         };
         let restore = |reply: &RestoreReply, target, reader| {
             let (evidence, copy) = match reply {
@@ -431,10 +430,9 @@ impl CheckpointResponse {
                 Ok(())
             }
             (Op::Capture { binding }, Self::Captured(reply)) => match reply.as_ref() {
-                CaptureReply::Complete { evidence } => {
-                    evidence.verify_complete(binding)?;
-                    epoch_is(evidence.evidence.helper_epoch)
-                }
+                CaptureReply::Complete { evidence } => evidence
+                    .verify_complete_reply(binding, replying()?)
+                    .map(drop),
                 CaptureReply::Failed { .. } | CaptureReply::Pending => Ok(()),
             },
             (Op::Restore { target, reader, .. }, Self::Restored(reply)) => {

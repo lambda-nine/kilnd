@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Bind every stored checkpoint fact to the helper epoch and boot its dispatch was
+  recorded under (checkpoint C4 adversarial review, HIGH 1): COMPLETE to the capture's,
+  ABSENT to the latest removal's, a reader's end to its pin's. Evidence about the right
+  nonce from another helper process or boot no longer seals READY, releases a charge or
+  releases a pin, in the typed paths, the SQL triggers or the audits.
 - Add milestone C4 of workspace checkpoints, the daemon's store: schema 15 with every
   table and column the feature needs (checkpoints, helper evidence, fork pins, capture
   keys, trigger-kept counts and membership aggregates; fork provenance and image

@@ -129,15 +129,16 @@ fn inserted(outcome: ReserveCheckpoint) -> Checkpoint {
     }
 }
 
-fn evidence(c: &Checkpoint, operation: Id128, fact: Fact) -> SealedEvidence {
+/// The helper's fact about one dispatch: its nonce, from its helper epoch and boot.
+fn evidence(c: &Checkpoint, dispatch: &HelperDispatch, fact: Fact) -> SealedEvidence {
     Evidence {
         version: EVIDENCE_VERSION,
         instance: c.instance_id,
         checkpoint: c.id.clone(),
         generation: c.generation,
-        operation,
-        helper_epoch: Id128::random(),
-        boot_id: Id128::random(),
+        operation: dispatch.operation,
+        helper_epoch: dispatch.helper_epoch,
+        boot_id: dispatch.boot_id,
         fact,
     }
     .seal()
@@ -147,7 +148,7 @@ fn evidence(c: &Checkpoint, operation: Id128, fact: Fact) -> SealedEvidence {
 fn complete(c: &Checkpoint, charge: u64) -> SealedEvidence {
     evidence(
         c,
-        c.capture.operation,
+        &c.capture,
         Fact::Complete(Box::new(CompleteFact {
             source: c.source_backend_id.clone(),
             content_sha256: Digest::of(c.id.as_str().as_bytes()),
@@ -163,7 +164,7 @@ fn complete(c: &Checkpoint, charge: u64) -> SealedEvidence {
     )
 }
 
-fn absent(c: &Checkpoint, removal: Id128) -> SealedEvidence {
+fn absent(c: &Checkpoint, removal: &HelperDispatch) -> SealedEvidence {
     evidence(c, removal, Fact::Absent { existed: true })
 }
 
@@ -190,7 +191,7 @@ fn remove(store: &Store, c: &Checkpoint) -> Checkpoint {
             .unwrap()
     );
     match store
-        .settle_checkpoint_absence(c.id.as_str(), &absent(c, removal.operation))
+        .settle_checkpoint_absence(c.id.as_str(), &absent(c, &removal))
         .unwrap()
     {
         SettleAbsence::Released(c) => *c,
@@ -638,7 +639,11 @@ fn a_checkpoint_is_charged_r_then_s_until_its_absence_is_proved() {
         .checkpoint_evidence(&published.seal.as_ref().unwrap().evidence_id)
         .unwrap()
         .unwrap();
-    assert!(sealed.verify_complete(&published.capture_binding()).is_ok());
+    assert!(
+        sealed
+            .verify_complete(&published.capture_binding(), published.capture.dispatched())
+            .is_ok()
+    );
     // DELETING keeps the charge; only the removal's ABSENT evidence releases it.
     let deleting = store
         .publish_checkpoint_delete_intent(c.id.as_str(), DeletionReason::Requested)
@@ -649,7 +654,7 @@ fn a_checkpoint_is_charged_r_then_s_until_its_absence_is_proved() {
     // Without a recorded removal there is nothing to match.
     assert!(matches!(
         store
-            .settle_checkpoint_absence(c.id.as_str(), &absent(&c, Id128::random()))
+            .settle_checkpoint_absence(c.id.as_str(), &absent(&c, &dispatch()))
             .unwrap(),
         SettleAbsence::Refused(_)
     ));
@@ -662,7 +667,7 @@ fn a_checkpoint_is_charged_r_then_s_until_its_absence_is_proved() {
     // Another removal's absence, or a COMPLETE fact, is not this removal's.
     assert!(matches!(
         store
-            .settle_checkpoint_absence(c.id.as_str(), &absent(&c, Id128::random()))
+            .settle_checkpoint_absence(c.id.as_str(), &absent(&c, &dispatch()))
             .unwrap(),
         SettleAbsence::Refused(_)
     ));
@@ -673,7 +678,7 @@ fn a_checkpoint_is_charged_r_then_s_until_its_absence_is_proved() {
         SettleAbsence::Refused(_)
     ));
     assert_eq!(disk(&store), base + (40 << 20));
-    let proof = absent(&c, removal.operation);
+    let proof = absent(&c, &removal);
     let deleted = match store
         .settle_checkpoint_absence(c.id.as_str(), &proof)
         .unwrap()
@@ -712,7 +717,7 @@ fn a_failed_capture_stays_charged_r_until_its_absence_then_may_be_deleted() {
     );
     assert!(matches!(
         store
-            .settle_checkpoint_absence(c.id.as_str(), &absent(&c, removal.operation))
+            .settle_checkpoint_absence(c.id.as_str(), &absent(&c, &removal))
             .unwrap(),
         SettleAbsence::NotReleasable(CheckpointState::Capturing)
     ));
@@ -733,7 +738,7 @@ fn a_failed_capture_stays_charged_r_until_its_absence_then_may_be_deleted() {
     );
     assert_eq!(disk(&store), base + GIB);
     let failed = match store
-        .settle_checkpoint_absence(c.id.as_str(), &absent(&c, removal.operation))
+        .settle_checkpoint_absence(c.id.as_str(), &absent(&c, &removal))
         .unwrap()
     {
         SettleAbsence::Released(c) => *c,
@@ -762,8 +767,15 @@ fn publication_needs_this_bindings_complete_fact_and_a_ready_source() {
     let other = inserted(reserve(&store, &new_checkpoint(&s, 1000, GIB)));
     for wrong in [
         complete(&other, 1 << 20),
-        evidence(&c, Id128::random(), complete(&c, 1 << 20).evidence.fact),
-        absent(&c, c.capture.operation),
+        evidence(
+            &c,
+            &HelperDispatch {
+                operation: Id128::random(),
+                ..c.capture
+            },
+            complete(&c, 1 << 20).evidence.fact,
+        ),
+        absent(&c, &c.capture),
     ] {
         assert!(matches!(
             store
@@ -783,7 +795,7 @@ fn publication_needs_this_bindings_complete_fact_and_a_ready_source() {
         store
             .publish_checkpoint_ready(
                 c.id.as_str(),
-                &evidence(&c, c.capture.operation, Fact::Complete(fact))
+                &evidence(&c, &c.capture, Fact::Complete(fact))
             )
             .unwrap(),
         PublishCheckpoint::Refused(_)
@@ -1375,7 +1387,7 @@ fn a_fork_commits_its_row_provenance_and_pin_together() {
     // A reader that may still read never releases; one that completed does.
     let unknown = evidence(
         &c,
-        reader.operation,
+        &reader,
         Fact::ReaderEnded {
             copy: CopyOutcome::Unknown,
         },
@@ -1383,7 +1395,7 @@ fn a_fork_commits_its_row_provenance_and_pin_together() {
     assert!(store.release_checkpoint_pin(&fork.id, &unknown).is_err());
     let other = evidence(
         &c,
-        Id128::random(),
+        &dispatch(),
         Fact::ReaderEnded {
             copy: CopyOutcome::Complete,
         },
@@ -1391,7 +1403,7 @@ fn a_fork_commits_its_row_provenance_and_pin_together() {
     assert!(store.release_checkpoint_pin(&fork.id, &other).is_err());
     let done = evidence(
         &c,
-        reader.operation,
+        &reader,
         Fact::ReaderEnded {
             copy: CopyOutcome::Complete,
         },
@@ -1566,7 +1578,7 @@ fn fixture() -> Fixture {
     store
         .record_checkpoint_removal(deleting.id.as_str(), &removal)
         .unwrap();
-    let proof = absent(&deleting, removal.operation);
+    let proof = absent(&deleting, &removal);
     checkpoint::insert_evidence(
         &store.conn(),
         &proof,
@@ -1809,8 +1821,8 @@ fn tampering_past_the_triggers_is_caught_and_never_frees_capacity() {
                      removal_helper_epoch = '{}', removal_boot_id = '{}' WHERE id = '{}'",
                 f.deleted.release_evidence_id.unwrap(),
                 f.deleted.removal.unwrap().operation,
-                f.deleted.removal.unwrap().operation,
-                f.deleted.removal.unwrap().operation,
+                f.deleted.removal.unwrap().helper_epoch,
+                f.deleted.removal.unwrap().boot_id,
                 f.ready.id
             )
             }),
@@ -1946,15 +1958,15 @@ fn evidence_is_bound_to_this_instance_and_an_existing_checkpoint() {
     // About a checkpoint that does not exist, another instance, another generation.
     let mut unknown = f.ready.clone();
     unknown.id = CheckpointId::random();
-    assert!(insert(&absent(&unknown, Id128::random())).is_err());
+    assert!(insert(&absent(&unknown, &dispatch())).is_err());
     let mut foreign = f.ready.clone();
     foreign.instance_id = Id128::random();
-    assert!(insert(&absent(&foreign, Id128::random())).is_err());
+    assert!(insert(&absent(&foreign, &dispatch())).is_err());
     let mut stale = f.ready.clone();
     stale.generation = 2;
-    assert!(insert(&absent(&stale, Id128::random())).is_err());
+    assert!(insert(&absent(&stale, &dispatch())).is_err());
     // Bytes that are not the ID's, or columns that say something else.
-    let good = absent(&f.ready, Id128::random());
+    let good = absent(&f.ready, &dispatch());
     let mut wrong_id = good.clone();
     wrong_id.id = Digest::of(b"x");
     assert!(insert(&wrong_id).is_err());
@@ -1976,4 +1988,458 @@ fn evidence_is_bound_to_this_instance_and_an_existing_checkpoint() {
     // The real thing enters, once.
     insert(&good).unwrap();
     assert!(insert(&good).is_err());
+}
+
+// --- Fix round 1: evidence is bound to the dispatch's helper epoch and boot ----------
+
+/// The three ways a fact can come from somewhere other than the dispatch: another
+/// helper epoch and boot, another epoch in the same boot, the same epoch on another boot.
+fn foreign_certifiers(d: &HelperDispatch) -> [(HelperDispatch, &'static str); 3] {
+    [
+        (
+            HelperDispatch {
+                helper_epoch: Id128::random(),
+                boot_id: Id128::random(),
+                ..*d
+            },
+            "another epoch and boot",
+        ),
+        (
+            HelperDispatch {
+                helper_epoch: Id128::random(),
+                ..*d
+            },
+            "another epoch, same boot",
+        ),
+        (
+            HelperDispatch {
+                boot_id: Id128::random(),
+                ..*d
+            },
+            "same epoch, another boot",
+        ),
+    ]
+}
+
+/// Adversarial review HIGH 1 (adopted PoC): COMPLETE evidence about the right capture
+/// nonce, certified by another helper epoch or boot, does not seal READY.
+#[test]
+fn complete_evidence_from_another_helper_epoch_is_refused() {
+    let (store, _) = store();
+    let source = source(&store, 1000);
+    let checkpoint = inserted(reserve(&store, &new_checkpoint(&source, 1000, 1 << 30)));
+    for (other, case) in foreign_certifiers(&checkpoint.capture) {
+        let wrong = evidence(
+            &checkpoint,
+            &other,
+            complete(&checkpoint, 1 << 20).evidence.fact,
+        );
+        let outcome = store
+            .publish_checkpoint_ready(checkpoint.id.as_str(), &wrong)
+            .unwrap();
+        assert!(
+            matches!(outcome, PublishCheckpoint::Refused(_)),
+            "{case}: mismatched-epoch COMPLETE evidence was accepted: {outcome:?}"
+        );
+    }
+    let row = store.checkpoint(checkpoint.id.as_str()).unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.charge_bytes()),
+        (CheckpointState::Capturing, 1 << 30)
+    );
+    // The dispatch's own fact still seals it.
+    assert!(matches!(
+        store
+            .publish_checkpoint_ready(checkpoint.id.as_str(), &complete(&checkpoint, 1 << 20))
+            .unwrap(),
+        PublishCheckpoint::Published(_)
+    ));
+}
+
+/// Adversarial review HIGH 1 (adopted PoC): ABSENT evidence about the recorded removal
+/// nonce, certified by another helper epoch or boot, releases nothing.
+#[test]
+fn absent_evidence_from_another_helper_epoch_is_refused() {
+    let (store, _) = store();
+    let source = source(&store, 1000);
+    let checkpoint = ready(&store, &source, 1000, 1 << 20);
+    store
+        .publish_checkpoint_delete_intent(checkpoint.id.as_str(), DeletionReason::Requested)
+        .unwrap();
+    let removal = dispatch();
+    store
+        .record_checkpoint_removal(checkpoint.id.as_str(), &removal)
+        .unwrap();
+    let charged = disk(&store);
+    for (other, case) in foreign_certifiers(&removal) {
+        let outcome = store
+            .settle_checkpoint_absence(checkpoint.id.as_str(), &absent(&checkpoint, &other))
+            .unwrap();
+        assert!(
+            matches!(outcome, SettleAbsence::Refused(_)),
+            "{case}: mismatched-epoch ABSENT evidence was accepted: {outcome:?}"
+        );
+    }
+    let row = store.checkpoint(checkpoint.id.as_str()).unwrap().unwrap();
+    assert_eq!(row.state, CheckpointState::Deleting);
+    assert_eq!(disk(&store), charged, "no charge released");
+    // A later removal redispatched under a new epoch: only that dispatch's fact counts.
+    let again = dispatch();
+    store
+        .record_checkpoint_removal(checkpoint.id.as_str(), &again)
+        .unwrap();
+    assert!(matches!(
+        store
+            .settle_checkpoint_absence(checkpoint.id.as_str(), &absent(&checkpoint, &removal))
+            .unwrap(),
+        SettleAbsence::Refused(_)
+    ));
+    assert!(matches!(
+        store
+            .settle_checkpoint_absence(checkpoint.id.as_str(), &absent(&checkpoint, &again))
+            .unwrap(),
+        SettleAbsence::Released(_)
+    ));
+}
+
+/// Adversarial review HIGH 1 (adopted PoC): a reader's end certified by another helper
+/// epoch or boot does not release its pin. In particular, a pin whose dispatch epoch
+/// died can't be released by a new epoch's word about its nonce: only its checkpoint's
+/// ABSENT evidence releases it.
+#[test]
+fn reader_evidence_from_another_helper_epoch_is_refused() {
+    let (store, _) = store();
+    let source = source(&store, 1000);
+    let checkpoint = ready(&store, &source, 1000, 1 << 20);
+    let fork = fork_row(&checkpoint, 1000);
+    let reader = dispatch();
+    assert_eq!(
+        store
+            .reserve_fork_sandbox(&fork, roomy(), None, &[], &reader)
+            .unwrap(),
+        ReserveFork::Sandbox(ReserveSandbox::Inserted)
+    );
+    for copy in [CopyOutcome::Complete, CopyOutcome::NotStarted] {
+        for (other, case) in foreign_certifiers(&reader) {
+            let wrong = evidence(&checkpoint, &other, Fact::ReaderEnded { copy });
+            let outcome = store.release_checkpoint_pin(&fork.id, &wrong);
+            assert!(
+                outcome.is_err(),
+                "{case}: mismatched-epoch READER_ENDED evidence was accepted: {outcome:?}"
+            );
+        }
+    }
+    assert!(
+        store
+            .checkpoint_pin(&fork.id)
+            .unwrap()
+            .unwrap()
+            .released_at_ms
+            .is_none()
+    );
+    // The pin holds the checkpoint: nothing releases it but its removal's absence.
+    let deleted = remove(&store, &checkpoint);
+    assert_eq!(deleted.state, CheckpointState::Deleted);
+    let pin = store.checkpoint_pin(&fork.id).unwrap().unwrap();
+    assert_eq!(pin.released_by.as_deref(), Some("absent"));
+}
+
+/// The SQL triggers refuse the same wrong-epoch facts on their own (a writer that
+/// skips the typed API), for each of the three paths.
+#[test]
+fn the_triggers_bind_each_fact_to_its_dispatch_epoch_and_boot() {
+    let f = fixture();
+    // A DELETING checkpoint with its removal recorded and no pin.
+    let lone = ready(&f.store, &f.source, 1000, 1 << 20);
+    f.store
+        .publish_checkpoint_delete_intent(lone.id.as_str(), DeletionReason::Requested)
+        .unwrap();
+    let lone_removal = dispatch();
+    f.store
+        .record_checkpoint_removal(lone.id.as_str(), &lone_removal)
+        .unwrap();
+    let conn = f.store.conn();
+    let store_evidence = |sealed: &SealedEvidence| {
+        checkpoint::insert_evidence(
+            &conn,
+            sealed,
+            &sealed.evidence.canonical_bytes().unwrap(),
+            1,
+        )
+        .unwrap();
+        sealed.id.to_string()
+    };
+    for (other, case) in foreign_certifiers(&f.capturing.capture) {
+        let wrong = evidence(
+            &f.capturing,
+            &other,
+            complete(&f.capturing, 1 << 20).evidence.fact,
+        );
+        let id = store_evidence(&wrong);
+        let error = conn
+            .execute(
+                "UPDATE checkpoints SET state = 'ready', complete_evidence_id = ?2, content_sha256 = ?3,
+                     binding_sha256 = ?4, charge_bytes = ?5, logical_bytes = ?6, allocated_bytes = ?6,
+                     entry_count = 7, ready_at_ms = 1, ready_boottime_ms = 1, clock_boot_id = 'b'
+                 WHERE id = ?1",
+                params![
+                    f.capturing.id.as_str(),
+                    id,
+                    Digest::of(f.capturing.id.as_str().as_bytes()).to_string(),
+                    Digest::of(b"binding").to_string(),
+                    1i64 << 20,
+                    1i64 << 19
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("helper epoch and boot"), "{case}: {error}");
+    }
+    let removal = f.deleting.removal.unwrap();
+    for (other, case) in foreign_certifiers(&removal) {
+        // Release the pin the way D3 does, but with the wrong certifier.
+        let id = store_evidence(&absent(&f.deleting, &other));
+        let error = conn
+            .execute(
+                "UPDATE checkpoint_pins SET released_at_ms = 1, released_by = 'absent', release_evidence_id = ?2
+                 WHERE checkpoint_id = ?1",
+                params![f.deleting.id.as_str(), id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pin is released only"), "{case}: {error}");
+    }
+    let pin = conn
+        .query_row(
+            &format!("SELECT {PIN_COLUMNS} FROM checkpoint_pins WHERE sandbox_id = ?1"),
+            [&f.fork.id],
+            pin_row,
+        )
+        .unwrap()
+        .unwrap();
+    for (other, case) in foreign_certifiers(&pin.reader) {
+        let id = store_evidence(&evidence(
+            &f.ready,
+            &other,
+            Fact::ReaderEnded {
+                copy: CopyOutcome::Complete,
+            },
+        ));
+        let error = conn
+            .execute(
+                "UPDATE checkpoint_pins SET released_at_ms = 1, released_by = 'complete', release_evidence_id = ?2
+                 WHERE sandbox_id = ?1",
+                params![f.fork.id, id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pin is released only"), "{case}: {error}");
+    }
+    // The right certifier passes the same statements: each refusal above was the binding.
+    let id = store_evidence(&evidence(
+        &f.ready,
+        &pin.reader,
+        Fact::ReaderEnded {
+            copy: CopyOutcome::Complete,
+        },
+    ));
+    conn.execute(
+        "UPDATE checkpoint_pins SET released_at_ms = 1, released_by = 'complete', release_evidence_id = ?2
+         WHERE sandbox_id = ?1",
+        params![f.fork.id, id],
+    )
+    .unwrap();
+    let id = store_evidence(&absent(&f.deleting, &removal));
+    conn.execute(
+        "UPDATE checkpoint_pins SET released_at_ms = 1, released_by = 'absent', release_evidence_id = ?2
+         WHERE checkpoint_id = ?1",
+        params![f.deleting.id.as_str(), id],
+    )
+    .unwrap();
+    // The charge release, on a checkpoint with no pin.
+    let release = |id: &str| {
+        conn.execute(
+            "UPDATE checkpoints SET state = 'deleted', deleted_at_ms = 1, released_at_ms = 1, release_evidence_id = ?2
+             WHERE id = ?1",
+            params![lone.id.as_str(), id],
+        )
+    };
+    for (other, case) in foreign_certifiers(&lone_removal) {
+        let id = store_evidence(&absent(&lone, &other));
+        let error = release(&id).unwrap_err().to_string();
+        assert!(error.contains("helper epoch and boot"), "{case}: {error}");
+    }
+    release(&store_evidence(&absent(&lone, &lone_removal))).unwrap();
+}
+
+/// Past the triggers: a writer that releases a pin or a charge, or seals READY, with a
+/// self-consistent fact from the wrong helper epoch or boot, and keeps every aggregate
+/// consistent so that only the evidence binding can catch it. The next decision and a
+/// restart's full audit both quarantine it: degraded, charge kept, admission refused.
+#[test]
+fn wrong_epoch_facts_past_the_triggers_are_caught_by_the_audits() {
+    #[derive(Clone, Copy, Debug)]
+    enum Path {
+        Complete,
+        Absent,
+        Pin,
+    }
+    for path in [Path::Complete, Path::Absent, Path::Pin] {
+        for restart in [false, true] {
+            let f = fixture();
+            let src = f.source.clone();
+            let charged_before = disk(&f.store);
+            {
+                let conn = Connection::open(f._tmp.path().join("kilnd.db")).unwrap();
+                checkpoint::register_evidence_validator(&conn).unwrap();
+                let store_evidence = |sealed: &SealedEvidence| {
+                    checkpoint::insert_evidence(
+                        &conn,
+                        sealed,
+                        &sealed.evidence.canonical_bytes().unwrap(),
+                        1,
+                    )
+                    .unwrap();
+                    sealed.id.to_string()
+                };
+                // Evidence rows are inserted with the triggers on: they pass, being
+                // self-consistent and about an existing checkpoint generation.
+                let wrong_id = match path {
+                    Path::Complete => {
+                        let mut other = f.capturing.capture;
+                        other.helper_epoch = Id128::random();
+                        store_evidence(&evidence(
+                            &f.capturing,
+                            &other,
+                            complete(&f.capturing, 1 << 30).evidence.fact,
+                        ))
+                    }
+                    Path::Absent => String::new(),
+                    Path::Pin => {
+                        let pin_reader: (String, String, String) = conn
+                            .query_row(
+                                "SELECT reader_operation, helper_epoch, boot_id FROM checkpoint_pins WHERE sandbox_id = ?1",
+                                [&f.fork.id],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                            )
+                            .unwrap();
+                        let reader = HelperDispatch {
+                            operation: Id128::parse(&pin_reader.0).unwrap(),
+                            helper_epoch: Id128::random(),
+                            boot_id: Id128::parse(&pin_reader.2).unwrap(),
+                        };
+                        store_evidence(&evidence(
+                            &f.ready,
+                            &reader,
+                            Fact::ReaderEnded {
+                                copy: CopyOutcome::Complete,
+                            },
+                        ))
+                    }
+                };
+                conn.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+                    false,
+                )
+                .unwrap();
+                match path {
+                    Path::Complete => {
+                        // Seal READY at S = R (no count change), and move the row's
+                        // membership exactly as the typed path would.
+                        let id = f.capturing.id.as_str();
+                        let before = checkpoint::row_membership(&conn, id).unwrap();
+                        conn.execute(
+                            "UPDATE checkpoints SET state = 'ready', complete_evidence_id = ?2, content_sha256 = ?3,
+                                 binding_sha256 = ?4, charge_bytes = max_size_bytes, logical_bytes = ?5,
+                                 allocated_bytes = ?5, entry_count = 7, ready_at_ms = 1, ready_boottime_ms = 1,
+                                 clock_boot_id = 'b'
+                             WHERE id = ?1",
+                            params![
+                                id,
+                                wrong_id,
+                                Digest::of(id.as_bytes()).to_string(),
+                                Digest::of(b"binding").to_string(),
+                                1i64 << 29
+                            ],
+                        )
+                        .unwrap();
+                        let (all, settled) =
+                            checkpoint::stored_checkpoint_membership(&conn).unwrap();
+                        let after = checkpoint::row_membership(&conn, id).unwrap();
+                        checkpoint::store_checkpoint_membership(
+                            &conn,
+                            all.minus(before).plus(after),
+                            settled,
+                        )
+                        .unwrap();
+                    }
+                    Path::Absent => {
+                        // Release `deleting`: its pins with the wrong fact, then the
+                        // charge, noting it unsettled and lowering the counters the way
+                        // the triggers would have.
+                        let removal = f.deleting.removal.unwrap();
+                        let wrong = HelperDispatch {
+                            boot_id: Id128::random(),
+                            ..removal
+                        };
+                        let id = store_evidence(&absent(&f.deleting, &wrong));
+                        let charge = f.deleting.charge_bytes() as i64;
+                        conn.execute_batch(&format!(
+                            "UPDATE checkpoint_pins SET released_at_ms = 1, released_by = 'absent', release_evidence_id = '{id}'
+                                 WHERE checkpoint_id = '{c}';
+                             UPDATE checkpoints SET state = 'deleted', deleted_at_ms = 1, released_at_ms = 1,
+                                 release_evidence_id = '{id}' WHERE id = '{c}';
+                             INSERT INTO checkpoint_unsettled VALUES ('{c}');
+                             UPDATE checkpoint_counts SET live = live - 1, charged_bytes = charged_bytes - {charge}
+                                 WHERE owner_uid IN (1000, -1);",
+                            c = f.deleting.id
+                        ))
+                        .unwrap();
+                    }
+                    Path::Pin => {
+                        conn.execute(
+                            "UPDATE checkpoint_pins SET released_at_ms = 1, released_by = 'complete', release_evidence_id = ?2
+                             WHERE sandbox_id = ?1",
+                            params![f.fork.id, wrong_id],
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            let Fixture { _tmp, store, .. } = f;
+            let store = if restart {
+                drop(store);
+                Store::open(_tmp.path()).unwrap()
+            } else {
+                store
+            };
+            store.set_clock(std::sync::Arc::new(ManualClock::default()));
+            let (resources, degraded) = store.accounting_snapshot().unwrap();
+            assert!(degraded, "{path:?} (restart {restart}): not degraded");
+            assert!(
+                resources.disk_bytes >= charged_before,
+                "{path:?} (restart {restart}): freed capacity {} < {charged_before}",
+                resources.disk_bytes
+            );
+            assert!(
+                store
+                    .reserve_sandbox(&row(SandboxState::Creating, 1000), roomy())
+                    .is_err()
+            );
+            assert!(
+                store
+                    .reserve_checkpoint(
+                        &new_checkpoint(&src, 1000, 1 << 20),
+                        &CheckpointBudgets::default(),
+                        roomy(),
+                        None
+                    )
+                    .is_err()
+            );
+            println!(
+                "{path:?} (restart {restart}): degraded, {} charged bytes kept",
+                resources.disk_bytes
+            );
+        }
+    }
 }

@@ -182,7 +182,7 @@ async fn capture_restore_inspect_and_remove_cross_the_socket() {
     // What C4 would store: canonical bytes under their ID, verified for this binding.
     let bytes = evidence.evidence.canonical_bytes().unwrap();
     let stored = crate::checkpoint::SealedEvidence::decode(&bytes, evidence.id).unwrap();
-    stored.verify_complete(&b).unwrap();
+    stored.verify_complete_reply(&b, epoch).unwrap();
     let view = helper
         .call(
             Some(epoch),

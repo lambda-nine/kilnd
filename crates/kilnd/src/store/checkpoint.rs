@@ -12,8 +12,8 @@
 
 use super::*;
 use crate::checkpoint::{
-    ArtifactTarget, CaptureBinding, CheckpointId, CopyOutcome, Expected, FORMAT_VERSION, Fact,
-    Reason, SealedEvidence,
+    ArtifactTarget, CaptureBinding, CheckpointId, CopyOutcome, Dispatched, Expected,
+    FORMAT_VERSION, Fact, Reason, SealedEvidence,
 };
 use crate::model::{CheckpointProvenance, ImageIdentity};
 
@@ -193,6 +193,27 @@ pub struct Checkpoint {
     pub request_id_released_at_ms: Option<i64>,
     /// Its release evidence failed the audit: it is charged again and admission is off.
     pub accounting_quarantined: bool,
+}
+
+impl HelperDispatch {
+    /// The helper epoch and boot a fact about this dispatch must come from.
+    pub fn dispatched(&self) -> Dispatched {
+        Dispatched {
+            helper_epoch: self.helper_epoch,
+            boot_id: self.boot_id,
+        }
+    }
+
+    /// What a fact about this dispatch must be: its nonce, kind, epoch and boot.
+    pub fn expected<'a>(&self, target: &'a ArtifactTarget, kind: &'static str) -> Expected<'a> {
+        Expected {
+            target,
+            operation: self.operation,
+            kind,
+            helper_epoch: self.helper_epoch,
+            boot_id: self.boot_id,
+        }
+    }
 }
 
 impl Checkpoint {
@@ -911,7 +932,7 @@ fn checkpoint_evidence_valid(conn: &Connection, c: &Checkpoint) -> Result<bool> 
         let Some((sealed, stored)) = load_evidence(conn, &seal.evidence_id)? else {
             return Ok(false);
         };
-        let Ok(fact) = sealed.verify_complete(&c.capture_binding()) else {
+        let Ok(fact) = sealed.verify_complete(&c.capture_binding(), c.capture.dispatched()) else {
             return Ok(false);
         };
         if !columns_match(&sealed, &stored)
@@ -932,12 +953,8 @@ fn checkpoint_evidence_valid(conn: &Connection, c: &Checkpoint) -> Result<bool> 
         else {
             return Ok(false);
         };
-        let expected = Expected {
-            target: &c.target(),
-            operation: removal.operation,
-            kind: "absent",
-        };
-        if sealed.verify(&expected).is_err()
+        let target = c.target();
+        if sealed.verify(&removal.expected(&target, "absent")).is_err()
             || !columns_match(&sealed, &stored)
             || !matches!(c.state, CheckpointState::Failed | CheckpointState::Deleted)
         {
@@ -947,22 +964,21 @@ fn checkpoint_evidence_valid(conn: &Connection, c: &Checkpoint) -> Result<bool> 
     Ok(true)
 }
 
-fn pin_evidence_valid(
-    conn: &Connection,
-    pin: &CheckpointPin,
-    removal: Option<Id128>,
-) -> Result<bool> {
+/// A released pin's evidence, against the pin and its checkpoint as the store holds
+/// them: the target is the checkpoint's own instance, generation and ID, and the fact
+/// must come from the reader's dispatch (or the checkpoint's recorded removal), never
+/// from anything the evidence says about itself.
+fn pin_evidence_valid(conn: &Connection, pin: &CheckpointPin, c: &Checkpoint) -> Result<bool> {
     let (Some(by), Some(id)) = (pin.released_by.as_deref(), pin.release_evidence_id) else {
         return Ok(true);
     };
     let Some((sealed, _)) = load_evidence(conn, &id)? else {
         return Ok(false);
     };
-    let target = ArtifactTarget {
-        instance: sealed.evidence.instance,
-        checkpoint: pin.checkpoint.clone(),
-        generation: pin.generation,
-    };
+    if pin.checkpoint != c.id || pin.generation != c.generation {
+        return Ok(false);
+    }
+    let target = c.target();
     Ok(match by {
         "complete" | "not_started" => {
             let copy = match &sealed.evidence.fact {
@@ -970,23 +986,13 @@ fn pin_evidence_valid(
                 _ => return Ok(false),
             };
             sealed
-                .verify(&Expected {
-                    target: &target,
-                    operation: pin.reader.operation,
-                    kind: "reader_ended",
-                })
+                .verify(&pin.reader.expected(&target, "reader_ended"))
                 .is_ok()
                 && copy_token(copy) == Some(by)
         }
-        "absent" => removal.is_some_and(|removal| {
-            sealed
-                .verify(&Expected {
-                    target: &target,
-                    operation: removal,
-                    kind: "absent",
-                })
-                .is_ok()
-        }),
+        "absent" => c
+            .removal
+            .is_some_and(|removal| sealed.verify(&removal.expected(&target, "absent")).is_ok()),
         _ => false,
     })
 }
@@ -1027,7 +1033,7 @@ fn evidence_checks(conn: &Connection, filter: &str) -> Result<()> {
         };
         let mut valid = checkpoint_evidence_valid(conn, c)?;
         for pin in &pins {
-            valid &= pin_evidence_valid(conn, pin, c.removal.map(|r| r.operation))?;
+            valid &= pin_evidence_valid(conn, pin, c)?;
         }
         if !valid {
             quarantine(conn, c.id.as_str())?;
@@ -1776,7 +1782,8 @@ impl Store {
             if c.state != CheckpointState::Capturing {
                 return Ok(PublishCheckpoint::NotCapturing(c.state));
             }
-            let fact = match evidence.verify_complete(&c.capture_binding()) {
+            let fact = match evidence.verify_complete(&c.capture_binding(), c.capture.dispatched())
+            {
                 Ok(fact) => fact.clone(),
                 Err(e) => return Ok(PublishCheckpoint::Refused(e)),
             };
@@ -1902,12 +1909,8 @@ impl Store {
             let Some(removal) = c.removal else {
                 return Ok(SettleAbsence::Refused("no removal was dispatched".into()));
             };
-            let expected = Expected {
-                target: &c.target(),
-                operation: removal.operation,
-                kind: "absent",
-            };
-            let bytes = match evidence.verify(&expected) {
+            let target = c.target();
+            let bytes = match evidence.verify(&removal.expected(&target, "absent")) {
                 Ok(bytes) => bytes,
                 Err(e) => return Ok(SettleAbsence::Refused(e)),
             };
@@ -2016,11 +2019,7 @@ impl Store {
             generation: pin.generation,
         };
         let bytes = evidence
-            .verify(&Expected {
-                target: &target,
-                operation: pin.reader.operation,
-                kind: "reader_ended",
-            })
+            .verify(&pin.reader.expected(&target, "reader_ended"))
             .map_err(anyhow::Error::msg)?;
         let by = match &evidence.evidence.fact {
             Fact::ReaderEnded { copy } => copy_token(*copy),

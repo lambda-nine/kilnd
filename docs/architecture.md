@@ -1296,7 +1296,12 @@ checkpoint at that commit: READY, the same content digest, its owner or root, th
 image and root-write policy and canonical writable set, and disk at least S. The pin
 also records the checkpoint's activity.
 
-**Transitions and evidence.** `publish_checkpoint_ready` checks the COMPLETE evidence
+**Transitions and evidence.** Every fact is bound to the dispatch it answers: the same
+artifact, generation, nonce and kind, **certified by the helper epoch and boot that
+dispatch was recorded under** (the capture's at C1, the latest removal's, the pin's
+reader's). A fact about the right nonce from another helper process or boot is refused,
+so a pin whose dispatch epoch died before the restore ran can only be released by its
+checkpoint's ABSENT evidence. `publish_checkpoint_ready` checks the COMPLETE evidence
 against the row's own binding in Rust, then seals S and the digests and stamps READY in
 one transaction that also requires the source still READY under the bound backend ID.
 `publish_checkpoint_delete_intent` is D1; `record_checkpoint_removal` records the fresh
@@ -1308,16 +1313,17 @@ evidence with copy `complete` or `not_started`; `unknown` never releases.
 **Triggers** (defense in depth against ordinary SQL, as in schemas 8 to 12): type and
 range CHECKs on every column; no INSERT OR REPLACE on any key; immutable identity,
 owner, source, cap, format, compatibility, expiry policy and key; a seal written once,
-only from CAPTURING to READY, only with stored COMPLETE evidence whose JSON fields are
-the seal's and while the source is READY; legal transitions only (no resurrection); a
-release only with stored ABSENT evidence of the recorded removal and no live pin, and
-never undone; removals dispatched with a fresh nonce, only while CAPTURING or DELETING;
+only from CAPTURING to READY, only with stored COMPLETE evidence from the capture's
+helper epoch and boot whose JSON fields are the seal's, and while the source is READY;
+legal transitions only (no resurrection); a release only with stored ABSENT evidence of
+the recorded removal from its helper epoch and boot, and no live pin, and never undone; removals dispatched with a fresh nonce, only while CAPTURING or DELETING;
 first deletion reason, failure written once, monotonic activity sequence; no deletion of
 a charged, keyed or pinned row; evidence immutable, validated by
 `kilnd_checkpoint_evidence_valid` on insert, bound to this instance and an existing
 checkpoint generation, and kept while its row exists; pins taken only on READY by their
 own CREATING fork with the same generation, digest and image, fixed, released once with
-matching evidence, never deleted while live. `trusted_schema` stays off: the triggers use
+matching evidence from the reader's (or the removal's) helper epoch and boot, never
+deleted while live. `trusted_schema` stays off: the triggers use
 only innocuous built-ins and the registered validator.
 
 **Audits.** No trigger makes the file tamperproof against its owner. Every accounting
@@ -1340,8 +1346,11 @@ fork's released pin goes with its pruned sandbox.
 
 **Migration 14 to 15** runs in the startup transaction after auditing the existing
 sandbox membership as it stands (a mismatch refuses startup and leaves schema 14
-untouched). It adds the tables and columns, seeds empty aggregates, and changes no
-schema 14 row, digest, aggregate or charge predicate. Older binaries refuse schema 15;
+untouched). It adds the tables and columns and seeds empty aggregates. No schema 14 row,
+request digest or charge predicate changes, and the reservation membership (all and
+settled, recomputed from the rows) is the same: semantic accounting is unchanged. The
+stored aggregate rows themselves are rewritten only by the normal startup audit, which
+settles a release still unsettled, as schema 14's own startup does. Older binaries refuse schema 15;
 see [setup.md](setup.md) for rollback.
 
 ## Limits and defaults

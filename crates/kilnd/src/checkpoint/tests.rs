@@ -209,7 +209,43 @@ fn evidence_is_canonical_bounded_and_identified() {
     if let Fact::Complete(fact) = &mut forged.evidence.fact {
         fact.charge_bytes = 1;
     }
-    assert!(forged.verify_complete(&binding()).is_err());
+    assert!(forged.verify_complete(&binding(), dispatched()).is_err());
+}
+
+/// The helper epoch and boot `complete_evidence` is certified by.
+fn dispatched() -> Dispatched {
+    Dispatched {
+        helper_epoch: Id128::parse("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap(),
+        boot_id: Id128::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+    }
+}
+
+/// C4 adversarial review HIGH 1: a fact is the dispatch's only if the helper epoch and
+/// boot it was dispatched under certified it; the adapter's reply check binds the epoch.
+#[test]
+fn evidence_is_bound_to_the_dispatching_helper_epoch_and_boot() {
+    let b = binding();
+    let sealed = complete_evidence().seal().unwrap();
+    let d = dispatched();
+    assert!(sealed.verify_complete(&b, d).is_ok());
+    for wrong in [
+        Dispatched {
+            helper_epoch: Id128::random(),
+            ..d
+        },
+        Dispatched {
+            boot_id: Id128::random(),
+            ..d
+        },
+        Dispatched {
+            helper_epoch: Id128::random(),
+            boot_id: Id128::random(),
+        },
+    ] {
+        assert!(sealed.verify_complete(&b, wrong).is_err(), "{wrong:?}");
+    }
+    assert!(sealed.verify_complete_reply(&b, d.helper_epoch).is_ok());
+    assert!(sealed.verify_complete_reply(&b, Id128::random()).is_err());
 }
 
 /// Reproduced by an independent Python encoder (`hashlib.sha256(domain + b"\0" + bytes)`).
@@ -219,25 +255,25 @@ const EVIDENCE_GOLDEN_ID: &str = "6c415b9f3ff66060f95e95e69539d5694f96eec0c8d772
 fn evidence_is_accepted_only_for_what_was_dispatched() {
     let b = binding();
     let sealed = complete_evidence().seal().unwrap();
-    assert!(sealed.verify_complete(&b).is_ok());
+    assert!(sealed.verify_complete(&b, dispatched()).is_ok());
     let mut other = b.clone();
     other.target.generation = 2;
-    assert!(sealed.verify_complete(&other).is_err());
+    assert!(sealed.verify_complete(&other, dispatched()).is_err());
     let mut other = b.clone();
     other.operation = Id128::random();
-    assert!(sealed.verify_complete(&other).is_err());
+    assert!(sealed.verify_complete(&other, dispatched()).is_err());
     let mut other = b.clone();
     other.source = "fedcba9876543210".into();
-    assert!(sealed.verify_complete(&other).is_err());
+    assert!(sealed.verify_complete(&other, dispatched()).is_err());
     let mut other = b.clone();
     other.limit_bytes = 2 << 30;
-    assert!(sealed.verify_complete(&other).is_err());
+    assert!(sealed.verify_complete(&other, dispatched()).is_err());
     let mut other = b.clone();
     other.target.checkpoint = CheckpointId::random();
-    assert!(sealed.verify_complete(&other).is_err());
+    assert!(sealed.verify_complete(&other, dispatched()).is_err());
     let mut other = b.clone();
     other.target.instance = Id128::random();
-    assert!(sealed.verify_complete(&other).is_err());
+    assert!(sealed.verify_complete(&other, dispatched()).is_err());
     // The right artifact and nonce, the wrong kind of fact.
     for kind in ["absent", "reader_ended"] {
         assert!(
@@ -246,6 +282,8 @@ fn evidence_is_accepted_only_for_what_was_dispatched() {
                     target: &b.target,
                     operation: b.operation,
                     kind,
+                    helper_epoch: dispatched().helper_epoch,
+                    boot_id: dispatched().boot_id,
                 })
                 .is_err()
         );
@@ -255,7 +293,12 @@ fn evidence_is_accepted_only_for_what_was_dispatched() {
     if let Fact::Complete(fact) = &mut bad.fact {
         fact.charge_bytes = fact.limit_bytes + 1;
     }
-    assert!(bad.seal().unwrap().verify_complete(&b).is_err());
+    assert!(
+        bad.seal()
+            .unwrap()
+            .verify_complete(&b, dispatched())
+            .is_err()
+    );
 }
 
 fn epoch() -> Id128 {
