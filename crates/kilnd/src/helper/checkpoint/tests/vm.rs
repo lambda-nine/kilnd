@@ -12,15 +12,21 @@ use super::super::*;
 use crate::model::Id128;
 use std::process::Command;
 
-const KILN: &str = "/usr/local/bin/kiln";
+/// The installed kiln, unless `KILND_C3_KILN` names another (a guest-built kiln on
+/// the VM, so nothing needs installing). Test-only: the helper itself takes its kiln
+/// from root's command line.
+fn kiln_bin() -> String {
+    std::env::var("KILND_C3_KILN").unwrap_or_else(|_| "/usr/local/bin/kiln".into())
+}
 const RUNS: &str = "/var/lib/kiln/runs";
 const CPS: &str = "/var/lib/kiln/runs/.checkpoints";
 const IMAGES: &str = "/var/lib/kiln/images";
 const REGISTRY: &str = "/var/lib/kiln/image-registry";
 const CHILD: &str = "KILND_C3_VM_CHILD";
+const REMOVE_CHILD: &str = "KILND_C3_VM_REMOVE_CHILD";
 
 fn kiln(args: &[&str]) -> std::process::Output {
-    Command::new(KILN).args(args).output().unwrap()
+    Command::new(kiln_bin()).args(args).output().unwrap()
 }
 
 struct Scene {
@@ -159,7 +165,7 @@ impl Drop for Scene {
 }
 
 fn new_node() -> Arc<Node> {
-    Node::new(Arc::new(KilnWorkers::new(KILN.into()))).unwrap()
+    Node::new(Arc::new(KilnWorkers::new(kiln_bin().into()))).unwrap()
 }
 
 async fn call(
@@ -246,6 +252,124 @@ fn c3_vm_child() {
         });
 }
 
+/// A fresh helper process that removes the target named in the environment and
+/// prints its reply.
+#[test]
+#[ignore = "a child of c3_vm_generation_checked_removal, not a test by itself"]
+fn c3_vm_remove_child() {
+    let Ok(spec) = std::env::var(REMOVE_CHILD) else {
+        return;
+    };
+    let target: ArtifactTarget = serde_json::from_str(&spec).unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let node = new_node();
+            let reply = call(
+                &node,
+                CheckpointOperation::Remove {
+                    target,
+                    operation: Id128::random(),
+                },
+                60,
+            )
+            .await;
+            println!(
+                "C3 REMOVE CHILD REPLY {}",
+                serde_json::to_string(&reply).unwrap()
+            );
+            node.shutdown().await;
+        });
+}
+
+fn child(test: &str, var: &str, value: String) -> String {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("helper::checkpoint::tests::vm::{test}"),
+            "--include-ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(var, value)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{test}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Adversarial review H1 against real kiln: one helper process publishes generation
+/// 1, a fresh one is asked to remove generation 2. kiln refuses the other generation,
+/// the artifact stays verifiable, and nothing is sealed ABSENT; generation 1's own
+/// removal then is.
+#[test]
+#[ignore = "root on the prepared VM with a generation-checking kiln (KILND_C3_KILN)"]
+fn c3_vm_generation_checked_removal() {
+    let mut scene = Scene::new();
+    let source = scene.create("256M");
+    assert_eq!(
+        scene
+            .sh(&source, "echo generation-one > /workspace/generation")
+            .0,
+        0
+    );
+    let one = scene.target(62);
+    child(
+        "c3_vm_child",
+        CHILD,
+        serde_json::to_string(&binding(&one, &source, 64 << 20)).unwrap(),
+    );
+    let inspect = || {
+        kiln(&[
+            "checkpoint",
+            "inspect",
+            &format!("--instance={}", one.instance),
+            &format!("--checkpoint={}", one.checkpoint),
+            "--verify",
+        ])
+    };
+    let before = inspect();
+    assert!(before.status.success(), "{before:?}");
+    assert!(String::from_utf8_lossy(&before.stdout).contains("generation 1\n"));
+    let two = ArtifactTarget {
+        generation: 2,
+        ..one.clone()
+    };
+    let out = child(
+        "c3_vm_remove_child",
+        REMOVE_CHILD,
+        serde_json::to_string(&two).unwrap(),
+    );
+    eprintln!("C3 VM generation-2 removal in a fresh helper: {out}");
+    assert!(
+        out.contains(r#""retained":{"reason":"checkpoint_generation_mismatch""#),
+        "{out}"
+    );
+    assert!(!out.contains(r#""absent""#), "{out}");
+    let after = inspect();
+    assert!(
+        after.status.success(),
+        "generation 1 was removed: {after:?}"
+    );
+    assert!(String::from_utf8_lossy(&after.stdout).contains("generation 1\n"));
+    let out = child(
+        "c3_vm_remove_child",
+        REMOVE_CHILD,
+        serde_json::to_string(&one).unwrap(),
+    );
+    eprintln!("C3 VM generation-1 removal in a fresh helper: {out}");
+    assert!(
+        out.contains(r#""absent":{"evidence""#) && out.contains(r#""existed":true"#),
+        "{out}"
+    );
+    assert!(!inspect().status.success());
+    scene.remove(&source);
+    drop(scene);
+    eprintln!("C3 VM H1 PASS");
+}
+
 #[test]
 #[ignore = "root on the prepared VM with kiln's checkpoint format installed"]
 fn c3_vm_checkpoint_group() {
@@ -310,7 +434,7 @@ async fn run() {
     );
 
     // 2. Busy source: a running command makes kiln refuse the lease, typed.
-    let mut running = Command::new(KILN)
+    let mut running = Command::new(kiln_bin())
         .args(["exec", &source, "sleep", "4"])
         .spawn()
         .unwrap();

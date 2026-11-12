@@ -536,14 +536,27 @@ impl KilnArgs {
         Ok(Self(args))
     }
 
-    /// `checkpoint rm --instance=I --checkpoint=C`.
-    pub fn checkpoint_rm(instance: &str, checkpoint: &str) -> io::Result<Self> {
+    /// `checkpoint rm --instance=I --checkpoint=C --generation=G`: kiln removes only that
+    /// capture generation and refuses another one published under the name.
+    pub fn checkpoint_rm(instance: &str, checkpoint: &str, generation: u64) -> io::Result<Self> {
+        if generation == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint generation must be nonzero",
+            ));
+        }
         Ok(Self(vec![
             "checkpoint".into(),
             "rm".into(),
             format!("--instance={}", checkpoint_instance(instance)?),
             format!("--checkpoint={}", checkpoint_id(checkpoint)?),
+            format!("--generation={generation}"),
         ]))
+    }
+
+    /// `checkpoint rm --help`: whether the installed kiln checks generations.
+    pub fn checkpoint_rm_help() -> Self {
+        Self(vec!["checkpoint".into(), "rm".into(), "--help".into()])
     }
 
     /// `checkpoint ls`: the whole artifact namespace, removing nothing.

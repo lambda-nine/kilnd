@@ -34,6 +34,8 @@ ART=os.path.join(D,'art')
 art=lambda i,c: os.path.join(ART,i+'_'+c)
 if a[:1]==['capabilities']:
     os.write(1,bytes.fromhex('{CAPS_WITH_LEASE}')); sys.exit(0)
+if a==['checkpoint','rm','--help']:
+    print('Usage: kiln checkpoint rm --instance <I> --checkpoint <C>' + ('' if mode()=='oldkiln' else ' [--generation <G>]')); sys.exit(0)
 if a==['gc','--help']:
     print('Usage: kiln gc [ID]...'); sys.exit(0)
 if a[:2]==['checkpoint','capture']:
@@ -350,6 +352,24 @@ async fn a_cancelled_waiter_gets_pending_and_the_outcome_settles() {
         settled.as_deref(),
         Some(CheckpointResponse::Captured(r)) if matches!(r.as_ref(), CaptureReply::Complete { .. })
     ));
+    helper.stop().await;
+}
+
+/// A kiln whose removal can't check generations is not supported at all.
+#[tokio::test]
+async fn a_kiln_without_generation_checked_removal_is_unsupported() {
+    let helper = helper(true).await;
+    helper.mode("oldkiln");
+    match helper
+        .call(None, CheckpointOperation::Capabilities, 5)
+        .await
+    {
+        CheckpointResponse::Capabilities(caps) => {
+            assert!(caps.enabled && !caps.supported, "{caps:?}");
+            assert!(caps.unsupported_reason.unwrap().contains("generations"));
+        }
+        other => panic!("{other:?}"),
+    }
     helper.stop().await;
 }
 

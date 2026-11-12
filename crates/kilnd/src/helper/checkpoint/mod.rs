@@ -150,7 +150,10 @@ impl State {
         });
     }
 
-    /// The artifact's entry, created on first use, refusing another generation.
+    /// The artifact's entry, created on first use, refusing another generation while
+    /// this epoch tracks it. That is only a fast refusal: idle entries are pruned and a
+    /// new epoch starts empty, so the binding is kiln's own check of the generation
+    /// recorded in the artifact (inspect's record, and generation-checked removal).
     fn artifact(&mut self, target: &ArtifactTarget) -> Result<&mut Artifact, CheckpointError> {
         let tracked = self.artifacts.len();
         let artifact = match self.artifacts.entry(key(target)) {
@@ -771,13 +774,16 @@ impl Node {
             let key = key(&target);
             match state.prior(nonce, &key) {
                 Some(Prior::Replay(reply)) => return Err(reply),
-                Some(Prior::Join) => return Ok(false),
+                Some(Prior::Join) => return Ok(None),
                 Some(Prior::Refused(e)) => return Err(CheckpointResponse::Error(e)),
                 None => {}
             }
             state
                 .room_for_operation()
                 .map_err(CheckpointResponse::Error)?;
+            // Whether this epoch knew the artifact. If it didn't, nothing of it runs here,
+            // and a removal kiln refuses as another generation takes its tombstone back.
+            let fresh = !state.artifacts.contains_key(&key);
             let artifact = state.artifact(&target).map_err(CheckpointResponse::Error)?;
             if artifact.removing.is_some() {
                 return Err(error(
@@ -785,6 +791,18 @@ impl Node {
                     "another removal of this checkpoint is running",
                 ));
             }
+            // Like every lane, cleanup refuses at once when full, before any state
+            // changes. The slot is held until the removal settles.
+            let Ok(slot) = self.cleanup.clone().try_acquire_owned() else {
+                return Err(error(
+                    CheckpointErrorKind::Workers,
+                    "every cleanup worker is busy",
+                ));
+            };
+            let artifact = state
+                .artifacts
+                .get_mut(&key)
+                .expect("the artifact entry was just made");
             // D1: the tombstone first, then cancellation. From here nothing can start
             // on this artifact, and a capture settling later is never COMPLETE.
             artifact.tombstone = Some(Tombstone {
@@ -800,20 +818,35 @@ impl Node {
             }
             artifact.removing = Some(nonce);
             state.active.insert(nonce, key);
-            Ok(true)
+            Ok(Some((slot, fresh)))
         })();
         match admitted {
             Err(reply) => return reply,
-            Ok(false) => {}
-            Ok(true) => {
+            Ok(None) => {}
+            Ok(Some((slot, fresh))) => {
                 let node = self.clone();
                 let target = target.clone();
                 self.tasks.spawn(async move {
                     let reply = node.run_remove(&target, nonce, deadline).await;
+                    // Held through cancellation, every reap, kiln's removal, the listing
+                    // and the process table.
+                    drop(slot);
                     let mut state = node.lock();
                     let key = key(&target);
+                    let mismatch = matches!(
+                        reply,
+                        RemoveReply::Retained {
+                            reason: Reason::GenerationMismatch,
+                            ..
+                        }
+                    );
                     if let Some(artifact) = state.artifacts.get_mut(&key) {
                         artifact.removing = None;
+                        // The name holds another generation, untouched: this removal's
+                        // tombstone would only block that generation's own operations.
+                        if mismatch && fresh {
+                            artifact.tombstone = None;
+                        }
                     }
                     state.settle(nonce, key, CheckpointResponse::Removed(Box::new(reply)));
                     drop(state);
@@ -855,14 +888,13 @@ impl Node {
                 }
             }
         }
-        let _slot =
-            match tokio::time::timeout_at(deadline, self.cleanup.clone().acquire_owned()).await {
-                Ok(Ok(slot)) => slot,
-                _ => return retained(Reason::Workers, "no cleanup worker became free"),
-            };
         let cancel = self.shutdown.child_token();
         let instance = target.instance.to_string();
-        let Ok(args) = KilnArgs::checkpoint_rm(&instance, target.checkpoint.as_str()) else {
+        // kiln checks the generation under the artifact's exclusive lock: the helper's
+        // memory of it is only a fast refusal, never the binding.
+        let Ok(args) =
+            KilnArgs::checkpoint_rm(&instance, target.checkpoint.as_str(), target.generation)
+        else {
             return retained(Reason::InvalidRequest, "invalid removal arguments");
         };
         let existed = match self.workers.run(args, deadline, cancel.clone()).await {
@@ -878,16 +910,25 @@ impl Node {
                         .unwrap_or((Reason::Io, "malformed failure record".into()));
                     return RemoveReply::Retained { reason, detail };
                 }
-                _ => return retained(Reason::Io, "kiln checkpoint rm did not finish"),
+                // An older kiln refuses `--generation` as a usage error, removing nothing.
+                Some(_) => {
+                    return retained(
+                        Reason::Io,
+                        "kiln checkpoint rm refused its arguments (a kiln without generation-checked removal?)",
+                    );
+                }
+                None => return retained(Reason::Io, "kiln checkpoint rm did not finish"),
             },
             Err(_) => return retained(Reason::Io, "kiln checkpoint rm could not be started"),
         };
-        // The namespace must list nothing of it: no artifact, staging or removal.
+        // The namespace must list nothing of this generation: no artifact, and no
+        // staging or removal whose name doesn't prove another generation.
         match self.listing(&cancel, deadline).await {
             Ok(lines)
                 if lines.iter().any(|l| {
                     l.instance == Some(target.instance)
                         && l.checkpoint().as_ref() == Some(&target.checkpoint)
+                        && l.generation().is_none_or(|g| g == target.generation)
                 }) =>
             {
                 return retained(Reason::Io, "the namespace still lists this checkpoint");

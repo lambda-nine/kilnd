@@ -146,6 +146,10 @@ pub enum Reason {
     DiskTooSmall,
     #[serde(rename = "checkpoint_corrupt")]
     Corrupt,
+    /// kiln's generation-checked removal found another generation published
+    /// under the name, and removed nothing.
+    #[serde(rename = "checkpoint_generation_mismatch")]
+    GenerationMismatch,
     #[serde(rename = "checkpoint_io")]
     Io,
     #[serde(rename = "checkpoint_workers")]
@@ -155,7 +159,7 @@ pub enum Reason {
 }
 
 impl Reason {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::SandboxUnsupported,
         Self::Busy,
         Self::LayoutUnsupported,
@@ -165,6 +169,7 @@ impl Reason {
         Self::SpecMismatch,
         Self::DiskTooSmall,
         Self::Corrupt,
+        Self::GenerationMismatch,
         Self::Io,
         Self::Workers,
         Self::InvalidRequest,
@@ -181,6 +186,7 @@ impl Reason {
             Self::SpecMismatch => "checkpoint_spec_mismatch",
             Self::DiskTooSmall => "checkpoint_disk_too_small",
             Self::Corrupt => "checkpoint_corrupt",
+            Self::GenerationMismatch => "checkpoint_generation_mismatch",
             Self::Io => "checkpoint_io",
             Self::Workers => "checkpoint_workers",
             Self::InvalidRequest => "invalid_request",

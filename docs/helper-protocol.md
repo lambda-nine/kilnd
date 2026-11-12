@@ -331,7 +331,7 @@ before its future returns).
 | `capture {binding}` | 300 s | copy | `kiln checkpoint capture` for `{target, operation nonce, source backend, R}`: `complete {evidence}`, `failed {reason, detail}` or `pending` |
 | `restore {target, content_sha256, reader, spec}` | 300 s | copy | `kiln checkpoint inspect` (same generation and content digest), then `kiln create --from-checkpoint`: `created`, `not_created` or `ambiguous`, each with the reader's evidence |
 | `inspect {target, verify, operation?}` | 30 s (300 s with `verify`) | cleanup (copy) | The namespace's view of the artifact, this epoch's activity on it, and an operation nonce's state |
-| `remove {target, operation}` | 60 s | cleanup | Tombstone, cancel, wait for every reap, `kiln checkpoint rm`, then the absence checks: `absent {evidence}`, `retained {reason, detail}` or `pending` |
+| `remove {target, operation}` | 60 s | cleanup | Reserve a cleanup slot (or refuse `workers`), tombstone, cancel, wait for every reap, generation-checked `kiln checkpoint rm --generation`, then the absence checks: `absent {evidence}`, `retained {reason, detail}` or `pending` |
 | `inventory {instance}` | 30 s | cleanup | That instance's artifacts, partial captures and removals, tracked operations and untracked workers |
 | `acknowledge {target, operation}` | 5 s | recovery | The daemon stored that operation's evidence |
 
@@ -359,9 +359,18 @@ decides otherwise.
 every admission takes), then cancels its capture and readers. From then on nothing can
 capture, restore or inspect it in this epoch, and a capture that settles afterwards is
 `failed`, even if its worker exited 0. Only once every worker of the artifact was reaped
-does `kiln checkpoint rm` run on the cleanup lane; then `kiln checkpoint ls` must list
-nothing of it (no artifact, staging or removal), and the process table must show no
-process whose arguments name it. Only then is it `absent`. A restored sandbox's shim
+does `kiln checkpoint rm --generation G` run, on the cleanup slot the removal reserved at
+admission (a full cleanup lane refuses the removal with `workers` before any state
+changes). kiln reads the published header under its exclusive lock: another generation
+under the name is `retained {checkpoint_generation_mismatch}`, nothing is removed, and a
+tombstone this epoch made only for that removal is taken back. The helper's memory of an
+artifact's generation is only a fast refusal while it tracks the artifact; kiln's check is
+the binding, so a forgotten or restarted epoch can't remove another generation. Then
+`kiln checkpoint ls` must list nothing of this generation (no artifact, and no staging or
+removal whose name doesn't prove another generation), and the process table must show no
+process whose arguments name it. Only then is it `absent`. A kiln whose `rm` refuses
+`--generation` gets `retained {checkpoint_io}`, and `capabilities` reports it
+unsupported. A restored sandbox's shim
 (a session leader) does not count: while restoring it holds the artifact's lock, which
 keeps kiln's removal busy, and it never reads the artifact again. The tombstone stays
 until its last worker has been quiet for 300 seconds (the longest request validity) and

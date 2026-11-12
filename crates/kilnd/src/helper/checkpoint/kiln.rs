@@ -109,7 +109,27 @@ impl Workers for KilnWorkers {
             .await
             .map_err(|e| format!("kiln checkpoint ls: {e}"))?;
             let text = success_stdout(&out).ok_or("kiln checkpoint ls failed")?;
-            parse_inventory(text).map(|_| ())
+            parse_inventory(text)?;
+            // Removal must be generation-checked: an older kiln would delete any
+            // generation published under the name.
+            let out = process::run(
+                &process::Request {
+                    tool: process::Tool::Kiln {
+                        bin: &bin,
+                        args: &KilnArgs::checkpoint_rm_help(),
+                    },
+                    stdin: b"",
+                    deadline,
+                    max_output: WORKER_OUTPUT,
+                },
+                &cancel,
+            )
+            .await
+            .map_err(|e| format!("kiln checkpoint rm --help: {e}"))?;
+            match success_stdout(&out) {
+                Some(help) if help.contains("--generation") => Ok(()),
+                _ => Err("the installed kiln's checkpoint rm does not check generations".into()),
+            }
         })
     }
 }
@@ -161,6 +181,26 @@ pub struct InventoryLine {
 }
 
 impl InventoryLine {
+    /// The capture generation a staging or removal entry's name records:
+    /// `.staging-C-G-nonce` and `.removing-C-G-pid-n`. None for a published artifact
+    /// (its header holds it), an older kiln's `.removing-C-pid-n`, or `G` 0 (unknown).
+    pub fn generation(&self) -> Option<u64> {
+        let rest = match self.kind? {
+            ItemKind::Published => return None,
+            ItemKind::Staging => self.name.strip_prefix(".staging-")?.get(36..)?,
+            ItemKind::Removing => self.name.strip_prefix(".removing-")?.get(36..)?,
+        };
+        let parts: Vec<&str> = rest.split('-').collect();
+        let generation = match (self.kind?, parts.as_slice()) {
+            (ItemKind::Staging, [g, _]) | (ItemKind::Removing, [g, _, _]) => *g,
+            _ => return None,
+        };
+        if generation.is_empty() || !generation.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        generation.parse().ok().filter(|g| *g != 0)
+    }
+
     /// The checkpoint a published, staging or removal entry belongs to.
     pub fn checkpoint(&self) -> Option<CheckpointId> {
         let id = match self.kind? {

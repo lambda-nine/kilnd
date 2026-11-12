@@ -38,6 +38,10 @@ enum Act {
     /// Never resolves: a worker stuck in the kernel.
     Unkillable,
     SpawnError,
+    /// kiln's removal of what the fake has published: generation-checked with
+    /// `--generation`, as kiln from this milestone; every generation without it, as
+    /// kiln `d2d125a`.
+    Rm,
 }
 
 #[derive(Default)]
@@ -46,6 +50,9 @@ struct Fake {
     events: Mutex<Vec<String>>,
     /// `None`: the process table cannot be read.
     processes: Mutex<Option<Vec<ProcessArgs>>>,
+    /// Published artifacts by checkpoint ID, and their generations: what a capture
+    /// published and a removal took.
+    published: Mutex<HashMap<String, u64>>,
 }
 
 fn kind(argv: &[String]) -> &'static str {
@@ -108,14 +115,7 @@ impl Fake {
             let mut d = fake.defaults.lock().unwrap();
             d.insert("capture", Act::Echo);
             d.insert("inspect", Act::Echo);
-            d.insert(
-                "rm",
-                Act::Exit(
-                    0,
-                    "kiln-checkpoint-removed 1\nexisted yes\n".into(),
-                    "".into(),
-                ),
-            );
+            d.insert("rm", Act::Rm);
             d.insert(
                 "ls",
                 Act::Exit(0, "kiln-checkpoint-inventory 1\n".into(), "".into()),
@@ -177,7 +177,39 @@ fn play(
     Box::pin(async move {
         let result = match act {
             Act::Exit(code, out, err) => Ok(exited(code, &out, &err)),
-            Act::Echo => Ok(echo(&argv)),
+            Act::Echo => {
+                if kind == "capture" {
+                    let generation = flag(&argv, "--generation").unwrap().parse().unwrap();
+                    fake.published
+                        .lock()
+                        .unwrap()
+                        .insert(flag(&argv, "--checkpoint").unwrap(), generation);
+                }
+                Ok(echo(&argv))
+            }
+            Act::Rm => {
+                let checkpoint = flag(&argv, "--checkpoint").unwrap();
+                let wanted: Option<u64> = flag(&argv, "--generation").map(|g| g.parse().unwrap());
+                let mut published = fake.published.lock().unwrap();
+                match (published.get(&checkpoint).copied(), wanted) {
+                    (Some(seen), Some(wanted)) if seen != wanted => Ok(exited(
+                        125,
+                        &format!(
+                            "kiln-checkpoint-failure 1\nreason checkpoint_generation_mismatch\ndetail the published checkpoint is generation {seen}, not {wanted}; nothing was removed\n"
+                        ),
+                        "",
+                    )),
+                    (seen, _) => {
+                        published.remove(&checkpoint);
+                        let existed = if seen.is_some() { "yes" } else { "no" };
+                        Ok(exited(
+                            0,
+                            &format!("kiln-checkpoint-removed 1\nexisted {existed}\n"),
+                            "",
+                        ))
+                    }
+                }
+            }
             Act::SpawnError => Err(io::Error::other("spawn failed")),
             Act::Unkillable => std::future::pending().await,
             Act::Gated(gate, then) => {
@@ -1244,7 +1276,14 @@ fn the_kiln_adapter_parses_strictly() {
     // The worker arguments are typed: nothing malformed reaches kiln.
     assert!(KilnArgs::checkpoint_capture(i, c, 0, 1 << 30, "ab").is_err());
     assert!(KilnArgs::checkpoint_capture("x", c, 1, 1 << 30, "ab").is_err());
-    assert!(KilnArgs::checkpoint_rm(i, "cp-../../etc").is_err());
+    assert!(KilnArgs::checkpoint_rm(i, "cp-../../etc", 1).is_err());
+    assert!(KilnArgs::checkpoint_rm(i, c, 0).is_err());
+    assert!(
+        KilnArgs::checkpoint_rm(i, c, 7)
+            .unwrap()
+            .as_slice()
+            .ends_with(&["--generation=7".to_string()])
+    );
     assert!(
         KilnArgs::checkpoint_inspect(i, c, true)
             .unwrap()
@@ -1252,6 +1291,222 @@ fn the_kiln_adapter_parses_strictly() {
             .ends_with(&["--verify".to_string()])
     );
     assert!(KilnArgs::checkpoint_capture(i, c, 1, 1 << 30, "--ab").is_err());
+}
+
+fn generation(target: &ArtifactTarget, generation: u64) -> ArtifactTarget {
+    ArtifactTarget {
+        generation,
+        ..target.clone()
+    }
+}
+
+fn mismatch(reply: &CheckpointResponse) -> bool {
+    matches!(
+        removed(reply),
+        RemoveReply::Retained {
+            reason: Reason::GenerationMismatch,
+            ..
+        }
+    )
+}
+
+/// Adversarial review H1, after idle pruning: the helper has forgotten generation 1,
+/// and a removal naming generation 2 must leave it published and seal nothing.
+#[tokio::test]
+async fn h1_a_removal_of_another_generation_after_pruning_touches_nothing() {
+    let (node, fake) = setup();
+    let b = binding();
+    assert!(matches!(
+        captured(&call(&node, capture(&b)).await),
+        CaptureReply::Complete { .. }
+    ));
+    // Idle: the next lock prunes it.
+    assert!(node.lock().artifacts.is_empty());
+    let reply = call(&node, remove(&generation(&target(), 2), Id128::random())).await;
+    assert!(mismatch(&reply), "{reply:?}");
+    assert!(fake.argv("rm").contains(&"--generation=2".to_string()));
+    assert_eq!(fake.published.lock().unwrap().get(CHECKPOINT), Some(&1));
+    // The mismatch took its tombstone back: generation 1's own removal proceeds.
+    let reply = call(&node, remove(&target(), Id128::random())).await;
+    match removed(&reply) {
+        RemoveReply::Absent { evidence } => {
+            assert_eq!(evidence.evidence.generation, 1);
+            assert_eq!(evidence.evidence.fact, Fact::Absent { existed: true });
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fake.published.lock().unwrap().is_empty());
+}
+
+/// Adversarial review H1, after a restart: a fresh helper epoch knows nothing of the
+/// generation the earlier one published.
+#[tokio::test]
+async fn h1_a_fresh_epoch_cannot_remove_another_generation() {
+    let fake = Fake::new();
+    let first = Node::new(Arc::new(Workers(fake.clone()))).unwrap();
+    assert!(matches!(
+        captured(&call(&first, capture(&binding())).await),
+        CaptureReply::Complete { .. }
+    ));
+    let restarted = Node::new(Arc::new(Workers(fake.clone()))).unwrap();
+    assert_ne!(restarted.epoch(), first.epoch());
+    let reply = call(
+        &restarted,
+        remove(&generation(&target(), 2), Id128::random()),
+    )
+    .await;
+    assert!(mismatch(&reply), "{reply:?}");
+    assert_eq!(fake.published.lock().unwrap().get(CHECKPOINT), Some(&1));
+    // While its removal of the other generation runs, generation 1 is not tombstoned.
+    assert!(
+        restarted
+            .lock()
+            .artifacts
+            .get(&key(&target()))
+            .is_none_or(|a| a.tombstone.is_none())
+    );
+    assert!(matches!(
+        removed(&call(&restarted, remove(&target(), Id128::random())).await),
+        RemoveReply::Absent { .. }
+    ));
+}
+
+/// A kiln without generation-checked removal refuses the flag as a usage error: the
+/// helper reports a typed failure and certifies nothing.
+#[tokio::test]
+async fn h1_an_older_kiln_fails_closed() {
+    let (node, fake) = setup();
+    fake.set(
+        "rm",
+        Act::Exit(
+            2,
+            "".into(),
+            "error: unexpected argument '--generation' found\n".into(),
+        ),
+    );
+    let reply = call(&node, remove(&target(), Id128::random())).await;
+    match removed(&reply) {
+        RemoveReply::Retained { reason, detail } => {
+            assert_eq!(*reason, Reason::Io);
+            assert!(detail.contains("generation"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fake.starts("ls"), 0);
+}
+
+/// Absence of one generation ignores another generation's staging, never its own.
+#[tokio::test]
+async fn the_absence_check_reads_generations_from_names() {
+    for (leftover, absent) in [
+        (
+            format!("staging {INSTANCE} .staging-{CHECKPOINT}-1-00000000000000aa"),
+            true,
+        ),
+        (
+            format!("removing {INSTANCE} .removing-{CHECKPOINT}-1-77-0"),
+            true,
+        ),
+        (
+            format!("staging {INSTANCE} .staging-{CHECKPOINT}-2-00000000000000aa"),
+            false,
+        ),
+        (
+            format!("removing {INSTANCE} .removing-{CHECKPOINT}-2-77-0"),
+            false,
+        ),
+        // An older kiln's or an unknown generation's removal: it may be this one.
+        (
+            format!("removing {INSTANCE} .removing-{CHECKPOINT}-77-0"),
+            false,
+        ),
+        (
+            format!("removing {INSTANCE} .removing-{CHECKPOINT}-0-77-0"),
+            false,
+        ),
+    ] {
+        let (node, fake) = setup();
+        fake.set(
+            "ls",
+            Act::Exit(
+                0,
+                format!("kiln-checkpoint-inventory 1\n{leftover}\n"),
+                "".into(),
+            ),
+        );
+        let reply = call(&node, remove(&generation(&target(), 2), Id128::random())).await;
+        assert_eq!(
+            matches!(removed(&reply), RemoveReply::Absent { .. }),
+            absent,
+            "{leftover}: {reply:?}"
+        );
+    }
+}
+
+/// Adversarial review M1: a full cleanup lane refuses a removal at once, with no
+/// tombstone, cancellation or task.
+#[tokio::test]
+async fn m1_a_full_cleanup_lane_refuses_removal_without_changing_anything() {
+    let (node, fake) = setup();
+    fake.set("capture", Act::Gated(Gate::new(), Box::new(Act::Echo)));
+    let b = binding();
+    let capturing = spawn_call(&node, capture(&b));
+    until(|| fake.starts("capture") == 1).await;
+    let held: Vec<_> = (0..CLEANUP_WORKERS)
+        .map(|_| node.cleanup.clone().try_acquire_owned().unwrap())
+        .collect();
+    let started = Instant::now();
+    let reply = call(&node, remove(&target(), Id128::random())).await;
+    assert_eq!(error_kind(&reply), CheckpointErrorKind::Workers);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    {
+        let state = node.lock();
+        let artifact = state.artifacts.get(&key(&target())).unwrap();
+        assert!(artifact.tombstone.is_none() && artifact.removing.is_none());
+        assert!(
+            artifact
+                .capture
+                .as_ref()
+                .is_some_and(|c| !c.cancel.is_cancelled())
+        );
+    }
+    assert_eq!(fake.starts("rm"), 0);
+    drop(held);
+    // With a slot free it runs, and holds the slot until it settles.
+    let removing = spawn_call(&node, remove(&target(), Id128::random()));
+    assert!(matches!(
+        captured(&capturing.await.unwrap()),
+        CaptureReply::Failed { .. }
+    ));
+    assert!(matches!(
+        removed(&removing.await.unwrap()),
+        RemoveReply::Absent { .. }
+    ));
+    assert_eq!(node.cleanup.available_permits(), CLEANUP_WORKERS);
+}
+
+#[test]
+fn inventory_names_carry_their_generation() {
+    let line = |kind, name: String| kiln::InventoryLine {
+        kind: Some(kind),
+        instance: Some(target().instance),
+        name,
+    };
+    let c = CHECKPOINT;
+    for (kind, name, expected) in [
+        (
+            ItemKind::Staging,
+            format!(".staging-{c}-12-00000000000000aa"),
+            Some(12),
+        ),
+        (ItemKind::Removing, format!(".removing-{c}-3-77-0"), Some(3)),
+        (ItemKind::Removing, format!(".removing-{c}-0-77-0"), None),
+        (ItemKind::Removing, format!(".removing-{c}-77-0"), None),
+        (ItemKind::Staging, format!(".staging-{c}-x-00"), None),
+        (ItemKind::Published, c.to_string(), None),
+    ] {
+        assert_eq!(line(kind, name.clone()).generation(), expected, "{name}");
+    }
 }
 
 #[cfg(test)]

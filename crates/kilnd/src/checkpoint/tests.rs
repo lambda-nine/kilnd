@@ -124,11 +124,11 @@ fn the_kiln_record_parser_is_strict() {
         text.replace("instance ", "instance  "),
         text.replace("kiln-checkpoint-record 1", "kiln-checkpoint-record 2"),
         text.replace("logical-bytes", "logical_bytes"),
-        text.replace("\nentries 3\nlogical-bytes 4096", "\nlogical-bytes 4096\nentries 3"),
         text.replace(
-            "limit-bytes 1073741824",
-            "limit-bytes 18446744073709551616",
+            "\nentries 3\nlogical-bytes 4096",
+            "\nlogical-bytes 4096\nentries 3",
         ),
+        text.replace("limit-bytes 1073741824", "limit-bytes 18446744073709551616"),
     ];
     for bad in mutations {
         assert!(ArtifactRecord::parse(&bad).is_err(), "{bad:?}");
@@ -143,8 +143,10 @@ fn failure_records_keep_only_known_tokens() {
         (Reason::Busy, "held".into())
     );
     assert_eq!(
-        parse("kiln-checkpoint-failure 1\nreason sandbox_unsupported:workspace_checkpoint\ndetail \n")
-            .unwrap(),
+        parse(
+            "kiln-checkpoint-failure 1\nreason sandbox_unsupported:workspace_checkpoint\ndetail \n"
+        )
+        .unwrap(),
         (Reason::SandboxUnsupported, String::new())
     );
     // An unknown token never becomes a more specific class.
@@ -274,7 +276,10 @@ fn replies_are_checked_against_their_requests() {
     other.operation = Id128::random();
     assert!(
         complete
-            .check(&CheckpointOperation::Capture { binding: other }, Some(epoch()))
+            .check(
+                &CheckpointOperation::Capture { binding: other },
+                Some(epoch())
+            )
             .is_err()
     );
     let remove = CheckpointOperation::Remove {
@@ -292,7 +297,11 @@ fn replies_are_checked_against_their_requests() {
         }))
     };
     assert!(absent(b.operation).check(&remove, Some(epoch())).is_ok());
-    assert!(absent(Id128::random()).check(&remove, Some(epoch())).is_err());
+    assert!(
+        absent(Id128::random())
+            .check(&remove, Some(epoch()))
+            .is_err()
+    );
     // A restore's evidence must agree with its outcome.
     let reader = Id128::random();
     let restore = CheckpointOperation::Restore {
@@ -317,8 +326,16 @@ fn replies_are_checked_against_their_requests() {
             evidence: ended(copy),
         }))
     };
-    assert!(created(CopyOutcome::Complete).check(&restore, Some(epoch())).is_ok());
-    assert!(created(CopyOutcome::Unknown).check(&restore, Some(epoch())).is_err());
+    assert!(
+        created(CopyOutcome::Complete)
+            .check(&restore, Some(epoch()))
+            .is_ok()
+    );
+    assert!(
+        created(CopyOutcome::Unknown)
+            .check(&restore, Some(epoch()))
+            .is_err()
+    );
     let not_created = CheckpointResponse::Restored(Box::new(RestoreReply::NotCreated {
         reason: Reason::SpecMismatch,
         detail: String::new(),
@@ -343,12 +360,28 @@ fn replies_are_checked_against_their_requests() {
         }))
     };
     let settled = inspected(Some(OperationState::Settled(Box::new(complete.clone()))));
-    assert!(settled.check(&inspect(Some(b.operation)), Some(epoch())).is_ok());
-    assert!(settled.check(&inspect(Some(Id128::random())), Some(epoch())).is_err());
+    assert!(
+        settled
+            .check(&inspect(Some(b.operation)), Some(epoch()))
+            .is_ok()
+    );
+    assert!(
+        settled
+            .check(&inspect(Some(Id128::random())), Some(epoch()))
+            .is_err()
+    );
     assert!(settled.check(&inspect(None), Some(epoch())).is_err());
     let pending = inspected(Some(OperationState::Settled(Box::new(
         CheckpointResponse::Captured(Box::new(CaptureReply::Pending)),
     ))));
-    assert!(pending.check(&inspect(Some(b.operation)), Some(epoch())).is_err());
-    assert!(inspected(None).check(&inspect(Some(b.operation)), Some(epoch())).is_err());
+    assert!(
+        pending
+            .check(&inspect(Some(b.operation)), Some(epoch()))
+            .is_err()
+    );
+    assert!(
+        inspected(None)
+            .check(&inspect(Some(b.operation)), Some(epoch()))
+            .is_err()
+    );
 }

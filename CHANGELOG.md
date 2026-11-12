@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix the checkpoint C3 adversarial review findings. **H1 (HIGH):** a helper that had
+  forgotten an artifact (idle pruning, or a new epoch) removed another generation's
+  published artifact and sealed ABSENT for the generation it was asked about. Removal now
+  passes `--generation` to kiln, which refuses another generation
+  (`checkpoint_generation_mismatch`) and removes nothing; the absence check reads
+  generations from staging and removal names; a kiln without generation-checked removal
+  is unsupported and its usage error is a typed failure. **M1 (MEDIUM):** removal waited
+  for a cleanup slot instead of refusing; it now reserves one at admission, or answers
+  `workers` with no state changed, and holds it until it settles.
 - Add milestone C3 of workspace checkpoints, the root helper's side: a checkpoint group
   in the helper protocol (capabilities, capture, restore, inspect, remove, inventory,
   acknowledge), off unless `kilnd-helper --enable-checkpoints`. It supervises kiln's
