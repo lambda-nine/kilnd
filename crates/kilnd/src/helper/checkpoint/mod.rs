@@ -828,9 +828,6 @@ impl Node {
                 let target = target.clone();
                 self.tasks.spawn(async move {
                     let reply = node.run_remove(&target, nonce, deadline).await;
-                    // Held through cancellation, every reap, kiln's removal, the listing
-                    // and the process table.
-                    drop(slot);
                     let mut state = node.lock();
                     let key = key(&target);
                     let mismatch = matches!(
@@ -849,6 +846,10 @@ impl Node {
                         }
                     }
                     state.settle(nonce, key, CheckpointResponse::Removed(Box::new(reply)));
+                    // Held through cancellation, every reap, kiln's removal, the listing,
+                    // the process table and this settlement; freed under the state lock,
+                    // so an admission never sees a free slot beside an unsettled removal.
+                    drop(slot);
                     drop(state);
                     node.changed.notify_waiters();
                 });
