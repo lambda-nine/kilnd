@@ -110,13 +110,20 @@ impl Fake {
             d.insert("inspect", Act::Echo);
             d.insert(
                 "rm",
-                Act::Exit(0, "kiln-checkpoint-removed 1\nexisted yes\n".into(), "".into()),
+                Act::Exit(
+                    0,
+                    "kiln-checkpoint-removed 1\nexisted yes\n".into(),
+                    "".into(),
+                ),
             );
             d.insert(
                 "ls",
                 Act::Exit(0, "kiln-checkpoint-inventory 1\n".into(), "".into()),
             );
-            d.insert("create", Act::Exit(0, "0123456789abcdef\n".into(), "".into()));
+            d.insert(
+                "create",
+                Act::Exit(0, "0123456789abcdef\n".into(), "".into()),
+            );
         }
         *fake.processes.lock().unwrap() = Some(Vec::new());
         Arc::new(fake)
@@ -191,7 +198,12 @@ fn play(
 }
 
 impl kiln::Workers for Workers {
-    fn run(&self, args: KilnArgs, deadline: Instant, cancel: CancellationToken) -> kiln::WorkerFuture {
+    fn run(
+        &self,
+        args: KilnArgs,
+        deadline: Instant,
+        cancel: CancellationToken,
+    ) -> kiln::WorkerFuture {
         let argv = args.as_slice().to_vec();
         let kind = kind(&argv);
         let act = self
@@ -420,10 +432,14 @@ async fn a_complete_capture_certifies_exactly_its_binding_and_replays() {
 
 #[tokio::test(start_paused = true)]
 async fn every_capture_without_a_valid_matching_record_fails() {
-    let failure = "kiln-checkpoint-failure 1\nreason checkpoint_metadata_unsupported\ndetail entry 7\n";
+    let failure =
+        "kiln-checkpoint-failure 1\nreason checkpoint_metadata_unsupported\ndetail entry 7\n";
     let gate = Gate::new();
     let cases = [
-        (Act::Exit(125, failure.into(), "".into()), Reason::MetadataUnsupported),
+        (
+            Act::Exit(125, failure.into(), "".into()),
+            Reason::MetadataUnsupported,
+        ),
         (Act::Exit(125, "garbage\n".into(), "".into()), Reason::Io),
         (Act::Exit(0, "garbage\n".into(), "".into()), Reason::Io),
         (Act::Exit(0, record_text(2, 1 << 30), "".into()), Reason::Io),
@@ -482,7 +498,8 @@ async fn lanes_refuse_at_once_and_cleanup_never_waits_for_copying() {
         CheckpointErrorKind::Busy
     );
     // Health, inspection, inventory and removal keep their own lane.
-    let CheckpointResponse::Capabilities(caps) = call(&node, CheckpointOperation::Capabilities).await
+    let CheckpointResponse::Capabilities(caps) =
+        call(&node, CheckpointOperation::Capabilities).await
     else {
         panic!()
     };
@@ -628,7 +645,11 @@ async fn restore_outcomes_name_the_copy_exactly() {
             CopyOutcome::NotStarted,
         ),
         (
-            Act::Exit(1, "".into(), "sandbox shim failed during setup: checkpoint_disk_too_small: full\n".into()),
+            Act::Exit(
+                1,
+                "".into(),
+                "sandbox shim failed during setup: checkpoint_disk_too_small: full\n".into(),
+            ),
             "ambiguous",
             Some(Reason::DiskTooSmall),
             CopyOutcome::Unknown,
@@ -664,7 +685,12 @@ async fn restore_outcomes_name_the_copy_exactly() {
             &format!("--from-checkpoint={INSTANCE}/{CHECKPOINT}")
         );
         // Settled: its reader lease is gone and the nonce replays.
-        assert!(node.lock().artifacts.get(&key(&target())).is_none_or(Artifact::idle));
+        assert!(
+            node.lock()
+                .artifacts
+                .get(&key(&target()))
+                .is_none_or(Artifact::idle)
+        );
         assert_eq!(call(&node, restore(&target(), reader)).await, reply);
     }
 }
@@ -678,7 +704,10 @@ async fn restore_reads_nothing_it_cannot_match() {
     let busy = "kiln-checkpoint-failure 1\nreason checkpoint_corrupt\ndetail object 3\n";
     for (act, expected) in [
         (Act::Exit(0, mismatch, "".into()), Reason::Corrupt),
-        (Act::Exit(0, record_text(2, 1 << 30), "".into()), Reason::Corrupt),
+        (
+            Act::Exit(0, record_text(2, 1 << 30), "".into()),
+            Reason::Corrupt,
+        ),
         (Act::Exit(125, busy.into(), "".into()), Reason::Corrupt),
         (Act::Exit(0, "junk".into(), "".into()), Reason::Io),
     ] {
@@ -707,13 +736,19 @@ async fn an_unkillable_worker_keeps_its_slot_and_blocks_absence() {
     let b = binding();
     let reply = call_with(&node, capture(&b), 5, &CancellationToken::new()).await;
     assert_eq!(*captured(&reply), CaptureReply::Pending);
-    let CheckpointResponse::Capabilities(caps) = call(&node, CheckpointOperation::Capabilities).await
+    let CheckpointResponse::Capabilities(caps) =
+        call(&node, CheckpointOperation::Capabilities).await
     else {
         panic!()
     };
     assert_eq!(caps.copy_workers_busy, 1);
-    let reply = call_with(&node, remove(&target(), Id128::random()), 10, &CancellationToken::new())
-        .await;
+    let reply = call_with(
+        &node,
+        remove(&target(), Id128::random()),
+        10,
+        &CancellationToken::new(),
+    )
+    .await;
     match removed(&reply) {
         RemoveReply::Retained { reason, .. } => assert_eq!(*reason, Reason::Busy),
         other => panic!("{other:?}"),
@@ -759,7 +794,14 @@ async fn untracked_processes_block_absence_until_they_are_gone() {
     let source = format!("{INSTANCE}/{CHECKPOINT}");
     fake.set_processes(Some(vec![process(
         false,
-        &["/usr/local/bin/kiln", "checkpoint", "capture", &instance, &checkpoint, "--generation=1"],
+        &[
+            "/usr/local/bin/kiln",
+            "checkpoint",
+            "capture",
+            &instance,
+            &checkpoint,
+            "--generation=1",
+        ],
     )]));
     let reply = call(&node, remove(&target(), Id128::random())).await;
     assert!(matches!(
@@ -781,7 +823,8 @@ async fn untracked_processes_block_absence_until_they_are_gone() {
     };
     assert!(!inventory.complete);
     assert_eq!(inventory.untracked_workers, [target().checkpoint]);
-    let CheckpointResponse::Capabilities(caps) = call(&node, CheckpointOperation::Capabilities).await
+    let CheckpointResponse::Capabilities(caps) =
+        call(&node, CheckpointOperation::Capabilities).await
     else {
         panic!()
     };
@@ -789,7 +832,13 @@ async fn untracked_processes_block_absence_until_they_are_gone() {
     // A create CLI in the space-separated form blocks too.
     fake.set_processes(Some(vec![process(
         false,
-        &["kiln", "create", "--image=alpine", "--from-checkpoint", &source],
+        &[
+            "kiln",
+            "create",
+            "--image=alpine",
+            "--from-checkpoint",
+            &source,
+        ],
     )]));
     assert!(matches!(
         removed(&call(&node, remove(&target(), Id128::random())).await),
@@ -826,7 +875,10 @@ async fn kiln_failures_keep_the_charge() {
             ),
             Reason::Busy,
         ),
-        (Act::Exit(0, "kiln-checkpoint-removed 1\n".into(), "".into()), Reason::Io),
+        (
+            Act::Exit(0, "kiln-checkpoint-removed 1\n".into(), "".into()),
+            Reason::Io,
+        ),
         (Act::SpawnError, Reason::Io),
     ] {
         let (node, fake) = setup();
@@ -842,7 +894,9 @@ async fn kiln_failures_keep_the_charge() {
         "ls",
         Act::Exit(
             0,
-            format!("kiln-checkpoint-inventory 1\nstaging {INSTANCE} .staging-{CHECKPOINT}-1-00ff\n"),
+            format!(
+                "kiln-checkpoint-inventory 1\nstaging {INSTANCE} .staging-{CHECKPOINT}-1-00ff\n"
+            ),
             "".into(),
         ),
     );
@@ -861,7 +915,11 @@ async fn epochs_and_retired_nonces_refuse_before_any_worker() {
     let mut stale = request(&node, &capture(&binding()));
     stale.helper_epoch = Some(Id128::random());
     let reply = node
-        .handle(stale, Instant::now() + Duration::from_secs(5), &CancellationToken::new())
+        .handle(
+            stale,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
         .await;
     assert_eq!(error_kind(&reply), CheckpointErrorKind::StaleEpoch);
     // A restarted helper has a new epoch, and the old one's requests are refused.
@@ -930,10 +988,7 @@ async fn a_departed_waiter_leaves_the_worker_supervised() {
         }
         other => panic!("{other:?}"),
     }
-    assert!(matches!(
-        inspected(&view).artifact,
-        ArtifactView::NotListed
-    ));
+    assert!(matches!(inspected(&view).artifact, ArtifactView::NotListed));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1036,7 +1091,10 @@ async fn the_inventory_lists_one_instance_within_its_bound() {
     // More than the bound: listed up to it, and incomplete.
     let mut text = String::from("kiln-checkpoint-inventory 1\n");
     for _ in 0..=MAX_INVENTORY_ENTRIES {
-        text.push_str(&format!("published {INSTANCE} {}\n", CheckpointId::random()));
+        text.push_str(&format!(
+            "published {INSTANCE} {}\n",
+            CheckpointId::random()
+        ));
     }
     fake.set("ls", Act::Exit(0, text, "".into()));
     let CheckpointResponse::Inventory(inventory) =
@@ -1058,7 +1116,10 @@ async fn the_inventory_lists_one_instance_within_its_bound() {
         else {
             panic!()
         };
-        assert!(!inventory.complete && inventory.entries.is_empty(), "{broken}");
+        assert!(
+            !inventory.complete && inventory.entries.is_empty(),
+            "{broken}"
+        );
     }
 }
 
@@ -1073,7 +1134,10 @@ async fn shutdown_kills_and_reaps_every_worker() {
         captured(&handle.await.unwrap()),
         CaptureReply::Failed { .. }
     ));
-    assert_eq!(fake.position("end capture"), fake.position("start capture") + 2);
+    assert_eq!(
+        fake.position("end capture"),
+        fake.position("start capture") + 2
+    );
 }
 
 #[test]
@@ -1101,12 +1165,45 @@ fn the_kiln_adapter_parses_strictly() {
     let i = INSTANCE;
     let c = CHECKPOINT;
     for (argv, named) in [
-        (args(&["kiln", "checkpoint", "rm", &format!("--instance={i}"), &format!("--checkpoint={c}")]), true),
-        (args(&["kiln", "checkpoint", "inspect", "--instance", i, "--checkpoint", c]), true),
-        (args(&["kiln", "create", &format!("--from-checkpoint={i}/{c}")]), true),
+        (
+            args(&[
+                "kiln",
+                "checkpoint",
+                "rm",
+                &format!("--instance={i}"),
+                &format!("--checkpoint={c}"),
+            ]),
+            true,
+        ),
+        (
+            args(&[
+                "kiln",
+                "checkpoint",
+                "inspect",
+                "--instance",
+                i,
+                "--checkpoint",
+                c,
+            ]),
+            true,
+        ),
+        (
+            args(&["kiln", "create", &format!("--from-checkpoint={i}/{c}")]),
+            true,
+        ),
         (args(&["kiln", "checkpoint", "ls"]), false),
         (args(&["kiln", "exec", "--checkpoint", c]), false),
-        (args(&["kiln", "checkpoint", "capture", "--checkpoint-x=1", "--instance", i]), false),
+        (
+            args(&[
+                "kiln",
+                "checkpoint",
+                "capture",
+                "--checkpoint-x=1",
+                "--instance",
+                i,
+            ]),
+            false,
+        ),
     ] {
         let found = named_artifact(&ProcessArgs {
             session_leader: false,
@@ -1117,7 +1214,10 @@ fn the_kiln_adapter_parses_strictly() {
             assert_eq!((instance.as_str(), checkpoint.as_str()), (i, c));
         }
     }
-    assert_eq!(parse_removed("kiln-checkpoint-removed 1\nexisted no\n"), Ok(false));
+    assert_eq!(
+        parse_removed("kiln-checkpoint-removed 1\nexisted no\n"),
+        Ok(false)
+    );
     assert!(parse_removed("kiln-checkpoint-removed 1\nexisted maybe\n").is_err());
     let lines = parse_inventory(&format!(
         "kiln-checkpoint-inventory 1\nstaging {i} .staging-{c}-12-00aa\nunknown - x y\n"
@@ -1135,7 +1235,9 @@ fn the_kiln_adapter_parses_strictly() {
         assert!(parse_inventory(&bad).is_err(), "{bad}");
     }
     assert_eq!(
-        create_reason(b"Error: x\n\nCaused by:\n    0: sandbox_unsupported:workspace_checkpoint: old\n"),
+        create_reason(
+            b"Error: x\n\nCaused by:\n    0: sandbox_unsupported:workspace_checkpoint: old\n"
+        ),
         Some(Reason::SandboxUnsupported)
     );
     assert_eq!(create_reason(b"checkpoint_busyness: no\n"), None);
@@ -1143,10 +1245,12 @@ fn the_kiln_adapter_parses_strictly() {
     assert!(KilnArgs::checkpoint_capture(i, c, 0, 1 << 30, "ab").is_err());
     assert!(KilnArgs::checkpoint_capture("x", c, 1, 1 << 30, "ab").is_err());
     assert!(KilnArgs::checkpoint_rm(i, "cp-../../etc").is_err());
-    assert!(KilnArgs::checkpoint_inspect(i, c, true)
-        .unwrap()
-        .as_slice()
-        .ends_with(&["--verify".to_string()]));
+    assert!(
+        KilnArgs::checkpoint_inspect(i, c, true)
+            .unwrap()
+            .as_slice()
+            .ends_with(&["--verify".to_string()])
+    );
     assert!(KilnArgs::checkpoint_capture(i, c, 1, 1 << 30, "--ab").is_err());
 }
 
@@ -1155,3 +1259,9 @@ fn the_kiln_adapter_parses_strictly() {
 // fixture CLI, spawn and signal their own stray processes and remove their scratch files.
 #[allow(clippy::disallowed_methods)]
 mod socket;
+
+#[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). The root VM test
+// copies and removes its own image, sandboxes, artifacts and stray processes.
+#[allow(clippy::disallowed_methods)]
+mod vm;

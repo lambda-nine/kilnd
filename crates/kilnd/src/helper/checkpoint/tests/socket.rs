@@ -156,7 +156,11 @@ async fn capture_restore_inspect_and_remove_cross_the_socket() {
     let epoch = helper.epoch().await;
     let b = binding();
     let reply = helper
-        .call(Some(epoch), CheckpointOperation::Capture { binding: b.clone() }, 60)
+        .call(
+            Some(epoch),
+            CheckpointOperation::Capture { binding: b.clone() },
+            60,
+        )
         .await;
     let CheckpointResponse::Captured(captured) = &reply else {
         panic!("{reply:?}")
@@ -182,7 +186,9 @@ async fn capture_restore_inspect_and_remove_cross_the_socket() {
     let CheckpointResponse::Inspected(view) = view else {
         panic!()
     };
-    assert!(matches!(&view.artifact, ArtifactView::Published { record } if record.content_sha256 == content()));
+    assert!(
+        matches!(&view.artifact, ArtifactView::Published { record } if record.content_sha256 == content())
+    );
     assert!(matches!(view.operation, Some(OperationState::Settled(_))));
     let reader = Id128::random();
     let reply = helper
@@ -227,9 +233,21 @@ async fn capture_restore_inspect_and_remove_cross_the_socket() {
             "{reply:?}"
         );
     } else {
-        assert!(matches!(removed.as_ref(), RemoveReply::Retained { reason: Reason::Io, .. }));
+        assert!(matches!(
+            removed.as_ref(),
+            RemoveReply::Retained {
+                reason: Reason::Io,
+                ..
+            }
+        ));
     }
-    assert!(!helper.dir.join("art").join(format!("{INSTANCE}_{CHECKPOINT}")).exists());
+    assert!(
+        !helper
+            .dir
+            .join("art")
+            .join(format!("{INSTANCE}_{CHECKPOINT}"))
+            .exists()
+    );
     helper.stop().await;
 }
 
@@ -241,7 +259,11 @@ async fn a_hung_worker_is_killed_and_reaped_at_its_deadline() {
     helper.mode("hang");
     let started = Instant::now();
     let reply = helper
-        .call(Some(epoch), CheckpointOperation::Capture { binding: binding() }, 2)
+        .call(
+            Some(epoch),
+            CheckpointOperation::Capture { binding: binding() },
+            2,
+        )
         .await;
     assert!(
         matches!(&reply, CheckpointResponse::Captured(r) if matches!(r.as_ref(), CaptureReply::Failed { reason: Reason::Io, .. })),
@@ -255,7 +277,10 @@ async fn a_hung_worker_is_killed_and_reaped_at_its_deadline() {
     // Not even a zombie: the runner reaped it.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
-    assert_eq!(helper.node.as_ref().unwrap().copy.available_permits(), COPY_WORKERS);
+    assert_eq!(
+        helper.node.as_ref().unwrap().copy.available_permits(),
+        COPY_WORKERS
+    );
     helper.stop().await;
 }
 
@@ -322,7 +347,9 @@ async fn a_cancelled_waiter_gets_pending_and_the_outcome_settles() {
 #[tokio::test]
 async fn a_disabled_group_and_malformed_frames_get_nothing() {
     let helper = helper(false).await;
-    let reply = helper.call(None, CheckpointOperation::Capabilities, 5).await;
+    let reply = helper
+        .call(None, CheckpointOperation::Capabilities, 5)
+        .await;
     assert!(matches!(&reply, CheckpointResponse::Capabilities(c) if !c.enabled));
     let reply = helper
         .call(
@@ -331,7 +358,9 @@ async fn a_disabled_group_and_malformed_frames_get_nothing() {
             5,
         )
         .await;
-    assert!(matches!(&reply, CheckpointResponse::Error(e) if e.kind == CheckpointErrorKind::Disabled));
+    assert!(
+        matches!(&reply, CheckpointResponse::Error(e) if e.kind == CheckpointErrorKind::Disabled)
+    );
     // A duplicate key anywhere in a group frame closes the connection unanswered, as
     // does a request outside the group's schema.
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -350,7 +379,9 @@ async fn a_disabled_group_and_malformed_frames_get_nothing() {
             r#"{{"version":3,"timeout_ms":2000,"deadline_ns":{deadline},"operation":{{"checkpoint":{{"group_version":1,"helper_epoch":null,"operation":"capabilities","path":"/"}}}}}}"#
         ),
     ] {
-        let mut stream = tokio::net::UnixStream::connect(&helper.socket).await.unwrap();
+        let mut stream = tokio::net::UnixStream::connect(&helper.socket)
+            .await
+            .unwrap();
         crate::helper::fds::send(&stream, &[]).await.unwrap();
         stream.write_u32(frame.len() as u32).await.unwrap();
         stream.write_all(frame.as_bytes()).await.unwrap();

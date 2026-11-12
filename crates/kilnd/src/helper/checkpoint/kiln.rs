@@ -258,7 +258,7 @@ const MAX_PROCESSES: usize = 65_536;
 /// private procfs instance (`crate::sys::procfs`: no link followed, no mount crossed).
 /// A process that exits during the scan is skipped; any other failure fails the scan.
 #[cfg(target_os = "linux")]
-fn process_table() -> io::Result<Vec<ProcessArgs>> {
+pub(crate) fn process_table() -> io::Result<Vec<ProcessArgs>> {
     use crate::sys::procfs;
     use std::io::Read;
     let gone = |e: &io::Error| {
@@ -309,7 +309,7 @@ fn process_table() -> io::Result<Vec<ProcessArgs>> {
 
 /// Production runs on Linux only: elsewhere no scan can prove anything.
 #[cfg(not(target_os = "linux"))]
-fn process_table() -> io::Result<Vec<ProcessArgs>> {
+pub(crate) fn process_table() -> io::Result<Vec<ProcessArgs>> {
     Err(io::Error::other("no process table on this platform"))
 }
 
