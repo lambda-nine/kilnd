@@ -399,6 +399,11 @@ async fn a_disabled_group_and_malformed_frames_get_nothing() {
 async fn a_live_process_naming_the_artifact_blocks_absence() {
     let helper = helper(true).await;
     let epoch = helper.epoch().await;
+    // Its own checkpoint: the stray must not block the other socket tests running beside it.
+    let stray_target = ArtifactTarget {
+        checkpoint: CheckpointId::random(),
+        ..target()
+    };
     let mut stray = std::process::Command::new("/usr/bin/python3")
         .args([
             "-c",
@@ -406,12 +411,12 @@ async fn a_live_process_naming_the_artifact_blocks_absence() {
             "checkpoint",
             "rm",
             &format!("--instance={INSTANCE}"),
-            &format!("--checkpoint={CHECKPOINT}"),
+            &format!("--checkpoint={}", stray_target.checkpoint),
         ])
         .spawn()
         .unwrap();
     let remove = |operation| CheckpointOperation::Remove {
-        target: target(),
+        target: stray_target.clone(),
         operation,
     };
     let reply = helper.call(Some(epoch), remove(Id128::random()), 30).await;
