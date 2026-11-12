@@ -12,13 +12,13 @@
 # workspace with KILND_DEPENDENCY_GATE_FIXTURE. The authoritative the_dependency_gate_holds
 # reads no variable at all (case 7).
 #
-# 1. HIGH-1, Daybreak's fs-err PoC: kilnd gains the ordinary `fs-err` dependency and a
+# 1. HIGH-1, the break-it reviewer's fs-err PoC: kilnd gains the ordinary `fs-err` dependency and a
 #    production call to fs_err::remove_dir_all.
 #    a. Reviewed as `none`: the gate refuses, naming the production call and fs-err's
 #       own source.
 #    b. Reviewed honestly as `filesystem`, its destructive paths listed and disallowed:
 #       the gate holds, and clippy rejects the call on every toolchain.
-# 2. The HIGH-1 recheck, Daybreak's method and transitive wrappers
+# 2. The HIGH-1 recheck, the break-it reviewer's method and transitive wrappers
 #    (reviews/poc-b7m2-recheck), as vendored registry packages with Cargo.lock checksums:
 #    a. method-wrapper (an extension trait on std::fs::File whose method calls
 #       set_len), reviewed `filesystem` with `no_destructive_api`: the gate refuses on
@@ -33,14 +33,14 @@
 #       is reviewed (entry and exception), then holds.
 #    f. Case d with method-wrapper's `extra` feature enabled: refused (the review and the
 #       exception are scoped to no features).
-#    g. Recheck 2 HIGH-2, Daybreak's type-alias UFCS PoC (reviews/poc-b7m2-recheck2/
+#    g. Recheck 2 HIGH-2, the break-it reviewer's type-alias UFCS PoC (reviews/poc-b7m2-recheck2/
 #       type-alias-ufcs.sh): its exact wrapper source (`pub type LocalFile = File;` and
 #       `LocalFile::set_len(self, 0)` in an extension trait) as the vendored
 #       alias-wrapper, reviewed `none`: refused on the `set_len` identifier, the alias and
 #       the impl; clippy accepts the workspace.
-# 3. MEDIUM-1, Daybreak's missing-methods PoC: std::fs::copy and libc::creat (exact
+# 3. MEDIUM-1, the break-it reviewer's missing-methods PoC: std::fs::copy and libc::creat (exact
 #    libc 0.2.190) against this clippy.toml: clippy rejects both.
-# 4. Recheck 2 HIGH-1, Daybreak's feature-injection PoC (feature-injection.sh) through
+# 4. Recheck 2 HIGH-1, the break-it reviewer's feature-injection PoC (feature-injection.sh) through
 #    scripts/build.sh: `--features tokio/full`, and every other spelling of a feature,
 #    manifest, config or unstable selection, is refused before cargo runs.
 # 5. Recheck 2 HIGH-1, a profile's own graph:
@@ -49,14 +49,14 @@
 #       Cargo.lock does not lock (parking_lot and the rest).
 #    b. A checked-in workspace feature forwarding tokio/full, in a profile: the gate
 #       refuses the unreviewed packages it locks and Tokio's unreviewed features.
-# 6. Recheck 2 MEDIUM-1, Daybreak's two-registry PoC (source-collision.sh): two
+# 6. Recheck 2 MEDIUM-1, the break-it reviewer's two-registry PoC (source-collision.sh): two
 #    dupe@1.0.0 packages from two local registries. The gate and the review drafter
 #    refuse the duplicate identity.
-# 7. Recheck 2 MEDIUM-2, Daybreak's root-override PoC (root-override.sh): in a workspace
+# 7. Recheck 2 MEDIUM-2, the break-it reviewer's root-override PoC (root-override.sh): in a workspace
 #    with an unreviewed path dependency, the authoritative test refuses even with
 #    KILND_DEPENDENCY_GATE_ROOT and KILND_DEPENDENCY_GATE_FIXTURE naming a clean copy, and
 #    the pristine copy's authoritative test holds with both naming the dirty one.
-# 8. Recheck 3 HIGH-1, Daybreak's compiler-cfg PoC (reviews/poc-b7m2-recheck3/
+# 8. Recheck 3 HIGH-1, the break-it reviewer's compiler-cfg PoC (reviews/poc-b7m2-recheck3/
 #    rustflags-feature.sh): a declared `ambient-poc` feature no profile selects, and a
 #    test compiled only under it.
 #    a. RUSTFLAGS and CARGO_BUILD_RUSTFLAGS='--cfg feature="ambient-poc"' through
@@ -67,14 +67,14 @@
 #       environment overrides them, and the feature's test is not compiled.
 #    d. A raw cargo build with that RUSTFLAGS: the workspace build scripts' backstop
 #       refuses the `--cfg`.
-# 9. Recheck 3 HIGH-2, Daybreak's path-module PoC (path-module-sink.sh): its exact
+# 9. Recheck 3 HIGH-2, the break-it reviewer's path-module PoC (path-module-sink.sh): its exact
 #    vendored path-module-wrapper (src/lib.rs delegates through `#[path = "../hidden.rs"]`
 #    to a package-root file whose `File` alias impl calls `LocalFile::set_len(self, 0)`),
 #    reviewed `none`.
 #    a. Refused on hidden.rs's `set_len`, alias and impl; clippy accepts the workspace.
 #    b. The module under tests/, reached only by its `#[path]`: refused the same way.
 #    c. A `#[path]` outside the package root: refused as unscannable.
-# 10. Integrated recheck HIGH-1, Daybreak's ordinary-child PoC (reviews/poc-b7-integrated/
+# 10. Integrated recheck HIGH-1, the break-it reviewer's ordinary-child PoC (reviews/poc-b7-integrated/
 #    ordinary-child-module.sh): its exact vendored nested-module-wrapper (src/lib.rs
 #    reaches tests/common/mod.rs through `#[path]`, whose ordinary `mod reset;` is
 #    tests/common/reset.rs, an extension trait on std::fs::File calling `set_len(0)`),
@@ -83,7 +83,7 @@
 #    b. Two levels: tests/common/mod.rs's `mod a;` is tests/common/a.rs, whose `mod b;`
 #       is tests/common/a/b.rs (the sink): refused on b.rs.
 #    c. The same through tests/common/a/mod.rs: refused on b.rs.
-# 11. Integrated recheck 2 HIGH-1, Daybreak's nested-cfg_attr PoC (reviews/
+# 11. Integrated recheck 2 HIGH-1, the break-it reviewer's nested-cfg_attr PoC (reviews/
 #    poc-b7-integrated-recheck2/nested-cfgattr-path-bypass.sh): its exact vendored
 #    nested-module-wrapper (src/lib.rs's `#[cfg_attr(all(), cfg_attr(all(), path =
 #    "../tests/hidden.rs"))] mod hidden;`, a harmless ordinary src/hidden.rs, and a
@@ -198,7 +198,7 @@ lib = open("crates/kilnd/src/lib.rs").read()
 lib = lib.replace("pub mod admission;\n", "pub mod admission;\npub mod gate_bypass_poc;\n", 1)
 open("crates/kilnd/src/lib.rs", "w").write(lib)
 open("crates/kilnd/src/gate_bypass_poc.rs", "w").write(
-    "//! Daybreak's honest-looking wrapper call (B7 milestone 2 HIGH-1).\n\n"
+    "//! The break-it reviewer's honest-looking wrapper call (B7 milestone 2 HIGH-1).\n\n"
     "use std::path::Path;\n\n"
     "/// Removes a caller-selected tree.\n"
     "pub fn remove_tree(path: &Path) -> std::io::Result<()> {\n"
@@ -337,7 +337,7 @@ lib = open("crates/kilnd/src/lib.rs").read()
 lib = lib.replace("pub mod admission;\n", "pub mod admission;\npub mod gate_method_poc;\n", 1)
 open("crates/kilnd/src/lib.rs", "w").write(lib)
 open("crates/kilnd/src/gate_method_poc.rs", "w").write(
-    "//! Daybreak's method wrapper call (B7 milestone 2 recheck HIGH-1).\n\n"
+    "//! The break-it reviewer's method wrapper call (B7 milestone 2 recheck HIGH-1).\n\n"
     "use %s::Reset as _;\n\n"
     "/// Empties a file through the dependency's extension trait.\n"
     "pub fn reset(file: &std::fs::File) -> std::io::Result<()> {\n"
@@ -503,7 +503,7 @@ injection=$scratch/injection
 copy_head "$injection"
 cd "$injection"
 for toolchain in $toolchains; do
-    echo "== Rust $toolchain: Daybreak's feature injection through scripts/build.sh =="
+    echo "== Rust $toolchain: The break-it reviewer's feature injection through scripts/build.sh =="
     for arguments in "--all-features --features tokio/full" "--features tokio/full" \
         "--features=tokio/full" "-F tokio/full" "-Ftokio/full" "-rF tokio/full" \
         "--all-features" "--no-default-features" "--manifest-path ../other/Cargo.toml" \
@@ -727,7 +727,7 @@ expect_build_refused() { # what message command...
     fi
 }
 for toolchain in $toolchains; do
-    echo "== Rust $toolchain: Daybreak's compiler cfg inputs through scripts/build.sh =="
+    echo "== Rust $toolchain: The break-it reviewer's compiler cfg inputs through scripts/build.sh =="
     for route in RUSTFLAGS CARGO_BUILD_RUSTFLAGS; do
         expect_build_refused "$route" "$route is set; build.sh runs cargo in a closed compiler environment" \
             env "$route=--cfg feature=\"ambient-poc\"" sh scripts/build.sh "+$toolchain" default test \

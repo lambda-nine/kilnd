@@ -4120,7 +4120,7 @@ fn the_synthetic_workspace_passes() {
     assert_eq!(check(&demo("", "", &[])), "");
 }
 
-/// B7 milestone 2 HIGH-1, Daybreak's `fs-err` PoC as a regression: an honest-looking
+/// B7 milestone 2 HIGH-1, the break-it reviewer's `fs-err` PoC as a regression: an honest-looking
 /// `std::fs` wrapper whose lock record shows no raw system-call crate.
 #[test]
 fn b7m2_an_fs_err_wrapper_declared_none_is_refused() {
@@ -4160,7 +4160,7 @@ fn b7m2_an_fs_err_wrapper_declared_none_is_refused() {
         "{wrong}"
     );
 
-    // Daybreak's declaration (`none`, nothing destructive): refused twice over, by the
+    // The break-it reviewer's declaration (`none`, nothing destructive): refused twice over, by the
     // production call and by fs-err's own source.
     let none = serde_json::json!({"kind": "runtime", "capability": "none", "why": "std::fs wrappers with path-rich errors"});
     let wrong = check(&with(none.clone(), "", production));
@@ -4285,7 +4285,7 @@ fn transitive_wrapper() -> Inputs {
 
 #[test]
 fn b7m2_recheck_a_method_wrapper_is_refused() {
-    // Daybreak's direct case: `filesystem` with `no_destructive_api`.
+    // The break-it reviewer's direct case: `filesystem` with `no_destructive_api`.
     let wrong = check(&method_wrapper(no_destructive_api()));
     assert!(
         wrong.contains("method-wrapper@1.0.0 is declared `filesystem` with no destructive API, but its runtime subtree reaches `impl for std::fs::File` in method-wrapper@1.0.0 (method-wrapper-1.0.0/src/lib.rs); `set_len` in method-wrapper@1.0.0 (method-wrapper-1.0.0/src/lib.rs)"),
@@ -4329,7 +4329,7 @@ fn b7m2_recheck_a_method_wrapper_is_refused() {
         "use std::fs::*;\npub fn tidy(p: &std::path::Path) { let _ = remove_file(p); }\n",
         "use std::fs::*;\npub fn fresh(p: &std::path::Path) { let _ = File::create(p); }\n",
         "use std::{fs::*, io};\npub fn tidy(p: &std::path::Path) -> io::Result<()> { remove_dir_all(p) }\n",
-        // Recheck 2 HIGH-2: the identifier itself, whatever surrounds it. Daybreak's type
+        // Recheck 2 HIGH-2: the identifier itself, whatever surrounds it. The break-it reviewer's type
         // alias plus UFCS, a qualifier of any kind, a function value, a `use` list, a
         // definition and a field.
         "use std::fs::File;\npub type LocalFile = File;\npub trait Reset { fn reset(&self) -> std::io::Result<()>; }\nimpl Reset for LocalFile { fn reset(&self) -> std::io::Result<()> { LocalFile::set_len(self, 0) } }\n",
@@ -4367,7 +4367,7 @@ fn b7m2_recheck_a_method_wrapper_is_refused() {
 
 #[test]
 fn b7m2_recheck_a_transitive_wrapper_is_refused() {
-    // Daybreak's transitive case: the inner package is unreviewed, and the `none` outer
+    // The break-it reviewer's transitive case: the inner package is unreviewed, and the `none` outer
     // package's subtree scan reaches the inner package's `set_len`.
     let wrong = check(&transitive_wrapper());
     assert!(
@@ -4847,7 +4847,7 @@ fn b7m2_recheck2_each_profile_graph_is_reviewed() {
         });
         inputs
     };
-    // Daybreak's feature injection as a profile: a dependency's feature directly.
+    // The break-it reviewer's feature injection as a profile: a dependency's feature directly.
     let wrong = check(&with_profile(&["tokio/full"]));
     assert!(
         wrong.contains(
@@ -5055,7 +5055,7 @@ fn names(files: &[PathBuf]) -> Vec<String> {
 
 #[test]
 fn b7m2_recheck3_the_whole_package_is_scanned_and_its_edges_followed() {
-    // Daybreak's layout: the library root delegates to a package-root module.
+    // The break-it reviewer's layout: the library root delegates to a package-root module.
     let found = package_tree(&[
         (
             "src/lib.rs",
@@ -5222,7 +5222,7 @@ fn b7int_ordinary_out_of_line_modules_are_source_edges() {
 
 #[test]
 fn b7int2_nested_cfg_attr_paths_are_source_edges() {
-    // Daybreak's integrated recheck 2 HIGH-1: a `path` emitted by a `cfg_attr` inside a
+    // The integrated break-it recheck 2 HIGH-1: a `path` emitted by a `cfg_attr` inside a
     // `cfg_attr` is as conditional an edge as one directly inside it, at any depth, and
     // the module keeps its ordinary location for a configuration none of them applies to.
     let module = |path: &str, inline: &[&str]| SourceEdge::Module {
@@ -5327,7 +5327,7 @@ fn b7int2_nested_cfg_attr_paths_are_source_edges() {
 
 #[test]
 fn b7int_ordinary_child_modules_below_a_path_module_are_scanned() {
-    // Daybreak's integrated-recheck HIGH-1 shape: a #[path] into tests/, then `mod reset;`.
+    // The integrated break-it recheck's HIGH-1 shape: a #[path] into tests/, then `mod reset;`.
     let found = package_tree(&[
         (
             "src/lib.rs",

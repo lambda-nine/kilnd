@@ -11,7 +11,7 @@ date: "October 31, 2026"
 
 This is an implementation specification, not an implemented backend or a security certification. Baseline: kilnd `734e275163bd6b028736af8261e4897d93169a5f`, helper protocol v3, SQLite schema 7, and kiln `00d61c546db7aa67ad283d10c2ca6165ca5f8166`. No production code changes accompany this document. Stephen confirmed section 12's decisions on **October 31, 2026**. Guest RAM, session mapping, pool size, broker location and interruption policy are settled; the 128 MiB per-session/shared overhead estimates still require B7 measurement.
 
-Initial scope is Linux aarch64, cgroup v2, the pinned Firecracker/jailer 1.17.0 lineage with the final capability-drop requirement in section 6.2, the approved hardened kiln-guest lineage, offline execution, no pool, no snapshot/restore/fork/pause, no guest image download, no host directory sharing, and no remote public API. Existing `KilnRuntime` remains supported and unchanged in public behavior. Daybreak Blue's October 31 recheck closed all seven original findings and requested one executable-handoff correction. This revision specifies that correction; section 15 maps it. Clearance of the correction remains a review gate. Choose one backend per daemon at startup using the existing generic `Manager<R: Runtime>`; do not introduce an unsupported `dyn Runtime` conversion.
+Initial scope is Linux aarch64, cgroup v2, the pinned Firecracker/jailer 1.17.0 lineage with the final capability-drop requirement in section 6.2, the approved hardened kiln-guest lineage, offline execution, no pool, no snapshot/restore/fork/pause, no guest image download, no host directory sharing, and no remote public API. Existing `KilnRuntime` remains supported and unchanged in public behavior. The October 31 break-it recheck closed all seven original findings and requested one executable-handoff correction. This revision specifies that correction; section 15 maps it. Clearance of the correction remains a review gate. Choose one backend per daemon at startup using the existing generic `Manager<R: Runtime>`; do not introduce an unsupported `dyn Runtime` conversion.
 
 ## 1.1 Non-negotiable invariants
 
@@ -683,7 +683,7 @@ Test fixtures are excluded from the gate. Outside the approved items above, noth
 
 *Reviewed and not gated.* `fork`, `vfork` and `clone` duplicate the caller, and running another program needs `exec*`, which is gated. `unshare`, `setns` and `chroot` change only the caller's own view. `mknod`, `link` and `symlink` create and never replace. Descriptor writes, and `O_TRUNC` passed by flag to `open`/`openat`, are invisible to any path-based gate.
 
-The jail base's two mounts moved into typed wrappers (`sys::bind_onto_itself`, `sys::make_private_recursive`) when `libc::mount` joined the list, and `kilnd-api/build.rs` carries the one approved allow, for `tonic-prost-build`; the other five crates' build scripts are only the compiler-flag backstop. `scripts/dependency-gate-regressions.sh` (and a CI job) replays Daybreak's PoCs on Rust 1.88 and 1.99 through the actual source loader, cargo and clippy. Its method, transitive and type-alias wrappers are vendored registry packages with `Cargo.lock` checksums. The script points the ignored `regression_fixture_gate` test (the same loader and gate) at each case's workspace with `KILND_DEPENDENCY_GATE_FIXTURE`; the authoritative `the_dependency_gate_holds` always checks the workspace its test binary was built from and reads no variable, which `the_authoritative_gate_reads_no_environment` checks in its source and the script checks by setting both variables.
+The jail base's two mounts moved into typed wrappers (`sys::bind_onto_itself`, `sys::make_private_recursive`) when `libc::mount` joined the list, and `kilnd-api/build.rs` carries the one approved allow, for `tonic-prost-build`; the other five crates' build scripts are only the compiler-flag backstop. `scripts/dependency-gate-regressions.sh` (and a CI job) replays the break-it PoCs on Rust 1.88 and 1.99 through the actual source loader, cargo and clippy. Its method, transitive and type-alias wrappers are vendored registry packages with `Cargo.lock` checksums. The script points the ignored `regression_fixture_gate` test (the same loader and gate) at each case's workspace with `KILND_DEPENDENCY_GATE_FIXTURE`; the authoritative `the_dependency_gate_holds` always checks the workspace its test binary was built from and reads no variable, which `the_authoritative_gate_reads_no_environment` checks in its source and the script checks by setting both variables.
 
 ## 7.2 Durable reservation vector
 
@@ -939,7 +939,7 @@ All production assertions below are **required future tests**, not tests perform
 
 Preserve per-test approved digest, exact config/argv, expected and actually executed device/inode/digest tuples for J/V/formatter/workers, host boot ID, versions, namespace/cgroup identities and bounded raw logs. Never log the boot nonce in routine API logs; store only its digest there. Record create-ready and first-tool-result latency separately from kiln-guest's earlier serial-marker boot metric. Do not reuse the spike's tiny idle-PSS density claim for hardened guests.
 
-Daybreak Blue reviewed `c81de00`, then rechecked `1e448d2` in `reviews/2026-10-31-phase1b-design-recheck.md`. The recheck **closed all seven original findings** and identified one remaining executable-handoff requirement. Section 3.4 and the B1/B3/B4 gates address it; section 15 maps the correction. This is not a claim that the correction itself has passed re-review. The coordinating task schedules that narrow recheck before implementation. Each implementation slice also needs an independent adversarial pass and its local gates before landing; no merge authority is implied here.
+The break-it reviewer reviewed `c81de00`, then rechecked `1e448d2` in `reviews/2026-10-31-phase1b-design-recheck.md`. The recheck **closed all seven original findings** and identified one remaining executable-handoff requirement. Section 3.4 and the B1/B3/B4 gates address it; section 15 maps the correction. This is not a claim that the correction itself has passed re-review. The coordinating task schedules that narrow recheck before implementation. Each implementation slice also needs an independent adversarial pass and its local gates before landing; no merge authority is implied here.
 
 # 11. Build order and file-level implementation map
 
@@ -997,7 +997,7 @@ kiln-guest embeds the broker at a pinned kilnd commit/binary digest, adds the vd
 
 **Retired-token compaction comes first.** Without it a node admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1 refusals. B7 implements [section 16](#retired-token-compaction-pre-b7-design) (helper-issued sequence tokens and a per-instance watermark, rules RTC-1 to RTC-18, node ledger schema 2 and Firecracker group schema 2) and passes its section 16.6 acceptance criteria, including the lifetime test past 16,384 sessions, before production is enabled.
 
-**Exit:** node-global stress across at least two daemon namespaces supports the chosen profile, accounting for all per-allocation S/P/R/D and VMM/KVM costs plus shared H/L/M/K, the full tmpfs allowance, journal/WAL/fence and bundle-store headroom. Measure peak CPU/PIDs/memory/storage and workload density; reapprove limits if 128 MiB per-session or shared allowances fail. Legacy privileged suites pass; Daybreak recheck closes the findings (or Stephen explicitly accepts any residual risk); Stephen's section 12 choices are reflected in fixtures. These tests alone do not establish hostile multi-tenant production readiness.
+**Exit:** node-global stress across at least two daemon namespaces supports the chosen profile, accounting for all per-allocation S/P/R/D and VMM/KVM costs plus shared H/L/M/K, the full tmpfs allowance, journal/WAL/fence and bundle-store headroom. Measure peak CPU/PIDs/memory/storage and workload density; reapprove limits if 128 MiB per-session or shared allowances fail. Legacy privileged suites pass; the break-it recheck closes the findings (or Stephen explicitly accepts any residual risk); Stephen's section 12 choices are reflected in fixtures. These tests alone do not establish hostile multi-tenant production readiness.
 
 **B4 recheck 6 hardening follow-ups** (`reviews/2026-11-03-b4-recheck6.md`, ranked; none blocks B5):
 
@@ -1016,7 +1016,7 @@ block B6):
    the connection's life, and admission has only global connection and ordinary-RPC
    budgets. Any principal the socket's filesystem gate lets in can open 64 sockets that
    never send an HTTP/2 preface, and a new Health, Get or Delete connection is then
-   dropped before authorization or Health's reserved RPC lane can help (Daybreak's
+   dropped before authorization or Health's reserved RPC lane can help (the break-it reviewer's
    `reviews/poc-b6/public-connection-starvation.py`). An accepted, manager-owned
    detached Delete still drains. Direction: reserve ingress capacity (a connection slot
    held back for Health and cleanup RPCs), and after reading peer credentials enforce
@@ -1052,7 +1052,7 @@ Local evidence is deliberately distinguished from future design obligations. Pat
 - Design recheck: `reviews/2026-10-31-phase1b-design-recheck.md` reviewed `1e448d2`, closed all seven original findings and required race-free executable handoff plus B1/B3/B4 replacement tests. That narrow correction is specified here, awaiting its own clearance.
 - Pinned upstream mechanics: [jailer v1.17.0](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/docs/jailer.md) and [vsock v1.17.0](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/docs/vsock.md), consulted for exact flags, PID/cgroup behavior and host-port handshake. All additional lifecycle, reservation and broker rules above are this design's requirements, not claims that Firecracker supplies them automatically.
 
-Stephen's section 12 decisions are settled as of October 31, 2026. Production implementation, the required hardened jailer/broker artifacts, final bundle approval and the narrow executable-handoff recheck remain open. The earlier seven findings are closed by Daybreak's recheck, not merely marked resolved by this author.
+Stephen's section 12 decisions are settled as of October 31, 2026. Production implementation, the required hardened jailer/broker artifacts, final bundle approval and the narrow executable-handoff recheck remain open. The earlier seven findings are closed by the break-it recheck, not merely marked resolved by this author.
 
 # 14. Document rendering
 
@@ -1072,7 +1072,7 @@ The PDF is a local review artifact; the source and style are versioned with this
 
 # 15. Review response
 
-Daybreak Blue's October 31 recheck at `1e448d2` **closed all seven original findings** listed below. Its one new executable-handoff finding is accepted and addressed in this revision; none is rejected. This does not claim implementation or re-review of the new correction has passed. Stephen confirmed section 12's decisions on October 31, 2026.
+The October 31 break-it recheck at `1e448d2` **closed all seven original findings** listed below. Its one new executable-handoff finding is accepted and addressed in this revision; none is rejected. This does not claim implementation or re-review of the new correction has passed. Stephen confirmed section 12's decisions on October 31, 2026.
 
 | Finding | Revision and local gate |
 |---|---|
@@ -1272,7 +1272,7 @@ the positive control before the next independent attack.
 
 ## B3 break-it corrections (October 31, 2026)
 
-The Daybreak Blue review (`reviews/2026-10-31-b3-breakit.md`) found the release invariant
+The break-it review (`reviews/2026-10-31-b3-breakit.md`) found the release invariant
 intact and four control-plane failures. The decisions below are made; sections 4.1, 6.4,
 7.3 and the B3 exit reflect them.
 
@@ -1360,7 +1360,7 @@ service accounts, since instances no longer share one.
 
 ## B3 recheck corrections (November 1, 2026)
 
-The Daybreak Blue recheck (`reviews/2026-10-31-b3-recheck.md`) found the first four failures
+The break-it recheck (`reviews/2026-10-31-b3-recheck.md`) found the first four failures
 repaired and three cross-instance ones left, all from enrolled instances sharing one Unix
 UID. These decisions are made; sections 4.1, 6.1, 6.2, 6.4 and 7.3 reflect them.
 
@@ -1433,7 +1433,7 @@ report says: the production-disabled no-image branch must not survive enabling p
 
 ## B3 deployment corrections (November 1, 2026)
 
-The Daybreak Blue final recheck (`reviews/2026-11-01-b3-final.md`) found the security core
+The final break-it recheck (`reviews/2026-11-01-b3-final.md`) found the security core
 sound and the deployment path broken in three ways. The decisions are made, and
 `docs/setup.md` is the operator's account. Root's maintenance commands now live in one
 script, `scripts/kilnd-maintenance.py`, with `scripts/add-instance.sh` and
@@ -1634,7 +1634,7 @@ item 4's gate moved after publishing, and item 5's record waits for exit status 
 by the B4 recheck 2 corrections:* item 2's NotOurs for another backing file now applies only
 to a slot with no journaled generation.
 
-Daybreak Blue's B4 review (`reviews/2026-11-02-b4-breakit.md`, PoCs in `reviews/poc-b4/`)
+The B4 break-it review (`reviews/2026-11-02-b4-breakit.md`, PoCs in `reviews/poc-b4/`)
 found destructive cleanup acting on replacements, a fail-open capability path, unpinned
 build inputs and mislabelled formatter evidence. All five findings are accepted and fixed
 in the direction the review gave; launch and containment were not changed.
@@ -1755,7 +1755,7 @@ to installed main `734e275` with its schema-7 database.
 another backing file in its slot Unknown too, and the leftover check reads the journaled slot
 itself.
 
-Daybreak Blue's recheck of `38aee62` (`reviews/2026-11-02-b4-recheck.md`, PoCs in
+The break-it recheck of `38aee62` (`reviews/2026-11-02-b4-recheck.md`, PoCs in
 `reviews/poc-b4-recheck/`) broke all five corrections with adversarial variants: a copied
 marker and an unjournaled bind name authorized replacement mounts, a loop retuned between
 comparison and `LOOP_CLR_FD` was detached, the build published an output swapped after its
@@ -1867,7 +1867,7 @@ or work directory, or cgroup is no longer ours by its name but Unknown; H's stop
 another boot's tree, which K's proof refuses; the VMM and every worker identity carry the boot
 ID; and every kill and removal goes through section 7.1's proof types.
 
-Daybreak Blue's second recheck of `ee79331` (`reviews/2026-11-02-b4-recheck2.md`, PoC in
+The second break-it recheck of `ee79331` (`reviews/2026-11-02-b4-recheck2.md`, PoC in
 `reviews/poc-b4-recheck2/`) confirmed the five earlier corrections and found one in-scope
 replacement that still reached ABSENT: root detaches the journaled loop and rebinds its slot
 to another backing inode. `match_slot` reported `OtherBacking` before the disk sequence
@@ -1965,7 +1965,7 @@ were left out, and `history_sequence` went back to 272. The schema-10 file is ke
 
 ## B4 recheck 3 corrections (November 2, 2026)
 
-Daybreak Blue's third recheck of `eead82c` (`reviews/2026-11-02-b4-recheck3.md`, PoCs in
+The third break-it recheck of `eead82c` (`reviews/2026-11-02-b4-recheck3.md`, PoCs in
 `reviews/poc-b4-recheck3/`) found three more destructive paths that acted before identity
 was proved: a replaced `vm/vmm` child killed through its unchanged `vm` parent, cgroups and
 work files created before their identity record and then deleted by deterministic name (also
@@ -2086,7 +2086,7 @@ account reports serving.
 
 ## B4 recheck 4 corrections (November 2, 2026)
 
-Daybreak Blue's fourth recheck of `d268d8d` (`reviews/2026-11-02-b4-recheck4.md`, PoCs in
+The fourth break-it recheck of `d268d8d` (`reviews/2026-11-02-b4-recheck4.md`, PoCs in
 `reviews/poc-b4-recheck4/`) confirmed the three recheck-3 fixes and found two gaps in the
 gate itself. Both are accepted.
 
@@ -2193,7 +2193,7 @@ cgroup, process or build output remains.
 
 ## B4 recheck 5 corrections (November 2, 2026)
 
-Daybreak Blue's fifth recheck of `572284e` (`reviews/2026-11-02-b4-recheck5.md`, PoCs in
+The fifth break-it recheck of `572284e` (`reviews/2026-11-02-b4-recheck5.md`, PoCs in
 `reviews/poc-b4-recheck5/`) confirmed the recheck-4 executable fix and found three
 destructive-boundary failures. All three are accepted. The lead added two scope statements,
 now in section 7.1's *Teardown fault model*: the helper's own mount namespace, `/proc` view,
@@ -2519,7 +2519,7 @@ clippy::disallowed_methods` on 1.88 and 1.99 for macOS and checked for
 
 ### Milestone 1 break-it findings folded in
 
-Daybreak accepted milestone 1 at `bd3f228` with no HIGH findings
+The break-it reviewer accepted milestone 1 at `bd3f228` with no HIGH findings
 (`reviews/2026-11-03-b5m1-breakit.md`) and three non-blockers, fixed in `4cd1ce6`, before every
 milestone 2 exit run, each with a regression test:
 
@@ -2530,13 +2530,13 @@ milestone 2 exit run, each with a regression test:
   the control channel's `CancelAck` is admitted at once, and both count against one budget.
 - *LOW, duplicate-key checking.* An ordered set per object (the sorted-keys approach, n log n)
   replaces the quadratic scan. Test (`property.rs`): about 30,000 distinct shortest keys in
-  384 KiB check in under 200 ms. Daybreak's own benchmark at the branch head: 3 ms at
+  384 KiB check in under 200 ms. The break-it reviewer's own benchmark at the branch head: 3 ms at
   384 KiB, from 704 ms.
 - *LOW, retry after timeout.* Any timeout, codec or I/O error poisons a `FrameReader` or
   `FrameWriter`: every later call returns the stored error, and every caller closes the
   connection. Test (`adversary.rs`): a read retried after a timeout, with the rest of the
   frame now available, still fails, as do a later EOF read and a write after a write
-  timeout. Daybreak's retry harness now fails where it expected success, and its
+  timeout. The break-it reviewer's retry harness now fails where it expected success, and its
   2,000,000-case decoder harness still finds no panic.
 
 ### The guest broker: kilnd-guest-broker
@@ -2743,7 +2743,7 @@ do not break down; B7 owns that profile.
 
 ## B5 break-it corrections (November 3, 2026)
 
-Daybreak's B5 break-it review (`reviews/2026-11-03-b5-breakit.md`, kilnd `38aefb4`,
+The B5 break-it review (`reviews/2026-11-03-b5-breakit.md`, kilnd `38aefb4`,
 kiln-guest `92c7acd`) found three HIGH, six MEDIUM and one LOW defect. Stephen's rule
 governs every fix: any post-dispatch timeout, cancel or uncertainty terminates the VM,
 and a guest that breaks the session protocol is not reusable. The attacks that held
@@ -2770,13 +2770,13 @@ destructive-action gate, provenance) are unchanged and rerun below.
   journal records (Create's path) keep their existing acknowledgement protocol.
 - **B5-03, a timed-out partial frame was delivered later (HIGH).** Section 5.6's
   all-or-nothing frames. Tests: `workers::tests::b5_03_a_timed_out_partial_frame_is_never_delivered_later`
-  (Daybreak's `endpoint_resume`: frame 101 never arrives), the rewritten
+  (the break-it reviewer's `endpoint_resume`: frame 101 never arrives), the rewritten
   `a_given_up_write_never_tears_the_frame_stream`, `an_oversized_frame_is_refused_without_poisoning`,
   and `exec::tests::b5_03_an_uncertain_dispatch_failure_retires_the_vm`.
 - **B5-04, stale health (MEDIUM).** Section 5.3's Probe health. Tests: the guest
   broker's `server::tests::b5_04_probe_reports_a_dead_inner_sandbox_as_faulted`, and in
   the VM `b5_linux_root_a_killed_inner_sandbox_is_never_ready` with the kill-inner test
-  guest (`scripts/b5-test-guest.sh`, Daybreak's wrapper).
+  guest (`scripts/b5-test-guest.sh`, the break-it reviewer's wrapper).
 - **B5-05, concurrent Validate and Exec (MEDIUM).** Section 5.6's control slot and the
   `control_busy` Validate answer. Test: `exec::tests::b5_05_control_operations_are_serialized_per_allocation`.
 - **B5-06, Result's inner ID (MEDIUM).** Test: `exec::tests::b5_06_a_result_for_another_inner_sandbox_retires_the_vm`.
@@ -2982,7 +2982,7 @@ tests in step. The scripts refuse to start past 90 minutes of VM uptime.
 
 - **A dropped POSIX lock let another reader unlink the daemon's live WAL.** `Store::open`
   (since `7c3cd14`, so also on main `b58d94a` and in the installed `734e275`, where
-  Daybreak demonstrated the loss: B6-BI-02 below) checked the database's and its sidecars' owner,
+  the break-it reviewer demonstrated the loss: B6-BI-02 below) checked the database's and its sidecars' owner,
   mode and link count by opening and closing its own descriptors, some after SQLite had
   opened them. Closing any descriptor to a file drops every POSIX lock the process holds
   on it, SQLite's included. Another process's connection, such as an operator's `sqlite3`,
@@ -3094,7 +3094,7 @@ during milestone 2. Milestone 1's evidence records its earlier interruptions.
 
 ## B6 break-it corrections (November 3, 2026)
 
-Daybreak Blue reviewed `phase1b/b6-lifecycle` at `1973a14`
+The break-it reviewer reviewed `phase1b/b6-lifecycle` at `1973a14`
 (`reviews/2026-11-03-b6-breakit.md`, PoCs in `reviews/poc-b6/`): REJECT on one HIGH,
 with a HIGH operational exposure on main and two MEDIUM follow-ups. All four are
 answered here; B6-BI-03 is scheduled for B7.
@@ -3135,7 +3135,7 @@ naming `kilnd-fctest-manifest-only` for all three. Two fixes, either sufficient:
   after `check_daemon`, every Firecracker name in `main.rs` behind the feature, and the
   feature absent from `default`.
 
-Regressions: `scripts/test-deployment-gate-regressions.sh` turns Daybreak's PoC into
+Regressions: `scripts/test-deployment-gate-regressions.sh` turns the break-it PoC into
 three modes. `release` runs the PoC command and each flag alone against a default build
 and requires clap's refusal, no Firecracker selection and no state; CI runs it after
 `cargo build --release`. `feature` runs the PoC against a feature build, with the PoC's
@@ -3151,8 +3151,8 @@ before any state exists. The whole B6 session test still runs as `kilnd-fctest` 
 *B6-BI-02 (HIGH operational exposure): the WAL lock-drop bug is on main and installed.*
 The milestone-2 note above said the `Store::open` defect was never on main or installed.
 That was wrong: it came with `7c3cd14` and is on main `b58d94a` and in the installed
-`734e275`, and Daybreak's `reviews/poc-b6/store-wal-lock-drop.py` lost a committed row
-there on Linux. `1089aab` on this branch fixes it (Daybreak assessed the fix as sound).
+`734e275`, and the break-it reviewer's `reviews/poc-b6/store-wal-lock-drop.py` lost a committed row
+there on Linux. `1089aab` on this branch fixes it (the break-it reviewer assessed the fix as sound).
 **Until main carries `1089aab` and the installed build is replaced, nobody opens the live
 `/var/lib/kilnd/kilnd.db` with `sqlite3` (or any other SQLite client) while the daemon
 runs; inspect only stopped byte copies.** Updating main is the roadmap lead's.
@@ -3190,7 +3190,7 @@ process, restarted at 03:18 UTC for a fresh window, at `7474f4f`, with the appro
 jailer `42e9dea3…` and `mkfs.xfs` `9571cecc…` rebuilt by `build-phase1b-tools.sh`,
 release Firecracker v1.17.0 `fe726e0b…` and kiln-guest `ba890f8`'s bundle (broker
 `35fad74f…`): `test-deployment-gate-regressions.sh` release, feature and root all pass,
-and Daybreak's PoC no longer selects Firecracker from either build; the whole session
+and the break-it PoC no longer selects Firecracker from either build; the whole session
 through kilnd and kilndctl as `kilnd-fctest` in `kilnd-fctest.service` passes;
 `firecracker-crash-matrix.py` 11/11; `firecracker-regressions.py` 7/7; B5's
 `b5_linux_root` 8/8 (862 s). B4's `b4_linux_root` (not required: no B4 code changed)
@@ -3216,7 +3216,7 @@ disabled.
 
 ### Ingress fairness (B6-BI-03, MEDIUM)
 
-Daybreak's PoC held all 64 connection slots with idle sockets that never sent an HTTP/2
+The break-it PoC held all 64 connection slots with idle sockets that never sent an HTTP/2
 preface; a new Health, Get or Delete connection was closed before authorization or
 Health's reserved RPC lane could help. Admission (`admission.rs`) now splits each shared
 budget by the caller's kernel UID:
@@ -3251,7 +3251,7 @@ budget by the caller's kernel UID:
   (`--max-connections` minus `--reserved-connections`); that share plus the UID's one
   reserved slot is strictly below `--max-connections`; `--max-concurrent-rpcs-per-uid`
   is strictly below `--max-concurrent-rpcs`; and `--max-concurrent-cleanup` is at least
-  1. Equality is refused: Daybreak's accepted `33/1/32` let one UID hold all 32 general
+  1. Equality is refused: the break-it reviewer's accepted `33/1/32` let one UID hold all 32 general
   slots and the only reserved one.
 - *Root's slot (B7 milestone 2 break-it, MEDIUM-2).* Beyond `--max-connections`, one
   connection slot only UID 0 may take, after the general and reserved slots refuse it,
@@ -3271,7 +3271,7 @@ own slot. Tests:
 `server::tests::b7_idle_sockets_are_dropped_at_the_preface_deadline` (fails without the
 deadline: the idle sockets outlive it) and `b7_a_reserved_slot_serves_health_and_cleanup_only`
 on the real transport. The real-daemon regression is
-`scripts/hostile-public-caller.py`, Daybreak's PoC made harder: as root it starts a
+`scripts/hostile-public-caller.py`, the break-it PoC made harder: as root it starts a
 hostile caller under another UID (`nobody` with the socket's group as its one
 supplementary group), which keeps 64 idle sockets open for the whole victim phase and
 reconnects each one the daemon closes; while that runs, Health, GetSandbox and
@@ -3436,10 +3436,10 @@ a `gdb` sample showed H in `sha2::sha256::soft` under `verify_self_image`.
 
 ## B7 milestone 2 break-it corrections (November 5, 2026)
 
-Daybreak Blue's break-it review of milestone 2 at `01cc7bc`
+The break-it review of milestone 2 at `01cc7bc`
 (`reviews/2026-11-05-b7m2-breakit.md`) returned MUST-FIX with two HIGH findings, two
 MEDIUM and two LOW. All six are accepted and corrected on `phase1b/b7-hardening`; none is
-rejected. Daybreak's recheck of those fixes at `1d11ac9`
+rejected. The break-it recheck of those fixes at `1d11ac9`
 (`reviews/2026-11-05-b7m2-recheck.md`) found HIGH-1 only partly fixed; *HIGH-1 recheck*
 below closes it. Production Firecracker stays disabled.
 
@@ -3458,7 +3458,7 @@ does not disallow (aliases, grouped imports and `extern crate ... as` resolved; 
 import of such a crate refused), and a dependency whose own locked source reaches a
 disallowed std, Tokio or libc path (the real `fs-err` 3.3.2 reaches thirteen). The recheck
 showed these were narrower than this section first claimed; see *HIGH-1 recheck*. Tests: `proven::tests::dependency_gate::b7m2_an_fs_err_wrapper_declared_none_is_refused`
-(Daybreak's PoC on a synthetic lockfile, manifest and source: unreviewed, `none`, aliased,
+(the break-it PoC on a synthetic lockfile, manifest and source: unreviewed, `none`, aliased,
 glob, `filesystem` without paths and with paths not disallowed are refused; listed and
 disallowed passes, though `Cargo.lock` shows no raw crate), `the_lock_graph_requires_but_never_overrides`
 and `the_dependency_gate_holds`; on the real crates, `scripts/dependency-gate-regressions.sh`
@@ -3467,7 +3467,7 @@ paths disallowed, clippy rejecting the call on Rust 1.88 and 1.99.
 
 ### HIGH-1 recheck: method and transitive wrappers
 
-Daybreak's recheck (`reviews/poc-b7m2-recheck/`) showed that both lexical checks missed two
+The break-it recheck (`reviews/poc-b7m2-recheck/`) showed that both lexical checks missed two
 ordinary shapes. In the first, `method-wrapper`, reviewed `filesystem` with
 `no_destructive_api`, implements an extension trait for `std::fs::File` whose `reset`
 calls `self.set_len(0)`; production imports it `as _` and calls `file.reset()`. In the
@@ -3505,7 +3505,7 @@ The gate now fails closed on review, not detection (section 7.1 has the model):
 
 Tests (synthetic, under `cargo test`):
 
-- `b7m2_recheck_a_method_wrapper_is_refused`: Daybreak's direct case, reviewed
+- `b7m2_recheck_a_method_wrapper_is_refused`: the break-it reviewer's direct case, reviewed
   `filesystem` with `no_destructive_api` or `none`, is refused for `.set_len(` and
   `impl for std::fs::File`, and the refusal drafts the scoped exception. So is the same
   shape through a lifetime-qualified reference, UFCS, an aliased module, a glob-imported
@@ -3553,7 +3553,7 @@ test rather than two hand-written lists agreeing: `every_destructive_libc_functi
 reads the pinned libc source, and `std_and_tokio_destructive_surfaces_are_disallowed` holds
 `clippy.toml` to a curated std review and to every public `tokio::fs` function of the
 locked Tokio. Gating `libc::mount` moved the jail base's two production mounts into the
-typed `sys::bind_onto_itself` and `sys::make_private_recursive`. Daybreak's
+typed `sys::bind_onto_itself` and `sys::make_private_recursive`. The break-it reviewer's
 `missing-methods` fixture is part of `scripts/dependency-gate-regressions.sh`: clippy
 rejects both calls on 1.88 and 1.99.
 
@@ -3703,7 +3703,7 @@ CI, the full suites, and the `1d11ac9` baseline).
 
 ### Recheck 2: the build's own graph, identifiers, identities and the root
 
-Daybreak's second recheck (`reviews/2026-11-05-b7m2-recheck2.md`, PoCs in
+The second break-it recheck (`reviews/2026-11-05-b7m2-recheck2.md`, PoCs in
 `reviews/poc-b7m2-recheck2/`) at `c500a6e` failed the gate on two HIGHs and raised two
 MEDIUMs:
 
@@ -3781,7 +3781,7 @@ Tests (synthetic, under `cargo test`):
   `use` aliases and chains, glob-imported, associated) are flagged and their impls
   resolved; the package's own `File`, another crate's and target-less associated types
   are not.
-- `b7m2_recheck_a_method_wrapper_is_refused` now also refuses Daybreak's alias-UFCS
+- `b7m2_recheck_a_method_wrapper_is_refused` now also refuses the break-it reviewer's alias-UFCS
   wrapper, `Handle::set_len(x, 0)`, `<Handle as Len>::set_len`, a function value, a `use`
   list, a definition and a field; strings, comments and aliases of non-std types are not
   hits.
@@ -3789,7 +3789,7 @@ Tests (synthetic, under `cargo test`):
   `the_authoritative_gate_reads_no_environment`, and `the_dependency_gate_holds` on the
   real workspace (both profiles).
 
-`scripts/dependency-gate-regressions.sh` keeps every earlier case and adds Daybreak's
+`scripts/dependency-gate-regressions.sh` keeps every earlier case and adds the break-it reviewer's
 type-alias UFCS wrapper (vendored, its source exact), feature injection through
 `build.sh`, a profile's own graph, the two-registry collision and the root override.
 Results are under *Recheck 2 corrections evidence*.
@@ -3821,7 +3821,7 @@ changed, so no VM run was needed.
   and without the inner entry; the exception holding at its scope; the 1.0.1 bump refused
   until reviewed; `extra` refused; clippy rejecting `std::fs::copy` and `libc::creat`),
   with hits now labelled `set_len` rather than `.set_len(`. The new cases:
-  - Daybreak's type-alias UFCS wrapper, reviewed `none`: refused for `set_len`, `type
+  - The break-it reviewer's type-alias UFCS wrapper, reviewed `none`: refused for `set_len`, `type
     alias for std::fs::File` and `impl for std::fs::File`; clippy accepts the workspace.
   - Feature injection through `build.sh`: the PoC's `--all-features --features
     tokio/full` and ten other spellings (`--features=`, `-F`, `-Fx`, `-rF`,
@@ -3850,7 +3850,7 @@ CI, the full suites, and the failed `feature` attempt).
 
 ### Recheck 3: compiler cfg inputs, the whole package and every build instruction
 
-Daybreak's third recheck (`reviews/2026-11-05-b7m2-recheck3.md`, PoCs in
+The third break-it recheck (`reviews/2026-11-05-b7m2-recheck3.md`, PoCs in
 `reviews/poc-b7m2-recheck3/`) at `0c4bdd5` failed the gate on two HIGHs and raised one
 MEDIUM:
 
@@ -3939,7 +3939,7 @@ compiler could reach by a literal path. It does not claim more: a raw cargo buil
 other `-C` flags is outside the guarantee, a path a macro assembles is not followed, and
 generated `OUT_DIR` code is not read.
 
-`scripts/dependency-gate-regressions.sh` adds case 8, Daybreak's `rustflags-feature.sh`
+`scripts/dependency-gate-regressions.sh` adds case 8, the break-it reviewer's `rustflags-feature.sh`
 (`RUSTFLAGS` and `CARGO_BUILD_RUSTFLAGS` refused by name, the Clippy tail refused, a
 Cargo config file's `build.rustflags`, `target.'cfg(all())'` table and `rustc-wrapper`
 overridden so the feature's test is not compiled, and a raw cargo build refused by the
@@ -4045,7 +4045,7 @@ bytecode milestone 2 had committed under `scripts/__pycache__/` and ignores it.
 
 ## B7 integrated recheck (November 5, 2026)
 
-Daybreak Blue's recheck of the integrated branch at `f4db5b5`
+The break-it recheck of the integrated branch at `f4db5b5`
 (`reviews/2026-11-05-b7-integrated-recheck.md`, PoCs in `reviews/poc-b7-integrated/`)
 failed it on two HIGH findings and ranked one MEDIUM; every earlier PoC was confirmed
 fixed. Each is corrected on `phase1b/b7-integrated`, with the lead's decisions.
@@ -4068,7 +4068,7 @@ was never replaced and `/var/lib/kilnd` was restored from its `cmp`-verified cop
 
 ## B7 integrated recheck 2 (November 6, 2026)
 
-Daybreak Blue's second recheck of the integrated branch at `4232ccd`
+The second break-it recheck of the integrated branch at `4232ccd`
 (`reviews/2026-11-05-b7-integrated-recheck2.md`, PoCs in
 `reviews/poc-b7-integrated-recheck2/`) confirmed the three earlier findings fixed and found
 no HIGH-2 or MEDIUM-1 variant, but failed the gate on one HIGH. Stephen approved merging
@@ -4096,16 +4096,16 @@ recommends one: **helper-issued sequence tokens with a per-instance durable low
 watermark**, in which a row always outranks the watermark, everything below the watermark
 is permanently absent, and the watermark's movement is a liveness choice that no safety
 rule depends on. Rules RTC-1 to RTC-18 in section 16.5 are what B7 builds and what
-Daybreak should attack. Nothing here changes Stephen's settled decisions (one VM per
+the break-it reviewer should attack. Nothing here changes Stephen's settled decisions (one VM per
 session, terminate on uncertainty, no API socket, offline and cold only).
 
-*Revised the same day for Daybreak Blue's design review
+*Revised the same day for the break-it design review
 (`reviews/2026-11-04-rtc-design-review.md`): every request that can meet a compacted token
 now carries its plan digest, the issue pointer is persisted exactly, L alone classifies,
 compaction has a guaranteed share of L, admission headroom has a guaranteed per-instance
 share, and the rollback claims are corrected. Section 16.8 maps each finding to its change.*
 
-*Revised again for Daybreak Blue's recheck (`reviews/2026-11-04-rtc-design-recheck.md`):
+*Revised again for the break-it recheck (`reviews/2026-11-04-rtc-design-recheck.md`):
 the rollback detector accepts only a helper-issued token whose tag verifies, and its
 durable latch closes every forward effect node-wide; the issue pointer is a high-water
 mark, not a delivery record; watermark checkpoints are bounded; section 9's Runtime
@@ -4362,7 +4362,7 @@ fence). Stable or rotating filters can retire old entries, but keeping them free
 negatives across deletion needs generations or epochs (B or A again), and saturation stays
 a lifetime concern. It does nothing for the 9.8 KB of allocation history per session, which is most of
 the space. It must be keyed (the daemon chooses IDs today) and rewritten inside the fence's
-FULL-sync transaction. Operators and Daybreak cannot enumerate or audit what it contains,
+FULL-sync transaction. Operators and the break-it reviewer cannot enumerate or audit what it contains,
 and every safety argument becomes probabilistic. An exact summary of random IDs is the
 fence table itself; an exact summary of structured IDs is a watermark (A).
 
@@ -5160,7 +5160,7 @@ about five times over and many compaction cycles, inside one VM window.
 3. B6's eleven crash scenarios and seven regressions still pass, plus the eighteen B7
    crash scenarios, the real-wire digest tests and the attack regressions above.
 4. The fence allowance's per-token bound is the measured worst case, not an estimate.
-5. Daybreak attacks this design and its implementation and finds no path to a VM, disk,
+5. The break-it reviewer attacks this design and its implementation and finds no path to a VM, disk,
    claim release, absence, DELETED row or READY for a compacted token (or Stephen accepts a
    named residual risk).
 6. Section 4.1's "never prune fences by age" and B3's lifetime-budget limit are rewritten
@@ -5258,7 +5258,7 @@ about five times over and many compaction cycles, inside one VM window.
 
 ## 16.8 Design review and recheck corrections (November 4, 2026)
 
-Daybreak Blue's design review of `424c74c` (`reviews/2026-11-04-rtc-design-review.md`,
+The break-it design review of `424c74c` (`reviews/2026-11-04-rtc-design-review.md`,
 models in `reviews/poc-rtc-design/`) rejected the design as written for one HIGH and found
 the rows-first core sound. Every finding is accepted; none is rejected.
 
@@ -5276,7 +5276,7 @@ the rows-first core sound. Every finding is accepted; none is rejected.
 
 ### Design recheck corrections (November 4, 2026)
 
-Daybreak Blue's recheck of `01daf61` (`reviews/2026-11-04-rtc-design-recheck.md`, model in
+The break-it recheck of `01daf61` (`reviews/2026-11-04-rtc-design-recheck.md`, model in
 `reviews/poc-rtc-design-recheck/rtc_recheck_model.py`) closed RTC-DR-01 and RTC-DR-04 to
 RTC-DR-06, closed RTC-DR-02 and RTC-DR-03 with residuals, and rejected the revision for one
 new HIGH. Every finding is accepted.
@@ -5447,7 +5447,7 @@ the section 9.1 Runtime contract. Production Firecracker stays disabled (milesto
 
 ## 16.10 B7 milestone 1 break-it corrections (November 5, 2026)
 
-Daybreak Blue's break-it review of `179837c` (`reviews/2026-11-05-b7m1-breakit.md`) found no
+The break-it review of `179837c` (`reviews/2026-11-05-b7m1-breakit.md`) found no
 compacted-token replay and no digest-binding break, one HIGH and four lower findings. Each
 is corrected on `phase1b/b7-compaction`; the lead's decisions are recorded here.
 
@@ -5484,7 +5484,7 @@ kilnd (main `2a1faea`, schema 10) was never replaced; `/var/lib/kilnd` was resto
 
 ### Recheck residuals (November 5, 2026)
 
-Daybreak Blue's recheck of `d7f7b44` (`reviews/2026-11-05-b7m1-recheck.md`) accepted
+The break-it recheck of `d7f7b44` (`reviews/2026-11-05-b7m1-recheck.md`) accepted
 milestone 1 (no HIGH finding) and ranked four MEDIUM residuals and one LOW gap, with
 review-only PoCs in `reviews/poc-b7m1-recheck/`. Each is corrected before milestone 1
 merges; the lead's decisions are recorded with them.
@@ -5537,7 +5537,7 @@ copy, every file `cmp`-identical (`kilnd.db` SHA-256 `ef02941f…`).
 
 ### Integrated recheck: the transferred hold (November 5, 2026)
 
-Daybreak Blue's integrated recheck of `f4db5b5` (`reviews/2026-11-05-b7-integrated-recheck.md`,
+The integrated break-it recheck of `f4db5b5` (`reviews/2026-11-05-b7-integrated-recheck.md`,
 HIGH-2) found the gap R1 left at an L death. `LostAnswers` treated the dead worker's
 `Closed` as the end of a lost fault-bearing answer and lifted the hold, on the premise that
 the replacement's Handover would import whatever L had made durable. Between that `Closed`

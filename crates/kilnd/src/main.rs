@@ -1420,7 +1420,7 @@ mod tests {
         }
     }
 
-    /// B7 milestone 2 (HIGH-2): the ingress invariants at their boundaries. Daybreak's
+    /// B7 milestone 2 (HIGH-2): the ingress invariants at their boundaries. The break-it reviewer's
     /// `33/1/32` let one UID hold all 32 general slots and the only reserved slot; it is
     /// refused at startup, and one fewer per UID is accepted.
     #[test]

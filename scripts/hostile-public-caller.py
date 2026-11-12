@@ -2,7 +2,7 @@
 """B6-BI-03's real-daemon regression: a hostile public caller cannot starve Health or
 cleanup (Phase 1b B7 milestone 2).
 
-Daybreak's PoC (reviews/poc-b6/public-connection-starvation.py) held 64 idle Unix
+The break-it PoC (reviews/poc-b6/public-connection-starvation.py) held 64 idle Unix
 sockets that never sent the HTTP/2 preface and so took every connection slot; a new
 Health, Get or Delete connection was then closed before authorization. This runs the
 same attack against a real, running kilnd, harder: the hostile UID keeps all 64 open

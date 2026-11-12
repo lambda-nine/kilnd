@@ -104,7 +104,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   is the tested companion for exec options and `e48f0e7` stays the minimum for
   everything else.
 
-- Fix Daybreak's break-it findings on API additions milestone 2. HIGH 1: a create
+- Fix the break-it findings on API additions milestone 2. HIGH 1: a create
   request record's retention anchor was read before its admitting transaction began,
   so a pause before the commit (suspend, `SIGSTOP`, a stall) shortened the guaranteed
   window; the review's PoC freed a key 58 min 33.6 s early and created a second
@@ -149,7 +149,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   `--create-request-retention-secs` (a day) measured on `CLOCK_BOOTTIME` plus 0.1 %,
   get a fresh window after a reboot (one startup rebase), are never pruned while their
   sandbox is live or charged, and pin their row against ordinary retention, so a
-  wall-clock step cannot free a key early (Daybreak's design review HIGH 1).
+  wall-clock step cannot free a key early (the break-it design review HIGH 1).
   `DeleteSandboxRequest.release_request_id` drops a record only in the transaction
   that sees the row `DELETED`, through the prune-safe path, shown as
   `Sandbox.request_id_released`; the client takes the duplicate risk after it. Health
@@ -184,14 +184,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   and get a 60-second idle grace after startup. An indexed timer queue holds one
   entry per durable reservation; idle expiry and Exec admission share a per-slot
   admission gate, so an admitted Exec is never refused by a concurrent idle expiry
-  (Daybreak's design recheck MEDIUM 1), and the queue bound is stated as
+  (the break-it design recheck MEDIUM 1), and the queue bound is stated as
   `max(--max-sandboxes, reservations at startup)` (LOW 1). Schema 11 adds the policy,
   anchors, `activity_seq`, `deletion_reason` and `cancel_reason` with their
   triggers. An execution row is now inserted only while its sandbox is still READY.
   `kilndctl` gains `create --max-lifetime/--idle-timeout/--expiry-defaults`, `renew`,
   and shows features, expiry and reasons; `scripts/expiry-regressions.sh` checks real
   deadlines under the installed daemon.
-  Daybreak's milestone 1 break-it fixes: an expiry removal task now exists only while
+  The milestone 1 break-it fixes: an expiry removal task now exists only while
   it holds one of the `--max-concurrent-expiry-deletes` permits; a due delete without
   one waits as a flag on its bounded pending entry, and each returned permit starts
   the next. A client Delete of an expiry-owned row joins that removal under the same
@@ -211,7 +211,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   and a forced-failure self-test checks its EXIT cleanup (LOW 2). A new step races
   client Deletes against a mass lifetime expiry past the four permits.
 
-- Close Daybreak's integrated B7 recheck 2 (design section 15, *B7 integrated recheck 2*).
+- Close the integrated B7 break-it recheck 2 (design section 15, *B7 integrated recheck 2*).
   The dependency gate reads a `#[path]` emitted by nested `cfg_attr`s at any depth
   (`#[cfg_attr(a, cfg_attr(b, path = "..."))]`), and every `path` a `cfg_attr` emits rather
   than the first, each as a conditional source edge beside the module's ordinary location.
@@ -219,7 +219,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   copyright line is now Stephen Estrada; its pinned digest is updated, and the jailer it
   builds is unchanged.
 
-- Close Daybreak's integrated B7 recheck (design section 15, *B7 integrated recheck*, and
+- Close the integrated B7 break-it recheck (design section 15, *B7 integrated recheck*, and
   section 16.10, *Integrated recheck: the transferred hold*). A fault-bearing ledger call
   that ends because the ledger process died no longer lifts its hold on forward effects:
   the hold moves to a barrier for that ledger generation and lifts only after a
@@ -249,7 +249,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   an `unresolved source edge` needing a reviewed exception. Ten new exceptions (37) and
   seven packages moved from groups to their own justifications. The raw-build policy
   test reads every Markdown, shell, Python and workflow file; `CLAUDE.md` and the test
-  deployment's README use `build.sh` profiles. The regression script adds Daybreak's
+  deployment's README use `build.sh` profiles. The regression script adds the break-it reviewer's
   compiler-cfg and `#[path]` PoCs. The VM test library build's optimized dependencies are
   now the `vm-test` Cargo profile.
 
@@ -315,7 +315,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   new). One `name@version` from two sources is refused by the gate and the drafter. The
   authoritative `the_dependency_gate_holds` always checks its own workspace; the
   regression script uses the ignored `regression_fixture_gate` instead of
-  `KILND_DEPENDENCY_GATE_ROOT`, and adds Daybreak's feature-injection, type-alias UFCS,
+  `KILND_DEPENDENCY_GATE_ROOT`, and adds the break-it reviewer's feature-injection, type-alias UFCS,
   two-registry and root-override cases.
 - Phase 1b B7 milestone 2 recheck, HIGH-1 (design section 15, *HIGH-1 recheck*):
   the dependency gate now fails closed on review. `dependency-gate.json` reviews every
@@ -329,7 +329,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   curated destructive method names whatever the receiver (`.set_len(`, `.truncate(`,
   `.remove_file(`, `.kill(` and the rest), disallowed paths and trait impls on std's and
   Tokio's file and process types. Each hit needs a `sink_exceptions` entry scoped to
-  package, version and feature set (22 today). This refuses Daybreak's extension-trait
+  package, version and feature set (22 today). This refuses the break-it reviewer's extension-trait
   `method-wrapper` and the re-exporting `outer-wrapper`/`inner-wrapper`. The claim is
   narrowed to what the gate guarantees, and identifying a destructive API stays the
   reviewer's job. `scripts/dependency-gate-regressions.sh` runs the recheck PoCs, a
@@ -338,14 +338,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   break-it corrections*). Ingress: kilnd refuses to start unless one UID's connection
   share is strictly below the general pool and, with its reserved slot, below
   `--max-connections`, its RPC share strictly below `--max-concurrent-rpcs`, and at
-  least one reserved connection and one cleanup permit exist (Daybreak's accepted
+  least one reserved connection and one cleanup permit exist (the break-it reviewer's accepted
   `33/1/32` let one UID hold every slot); UID 0 keeps one connection slot and one
   Health/cleanup RPC permit beyond the budget; the design and threat model now call the
   reserve first-come and bounded per UID. Dependency gate: `dependency-gate.json`
   records a reviewed kind and capability for every direct dependency instead of
   inferring capability from `Cargo.lock`, a destructive-capable one lists its
   destructive paths for `clippy.toml`, build-only and dev-only kinds are checked against
-  the lock graph, and two backstops catch a mistaken `none` (Daybreak's `fs-err`
+  the lock graph, and two backstops catch a mistaken `none` (the break-it reviewer's `fs-err`
   wrapper). `clippy.toml` gains `std::fs::copy`, `tokio::fs::copy`, `CommandExt::exec`
   and every locked libc function matching the destructive patterns (`creat`, `execl`,
   `popen`, `sigqueue`, `mount`, `truncate64` and the rest), with completeness tests that
@@ -375,19 +375,19 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   ledger admits 12,287 sessions in its lifetime and an instance stops after 384 post-C1
   refusals; helper-issued sequence tokens with a per-instance durable watermark remove
   both limits without trusting clocks or daemon state. Design only; no code changes.
-- Revise the retired-token compaction design for Daybreak's design review (section 16.8):
+- Revise the retired-token compaction design for the break-it design review (section 16.8):
   Inspect, Remove and each Gc target carry the plan digest, the issue pointer is persisted
   exactly, L alone classifies tokens, compaction and admission headroom get guaranteed
   shares (RTC-17, RTC-18), and ledger restore is stated as outside the fault model with a
   mandatory offline inventory. Design only; no code changes.
-- Revise it again for Daybreak's recheck (section 16.8): the rollback detector accepts only
+- Revise it again for the break-it recheck (section 16.8): the rollback detector accepts only
   a helper-issued token whose tag verifies, and its durable latch refuses every forward
   effect node-wide until a root offline clear; the issue pointer is a high-water mark, not
   a delivery record; watermark checkpoints are bounded per pass; section 9.1's Runtime
   listing is the B7 contract; every policy slot's headroom share is reserved. Design only;
   no code changes.
 
-- Phase 1b B6 break-it corrections (Daybreak, November 3). B6-BI-01: `--backend
+- Phase 1b B6 break-it corrections (break-it review, November 3). B6-BI-01: `--backend
   firecracker` and `--firecracker-test-deployment` exist only in a build with the new
   non-default `firecracker-test-deployment` cargo feature; a default (release, installed)
   build refuses both at argument parsing. A feature build selects the isolated test
@@ -424,7 +424,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   `b6_linux_root_a_whole_session_through_kilnd_and_kilndctl` runs the real daemon in its
   own enrolled unit and drives it with `kilndctl`.
 
-- Phase 1b B5 break-it corrections (Daybreak, November 3). The ledger compacts settled
+- Phase 1b B5 break-it corrections (break-it review, November 3). The ledger compacts settled
   execution rows into one `exec_history` summary in the settling transaction, caps stop
   reasons and settled cleanup workers per allocation, and answers an oversized reply with
   `oversized` instead of exiting; Exec polls cancellation, the deadline and the session

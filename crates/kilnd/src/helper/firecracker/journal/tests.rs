@@ -2132,7 +2132,7 @@ fn phase(ledger: &mut Ledger, allocation: Id128, from: &str, to: &str) {
         .unwrap();
 }
 
-/// B5-01 (Daybreak's `ledger_growth`): 100,000 executions in one session leave an
+/// B5-01 (the break-it reviewer's `ledger_growth`): 100,000 executions in one session leave an
 /// `AllocationState` whose size does not depend on the history, so its reply fits one
 /// worker frame and Stop and Remove still reach ABSENT.
 #[test]

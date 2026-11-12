@@ -380,7 +380,7 @@ struct Slot {
     running: Mutex<Option<Arc<ExecCancellation>>>,
     outstanding_execs: Arc<Semaphore>,
     capacity: usize,
-    /// The admission gate (Daybreak recheck MEDIUM 1): Exec rechecks READY and takes
+    /// The admission gate (break-it recheck MEDIUM 1): Exec rechecks READY and takes
     /// its outstanding permit while holding it, and idle expiry holds it with the
     /// exec lock from its all-permits-free check through its delete-intent CAS, so a
     /// newly admitted request and an idle expiry cannot both win. Nothing awaits
@@ -722,7 +722,7 @@ struct ExpiryState {
     pending: HashMap<u64, PendingDelete>,
     /// Idle deadlines never fall before this boottime (`--expiry-restart-grace-secs`).
     grace_until: i64,
-    /// The queue's bound (Daybreak recheck LOW 1): one entry per durable reservation,
+    /// The queue's bound (break-it recheck LOW 1): one entry per durable reservation,
     /// which admission holds at `--max-sandboxes` except that reservations made under
     /// a higher earlier cap remain until they drain. So the bound is
     /// `max(--max-sandboxes, reservations at startup)`.

@@ -554,7 +554,7 @@ async fn b5_linux_root_three_thousand_executions_keep_the_ledger_bounded() {
     removed_cleanly(&real, &runtime, &context).await;
 }
 
-/// B5-04 (Daybreak's live PoC): the test guest's root wrapper kills the persistent
+/// B5-04 (the break-it reviewer's live PoC): the test guest's root wrapper kills the persistent
 /// sandbox's init five seconds after it appears, leaving the broker Idle. Validate
 /// must not call that sandbox Ready: the broker's liveness check faults the session,
 /// and H retires the VM. The guest comes from `scripts/b5-test-guest.sh`.
@@ -602,7 +602,7 @@ async fn b5_linux_root_a_killed_inner_sandbox_is_never_ready() {
     removed_cleanly(&real, &runtime, &context).await;
 }
 
-/// The real guest console flood Daybreak ran beside the healthy path: a guest-root
+/// The real guest console flood the break-it reviewer ran beside the healthy path: a guest-root
 /// writer at about 128 KiB/s, past D's 64 KiB prefix and under its 1 MiB/s rate. D keeps
 /// draining with flat memory and RSS, executions stay reusable, and nothing retires.
 #[tokio::test]

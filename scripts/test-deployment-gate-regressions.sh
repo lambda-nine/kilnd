@@ -2,7 +2,7 @@
 # B6-BI-01's regressions: the isolated Firecracker test deployment is selected only by a
 # kilnd built with the non-default `firecracker-test-deployment` feature, and only when
 # the deployment's account, socket group and systemd unit are what the process observably
-# is. Daybreak's PoC (reviews/poc-b6/test-deployment-identity-gate.sh) selected
+# is. The break-it PoC (reviews/poc-b6/test-deployment-identity-gate.sh) selected
 # Firecracker from an ordinary release binary with all three wrong.
 #
 #   scripts/test-deployment-gate-regressions.sh release BINARY
@@ -88,7 +88,7 @@ release)
     manifest "$run/deployment.json" "$run" kilnd-fctest-manifest-only \
         kilnd-fctest-manifest-only kilnd-fctest-manifest-only.service
     group=$(id -gn)
-    # Daybreak's PoC command, verbatim but for its paths.
+    # The break-it PoC command, verbatim but for its paths.
     status=0
     "$binary" --backend firecracker --firecracker-test-deployment "$run/deployment.json" \
         --socket "$run/socket/kilnd.sock" --socket-group "$group" \
@@ -121,7 +121,7 @@ feature)
     trap 'rm -rf -- "$run"' EXIT HUP INT TERM
     mkdir -m 700 "$run/socket" "$run/helper" "$run/state-parent"
     group=$(id -gn)
-    # Daybreak's PoC: names that exist nowhere. Refused when they do not resolve.
+    # The break-it PoC: names that exist nowhere. Refused when they do not resolve.
     manifest "$run/poc.json" "$run" kilnd-fctest-manifest-only \
         kilnd-fctest-manifest-only kilnd-fctest-manifest-only.service
     status=0

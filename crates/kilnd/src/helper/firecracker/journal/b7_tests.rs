@@ -890,7 +890,7 @@ fn ensure_child(config: &LedgerConfig, conn: &Connection, who: Id128, token: Id1
     conn.execute_batch(&insert).unwrap();
 }
 
-/// Daybreak B7 M1 finding 5: RTC-10's child order is the triggers' own, not the foreign
+/// Break-it B7 M1 finding 5: RTC-10's child order is the triggers' own, not the foreign
 /// keys'. With `foreign_keys=OFF`, neither the allocation nor its fence may go while any
 /// child row of the token remains, including the review's unreleased identity lease;
 /// the honest order still compacts with foreign keys off.

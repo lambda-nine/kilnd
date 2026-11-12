@@ -1,5 +1,5 @@
 /*
- * B5's test-guest broker wrapper (from Daybreak's B5 break-it PoC). The parent
+ * B5's test-guest broker wrapper (from the B5 break-it PoC). The parent
  * immediately becomes the approved broker, renamed kilnd-guest-broker.real; a guest-root
  * child attacks:
  *   B5_KILL_INNER     finds the persistent kiln sandbox's recorded init.pid, waits five

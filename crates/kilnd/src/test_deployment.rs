@@ -611,7 +611,7 @@ mod tests {
         let error = identity_error(&production, &o);
         assert!(error.contains("production \"kilnd\" group"), "{error}");
 
-        // Every mismatch at once is named at once (Daybreak's PoC).
+        // Every mismatch at once is named at once (the break-it PoC).
         let mut o = observed();
         (o.real_uid, o.effective_uid, o.saved_uid) = (501, 501, 501);
         o.socket_gid = Some(20);

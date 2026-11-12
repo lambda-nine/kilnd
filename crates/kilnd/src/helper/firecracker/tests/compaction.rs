@@ -2507,7 +2507,7 @@ async fn observe(
     panic!("no observation of {}", context.allocation_id)
 }
 
-/// B7 RTC-13, the daemon's side (Daybreak B7 M1 finding 4): the adapter's digest cache
+/// B7 RTC-13, the daemon's side (break-it B7 M1 finding 4): the adapter's digest cache
 /// holds only allocations past C1 that are not yet settled. Completed sessions, a
 /// Preflight dropped before C1, and every terminal path (fence, AbsentFenced Inspect,
 /// Remove, Gc) leave no entry; only Create and a non-terminal Inspect learn one, and

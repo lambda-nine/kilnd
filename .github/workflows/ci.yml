@@ -52,7 +52,7 @@ jobs:
           sh scripts/build.sh +1.99.0 default clippy --all-targets
 
       # B6-BI-01's build boundary: the release build CI and the installers make has no
-      # Firecracker flags, and refuses Daybreak's PoC command at argument parsing.
+      # Firecracker flags, and refuses the break-it PoC command at argument parsing.
       - name: Release build refuses the Firecracker test deployment
         run: |
           sh scripts/build.sh default build --release -p kilnd --bin kilnd
@@ -116,7 +116,7 @@ jobs:
           sh scripts/build.sh "$PROFILE" build -p kilnd --bin kilnd
           sh scripts/test-deployment-gate-regressions.sh feature target/debug/kilnd
 
-  # B7 milestone 2 and its rechecks: Daybreak's dependency-gate PoCs through the actual
+  # B7 milestone 2 and its rechecks: the break-it reviewer's dependency-gate PoCs through the actual
   # source loader, cargo and clippy on both toolchains (fs-err reviewed as none and as
   # filesystem; the method, transitive and type-alias UFCS wrappers as vendored registry
   # packages, a version bump and an exception's scope; std::fs::copy and libc::creat;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PH0-1: hostile descriptor flags/backpressure cannot stall the root helper.
 
-Run as kilnd against the installed service. Derived from the Daybreak Phase 0
+Run as kilnd against the installed service. Derived from the break-it Phase 0
 PoC; both the legacy descriptor injection and the v3 handoff are exercised.
 No sandbox is needed for the stdin/deadline attack.
 """

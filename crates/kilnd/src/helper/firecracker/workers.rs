@@ -3628,7 +3628,7 @@ pub(super) mod tests {
         assert_eq!(rc, 0, "{}", io::Error::last_os_error());
     }
 
-    /// B5-03 (Daybreak's `endpoint_resume`): a frame that timed out after a partial
+    /// B5-03 (the break-it reviewer's `endpoint_resume`): a frame that timed out after a partial
     /// write is never completed by the next send. The endpoint is poisoned, the second
     /// send fails with the stored error, and the receiver sees no frame 101.
     #[test]
@@ -3677,7 +3677,7 @@ pub(super) mod tests {
         assert_eq!(reader.join().unwrap(), Vec::<(u64, u64, usize)>::new());
     }
 
-    /// B5-01 defense in depth: an `AllocationState` larger than one frame (Daybreak's
+    /// B5-01 defense in depth: an `AllocationState` larger than one frame (the break-it reviewer's
     /// 5,890 Exec rows) is answered with a typed refusal, and L's endpoint stays up.
     #[test]
     fn b5_01_an_oversized_ledger_answer_is_refused_and_l_stays_up() {

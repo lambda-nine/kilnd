@@ -715,7 +715,7 @@ With R = `--create-request-retention-secs` (at least a day):
   `CLOCK_BOOTTIME`, is written by a second `IMMEDIATE` transaction that reads the
   clocks only once it holds the write lock, after the inserting commit. So no pause
   before that commit (suspend, `SIGSTOP`, a stall, a VM pause) is counted against the
-  window, which starts no earlier than the commit (Daybreak's M2 break-it HIGH 1). If
+  window, which starts no earlier than the commit (the M2 break-it HIGH 1). If
   that transaction fails or the daemon dies first, the record stays unanchored and
   unprunable until the next prune anchors it from a reading under its own write lock,
   or the startup rebase does: later, never earlier. An anchor is never removed.
@@ -736,7 +736,7 @@ With R = `--create-request-retention-secs` (at least a day):
 **Bounded integrity checks (schema 12).** Schemas 10 and 11 kept one SHA-256 over
 every sandbox row's immutable membership, and every accounting decision recomputed
 it, so with retained request history (up to 32,768 pinned rows) admission and quota
-fill were O(N) per create and could starve a node (Daybreak's M2 break-it MEDIUM 2).
+fill were O(N) per create and could starve a node (the M2 break-it MEDIUM 2).
 Schema 12 verifies that marker during the upgrade, then replaces it with
 `reservation_membership`: the count and the sum modulo 2^256 of each row's own
 SHA-256, for all rows and for the rows settled (uncharged) at the last full audit.

@@ -632,7 +632,7 @@ async fn futures_join(
     out
 }
 
-/// Daybreak B5 milestone 1 finding 3: a timed-out reader or writer is poisoned, so no
+/// Break-it B5 milestone 1 finding 3: a timed-out reader or writer is poisoned, so no
 /// retry can complete a partial frame under a fresh deadline.
 #[tokio::test(start_paused = true)]
 async fn a_timed_out_stream_is_poisoned_for_every_later_call() {
@@ -681,7 +681,7 @@ async fn a_timed_out_stream_is_poisoned_for_every_later_call() {
     );
 }
 
-/// Daybreak B5 milestone 1 finding 1: the execution's budget is shared by its exec and
+/// Break-it B5 milestone 1 finding 1: the execution's budget is shared by its exec and
 /// Cancel readers through a synchronous admission, so a stalled exec read never blocks
 /// the control channel's CancelAck, and both still count against one budget.
 #[tokio::test(start_paused = true)]

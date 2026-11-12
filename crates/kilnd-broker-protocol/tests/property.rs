@@ -285,7 +285,7 @@ fn deep_nesting_and_huge_strings_stay_bounded() {
 
 #[test]
 fn wide_objects_check_in_well_under_quadratic_time() {
-    // Daybreak B5 milestone 1 finding 2: 30,000 distinct keys in 384 KiB.
+    // Break-it B5 milestone 1 finding 2: 30,000 distinct keys in 384 KiB.
     let mut text = String::from("{");
     let mut i = 0;
     while text.len() < 380 * 1024 {

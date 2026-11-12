@@ -325,7 +325,7 @@ async fn running_and_queued_executions_pause_idle() {
     assert_eq!(row(&m, &sandbox.id).state, SandboxState::Deleted);
 }
 
-/// Daybreak recheck MEDIUM 1: expiry paused after its all-permits-free check while
+/// Break-it recheck MEDIUM 1: expiry paused after its all-permits-free check while
 /// an Exec arrives. The gate keeps the Exec from being admitted; when expiry's CAS
 /// commits, the Exec sees the typed expiry and never held a permit.
 #[tokio::test]
@@ -854,7 +854,7 @@ async fn churn_never_grows_the_queue_past_reservations() {
     assert_eq!(m.expiry.lock().unwrap().queue.capacity(), capacity);
 }
 
-/// Daybreak recheck LOW 1: restarting with a lower `--max-sandboxes` keeps one entry
+/// Break-it recheck LOW 1: restarting with a lower `--max-sandboxes` keeps one entry
 /// per durable reservation; the bound is `max(cap, reservations at startup)`.
 #[tokio::test]
 async fn a_lowered_cap_restart_keeps_one_entry_per_reservation() {

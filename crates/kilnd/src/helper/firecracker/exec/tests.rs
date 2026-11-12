@@ -16,7 +16,7 @@ const INNER: &str = "abcd-1";
 enum Write {
     Durable,
     Refused,
-    /// Never answers: a stalled L or fsync (Daybreak's `stalled_busy`).
+    /// Never answers: a stalled L or fsync (the break-it reviewer's `stalled_busy`).
     Stall,
 }
 
@@ -307,7 +307,7 @@ async fn a_delivered_result_with_drain_evidence_is_reusable() {
     );
 }
 
-/// B5-02 (Daybreak's `stalled_busy`): after `Accepted`, BUSY stalls forever and the
+/// B5-02 (the break-it reviewer's `stalled_busy`): after `Accepted`, BUSY stalls forever and the
 /// caller cancels. The VM is retired at once, not after the stall.
 #[tokio::test(start_paused = true)]
 async fn b5_02_a_stalled_busy_write_never_blocks_cancellation() {
