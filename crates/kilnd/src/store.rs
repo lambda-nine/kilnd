@@ -30,7 +30,24 @@ use crate::model::{
 use crate::retention::{OutputStorage, Pruned, Retention};
 use crate::runtime::{CreatedSandbox, FencedAbsence, RuntimeReceipt};
 
-const SCHEMA_VERSION: i64 = 14;
+mod checkpoint;
+mod checkpoint_schema;
+
+pub use checkpoint::{
+    Checkpoint, CheckpointBudgets, CheckpointCounts, CheckpointExhausted, CheckpointExpiry,
+    CheckpointFailure, CheckpointPage, CheckpointPin, CheckpointSeal, CheckpointState,
+    CheckpointUsage, ForkRefusal, HelperDispatch, NewCheckpoint, PublishCheckpoint, ReleasePin,
+    ReserveCheckpoint, ReserveFork, SettleAbsence, normalized_paths,
+};
+pub use checkpoint::{
+    DEFAULT_MAX_CHECKPOINT_BYTES, DEFAULT_MAX_CHECKPOINT_BYTES_NODE,
+    DEFAULT_MAX_CHECKPOINT_BYTES_PER_UID, DEFAULT_MAX_CHECKPOINT_RECORDS,
+    DEFAULT_MAX_CHECKPOINT_RECORDS_PER_UID, DEFAULT_MAX_CHECKPOINTS,
+    DEFAULT_MAX_CHECKPOINTS_PER_UID, MAX_CHECKPOINT_IDLE_MS, MAX_CHECKPOINT_LIFETIME_MS,
+    MIN_CHECKPOINT_EXPIRY_MS, MIN_CHECKPOINT_HISTORY_SECS,
+};
+
+const SCHEMA_VERSION: i64 = 15;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -880,7 +897,8 @@ fn live_membership(conn: &Connection) -> Result<Membership> {
 
 fn quarantined(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM temp.accounting_quarantine)",
+        "SELECT EXISTS (SELECT 1 FROM temp.accounting_quarantine)
+             OR EXISTS (SELECT 1 FROM temp.checkpoint_quarantine)",
         [],
         |r| r.get(0),
     )?)
@@ -892,6 +910,22 @@ fn quarantined(conn: &Connection) -> Result<bool> {
 /// quota counters against the records, and every fenced release's evidence, from
 /// which the quarantine is rebuilt. O(N). Stamps the data version it verified.
 fn verify_membership(conn: &Connection) -> Result<bool> {
+    verify_sandbox_membership(conn)?;
+    // Schema 15: the checkpoint rows, their counters and evidence, in the same snapshot.
+    checkpoint::verify_checkpoints(conn, true)?;
+    // In the caller's transaction with the quarantine it rebuilt: if that rolls
+    // back, so does the stamp, and the next decision verifies again.
+    conn.execute(
+        "INSERT INTO temp.membership_verified VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET data_version = excluded.data_version",
+        [data_version(conn)?],
+    )?;
+    quarantined(conn)
+}
+
+/// The sandbox half of [`verify_membership`], which the 14 to 15 migration also runs
+/// against the schema 14 rows before it changes anything.
+fn verify_sandbox_membership(conn: &Connection) -> Result<()> {
     latched_lost(conn)?;
     let (all, settled) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
     if all_membership(conn)? != all || settled.plus(live_membership(conn)?) != all {
@@ -919,14 +953,7 @@ fn verify_membership(conn: &Connection) -> Result<bool> {
              LEFT JOIN release_evidence e ON e.receipt_id = s.release_evidence_id WHERE {FENCED_RELEASE_WHERE}"
         ),
     )?;
-    // In the caller's transaction with the quarantine it rebuilt: if that rolls
-    // back, so does the stamp, and the next decision verifies again.
-    conn.execute(
-        "INSERT INTO temp.membership_verified VALUES (1, ?1)
-         ON CONFLICT(id) DO UPDATE SET data_version = excluded.data_version",
-        [data_version(conn)?],
-    )?;
-    quarantined(conn)
+    Ok(())
 }
 
 // Call inside the same transaction/snapshot as every accounting decision. Decode
@@ -972,6 +999,7 @@ fn audit_accounting(conn: &Connection) -> Result<bool> {
             live_ids()
         ),
     )?;
+    checkpoint::verify_checkpoints(conn, false)?;
     quarantined(conn)
 }
 
@@ -981,6 +1009,7 @@ fn audit_accounting(conn: &Connection) -> Result<bool> {
 /// (break-it review MEDIUM 2 of the fix): a decision's cost is bounded by the charged
 /// rows and the releases since the last committed write.
 fn settle_unsettled(conn: &Connection) -> Result<()> {
+    checkpoint::settle_checkpoints(conn)?;
     let unsettled = membership_of(
         conn,
         &format!(
@@ -1007,6 +1036,7 @@ fn audit_accounting_full(conn: &Connection) -> Result<bool> {
     let (all, _) = stored_membership(conn)?.context(MEMBERSHIP_MISMATCH)?;
     store_membership(conn, all, settled_membership(conn)?)?;
     conn.execute("DELETE FROM reservation_unsettled", [])?;
+    checkpoint::reseed_settled_checkpoints(conn)?;
     Ok(degraded)
 }
 
@@ -1407,9 +1437,10 @@ fn insert_sandbox_env(conn: &Connection, sandbox: &Sandbox, default_env: Option<
             host_spec_sha256, guest_exec_spec_sha256, runtime_profile, runtime_artifact_digest, disposition, boot_id, legacy_release,
             node_id, instance_id, allocation_id, plan_version, plan_digest, plan, release_evidence_id, last_helper_generation,
             expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, ready_boottime_ms, activity_at_ms, activity_boottime_ms, clock_boot_id,
-            activity_seq, deletion_reason, request_id, default_env, default_env_names, default_env_sha256, exec_features, list_seq)
+            activity_seq, deletion_reason, request_id, default_env, default_env_names, default_env_sha256, exec_features,
+            from_checkpoint, checkpoint_content_sha256, image_content_sha256, checkpoint_format_version, list_seq)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33,
-            ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, (SELECT value FROM history_sequence WHERE id = 1))",
+            ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, (SELECT value FROM history_sequence WHERE id = 1))",
         params![
             sandbox.id,
             sandbox.backend,
@@ -1469,6 +1500,10 @@ fn insert_sandbox_env(conn: &Connection, sandbox: &Sandbox, default_env: Option<
             names_column(&lifecycle.default_env_names)?,
             lifecycle.default_env_sha256,
             lifecycle.exec_features,
+            lifecycle.from_checkpoint.as_ref().map(|p| p.checkpoint.as_str()),
+            lifecycle.from_checkpoint.as_ref().map(|p| p.content_sha256.to_string()),
+            lifecycle.image_identity.map(|i| i.content_sha256.to_string()),
+            lifecycle.image_identity.map(|i| i.checkpoint_format_version),
         ],
     )?;
     Ok(())
@@ -1649,6 +1684,14 @@ fn sandbox_resources(conn: &Connection) -> Result<SandboxResources> {
                 host_pids: amount(5)?,
             }))?;
     }
+    // Schema 15 (checkpoint design 6): the node disk total is sandbox promises plus
+    // checkpoint charges, so every sandbox admission and Health sum composes with them.
+    // An empty checkpoint table adds zero.
+    let (_, checkpoint_bytes) = checkpoint::checkpoint_charge(conn)?;
+    resources.disk_bytes = resources
+        .disk_bytes
+        .checked_add(checkpoint_bytes)
+        .context("sandbox and checkpoint disk reservation overflow")?;
     Ok(resources)
 }
 
@@ -1839,6 +1882,7 @@ impl Store {
     fn initialize(&self) -> Result<()> {
         let mut conn = self.conn();
         register_receipt_validator(&conn)?;
+        checkpoint::register_evidence_validator(&conn)?;
         conn.pragma_update(None, "trusted_schema", "OFF")?;
         let trusted: i64 = conn.pragma_query_value(None, "trusted_schema", |r| r.get(0))?;
         if trusted != 0 {
@@ -1847,7 +1891,8 @@ impl Store {
         conn.execute_batch(
             "CREATE TEMP TABLE accounting_quarantine (id TEXT PRIMARY KEY);
              CREATE TEMP TABLE membership_lost (id INTEGER PRIMARY KEY CHECK (id = 1));
-             CREATE TEMP TABLE membership_verified (id INTEGER PRIMARY KEY CHECK (id = 1), data_version INTEGER NOT NULL);",
+             CREATE TEMP TABLE membership_verified (id INTEGER PRIMARY KEY CHECK (id = 1), data_version INTEGER NOT NULL);
+             CREATE TEMP TABLE checkpoint_quarantine (id TEXT PRIMARY KEY);",
         )?;
         // Evidence references depend on this, and SQLite ignores it inside a
         // transaction and defaults it off per connection. Set and verify it first.
@@ -1968,7 +2013,18 @@ impl Store {
         if version < 13 {
             tx.execute_batch(MIGRATE_V13)?;
         }
-        tx.execute_batch(MIGRATE_V14)?;
+        if version < 14 {
+            tx.execute_batch(MIGRATE_V14)?;
+        }
+        // Checkpoint design 9: audit the existing sandbox membership as it stands before
+        // schema 15 changes anything. Schema 15 adds no membership column, so a schema
+        // 12-14 database keeps its aggregates byte for byte.
+        if version >= 12 {
+            verify_sandbox_membership(&tx).with_context(|| {
+                format!("schema {version} reservation membership does not match; refusing to migrate to schema {SCHEMA_VERSION}")
+            })?;
+        }
+        tx.execute_batch(checkpoint::MIGRATE_V15)?;
         audit_accounting_full(&tx)?;
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
@@ -2071,6 +2127,28 @@ impl Store {
         request: Option<&RequestAdmission>,
         default_env: &[crate::exec_env::EnvVar],
     ) -> Result<ReserveSandbox> {
+        if s.lifecycle.from_checkpoint.is_some() {
+            bail!("a create from a checkpoint is admitted with its pin (reserve_fork_sandbox)");
+        }
+        match self.reserve_sandbox_inner(s, budgets, request, default_env, None)? {
+            ReserveFork::Sandbox(reserved) => Ok(reserved),
+            ReserveFork::Refused(refusal) => bail!("unexpected fork refusal {refusal:?}"),
+        }
+    }
+
+    /// The one admission path: an ordinary create (`fork` none) or a fork, whose
+    /// checkpoint is rechecked and pinned in the same transaction (checkpoint design 7.2).
+    fn reserve_sandbox_inner(
+        &self,
+        s: &Sandbox,
+        budgets: SandboxBudgets,
+        request: Option<&RequestAdmission>,
+        default_env: &[crate::exec_env::EnvVar],
+        fork: Option<&HelperDispatch>,
+    ) -> Result<ReserveFork> {
+        if fork.is_some() != s.lifecycle.from_checkpoint.is_some() {
+            bail!("a fork and only a fork names its checkpoint");
+        }
         let stored = if default_env.is_empty() {
             None
         } else {
@@ -2081,11 +2159,11 @@ impl Store {
             }
             Some(crate::exec_env::encode_stored(default_env)?)
         };
-        // A keyed create needs the boot clock to anchor its record: refuse before
-        // anything is written if there is none. This reading is display only.
-        let reading = match request {
-            Some(_) => Some(self.clock_reading()?),
-            None => None,
+        // A keyed create needs the boot clock to anchor its record, and a fork to record
+        // its checkpoint's activity: refuse before anything is written if there is none.
+        let reading = match (request, fork) {
+            (None, None) => None,
+            _ => Some(self.clock_reading()?),
         };
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2108,47 +2186,64 @@ impl Store {
             )?;
             if taken {
                 tx.commit()?;
-                return Ok(ReserveSandbox::RequestIdTaken);
+                return Ok(ReserveFork::Sandbox(ReserveSandbox::RequestIdTaken));
             }
             let counts = request_counts(&tx, s.owner_uid)?;
             if counts.uid >= request.max_per_uid {
                 tx.commit()?;
-                return Ok(ReserveSandbox::RequestQuota(RequestQuota {
+                return Ok(ReserveFork::Sandbox(ReserveSandbox::RequestQuota(RequestQuota {
                     scope: "uid",
                     count: counts.uid,
                     limit: request.max_per_uid,
-                }));
+                })));
             }
             if counts.node >= request.max_node {
                 tx.commit()?;
-                return Ok(ReserveSandbox::RequestQuota(RequestQuota {
+                return Ok(ReserveFork::Sandbox(ReserveSandbox::RequestQuota(RequestQuota {
                     scope: "node",
                     count: counts.node,
                     limit: request.max_node,
-                }));
+                })));
             }
         } else if s.lifecycle.request_id.is_some() {
             bail!("an unkeyed create cannot name a request ID");
         }
+        // A fork rechecks its checkpoint at this commit, after any preflight await.
+        let checkpoint = match &s.lifecycle.from_checkpoint {
+            None => None,
+            Some(from) => match checkpoint::check_fork(&tx, s, from)? {
+                Ok(checkpoint) => Some(checkpoint),
+                Err(refusal) => {
+                    tx.commit()?;
+                    return Ok(ReserveFork::Refused(refusal));
+                }
+            },
+        };
         let reserved = sandbox_resources(&tx)?;
         let requested = SandboxResources::for_reservation(&s.accounting.reservation);
         if let Some(exhausted) = exhausted_budget(reserved, requested, budgets)? {
             tx.commit()?;
-            return Ok(ReserveSandbox::Exhausted(exhausted));
+            return Ok(ReserveFork::Sandbox(ReserveSandbox::Exhausted(exhausted)));
         }
         insert_sandbox_env(&tx, s, stored.as_deref())?;
         if let (Some(request), Some(now)) = (request, &reading) {
+            // Design 7.2: digest version 2 exactly for a create from a checkpoint.
+            let digest_version = if s.lifecycle.from_checkpoint.is_some() { 2 } else { 1 };
             tx.execute(
-                "INSERT INTO create_requests (owner_uid, request_id, request_sha256, sandbox_id, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO create_requests (owner_uid, request_id, request_sha256, sandbox_id, created_at_ms, digest_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     s.owner_uid,
                     s.lifecycle.request_id,
                     request.sha256.to_string(),
                     s.id,
                     now.wall_ms,
+                    digest_version,
                 ],
             )?;
+        }
+        if let (Some(checkpoint), Some(reader), Some(now)) = (&checkpoint, fork, &reading) {
+            checkpoint::insert_pin(&tx, &s.id, checkpoint, reader, now)?;
         }
         note_inserted_sandbox(&tx, &s.id)?;
         #[cfg(test)]
@@ -2167,7 +2262,7 @@ impl Store {
                 tracing::warn!(sandbox = %s.id, error = %format!("{error:#}"), "create request record left unanchored until the next prune");
             }
         }
-        Ok(ReserveSandbox::Inserted)
+        Ok(ReserveFork::Sandbox(ReserveSandbox::Inserted))
     }
 
     /// Design 3.1 step 3: the caller's record for `request_id` and its sandbox, read in
@@ -3242,6 +3337,7 @@ impl Store {
         // cutoff above was read before this, so it cannot select one it anchors.
         if let Some(clock) = &clock {
             anchor_unanchored(&tx, &**clock)?;
+            checkpoint::anchor_unanchored_checkpoint_requests(&tx, &ClockReading::now(&**clock))?;
         }
         let terminal = "state IN ('exited','timed_out','canceled','failed','interrupted') AND finished_at_ms IS NOT NULL";
         let mut result = Pruned {
@@ -3251,6 +3347,8 @@ impl Store {
                 params![execution_cutoff, policy.execution_max_count])?,
             sandboxes: 0,
             create_requests: 0,
+            checkpoints: 0,
+            checkpoint_requests: 0,
         };
         // Design 3.3 R3, before the age and count prune so a row whose record ends
         // here follows ordinary retention from now on.
@@ -3262,6 +3360,8 @@ impl Store {
                     cutoff_boottime_ms: *cutoff,
                 },
             )?;
+            result.checkpoint_requests =
+                checkpoint::prune_checkpoint_requests(&tx, boot_id, *cutoff)?;
         }
         tx.execute_batch("CREATE TEMP TABLE retention_sandboxes (id TEXT PRIMARY KEY);")?;
         // R4: a row with a record is pinned, outside both the age and the count.
@@ -3270,8 +3370,14 @@ impl Store {
             FROM sandboxes WHERE state IN ('deleted','failed') AND NOT ({RESERVED_SANDBOX_WHERE})
             AND id NOT IN (SELECT id FROM temp.accounting_quarantine)
             AND NOT EXISTS (SELECT 1 FROM create_requests WHERE sandbox_id = sandboxes.id)
+            AND NOT EXISTS (SELECT 1 FROM checkpoint_pins WHERE sandbox_id = sandboxes.id AND released_at_ms IS NULL)
             AND NOT EXISTS (SELECT 1 FROM executions WHERE sandbox_id = sandboxes.id AND NOT ({terminal})))
             WHERE updated_at_ms <= ?1 OR n > ?2"), params![sandbox_cutoff, policy.sandbox_max_count])?;
+        // A pruned fork's released pin goes with it: its provenance stays on no row.
+        tx.execute(
+            "DELETE FROM checkpoint_pins WHERE sandbox_id IN (SELECT id FROM retention_sandboxes)",
+            [],
+        )?;
         result.executions += tx.execute(
             "DELETE FROM executions WHERE sandbox_id IN (SELECT id FROM retention_sandboxes)",
             [],
@@ -3295,6 +3401,10 @@ impl Store {
         tx.execute_batch("DROP TABLE retention_sandboxes;")?;
         let (all, settled) = stored_membership(&tx)?.context(MEMBERSHIP_MISMATCH)?;
         store_membership(&tx, all.minus(removed), settled.minus(removed))?;
+        // Terminal checkpoint history: age only, at least a day (design 6.2); caps refuse
+        // new work instead of pruning early.
+        let checkpoint_cutoff = cutoff(policy.sandbox_max_age_secs.max(MIN_CHECKPOINT_HISTORY_SECS))?;
+        result.checkpoints = checkpoint::prune_checkpoints(&tx, checkpoint_cutoff)?;
         tx.commit()?;
         Ok(result)
     }
@@ -3990,8 +4100,9 @@ const SANDBOX_COLUMNS: &str = "id, backend, backend_id, state, spec, failure_rea
     id IN (SELECT id FROM temp.accounting_quarantine),
     expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, ready_boottime_ms, activity_at_ms, activity_boottime_ms,
     clock_boot_id, activity_seq, deletion_reason, request_id, request_id_released_at_ms,
-    default_env_names, default_env_sha256, exec_features";
-const SANDBOX_COLUMN_COUNT: usize = 48;
+    default_env_names, default_env_sha256, exec_features,
+    from_checkpoint, checkpoint_content_sha256, image_content_sha256, checkpoint_format_version";
+const SANDBOX_COLUMN_COUNT: usize = 52;
 
 /// Row decoding errors are reported per row rather than as SQLite errors.
 fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
@@ -4028,6 +4139,8 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
     let default_env_names: Option<String> = row.get(45)?;
     let default_env_sha256: Option<String> = row.get(46)?;
     let exec_features: Option<i64> = row.get(47)?;
+    let from_checkpoint: [Option<String>; 2] = [row.get(48)?, row.get(49)?];
+    let image_identity: (Option<String>, Option<i64>) = (row.get(50)?, row.get(51)?);
     Ok((|| {
         let bad = |what: &str, why: String| anyhow::anyhow!("sandbox {id}: bad {what}: {why}");
         let amount = |index: usize| {
@@ -4144,6 +4257,26 @@ fn sandbox_row(row: &Row<'_>) -> rusqlite::Result<Result<Sandbox>> {
                     .map(u32::try_from)
                     .transpose()
                     .map_err(|e| bad("exec features", e.to_string()))?,
+                from_checkpoint: match from_checkpoint {
+                    [None, None] => None,
+                    [Some(checkpoint), Some(content)] => Some(crate::model::CheckpointProvenance {
+                        checkpoint: crate::checkpoint::CheckpointId::parse(&checkpoint)
+                            .map_err(|e| bad("checkpoint provenance", e))?,
+                        content_sha256: Digest::parse(&content)
+                            .map_err(|e| bad("checkpoint content digest", e))?,
+                    }),
+                    _ => bail!("sandbox {id}: partial checkpoint provenance"),
+                },
+                image_identity: match image_identity {
+                    (None, None) => None,
+                    (Some(content), Some(format)) => Some(crate::model::ImageIdentity {
+                        content_sha256: Digest::parse(&content)
+                            .map_err(|e| bad("image digest", e))?,
+                        checkpoint_format_version: u32::try_from(format)
+                            .map_err(|e| bad("checkpoint format", e.to_string()))?,
+                    }),
+                    _ => bail!("sandbox {id}: partial image identity"),
+                },
             },
             id: id.clone(),
         };
@@ -7229,7 +7362,8 @@ mod tests {
             if valid {
                 let store = upgraded.unwrap();
                 // Schemas 11, 12 and 13 append lifecycle columns; history gets their
-                // nulls, seq 0, no request ID, no default env and no exec features.
+                // nulls, seq 0, no request ID, no default env and no exec features. Schema
+                // 15 appends four: no checkpoint provenance and no image identity.
                 let after = table_snapshot(&store.conn(), "sandboxes");
                 assert_eq!(after.len(), before.len());
                 for (after, before) in after.iter().zip(&before) {
@@ -7246,6 +7380,10 @@ mod tests {
                             Null,
                             Null,
                             Integer(0),
+                            Null,
+                            Null,
+                            Null,
+                            Null,
                             Null,
                             Null,
                             Null,
@@ -9748,15 +9886,15 @@ mod tests {
         let id = &live.id;
         // No replace, in either key; no record for a foreign or non-CREATING row.
         refused(&format!(
-            "INSERT OR REPLACE INTO create_requests VALUES (1000, 'live', '{}', '{id}', 1, 'b', 1)",
+            "INSERT OR REPLACE INTO create_requests VALUES (1000, 'live', '{}', '{id}', 1, 'b', 1, 1)",
             "0".repeat(64)
         ));
         refused(&format!(
-            "INSERT OR REPLACE INTO create_requests VALUES (1000, 'other', '{}', '{id}', 1, 'b', 1)",
+            "INSERT OR REPLACE INTO create_requests VALUES (1000, 'other', '{}', '{id}', 1, 'b', 1, 1)",
             "0".repeat(64)
         ));
         refused(&format!(
-            "INSERT INTO create_requests VALUES (1001, 'other', '{}', '{id}', 1, 'b', 1)",
+            "INSERT INTO create_requests VALUES (1001, 'other', '{}', '{id}', 1, 'b', 1, 1)",
             "0".repeat(64)
         ));
         // A record changes only in the cross-boot rebase.

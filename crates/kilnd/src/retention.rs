@@ -54,4 +54,8 @@ pub struct Pruned {
     pub sandboxes: usize,
     /// Create request records whose retention ended.
     pub create_requests: usize,
+    /// Terminal checkpoint history rows (schema 15).
+    pub checkpoints: usize,
+    /// Capture request records whose retention ended (schema 15).
+    pub checkpoint_requests: usize,
 }

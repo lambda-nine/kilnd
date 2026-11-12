@@ -427,6 +427,19 @@ for investigation rather than deleting evidence. Independent SQLite connections
 without the registered receipt validator cannot insert release evidence. Older
 binaries refuse schema 9.
 
+Schema 15 adds the workspace checkpoint store (checkpoint milestone C4; see
+[architecture.md](architecture.md#workspace-checkpoint-store-schema-15)). The feature is
+off, so the tables stay empty and every total is unchanged. The upgrade audits the
+schema 14 reservation membership first and refuses (leaving schema 14 intact) if it does
+not match. Older binaries refuse schema 15. **Rollback never lowers `user_version`:**
+it restores a database backup taken before the upgrade, together with the checkpoint
+artifacts that match it (`/var/lib/kiln/runs/.checkpoints/<instance>/`), with the
+daemon and helper stopped. While the feature is off there are no artifacts, so the
+database backup alone is the matching set, which is what `kilnd-maintenance.py` restores
+when an upgrade fails. Once checkpoints exist, a database restored without its artifacts,
+or artifacts without their rows, leaves unexplained artifacts that block new disk
+allocation until reconciled; they are never adopted or swept as free space.
+
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart. On a Firecracker node this is a transaction; see above.
 - **State path:** `--state-dir` must be absolute. Its real ancestors must be

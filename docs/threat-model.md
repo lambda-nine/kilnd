@@ -231,6 +231,14 @@ freeing it. The group is disabled unless root starts the helper with
 `--enable-checkpoints`, and the daemon does not use it before the feature's later
 milestones.
 
+The daemon's checkpoint store (schema 15, milestone C4) keeps each checkpoint charged
+until it stores ABSENT evidence of its own recorded removal, in the same node disk
+budget as sandbox reservations. Its triggers and audits defend against malformed SQL
+and accidental or partial edits, not a hostile writer with the database's file
+authority, exactly as for sandbox reservations: a mismatch or invalid evidence degrades
+accounting and refuses capture and sandbox Create, and never frees capacity. The
+evidence is the helper's certification, not an independent ledger.
+
 ## What it relies on kiln for
 
 Isolation itself: namespaces, the user-ID shift, seccomp denylist, Landlock,

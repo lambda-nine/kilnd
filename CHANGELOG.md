@@ -6,6 +6,18 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone C4 of workspace checkpoints, the daemon's store: schema 15 with every
+  table and column the feature needs (checkpoints, helper evidence, fork pins, capture
+  keys, trigger-kept counts and membership aggregates; fork provenance and image
+  identity on sandboxes; a create request digest version). A checkpoint is charged R,
+  then its sealed S, until ABSENT evidence of its own removal is stored, in the same
+  node disk budget sandbox reservations use, and admission checks every per-checkpoint,
+  per-uid and node cap in one transaction. Triggers refuse tampering through ordinary
+  SQL; every accounting decision audits the rows it depends on, and a mismatch refuses
+  capture and sandbox Create without freeing capacity. The migration audits schema 14's
+  membership first and changes no existing row, digest or charge. The feature stays
+  off: no RPC, Health field or command uses the store yet. Older binaries refuse schema
+  15; rollback restores a backup with its matching artifacts.
 - Take back a fresh removal's tombstone when kiln answers `checkpoint_busy` too, not
   only on a generation mismatch (checkpoint C3 adversarial recheck, LOW L1): a busy
   removal naming the wrong generation removed nothing, but its tombstone refused the

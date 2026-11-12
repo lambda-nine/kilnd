@@ -1246,6 +1246,104 @@ insert by a trigger); null on history. Schemas 9 to 13 migrate in one transactio
 exits with the command's code; `kilndctl execution` shows the mode.
 
 
+## Workspace checkpoint store (schema 15)
+
+Milestone C4 of the workspace checkpoint design reserves schema 15 for the whole
+feature: every table and column C5's RPCs and C6's acceptance need exists now, so no
+later milestone reshapes a migrated row. **The feature stays off:** no RPC, Health
+field, `kilndctl` command or feature bit reaches these tables yet, and an empty
+`checkpoints` table adds exactly zero to every total. The store API in
+`crates/kilnd/src/store/checkpoint.rs` is what C5 will call.
+
+**Tables.**
+
+| Table | What it holds |
+|---|---|
+| `checkpoints` | `cp-` + 32 hex ID; owner uid; this instance; generation; format (1); source sandbox, backend and backend ID (provenance, no foreign key); creation sequence; capture nonce, helper epoch and boot; R (`max_size_bytes`, 64 KiB to 1 TiB); image name and content digest, root-write policy, normalized writable paths and the exclusions; finite expiry policy (lifetime 10 s to 7 days, idle 10 s to 24 h); state; the READY seal (COMPLETE evidence ID, content and binding digests, S, logical and allocated bytes, entries, READY anchors), set once; activity anchors and sequence; first deletion reason; expiry intent anchors; failure token and redacted detail; the latest removal's nonce, epoch and boot; ABSENT evidence ID and release time; capture key and its release time |
+| `checkpoint_evidence` | The helper's sealed facts (COMPLETE, ABSENT, reader-ended): canonical bytes (at most 16 KiB) and ID, with instance, checkpoint, generation, nonce, epoch, boot and kind as columns. Reloaded with `SealedEvidence::decode` |
+| `checkpoint_pins` | One per fork sandbox (its primary key, a foreign key to the fork's row): checkpoint, generation, content digest, reader nonce, epoch and boot; released once, by `complete`, `not_started` or `absent`, with that evidence |
+| `checkpoint_requests` | Capture keys: `(owner uid, request ID)`, request digest and version, the checkpoint, and M2's post-commit retention anchors. A separate namespace from create keys |
+| `checkpoint_counts` | Node (`-1`) and per-uid live count, charged bytes, retained records and keys, kept by triggers |
+| `checkpoint_membership`, `checkpoint_unsettled` | Schema 12's pattern: versioned aggregates over each row's identity, binding, cap and READY seal, and the rows released since the last full audit |
+| `checkpoint_sequence` | The creation sequence, which survives retention |
+
+`sandboxes` gains `from_checkpoint` and `checkpoint_content_sha256` (both or neither,
+fixed at insert, CREATING only) and `image_content_sha256` with
+`checkpoint_format_version` (both or neither, written once, for a new checkpoint-capable
+sandbox; history has none, so an older sandbox can never be captured).
+`create_requests` gains `digest_version`: 1 on every existing record and every ordinary
+create, 2 exactly for a create from a checkpoint (a trigger checks the row). None of
+this is sandbox reservation membership, so the schema 12 aggregates are unchanged.
+
+**Charge.** A checkpoint row is charged until it references ABSENT evidence of its own
+recorded removal, whatever its state: R from the CAPTURING insert, S (0 < S <= R) from
+the READY seal, through QUARANTINED and DELETING. FAILED and DELETED are exactly the
+released states; a capture that failed stays CAPTURING, charged R, until its absence is
+proved. A failed row may later become DELETED. The node disk total that every sandbox
+admission, capture admission and Health compares against is sandbox disk promises plus
+checkpoint charges, computed in the same snapshot (`sandbox_resources`), so a sandbox
+create can't spend a checkpoint's bytes or the reverse.
+
+**Admission** (`reserve_checkpoint`) is one IMMEDIATE transaction after the accounting
+audit: the capture key (taken, or at its quota), a READY, checkpoint-capable source whose
+writable set the capture records, R at most the node's per-checkpoint limit (1 GiB) and
+the source's own disk, then per-uid and node live count (32 / 128), charged bytes (4 /
+8 GiB), retained records (4,096 / 32,768) and the shared node disk budget; then the
+row, its key record and its membership. A refusal changes nothing. A fork
+(`reserve_fork_sandbox`) commits the ordinary CREATING row and full reservation, its
+key record (version 2), its provenance and its pin together, after rechecking the
+checkpoint at that commit: READY, the same content digest, its owner or root, the same
+image and root-write policy and canonical writable set, and disk at least S. The pin
+also records the checkpoint's activity.
+
+**Transitions and evidence.** `publish_checkpoint_ready` checks the COMPLETE evidence
+against the row's own binding in Rust, then seals S and the digests and stamps READY in
+one transaction that also requires the source still READY under the bound backend ID.
+`publish_checkpoint_delete_intent` is D1; `record_checkpoint_removal` records the fresh
+nonce each removal is dispatched with; `settle_checkpoint_absence` is D3: the recorded
+removal's ABSENT evidence, checked in Rust, releases every live pin (`absent`) and then
+the charge, in one transaction. `release_checkpoint_pin` accepts only the reader's
+evidence with copy `complete` or `not_started`; `unknown` never releases.
+
+**Triggers** (defense in depth against ordinary SQL, as in schemas 8 to 12): type and
+range CHECKs on every column; no INSERT OR REPLACE on any key; immutable identity,
+owner, source, cap, format, compatibility, expiry policy and key; a seal written once,
+only from CAPTURING to READY, only with stored COMPLETE evidence whose JSON fields are
+the seal's and while the source is READY; legal transitions only (no resurrection); a
+release only with stored ABSENT evidence of the recorded removal and no live pin, and
+never undone; removals dispatched with a fresh nonce, only while CAPTURING or DELETING;
+first deletion reason, failure written once, monotonic activity sequence; no deletion of
+a charged, keyed or pinned row; evidence immutable, validated by
+`kilnd_checkpoint_evidence_valid` on insert, bound to this instance and an existing
+checkpoint generation, and kept while its row exists; pins taken only on READY by their
+own CREATING fork with the same generation, digest and image, fixed, released once with
+matching evidence, never deleted while live. `trusted_schema` stays off: the triggers use
+only innocuous built-ins and the registered validator.
+
+**Audits.** No trigger makes the file tamperproof against its owner. Every accounting
+decision runs the checkpoint audit in its snapshot: the settled and live (charged plus
+recently released) membership against the stored total, the charged columns of the
+cached counters against the charged rows, and the evidence of those rows and their
+released pins, decoded in Rust. Startup, prune and any decision after another
+connection committed run the full audit: every row, every counter including records and
+keys, and every stored evidence row. Bad evidence quarantines the row, which stays
+charged (a released row is charged again), and Health is degraded; reads still work.
+A membership or counter mismatch fails the decision itself (totals unavailable), as a
+sandbox membership mismatch does, until the database is restored or reconciled. Either
+way both capture and sandbox Create are refused and no capacity is freed.
+
+**Retention.** Prune removes terminal (FAILED or DELETED, released, unquarantined)
+checkpoint rows with no capture key and no live pin once they are older than the larger
+of the sandbox history age and a day, with their released pins and evidence. Capture
+keys follow create keys' boot-clock retention and are anchored after their commit; a
+fork's released pin goes with its pruned sandbox.
+
+**Migration 14 to 15** runs in the startup transaction after auditing the existing
+sandbox membership as it stands (a mismatch refuses startup and leaves schema 14
+untouched). It adds the tables and columns, seeds empty aggregates, and changes no
+schema 14 row, digest, aggregate or charge predicate. Older binaries refuse schema 15;
+see [setup.md](setup.md) for rollback.
+
 ## Limits and defaults
 
 | Setting | Default | Flag |

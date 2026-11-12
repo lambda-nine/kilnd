@@ -469,6 +469,29 @@ pub struct SandboxLifecycle {
     /// The exec runtime feature bits recorded at READY publication (design 4.1);
     /// `None` before READY, on rows from before schema 13 and when unknown.
     pub exec_features: Option<u32>,
+    /// The checkpoint a fork was created from and its content digest (schema 15,
+    /// checkpoint design 7.2), fixed at insert. `None` for every ordinary create.
+    pub from_checkpoint: Option<CheckpointProvenance>,
+    /// The image content identity and checkpoint format the sandbox's runtime supports,
+    /// recorded once for a new checkpoint-capable sandbox (schema 15). `None` on every
+    /// older row: such a sandbox cannot be checkpointed.
+    pub image_identity: Option<ImageIdentity>,
+}
+
+/// Where a fork's workspace came from. Provenance only: no lifetime dependency on the
+/// checkpoint, which may be deleted while the fork lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointProvenance {
+    pub checkpoint: crate::checkpoint::CheckpointId,
+    pub content_sha256: Digest,
+}
+
+/// A sandbox's image content identity (checkpoint design 4.2) and the checkpoint
+/// format its runtime supports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageIdentity {
+    pub content_sha256: Digest,
+    pub checkpoint_format_version: u32,
 }
 
 /// Why a CANCELED execution was canceled.
