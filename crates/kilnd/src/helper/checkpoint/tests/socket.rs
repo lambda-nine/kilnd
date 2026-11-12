@@ -154,7 +154,16 @@ impl Helper {
 async fn capture_restore_inspect_and_remove_cross_the_socket() {
     let helper = helper(true).await;
     let epoch = helper.epoch().await;
-    let b = binding();
+    // Its own checkpoint: on Linux the other tests' workers, which name theirs, would
+    // rightly block this one's absence.
+    let t = ArtifactTarget {
+        checkpoint: CheckpointId::random(),
+        ..target()
+    };
+    let b = CaptureBinding {
+        target: t.clone(),
+        ..binding()
+    };
     let reply = helper
         .call(
             Some(epoch),
@@ -176,7 +185,7 @@ async fn capture_restore_inspect_and_remove_cross_the_socket() {
         .call(
             Some(epoch),
             CheckpointOperation::Inspect {
-                target: target(),
+                target: t.clone(),
                 verify: true,
                 operation: Some(b.operation),
             },
@@ -195,7 +204,7 @@ async fn capture_restore_inspect_and_remove_cross_the_socket() {
         .call(
             Some(epoch),
             CheckpointOperation::Restore {
-                target: target(),
+                target: t.clone(),
                 content_sha256: content(),
                 reader,
                 spec: serde_json::from_value(serde_json::json!({
@@ -217,7 +226,7 @@ async fn capture_restore_inspect_and_remove_cross_the_socket() {
         .call(
             Some(epoch),
             CheckpointOperation::Remove {
-                target: target(),
+                target: t.clone(),
                 operation: removal,
             },
             30,
@@ -245,7 +254,7 @@ async fn capture_restore_inspect_and_remove_cross_the_socket() {
         !helper
             .dir
             .join("art")
-            .join(format!("{INSTANCE}_{CHECKPOINT}"))
+            .join(format!("{INSTANCE}_{}", t.checkpoint))
             .exists()
     );
     helper.stop().await;
