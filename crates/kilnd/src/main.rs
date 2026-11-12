@@ -204,7 +204,8 @@ struct Args {
     /// ExecStreams one uid may hold at once (below --max-exec-streams).
     #[arg(long, default_value_t = 8)]
     max_exec_streams_per_uid: usize,
-    /// One ExecStream's live queue, in bytes (at least two chunks); a full queue drops
+    /// One ExecStream's live queue, in bytes (at least two chunks with their overhead and
+    /// idle deque slots: 65,984 for 32 KiB chunks); a full queue drops
     /// live output and reports the gap.
     #[arg(long, default_value_t = 256 * 1024)]
     exec_stream_buffer_bytes: usize,
@@ -906,12 +907,11 @@ fn validate_exec_streams(limits: &Limits) -> Result<()> {
             kilnd::exec_stream::MAX_CHUNK_BYTES
         );
     }
-    if stream.buffer_bytes / 2 < stream.chunk_bytes + kilnd::exec_stream::ENTRY_OVERHEAD
-        || u32::try_from(stream.buffer_bytes).is_err()
-    {
+    // Two chunks with their entry overhead and every idle deque slot (recheck M4-R1).
+    let minimum = kilnd::exec_stream::min_buffer_bytes(stream.chunk_bytes);
+    if stream.buffer_bytes < minimum || u32::try_from(stream.buffer_bytes).is_err() {
         bail!(
-            "--exec-stream-buffer-bytes must hold at least two chunks with their overhead ({} bytes) and fit u32",
-            2 * (stream.chunk_bytes + kilnd::exec_stream::ENTRY_OVERHEAD)
+            "--exec-stream-buffer-bytes must hold at least two chunks with their overhead and deque slots ({minimum} bytes) and fit u32"
         );
     }
     Ok(())
@@ -1236,8 +1236,11 @@ mod tests {
             (&["--exec-stream-chunk-bytes", "65536"], true),
             (&["--exec-stream-chunk-bytes", "65537"], false),
             (&["--exec-stream-chunk-bytes", "0"], false),
-            (&["--exec-stream-buffer-bytes", "65663"], false),
-            (&["--exec-stream-buffer-bytes", "65664"], true),
+            // Recheck M4-R1: two 32 KiB chunks, their 64-byte overheads and eight
+            // 40-byte idle deque slots. The old minimum, 65,664, no longer passes.
+            (&["--exec-stream-buffer-bytes", "65664"], false),
+            (&["--exec-stream-buffer-bytes", "65983"], false),
+            (&["--exec-stream-buffer-bytes", "65984"], true),
             (&["--exec-stream-buffer-bytes", "4294967296"], false),
         ] {
             let mut full = vec!["kilnd"];

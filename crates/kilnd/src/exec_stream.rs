@@ -27,6 +27,16 @@ use crate::model::Execution;
 pub const ENTRY_OVERHEAD: usize = 64;
 /// One deque slot. The deque's whole capacity, live or not, is charged at this size.
 const SLOT_BYTES: usize = std::mem::size_of::<Entry>();
+/// The most deque slots a drained queue keeps: `shrink_slots` never shrinks below this,
+/// and a fresh queue's first allocation is smaller.
+const IDLE_SLOTS: usize = 8;
+
+/// The smallest `--exec-stream-buffer-bytes` that keeps two whole `chunk_bytes` chunks
+/// whatever the queue held before: both entries with their overhead, plus every deque
+/// slot an empty queue may still be charged for (recheck finding M4-R1).
+pub fn min_buffer_bytes(chunk_bytes: usize) -> usize {
+    2 * (chunk_bytes + ENTRY_OVERHEAD) + IDLE_SLOTS * SLOT_BYTES
+}
 /// `--exec-stream-buffer-bytes` and `--exec-stream-chunk-bytes` defaults (design 7).
 pub const DEFAULT_BUFFER_BYTES: usize = 256 * 1024;
 pub const DEFAULT_CHUNK_BYTES: usize = 32 * 1024;
@@ -200,7 +210,7 @@ impl QueueState {
     /// peak allocation (amortized: it shrinks to twice the live entries).
     fn shrink_slots(&mut self) {
         let (len, cap) = (self.entries.len(), self.entries.capacity());
-        if cap > 8 && len * 4 <= cap {
+        if cap > IDLE_SLOTS && len * 4 <= cap {
             self.entries.shrink_to((len * 2).max(4));
         }
     }
@@ -768,6 +778,67 @@ mod tests {
             state.queue_dropped
         );
         assert!(total <= DEFAULT_BUFFER_BYTES);
+    }
+
+    /// Recheck M4-R1: the accepted minimum keeps two whole chunks in a fresh queue...
+    #[test]
+    fn m4_r1_the_minimum_buffer_holds_two_chunks_when_fresh() {
+        let chunk = DEFAULT_CHUNK_BYTES;
+        let queue = small(min_buffer_bytes(chunk), chunk);
+        let _handle = queue.handle();
+        queue.offer(LiveStream::Stdout, 0, &vec![7; 2 * chunk]);
+        let state = queue.state();
+        let retained: usize = state.entries.iter().map(|entry| entry.data.len()).sum();
+        assert_eq!(state.queue_dropped, [0, 0]);
+        assert_eq!(retained, 2 * chunk);
+        assert!(state.charged() <= min_buffer_bytes(chunk));
+    }
+
+    /// ...and after a drain left its idle deque slots behind (the recheck's second PoC,
+    /// where four extra slots were not enough).
+    #[test]
+    fn m4_r1_the_minimum_buffer_holds_two_chunks_after_drain_and_refill() {
+        let chunk = DEFAULT_CHUNK_BYTES;
+        let queue = small(min_buffer_bytes(chunk), chunk);
+        let handle = queue.handle();
+        for n in 0..5u64 {
+            let stream = if n % 2 == 0 {
+                LiveStream::Stdout
+            } else {
+                LiveStream::Stderr
+            };
+            queue.offer(stream, n, &[n as u8]);
+        }
+        {
+            let mut state = queue.state();
+            assert_eq!(state.entries.capacity(), IDLE_SLOTS, "setup grew the deque");
+            while handle.take_chunk(&mut state).is_some() {}
+            assert!(state.entries.is_empty());
+            assert_eq!(state.entries.capacity(), IDLE_SLOTS, "a drain keeps them");
+        }
+        queue.offer(LiveStream::Stdout, 5, &vec![7; 2 * chunk]);
+        let state = queue.state();
+        let retained: usize = state.entries.iter().map(|entry| entry.data.len()).sum();
+        assert_eq!(state.queue_dropped, [0, 0]);
+        assert_eq!(retained, 2 * chunk);
+        // The minimum is exact: one byte less loses the second chunk.
+        let tight = small(min_buffer_bytes(chunk) - 1, chunk);
+        let tight_handle = tight.handle();
+        for n in 0..5u64 {
+            let stream = if n % 2 == 0 {
+                LiveStream::Stdout
+            } else {
+                LiveStream::Stderr
+            };
+            tight.offer(stream, n, &[n as u8]);
+        }
+        {
+            let mut state = tight.state();
+            assert_eq!(state.entries.capacity(), IDLE_SLOTS);
+            while tight_handle.take_chunk(&mut state).is_some() {}
+        }
+        tight.offer(LiveStream::Stdout, 5, &vec![7; 2 * chunk]);
+        assert_ne!(tight.state().queue_dropped, [0, 0]);
     }
 
     /// Any mix of offers (contiguous, gapped, both streams, one byte to several chunks)

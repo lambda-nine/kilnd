@@ -1294,7 +1294,7 @@ exits with the command's code; `kilndctl execution` shows the mode.
 | Exec options memfd | at most 40 KiB (largest frame 37,272 bytes) | (code) |
 | ExecStream timeout (helper ceiling 4 h) | 30 min, max 2 h | `--default-stream-timeout-secs`, `--max-stream-timeout-secs` |
 | ExecStreams on the node / per uid (per uid below node, node below Exec admissions) | 16 / 8 | `--max-exec-streams`, `--max-exec-streams-per-uid` |
-| ExecStream live queue / chunk (queue at least two chunks; chunk at most 64 KiB) | 256 KiB / 32 KiB | `--exec-stream-buffer-bytes`, `--exec-stream-chunk-bytes` |
+| ExecStream live queue / chunk (queue at least two chunks with their overhead and idle deque slots, 65,984 bytes for 32 KiB chunks; chunk at most 64 KiB) | 256 KiB / 32 KiB | `--exec-stream-buffer-bytes`, `--exec-stream-chunk-bytes` |
 | Helper live message | 16 KiB data | (code) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
 
@@ -1311,7 +1311,9 @@ record caps are nonzero with the per-uid cap below the node's. The exec cwd and 
 flags are at most their ceilings, and all but the value bound are nonzero. Stream
 timeouts are nonzero, the default at most the maximum and the maximum at most the
 helper's 4 h; the stream caps are nonzero, per uid below the node's and the node's
-below the Exec admissions; the live queue holds at least two chunks and fits `u32`.
+below the Exec admissions; the live queue holds at least two chunks, each with its 64-byte entry overhead, plus the
+eight deque slots a drained queue keeps (`2 × (chunk + 64) + 8 × 40` bytes, 65,984 for
+32 KiB chunks), and fits `u32`.
 These are finite capacity bounds, not a hard-real-time guarantee: synchronous
 SQLite/filesystem work may block, slow clients may deny availability until
 disconnected, and authorized callers can monopolize capacity without tenant

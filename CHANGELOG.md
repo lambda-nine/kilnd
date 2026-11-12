@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix the M4 recheck finding (LOW M4-R1): the smallest accepted
+  `--exec-stream-buffer-bytes` did not hold two chunks once deque slots were charged.
+  The minimum is now two chunks with their overhead plus the eight slots a drained
+  queue keeps (65,984 bytes for 32 KiB chunks); regressions cover a fresh queue and a
+  drain and refill.
 - Fix the M4 break-it finding (MEDIUM M4-B1): the ExecStream live queue charged an
   entry's logical length, so coalescing let `Vec` growth hold up to about twice
   `--exec-stream-buffer-bytes` of payload capacity. The queue now charges allocated
