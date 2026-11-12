@@ -6,6 +6,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Take back a fresh removal's tombstone when kiln answers `checkpoint_busy` too, not
+  only on a generation mismatch (checkpoint C3 adversarial recheck, LOW L1): a busy
+  removal naming the wrong generation removed nothing, but its tombstone refused the
+  real generation's operations until pruning.
 - Fix the checkpoint C3 adversarial review findings. **H1 (HIGH):** a helper that had
   forgotten an artifact (idle pruning, or a new epoch) removed another generation's
   published artifact and sealed ABSENT for the generation it was asked about. Removal now

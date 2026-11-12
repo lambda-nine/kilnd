@@ -782,7 +782,8 @@ impl Node {
                 .room_for_operation()
                 .map_err(CheckpointResponse::Error)?;
             // Whether this epoch knew the artifact. If it didn't, nothing of it runs here,
-            // and a removal kiln refuses as another generation takes its tombstone back.
+            // and a removal kiln refuses as another generation, or as busy, takes its
+            // tombstone back.
             let fresh = !state.artifacts.contains_key(&key);
             let artifact = state.artifact(&target).map_err(CheckpointResponse::Error)?;
             if artifact.removing.is_some() {
@@ -830,18 +831,24 @@ impl Node {
                     let reply = node.run_remove(&target, nonce, deadline).await;
                     let mut state = node.lock();
                     let key = key(&target);
-                    let mismatch = matches!(
+                    // kiln removed nothing: the name holds another generation, or a
+                    // lock holder outside this epoch made it busy before kiln could read
+                    // which generation it holds (adversarial recheck L1).
+                    let untouched = matches!(
                         reply,
                         RemoveReply::Retained {
-                            reason: Reason::GenerationMismatch,
+                            reason: Reason::GenerationMismatch | Reason::Busy,
                             ..
                         }
                     );
                     if let Some(artifact) = state.artifacts.get_mut(&key) {
                         artifact.removing = None;
-                        // The name holds another generation, untouched: this removal's
-                        // tombstone would only block that generation's own operations.
-                        if mismatch && fresh {
+                        // A fresh entry ran nothing in this epoch, and its tombstone refused
+                        // every admission while the removal ran, so nothing of this epoch
+                        // can publish late. Keeping the tombstone would only refuse the
+                        // generation the name really holds, as "another generation", until
+                        // pruning. Taken back, the entry is idle and the next lock prunes it.
+                        if untouched && fresh {
                             artifact.tombstone = None;
                         }
                     }

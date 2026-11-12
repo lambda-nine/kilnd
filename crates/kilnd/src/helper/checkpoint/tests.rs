@@ -1310,6 +1310,53 @@ fn mismatch(reply: &CheckpointResponse) -> bool {
     )
 }
 
+/// Adversarial recheck L1: a fresh removal naming the wrong generation that kiln
+/// refuses as busy (another holder has the lock, so kiln never reads the header) has
+/// removed nothing, so it takes its tombstone back, and the generation the name really
+/// holds is not refused as "another generation" until pruning.
+#[tokio::test]
+async fn l1_a_busy_stale_removal_does_not_block_the_real_generation() {
+    let (node, fake) = setup();
+    fake.published
+        .lock()
+        .unwrap()
+        .insert(CHECKPOINT.to_string(), 1);
+    fake.set(
+        "rm",
+        Act::Exit(
+            CHECKPOINT_FAILED,
+            "kiln-checkpoint-failure 1\nreason checkpoint_busy\ndetail another operation holds this checkpoint\n".into(),
+            "".into(),
+        ),
+    );
+    let stale = generation(&target(), 2);
+    let reply = call(&node, remove(&stale, Id128::random())).await;
+    assert!(
+        matches!(
+            removed(&reply),
+            RemoveReply::Retained {
+                reason: Reason::Busy,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(fake.published.lock().unwrap().get(CHECKPOINT), Some(&1));
+    // Nothing of generation 2 stays tracked: the next lock prunes the idle entry.
+    assert!(!node.lock().artifacts.contains_key(&key(&target())));
+    // The lock holder is gone; generation 1's own removal proceeds.
+    fake.set("rm", Act::Rm);
+    let reply = call(&node, remove(&target(), Id128::random())).await;
+    match removed(&reply) {
+        RemoveReply::Absent { evidence } => {
+            assert_eq!(evidence.evidence.generation, 1);
+            assert_eq!(evidence.evidence.fact, Fact::Absent { existed: true });
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fake.published.lock().unwrap().is_empty());
+}
+
 /// Adversarial review H1, after idle pruning: the helper has forgotten generation 1,
 /// and a removal naming generation 2 must leave it published and seal nothing.
 #[tokio::test]

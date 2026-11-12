@@ -362,8 +362,12 @@ capture, restore or inspect it in this epoch, and a capture that settles afterwa
 does `kiln checkpoint rm --generation G` run, on the cleanup slot the removal reserved at
 admission (a full cleanup lane refuses the removal with `workers` before any state
 changes). kiln reads the published header under its exclusive lock: another generation
-under the name is `retained {checkpoint_generation_mismatch}`, nothing is removed, and a
-tombstone this epoch made only for that removal is taken back. The helper's memory of an
+under the name is `retained {checkpoint_generation_mismatch}` and nothing is removed. A
+tombstone this epoch made only for that removal is taken back when kiln removed nothing:
+on that mismatch, and on `checkpoint_busy` (a lock holder outside this epoch kept kiln
+from reading which generation it holds). The entry ran nothing in this epoch and its
+tombstone refused every admission meanwhile, so nothing can publish late; keeping it
+would only refuse the real generation until pruning. The helper's memory of an
 artifact's generation is only a fast refusal while it tracks the artifact; kiln's check is
 the binding, so a forgotten or restarted epoch can't remove another generation. Then
 `kiln checkpoint ls` must list nothing of this generation (no artifact, and no staging or
