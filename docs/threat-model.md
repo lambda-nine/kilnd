@@ -216,6 +216,21 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   signal defaults before exec, and interrupted executions are recovered at
   startup.
 
+### Workspace checkpoints (helper side, off by default)
+
+The helper's checkpoint group (milestone C3, [helper-protocol.md](helper-protocol.md#checkpoint-group-1))
+adds root operations over attacker-controlled sandbox state: kiln's capture walker and
+fresh-upper importer parse it, and the helper parses only kiln's own strict records.
+Requests carry typed IDs, never paths or flags. The helper certifies artifact facts
+(COMPLETE, ABSENT, a reader's end) bound to the artifact, nonce, helper epoch and boot;
+uid policy, quotas and node budgets stay the daemon's trust boundary, as for sandboxes.
+A compromised daemon can capture and remove artifacts of its own instance ID, as it can
+create and remove sandboxes. Absence is certified only after every worker was reaped and
+no process names the artifact; a stuck worker keeps the artifact charged rather than
+freeing it. The group is disabled unless root starts the helper with
+`--enable-checkpoints`, and the daemon does not use it before the feature's later
+milestones.
+
 ## What it relies on kiln for
 
 Isolation itself: namespaces, the user-ID shift, seccomp denylist, Landlock,

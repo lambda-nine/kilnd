@@ -41,6 +41,10 @@ pub struct Request {
 pub enum Operation {
     Kiln(KilnRequest),
     Firecracker(FirecrackerRequest),
+    /// Workspace checkpoints (milestone C3): a separate group, so every kiln and
+    /// Firecracker frame and reply is byte-identical, and an older helper closes the
+    /// connection on it unanswered.
+    Checkpoint(CheckpointRequest),
 }
 
 impl KilnRequest {
@@ -99,6 +103,18 @@ impl Request {
     pub fn validate(&self, fds: usize) -> Result<(), String> {
         let op = match &self.operation {
             Operation::Kiln(op) => op,
+            Operation::Checkpoint(request) => {
+                if self.version != VERSION
+                    || self.timeout_ms == 0
+                    || self.timeout_ms > request.operation.timeout_ms()
+                {
+                    return Err("unsupported version or timeout".into());
+                }
+                if fds != 0 {
+                    return Err("wrong descriptor count".into());
+                }
+                return request.validate();
+            }
             Operation::Firecracker(request) => {
                 if self.version != VERSION
                     || self.timeout_ms == 0
@@ -817,7 +833,7 @@ impl FirecrackerResponse {
     }
 }
 
-fn validate_spec(spec: &SandboxSpec) -> Result<(), String> {
+pub(crate) fn validate_spec(spec: &SandboxSpec) -> Result<(), String> {
     validate_image_name(&spec.image)?;
     if spec.memory_bytes == 0
         || spec.memory_bytes > 8 << 30
@@ -994,4 +1010,10 @@ pub enum Response {
     },
     /// A separate branch: every legacy kiln reply above stays byte-identical.
     Firecracker(FirecrackerResponse),
+    /// The checkpoint group's own branch (C3).
+    Checkpoint(CheckpointResponse),
 }
+
+/// The checkpoint group's wire types (milestone C3) live with its facts, so the runtime
+/// adapter can name them.
+pub use crate::checkpoint::wire::*;

@@ -27,6 +27,16 @@ impl KilnRuntime {
             },
         }
     }
+    /// A runtime whose helper peer is `uid` (tests run the helper unprivileged).
+    #[cfg(test)]
+    pub(crate) fn with_helper_uid(helper_socket: PathBuf, uid: u32) -> Self {
+        Self {
+            client: Client {
+                path: helper_socket,
+                expected_uid: uid,
+            },
+        }
+    }
     async fn call(
         &self,
         op: KilnRequest,
@@ -132,6 +142,31 @@ impl Runtime for KilnRuntime {
             } => Ok(probed_features(exec_options, exec_stream)),
             _ => Err(unexpected()),
         }
+    }
+    /// The checkpoint group through the root helper. A reply that does not match its
+    /// request is an error, never evidence.
+    async fn checkpoint(
+        &self,
+        epoch: Option<crate::model::Id128>,
+        operation: crate::checkpoint::wire::CheckpointOperation,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<crate::checkpoint::wire::CheckpointResponse, RuntimeError> {
+        let request = crate::checkpoint::wire::CheckpointRequest {
+            group_version: crate::checkpoint::GROUP_VERSION,
+            helper_epoch: epoch,
+            operation: operation.clone(),
+        };
+        let response = self.client.checkpoint(request, deadline, cancel).await?;
+        // Capabilities names the epoch every later reply must carry.
+        let epoch = match &response {
+            crate::checkpoint::wire::CheckpointResponse::Capabilities(caps) => caps.helper_epoch,
+            _ => epoch,
+        };
+        response
+            .check(&operation, epoch)
+            .map_err(|e| RuntimeError::Backend(format!("root helper checkpoint reply: {e}")))?;
+        Ok(response)
     }
     async fn validate_sandbox(
         &self,

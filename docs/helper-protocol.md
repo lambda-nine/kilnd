@@ -138,8 +138,9 @@ larger scopes. Exec deadlines are at most one hour (four for a live exec); contr
 Connections and operations have separate bounds. At most 128 connections can be
 reading their frame, each for at most two seconds, and only a framed, classified
 request takes an operation slot. There are 64 operation slots: 60 for anything and
-4 reserved for recovery, which are kiln `capabilities`, `features`, `rm` and `gc` and Firecracker
-`capabilities`, `inspect` and `fence_absent`. A normal operation, legacy or not, can
+4 reserved for recovery, which are kiln `capabilities`, `features`, `rm` and `gc`, Firecracker
+`capabilities`, `inspect` and `fence_absent`, and checkpoint `capabilities`, a non-verifying
+`inspect`, `remove`, `inventory` and `acknowledge`. A normal operation, legacy or not, can
 never take a reserved slot; a kiln request with no slot closes without a reply, as
 before, and a group request answers `resource_exhausted`. Slow clients consume only
 framing slots, for a bounded time. This is not fairness against every raw connection:
@@ -304,6 +305,86 @@ recorded VMM, compared by start time; a replaced node or reused PID is left alon
 session preparation holds one of the two P slots. Remove's cleanup runs in a fresh,
 journaled cleanup-only S, and K removes the empty tree. A Stop whose ledger does not answer
 within a second still revokes and contains under C2's authority, and answers `unknown`.
+
+## Checkpoint group 1
+
+Workspace checkpoints (design `kilnd-checkpoint-fork`, milestone C3) are a third group in
+the same v3 envelope: `operation: {"checkpoint": {group_version, helper_epoch, operation}}`,
+answered on its own `Response::Checkpoint` branch. Every kiln and Firecracker frame and
+reply is byte-identical, an older helper closes the connection on the unknown variant,
+and the whole frame must be strict JSON as for Firecracker. Only the `kilnd` account may
+use it. **It is off by default:** without `kilnd-helper --enable-checkpoints`,
+`capabilities` answers `enabled: false` and every other operation `disabled`. Nothing in
+the daemon calls it yet: there is no RPC, Health field or feature for checkpoints, and
+`RuntimeCapabilities.checkpoint` stays false.
+
+No request carries a path, flag, command, descriptor or environment. Artifacts are named
+by typed IDs (`ArtifactTarget`: a 32-hex instance, `cp-` and 32 hex, a nonzero
+generation), the helper picks the executable and kiln picks the storage root. Every
+worker is the configured kiln CLI with fixed, typed arguments, run by the one subprocess
+runner (cleared environment, parent-death SIGKILL, killed at its deadline and reaped
+before its future returns).
+
+| Operation | Budget | Lane | Does |
+| --- | --- | --- | --- |
+| `capabilities` | 5 s | recovery | Group version, this helper's epoch and boot ID, whether the CLI grants leases (bit `0x40`) and lists `kiln checkpoint ls` format 1, limits, workers in use, untracked workers |
+| `capture {binding}` | 300 s | copy | `kiln checkpoint capture` for `{target, operation nonce, source backend, R}`: `complete {evidence}`, `failed {reason, detail}` or `pending` |
+| `restore {target, content_sha256, reader, spec}` | 300 s | copy | `kiln checkpoint inspect` (same generation and content digest), then `kiln create --from-checkpoint`: `created`, `not_created` or `ambiguous`, each with the reader's evidence |
+| `inspect {target, verify, operation?}` | 30 s (300 s with `verify`) | cleanup (copy) | The namespace's view of the artifact, this epoch's activity on it, and an operation nonce's state |
+| `remove {target, operation}` | 60 s | cleanup | Tombstone, cancel, wait for every reap, `kiln checkpoint rm`, then the absence checks: `absent {evidence}`, `retained {reason, detail}` or `pending` |
+| `inventory {instance}` | 30 s | cleanup | That instance's artifacts, partial captures and removals, tracked operations and untracked workers |
+| `acknowledge {target, operation}` | 5 s | recovery | The daemon stored that operation's evidence |
+
+**Admission and supervision.** Two copy slots (capture, restore, verifying inspection)
+and two cleanup slots (removal, inspection, inventory), separate from the helper's
+operation slots. A full lane refuses at once with `workers`; nothing queues, and cleanup
+never waits for copying. A capture is exclusive on its artifact and refuses `busy` beside
+any other operation; restores and inspections are reader leases. Admitted capture,
+restore and removal run in tasks the helper owns: the waiter's deadline, cancellation
+byte or disconnect only ends the wait, with `pending`, and the outcome settles for a
+later `inspect`. The worker's deadline is the request's own. A slot, lease or exclusive
+hold is released only after the worker was reaped, so an unkillable worker keeps them
+for ever and nothing claims cleanup.
+
+**Epochs and nonces.** Each helper process draws a random epoch, reported by
+`capabilities` and required on every other request; another epoch's request is
+`stale_epoch` before anything else. An operation nonce is unique for the epoch: repeating
+a settled one replays its reply, repeating a running one joins it, using it for another
+artifact is `conflict`, and `inspect` of a nonce this epoch never saw retires it, so a
+delayed request with it can never start afterwards. While the epoch tracks an artifact,
+another generation of it is `conflict`; kiln's own record, which names the generation,
+decides otherwise.
+
+**Tombstones and removal.** `remove` first tombstones the artifact (under the same lock
+every admission takes), then cancels its capture and readers. From then on nothing can
+capture, restore or inspect it in this epoch, and a capture that settles afterwards is
+`failed`, even if its worker exited 0. Only once every worker of the artifact was reaped
+does `kiln checkpoint rm` run on the cleanup lane; then `kiln checkpoint ls` must list
+nothing of it (no artifact, staging or removal), and the process table must show no
+process whose arguments name it. Only then is it `absent`. A restored sandbox's shim
+(a session leader) does not count: while restoring it holds the artifact's lock, which
+keeps kiln's removal busy, and it never reads the artifact again. The tombstone stays
+until its last worker has been quiet for 300 seconds (the longest request validity) and
+the daemon acknowledged it, or for an hour unacknowledged; settled records follow the
+same rule. Losing one only costs a retry: removal is idempotent.
+
+**Evidence.** Each fact is an `Evidence` record: version, instance, checkpoint,
+generation, operation nonce, helper epoch, boot ID and one fact, `complete` (kiln's
+record and the binding's source and R), `absent {existed}` or
+`reader_ended {copy: not_started | complete | unknown}`. Its canonical bytes are its JSON
+in field order, at most 16 KiB, and its ID is `SHA-256("kilnd.checkpoint-evidence.1" ||
+0x00 || bytes)`. `SealedEvidence::verify` accepts a fact only for the artifact,
+generation, nonce and kind the daemon dispatched, and the runtime adapter checks every
+reply that way (`CheckpointResponse::check`). Only `complete` and `not_started` copies
+can release a fork's pin: `unknown` (a killed or failed `kiln create`, whose detached
+shim may still be reading) keeps it until the artifact's absence.
+
+**Restart.** Workers die with their helper (parent-death SIGKILL), so a new epoch starts
+with none of its own. Its proof that an earlier epoch's straggler is gone is the process
+table, read beneath the private procfs instance: any live process naming an artifact
+blocks that artifact's absence, appears in `inventory` as an untracked worker (making the
+inventory incomplete) and is counted in `capabilities`. An unreadable process table, or a
+host with more than 65,536 processes, certifies nothing.
 
 ## Trust and failure analysis
 

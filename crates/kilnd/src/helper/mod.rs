@@ -1,4 +1,6 @@
 //! Minimal private root-helper transport; it never decodes gRPC or opens SQLite.
+/// The checkpoint group (milestone C3).
+pub mod checkpoint;
 mod client;
 mod fds;
 pub mod firecracker;
@@ -9,7 +11,7 @@ mod server;
 mod socket;
 pub(crate) use client::{AttachedConnection, Client};
 use serde::{Serialize, de::DeserializeOwned};
-pub use server::{serve, serve_with_firecracker};
+pub use server::{serve, serve_with_firecracker, serve_with_groups};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 

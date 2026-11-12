@@ -408,6 +408,34 @@ fn kiln_id(id: &str) -> io::Result<&str> {
     }
 }
 
+fn lower_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A checkpoint owner instance: 32 lowercase hexadecimal digits.
+fn checkpoint_instance(id: &str) -> io::Result<&str> {
+    if id.len() == 32 && lower_hex(id) {
+        Ok(id)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid checkpoint instance",
+        ))
+    }
+}
+
+/// A checkpoint ID: `cp-` and 32 lowercase hexadecimal digits.
+fn checkpoint_id(id: &str) -> io::Result<&str> {
+    match id.strip_prefix("cp-") {
+        Some(hex) if hex.len() == 32 && lower_hex(hex) => Ok(id),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid checkpoint ID",
+        )),
+    }
+}
+
 impl KilnArgs {
     /// `capabilities --protocol=1 [ID]`.
     pub fn capabilities(id: Option<&str>) -> io::Result<Self> {
@@ -451,6 +479,76 @@ impl KilnArgs {
     /// `create` with the spec's flags (every value in `--flag=value` form).
     pub fn create(spec: &crate::model::SandboxSpec) -> Self {
         Self(crate::runtime::kiln_direct::create_args(spec))
+    }
+
+    /// `create` with the spec's flags, restoring its upper from one checkpoint artifact:
+    /// `--from-checkpoint=I/C` last (kiln's checkpoint format v1).
+    pub fn create_from_checkpoint(
+        spec: &crate::model::SandboxSpec,
+        instance: &str,
+        checkpoint: &str,
+    ) -> io::Result<Self> {
+        let mut args = crate::runtime::kiln_direct::create_args(spec);
+        args.push(format!(
+            "--from-checkpoint={}/{}",
+            checkpoint_instance(instance)?,
+            checkpoint_id(checkpoint)?
+        ));
+        Ok(Self(args))
+    }
+
+    /// `checkpoint capture --instance=I --checkpoint=C --generation=G --max-bytes=R ID`.
+    pub fn checkpoint_capture(
+        instance: &str,
+        checkpoint: &str,
+        generation: u64,
+        max_bytes: u64,
+        id: &str,
+    ) -> io::Result<Self> {
+        if generation == 0 || max_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint generation and limit must be nonzero",
+            ));
+        }
+        Ok(Self(vec![
+            "checkpoint".into(),
+            "capture".into(),
+            format!("--instance={}", checkpoint_instance(instance)?),
+            format!("--checkpoint={}", checkpoint_id(checkpoint)?),
+            format!("--generation={generation}"),
+            format!("--max-bytes={max_bytes}"),
+            kiln_id(id)?.to_string(),
+        ]))
+    }
+
+    /// `checkpoint inspect --instance=I --checkpoint=C [--verify]`.
+    pub fn checkpoint_inspect(instance: &str, checkpoint: &str, verify: bool) -> io::Result<Self> {
+        let mut args = vec![
+            "checkpoint".into(),
+            "inspect".into(),
+            format!("--instance={}", checkpoint_instance(instance)?),
+            format!("--checkpoint={}", checkpoint_id(checkpoint)?),
+        ];
+        if verify {
+            args.push("--verify".into());
+        }
+        Ok(Self(args))
+    }
+
+    /// `checkpoint rm --instance=I --checkpoint=C`.
+    pub fn checkpoint_rm(instance: &str, checkpoint: &str) -> io::Result<Self> {
+        Ok(Self(vec![
+            "checkpoint".into(),
+            "rm".into(),
+            format!("--instance={}", checkpoint_instance(instance)?),
+            format!("--checkpoint={}", checkpoint_id(checkpoint)?),
+        ]))
+    }
+
+    /// `checkpoint ls`: the whole artifact namespace, removing nothing.
+    pub fn checkpoint_ls() -> Self {
+        Self(vec!["checkpoint".into(), "ls".into()])
     }
 
     pub fn as_slice(&self) -> &[String] {

@@ -87,6 +87,31 @@ impl Client {
         }
     }
 
+    /// One typed checkpoint exchange (C3). The deadline narrows to the operation's own
+    /// ceiling. A cancellation only detaches this waiter: admitted work stays with the
+    /// helper, which settles it for a later Inspect.
+    pub async fn checkpoint(
+        &self,
+        request: CheckpointRequest,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> io::Result<CheckpointResponse> {
+        let ceiling =
+            Instant::now() + Duration::from_millis(u64::from(request.operation.timeout_ms()));
+        match self
+            .exchange(
+                Operation::Checkpoint(request),
+                deadline.min(ceiling),
+                cancel,
+                None,
+            )
+            .await?
+        {
+            Response::Checkpoint(response) => Ok(response),
+            _ => Err(io::Error::other("unexpected helper reply")),
+        }
+    }
+
     /// AttachInstance keeps its connection open: one reply, then no EOF until a side
     /// detaches. It fails only by not attaching, so there is nothing to clean up.
     pub async fn attach(
@@ -149,12 +174,24 @@ impl Client {
                 FirecrackerOperation::Exec { .. } => Duration::from_secs(70),
                 _ => Duration::from_secs(2),
             },
+            // A supervised worker settles within two seconds of the wire deadline, when
+            // it is killed and reaped; the waiter reads that settlement.
+            Operation::Checkpoint(request) => match request.operation {
+                CheckpointOperation::Capture { .. }
+                | CheckpointOperation::Restore { .. }
+                | CheckpointOperation::Remove { .. }
+                | CheckpointOperation::Inspect { verify: true, .. } => Duration::from_secs(5),
+                _ => Duration::from_secs(2),
+            },
             _ => Duration::from_secs(2),
         };
         let response_deadline = deadline + allowance;
         // The group answers at its deadline and closes, so a cancel byte can race that
         // close. Its reply decides the result, not a failed courtesy write.
-        let group = matches!(operation, Operation::Firecracker(_));
+        let group = matches!(
+            operation,
+            Operation::Firecracker(_) | Operation::Checkpoint(_)
+        );
         // Three stdio sockets for an execution, and ExecStream's live socket fourth.
         let expected_fds = match (&operation, stdio.is_some()) {
             (_, false) => 0,

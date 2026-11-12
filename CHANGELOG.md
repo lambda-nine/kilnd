@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone C3 of workspace checkpoints, the root helper's side: a checkpoint group
+  in the helper protocol (capabilities, capture, restore, inspect, remove, inventory,
+  acknowledge), off unless `kilnd-helper --enable-checkpoints`. It supervises kiln's
+  capture and fork workers on fixed copy and cleanup lanes with no queue, holds reader
+  leases and exclusive captures until each worker is reaped, tombstones an artifact
+  before removing it, and certifies COMPLETE, ABSENT and reader-ended evidence (canonical,
+  bounded, ID'd, bound to the artifact, nonce and helper epoch). A new helper epoch
+  refuses the old one's requests, and any process still naming an artifact blocks its
+  absence. The runtime adapter checks every reply. No RPC, Health field or feature
+  changes.
 - Fix the M4 recheck finding (LOW M4-R1): the smallest accepted
   `--exec-stream-buffer-bytes` did not hold two chunks once deque slots were charged.
   The minimum is now two chunks with their overhead plus the eight slots a drained

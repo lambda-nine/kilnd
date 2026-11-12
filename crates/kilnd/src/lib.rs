@@ -29,6 +29,9 @@ pub mod retention;
 
 pub mod helper;
 
+/// Workspace checkpoint facts shared by the helper and the daemon (milestone C3).
+pub mod checkpoint;
+
 /// Phase 1b frozen byte and execution-spec contract; production launch is disabled.
 pub mod firecracker;
 pub mod idempotency;

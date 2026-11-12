@@ -672,6 +672,25 @@ pub trait Runtime: Send + Sync + 'static {
         async { Ok(crate::manager::ProvenFeatures::default()) }
     }
 
+    /// The root helper's checkpoint group (milestone C3), with each reply checked
+    /// against its request (`CheckpointResponse::check`). Nothing reaches it before C5:
+    /// no RPC, Health field or feature mentions checkpoints. A backend without them
+    /// refuses before any effect, `backend_unsupported:workspace_checkpoint`.
+    fn checkpoint(
+        &self,
+        _epoch: Option<Id128>,
+        _operation: crate::checkpoint::wire::CheckpointOperation,
+        _deadline: Instant,
+        _cancel: &CancellationToken,
+    ) -> impl Future<Output = Result<crate::checkpoint::wire::CheckpointResponse, RuntimeError>> + Send
+    {
+        async {
+            Err(RuntimeError::Unsupported(
+                crate::checkpoint::BACKEND_UNSUPPORTED.into(),
+            ))
+        }
+    }
+
     /// Read-only preflight before any reservation: must allocate nothing.
     /// Returning an error leaves no row and no charge. A fenced backend's plan names
     /// the token its authority issued (`PreparedCreate::allocation_id`).

@@ -100,6 +100,19 @@ pub async fn serve_with_firecracker(
     firecracker: Option<Arc<Node>>,
     shutdown: CancellationToken,
 ) -> io::Result<()> {
+    serve_with_groups(listener, uid, bin, firecracker, None, shutdown).await
+}
+
+/// With the checkpoint group too: present only when root enabled it, and otherwise
+/// answering Disabled, with every other reply byte-identical.
+pub async fn serve_with_groups(
+    listener: UnixListener,
+    uid: u32,
+    bin: PathBuf,
+    firecracker: Option<Arc<Node>>,
+    checkpoint: Option<Arc<super::checkpoint::Node>>,
+    shutdown: CancellationToken,
+) -> io::Result<()> {
     let runtime = Arc::new(DirectKilnRuntime::new(bin));
     let budgets = Arc::new(Budgets::new());
     let tasks = TaskTracker::new();
@@ -125,11 +138,16 @@ pub async fn serve_with_firecracker(
         let runtime = runtime.clone();
         let stop = shutdown.child_token();
         let firecracker = firecracker.clone();
+        let checkpoint = checkpoint.clone();
         let budgets = budgets.clone();
         tasks.spawn(async move {
             let legacy = peer_uid == uid;
+            let groups = Groups {
+                firecracker,
+                checkpoint,
+            };
             if let Err(error) =
-                handle(stream, runtime, firecracker, legacy, framing, budgets, stop).await
+                handle(stream, runtime, groups, legacy, framing, budgets, stop).await
             {
                 tracing::warn!(%error, "helper request failed");
                 #[cfg(test)]
@@ -142,10 +160,15 @@ pub async fn serve_with_firecracker(
     Ok(())
 }
 
+struct Groups {
+    firecracker: Option<Arc<Node>>,
+    checkpoint: Option<Arc<super::checkpoint::Node>>,
+}
+
 async fn handle(
     stream: UnixStream,
     runtime: Arc<DirectKilnRuntime>,
-    firecracker: Option<Arc<Node>>,
+    groups: Groups,
     legacy: bool,
     framing: OwnedSemaphorePermit,
     budgets: Arc<Budgets>,
@@ -170,7 +193,16 @@ async fn handle(
     }
     let deadline = Instant::now() + Duration::from_nanos(remaining);
     let wire_deadline_ns = request.deadline_ns;
+    let Groups {
+        firecracker,
+        checkpoint,
+    } = groups;
     let request = match request.operation {
+        // Like kiln's, checkpoints belong to the service account alone.
+        Operation::Checkpoint(_) if !legacy => return Ok(()),
+        Operation::Checkpoint(group) => {
+            return checkpoint_request(stream, group, checkpoint, budgets, deadline, cancel).await;
+        }
         Operation::Firecracker(group) => {
             return firecracker_request(
                 stream,
@@ -292,7 +324,10 @@ fn parse_request(bytes: &[u8]) -> io::Result<Request> {
             error.column()
         ))
     })?;
-    if matches!(request.operation, Operation::Firecracker(_)) {
+    if matches!(
+        request.operation,
+        Operation::Firecracker(_) | Operation::Checkpoint(_)
+    ) {
         crate::firecracker::strict_json(bytes).map_err(|_error| {
             #[cfg(test)]
             eprintln!("helper request frame detail: {_error}");
@@ -406,6 +441,51 @@ async fn firecracker_request(
     }
     node.detach(instance, epoch);
     written
+}
+
+/// One checkpoint request: no descriptors either way, the reply on its own branch. The
+/// waiter's cancellation byte, extra data or EOF only detaches it; admitted work stays
+/// supervised by the node.
+async fn checkpoint_request(
+    stream: Socket,
+    request: CheckpointRequest,
+    node: Option<Arc<super::checkpoint::Node>>,
+    budgets: Arc<Budgets>,
+    deadline: Instant,
+    cancel: CancellationToken,
+) -> io::Result<()> {
+    timeout(Duration::from_secs(2), fds::send(&stream.0, &[]))
+        .await
+        .map_err(io::Error::other)??;
+    let slot = budgets.admit(request.operation.is_recovery());
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let waiter = cancel.child_token();
+    let response = match (&node, &slot) {
+        (None, _) => super::checkpoint::disabled(&request.operation),
+        (Some(_), None) => CheckpointResponse::Error(CheckpointError::new(
+            CheckpointErrorKind::Workers,
+            "only reserved recovery slots remain",
+        )),
+        (Some(node), Some(_)) => {
+            let operation = node.handle(request, deadline, &waiter);
+            tokio::pin!(operation);
+            tokio::select! {
+                response = &mut operation => response,
+                _ = reader.read_u8() => { waiter.cancel(); operation.await }
+            }
+        }
+    };
+    drop(slot);
+    timeout(
+        Duration::from_secs(2),
+        write_frame(&mut writer, &Response::Checkpoint(response)),
+    )
+    .await
+    .map_err(io::Error::other)??;
+    writer
+        .shutdown()
+        .await
+        .map_err(|e| super::io_stage("response shutdown", e))
 }
 
 /// Discards bytes until EOF or an error; nothing on this connection is a request.

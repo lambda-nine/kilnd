@@ -24,6 +24,11 @@ struct Args {
     /// or partial ledger is refused; nothing else ever creates one.
     #[arg(long, requires = "firecracker_policy")]
     firecracker_init_ledger: bool,
+    /// Serve the workspace checkpoint group (design section 4.3). Off by default: until
+    /// the feature's acceptance milestone nothing in kilnd uses it, and without this
+    /// flag the group answers Disabled.
+    #[arg(long)]
+    enable_checkpoints: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -188,6 +193,19 @@ async fn main() -> Result<()> {
             }
         },
     };
+    // As with Firecracker, a checkpoint group that can't start never takes kiln down.
+    let checkpoint = if args.enable_checkpoints {
+        let workers = std::sync::Arc::new(kilnd::helper::checkpoint::KilnWorkers::new(bin.clone()));
+        match kilnd::helper::checkpoint::Node::new(workers) {
+            Ok(node) => Some(node),
+            Err(error) => {
+                eprintln!("kilnd-helper: checkpoint group disabled: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let stop = CancellationToken::new();
     let stopped = stop.clone();
     tokio::spawn(async move {
@@ -197,16 +215,21 @@ async fn main() -> Result<()> {
         tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
         stopped.cancel();
     });
-    let served = kilnd::helper::serve_with_firecracker(
+    let served = kilnd::helper::serve_with_groups(
         tokio::net::UnixListener::from_std(listener)?,
         service_uid,
         bin,
         firecracker.clone(),
+        checkpoint.clone(),
         stop,
     )
     .await;
     if let Some(node) = firecracker {
         node.shutdown();
+    }
+    // Every checkpoint worker is killed and reaped before the helper exits.
+    if let Some(node) = checkpoint {
+        node.shutdown().await;
     }
     served.context("root helper")
 }
