@@ -1377,12 +1377,20 @@ pruned and never hides a capture admitted meanwhile. Falling presence never disc
 blocked barrier: while `barrier_blocked` is set the engine counts as maintained, so its
 retry (started at startup even if startup's prune just removed the last row) still takes
 a fresh session and a complete inventory, and only a clean one clears it. The obligation
-is durable apart from any row: when reconciliation blocks, it blocks allocation in memory
-and then writes the `checkpoint_barrier` marker (schema 16) before the verdict is
-reported, and only a clean inventory deletes it, before allocation reopens. A restart
-reads the marker in its one existence query, so even with the feature off and no rows it
-reconciles again; a crash after a clean inventory but before the delete costs one more
-inventory. While blocked, retention also keeps every checkpoint row and capture key and
+is durable apart from any row, and written ahead: before any pass on a checkpoint backend
+(at startup and in the retry) asks the helper anything, it blocks allocation in memory
+and commits the `checkpoint_barrier` marker (schema 16), so no verdict exists before the
+marker does. Only a complete clean pass deletes it, before allocation reopens. With the
+feature on and nothing stored, each startup therefore arms, inventories and clears. A
+restart reads the marker in its one existence query, so even with the feature off and no
+rows it reconciles again; a crash after a clean inventory but before the delete costs one
+more inventory. A backend without the checkpoint group cannot inventory, so it never
+clears an outstanding marker: it reports the barrier blocked, logs why and runs no retry,
+and the operator switches back to a checkpoint backend, whose clean inventory clears it.
+A DELETING row whose removal found an artifact it cannot prove the row's (its failure
+token `checkpoint_corrupt` or `checkpoint_generation_mismatch`, C3) also blocks every
+pass until a removal proves the target ABSENT, so the in-memory block that removal set
+survives a restart. While blocked, retention also keeps every checkpoint row and capture key and
 never touches the marker; only once a clean inventory clears the barrier may a prune
 remove the last row (the barrier's set and clear and that prune share the presence
 lock). With it off and nothing durable,

@@ -1451,3 +1451,298 @@ async fn a_clean_inventory_clears_the_marker_and_the_fast_path_returns() {
     assert_eq!(m.checkpoint.store_calls.load(Ordering::Relaxed), 0);
     assert!(fake.checkpoints(|g| g.calls.is_empty()), "no helper call");
 }
+
+// --- Round 6 (fifth recheck) ------------------------------------------------------------
+
+/// A durable barrier is not discharged by a backend that cannot produce the complete
+/// inventory that alone clears it: the marker stays, allocation stays blocked, and no
+/// retry spins on that backend.
+#[tokio::test]
+async fn a_backend_without_checkpoints_cannot_clear_a_rowless_barrier() {
+    let (_tmp, dir) = state_dir();
+    let checkpoint_runtime = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    checkpoint_runtime.checkpoints(|g| g.inventory_extra.push(CheckpointId::random()));
+
+    let m = on_disk(&dir, &checkpoint_runtime, &clock, &test_limits());
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+    assert!(m.store.unsettled_checkpoints().unwrap().is_empty());
+    let limits = off(stop(m).await);
+
+    let no_checkpoint_runtime = FakeRuntime::default();
+    let m = on_disk(&dir, &no_checkpoint_runtime, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(
+        r.checkpoints_blocked && r.admission_blocked,
+        "backend change cleared the rowless barrier without inventory: {r:?}"
+    );
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+    assert!(create_is_blocked(&m).await);
+    assert!(
+        !m.checkpoint.barrier_retrying.load(Ordering::Relaxed),
+        "no retry on a backend that cannot inventory"
+    );
+}
+
+/// The operator's way out of the case above: back on a checkpoint backend, feature off,
+/// the marker makes startup inventory, and a clean inventory clears it and admits.
+#[tokio::test]
+async fn back_on_a_checkpoint_backend_a_clean_inventory_clears_the_marker() {
+    let (_tmp, dir) = state_dir();
+    let capable = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    capable.checkpoints(|g| g.inventory_extra.push(CheckpointId::random()));
+    let m = on_disk(&dir, &capable, &clock, &test_limits());
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked, "{r:?}");
+    let limits = off(stop(m).await);
+
+    let m = on_disk(&dir, &FakeRuntime::default(), &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked, "{r:?}");
+    let limits = stop(m).await;
+
+    capable.checkpoints(|g| g.inventory_extra.clear());
+    let inventories = calls(&capable, "inventory");
+    let m = on_disk(&dir, &capable, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(!r.checkpoints_blocked && !r.admission_blocked, "{r:?}");
+    assert_eq!(calls(&capable, "inventory"), inventories + 1);
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
+    assert!(!m.checkpoint.present.load(Ordering::Relaxed));
+    m.create_owned(CreateRequest::default(), 1000)
+        .await
+        .unwrap();
+}
+
+/// Unsettled rows on a backend without checkpoints block whether or not the caller's
+/// marker write landed: crash before it, the rows alone re-derive the block; after
+/// it, rows and marker both do.
+#[tokio::test]
+async fn unsettled_rows_on_a_backend_without_checkpoints_block_with_or_without_the_marker() {
+    let (_tmp, dir) = state_dir();
+    let capable = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    let m = on_disk(&dir, &capable, &clock, &test_limits());
+    let (r, _) = startup_like_main(&m).await;
+    assert!(!r.checkpoints_blocked, "{r:?}");
+    let s = m.create_owned(CreateRequest::default(), 1000).await.unwrap();
+    let c = m.capture_checkpoint(req(&s), 1000, None, None).await.unwrap();
+    let limits = stop(m).await;
+    // A restart quarantines it: an unsettled row, kept and charged.
+    capable.checkpoints(|g| {
+        g.unreadable.insert(c.id.to_string());
+    });
+    let m = on_disk(&dir, &capable, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(!r.checkpoints_blocked, "{r:?}");
+    assert_eq!(row(&m, c.id.as_str()).state, CheckpointState::Quarantined);
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
+    let limits = off(stop(m).await);
+
+    let none = FakeRuntime::default();
+    let m = on_disk(&dir, &none, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    assert!(m.store.checkpoint_barrier_marked().unwrap(), "after the write");
+    assert!(create_is_blocked(&m).await);
+    // Crash before the write: the marker is not there, the rows still are.
+    m.store.clear_checkpoint_barrier().unwrap();
+    let limits = stop(m).await;
+    let m = on_disk(&dir, &none, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+    assert!(create_is_blocked(&m).await);
+}
+
+/// Write-ahead: the pass arms the marker before it asks the helper anything, so a
+/// crash after its blocking verdict, before the caller's own write, keeps the
+/// obligation. The restart (feature off, no rows) inventories and blocks again.
+#[tokio::test]
+async fn a_crash_after_the_blocking_verdict_cannot_lose_the_obligation() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    fake.checkpoints(|g| g.inventory_extra.push(CheckpointId::random()));
+
+    let m = on_disk(&dir, &fake, &clock, &test_limits());
+    m.refresh_checkpoint_presence().unwrap();
+    assert!(!m.checkpoint.present.load(Ordering::Relaxed));
+    assert!(m.reconcile_checkpoints().await.unwrap());
+    assert!(
+        m.store.checkpoint_barrier_marked().unwrap(),
+        "the pass armed the marker before its verdict"
+    );
+    let limits = off(m.limits.clone());
+    let inventories = calls(&fake, "inventory");
+    drop(m); // crash cut: reconcile() has its verdict, but has not written it itself
+
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(
+        r.checkpoints_blocked && r.admission_blocked,
+        "crash before the marker commit lost the unexplained-artifact obligation: {r:?}"
+    );
+    assert!(calls(&fake, "inventory") > inventories);
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+    assert!(create_is_blocked(&m).await);
+}
+
+/// Crash after the arm, inside the pass (the inventory asked, not answered): the
+/// marker is already committed, so the feature-off restart with no rows reconciles.
+#[tokio::test]
+async fn a_crash_inside_the_pass_keeps_the_restart_reconciling() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    fake.checkpoints(|g| g.inventory_extra.push(CheckpointId::random()));
+    let gate = FakeGate::default();
+    fake.checkpoints(|g| g.inventory_gate = Some(gate.clone()));
+
+    let m = on_disk(&dir, &fake, &clock, &test_limits());
+    let limits = off(m.limits.clone());
+    let pass = tokio::spawn({
+        let m = Arc::clone(&m);
+        async move { m.reconcile().await }
+    });
+    gate.entered().await;
+    assert!(m.store.checkpoint_barrier_marked().unwrap(), "armed before the inventory");
+    assert!(m.checkpoint.barrier_blocked.load(Ordering::Relaxed));
+    pass.abort(); // crash cut: the inventory never answers
+    let _ = pass.await;
+    drop(m);
+
+    let inventories = calls(&fake, "inventory");
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    assert_eq!(calls(&fake, "inventory"), inventories + 1);
+    assert!(create_is_blocked(&m).await);
+}
+
+/// Crash before the arm: nothing was observed and nothing is owed. An enabled restart
+/// runs the pass again and finds the same artifact (the feature-off, nothing-durable
+/// fast path is the design's own: it runs no pass, so it observes nothing).
+#[tokio::test]
+async fn a_crash_before_the_arm_leaves_the_next_pass_to_observe() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    fake.checkpoints(|g| g.inventory_extra.push(CheckpointId::random()));
+    let m = on_disk(&dir, &fake, &clock, &test_limits());
+    m.refresh_checkpoint_presence().unwrap();
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
+    assert_eq!(calls(&fake, "inventory"), 0);
+    let limits = m.limits.clone();
+    drop(m); // crash cut: before the pass armed anything
+
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+    assert!(create_is_blocked(&m).await);
+}
+
+/// The retry's pass arms too, each time: with the marker gone from under it, the next
+/// pass writes it again before the inventory, and keeps it while still blocked.
+#[tokio::test]
+async fn the_retry_arms_before_each_pass() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    fake.checkpoints(|g| {
+        g.inventory_extra.push(CheckpointId::random());
+        g.unavailable = true;
+    });
+    let m = on_disk(&dir, &fake, &clock, &test_limits());
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked, "{r:?}");
+    let gate = FakeGate::default();
+    m.store.clear_checkpoint_barrier().unwrap();
+    fake.checkpoints(|g| {
+        g.inventory_gate = Some(gate.clone());
+        g.unavailable = false;
+    });
+    gate.entered().await;
+    assert!(m.store.checkpoint_barrier_marked().unwrap(), "the retry armed first");
+    gate.release();
+    until_slow("another blocked pass", || calls(&fake, "inventory") >= 2).await;
+    assert!(m.checkpoint.barrier_blocked.load(Ordering::Relaxed));
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+    assert!(create_is_blocked(&m).await);
+}
+
+/// With the feature on and nothing stored, each startup arms, inventories and clears:
+/// no marker survives a clean startup, and the next one does the same.
+#[tokio::test]
+async fn an_enabled_clean_startup_arms_then_clears() {
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    let mut limits = test_limits();
+    for round in 1..=2 {
+        let m = on_disk(&dir, &fake, &clock, &limits);
+        let (r, _) = startup_like_main(&m).await;
+        assert!(!r.checkpoints_blocked && !r.admission_blocked, "{r:?}");
+        assert_eq!(calls(&fake, "inventory"), round);
+        assert!(!m.store.checkpoint_barrier_marked().unwrap());
+        assert!(!m.checkpoint.present.load(Ordering::Relaxed));
+        assert!(!m.checkpoint.barrier_blocked.load(Ordering::Relaxed));
+        limits = stop(m).await;
+    }
+}
+
+/// Audit gap: a removal that finds an artifact it cannot prove its row's blocks
+/// allocation (C3), and its row records why. A restart must not admit before that
+/// row's removal proves ABSENT, and once it does, allocation reopens.
+#[tokio::test]
+async fn a_removal_that_found_a_foreign_artifact_keeps_the_restart_blocked() {
+    use crate::checkpoint::Reason;
+    for scripted in [Reason::GenerationMismatch, Reason::Corrupt] {
+        let (_tmp, dir) = state_dir();
+        let fake = FakeRuntime::default().with_checkpoints();
+        let clock = ManualClock::default();
+        let m = on_disk(&dir, &fake, &clock, &test_limits());
+        startup_like_main(&m).await;
+        let s = m.create_owned(CreateRequest::default(), 1000).await.unwrap();
+        let c = m.capture_checkpoint(req(&s), 1000, None, None).await.unwrap();
+        fake.checkpoints(|g| g.removals.push_back(FakeRemoval::Retained(scripted)));
+        m.delete_checkpoint(c.id.as_str(), 1000, false)
+            .await
+            .unwrap_err();
+        assert!(create_is_blocked(&m).await);
+        let limits = off(stop(m).await);
+
+        // Still not provably its row's; the restart's own removal is held.
+        let gate = FakeGate::default();
+        fake.checkpoints(|g| {
+            g.removals.push_back(FakeRemoval::Retained(scripted));
+            g.remove_gate = Some(gate.clone());
+        });
+        let m = on_disk(&dir, &fake, &clock, &limits);
+        let (r, _) = startup_like_main(&m).await;
+        assert!(r.checkpoints_blocked && r.admission_blocked, "{scripted:?}: {r:?}");
+        assert!(
+            create_is_blocked(&m).await,
+            "{scripted:?}: admitted before the removal answered"
+        );
+        gate.entered().await;
+        gate.release();
+        until_slow("the restart's removal answered", || {
+            m.admission_blocked.load(Ordering::Relaxed)
+        })
+        .await;
+        assert!(create_is_blocked(&m).await, "{scripted:?}");
+        let limits = stop(m).await;
+
+        // Control: the next removal proves ABSENT, and allocation reopens.
+        let m = on_disk(&dir, &fake, &clock, &limits);
+        startup_like_main(&m).await;
+        until_allocation_opens(&m, "the foreign artifact's row is released").await;
+        assert_eq!(row(&m, c.id.as_str()).state, CheckpointState::Deleted);
+        stop(m).await;
+    }
+}

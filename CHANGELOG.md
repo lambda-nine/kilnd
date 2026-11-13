@@ -21,6 +21,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   takes), restoring the no-query path with the feature off; startup and Delete never
   remove a source an interrupted capture may still read, the capture's removal re-drives
   the source's delete, and shutdown stops draining after 240 s.
+- Close the checkpoint engine's fifth recheck: the barrier's marker is written ahead,
+  before any checkpoint helper pass at startup or in the retry, so a crash after a
+  blocking verdict cannot lose it; a backend without checkpoints keeps an outstanding
+  marker and stays blocked until a checkpoint backend's clean inventory clears it; and a
+  removal that found an artifact it cannot prove its row's keeps allocation blocked
+  across a restart until a removal proves it absent.
 - Close the checkpoint engine's fourth recheck with schema 16: a blocked checkpoint
   barrier writes a durable marker (`checkpoint_barrier`, one row) that only a complete
   clean inventory deletes, so a restart reconciles again even with the feature off and

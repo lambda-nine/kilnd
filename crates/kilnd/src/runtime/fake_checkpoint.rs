@@ -71,6 +71,8 @@ pub struct FakeCheckpoints {
     pub removals: VecDeque<FakeRemoval>,
     /// One-shot pause in the next removal, after its tombstone and before its outcome.
     pub remove_gate: Option<FakeGate>,
+    /// One-shot pause before the next inventory replies.
+    pub inventory_gate: Option<FakeGate>,
     /// Published artifacts by checkpoint ID: their generation.
     pub published: BTreeMap<String, u64>,
     /// Admitted captures not yet published or removed (staging may exist).
@@ -110,6 +112,7 @@ impl Default for FakeCheckpoints {
             charge_bytes: 64 << 10,
             removals: VecDeque::new(),
             remove_gate: None,
+            inventory_gate: None,
             published: BTreeMap::new(),
             staging: BTreeSet::new(),
             workers: BTreeMap::new(),
@@ -237,8 +240,14 @@ impl FakeRuntime {
         operation: CheckpointOperation,
         cancel: &CancellationToken,
     ) -> Result<CheckpointResponse, RuntimeError> {
-        if matches!(&operation, CheckpointOperation::Source { .. }) {
-            let gate = self.checkpoints(|g| g.source_gate.take());
+        if matches!(
+            &operation,
+            CheckpointOperation::Source { .. } | CheckpointOperation::Inventory { .. }
+        ) {
+            let gate = self.checkpoints(|g| match &operation {
+                CheckpointOperation::Source { .. } => g.source_gate.take(),
+                _ => g.inventory_gate.take(),
+            });
             if let Some(gate) = gate {
                 tokio::select! {
                     () = gate.hold() => {}

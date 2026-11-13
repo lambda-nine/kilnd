@@ -431,10 +431,11 @@ impl<R: Runtime> Manager<R> {
     /// Sets or clears the checkpoint barrier, under the presence lock, so no prune
     /// runs across the change (see [`Self::prune_under_barrier`]). Its durable marker
     /// (schema 16) is the obligation a restart reads, rows or none: setting blocks in
-    /// memory first, so nothing is admitted while the marker is written, and writes the
-    /// marker before the verdict is reported; clearing deletes the marker first, so a
-    /// failure keeps allocation blocked and a crash costs only one more inventory. With
-    /// nothing durable (`present` false, recounted at startup), clearing makes no query.
+    /// memory first, so nothing is admitted while the marker is written. The pass arms
+    /// it (write-ahead) before it asks the helper anything, so no verdict exists before
+    /// the marker does; clearing deletes the marker first, so a failure keeps
+    /// allocation blocked and a crash costs only one more inventory. With nothing
+    /// durable (`present` false, recounted at startup), clearing makes no query.
     pub(super) fn set_checkpoint_barrier(&self, blocked: bool) -> Result<()> {
         let _presence = self.presence();
         let engine = &self.checkpoint;
@@ -1780,14 +1781,23 @@ impl<R: Runtime> Manager<R> {
     /// missing, corrupt or another generation's is quarantined; anything unknown keeps
     /// its row and charge and blocks allocation. Returns whether allocation stays
     /// blocked. With the feature off and no durable state (`present`, recounted by the
-    /// caller): no query.
+    /// caller): no query, no pass, no marker.
     pub(super) async fn reconcile_checkpoints(&self) -> Result<bool> {
         if !self.maintained() {
             return Ok(false);
         }
-        // A backend with no checkpoint group (Firecracker): no helper call.
+        // A backend with no checkpoint group (Firecracker): no helper call, so its
+        // verdict is the durable state alone. It cannot inventory, so it never
+        // discharges an outstanding marker: only a checkpoint backend's complete clean
+        // inventory does (design 11.1), and the operator switches back for it.
         if !self.runtime.checkpoint_backend() {
             let unsettled = self.db().unsettled_checkpoints()?;
+            if self.db().checkpoint_barrier_marked()? {
+                warn!(
+                    "the checkpoint barrier is outstanding and this backend has no checkpoints to inventory; allocation stays blocked until a clean inventory on a checkpoint backend clears it"
+                );
+                return Ok(true);
+            }
             if unsettled.is_empty() {
                 return Ok(false);
             }
@@ -1797,6 +1807,10 @@ impl<R: Runtime> Manager<R> {
             );
             return Ok(true);
         }
+        // Write-ahead: the obligation is durable, and allocation blocked, before the
+        // pass can observe anything that blocks, so a crash at any point in the pass
+        // leaves a restart that reconciles. A complete clean pass lets the caller clear it.
+        self.set_checkpoint_barrier(true)?;
         let mut rows: BTreeMap<String, Checkpoint> = BTreeMap::new();
         let charged = self.db().unsettled_checkpoints()?.into_iter().chain(
             self.db()
@@ -1867,6 +1881,18 @@ impl<R: Runtime> Manager<R> {
             }
         }
         for c in rows.values() {
+            // C3's unexplained artifact: a removal found one it cannot prove this row's
+            // and blocked allocation in memory. The reason its row records keeps that
+            // across a restart, until a removal proves the target ABSENT.
+            if c.state == CheckpointState::Deleting
+                && c.failure.as_ref().is_some_and(|f| {
+                    f.token == Reason::Corrupt.token()
+                        || f.token == Reason::GenerationMismatch.token()
+                })
+            {
+                warn!(checkpoint = %c.id, "a removal found an artifact it cannot prove this row's; allocation blocked until a removal proves it absent");
+                blocked = true;
+            }
             if !holds_its_source(c) || live.contains(c.id.as_str()) {
                 continue;
             }
