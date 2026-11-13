@@ -104,6 +104,39 @@ pub fn request_digest(req: &pb::CreateSandboxRequest) -> Digest {
     Digest::of(&input)
 }
 
+/// The capture digest's domain (checkpoint design 7.1), independent of create keys.
+pub const CHECKPOINT_DIGEST_DOMAIN: &[u8] = b"kilnd.v1.checkpoint-request.1";
+
+/// The canonical JSON a capture key's digest covers: `CheckpointSandboxRequest` as
+/// sent, without `request_id`: `expiry` (`null` when absent, else both fields),
+/// `max_size_bytes` and `sandbox_id`, through the same canonical encoder.
+pub fn canonical_capture_request(req: &crate::manager::CaptureRequest) -> Vec<u8> {
+    let expiry = match &req.expiry {
+        None => Value::Null,
+        Some(e) => json!({
+            "idle_timeout_ms": e.idle_timeout_ms,
+            "max_lifetime_ms": e.max_lifetime_ms,
+        }),
+    };
+    let value = json!({
+        "expiry": expiry,
+        "max_size_bytes": req.max_size_bytes,
+        "sandbox_id": req.sandbox_id,
+    });
+    crate::firecracker::canonical(&value).expect("a capture request always has canonical JSON")
+}
+
+/// A capture key's `request_sha256`: SHA-256 over the domain, one zero byte and the
+/// canonical JSON (design 7.1, digest version 1).
+pub fn capture_request_digest(req: &crate::manager::CaptureRequest) -> Digest {
+    let json = canonical_capture_request(req);
+    let mut input = Vec::with_capacity(CHECKPOINT_DIGEST_DOMAIN.len() + 1 + json.len());
+    input.extend_from_slice(CHECKPOINT_DIGEST_DOMAIN);
+    input.push(0);
+    input.extend_from_slice(&json);
+    Digest::of(&input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

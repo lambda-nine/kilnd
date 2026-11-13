@@ -228,8 +228,12 @@ A compromised daemon can capture and remove artifacts of its own instance ID, as
 create and remove sandboxes. Absence is certified only after every worker was reaped and
 no process names the artifact; a stuck worker keeps the artifact charged rather than
 freeing it. The group is disabled unless root starts the helper with
-`--enable-checkpoints`, and the daemon does not use it before the feature's later
-milestones.
+`--enable-checkpoints`. Its `source` operation (C5a) reads only a run's own root-owned
+`image` and `layout` records, through no-follow opens checked on the open descriptor
+(regular, owned by the helper, no group or other bits, at most 4 KiB, strict text); a
+symlink or anything unexpected is a typed refusal, and it never opens the image. The
+daemon's engine (C5a) uses the group only when `Limits::checkpoints` is set, which no flag
+does before milestone C5b.
 
 The daemon's checkpoint store (schema 15, milestone C4) keeps each checkpoint charged
 until it stores ABSENT evidence of its own recorded removal, in the same node disk
@@ -237,7 +241,11 @@ budget as sandbox reservations. Its triggers and audits defend against malformed
 and accidental or partial edits, not a hostile writer with the database's file
 authority, exactly as for sandbox reservations: a mismatch or invalid evidence degrades
 accounting and refuses capture and sandbox Create, and never frees capacity. The
-evidence is the helper's certification, not an independent ledger.
+evidence is the helper's certification, not an independent ledger. The engine keeps a
+capture's source gated until the helper proves the capture's worker reaped and its
+storage absent, and treats an artifact it cannot prove its own (a generation mismatch,
+an unreadable header, an inventory entry no charged row explains) as blocking new
+allocations, never as free space.
 
 ## What it relies on kiln for
 

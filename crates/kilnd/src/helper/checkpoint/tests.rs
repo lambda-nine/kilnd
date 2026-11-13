@@ -7,6 +7,7 @@ use crate::checkpoint::{GROUP_VERSION, MAX_INVENTORY_ENTRIES};
 use crate::model::{Captured, Id128};
 use crate::process::CaptureCompletion;
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 
 #[derive(Clone)]
@@ -53,6 +54,8 @@ struct Fake {
     /// Published artifacts by checkpoint ID, and their generations: what a capture
     /// published and a removal took.
     published: Mutex<HashMap<String, u64>>,
+    /// The runs directory the real record reader reads; `None`: unreadable.
+    runs: Mutex<Option<PathBuf>>,
 }
 
 fn kind(argv: &[String]) -> &'static str {
@@ -267,6 +270,17 @@ impl kiln::Workers for Workers {
     }
     fn support(&self, _deadline: Instant, _cancel: CancellationToken) -> kiln::SupportFuture {
         Box::pin(async { Ok(()) })
+    }
+    fn run_record(&self, backend_id: &str, record: RunRecord) -> io::Result<RecordRead> {
+        self.0
+            .events
+            .lock()
+            .unwrap()
+            .push(format!("record {}", record.name()));
+        match self.0.runs.lock().unwrap().clone() {
+            Some(runs) => kiln::read_run_record(&runs, backend_id, record),
+            None => Err(io::Error::other("no runs directory")),
+        }
     }
 }
 
@@ -1554,6 +1568,481 @@ fn inventory_names_carry_their_generation() {
     ] {
         assert_eq!(line(kind, name.clone()).generation(), expected, "{name}");
     }
+}
+
+// --- Source records (C5a) -------------------------------------------------------------
+
+const RUN: &str = "18e6c1e669b711eb-5357";
+const IMAGE_SHA: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+/// kiln `Reference::text` with an identity.
+fn image_ref() -> String {
+    format!(
+        "kiln-image-ref 1\nname alpine\ngeneration 3\nsha256 {IMAGE_SHA}\n\
+         directory 0000000000000803:1234:1700000000.000000001\n"
+    )
+}
+const IMAGE_NONE: &str = "kiln-image-ref 1\nname alpine\nidentity none image is not registered\n";
+/// kiln's `layout_record_round_trips_and_is_strict` text.
+const LAYOUT: &str = "kiln-layout 1\npinned index=off,metacopy=off,redirect_dir=nofollow,nfs_export=off\n\
+    defaults index=N metacopy=N nfs_export=N redirect_dir=N redirect_always_follow=Y\n\
+    super rw,lowerdir=<lower>,upperdir=<upper>,workdir=<work>,redirect_dir=nofollow\n\
+    effective index=off metacopy=off nfs_export=off redirect_dir=nofollow\n\
+    verified yes\ngenerated /etc/resolv.conf\n";
+/// `layout_text`'s `Err` branch: nothing was read back.
+const LAYOUT_UNREAD: &str = "kiln-layout 1\npinned index=off,metacopy=off,redirect_dir=nofollow,nfs_export=off\n\
+    verified no no params\n";
+
+/// A scratch runs directory owned by the test's own user, as root's is by root.
+struct Runs {
+    dir: tempfile::TempDir,
+}
+
+impl Runs {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        mkdir(&dir.path().join("runs"), 0o755);
+        Self { dir }
+    }
+    fn root(&self) -> PathBuf {
+        self.dir.path().join("runs")
+    }
+    /// A run with these records, each 0600 in a 0700 directory as kiln writes them.
+    fn run(&self, id: &str, image: Option<&str>, layout: Option<&str>) -> PathBuf {
+        let run = self.root().join(id);
+        mkdir(&run, 0o700);
+        if let Some(text) = image {
+            put(&run.join("image"), text.as_bytes(), 0o600);
+        }
+        if let Some(text) = layout {
+            put(&run.join("layout"), text.as_bytes(), 0o600);
+        }
+        run
+    }
+}
+
+fn mkdir(path: &Path, mode: u32) {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().mode(mode).create(path).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn put(path: &Path, data: &[u8], mode: u32) {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .unwrap()
+        .write_all(data)
+        .unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn source_op(backend_id: &str) -> CheckpointOperation {
+    CheckpointOperation::Source {
+        backend_id: backend_id.into(),
+    }
+}
+
+/// The node's answer for `RUN` under `runs` (checked by `call` as the daemon would).
+async fn source_in(runs: Option<PathBuf>) -> SourceReply {
+    let (node, fake) = setup();
+    *fake.runs.lock().unwrap() = runs;
+    let reply = call(&node, source_op(RUN)).await;
+    assert_eq!(fake.starts("capture") + fake.starts("create"), 0);
+    let CheckpointResponse::Source(reply) = reply else {
+        panic!("{reply:?}")
+    };
+    *reply
+}
+
+fn unsupported_reason(reply: &SourceReply) -> Reason {
+    match reply {
+        SourceReply::Unsupported { reason, detail } => {
+            assert!(!detail.is_empty() && detail.len() <= 512, "{detail}");
+            assert!(
+                !detail.contains("alpine") && !detail.contains("kiln-"),
+                "{detail}"
+            );
+            *reason
+        }
+        SourceReply::Capable { .. } => panic!("capable: {reply:?}"),
+    }
+}
+
+#[tokio::test]
+async fn source_names_a_verified_runs_recorded_image() {
+    let runs = Runs::new();
+    runs.run(RUN, Some(&image_ref()), Some(LAYOUT));
+    assert_eq!(
+        source_in(Some(runs.root())).await,
+        SourceReply::Capable {
+            image: "alpine".into(),
+            image_sha256: Digest::parse(IMAGE_SHA).unwrap(),
+        }
+    );
+    // kiln's documented form: more effective features after the pinned four, and no
+    // generated entries.
+    let runs = Runs::new();
+    let layout = LAYOUT
+        .replace(
+            "nfs_export=off redirect_dir=nofollow\n",
+            "nfs_export=off redirect_dir=nofollow uuid=on nouserxattr\n",
+        )
+        .replace("generated /etc/resolv.conf\n", "");
+    runs.run(RUN, Some(&image_ref()), Some(&layout));
+    assert!(matches!(
+        source_in(Some(runs.root())).await,
+        SourceReply::Capable { .. }
+    ));
+}
+
+#[tokio::test]
+async fn source_without_records_or_identity_is_unsupported() {
+    let image = image_ref();
+    let verified_no = LAYOUT.replace("verified yes", "verified no metacopy=on");
+    for (image, layout) in [
+        (None, Some(LAYOUT)),
+        (Some(image.as_str()), None),
+        (None, None),
+        (Some(IMAGE_NONE), Some(LAYOUT)),
+        (Some(image.as_str()), Some(verified_no.as_str())),
+        (Some(image.as_str()), Some(LAYOUT_UNREAD)),
+    ] {
+        let runs = Runs::new();
+        runs.run(RUN, image, layout);
+        let reply = source_in(Some(runs.root())).await;
+        assert_eq!(
+            unsupported_reason(&reply),
+            Reason::SandboxUnsupported,
+            "{image:?} {layout:?}"
+        );
+    }
+    // No run directory at all.
+    let runs = Runs::new();
+    let reply = source_in(Some(runs.root())).await;
+    assert_eq!(unsupported_reason(&reply), Reason::SandboxUnsupported);
+    // An unreadable runs directory is an I/O failure, not a verdict on the run.
+    let reply = source_in(None).await;
+    assert_eq!(unsupported_reason(&reply), Reason::Io);
+    let missing = Runs::new().root().join("absent");
+    assert_eq!(
+        unsupported_reason(&source_in(Some(missing)).await),
+        Reason::Io
+    );
+}
+
+#[tokio::test]
+async fn source_refuses_links_and_other_file_types() {
+    // A symlinked record pointing to a valid one elsewhere.
+    let runs = Runs::new();
+    let elsewhere = runs.dir.path().join("elsewhere");
+    mkdir(&elsewhere, 0o700);
+    put(&elsewhere.join("image"), image_ref().as_bytes(), 0o600);
+    let run = runs.run(RUN, None, Some(LAYOUT));
+    std::os::unix::fs::symlink(elsewhere.join("image"), run.join("image")).unwrap();
+    assert_eq!(
+        unsupported_reason(&source_in(Some(runs.root())).await),
+        Reason::Corrupt
+    );
+    // A symlinked run directory pointing to a valid run.
+    let runs = Runs::new();
+    let real = runs.run("aaaa", Some(&image_ref()), Some(LAYOUT));
+    std::os::unix::fs::symlink(&real, runs.root().join(RUN)).unwrap();
+    assert_eq!(
+        unsupported_reason(&source_in(Some(runs.root())).await),
+        Reason::Corrupt
+    );
+    // A FIFO named `image` (opened without blocking), a directory, and a run that is
+    // a file.
+    let runs = Runs::new();
+    let run = runs.run(RUN, None, Some(LAYOUT));
+    let fifo =
+        std::ffi::CString::new(run.join("image").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let reply = tokio::time::timeout(Duration::from_secs(5), source_in(Some(runs.root())))
+        .await
+        .expect("a FIFO record must not block");
+    assert_eq!(unsupported_reason(&reply), Reason::Corrupt);
+    let runs = Runs::new();
+    let run = runs.run(RUN, None, Some(LAYOUT));
+    mkdir(&run.join("image"), 0o700);
+    assert_eq!(
+        unsupported_reason(&source_in(Some(runs.root())).await),
+        Reason::Corrupt
+    );
+    let runs = Runs::new();
+    put(&runs.root().join(RUN), b"", 0o600);
+    assert_eq!(
+        unsupported_reason(&source_in(Some(runs.root())).await),
+        Reason::Corrupt
+    );
+}
+
+#[tokio::test]
+async fn source_refuses_oversized_open_foreign_and_noncanonical_records() {
+    let image = image_ref();
+    let mut cases: Vec<(String, String)> = vec![
+        // Over the cap, whatever it holds.
+        ("x".repeat(kiln::MAX_RUN_RECORD_BYTES + 1), LAYOUT.into()),
+        (
+            image.clone(),
+            format!("{LAYOUT}{}", "generated /x\n".repeat(400)),
+        ),
+        (format!("{image}extra 1\n"), LAYOUT.into()),
+        (
+            image.replace("generation 3", "generation 03"),
+            LAYOUT.into(),
+        ),
+        (
+            image.replace(IMAGE_SHA, &IMAGE_SHA.to_uppercase()),
+            LAYOUT.into(),
+        ),
+        (image.trim_end().into(), LAYOUT.into()),
+        (
+            image.clone(),
+            LAYOUT.replace("verified yes", "verified maybe"),
+        ),
+        (image.clone(), format!("{LAYOUT}verified yes\n")),
+    ];
+    cases.push((
+        image.replace("name alpine", "name ../alpine"),
+        LAYOUT.into(),
+    ));
+    for (image, layout) in &cases {
+        let runs = Runs::new();
+        runs.run(RUN, Some(image), Some(layout));
+        assert_eq!(
+            unsupported_reason(&source_in(Some(runs.root())).await),
+            Reason::Corrupt,
+            "{image:?} {layout:?}"
+        );
+    }
+    // Non-UTF-8.
+    let runs = Runs::new();
+    let run = runs.run(RUN, None, Some(LAYOUT));
+    put(&run.join("image"), b"kiln-image-ref 1\nname \xff\n", 0o600);
+    assert_eq!(
+        unsupported_reason(&source_in(Some(runs.root())).await),
+        Reason::Corrupt
+    );
+    // A record readable by others, and a run directory writable by others.
+    let runs = Runs::new();
+    let run = runs.run(RUN, None, Some(LAYOUT));
+    put(&run.join("image"), image.as_bytes(), 0o644);
+    assert_eq!(
+        unsupported_reason(&source_in(Some(runs.root())).await),
+        Reason::Corrupt
+    );
+    for mode in [0o770, 0o702] {
+        let runs = Runs::new();
+        let run = runs.run(RUN, Some(&image), Some(LAYOUT));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            unsupported_reason(&source_in(Some(runs.root())).await),
+            Reason::Corrupt,
+            "{mode:o}"
+        );
+    }
+    // A hostile record wins over a missing or unverified one, whichever it is.
+    let runs = Runs::new();
+    let run = runs.run(RUN, Some(IMAGE_NONE), None);
+    std::os::unix::fs::symlink("/nonexistent", run.join("layout")).unwrap();
+    assert_eq!(
+        unsupported_reason(&source_in(Some(runs.root())).await),
+        Reason::Corrupt
+    );
+    // Another owner: only root can make one.
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let runs = Runs::new();
+    let run = runs.run(RUN, Some(&image), Some(LAYOUT));
+    std::os::unix::fs::chown(run.join("image"), Some(65534), None).unwrap();
+    assert_eq!(
+        unsupported_reason(&source_in(Some(runs.root())).await),
+        Reason::Corrupt
+    );
+    let runs = Runs::new();
+    let run = runs.run(RUN, Some(&image), Some(LAYOUT));
+    std::os::unix::fs::chown(&run, Some(65534), None).unwrap();
+    assert_eq!(
+        unsupported_reason(&source_in(Some(runs.root())).await),
+        Reason::Corrupt
+    );
+}
+
+#[test]
+fn the_run_record_reader_and_parsers_are_strict() {
+    use kiln::*;
+    let runs = Runs::new();
+    runs.run(RUN, Some(&image_ref()), None);
+    assert_eq!(
+        read_run_record(&runs.root(), RUN, RunRecord::Image).unwrap(),
+        RecordRead::Text(image_ref())
+    );
+    assert_eq!(
+        read_run_record(&runs.root(), RUN, RunRecord::Layout).unwrap(),
+        RecordRead::Missing
+    );
+    assert_eq!(
+        read_run_record(&runs.root(), "beef", RunRecord::Image).unwrap(),
+        RecordRead::Missing
+    );
+    for id in ["", "..", "a/b", "-ab", "AB/..", &"a".repeat(65)] {
+        assert!(
+            matches!(
+                read_run_record(&runs.root(), id, RunRecord::Image).unwrap(),
+                RecordRead::Hostile(_)
+            ),
+            "{id}"
+        );
+    }
+    // Each hostile shape fails for its own reason.
+    let runs = Runs::new();
+    let link = runs.run("1", None, None);
+    std::os::unix::fs::symlink(runs.root().join(RUN).join("image"), link.join("image")).unwrap();
+    std::os::unix::fs::symlink(runs.root().join(RUN), runs.root().join("2")).unwrap();
+    let fifo = runs.run("3", None, None);
+    let path =
+        std::ffi::CString::new(fifo.join("image").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    mkdir(&runs.run("4", None, None).join("image"), 0o700);
+    put(&runs.run("5", None, None).join("image"), b"x", 0o640);
+    put(
+        &runs.run("6", None, None).join("image"),
+        &[b'x'; kiln::MAX_RUN_RECORD_BYTES + 1],
+        0o600,
+    );
+    put(&runs.run("7", None, None).join("image"), b"\xff", 0o600);
+    put(
+        &runs.run("8", None, None).join("image"),
+        &[b'x'; kiln::MAX_RUN_RECORD_BYTES],
+        0o600,
+    );
+    for (id, why) in [
+        ("1", "the image record is a symbolic link"),
+        ("2", "the run directory is not a directory"),
+        ("3", "a run record is a FIFO or socket"),
+        ("4", "a run record is not a regular file"),
+        ("5", "a run record has another owner or is open to others"),
+        ("6", "a run record is too large"),
+        ("7", "a run record is not UTF-8"),
+    ] {
+        assert_eq!(
+            read_run_record(&runs.root(), id, RunRecord::Image).unwrap(),
+            RecordRead::Hostile(why.into()),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        read_run_record(&runs.root(), "8", RunRecord::Image).unwrap(),
+        RecordRead::Text("x".repeat(kiln::MAX_RUN_RECORD_BYTES))
+    );
+
+    let sha = Digest::parse(IMAGE_SHA).unwrap();
+    assert_eq!(
+        parse_image_ref(&image_ref()),
+        Ok(Ok(("alpine".into(), sha)))
+    );
+    assert_eq!(
+        parse_image_ref(IMAGE_NONE),
+        Ok(Err("image is not registered".into()))
+    );
+    // kiln prints a birth time before 1970 with its sign.
+    let negative = image_ref().replace(":1700000000.", ":-5.");
+    assert!(matches!(parse_image_ref(&negative), Ok(Ok(_))));
+    let image = image_ref();
+    for bad in [
+        String::new(),
+        image.replace("kiln-image-ref 1", "kiln-image-ref 2"),
+        image.replace("generation 3", "generation 0"),
+        image.replace("generation 3", "generation 01"),
+        image.replace("generation 3", "generation +3"),
+        image.replace("generation 3\n", ""),
+        image.replace("name alpine", "name "),
+        image.replace("name alpine", "name .alpine"),
+        image.replace("name alpine", "name  alpine"),
+        image.replace(IMAGE_SHA, &IMAGE_SHA[1..]),
+        image.replace(IMAGE_SHA, &IMAGE_SHA.to_uppercase()),
+        image.replace("0000000000000803:", "803:"),
+        image.replace("0000000000000803:", "000000000000080A:"),
+        image.replace(":1234:", ":01234:"),
+        image.replace(".000000001", ".00000001"),
+        image.replace(":1700000000.", ":-0."),
+        image.replace("1700000000.000000001", "1700000000"),
+        image.replace("directory ", "directory 0:"),
+        image.replace('\n', "\r\n"),
+        format!("{image}\n"),
+        image.trim_end().into(),
+        image.replace("sha256", "identity none x\nsha256"),
+        IMAGE_NONE.replace("identity none image is not registered", "identity none "),
+        IMAGE_NONE.replace("identity none", "identity some"),
+        format!("{IMAGE_NONE}generation 3\n"),
+    ] {
+        assert!(parse_image_ref(&bad).is_err(), "{bad:?}");
+    }
+
+    assert_eq!(parse_layout(LAYOUT), Ok(Ok(())));
+    assert_eq!(parse_layout(LAYOUT_UNREAD), Ok(Err("no params".into())));
+    let unpinned = LAYOUT
+        .replace("effective index=off", "effective index=on")
+        .replace("verified yes", "verified no index is on");
+    assert_eq!(parse_layout(&unpinned), Ok(Err("index is on".into())));
+    for bad in [
+        LAYOUT.replace("verified yes", "verified maybe"),
+        LAYOUT.replace("verified yes", "verified no"),
+        LAYOUT.replace("kiln-layout 1", "kiln-layout 2"),
+        LAYOUT.replace("effective index=off", "effective index=on"),
+        LAYOUT.replace(
+            "nfs_export=off redirect_dir=nofollow\n",
+            "nfs_export=off redirect_dir=nofollowx\n",
+        ),
+        format!("{LAYOUT}verified yes\n"),
+        LAYOUT.replace("verified yes\n", ""),
+        format!("{LAYOUT}extra 1\n"),
+        format!("{LAYOUT}generated etc/hosts\n"),
+        LAYOUT.replace("pinned index=off,", "pinned "),
+        LAYOUT.replace("defaults", "default"),
+        LAYOUT.replace("super rw", "effective rw"),
+        LAYOUT.replace(
+            "super rw,lowerdir=<lower>,upperdir=<upper>,workdir=<work>,redirect_dir=nofollow\n",
+            "",
+        ),
+        LAYOUT_UNREAD.replace("verified no", "verified yes"),
+        LAYOUT_UNREAD.replace("verified no no params", "verified yes"),
+        LAYOUT.trim_end().into(),
+        LAYOUT.replace('\n', "\r\n"),
+        format!("{LAYOUT}\n"),
+    ] {
+        assert!(parse_layout(&bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn source_is_refused_when_disabled_and_by_an_older_helper() {
+    assert_eq!(
+        error_kind(&disabled(&source_op(RUN))),
+        CheckpointErrorKind::Disabled
+    );
+    // A helper whose operation enum lacks a variant refuses the request outright: the
+    // same rule makes a helper without `source` reject one.
+    let epoch = "0123456789abcdef0123456789abcdef";
+    let known = format!(
+        r#"{{"group_version":1,"helper_epoch":"{epoch}","operation":{{"source":{{"backend_id":"ab"}}}}}}"#
+    );
+    let request: CheckpointRequest = serde_json::from_slice(known.as_bytes()).unwrap();
+    assert!(
+        matches!(&request.operation, CheckpointOperation::Source { backend_id } if backend_id == "ab")
+    );
+    let unknown = known.replace("\"source\"", "\"sourcex\"");
+    assert!(serde_json::from_slice::<CheckpointRequest>(unknown.as_bytes()).is_err());
 }
 
 #[cfg(test)]

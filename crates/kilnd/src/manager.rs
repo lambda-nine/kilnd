@@ -110,6 +110,9 @@ pub struct Limits {
     pub max_exec_streams_per_uid: usize,
     /// `--exec-stream-buffer-bytes` and `--exec-stream-chunk-bytes`.
     pub exec_stream: crate::exec_stream::StreamBuffer,
+    /// Workspace checkpoints (milestone C5a): `None`, the default, is the feature off.
+    /// There is no flag yet; only Rust callers and tests set it.
+    pub checkpoints: Option<CheckpointLimits>,
 }
 
 /// `--max-create-requests-per-uid` and `--max-create-requests`.
@@ -178,6 +181,7 @@ impl Default for Limits {
             exec_env: crate::exec_env::EnvLimits::CEILINGS,
             default_stream_timeout: Duration::from_secs(1800),
             max_stream_timeout: Duration::from_secs(7200),
+            checkpoints: None,
             max_exec_streams: 16,
             max_exec_streams_per_uid: 8,
             exec_stream: crate::exec_stream::StreamBuffer::default(),
@@ -269,6 +273,10 @@ pub enum RefusalCode {
     Unavailable,
     /// `backend_unsupported:<feature>` (design section 1).
     Unimplemented,
+    /// A typed INVALID_ARGUMENT (checkpoint design 7.3).
+    InvalidArgument,
+    /// `checkpoint_corrupt` (checkpoint design 7.3).
+    DataLoss,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -386,6 +394,11 @@ struct Slot {
     /// newly admitted request and an idle expiry cannot both win. Nothing awaits
     /// while it is held.
     admission: Mutex<()>,
+    /// A workspace capture holds this source (checkpoint design 4.1 and 8.2): set under
+    /// the admission gate with the exec lock held, so new Exec refuses
+    /// `checkpoint_busy` and idle expiry pauses; Delete and lifetime expiry cancel it.
+    /// Never set while checkpoints are off.
+    capturing: Mutex<Option<CancellationToken>>,
 }
 
 impl Slot {
@@ -396,12 +409,27 @@ impl Slot {
             outstanding_execs: Arc::new(Semaphore::new(capacity)),
             capacity,
             admission: Mutex::new(()),
+            capturing: Mutex::new(None),
         }
     }
 
-    /// An execution is running or an admitted request is queued.
+    /// An execution is running, an admitted request is queued, or a capture holds it.
     fn busy(&self) -> bool {
-        self.outstanding_execs.available_permits() != self.capacity
+        self.outstanding_execs.available_permits() != self.capacity || self.capturing()
+    }
+
+    fn capturing(&self) -> bool {
+        self.capturing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Delete and lifetime expiry stop a capture of this source (design 8.2).
+    fn cancel_capture(&self) {
+        if let Some(cancel) = &*self.capturing.lock().unwrap_or_else(|e| e.into_inner()) {
+            cancel.cancel();
+        }
     }
 }
 
@@ -613,6 +641,8 @@ pub struct Manager<R> {
     create_retries_answered: AtomicU64,
     request_ids_released: AtomicU64,
     rejected_create_requests: AtomicU64,
+    /// The checkpoint engine's in-memory state (milestone C5a).
+    checkpoint: checkpoint::CheckpointEngine,
     #[cfg(test)]
     idle_commit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
@@ -851,6 +881,8 @@ pub struct Reconciled {
     pub released: Vec<String>,
     pub quarantined: Vec<String>,
     pub admission_blocked: bool,
+    /// Checkpoint artifacts, partials or an inventory no charged row explains.
+    pub checkpoints_blocked: bool,
 }
 
 /// What reconciliation learned about one charged absence-fenced row, gathered
@@ -896,6 +928,7 @@ impl<R: Runtime> Manager<R> {
             create_retries_answered: AtomicU64::new(0),
             request_ids_released: AtomicU64::new(0),
             rejected_create_requests: AtomicU64::new(0),
+            checkpoint: checkpoint::CheckpointEngine::default(),
             #[cfg(test)]
             idle_commit_hook: Mutex::new(None),
             clock,
@@ -1192,6 +1225,9 @@ impl<R: Runtime> Manager<R> {
             !known.contains(id)
                 && (record.allocation_id.is_some() || record.status == BackendStatus::Unknown)
         });
+        // Checkpoint design 10.2: unmatched artifacts or an unknown inventory block too.
+        out.checkpoints_blocked = self.reconcile_checkpoints().await?;
+        out.admission_blocked |= out.checkpoints_blocked;
         self.admission_blocked
             .store(out.admission_blocked, Ordering::Relaxed);
         out.unmanaged = live.into_keys().filter(|b| !known.contains(b)).collect();
@@ -2966,6 +3002,9 @@ impl<R: Runtime> Manager<R> {
         if let Some(cancel) = &*slot.running.lock().unwrap() {
             cancel.request(ExecCancelReason::SandboxDeleted);
         }
+        // A capture of this source stops, and keeps the exec lock until the helper
+        // proved its reader gone (checkpoint design 8.2).
+        slot.cancel_capture();
         // Wait for a running execution to finish canceling; new ones see
         // DELETING and refuse.
         let _guard = slot.exec_lock.lock().await;
@@ -3182,6 +3221,13 @@ impl<R: Runtime> Manager<R> {
             // typed reason without ever being admitted.
             let _gate = slot.admission.lock().unwrap_or_else(|e| e.into_inner());
             ready(&self.load(&req.sandbox_id)?)?;
+            // Checkpoint design 8.2: a capture set its flag under this gate first.
+            if slot.capturing() {
+                return Err(CheckpointReason::Busy.error(format!(
+                    "sandbox {} is being checkpointed",
+                    req.sandbox_id
+                )));
+            }
             slot.outstanding_execs
                 .clone()
                 .try_acquire_owned()
@@ -3712,7 +3758,12 @@ impl<R: Runtime> Manager<R> {
     /// The cross-boot rebase (design 2.3). Run once after reconciliation and before
     /// the sweeper, admission or any prune.
     pub fn rebase_expiry_clocks(&self) -> Result<usize> {
-        Ok(self.store.rebase_clocks()?)
+        let sandboxes = self.store.rebase_clocks()?;
+        let checkpoints = match self.limits.checkpoints {
+            Some(_) => self.store.rebase_checkpoint_clocks()?,
+            None => 0,
+        };
+        Ok(sandboxes + checkpoints)
     }
 
     /// The request-record rebase (design 3.3 R2). Run once after reconciliation and
@@ -3787,6 +3838,7 @@ impl<R: Runtime> Manager<R> {
     /// Starts the sweeper: one tracked task owning the queue's single timer.
     pub fn start_expiry(self: &Arc<Self>) -> Result<tokio::task::JoinHandle<()>> {
         self.rebuild_expiry()?;
+        self.start_checkpoints()?;
         let manager = Arc::clone(self);
         Ok(tokio::spawn(async move { manager.sweep().await }))
     }
@@ -3797,8 +3849,13 @@ impl<R: Runtime> Manager<R> {
                 break;
             }
             self.expire_due();
+            self.expire_checkpoints_due();
             let now = self.clock.boottime_ms();
             let head = self.expiry.lock().unwrap().queue.head();
+            let head = match (head, self.checkpoint_timer_head()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             // Timers are derived from the remaining boottime budget, and the rescan
             // bounds how late a resume from suspend can be noticed.
             let rescan = self.limits.expiry.rescan;
@@ -3887,6 +3944,7 @@ impl<R: Runtime> Manager<R> {
                 if let Some(cancel) = &*slot.running.lock().unwrap() {
                     cancel.request(ExecCancelReason::ExpiredLifetime);
                 }
+                slot.cancel_capture();
                 self.begin_expiry_removal(key, now);
             }
             Ok(false) => self.refresh_after_miss(id, key, now),
@@ -4638,8 +4696,21 @@ fn may_use(sandbox: &Sandbox, uid: u32) -> bool {
     uid == 0 || sandbox.owner_uid == uid
 }
 
+mod checkpoint;
+pub use checkpoint::{
+    CaptureKey, CaptureRequest, CheckpointCode, CheckpointLimits, CheckpointReason,
+    DEFAULT_CHECKPOINT_IDLE_MS, DEFAULT_CHECKPOINT_LIFETIME_MS, EXCLUDED_PATHS,
+    resolve_checkpoint_expiry,
+};
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). The root VM test
+// copies and removes its own image, sandboxes and artifacts.
+#[allow(clippy::disallowed_methods)]
+mod checkpoint_vm_tests;
 
 #[cfg(test)]
 mod fenced_tests;

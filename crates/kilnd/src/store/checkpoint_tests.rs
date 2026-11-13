@@ -113,6 +113,7 @@ fn new_checkpoint(source: &Sandbox, owner_uid: u32, r: u64) -> NewCheckpoint {
             idle_ms: 3_600_000,
         },
         request_id: None,
+        source_identity: None,
     }
 }
 

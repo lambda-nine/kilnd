@@ -54,6 +54,10 @@ pub enum CheckpointOperation {
     /// The instance's bounded inventory: artifacts, partials, tracked operations and
     /// untracked workers.
     Inventory { instance: Id128 },
+    /// The source run's image identity and layout verification (checkpoint milestone
+    /// C5a), read only from the run's own root-owned `image` and `layout` records, never
+    /// from the image by name. Answered without a worker.
+    Source { backend_id: String },
     /// The daemon has stored this operation's evidence.
     Acknowledge {
         target: ArtifactTarget,
@@ -66,7 +70,7 @@ impl CheckpointOperation {
     /// a verifying inspect take the design's 300-second helper ceiling.
     pub fn timeout_ms(&self) -> u32 {
         match self {
-            Self::Capabilities | Self::Acknowledge { .. } => 5_000,
+            Self::Capabilities | Self::Acknowledge { .. } | Self::Source { .. } => 5_000,
             Self::Inspect { verify: false, .. } | Self::Inventory { .. } => 30_000,
             Self::Remove { .. } => 60_000,
             Self::Capture { .. } | Self::Restore { .. } | Self::Inspect { verify: true, .. } => {
@@ -84,6 +88,7 @@ impl CheckpointOperation {
                 | Self::Remove { .. }
                 | Self::Inventory { .. }
                 | Self::Acknowledge { .. }
+                | Self::Source { .. }
         )
     }
 }
@@ -99,6 +104,13 @@ impl CheckpointRequest {
         }
         match &self.operation {
             CheckpointOperation::Capabilities | CheckpointOperation::Inventory { .. } => Ok(()),
+            CheckpointOperation::Source { backend_id } => {
+                if crate::runtime::kiln_direct::valid_kiln_id(backend_id) {
+                    Ok(())
+                } else {
+                    Err("invalid source backend ID".into())
+                }
+            }
             CheckpointOperation::Capture { binding } => binding.validate(),
             CheckpointOperation::Restore { target, spec, .. } => {
                 target.validate()?;
@@ -120,6 +132,7 @@ pub enum CheckpointResponse {
     Inspected(Box<ArtifactInspectReply>),
     Removed(Box<RemoveReply>),
     Inventory(Box<InventoryReply>),
+    Source(Box<SourceReply>),
     Acknowledged,
     Error(CheckpointError),
 }
@@ -209,6 +222,18 @@ pub enum RemoveReply {
         detail: String,
     },
     Pending,
+}
+
+/// What the source run's own records say (C5a). Only `Capable` lets the daemon record
+/// an image identity; anything unexpected in the records is `Unsupported` with a typed
+/// reason, never a guess.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceReply {
+    /// The run records a registered image identity and a verified pinned layout.
+    Capable { image: String, image_sha256: Digest },
+    /// Not a checkpoint source, or its records could not be trusted.
+    Unsupported { reason: Reason, detail: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +446,10 @@ impl CheckpointResponse {
         };
         match (operation, self) {
             (_, Self::Error(_)) => Ok(()),
+            (Op::Source { .. }, Self::Source(reply)) => match reply.as_ref() {
+                SourceReply::Capable { image, .. } => crate::validation::validate_image_name(image),
+                SourceReply::Unsupported { .. } => Ok(()),
+            },
             (Op::Capabilities, Self::Capabilities(caps)) => {
                 if caps.group_version != super::GROUP_VERSION
                     || caps.enabled != (caps.helper_epoch.is_some() && caps.boot_id.is_some())

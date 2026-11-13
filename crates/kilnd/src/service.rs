@@ -731,6 +731,8 @@ fn status(e: Error) -> Status {
                 RefusalCode::DeadlineExceeded => tonic::Code::DeadlineExceeded,
                 RefusalCode::Unavailable => tonic::Code::Unavailable,
                 RefusalCode::Unimplemented => tonic::Code::Unimplemented,
+                RefusalCode::InvalidArgument => tonic::Code::InvalidArgument,
+                RefusalCode::DataLoss => tonic::Code::DataLoss,
             },
             r,
         ),

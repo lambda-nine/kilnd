@@ -314,8 +314,9 @@ answered on its own `Response::Checkpoint` branch. Every kiln and Firecracker fr
 reply is byte-identical, an older helper closes the connection on the unknown variant,
 and the whole frame must be strict JSON as for Firecracker. Only the `kilnd` account may
 use it. **It is off by default:** without `kilnd-helper --enable-checkpoints`,
-`capabilities` answers `enabled: false` and every other operation `disabled`. Nothing in
-the daemon calls it yet: there is no RPC, Health field or feature for checkpoints, and
+`capabilities` answers `enabled: false` and every other operation `disabled`. The daemon's
+engine (milestone C5a) calls it only when `Limits::checkpoints` is set, which no flag
+does yet: there is no RPC, Health field or feature for checkpoints, and
 `RuntimeCapabilities.checkpoint` stays false.
 
 No request carries a path, flag, command, descriptor or environment. Artifacts are named
@@ -333,7 +334,22 @@ before its future returns).
 | `inspect {target, verify, operation?}` | 30 s (300 s with `verify`) | cleanup (copy) | The namespace's view of the artifact, this epoch's activity on it, and an operation nonce's state |
 | `remove {target, operation}` | 60 s | cleanup | Reserve a cleanup slot (or refuse `workers`), tombstone, cancel, wait for every reap, generation-checked `kiln checkpoint rm --generation`, then the absence checks: `absent {evidence}`, `retained {reason, detail}` or `pending` |
 | `inventory {instance}` | 30 s | cleanup | That instance's artifacts, partial captures and removals, tracked operations and untracked workers |
+| `source {backend_id}` | 5 s | recovery | Whether a run can be a checkpoint source, from its own `image` and `layout` records (no worker): `capable {image, image_sha256}` when the image reference records an identity and the layout says `verified yes` with the pinned effective features; otherwise `unsupported {reason, detail}`: `sandbox_unsupported:workspace_checkpoint` for a missing run or record (an older kiln's run), `identity none` or `verified no`, `checkpoint_corrupt` for anything hostile or malformed, `checkpoint_io` for any other read failure |
 | `acknowledge {target, operation}` | 5 s | recovery | The daemon stored that operation's evidence |
+
+**Source records.** `source` reads only `/var/lib/kiln/runs/<backend_id>/image` and
+`…/layout`, the records kiln writes root-only (0600 in a 0700 directory) for every run
+(kiln `docs/checkpoint-lease-v1.md`, "Run metadata"). It never opens the image by name and
+never runs a worker. The run directory and each record are opened with `openat` and
+`O_NOFOLLOW` beneath a no-follow open of the runs directory, a record also with
+`O_NONBLOCK` and `O_NOCTTY`, and are checked on the open descriptor: the directory owned
+by the helper's user and writable by it alone, the record a regular file owned by it with
+no group or other permission, at most 4 KiB and UTF-8. Both texts must be exactly kiln's
+canonical forms (`kiln-image-ref 1`, `kiln-layout 1`). A link in either component, another
+file type, owner or mode, an oversized or non-canonical record is `checkpoint_corrupt`,
+which outranks an I/O failure, which outranks plain unsupport. `detail` is a short fixed
+reason, never record contents. The daemon asks once, at a sandbox's first capture, and
+records the identity it answers.
 
 **Admission and supervision.** Two copy slots (capture, restore, verifying inspection)
 and two cleanup slots (removal, inspection, inventory), separate from the helper's

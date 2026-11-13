@@ -143,6 +143,10 @@ impl Runtime for KilnRuntime {
             _ => Err(unexpected()),
         }
     }
+    fn checkpoint_backend(&self) -> bool {
+        true
+    }
+
     /// The checkpoint group through the root helper. A reply that does not match its
     /// request is an error, never evidence.
     async fn checkpoint(

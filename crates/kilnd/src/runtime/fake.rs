@@ -33,6 +33,10 @@ use crate::model::{
     RuntimeErrorKind, RuntimeStage, SandboxDisposition, SandboxSpec,
 };
 
+#[path = "fake_checkpoint.rs"]
+mod checkpoint;
+pub use checkpoint::{FakeCheckpoints, FakeRemoval, fake_image_sha};
+
 /// A deterministic one-shot pause for lifecycle tests. Tests wait for
 /// `entered`, cancel a caller or begin shutdown, then explicitly `release`.
 #[derive(Clone)]
@@ -264,6 +268,8 @@ pub struct FakeState {
     pub max_active_removes: u32,
     /// Holds every legacy removal until released, so tests see them overlap.
     pub remove_hold: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// C5a: the scripted root helper checkpoint group; `None` has none.
+    pub checkpoints: Option<FakeCheckpoints>,
     next: u64,
 }
 
@@ -309,6 +315,7 @@ impl Default for FakeState {
             active_removes: 0,
             max_active_removes: 0,
             remove_hold: None,
+            checkpoints: None,
             next: 0,
         }
     }
@@ -895,6 +902,21 @@ impl Runtime for FakeRuntime {
             return Err(RuntimeError::Backend("fake backend unavailable".into()));
         }
         Ok("fake 1.0".into())
+    }
+
+    fn checkpoint_backend(&self) -> bool {
+        let state = self.state();
+        state.mode != FakeEvidenceMode::Fenced && state.checkpoints.is_some()
+    }
+
+    async fn checkpoint(
+        &self,
+        epoch: Option<Id128>,
+        operation: crate::checkpoint::wire::CheckpointOperation,
+        _deadline: tokio::time::Instant,
+        cancel: &CancellationToken,
+    ) -> Result<crate::checkpoint::wire::CheckpointResponse, RuntimeError> {
+        self.fake_checkpoint(epoch, operation, cancel).await
     }
 
     async fn proven_features(

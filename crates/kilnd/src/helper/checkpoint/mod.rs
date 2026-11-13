@@ -41,9 +41,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 pub mod kiln;
 use kiln::{
     CHECKPOINT_FAILED, CREATE_PREFLIGHT_FAILED, create_reason, exit_code, named_artifact,
-    parse_inventory, parse_removed, success_stdout,
+    parse_image_ref, parse_inventory, parse_layout, parse_removed, success_stdout,
 };
-pub use kiln::{KilnWorkers, ProcessArgs, Workers};
+pub use kiln::{KilnWorkers, ProcessArgs, RecordRead, RunRecord, Workers};
 
 /// Design 6.2: two capture and restore workers per node.
 pub const COPY_WORKERS: usize = 2;
@@ -357,7 +357,68 @@ impl Node {
             CheckpointOperation::Acknowledge { target, operation } => {
                 self.acknowledge(&target, operation)
             }
+            CheckpointOperation::Source { backend_id } => self.source(&backend_id),
         }
+    }
+
+    // --- Source identity (C5a) ----------------------------------------------------
+
+    /// Whether the run can be a checkpoint source: its `image` record holds an identity
+    /// and its `layout` record says `verified yes`. Reads only those two records, never
+    /// the image, and runs no worker. With several findings the gravest answers:
+    /// anything hostile or malformed, then an I/O failure, then plain unsupport.
+    fn source(&self, backend_id: &str) -> CheckpointResponse {
+        type Finding = (Reason, String);
+        fn unsupported((reason, detail): Finding) -> SourceReply {
+            SourceReply::Unsupported {
+                reason,
+                detail: bounded_detail(&detail),
+            }
+        }
+        let read = |record: RunRecord| -> Result<String, Finding> {
+            match self.workers.run_record(backend_id, record) {
+                Ok(RecordRead::Text(text)) => Ok(text),
+                Ok(RecordRead::Missing) => Err((
+                    Reason::SandboxUnsupported,
+                    format!("the source run has no {} record", record.name()),
+                )),
+                Ok(RecordRead::Hostile(why)) => Err((Reason::Corrupt, why)),
+                Err(e) => Err((
+                    Reason::Io,
+                    format!("the {} record could not be read: {e}", record.name()),
+                )),
+            }
+        };
+        let image = read(RunRecord::Image).and_then(|text| match parse_image_ref(&text) {
+            Ok(Ok(identity)) => Ok(identity),
+            Ok(Err(_)) => Err((
+                Reason::SandboxUnsupported,
+                "the source run's image has no recorded identity".into(),
+            )),
+            Err(why) => Err((Reason::Corrupt, why)),
+        });
+        let layout = read(RunRecord::Layout).and_then(|text| match parse_layout(&text) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err((
+                Reason::SandboxUnsupported,
+                "the source run's overlay layout is not verified".into(),
+            )),
+            Err(why) => Err((Reason::Corrupt, why)),
+        });
+        let gravity = |reason: Reason| match reason {
+            Reason::Corrupt => 0,
+            Reason::Io => 1,
+            _ => 2,
+        };
+        let reply = match (image, layout) {
+            (Ok((image, image_sha256)), Ok(())) => SourceReply::Capable {
+                image,
+                image_sha256,
+            },
+            (Err(finding), Ok(())) | (Ok(_), Err(finding)) => unsupported(finding),
+            (Err(a), Err(b)) => unsupported(if gravity(b.0) < gravity(a.0) { b } else { a }),
+        };
+        CheckpointResponse::Source(Box::new(reply))
     }
 
     /// Waits for an admitted operation's settlement, at most until the wire deadline

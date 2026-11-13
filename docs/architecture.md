@@ -1353,6 +1353,70 @@ stored aggregate rows themselves are rewritten only by the normal startup audit,
 settles a release still unsettled, as schema 14's own startup does. Older binaries refuse schema 15;
 see [setup.md](setup.md) for rollback.
 
+
+## Workspace checkpoint engine (milestone C5a)
+
+`crates/kilnd/src/manager/checkpoint.rs` drives C3's helper group and C4's store:
+supervised capture, the D1-D3 removal, checkpoint expiry and startup reconciliation.
+**It is off unless `Limits::checkpoints` is set**, which only Rust callers and tests do:
+there is no flag, RPC, `kilndctl` command, Health field or feature bit yet (C5b), and
+with it off the only change on any existing path is an in-memory capture flag on each
+sandbox slot that is never set. Creating a sandbox from a checkpoint is not reachable
+yet (milestone C5a-2).
+
+**Capture** (`capture_checkpoint`, design 4.1, 8.2 and 10). C0 resolves the required
+expiry policy (24 h lifetime and 1 h idle by default, 10 s to 7 days and 24 h), finds
+the source (another user's is `NotFound`; root may capture anyone's, and the checkpoint
+is root's), refuses a backend without the checkpoint group (Firecracker:
+`backend_unsupported:workspace_checkpoint` before any helper call, reservation or row),
+requires READY and resolves R (the lesser of the source's disk and 1 GiB). It then takes
+a capture worker permit (2 per node, 1 per uid), try-locks the source's exec mutex and,
+under the admission gate, requires no admitted or queued Exec and no other capture and
+sets the slot's capture flag: new Exec answers `checkpoint_busy`, idle expiry pauses,
+and source Delete or lifetime expiry cancel the capture. The helper's capabilities give
+the epoch and boot C1 binds. A source with no recorded image identity is asked once
+through the helper's `source` operation (the run's own `image` and `layout` records); the
+identity is written once in C1's transaction. C1 is `reserve_checkpoint`. The capture is
+dispatched under that epoch; only its own COMPLETE evidence publishes READY, and only
+while the source is still READY. Every other outcome (a kiln failure, a COMPLETE for
+another image, a source that changed, a lost reply, a cancellation) records a typed
+failure token and runs the removal; the source stays gated until the helper proves the
+capture's worker reaped and its storage absent. The capture runs as a tracked operation:
+a caller that leaves only detaches. Keyed captures use their own namespace
+(`kilnd.v1.checkpoint-request.1`, `idempotency::capture_request_digest`): the record is
+looked up before the source or any policy, an equal digest returns the settled row, a
+different one is `request_id_conflict`, and a running one is joined (or is
+`checkpoint_in_flight` past the caller's deadline).
+
+**Removal** (D1-D3, shared by Delete, expiry and failed captures). D1 publishes DELETING
+(no pin is admitted from then on) and cancels a running capture of the checkpoint. Each
+attempt, serialized per checkpoint, records a fresh removal nonce under the helper's
+current epoch, asks the helper to remove, and releases only with that removal's ABSENT
+evidence, which also releases every live pin. `checkpoint_busy`, an unavailable helper or
+a lost reply keeps the row DELETING and charged and is retried with backoff until ABSENT;
+`checkpoint_generation_mismatch` and `checkpoint_corrupt` are recorded on the DELETING row,
+keep the charge and block new allocations (sandboxes and captures) until an operator
+reconciles. Delete of a FAILED row makes it DELETED; Delete is idempotent; the capture key
+is released only from DELETED.
+
+**Expiry** (design 8.1). One timer per charged READY or QUARANTINED checkpoint on the
+sweeper's loop: lifetime from the READY anchor, idle from the last activity, paused
+while a pin is live and never inside the restart grace. Get refreshes idle through the
+store's CAS and never lifetime; a Get of a row already due expires it instead. A due
+checkpoint becomes DELETING with its reason and intent anchors (idle by CAS on its
+activity sequence) and takes the same removal. A reboot rebases the READY, activity and
+intent anchors once, by the wall time elapsed and clamped to the policy, as sandboxes do.
+
+**Startup** (design 10.2). Reconciliation lists the instance's artifacts through the
+helper: an artifact, partial or worker no charged row explains, or an incomplete or
+unavailable inventory, blocks new allocations. An interrupted capture is failed (a
+complete artifact without its READY row is discarded, never promoted); a READY row whose
+artifact is missing or does not match its seal is quarantined with its charge. The
+sweeper then starts the removal of every DELETING row and failed capture.
+
+**Typed reasons.** `CheckpointReason` carries each design 7.3 token with exactly one code
+(`CheckpointReason::code`); `Error::Refused` gains `InvalidArgument` and `DataLoss` so C5b
+maps each to its status without reshaping.
 ## Limits and defaults
 
 | Setting | Default | Flag |

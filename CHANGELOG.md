@@ -6,6 +6,18 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone C5a of workspace checkpoints, the daemon's engine, reachable only from
+  Rust and off unless `Limits::checkpoints` is set: supervised capture (source gate
+  against Exec, Delete and both expiries; READY only with the capture's own COMPLETE
+  evidence; every failure removed and proved absent before the source is released),
+  the D1-D3 removal shared by Delete, expiry and failed captures (busy and unavailable
+  retried; a generation mismatch or corrupt artifact keeps its charge and blocks
+  allocation), checkpoint expiry with the Get CAS and the cross-boot rebase, startup
+  reconciliation against the helper's inventory, capture keys with their own digest,
+  design 7.3's typed reasons, and the Firecracker refusal before any helper call or
+  allocation. The root helper's checkpoint group gains `source`, which reads a run's own
+  `image` and `layout` records (no-follow, 4 KiB, strict) so the daemon can record a
+  source's image identity once at its first capture. No RPC, flag or Health field yet.
 - Bind every stored checkpoint fact to the helper epoch and boot its dispatch was
   recorded under (checkpoint C4 adversarial review, HIGH 1): COMPLETE to the capture's,
   ABSENT to the latest removal's, a reader's end to its pin's. Evidence about the right

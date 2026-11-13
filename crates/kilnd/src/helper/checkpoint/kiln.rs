@@ -5,11 +5,13 @@
 //! child was reaped.
 use crate::checkpoint::CheckpointId;
 use crate::helper::protocol::ItemKind;
-use crate::model::Id128;
+use crate::model::{Digest, Id128};
 use crate::process::{self, CaptureCompletion, Finish, KilnArgs, KilnBinary, Outcome};
 use std::future::Future;
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -42,11 +44,17 @@ pub trait Workers: Send + Sync + 'static {
     fn processes(&self) -> io::Result<Vec<ProcessArgs>>;
     /// Whether the installed CLI grants leases and lists the artifact namespace.
     fn support(&self, deadline: Instant, cancel: CancellationToken) -> SupportFuture;
+    /// One of a run's own metadata records ([`read_run_record`]), never the image.
+    fn run_record(&self, backend_id: &str, record: RunRecord) -> io::Result<RecordRead>;
 }
+
+/// kiln's run directories (kiln `docs/checkpoint-lease-v1.md`, "Run metadata").
+pub const KILN_RUNS: &str = "/var/lib/kiln/runs";
 
 pub struct KilnWorkers {
     bin: KilnBinary,
     cgroup_root: PathBuf,
+    runs: PathBuf,
 }
 
 impl KilnWorkers {
@@ -54,7 +62,14 @@ impl KilnWorkers {
         Self {
             bin: KilnBinary::new(bin),
             cgroup_root: PathBuf::from("/sys/fs/cgroup/kiln"),
+            runs: PathBuf::from(KILN_RUNS),
         }
+    }
+
+    /// Another runs directory, for tests.
+    pub fn with_runs_root(mut self, runs: PathBuf) -> Self {
+        self.runs = runs;
+        self
     }
 }
 
@@ -132,6 +147,274 @@ impl Workers for KilnWorkers {
             }
         })
     }
+
+    fn run_record(&self, backend_id: &str, record: RunRecord) -> io::Result<RecordRead> {
+        read_run_record(&self.runs, backend_id, record)
+    }
+}
+
+// --- A run's own records (C5a) -------------------------------------------------------
+
+/// The most one run record may hold; kiln's own bound for its records.
+pub const MAX_RUN_RECORD_BYTES: usize = 4096;
+
+/// One of a run's root-owned metadata records, read without following any link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RunRecord {
+    /// `<run>/image`: the run's image reference (kiln `docs/image-identity-v1.md`).
+    Image,
+    /// `<run>/layout`: the overlay options read back from the kernel.
+    Layout,
+}
+
+impl RunRecord {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Layout => "layout",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordRead {
+    Text(String),
+    /// The run directory or the record does not exist: a run from an older kiln, or
+    /// no run at all.
+    Missing,
+    /// Something root's kiln never writes: a link, another file type or owner, open
+    /// permissions, oversized or non-UTF-8 content. The text is a short redacted reason.
+    Hostile(String),
+}
+
+/// `openat(dir, name, flags)`, retried on EINTR, as an owned descriptor.
+fn open_at(dir: &impl AsRawFd, name: &str, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let name = std::ffi::CString::new(name).map_err(|_| io::ErrorKind::InvalidInput)?;
+    loop {
+        // SAFETY: `dir` is an open descriptor and `name` is NUL-terminated.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        if fd >= 0 {
+            // SAFETY: openat just returned this descriptor, owned by nothing else.
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            return Err(e);
+        }
+    }
+}
+
+/// Reads `<runs>/<backend_id>/<record>` without following a link in either of the
+/// last two components and without opening anything but a regular file for reading.
+/// Both must belong to the helper's effective user, the directory writable by it
+/// alone and the record readable by it alone (kiln writes 0600 in 0700), and the
+/// record must be UTF-8 of at most [`MAX_RUN_RECORD_BYTES`]. An `Err` is any other
+/// I/O failure, including on `runs` itself.
+pub fn read_run_record(runs: &Path, backend_id: &str, record: RunRecord) -> io::Result<RecordRead> {
+    let hostile = |why: &str| Ok(RecordRead::Hostile(why.to_string()));
+    if !crate::runtime::kiln_direct::valid_kiln_id(backend_id) {
+        return hostile("invalid backend ID");
+    }
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    let runs = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(runs)?;
+    let run = match open_at(
+        &runs,
+        backend_id,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    ) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(RecordRead::Missing),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+            return hostile("the run directory is not a directory");
+        }
+        Err(e) => return Err(e),
+    };
+    let meta = run.metadata()?;
+    if meta.uid() != euid || meta.mode() & 0o022 != 0 {
+        return hostile("the run directory has another owner or is writable by others");
+    }
+    let file = match open_at(
+        &run,
+        record.name(),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+    ) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(RecordRead::Missing),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return hostile(match record {
+                RunRecord::Image => "the image record is a symbolic link",
+                RunRecord::Layout => "the layout record is a symbolic link",
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    let kind = meta.file_type();
+    if !kind.is_file() {
+        return hostile(if kind.is_fifo() || kind.is_socket() {
+            "a run record is a FIFO or socket"
+        } else {
+            "a run record is not a regular file"
+        });
+    }
+    if meta.uid() != euid || meta.mode() & 0o077 != 0 {
+        return hostile("a run record has another owner or is open to others");
+    }
+    if meta.size() > MAX_RUN_RECORD_BYTES as u64 {
+        return hostile("a run record is too large");
+    }
+    let mut data = Vec::with_capacity(MAX_RUN_RECORD_BYTES + 1);
+    file.take(MAX_RUN_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut data)?;
+    if data.len() > MAX_RUN_RECORD_BYTES {
+        return hostile("a run record is too large");
+    }
+    match String::from_utf8(data) {
+        Ok(text) => Ok(RecordRead::Text(text)),
+        Err(_) => hostile("a run record is not UTF-8"),
+    }
+}
+
+/// The value of `<key> <value>`, non-empty.
+fn record_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.strip_prefix(key)?
+        .strip_prefix(' ')
+        .filter(|v| !v.is_empty())
+}
+
+/// A canonical unsigned decimal: digits only, no leading zero but `0` itself.
+fn canonical_decimal(text: &str) -> Option<u64> {
+    let canonical = !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    canonical.then(|| text.parse().ok()).flatten()
+}
+
+/// kiln's directory identity, `<16 lowercase hex fsid>:<ino>:<btime sec>.<9 digits>`,
+/// exactly as its `DirIdentity::text` prints it.
+fn canonical_directory(text: &str) -> bool {
+    let parts: Vec<&str> = text.split(':').collect();
+    let [fsid, ino, btime] = parts.as_slice() else {
+        return false;
+    };
+    let Some((sec, nsec)) = btime.split_once('.') else {
+        return false;
+    };
+    let digits = sec.strip_prefix('-').unwrap_or(sec);
+    fsid.len() == 16
+        && fsid
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && canonical_decimal(ino).is_some()
+        && canonical_decimal(digits).is_some()
+        && sec.parse::<i64>().is_ok()
+        && sec != "-0"
+        && nsec.len() == 9
+        && nsec.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A run's `image` record (kiln `Reference::text`), exactly as kiln writes it:
+/// `Ok(Ok((name, sha256)))` for a recorded identity, `Ok(Err(reason))` for
+/// `identity none <reason>`, and `Err` for anything else.
+pub fn parse_image_ref(text: &str) -> Result<Result<(String, Digest), String>, String> {
+    let malformed = |why: &str| Err(format!("malformed image reference: {why}"));
+    let Some(body) = text.strip_suffix('\n') else {
+        return malformed("no final newline");
+    };
+    if body.contains(['\r', '\0']) {
+        return malformed("a control character");
+    }
+    let lines: Vec<&str> = body.split('\n').collect();
+    if lines.first() != Some(&"kiln-image-ref 1") {
+        return malformed("unexpected header");
+    }
+    let Some(name) = lines.get(1).and_then(|l| record_value(l, "name")) else {
+        return malformed("no name");
+    };
+    if crate::validation::validate_image_name(name).is_err() {
+        return malformed("invalid image name");
+    }
+    match lines[2..] {
+        [identity] => match identity.strip_prefix("identity none ") {
+            Some(reason) if !reason.is_empty() => Ok(Err(reason.to_string())),
+            _ => malformed("unexpected identity line"),
+        },
+        [generation, sha256, directory] => {
+            let generation = record_value(generation, "generation").and_then(canonical_decimal);
+            if generation.is_none_or(|g| g == 0) {
+                return malformed("generation");
+            }
+            let Some(Ok(sha256)) = record_value(sha256, "sha256").map(Digest::parse) else {
+                return malformed("sha256");
+            };
+            if !record_value(directory, "directory").is_some_and(canonical_directory) {
+                return malformed("directory");
+            }
+            Ok(Ok((name.to_string(), sha256)))
+        }
+        _ => malformed("unexpected lines"),
+    }
+}
+
+/// The overlay features a verified layout must report first (kiln `parse_layout`).
+pub const PINNED_EFFECTIVE: &str = "index=off metacopy=off nfs_export=off redirect_dir=nofollow";
+const PINNED_OPTIONS: &str = "index=off,metacopy=off,redirect_dir=nofollow,nfs_export=off";
+
+/// A run's `layout` record (kiln `layout_text`), in kiln's exact line order:
+/// `Ok(Ok(()))` for `verified yes` with the pinned effective features, `Ok(Err(reason))`
+/// for `verified no <reason>`, and `Err` for anything else.
+pub fn parse_layout(text: &str) -> Result<Result<(), String>, String> {
+    let malformed = |why: &str| Err(format!("malformed layout record: {why}"));
+    let Some(body) = text.strip_suffix('\n') else {
+        return malformed("no final newline");
+    };
+    if body.contains(['\r', '\0']) {
+        return malformed("a control character");
+    }
+    let mut lines = body.split('\n').peekable();
+    if lines.next() != Some("kiln-layout 1") {
+        return malformed("unexpected header");
+    }
+    if lines.next().and_then(|l| l.strip_prefix("pinned ")) != Some(PINNED_OPTIONS) {
+        return malformed("unexpected pinned options");
+    }
+    // kiln omits `defaults`, `super` and `effective` when it read nothing back.
+    let mut effective = None;
+    if !lines.peek().is_some_and(|l| l.starts_with("verified ")) {
+        for key in ["defaults", "super", "effective"] {
+            match lines.next().and_then(|l| record_value(l, key)) {
+                Some(value) => effective = Some(value),
+                None => return malformed("missing or unexpected option line"),
+            }
+        }
+    }
+    let verified = match lines.next().and_then(|l| l.strip_prefix("verified ")) {
+        Some("yes") => match effective {
+            Some(e)
+                if e == PINNED_EFFECTIVE
+                    || e.strip_prefix(PINNED_EFFECTIVE)
+                        .is_some_and(|r| r.starts_with(' ')) =>
+            {
+                Ok(())
+            }
+            _ => return malformed("verified without the pinned effective features"),
+        },
+        Some(v) => match v.strip_prefix("no ") {
+            Some(reason) => Err(reason.to_string()),
+            None => return malformed("unexpected verification"),
+        },
+        None => return malformed("no verification line"),
+    };
+    for line in lines {
+        if !record_value(line, "generated").is_some_and(|p| p.starts_with('/')) {
+            return malformed("unexpected trailing line");
+        }
+    }
+    Ok(verified)
 }
 
 /// The exit code of a run whose stdout and stderr both reached EOF untruncated.

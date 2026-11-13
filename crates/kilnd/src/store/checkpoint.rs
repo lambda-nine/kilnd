@@ -266,6 +266,10 @@ pub struct NewCheckpoint {
     pub excluded_paths: Vec<String>,
     pub expiry: CheckpointExpiry,
     pub request_id: Option<String>,
+    /// The source run's image identity, read from its own records by the helper at the
+    /// first capture (C5a). Recorded write-once in the admitting transaction, before the
+    /// source is checked; `None` when the row already has one.
+    pub source_identity: Option<ImageIdentity>,
 }
 
 /// Checkpoint caps (design 6.2), checked with the insert in one transaction.
@@ -1399,6 +1403,12 @@ impl Store {
         if request.is_some() != new.request_id.is_some() {
             bail!("a keyed capture names its request ID, and only a keyed one");
         }
+        if new
+            .source_identity
+            .is_some_and(|i| i.checkpoint_format_version != FORMAT_VERSION)
+        {
+            bail!("unsupported checkpoint format for the source identity");
+        }
         let reading = self.clock_reading()?;
         let now = reading.wall_ms;
         let mut conn = self.conn();
@@ -1408,6 +1418,19 @@ impl Store {
         }
         settle_unsettled(&tx)?;
         let outcome = (|| -> Result<Option<ReserveCheckpoint>> {
+            if let Some(identity) = new.source_identity {
+                // Write-once (`sandboxes_checkpoint_fixed`): a row that already has an
+                // identity keeps it, and the source check below compares against it.
+                tx.execute(
+                    "UPDATE sandboxes SET image_content_sha256 = ?2, checkpoint_format_version = ?3
+                     WHERE id = ?1 AND image_content_sha256 IS NULL",
+                    params![
+                        new.source_sandbox_id,
+                        identity.content_sha256.to_string(),
+                        identity.checkpoint_format_version
+                    ],
+                )?;
+            }
             if let (Some(request), Some(request_id)) = (request, &new.request_id) {
                 let taken: bool = tx.query_row(
                     "SELECT EXISTS (SELECT 1 FROM checkpoint_requests WHERE owner_uid = ?1 AND request_id = ?2)",
@@ -2095,6 +2118,158 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(rebased)
+    }
+
+    /// A failure token (design 7.3) recorded once on a CAPTURING row, or with
+    /// `quarantine` on a CAPTURING or READY row; the charge stays. The engine's tokens
+    /// include ones the helper never sends (`checkpoint_not_ready`, `checkpoint_expired`).
+    pub fn record_checkpoint_failure_token(
+        &self,
+        id: &str,
+        token: &'static str,
+        detail: &str,
+        quarantine: bool,
+    ) -> Result<bool> {
+        self.write_failure(id, token, detail, if quarantine { "('capturing', 'ready')" } else { "('capturing')" }, quarantine)
+    }
+
+    /// A removal's `checkpoint_generation_mismatch` or `checkpoint_corrupt` (C3), recorded
+    /// once on the DELETING row it was dispatched for. Nothing is released: the
+    /// artifact under that name is not this row's to prove absent.
+    pub fn record_checkpoint_removal_failure(
+        &self,
+        id: &str,
+        reason: Reason,
+        detail: &str,
+    ) -> Result<bool> {
+        self.write_failure(id, reason.token(), detail, "('deleting')", false)
+    }
+
+    fn write_failure(
+        &self,
+        id: &str,
+        token: &str,
+        detail: &str,
+        from: &str,
+        quarantine: bool,
+    ) -> Result<bool> {
+        let detail = crate::checkpoint::bounded_detail(detail);
+        let detail = if detail.is_empty() {
+            token.to_string()
+        } else {
+            detail
+        };
+        let n = self.conn().execute(
+            &format!(
+                "UPDATE checkpoints SET failure_token = ?2, failure_reason = ?3, updated_at_ms = ?4,
+                     state = CASE WHEN ?5 THEN 'quarantined' ELSE state END
+                 WHERE id = ?1 AND failure_token IS NULL AND state IN {from}"
+            ),
+            params![id, token, detail, now_ms(), quarantine],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Design 8.1's expiry intent: DELETING with an expiry reason and its intent
+    /// anchors, in one IMMEDIATE transaction. Lifetime takes READY or QUARANTINED rows;
+    /// idle only a READY row whose activity sequence is still `idle_seq` and that has
+    /// no live pin (pins pause idle). `false`: something else won first.
+    pub fn publish_checkpoint_expiry_intent(
+        &self,
+        id: &str,
+        reason: DeletionReason,
+        idle_seq: Option<i64>,
+    ) -> Result<bool> {
+        let reading = self.clock_reading()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = match (reason, idle_seq) {
+            (DeletionReason::ExpiredLifetime, None) => tx.execute(
+                "UPDATE checkpoints SET state = 'deleting', deletion_reason = 'expired_lifetime',
+                     expiry_intent_at_ms = ?2, expiry_intent_boottime_ms = ?3, updated_at_ms = ?2
+                 WHERE id = ?1 AND state IN ('ready', 'quarantined') AND ready_at_ms IS NOT NULL
+                   AND clock_boot_id IS ?4",
+                params![id, reading.wall_ms, reading.boottime_ms, reading.boot_id],
+            )?,
+            (DeletionReason::ExpiredIdle, Some(seq)) => tx.execute(
+                "UPDATE checkpoints SET state = 'deleting', deletion_reason = 'expired_idle',
+                     expiry_intent_at_ms = ?2, expiry_intent_boottime_ms = ?3, updated_at_ms = ?2
+                 WHERE id = ?1 AND state = 'ready' AND activity_seq = ?5 AND clock_boot_id IS ?4
+                   AND NOT EXISTS (SELECT 1 FROM checkpoint_pins WHERE checkpoint_id = ?1 AND released_at_ms IS NULL)",
+                params![id, reading.wall_ms, reading.boottime_ms, reading.boot_id, seq],
+            )?,
+            _ => bail!("an expiry intent is lifetime without a sequence or idle with one"),
+        };
+        tx.commit()?;
+        Ok(n == 1)
+    }
+
+    /// The cross-boot rebase for checkpoints (design 8.1, as M1's `rebase_clocks`): every
+    /// row anchored in another boot gets its READY, activity and expiry-intent anchors
+    /// moved onto this boot's clock by the wall time elapsed since, clamped to its own
+    /// lifetime and idle limits so nothing is ever extended. One IMMEDIATE transaction.
+    pub fn rebase_checkpoint_clocks(&self) -> Result<usize> {
+        let now = self.clock_reading()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        type Foreign = (String, i64, i64, Option<i64>, Option<i64>, Option<i64>);
+        let rows: Vec<Foreign> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, expiry_lifetime_ms, expiry_idle_ms, ready_at_ms, activity_at_ms, expiry_intent_at_ms
+                 FROM checkpoints WHERE clock_boot_id IS NOT NULL AND clock_boot_id != ?1",
+            )?;
+            stmt.query_map([&now.boot_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let elapsed = |limit: Option<i64>, anchor: Option<i64>| -> Option<i64> {
+            let spent = now.wall_ms.saturating_sub(anchor?).max(0);
+            Some(limit.map_or(spent, |limit| spent.min(limit)))
+        };
+        for (id, lifetime, idle, ready_at, activity_at, intent_at) in &rows {
+            let ready =
+                elapsed(Some(*lifetime), *ready_at).map(|e| now.boottime_ms.saturating_sub(e));
+            let activity = elapsed(Some(*idle), activity_at.or(*ready_at))
+                .map(|e| now.boottime_ms.saturating_sub(e));
+            let intent = elapsed(None, *intent_at).map(|e| now.boottime_ms.saturating_sub(e));
+            tx.execute(
+                "UPDATE checkpoints SET ready_boottime_ms = ?2, activity_boottime_ms = ?3, clock_boot_id = ?4,
+                     expiry_intent_boottime_ms = ?5
+                 WHERE id = ?1",
+                params![id, ready, activity, now.boot_id, intent],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    /// Charged rows the checkpoint expiry queue may need an entry for: READY,
+    /// QUARANTINED and DELETING, each with whether a live pin pauses its idle timer.
+    pub fn checkpoint_expiry_rows(&self) -> Result<Vec<(Checkpoint, bool)>> {
+        self.audited_read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {CHECKPOINT_COLUMNS}, EXISTS (SELECT 1 FROM checkpoint_pins p
+                     WHERE p.checkpoint_id = checkpoints.id AND p.released_at_ms IS NULL)
+                 FROM checkpoints WHERE release_evidence_id IS NULL
+                   AND state IN ('ready', 'quarantined', 'deleting') ORDER BY creation_seq"
+            ))?;
+            let rows = stmt.query_map([], |r| Ok((checkpoint_row(r)?, r.get::<_, bool>(50)?)))?;
+            rows.map(|r| {
+                let (row, pinned) = r?;
+                Ok((row?, pinned))
+            })
+            .collect()
+        })
+    }
+
+    /// Whether a live pin pauses this checkpoint's idle timer.
+    pub fn checkpoint_has_live_pins(&self, id: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM checkpoint_pins WHERE checkpoint_id = ?1 AND released_at_ms IS NULL)",
+            [id],
+            |r| r.get(0),
+        )?)
     }
 
     fn identity_in(conn: &Connection) -> Result<DaemonIdentity> {

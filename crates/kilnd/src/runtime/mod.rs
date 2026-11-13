@@ -672,6 +672,13 @@ pub trait Runtime: Send + Sync + 'static {
         async { Ok(crate::manager::ProvenFeatures::default()) }
     }
 
+    /// Whether this backend has the root helper's checkpoint group at all (kiln). A
+    /// backend without it (Firecracker) is refused before any helper call, allocation,
+    /// reservation or row (design 11.1). Static: no probe, no I/O.
+    fn checkpoint_backend(&self) -> bool {
+        false
+    }
+
     /// The root helper's checkpoint group (milestone C3), with each reply checked
     /// against its request (`CheckpointResponse::check`). Nothing reaches it before C5:
     /// no RPC, Health field or feature mentions checkpoints. A backend without them
