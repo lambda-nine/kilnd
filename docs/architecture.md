@@ -1359,9 +1359,14 @@ see [setup.md](setup.md) for rollback.
 `crates/kilnd/src/manager/checkpoint.rs` drives C3's helper group and C4's store:
 supervised capture, the D1-D3 removal, checkpoint expiry and startup reconciliation.
 **It is off unless `Limits::checkpoints` is set**, which only Rust callers and tests do:
-there is no flag, RPC, `kilndctl` command, Health field or feature bit yet (C5b), and
-with it off the only change on any existing path is an in-memory capture flag on each
-sandbox slot that is never set. Creating a sandbox from a checkpoint is not reachable
+there is no flag, RPC, `kilndctl` command, Health field or feature bit yet (C5b). The
+switch gates only new work: an unkeyed capture, or a keyed one whose key has no record.
+Checkpoints that already exist are maintained with it off (design 11.1): when startup's
+one existence check finds any row or capture key, expiry, removal, the cross-boot rebase
+of anchors and keys, and reconciliation all run, and a key with a record is answered from
+it. With it off and nothing durable, startup makes that one query and no helper call, and
+the only change on any request path is an in-memory capture flag on each sandbox slot
+that is never set. Creating a sandbox from a checkpoint is not reachable
 yet (milestone C5a-2).
 
 **Capture** (`capture_checkpoint`, design 4.1, 8.2 and 10). C0 resolves the required
@@ -1381,16 +1386,25 @@ dispatched under that epoch; only its own COMPLETE evidence publishes READY, and
 while the source is still READY. Every other outcome (a kiln failure, a COMPLETE for
 another image, a source that changed, a lost reply, a cancellation) records a typed
 failure token and runs the removal; the source stays gated until the helper proves the
-capture's worker reaped and its storage absent. The capture runs as a tracked operation:
-a caller that leaves only detaches. Keyed captures use their own namespace
+capture's worker reaped and its storage absent. Shutdown is no exception: it answers the
+waiter `ShuttingDown`, cancels the capture, takes the helper's reply, records
+`checkpoint_io` and removes the storage, with helper calls bounded by their own deadlines
+rather than by shutdown, so the source is released and the drain completes only after
+ABSENT (the drain waits for it past the shutdown grace; the unit's `TimeoutStopSec` is the
+outer bound, and startup removes whatever a killed daemon left). The capture runs as a tracked
+operation. A caller that leaves before C1 commits stops it with nothing allocated (no
+row, charge, key or identity); from C1 on, a caller that leaves only detaches. Keyed captures use their own namespace
 (`kilnd.v1.checkpoint-request.1`, `idempotency::capture_request_digest`): the record is
 looked up before the source or any policy, an equal digest returns the settled row, a
 different one is `request_id_conflict`, and a running one is joined (or is
 `checkpoint_in_flight` past the caller's deadline).
 
 **Removal** (D1-D3, shared by Delete, expiry and failed captures). D1 publishes DELETING
-(no pin is admitted from then on) and cancels a running capture of the checkpoint. Each
-attempt, serialized per checkpoint, records a fresh removal nonce under the helper's
+(no pin is admitted from then on) and cancels a running capture of the checkpoint. Delete
+and expiry then hand the removal to a tracked supervisor, at most one per checkpoint,
+before awaiting anything; Delete waits only for its first attempt's answer (and the
+supervisor releases the capture key once DELETED when asked), so a caller that leaves
+never strands a charged DELETING row. Each attempt, serialized per checkpoint, records a fresh removal nonce under the helper's
 current epoch, asks the helper to remove, and releases only with that removal's ABSENT
 evidence, which also releases every live pin. `checkpoint_busy`, an unavailable helper or
 a lost reply keeps the row DELETING and charged and is retried with backoff until ABSENT;
@@ -1407,12 +1421,25 @@ checkpoint becomes DELETING with its reason and intent anchors (idle by CAS on i
 activity sequence) and takes the same removal. A reboot rebases the READY, activity and
 intent anchors once, by the wall time elapsed and clamped to the policy, as sandboxes do.
 
-**Startup** (design 10.2). Reconciliation lists the instance's artifacts through the
-helper: an artifact, partial or worker no charged row explains, or an incomplete or
-unavailable inventory, blocks new allocations. An interrupted capture is failed (a
-complete artifact without its READY row is discarded, never promoted); a READY row whose
-artifact is missing or does not match its seal is quarantined with its charge. The
-sweeper then starts the removal of every DELETING row and failed capture.
+**Startup** (design 10.2). The barrier reads every charged row first, then needs a helper
+session (with the feature on, a failed one blocks new allocations whatever the rows say;
+with it off, only when charged rows exist) and a complete inventory. An artifact, partial
+or worker no charged row explains, or an incomplete or unavailable inventory, blocks new
+allocations, and so does any tracked helper activity its row does not explain: another
+generation, a capture that is not the CAPTURING row's own operation, a removal or
+tombstone on a row not being removed (DELETING, a failed capture's, FAILED or DELETED), a
+reader no live pin names, or a worker of an uncharged row. An interrupted capture is
+failed (a complete artifact without its READY row is discarded, never promoted). A READY
+row is quarantined with its charge only on an authoritative answer (a record that does
+not match its seal, a corrupt or other-generation artifact, a partial, or nothing
+listed); an I/O failure, a withheld or busy artifact, a transport failure or an
+unexpected reply keeps it READY and charged and blocks new allocations. The sweeper then
+starts the removal of every DELETING row and failed capture. This barrier's block is its
+own (`barrier_blocked`, apart from the sandbox reconciliation's and a removal's
+`admission_blocked`): while it is set, a tracked retry reruns the whole pass with backoff
+(the removal backoff, 1 s to 60 s by default), resumes timers and removals after each,
+and clears only the barrier's block after a clean pass, with no restart. Delete, Get,
+List and removals stay available meanwhile.
 
 **Typed reasons.** `CheckpointReason` carries each design 7.3 token with exactly one code
 (`CheckpointReason::code`); `Error::Refused` gains `InvalidArgument` and `DataLoss` so C5b

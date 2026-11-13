@@ -13,7 +13,7 @@
 use super::*;
 use crate::checkpoint::wire::{
     ArtifactView, CaptureReply, CheckpointErrorKind, CheckpointOperation, CheckpointResponse,
-    RemoveReply, SourceReply,
+    ExclusiveOp, OpKind, RemoveReply, SourceReply, TrackedArtifact,
 };
 use crate::checkpoint::{CheckpointId, Fact, MIN_LIMIT_BYTES, Reason, SealedEvidence};
 use crate::model::ImageIdentity;
@@ -240,8 +240,18 @@ pub(super) struct CheckpointEngine {
     retrying: Mutex<HashSet<String>>,
     /// The expiry timers: each charged checkpoint's next due boottime.
     timers: Mutex<BTreeMap<String, i64>>,
+    /// Durable checkpoint state exists (a row or a capture key): it is maintained,
+    /// and its keys answered, with the feature off (design 11.1).
+    pub(super) present: AtomicBool,
+    /// The checkpoint barrier's part of the allocation block (design 10.2), apart from
+    /// `Manager::admission_blocked`. Only startup and the barrier retry write it.
+    pub(super) barrier_blocked: AtomicBool,
+    barrier_retrying: AtomicBool,
     pub(super) rejected_captures: AtomicU64,
     pub(super) expired: AtomicU64,
+    /// The engine's store calls (tests: the feature off makes none on request paths).
+    #[cfg(test)]
+    pub(super) store_calls: std::sync::atomic::AtomicUsize,
 }
 
 /// A capture or restore worker permit (design 6.2), returned on drop.
@@ -349,6 +359,30 @@ fn may_see(c: &Checkpoint, uid: u32) -> bool {
 }
 
 impl<R: Runtime> Manager<R> {
+    /// The store, as the engine reads and writes it (tests count these calls).
+    pub(super) fn db(&self) -> &Store {
+        #[cfg(test)]
+        self.checkpoint.store_calls.fetch_add(1, Ordering::Relaxed);
+        &self.store
+    }
+
+    /// Existing checkpoints get expiry, removal, rebase and reconciliation while the
+    /// feature is on or any durable state exists; only new work needs the feature.
+    pub(super) fn maintained(&self) -> bool {
+        self.limits.checkpoints.is_some() || self.checkpoint.present.load(Ordering::Relaxed)
+    }
+
+    /// No new sandbox or capture is admitted while reconciliation or a removal found
+    /// resources no row explains, or the checkpoint barrier is not clean.
+    pub(super) fn allocation_blocked(&self) -> bool {
+        self.admission_blocked.load(Ordering::Relaxed)
+            || self.checkpoint.barrier_blocked.load(Ordering::Relaxed)
+    }
+
+    fn maintenance_limits(&self) -> CheckpointLimits {
+        self.limits.checkpoints.clone().unwrap_or_default()
+    }
+
     fn checkpoint_limits(&self) -> Result<&CheckpointLimits> {
         self.limits.checkpoints.as_ref().ok_or_else(|| {
             CheckpointReason::BackendUnsupported.error("workspace checkpoints are not enabled")
@@ -360,7 +394,7 @@ impl<R: Runtime> Manager<R> {
     fn visible_checkpoint(&self, id: &str, uid: u32) -> Result<Checkpoint> {
         let not_found = || Error::NotFound(format!("checkpoint {id}"));
         CheckpointId::parse(id).map_err(|_| not_found())?;
-        match self.store.checkpoint(id)? {
+        match self.db().checkpoint(id)? {
             Some(c) if may_see(&c, uid) => Ok(c),
             _ => Err(not_found()),
         }
@@ -369,13 +403,19 @@ impl<R: Runtime> Manager<R> {
     /// The helper group's epoch and boot, from `capabilities`. A disabled group or a
     /// kiln without leases refuses before anything is reserved.
     pub(super) async fn checkpoint_session(&self) -> Result<Session> {
+        self.checkpoint_session_with(&self.shutting_down.child_token())
+            .await
+    }
+
+    /// As [`Self::checkpoint_session`], canceled by `cancel`.
+    async fn checkpoint_session_with(&self, cancel: &CancellationToken) -> Result<Session> {
         let reply = self
             .runtime
             .checkpoint(
                 None,
                 CheckpointOperation::Capabilities,
                 Instant::now() + HELPER_QUICK_TIMEOUT,
-                &self.shutting_down.child_token(),
+                cancel,
             )
             .await
             .map_err(|e| helper_unavailable("root helper checkpoint capabilities", e))?;
@@ -479,10 +519,15 @@ impl<R: Runtime> Manager<R> {
         key: Option<CaptureKey>,
         deadline: Option<Instant>,
     ) -> Result<Checkpoint> {
-        self.checkpoint_limits()?;
         let Some(key) = key else {
+            self.checkpoint_limits()?;
             return self.spawn_capture(req, owner_uid, None).await;
         };
+        // An accepted key is answered from its record even with the feature off (design
+        // 7.1); with nothing durable, the refusal needs no lookup.
+        if !self.checkpoint.present.load(Ordering::Relaxed) {
+            self.checkpoint_limits()?;
+        }
         let map_key = (owner_uid, key.request_id.clone());
         loop {
             // The lookup and the registration happen under one lock with no await.
@@ -496,13 +541,15 @@ impl<R: Runtime> Manager<R> {
                     None => {
                         // Before the source, its policy or capability is looked at.
                         if let Some((sha, row)) =
-                            self.store.checkpoint_request(owner_uid, &key.request_id)?
+                            self.db().checkpoint_request(owner_uid, &key.request_id)?
                         {
                             if sha != key.sha256 {
                                 return Err(capture_key_conflict(&key.request_id));
                             }
                             return settled_capture(row);
                         }
+                        // No accepted operation: a new capture, which the feature gates.
+                        self.checkpoint_limits()?;
                         keys.insert(map_key.clone(), (key.sha256, watch::Sender::new(())));
                         None
                     }
@@ -542,11 +589,19 @@ impl<R: Runtime> Manager<R> {
     ) -> Result<Checkpoint> {
         self.check_serving()?;
         let (tx, rx) = oneshot::channel();
+        // Design 8.2: before durable admission, a departed waiter stops the capture.
+        let waiter_gone = CancellationToken::new();
         let manager = Arc::clone(self);
+        let gone = waiter_gone.clone();
         self.operations.spawn(async move {
-            manager.capture_supervised(req, owner_uid, key, tx).await;
+            manager
+                .capture_supervised(req, owner_uid, key, tx, gone)
+                .await;
         });
-        rx.await.map_err(|_| {
+        let departed = waiter_gone.drop_guard();
+        let answer = rx.await;
+        departed.disarm();
+        answer.map_err(|_| {
             Error::Internal(anyhow::anyhow!(
                 "capture supervisor stopped without a result"
             ))
@@ -563,6 +618,7 @@ impl<R: Runtime> Manager<R> {
         owner_uid: u32,
         key: Option<CaptureKey>,
         reply: oneshot::Sender<Result<Checkpoint>>,
+        waiter_gone: CancellationToken,
     ) {
         let mut reply = Some(reply);
         let keyed = key.as_ref().map(|k| (owner_uid, k.request_id.clone()));
@@ -650,6 +706,12 @@ impl<R: Runtime> Manager<R> {
             Ok(s) => s,
             Err(e) => return send(Err(e)),
         };
+        let departed = || {
+            CheckpointReason::NotReady.error("the caller departed before the capture was admitted")
+        };
+        if waiter_gone.is_cancelled() {
+            return send(Err(departed()));
+        }
         // Recorded once, in C1's transaction, from the run's own records.
         let identity = match source.lifecycle.image_identity {
             Some(_) => None,
@@ -686,14 +748,22 @@ impl<R: Runtime> Manager<R> {
             max_per_uid: limits.budgets.max_request_records_per_uid,
             max_node: limits.budgets.max_request_records_node,
         });
-        let reserved = self.store.reserve_checkpoint(
+        // After the source identity's await, and the last look before C1: from C1 on, a
+        // departed waiter only detaches.
+        if waiter_gone.is_cancelled() {
+            return send(Err(departed()));
+        }
+        let reserved = self.db().reserve_checkpoint(
             &new,
             &limits.budgets,
             self.sandbox_budgets(),
             admission.as_ref(),
         );
         let checkpoint = match reserved {
-            Ok(ReserveCheckpoint::Inserted(c)) => *c,
+            Ok(ReserveCheckpoint::Inserted(c)) => {
+                self.checkpoint.present.store(true, Ordering::Relaxed);
+                *c
+            }
             Ok(refused) => {
                 self.checkpoint
                     .rejected_captures
@@ -713,7 +783,7 @@ impl<R: Runtime> Manager<R> {
         // the registration above: its cancellation must still be seen.
         if !cancel.is_cancelled()
             && self
-                .store
+                .db()
                 .checkpoint(&id)
                 .ok()
                 .flatten()
@@ -730,20 +800,28 @@ impl<R: Runtime> Manager<R> {
                 self.checkpoint_timer_refresh(&id);
                 return send(Ok(ready));
             }
-            Err(CaptureFailure::ShuttingDown) => return send(Err(Error::ShuttingDown)),
+            // Shutdown answers the waiter but not the supervision: the capture is
+            // failed and removed like any other before its source is released.
+            Err(CaptureFailure::ShuttingDown) => {
+                send(Err(Error::ShuttingDown));
+                (
+                    CheckpointReason::Io,
+                    "kilnd shut down during the capture; its storage is removed".into(),
+                )
+            }
             Err(CaptureFailure::Failed(reason, detail)) => (reason, detail),
         };
         warn!(checkpoint = %id, reason = reason.token(), detail = %detail, "capture failed; removing its storage");
         // Keyed callers get the row (failure recorded); unkeyed the typed reason.
         let recorded =
-            self.store
+            self.db()
                 .record_checkpoint_failure_token(&id, reason.token(), &detail, false);
         if let Err(e) = recorded {
             warn!(checkpoint = %id, error = %format!("{e:#}"), "could not record the capture failure");
         }
         send(match &key {
             Some(_) => self
-                .store
+                .db()
                 .checkpoint(&id)
                 .map_err(Error::from)
                 .and_then(|row| {
@@ -752,8 +830,10 @@ impl<R: Runtime> Manager<R> {
             None => Err(reason.error(detail)),
         });
         // The source stays gated until the capture's worker is proved gone (design 8.2:
-        // stop the reader before the source's storage is removed).
-        let _ = self.remove_until_absent(&id).await;
+        // stop the reader before the source's storage is removed), through shutdown
+        // too: each helper call is bounded by its own deadline, not by shutdown.
+        self.remove_until_absent(&id, None, false, &CancellationToken::new())
+            .await;
         drop(flag);
     }
 
@@ -783,7 +863,7 @@ impl<R: Runtime> Manager<R> {
             return Err(CheckpointReason::BackendUnsupported
                 .error("this sandbox's backend has no workspace checkpoints"));
         }
-        if self.admission_blocked.load(Ordering::Relaxed) {
+        if self.allocation_blocked() {
             return Err(Error::FailedPrecondition(
                 "backend resources or checkpoint artifacts no row explains block new allocations until reconciled".into(),
             ));
@@ -873,9 +953,15 @@ impl<R: Runtime> Manager<R> {
             deadline,
             cancel,
         );
+        tokio::pin!(call);
+        // Shutdown cancels the capture and still takes its reply: the helper reports
+        // the worker's end, and the cleanup follows it.
         let reply = tokio::select! {
-            reply = call => reply,
-            () = self.shutting_down.cancelled() => return Err(CaptureFailure::ShuttingDown),
+            reply = &mut call => reply,
+            () = self.shutting_down.cancelled() => {
+                cancel.cancel();
+                call.await
+            }
         };
         let stopped = || {
             if self.shutting_down.is_cancelled() {
@@ -928,12 +1014,15 @@ impl<R: Runtime> Manager<R> {
             }
             _ => CheckpointReason::Corrupt,
         };
-        match self
-            .store
-            .publish_checkpoint_ready(c.id.as_str(), &evidence)
-        {
+        match self.db().publish_checkpoint_ready(c.id.as_str(), &evidence) {
             Ok(PublishCheckpoint::Published(row)) => {
-                self.acknowledge(c, c.capture.operation, session).await;
+                self.acknowledge(
+                    c,
+                    c.capture.operation,
+                    session,
+                    &self.shutting_down.child_token(),
+                )
+                .await;
                 info!(checkpoint = %c.id, size = row.charge_bytes(), "checkpoint ready");
                 Ok(*row)
             }
@@ -951,7 +1040,13 @@ impl<R: Runtime> Manager<R> {
     }
 
     /// Best effort: lets the helper drop its record of a stored fact.
-    async fn acknowledge(&self, c: &Checkpoint, operation: Id128, session: Session) {
+    async fn acknowledge(
+        &self,
+        c: &Checkpoint,
+        operation: Id128,
+        session: Session,
+        cancel: &CancellationToken,
+    ) {
         let _ = self
             .runtime
             .checkpoint(
@@ -961,7 +1056,7 @@ impl<R: Runtime> Manager<R> {
                     operation,
                 },
                 Instant::now() + HELPER_QUICK_TIMEOUT,
-                &self.shutting_down.child_token(),
+                cancel,
             )
             .await;
     }
@@ -976,11 +1071,11 @@ impl<R: Runtime> Manager<R> {
         if row.state != CheckpointState::Ready || !row.is_charged() {
             return Ok(row);
         }
-        let pinned = self.store.checkpoint_has_live_pins(id)?;
+        let pinned = self.db().checkpoint_has_live_pins(id)?;
         if let Some((due, _)) = self.checkpoint_due(&row, pinned) {
             if due <= self.clock.boottime_ms() {
                 self.expire_checkpoint(id);
-            } else if self.store.touch_checkpoint(id, row.activity_seq)? {
+            } else if self.db().touch_checkpoint(id, row.activity_seq)? {
                 self.checkpoint_timer_refresh(id);
             }
         }
@@ -998,14 +1093,15 @@ impl<R: Runtime> Manager<R> {
     ) -> Result<crate::store::CheckpointPage> {
         let owner = (uid != 0).then_some(uid);
         Ok(self
-            .store
+            .db()
             .checkpoint_page(owner, source, before_seq, limit)?)
     }
 
     /// DeleteCheckpoint (design 7.1, D1-D3): publish DELETING (no pin is admitted from
-    /// here), cancel a running capture, then remove. A failed attempt keeps the row
-    /// DELETING and charged and leaves a background retrier. Idempotent for DELETED
-    /// rows; a FAILED (already absent) row becomes DELETED. `release_request_id`
+    /// here), cancel a running capture, then hand the removal to a supervisor and wait
+    /// for its first attempt. A failed attempt keeps the row DELETING and charged while
+    /// the supervisor retries; a departed waiter leaves it running. Idempotent for
+    /// DELETED rows; a FAILED (already absent) row becomes DELETED. `release_request_id`
     /// releases the capture key only once the row is DELETED.
     pub async fn delete_checkpoint(
         self: &Arc<Self>,
@@ -1017,34 +1113,36 @@ impl<R: Runtime> Manager<R> {
         match row.state {
             CheckpointState::Deleted => {}
             CheckpointState::Failed => {
-                self.store.delete_failed_checkpoint(id)?;
+                self.db().delete_failed_checkpoint(id)?;
             }
             CheckpointState::Capturing
             | CheckpointState::Ready
             | CheckpointState::Quarantined
             | CheckpointState::Deleting => {
-                self.store
+                self.db()
                     .publish_checkpoint_delete_intent(id, DeletionReason::Requested)?;
                 self.cancel_capture(id);
                 self.checkpoint_timer_refresh(id);
+                let (tx, rx) = oneshot::channel();
+                if self.spawn_removal(id, Some(tx), release_request_id) {
+                    rx.await.map_err(|_| {
+                        Error::Internal(anyhow::anyhow!(
+                            "checkpoint removal supervisor stopped without a result"
+                        ))
+                    })??;
+                    return self.visible_checkpoint(id, uid);
+                }
+                // A supervisor already owns its retries (or the daemon is stopping, and
+                // startup resumes it): one attempt of this caller's own.
                 match self.removal_attempt(id).await {
                     Removal::Released(_) => {}
-                    Removal::NotRemovable(row) => {
-                        return Err(Error::Internal(anyhow::anyhow!(
-                            "checkpoint {id} is {} after its delete intent",
-                            row.state.as_str()
-                        )));
-                    }
-                    Removal::Retry(e) => {
-                        self.spawn_removal(id);
-                        return Err(e);
-                    }
-                    Removal::Blocked(e) => return Err(e),
+                    Removal::NotRemovable(row) => return Err(not_removable(&row)),
+                    Removal::Retry(e) | Removal::Blocked(e) => return Err(e),
                 }
             }
         }
         if release_request_id {
-            self.store.release_checkpoint_request_id(id)?;
+            self.db().release_checkpoint_request_id(id)?;
         }
         self.visible_checkpoint(id, uid)
     }
@@ -1082,17 +1180,27 @@ impl<R: Runtime> Manager<R> {
     /// epoch, the helper's tombstoning removal, and the release only with that
     /// removal's ABSENT evidence. Serialized per checkpoint.
     async fn removal_attempt(&self, id: &str) -> Removal {
+        self.removal_attempt_with(id, &self.shutting_down.child_token())
+            .await
+    }
+
+    /// As [`Self::removal_attempt`], its helper calls canceled by `cancel`.
+    async fn removal_attempt_with(&self, id: &str, cancel: &CancellationToken) -> Removal {
         let lock = self.removal_lock(id);
         let _one = lock.lock().await;
-        match self.removal_attempt_locked(id).await {
+        match self.removal_attempt_locked(id, cancel).await {
             Ok(removal) => removal,
             Err(e) => Removal::Retry(e),
         }
     }
 
-    async fn removal_attempt_locked(&self, id: &str) -> Result<Removal> {
+    async fn removal_attempt_locked(
+        &self,
+        id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Removal> {
         let row = self
-            .store
+            .db()
             .checkpoint(id)?
             .ok_or_else(|| Error::NotFound(format!("checkpoint {id}")))?;
         if !row.is_charged() {
@@ -1106,13 +1214,13 @@ impl<R: Runtime> Manager<R> {
         if !removable {
             return Ok(Removal::NotRemovable(Box::new(row)));
         }
-        let session = self.checkpoint_session().await?;
+        let session = self.checkpoint_session_with(cancel).await?;
         let dispatch = HelperDispatch {
             operation: Id128::random(),
             helper_epoch: session.epoch,
             boot_id: session.boot,
         };
-        if !self.store.record_checkpoint_removal(id, &dispatch)? {
+        if !self.db().record_checkpoint_removal(id, &dispatch)? {
             return Err(CheckpointReason::Busy.error(format!("checkpoint {id} changed")));
         }
         let reply = self
@@ -1124,7 +1232,7 @@ impl<R: Runtime> Manager<R> {
                     operation: dispatch.operation,
                 },
                 Instant::now() + REMOVE_TIMEOUT,
-                &self.shutting_down.child_token(),
+                cancel,
             )
             .await
             .map_err(|e| helper_unavailable("root helper checkpoint removal", e))?;
@@ -1138,7 +1246,7 @@ impl<R: Runtime> Manager<R> {
                     // charge, and stop new allocations (an unexplained artifact).
                     if row.state == CheckpointState::Deleting {
                         let _ = self
-                            .store
+                            .db()
                             .record_checkpoint_removal_failure(id, reason, &detail);
                     }
                     self.admission_blocked.store(true, Ordering::Relaxed);
@@ -1167,15 +1275,16 @@ impl<R: Runtime> Manager<R> {
                 ));
             }
         };
-        match self.store.settle_checkpoint_absence(id, &evidence)? {
+        match self.db().settle_checkpoint_absence(id, &evidence)? {
             SettleAbsence::Released(c) | SettleAbsence::AlreadyReleased(c) => {
-                self.acknowledge(&c, dispatch.operation, session).await;
+                self.acknowledge(&c, dispatch.operation, session, cancel)
+                    .await;
                 self.checkpoint_timer_refresh(id);
                 info!(checkpoint = %id, state = c.state.as_str(), "checkpoint storage proved absent; charge released");
                 Ok(Removal::Released(c))
             }
             SettleAbsence::NotReleasable(state) => Ok(Removal::NotRemovable(Box::new(
-                self.store.checkpoint(id)?.ok_or_else(|| {
+                self.db().checkpoint(id)?.ok_or_else(|| {
                     Error::NotFound(format!("checkpoint {id} ({})", state.as_str()))
                 })?,
             ))),
@@ -1185,30 +1294,61 @@ impl<R: Runtime> Manager<R> {
         }
     }
 
-    /// Retries removal with backoff until ABSENT releases the row, a removal is
-    /// blocked, or shutdown. Never gives up on a retryable failure: a charged
-    /// DELETING row (and any pin on it) must always reach ABSENT.
-    async fn remove_until_absent(&self, id: &str) -> Result<Checkpoint> {
-        let limits = self.limits.checkpoints.clone().unwrap_or_default();
+    /// Removes until ABSENT releases the row, the removal is blocked or the row is not
+    /// removable, retrying anything else with backoff: a charged DELETING row (and any
+    /// pin on it) must always reach ABSENT. `first` gets the first attempt's answer;
+    /// `release_request_id` releases the capture key once DELETED, before answering.
+    /// `cancel` bounds the helper calls and ends the retries: shutdown for a background
+    /// supervisor (startup resumes it), never for a capture's own cleanup.
+    async fn remove_until_absent(
+        &self,
+        id: &str,
+        mut first: Option<oneshot::Sender<Result<Checkpoint>>>,
+        release_request_id: bool,
+        cancel: &CancellationToken,
+    ) {
+        let limits = self.maintenance_limits();
         let mut delay = limits.removal_retry;
-        loop {
-            match self.removal_attempt(id).await {
-                Removal::Released(c) | Removal::NotRemovable(c) => return Ok(*c),
-                Removal::Blocked(e) => return Err(e),
-                Removal::Retry(e) => {
-                    warn!(checkpoint = %id, error = %e, delay_ms = delay.as_millis() as u64, "checkpoint removal will be retried; its charge is kept");
-                    tokio::select! {
-                        () = self.shutting_down.cancelled() => return Err(Error::ShuttingDown),
-                        () = tokio::time::sleep(delay) => {}
-                    }
-                    delay = (delay * 2).min(limits.max_removal_retry);
-                }
+        let mut answer = |result: Result<Checkpoint>| {
+            if let Some(first) = first.take() {
+                let _ = first.send(result);
             }
+        };
+        loop {
+            let error = match self.removal_attempt_with(id, cancel).await {
+                Removal::Released(c) => {
+                    let released = match release_request_id {
+                        true => self.db().release_checkpoint_request_id(id).map(|_| ()),
+                        false => Ok(()),
+                    };
+                    if let Err(e) = &released {
+                        warn!(checkpoint = %id, error = %format!("{e:#}"), "could not release the deleted checkpoint's capture key");
+                    }
+                    return answer(released.map(|()| *c).map_err(Error::from));
+                }
+                Removal::NotRemovable(c) => return answer(Err(not_removable(&c))),
+                Removal::Blocked(e) => return answer(Err(e)),
+                Removal::Retry(e) => e,
+            };
+            warn!(checkpoint = %id, error = %error, delay_ms = delay.as_millis() as u64, "checkpoint removal will be retried; its charge is kept");
+            answer(Err(error));
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(limits.max_removal_retry);
         }
     }
 
-    /// A tracked background retrier, at most one per checkpoint.
-    pub(super) fn spawn_removal(self: &Arc<Self>, id: &str) {
+    /// Hands a removal to a tracked supervisor, at most one per checkpoint, which
+    /// owns its lock, retries and charge from now on (see [`Self::remove_until_absent`]).
+    /// False when one already runs or the daemon is stopping.
+    pub(super) fn spawn_removal(
+        self: &Arc<Self>,
+        id: &str,
+        first: Option<oneshot::Sender<Result<Checkpoint>>>,
+        release_request_id: bool,
+    ) -> bool {
         if self.shutting_down.is_cancelled()
             || !self
                 .checkpoint
@@ -1217,12 +1357,15 @@ impl<R: Runtime> Manager<R> {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(id.to_string())
         {
-            return;
+            return false;
         }
         let manager = Arc::clone(self);
         let id = id.to_string();
         self.operations.spawn(async move {
-            let _ = manager.remove_until_absent(&id).await;
+            let cancel = manager.shutting_down.child_token();
+            manager
+                .remove_until_absent(&id, first, release_request_id, &cancel)
+                .await;
             manager
                 .checkpoint
                 .retrying
@@ -1230,6 +1373,7 @@ impl<R: Runtime> Manager<R> {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id);
         });
+        true
     }
 
     // --- Expiry ---------------------------------------------------------------------
@@ -1271,12 +1415,12 @@ impl<R: Runtime> Manager<R> {
 
     /// Recomputes one checkpoint's timer from its row.
     pub(super) fn checkpoint_timer_refresh(&self, id: &str) {
-        if self.limits.checkpoints.is_none() {
+        if !self.maintained() {
             return;
         }
         let next = match (
-            self.store.checkpoint(id),
-            self.store.checkpoint_has_live_pins(id),
+            self.db().checkpoint(id),
+            self.db().checkpoint_has_live_pins(id),
         ) {
             (Ok(Some(c)), Ok(pinned)) => self.checkpoint_due(&c, pinned).map(|(due, _)| due),
             (Ok(None), _) => None,
@@ -1312,7 +1456,7 @@ impl<R: Runtime> Manager<R> {
 
     /// The sweeper's checkpoint pass: every timer due now. Never awaits.
     pub(super) fn expire_checkpoints_due(self: &Arc<Self>) {
-        if self.limits.checkpoints.is_none() {
+        if !self.maintained() {
             return;
         }
         let now = self.clock.boottime_ms();
@@ -1339,14 +1483,14 @@ impl<R: Runtime> Manager<R> {
     pub(super) fn expire_checkpoint(self: &Arc<Self>, id: &str) {
         let now = self.clock.boottime_ms();
         let published = (|| -> Result<bool> {
-            let Some(c) = self.store.checkpoint(id)? else {
+            let Some(c) = self.db().checkpoint(id)? else {
                 return Ok(false);
             };
-            let pinned = self.store.checkpoint_has_live_pins(id)?;
+            let pinned = self.db().checkpoint_has_live_pins(id)?;
             Ok(match self.checkpoint_due(&c, pinned) {
                 Some((due, reason)) if due <= now => {
                     let seq = (reason == DeletionReason::ExpiredIdle).then_some(c.activity_seq);
-                    self.store
+                    self.db()
                         .publish_checkpoint_expiry_intent(id, reason, seq)?
                 }
                 _ => false,
@@ -1358,7 +1502,7 @@ impl<R: Runtime> Manager<R> {
                 info!(checkpoint = %id, "checkpoint expired; deleting");
                 self.cancel_capture(id);
                 self.checkpoint_timer_refresh(id);
-                self.spawn_removal(id);
+                self.spawn_removal(id, None, false);
             }
             Ok(false) => self.checkpoint_timer_refresh(id),
             Err(e) => {
@@ -1374,58 +1518,142 @@ impl<R: Runtime> Manager<R> {
     }
 
     /// Startup, after reconciliation and the rebase: one timer per charged READY or
-    /// QUARANTINED row, and a removal for every DELETING row and failed capture.
+    /// QUARANTINED row, a removal for every DELETING row and failed capture, and the
+    /// barrier's retry while it is blocked. With the feature off, as long as any durable
+    /// state exists (design 11.1).
     pub(super) fn start_checkpoints(self: &Arc<Self>) -> Result<()> {
-        if self.limits.checkpoints.is_none() {
+        if !self.maintained() {
             return Ok(());
         }
-        for (c, _) in self.store.checkpoint_expiry_rows()? {
+        self.resume_checkpoints()?;
+        self.spawn_barrier_retry();
+        Ok(())
+    }
+
+    fn resume_checkpoints(self: &Arc<Self>) -> Result<()> {
+        for (c, _) in self.db().checkpoint_expiry_rows()? {
             match c.state {
-                CheckpointState::Deleting => self.spawn_removal(c.id.as_str()),
+                CheckpointState::Deleting => {
+                    self.spawn_removal(c.id.as_str(), None, false);
+                }
                 _ => self.checkpoint_timer_refresh(c.id.as_str()),
             }
         }
-        for c in self.store.unsettled_checkpoints()? {
+        for c in self.db().unsettled_checkpoints()? {
             if c.state == CheckpointState::Capturing && c.failure.is_some() {
-                self.spawn_removal(c.id.as_str());
+                self.spawn_removal(c.id.as_str(), None, false);
             }
         }
         Ok(())
     }
 
+    /// While the barrier is blocked: its pass again with backoff, each followed by the
+    /// timers and removals it may have made due, until a clean pass clears the
+    /// checkpoint part of the allocation block (never `admission_blocked`). Delete, Get,
+    /// List and removals stay available meanwhile.
+    fn spawn_barrier_retry(self: &Arc<Self>) {
+        let engine = &self.checkpoint;
+        if !engine.barrier_blocked.load(Ordering::Relaxed)
+            || !self.runtime.checkpoint_backend()
+            || self.shutting_down.is_cancelled()
+            || engine.barrier_retrying.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let manager = Arc::clone(self);
+        self.operations.spawn(async move {
+            let limits = manager.maintenance_limits();
+            let mut delay = limits.removal_retry;
+            loop {
+                tokio::select! {
+                    () = manager.shutting_down.cancelled() => break,
+                    () = tokio::time::sleep(delay) => {}
+                }
+                let blocked = manager.reconcile_checkpoints().await.unwrap_or_else(|e| {
+                    warn!(error = %format!("{e:#}"), "checkpoint reconciliation failed; allocation stays blocked");
+                    true
+                });
+                if let Err(e) = manager.resume_checkpoints() {
+                    warn!(error = %format!("{e:#}"), "could not resume checkpoint timers and removals");
+                }
+                if !blocked {
+                    manager
+                        .checkpoint
+                        .barrier_blocked
+                        .store(false, Ordering::Relaxed);
+                    info!("checkpoint reconciliation is clean; new allocations are admitted");
+                    break;
+                }
+                delay = (delay * 2).min(limits.max_removal_retry);
+            }
+            manager
+                .checkpoint
+                .barrier_retrying
+                .store(false, Ordering::Relaxed);
+        });
+    }
+
     // --- Startup reconciliation (design 10.2) -----------------------------------------
 
-    /// Matches every unsettled row and every artifact the helper lists: an interrupted
-    /// capture is failed (C3 complete without C4 is discarded, never promoted), a READY
-    /// row whose artifact is missing or unreadable is quarantined, and an artifact, a
-    /// partial or an incomplete inventory no charged row explains blocks admission.
-    /// Returns whether admission must stay blocked. Removals start with the sweeper.
+    /// The barrier, at startup and in its retry. It reads every charged row first, then
+    /// needs a session, a complete inventory whose every entry names a charged row and
+    /// whose every tracked operation, reader and tombstone its row explains, and an
+    /// Inspect of every READY row. An interrupted capture is failed (C3 complete without
+    /// C4 is discarded, never promoted); a READY row whose artifact is authoritatively
+    /// missing, corrupt or another generation's is quarantined; anything unknown keeps
+    /// its row and charge and blocks allocation. Returns whether allocation stays
+    /// blocked. With the feature off and no durable state: one existence check.
     pub(super) async fn reconcile_checkpoints(&self) -> Result<bool> {
-        let unsettled = self.store.unsettled_checkpoints()?;
-        // Off, or a backend with no checkpoint group (Firecracker): no helper call.
-        if self.limits.checkpoints.is_none() || !self.runtime.checkpoint_backend() {
+        if self.db().checkpoint_state_exists()? {
+            self.checkpoint.present.store(true, Ordering::Relaxed);
+        }
+        if !self.maintained() {
+            return Ok(false);
+        }
+        // A backend with no checkpoint group (Firecracker): no helper call.
+        if !self.runtime.checkpoint_backend() {
+            let unsettled = self.db().unsettled_checkpoints()?;
             if unsettled.is_empty() {
                 return Ok(false);
             }
             warn!(
                 rows = unsettled.len(),
-                "unsettled checkpoints exist but checkpoints are not enabled; their charges are kept and admission is blocked"
+                "unsettled checkpoints exist but this backend has no checkpoints; their charges are kept and admission is blocked"
             );
             return Ok(true);
         }
+        let mut rows: BTreeMap<String, Checkpoint> = BTreeMap::new();
+        let charged = self.db().unsettled_checkpoints()?.into_iter().chain(
+            self.db()
+                .checkpoint_expiry_rows()?
+                .into_iter()
+                .map(|(c, _)| c),
+        );
+        for c in charged {
+            rows.entry(c.id.to_string()).or_insert(c);
+        }
+        let live: HashSet<String> = self
+            .checkpoint
+            .captures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let session = match self.checkpoint_session().await {
             Ok(s) => s,
             Err(e) => {
-                let charged =
-                    !unsettled.is_empty() || !self.store.checkpoint_expiry_rows()?.is_empty();
-                if charged {
-                    warn!(error = %e, "checkpoint reconciliation could not reach the helper; admission blocked");
+                // Enabled, storage no row names may exist whatever the rows say; off,
+                // only charged rows need the helper.
+                let blocked = self.limits.checkpoints.is_some() || !rows.is_empty();
+                if blocked {
+                    warn!(error = %e, "checkpoint reconciliation could not reach the helper; allocation blocked");
                 }
-                return Ok(charged);
+                return Ok(blocked);
             }
         };
         let mut blocked = false;
-        let instance = self.store.identity()?.instance_id;
+        let instance = self.db().identity()?.instance_id;
         let inventory = self
             .runtime
             .checkpoint(
@@ -1435,22 +1663,11 @@ impl<R: Runtime> Manager<R> {
                 &self.shutting_down.child_token(),
             )
             .await;
-        let mut charged: HashSet<String> = unsettled.iter().map(|c| c.id.to_string()).collect();
-        let ready: Vec<Checkpoint> = self
-            .store
-            .checkpoint_expiry_rows()?
-            .into_iter()
-            .map(|(c, _)| c)
-            .inspect(|c| {
-                charged.insert(c.id.to_string());
-            })
-            .filter(|c| c.state == CheckpointState::Ready)
-            .collect();
         match inventory {
             Ok(CheckpointResponse::Inventory(inv)) if inv.complete => {
                 for entry in &inv.entries {
-                    if !charged.contains(entry.checkpoint.as_str()) {
-                        warn!(checkpoint = %entry.checkpoint, "checkpoint artifact no charged row explains; admission blocked");
+                    if !rows.contains_key(entry.checkpoint.as_str()) {
+                        warn!(checkpoint = %entry.checkpoint, "checkpoint artifact no charged row explains; allocation blocked");
                         blocked = true;
                     }
                 }
@@ -1458,19 +1675,39 @@ impl<R: Runtime> Manager<R> {
                     || inv
                         .untracked_workers
                         .iter()
-                        .any(|c| !charged.contains(c.as_str()))
+                        .any(|c| !rows.contains_key(c.as_str()))
                 {
+                    warn!(
+                        "checkpoint entries or workers no charged row explains; allocation blocked"
+                    );
                     blocked = true;
+                }
+                for t in &inv.tracked {
+                    let fetched;
+                    let row = match rows.get(t.checkpoint.as_str()) {
+                        Some(row) => Some(row),
+                        None => {
+                            fetched = self.db().checkpoint(t.checkpoint.as_str())?;
+                            fetched.as_ref()
+                        }
+                    };
+                    if let Some(why) = self.unexplained(t, row, &live)? {
+                        warn!(checkpoint = %t.checkpoint, why, "helper activity no row explains; allocation blocked");
+                        blocked = true;
+                    }
                 }
             }
             other => {
-                warn!(reply = ?other.map(|r| format!("{r:?}")), "checkpoint inventory incomplete or unavailable; admission blocked");
+                warn!(reply = ?other.map(|r| format!("{r:?}")), "checkpoint inventory incomplete or unavailable; allocation blocked");
                 blocked = true;
             }
         }
-        for c in &unsettled {
-            if c.state == CheckpointState::Capturing && c.failure.is_none() {
-                self.store.record_checkpoint_failure_token(
+        for c in rows.values() {
+            if c.state == CheckpointState::Capturing
+                && c.failure.is_none()
+                && !live.contains(c.id.as_str())
+            {
+                self.db().record_checkpoint_failure_token(
                     c.id.as_str(),
                     CheckpointReason::Io.token(),
                     "kilnd stopped during the capture; its storage is removed",
@@ -1478,7 +1715,7 @@ impl<R: Runtime> Manager<R> {
                 )?;
             }
         }
-        for c in &ready {
+        for c in rows.values().filter(|c| c.state == CheckpointState::Ready) {
             let reply = self
                 .runtime
                 .checkpoint(
@@ -1492,36 +1729,119 @@ impl<R: Runtime> Manager<R> {
                     &self.shutting_down.child_token(),
                 )
                 .await;
-            let intact = match &reply {
-                Ok(CheckpointResponse::Inspected(view)) => match &view.artifact {
-                    ArtifactView::Published { record } => c.seal.as_ref().is_some_and(|seal| {
+            // Only an authoritative answer is a verdict; I/O, a busy or withheld
+            // artifact, a transport failure or an odd reply is unknown.
+            let intact = match reply {
+                Ok(CheckpointResponse::Inspected(view)) => match view.artifact {
+                    ArtifactView::Published { record } => Ok(c.seal.as_ref().is_some_and(|seal| {
                         record.content_sha256 == seal.content_sha256
                             && record.binding_sha256 == seal.binding_sha256
-                    }),
-                    _ => false,
+                    })),
+                    ArtifactView::Unreadable {
+                        reason: Reason::Corrupt | Reason::GenerationMismatch,
+                        ..
+                    }
+                    | ArtifactView::Partial { .. }
+                    | ArtifactView::NotListed => Ok(false),
+                    other => Err(format!("{other:?}")),
                 },
-                _ => {
-                    blocked = true;
-                    continue;
-                }
+                other => Err(format!("{:?}", other.map(|r| format!("{r:?}")))),
             };
-            if !intact {
-                warn!(checkpoint = %c.id, "READY checkpoint's artifact is missing or does not match; quarantined, charge kept");
-                self.store.record_checkpoint_failure_token(
-                    c.id.as_str(),
-                    CheckpointReason::Corrupt.token(),
-                    "the artifact is missing or does not match its seal",
-                    true,
-                )?;
+            match intact {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(checkpoint = %c.id, "READY checkpoint's artifact is missing or does not match; quarantined, charge kept");
+                    self.db().record_checkpoint_failure_token(
+                        c.id.as_str(),
+                        CheckpointReason::Corrupt.token(),
+                        "the artifact is missing or does not match its seal",
+                        true,
+                    )?;
+                }
+                Err(reply) => {
+                    warn!(checkpoint = %c.id, reply, "READY checkpoint's artifact could not be inspected; kept READY and charged, allocation blocked");
+                    blocked = true;
+                }
             }
         }
         Ok(blocked)
+    }
+
+    /// Why a tracked artifact's activity is not its row's, if it is not (design 10.2):
+    /// the row must exist at its generation; a capture must be the CAPTURING row's own;
+    /// a removal or tombstone needs a row being removed (a failed capture's included);
+    /// every reader a live pin; a worker a charge.
+    fn unexplained(
+        &self,
+        t: &TrackedArtifact,
+        row: Option<&Checkpoint>,
+        live: &HashSet<String>,
+    ) -> Result<Option<&'static str>> {
+        let Some(row) = row else {
+            return Ok(Some("no row names it"));
+        };
+        if t.generation != row.generation {
+            return Ok(Some("another generation"));
+        }
+        let charged = row.is_charged();
+        let failing = row.state == CheckpointState::Capturing
+            && (row.failure.is_some() || !live.contains(row.id.as_str()));
+        let removing = failing
+            || matches!(
+                row.state,
+                CheckpointState::Deleting | CheckpointState::Failed | CheckpointState::Deleted
+            );
+        let a = &t.activity;
+        let why = match &a.exclusive {
+            Some(ExclusiveOp {
+                kind: OpKind::Capture,
+                operation,
+            }) if !(charged
+                && row.state == CheckpointState::Capturing
+                && *operation == row.capture.operation) =>
+            {
+                Some("a capture that is not its row's")
+            }
+            Some(ExclusiveOp {
+                kind: OpKind::Remove,
+                ..
+            }) if !(charged && (failing || row.state == CheckpointState::Deleting)) => {
+                Some("a removal of a row not being removed")
+            }
+            _ if a.tombstone.is_some() && !removing => {
+                Some("a tombstone on a row not being removed")
+            }
+            _ if a.untracked_workers && !charged => Some("a worker of an uncharged row"),
+            _ => None,
+        };
+        if why.is_some() || a.readers.is_empty() {
+            return Ok(why);
+        }
+        let pins: HashSet<Id128> = self
+            .db()
+            .checkpoint_pins(row.id.as_str())?
+            .into_iter()
+            .filter(|p| p.released_at_ms.is_none())
+            .map(|p| p.reader.operation)
+            .collect();
+        Ok(a.readers
+            .iter()
+            .any(|r| !pins.contains(r))
+            .then_some("a reader no live pin names"))
     }
 }
 
 enum CaptureFailure {
     Failed(CheckpointReason, String),
     ShuttingDown,
+}
+
+fn not_removable(c: &Checkpoint) -> Error {
+    Error::Internal(anyhow::anyhow!(
+        "checkpoint {} is {} after its delete intent",
+        c.id,
+        c.state.as_str()
+    ))
 }
 
 fn capture_key_conflict(request_id: &str) -> Error {

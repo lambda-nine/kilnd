@@ -1548,3 +1548,6 @@ async fn a_reboot_rebases_checkpoint_anchors_without_extending_lifetime() {
     })
     .await;
 }
+
+#[path = "checkpoint_fix_tests.rs"]
+mod fix;

@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Harden the checkpoint engine (C5a-1 adversarial review: eight HIGH, one MEDIUM).
+  Delete and expiry hand removal to a supervisor before awaiting, so a departed caller
+  never strands a charged row; existing checkpoints are expired, removed, rebased and
+  reconciled with the feature off, and their keys answered; capture keys from an
+  earlier boot get a fresh retention window at startup; a transient Inspect failure
+  keeps a READY checkpoint and blocks instead of quarantining it; the startup barrier
+  blocks on a failed capability probe and on tracked helper activity no row explains,
+  and retries until clean with no restart; shutdown removes a running capture before
+  releasing its source; a caller that leaves before C1 allocates nothing.
 - Add milestone C5a of workspace checkpoints, the daemon's engine, reachable only from
   Rust and off unless `Limits::checkpoints` is set: supervised capture (source gate
   against Exec, Delete and both expiries; READY only with the capture's own COMPLETE

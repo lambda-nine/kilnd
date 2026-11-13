@@ -2120,6 +2120,28 @@ impl Store {
         Ok(rebased)
     }
 
+    /// Leaves a capture key's record unanchored, as a crash between its insert and its
+    /// anchoring transaction would (tests). The update trigger forbids it, so it is
+    /// dropped and recreated from its own text around the update.
+    #[cfg(test)]
+    pub(crate) fn unanchor_checkpoint_request_for_test(&self, checkpoint: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let trigger: String = tx.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'checkpoint_requests_fixed'",
+            [],
+            |r| r.get(0),
+        )?;
+        tx.execute_batch("DROP TRIGGER checkpoint_requests_fixed")?;
+        tx.execute(
+            "UPDATE checkpoint_requests SET retain_boot_id = NULL, retain_from_boottime_ms = NULL WHERE checkpoint_id = ?1",
+            [checkpoint],
+        )?;
+        tx.execute_batch(&trigger)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// A failure token (design 7.3) recorded once on a CAPTURING row, or with
     /// `quarantine` on a CAPTURING or READY row; the charge stays. The engine's tokens
     /// include ones the helper never sends (`checkpoint_not_ready`, `checkpoint_expired`).
@@ -2261,6 +2283,16 @@ impl Store {
             })
             .collect()
         })
+    }
+
+    /// Whether any durable checkpoint state exists: a row in any state, or a capture
+    /// key record. Read-only; the feature-off startup's only checkpoint query.
+    pub fn checkpoint_state_exists(&self) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM checkpoints) OR EXISTS (SELECT 1 FROM checkpoint_requests)",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// Whether a live pin pauses this checkpoint's idle timer.

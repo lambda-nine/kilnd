@@ -14,7 +14,7 @@ use super::{FakeGate, FakeRuntime};
 use crate::checkpoint::wire::{
     Activity, ArtifactInspectReply, ArtifactView, CaptureReply, CheckpointCapabilities,
     CheckpointError, CheckpointErrorKind, CheckpointOperation, CheckpointResponse, InventoryEntry,
-    InventoryReply, ItemKind, RemoveReply, SourceReply,
+    InventoryReply, ItemKind, RemoveReply, SourceReply, TrackedArtifact,
 };
 use crate::checkpoint::{
     ArtifactRecord, ArtifactTarget, CaptureBinding, CheckpointId, CompleteFact, Evidence, Fact,
@@ -51,6 +51,9 @@ pub struct FakeCheckpoints {
     pub sources: BTreeMap<String, SourceReply>,
     /// The helper answers nothing to `source` (an older helper closes the frame).
     pub source_unanswered: bool,
+    /// One-shot pause in the next `source`, before it answers (a cancellation of the
+    /// call ends it as unavailable).
+    pub source_gate: Option<FakeGate>,
     /// One-shot pause inside the next capture's worker, before it settles. A daemon
     /// cancellation stops the wait (the reply is `pending`); the worker stays until a
     /// removal tombstones it.
@@ -77,9 +80,14 @@ pub struct FakeCheckpoints {
     /// Checkpoints removal tombstoned in this epoch.
     pub tombstones: BTreeSet<String>,
     pub inventory_extra: Vec<CheckpointId>,
+    /// This epoch's private operation records `inventory` reports, as given.
+    pub inventory_tracked: Vec<TrackedArtifact>,
     pub inventory_incomplete: bool,
     /// `inspect` says the published artifact is unreadable.
     pub unreadable: BTreeSet<String>,
+    /// `inspect` cannot read the namespace for a moment (`kiln checkpoint ls` could
+    /// not run): `Unreadable { Io }` for every artifact.
+    pub inspect_io: bool,
     /// Every operation the daemon sent, as `kind` or `kind <id>`.
     pub calls: Vec<String>,
 }
@@ -93,6 +101,7 @@ impl Default for FakeCheckpoints {
             boot: Id128::random(),
             sources: BTreeMap::new(),
             source_unanswered: false,
+            source_gate: None,
             capture_gate: None,
             capture_fail: None,
             capture_image_sha: None,
@@ -106,8 +115,10 @@ impl Default for FakeCheckpoints {
             workers: BTreeMap::new(),
             tombstones: BTreeSet::new(),
             inventory_extra: Vec::new(),
+            inventory_tracked: Vec::new(),
             inventory_incomplete: false,
             unreadable: BTreeSet::new(),
+            inspect_io: false,
             calls: Vec::new(),
         }
     }
@@ -226,6 +237,15 @@ impl FakeRuntime {
         operation: CheckpointOperation,
         cancel: &CancellationToken,
     ) -> Result<CheckpointResponse, RuntimeError> {
+        if matches!(&operation, CheckpointOperation::Source { .. }) {
+            let gate = self.checkpoints(|g| g.source_gate.take());
+            if let Some(gate) = gate {
+                tokio::select! {
+                    () = gate.hold() => {}
+                    () = cancel.cancelled() => return Err(unavailable()),
+                }
+            }
+        }
         let response = self
             .fake_checkpoint_inner(epoch, &operation, cancel)
             .await?;
@@ -322,7 +342,12 @@ impl FakeRuntime {
                 Op::Remove { .. } => None,
                 Op::Inspect { target, .. } => {
                     let id = target.checkpoint.to_string();
-                    let artifact = if group.unreadable.contains(&id) {
+                    let artifact = if group.inspect_io {
+                        ArtifactView::Unreadable {
+                            reason: Reason::Io,
+                            detail: "kiln checkpoint ls could not be started".into(),
+                        }
+                    } else if group.unreadable.contains(&id) {
                         ArtifactView::Unreadable {
                             reason: Reason::Corrupt,
                             detail: "unreadable header".into(),
@@ -372,7 +397,7 @@ impl FakeRuntime {
                         entries,
                         unknown_entries: 0,
                         other_entries: 0,
-                        tracked: Vec::new(),
+                        tracked: group.inventory_tracked.clone(),
                         untracked_workers: Vec::new(),
                     })));
                 }

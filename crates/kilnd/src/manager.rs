@@ -1225,11 +1225,15 @@ impl<R: Runtime> Manager<R> {
             !known.contains(id)
                 && (record.allocation_id.is_some() || record.status == BackendStatus::Unknown)
         });
-        // Checkpoint design 10.2: unmatched artifacts or an unknown inventory block too.
+        // Checkpoint design 10.2: unmatched artifacts or an unknown inventory block too,
+        // as the barrier's own part of the block, which its retry clears.
         out.checkpoints_blocked = self.reconcile_checkpoints().await?;
-        out.admission_blocked |= out.checkpoints_blocked;
         self.admission_blocked
             .store(out.admission_blocked, Ordering::Relaxed);
+        self.checkpoint
+            .barrier_blocked
+            .store(out.checkpoints_blocked, Ordering::Relaxed);
+        out.admission_blocked |= out.checkpoints_blocked;
         out.unmanaged = live.into_keys().filter(|b| !known.contains(b)).collect();
         out.unmanaged.sort();
         for b in &out.unmanaged {
@@ -1975,7 +1979,7 @@ impl<R: Runtime> Manager<R> {
                 ));
             }
         }
-        if self.admission_blocked.load(Ordering::Relaxed) {
+        if self.allocation_blocked() {
             serving = false;
             if !detail.is_empty() {
                 detail.push_str("; ");
@@ -2269,7 +2273,7 @@ impl<R: Runtime> Manager<R> {
         committed: &OnceLock<String>,
     ) -> Result<Sandbox> {
         self.check_serving()?;
-        if self.admission_blocked.load(Ordering::Relaxed) {
+        if self.allocation_blocked() {
             return Err(Error::FailedPrecondition(
                 "backend resources no row explains block new sandboxes until reconciled".into(),
             ));
@@ -3759,17 +3763,22 @@ impl<R: Runtime> Manager<R> {
     /// the sweeper, admission or any prune.
     pub fn rebase_expiry_clocks(&self) -> Result<usize> {
         let sandboxes = self.store.rebase_clocks()?;
-        let checkpoints = match self.limits.checkpoints {
-            Some(_) => self.store.rebase_checkpoint_clocks()?,
-            None => 0,
+        let checkpoints = match self.maintained() {
+            true => self.db().rebase_checkpoint_clocks()?,
+            false => 0,
         };
         Ok(sandboxes + checkpoints)
     }
 
-    /// The request-record rebase (design 3.3 R2). Run once after reconciliation and
-    /// before admission, any prune or any keyed lookup.
+    /// The request-record rebase (design 3.3 R2), capture keys included while
+    /// checkpoints are maintained (checkpoint design 7.1). Run once after
+    /// reconciliation and before admission, any prune or any keyed lookup.
     pub fn rebase_create_requests(&self) -> Result<usize> {
-        Ok(self.store.rebase_create_requests()?)
+        let checkpoints = match self.maintained() {
+            true => self.db().rebase_checkpoint_requests()?,
+            false => 0,
+        };
+        Ok(self.store.rebase_create_requests()? + checkpoints)
     }
 
     /// `AdmissionStats` fields 21-25 for `caller` (Health is open to every caller; a

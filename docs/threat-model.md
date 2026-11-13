@@ -232,8 +232,9 @@ freeing it. The group is disabled unless root starts the helper with
 `image` and `layout` records, through no-follow opens checked on the open descriptor
 (regular, owned by the helper, no group or other bits, at most 4 KiB, strict text); a
 symlink or anything unexpected is a typed refusal, and it never opens the image. The
-daemon's engine (C5a) uses the group only when `Limits::checkpoints` is set, which no flag
-does before milestone C5b.
+daemon's engine (C5a) admits new captures only when `Limits::checkpoints` is set, which no
+flag does before milestone C5b; with it off it still uses the group to expire, remove and
+reconcile checkpoints that already exist, and calls nothing when none do.
 
 The daemon's checkpoint store (schema 15, milestone C4) keeps each checkpoint charged
 until it stores ABSENT evidence of its own recorded removal, in the same node disk
@@ -243,9 +244,11 @@ authority, exactly as for sandbox reservations: a mismatch or invalid evidence d
 accounting and refuses capture and sandbox Create, and never frees capacity. The
 evidence is the helper's certification, not an independent ledger. The engine keeps a
 capture's source gated until the helper proves the capture's worker reaped and its
-storage absent, and treats an artifact it cannot prove its own (a generation mismatch,
-an unreadable header, an inventory entry no charged row explains) as blocking new
-allocations, never as free space.
+storage absent, shutdown included, and treats an artifact or helper operation it cannot
+prove its own (a generation mismatch, an unreadable header, an inventory entry or tracked
+capture, removal, reader or tombstone no row explains, an inventory or capability probe
+that fails) as blocking new allocations, never as free space; an inspection that cannot
+read an artifact keeps it charged and blocks rather than condemning it.
 
 ## What it relies on kiln for
 
