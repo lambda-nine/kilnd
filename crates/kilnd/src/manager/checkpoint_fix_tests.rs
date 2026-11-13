@@ -761,7 +761,7 @@ async fn feature_off_with_no_rows_makes_no_store_query_on_request_paths() {
     let (r, rebased) = startup_like_main(&m).await;
     assert!(!r.checkpoints_blocked && !r.admission_blocked);
     assert_eq!(rebased, 0);
-    assert!(queries() <= 1, "startup: at most the existence check");
+    assert_eq!(queries(), 1, "startup: the one existence check");
     let s = source(&m, 1000).await;
     queries();
     let e = capture(&m, &s, 1000).await.unwrap_err();
@@ -967,6 +967,18 @@ async fn killed_mid_capture(
 /// Pauses the source's backend removal and proves, when it starts, that the capture's
 /// worker is gone and its row released; then lets it finish.
 async fn source_removed_after_the_capture(m: &M, fake: &FakeRuntime, s: &Sandbox, c: &Checkpoint) {
+    source_removed_after(m, fake, s, c, CheckpointState::Failed).await;
+}
+
+/// As [`source_removed_after_the_capture`], for a capture whose row settles `terminal`
+/// (FAILED for an interrupted capture, DELETED for one canceled by checkpoint D1).
+async fn source_removed_after(
+    m: &M,
+    fake: &FakeRuntime,
+    s: &Sandbox,
+    c: &Checkpoint,
+    terminal: CheckpointState,
+) {
     let backend = s.backend_id.clone().unwrap();
     let gate = FakeGate::default();
     fake.state().remove_before_delete = Some(gate.clone());
@@ -975,7 +987,7 @@ async fn source_removed_after_the_capture(m: &M, fake: &FakeRuntime, s: &Sandbox
         .await
         .expect("the source's delete is re-driven");
     assert!(fake.checkpoints(|g| !g.workers.contains_key(c.id.as_str())));
-    assert_eq!(row(m, c.id.as_str()).state, CheckpointState::Failed);
+    assert_eq!(row(m, c.id.as_str()).state, terminal);
     assert!(!fake.state().removed.contains(&backend));
     gate.release();
     until("the source is deleted", || {
@@ -1048,4 +1060,205 @@ async fn a_delete_after_restart_waits_for_the_interrupted_capture() {
     );
     fake.checkpoints(|g| g.unavailable = false);
     source_removed_after_the_capture(&m, &fake, &s, &c).await;
+}
+
+// --- Round 3 (second recheck) -----------------------------------------------------------
+
+/// Settled history, a failed session at startup, then retention ages the last row out.
+fn age_out(m: &M, c: &Checkpoint) {
+    m.store
+        .execute_for_test(
+            "UPDATE checkpoints SET updated_at_ms = 0 WHERE id = ?1",
+            c.id.as_str(),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pruning_after_a_failed_session_keeps_the_barrier_until_a_clean_inventory() {
+    let (_tmp, dir, fake, clock, limits, _, c) = feature_off_with_settled_history().await;
+    fake.checkpoints(|g| {
+        g.inventory_extra.push(CheckpointId::random());
+        g.unavailable = true;
+    });
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    age_out(&m, &c);
+    assert_eq!(m.prune().unwrap().checkpoints, 1);
+    assert!(!m.checkpoint.present.load(Ordering::Relaxed));
+    // Falling presence is no inventory: the retry keeps asking the helper. (With the
+    // feature off, the retry backs off on the default 1 s .. 60 s schedule.)
+    let before = calls(&fake, "capabilities");
+    until_slow("a retry session", || calls(&fake, "capabilities") > before).await;
+    assert!(create_is_blocked(&m).await);
+    // The helper recovers with the unexplained artifact still there: still blocked.
+    let inventories = calls(&fake, "inventory");
+    fake.checkpoints(|g| g.unavailable = false);
+    until_slow("a retry inventory", || {
+        calls(&fake, "inventory") > inventories
+    })
+    .await;
+    assert!(create_is_blocked(&m).await);
+    // Only a clean inventory clears it.
+    fake.checkpoints(|g| g.inventory_extra.clear());
+    until_slow("a clean retry", || {
+        !m.checkpoint.barrier_blocked.load(Ordering::Relaxed)
+    })
+    .await;
+    until_allocation_opens(&m, "a clean inventory clears the barrier").await;
+}
+
+/// [`until`] for the feature-off retry's real backoff: up to 30 s.
+async fn until_slow(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..3000 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn startup_prune_keeps_the_barrier_retry_running() {
+    let (_tmp, dir, fake, clock, limits, _, c) = feature_off_with_settled_history().await;
+    fake.checkpoints(|g| g.unavailable = true);
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    age_out(&m, &c);
+    // Reconcile blocks, then startup's prune removes the last row before
+    // start_checkpoints: the retry starts anyway.
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    assert!(!m.checkpoint.present.load(Ordering::Relaxed));
+    assert!(m.checkpoint.barrier_retrying.load(Ordering::Relaxed));
+    let inventories = calls(&fake, "inventory");
+    fake.checkpoints(|g| g.unavailable = false);
+    until_allocation_opens(&m, "the retry inventories once the helper recovers").await;
+    assert!(calls(&fake, "inventory") > inventories);
+}
+
+/// A capture killed mid-way whose checkpoint Delete committed D1 (DELETING, no seal)
+/// before the process could remove it; the worker may still read the source.
+async fn killed_after_d1(
+    deleting: bool,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    FakeRuntime,
+    ManualClock,
+    Limits,
+    Sandbox,
+    Checkpoint,
+) {
+    let (tmp, dir, fake, clock, limits, s, c) = killed_mid_capture(deleting).await;
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    m.store
+        .publish_checkpoint_delete_intent(c.id.as_str(), DeletionReason::Requested)
+        .unwrap();
+    let c = row(&m, c.id.as_str());
+    assert_eq!(
+        (c.state, c.seal.is_none()),
+        (CheckpointState::Deleting, true)
+    );
+    let limits = stop(m).await;
+    (tmp, dir, fake, clock, limits, s, c)
+}
+
+#[tokio::test]
+async fn checkpoint_d1_keeps_the_interrupted_capture_source_held() {
+    let (_tmp, dir, fake, clock, limits, s, c) = killed_after_d1(true).await;
+    let backend = s.backend_id.clone().unwrap();
+    fake.checkpoints(|g| g.unavailable = true);
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let r = m.reconcile().await.unwrap();
+    assert!(
+        !fake.state().removed.contains(&backend),
+        "the source outlives the D1 capture's reader: {r:?}"
+    );
+    assert!(fake.checkpoints(|g| g.workers.contains_key(c.id.as_str())));
+    assert_eq!(
+        m.store.sandbox(&s.id).unwrap().unwrap().state,
+        SandboxState::Deleting
+    );
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    assert!(create_is_blocked(&m).await);
+    fake.checkpoints(|g| g.unavailable = false);
+    source_removed_after(&m, &fake, &s, &c, CheckpointState::Deleted).await;
+}
+
+#[tokio::test]
+async fn a_delete_after_restart_waits_for_the_d1_capture() {
+    let (_tmp, dir, fake, clock, limits, s, c) = killed_after_d1(false).await;
+    let backend = s.backend_id.clone().unwrap();
+    fake.checkpoints(|g| g.unavailable = true);
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    startup_like_main(&m).await;
+    let e = m.delete(&s.id).await.unwrap_err();
+    assert!(e.to_string().contains(c.id.as_str()), "{e}");
+    assert!(!fake.state().removed.contains(&backend));
+    fake.checkpoints(|g| g.unavailable = false);
+    source_removed_after(&m, &fake, &s, &c, CheckpointState::Deleted).await;
+}
+
+#[tokio::test]
+async fn a_restart_after_the_d1_capture_is_absent_resumes_the_source_delete() {
+    let (_tmp, dir, fake, clock, limits, s, c) = killed_after_d1(true).await;
+    let backend = s.backend_id.clone().unwrap();
+    // A process reaches the capture's ABSENT and is killed before it re-drives the
+    // source's delete.
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    m.reconcile().await.unwrap();
+    assert!(!fake.state().removed.contains(&backend));
+    let released = m
+        .remove_until_absent(c.id.as_str(), None, false, &CancellationToken::new())
+        .await
+        .expect("the D1 capture reaches ABSENT");
+    assert_eq!(released.state, CheckpointState::Deleted);
+    assert!(fake.checkpoints(|g| !g.workers.contains_key(c.id.as_str())));
+    assert_eq!(
+        m.store.sandbox(&s.id).unwrap().unwrap().state,
+        SandboxState::Deleting
+    );
+    let limits = stop(m).await;
+    // The next start holds nothing and resumes the source's ordinary DELETING recovery.
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    assert!(m.held_sources().unwrap().is_empty());
+    startup_like_main(&m).await;
+    until("the source is deleted", || {
+        m.store.sandbox(&s.id).unwrap().unwrap().state == SandboxState::Deleted
+    })
+    .await;
+    assert!(fake.state().removed.contains(&backend));
+    until_allocation_opens(&m, "the capture is absent and its source gone").await;
+    assert_eq!(charge(&m), (0, 0));
+}
+
+/// Control: a READY checkpoint's D1 (sealed, DELETING) holds no source.
+#[tokio::test]
+async fn a_ready_checkpoint_deleting_holds_no_source() {
+    let (_tmp, dir, m, fake, clock) = persistent().await;
+    let s = source(&m, 1000).await;
+    let c = capture(&m, &s, 1000).await.unwrap();
+    assert_eq!(c.state, CheckpointState::Ready);
+    m.store
+        .publish_checkpoint_delete_intent(c.id.as_str(), DeletionReason::Requested)
+        .unwrap();
+    m.store_set_state_for_test(&s.id, SandboxState::Deleting);
+    let c = row(&m, c.id.as_str());
+    assert_eq!(
+        (c.state, c.seal.is_some()),
+        (CheckpointState::Deleting, true)
+    );
+    let backend = s.backend_id.clone().unwrap();
+    let limits = stop(m).await;
+    fake.checkpoints(|g| g.unavailable = true);
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    m.refresh_checkpoint_presence().unwrap();
+    assert!(m.held_sources().unwrap().is_empty());
+    m.reconcile().await.unwrap();
+    assert!(
+        fake.state().removed.contains(&backend),
+        "a sealed checkpoint's source is removed as usual"
+    );
 }

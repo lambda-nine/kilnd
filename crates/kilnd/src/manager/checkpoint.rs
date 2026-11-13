@@ -361,6 +361,22 @@ fn may_see(c: &Checkpoint, uid: u32) -> bool {
     uid == 0 || c.owner_uid == uid
 }
 
+/// A capture that never sealed: CAPTURING, or DELETING through D1 from CAPTURING. Only
+/// the READY transition writes a seal, so a READY-origin DELETING row always has one.
+/// Until its release (authoritative ABSENT), a helper worker may still read its source.
+fn capture_origin(c: &Checkpoint) -> bool {
+    c.seal.is_none()
+        && matches!(
+            c.state,
+            CheckpointState::Capturing | CheckpointState::Deleting
+        )
+}
+
+/// Whether `c` holds its source sandbox: a charged capture-origin row (design 8.2).
+fn holds_its_source(c: &Checkpoint) -> bool {
+    capture_origin(c) && c.is_charged()
+}
+
 impl<R: Runtime> Manager<R> {
     /// The store, as the engine reads and writes it (tests count these calls).
     pub(super) fn db(&self) -> &Store {
@@ -370,9 +386,13 @@ impl<R: Runtime> Manager<R> {
     }
 
     /// Existing checkpoints get expiry, removal, rebase and reconciliation while the
-    /// feature is on or any durable state exists; only new work needs the feature.
+    /// feature is on, any durable state exists, or the barrier is blocked; only new
+    /// work needs the feature. A blocked barrier is an obligation only a complete clean
+    /// inventory discharges, so durable state falling to none (a prune) never ends it.
     pub(super) fn maintained(&self) -> bool {
-        self.limits.checkpoints.is_some() || self.checkpoint.present.load(Ordering::Relaxed)
+        self.limits.checkpoints.is_some()
+            || self.checkpoint.present.load(Ordering::Relaxed)
+            || self.checkpoint.barrier_blocked.load(Ordering::Relaxed)
     }
 
     /// No new sandbox or capture is admitted while reconciliation or a removal found
@@ -407,10 +427,10 @@ impl<R: Runtime> Manager<R> {
             .collect()
     }
 
-    /// The charged CAPTURING checkpoints that are not this process's live captures, by
-    /// source sandbox: a helper worker may still read each source, so its storage must
-    /// be proved absent before the source is removed (design 8.2). Nothing maintained,
-    /// no query.
+    /// The charged captures not yet proved absent (CAPTURING, or DELETING through D1
+    /// before any seal) that are not this process's live captures, by source sandbox:
+    /// a helper worker may still read each source, so its storage must be proved absent
+    /// before the source is removed (design 8.2). Nothing maintained, no query.
     pub(super) fn held_sources(&self) -> Result<HashMap<String, CheckpointId>> {
         if !self.maintained() {
             return Ok(HashMap::new());
@@ -420,11 +440,7 @@ impl<R: Runtime> Manager<R> {
             .db()
             .unsettled_checkpoints()?
             .into_iter()
-            .filter(|c| {
-                c.state == CheckpointState::Capturing
-                    && c.is_charged()
-                    && !live.contains(c.id.as_str())
-            })
+            .filter(|c| holds_its_source(c) && !live.contains(c.id.as_str()))
             .map(|c| (c.source_sandbox_id, c.id))
             .collect())
     }
@@ -1456,9 +1472,10 @@ impl<R: Runtime> Manager<R> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id);
-            // A failed capture's source whose removal was held for this ABSENT (after a
-            // restart) is removed now; a failure leaves it DELETING for a later Delete.
-            let Some(c) = released.filter(|c| c.failure.is_some()) else {
+            // A capture's source whose removal was held for this ABSENT (a failed or
+            // D1-canceled capture, after a restart) is removed now; a failure leaves it
+            // DELETING for a later Delete. A sealed (READY-origin) row never held one.
+            let Some(c) = released.filter(|c| c.seal.is_none()) else {
                 return;
             };
             let source = c.source_sandbox_id.as_str();
@@ -1789,10 +1806,10 @@ impl<R: Runtime> Manager<R> {
             }
         }
         for c in rows.values() {
-            if c.state != CheckpointState::Capturing || live.contains(c.id.as_str()) {
+            if !holds_its_source(c) || live.contains(c.id.as_str()) {
                 continue;
             }
-            if c.failure.is_none() {
+            if c.state == CheckpointState::Capturing && c.failure.is_none() {
                 self.db().record_checkpoint_failure_token(
                     c.id.as_str(),
                     CheckpointReason::Io.token(),

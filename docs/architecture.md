@@ -1122,7 +1122,8 @@ metadata result alive and enforces an RSS increase below 32 MiB.
 On SIGTERM or SIGINT, kilnd refuses new creates and execs and stops accepting
 connections. A fixed `--shutdown-grace-secs` deadline starts immediately and
 does not disappear if the transport exits early. At the deadline kilnd
-cancels running executions (recorded as `CANCELED`); after a fixed 10-second
+cancels running executions (recorded as `CANCELED`), or at the 240 s limit below if
+that comes first; after a fixed 10-second
 reply deadline it stops waiting for transport replies but continues draining
 accepted create, compensation, and execution supervisors before removing the
 socket and exiting. Thus the reply deadline does not bound owned cleanup; a
@@ -1368,7 +1369,10 @@ one existence check finds any row or capture key, expiry, removal, the cross-boo
 of anchors and keys, and reconciliation all run, and a key with a record is answered from
 it. That presence is recounted before each barrier retry and after a prune removes rows
 or keys, under a lock C1's insert also takes, so it falls once the last row and key are
-pruned and never hides a capture admitted meanwhile. With it off and nothing durable,
+pruned and never hides a capture admitted meanwhile. Falling presence never discharges a
+blocked barrier: while `barrier_blocked` is set the engine counts as maintained, so its
+retry (started at startup even if startup's prune just removed the last row) still takes
+a fresh session and a complete inventory, and only a clean one clears it. With it off and nothing durable,
 startup makes that one query and no helper call, and the only change on any request
 path is an in-memory capture flag on each sandbox slot that is never set. Creating a sandbox from a checkpoint is not reachable
 yet (milestone C5a-2).
@@ -1439,13 +1443,15 @@ row is quarantined with its charge only on an authoritative answer (a record tha
 not match its seal, a corrupt or other-generation artifact, a partial, or nothing
 listed); an I/O failure, a withheld or busy artifact, a transport failure or an
 unexpected reply keeps it READY and charged and blocks new allocations. A sandbox that is
-the source of a charged CAPTURING checkpoint (not this process's live capture) is never
+the source of a charged capture that has not sealed (CAPTURING, or DELETING through D1
+from CAPTURING, told apart from a READY-origin DELETING row by its missing seal; not this
+process's live capture) is never
 removed first: before sandbox reconciliation, startup finds those sources and keeps a
 DELETING one DELETING (no garbage collection either), saying which checkpoint it waits
 for, and a later Delete or expiry of such a source does the same; allocation stays
 blocked while one waits. The sweeper then starts the removal of every DELETING row and
-failed capture; when a failed capture's removal stores ABSENT, its supervisor re-drives
-the held source's delete. This barrier's block is its
+failed capture; when an unsealed capture's removal stores ABSENT, its supervisor
+re-drives the held source's delete. This barrier's block is its
 own (`barrier_blocked`, apart from the sandbox reconciliation's and a removal's
 `admission_blocked`): while it is set, a tracked retry reruns the whole pass with backoff
 (the removal backoff, 1 s to 60 s by default), resumes timers and removals after each,

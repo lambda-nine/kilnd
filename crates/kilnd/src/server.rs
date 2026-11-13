@@ -577,7 +577,13 @@ async fn serve_with_limits<R: Runtime>(
     let operations = manager.drain_operations();
     tokio::pin!(operations);
     let mut operations_done = false;
-    let grace_deadline = tokio::time::sleep(grace);
+    // Every phase ends by the absolute drain limit, whatever grace is configured.
+    let drain_deadline = started + drain_limit;
+    let bounded = |from: tokio::time::Instant, wait: Duration| {
+        from.checked_add(wait)
+            .map_or(drain_deadline, |d| d.min(drain_deadline))
+    };
+    let grace_deadline = tokio::time::sleep_until(bounded(started, grace));
     tokio::pin!(grace_deadline);
 
     // Transport completion does not own manager operations. Keep the grace
@@ -596,7 +602,7 @@ async fn serve_with_limits<R: Runtime>(
 
     warn!("grace period over; canceling running executions");
     manager.cancel_executions();
-    let final_deadline = tokio::time::sleep(final_wait);
+    let final_deadline = tokio::time::sleep_until(bounded(tokio::time::Instant::now(), final_wait));
     tokio::pin!(final_deadline);
     while server_result.is_none() || !operations_done {
         tokio::select! {
@@ -609,7 +615,7 @@ async fn serve_with_limits<R: Runtime>(
         }
     }
     if !operations_done
-        && tokio::time::timeout_at(started + drain_limit, &mut operations)
+        && tokio::time::timeout_at(drain_deadline, &mut operations)
             .await
             .is_err()
     {
@@ -1146,6 +1152,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(manager.list(true).unwrap()[0].state, SandboxState::Deleting);
+        remove_gate.release();
+    }
+
+    #[tokio::test]
+    async fn a_long_grace_still_ends_at_the_shutdown_drain_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = tmp.path().join("run/kilnd.sock");
+        let fake = FakeRuntime::default();
+        let remove_gate = FakeGate::default();
+        fake.state().remove_before_delete = Some(remove_gate.clone());
+        let store = Store::open(&tmp.path().join("state")).unwrap();
+        store.reject_ready_updates().unwrap();
+        let manager = Arc::new(Manager::new(fake, store, Limits::default()));
+        let waiter = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.create(CreateRequest::default()).await }
+        });
+        remove_gate.entered().await;
+        waiter.abort();
+        let BoundSocket {
+            listener,
+            path_guard: _path_guard,
+        } = bind(&socket, None).await.unwrap();
+        // A grace (and a final wait) far past the limit: the limit still ends shutdown.
+        let server = tokio::spawn(serve_with_limits(
+            manager,
+            listener,
+            async {},
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("every shutdown phase ends by the drain limit")
+            .unwrap()
+            .unwrap();
         remove_gate.release();
     }
 

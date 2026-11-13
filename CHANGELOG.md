@@ -21,6 +21,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   takes), restoring the no-query path with the feature off; startup and Delete never
   remove a source an interrupted capture may still read, the capture's removal re-drives
   the source's delete, and shutdown stops draining after 240 s.
+- Close the checkpoint engine's second recheck: pruning the last row no longer clears a
+  blocked barrier without a clean inventory, and startup keeps its retry running; a
+  capture canceled by checkpoint Delete (D1) keeps its source held until ABSENT, and
+  that ABSENT re-drives the source's delete; every shutdown phase ends by the 240 s
+  limit, whatever `--shutdown-grace-secs` says.
 - Add milestone C5a of workspace checkpoints, the daemon's engine, reachable only from
   Rust and off unless `Limits::checkpoints` is set: supervised capture (source gate
   against Exec, Delete and both expiries; READY only with the capture's own COMPLETE
