@@ -1356,6 +1356,10 @@ stored aggregate rows themselves are rewritten only by the normal startup audit,
 settles a release still unsettled, as schema 14's own startup does. Older binaries refuse schema 15;
 see [setup.md](setup.md) for rollback.
 
+**Migration 15 to 16** (C5a-1) adds one table, `checkpoint_barrier`: at most one row
+(`id = 1`, `set_at_ms`), the checkpoint barrier's durable obligation (below). Every
+schema 15 row is unchanged; the table starts empty. Older binaries refuse schema 16.
+
 
 ## Workspace checkpoint engine (milestone C5a)
 
@@ -1365,18 +1369,23 @@ supervised capture, the D1-D3 removal, checkpoint expiry and startup reconciliat
 there is no flag, RPC, `kilndctl` command, Health field or feature bit yet (C5b). The
 switch gates only new work: an unkeyed capture, or a keyed one whose key has no record.
 Checkpoints that already exist are maintained with it off (design 11.1): when startup's
-one existence check finds any row or capture key, expiry, removal, the cross-boot rebase
+one existence check finds any row, capture key or barrier marker, expiry, removal, the cross-boot rebase
 of anchors and keys, and reconciliation all run, and a key with a record is answered from
 it. That presence is recounted before each barrier retry and after a prune removes rows
 or keys, under a lock C1's insert also takes, so it falls once the last row and key are
 pruned and never hides a capture admitted meanwhile. Falling presence never discharges a
 blocked barrier: while `barrier_blocked` is set the engine counts as maintained, so its
 retry (started at startup even if startup's prune just removed the last row) still takes
-a fresh session and a complete inventory, and only a clean one clears it. The barrier
-itself is only in memory, so while it is blocked retention keeps every checkpoint row and
-capture key: they stay the durable obligation, a restart sees them and reconciles again,
-and only once a clean inventory clears the barrier may a prune remove the last one (the
-barrier's set and clear and that prune share the presence lock). With it off and nothing durable,
+a fresh session and a complete inventory, and only a clean one clears it. The obligation
+is durable apart from any row: when reconciliation blocks, it blocks allocation in memory
+and then writes the `checkpoint_barrier` marker (schema 16) before the verdict is
+reported, and only a clean inventory deletes it, before allocation reopens. A restart
+reads the marker in its one existence query, so even with the feature off and no rows it
+reconciles again; a crash after a clean inventory but before the delete costs one more
+inventory. While blocked, retention also keeps every checkpoint row and capture key and
+never touches the marker; only once a clean inventory clears the barrier may a prune
+remove the last row (the barrier's set and clear and that prune share the presence
+lock). With it off and nothing durable,
 startup makes that one query and no helper call, and the only change on any request
 path is an in-memory capture flag on each sandbox slot that is never set. Creating a sandbox from a checkpoint is not reachable
 yet (milestone C5a-2).

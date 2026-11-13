@@ -343,8 +343,10 @@ fn assert_migration_preserves(dir: &Path) {
     assert_eq!(
         conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        15
+        16
     );
+    // Schema 16: the barrier's marker table, empty.
+    assert!(table_snapshot(&conn, "checkpoint_barrier").is_empty());
     let after = schema14_facts(&conn, sandbox_columns, request_columns);
     // The startup full audit settles anything released since the last one, exactly as
     // schema 14's own startup does: compare the settled aggregate to a recount.
@@ -579,13 +581,91 @@ fn a_newer_schema_is_refused() {
     let tmp = private_dir();
     drop(Store::open(tmp.path()).unwrap());
     let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
-    conn.pragma_update(None, "user_version", 16).unwrap();
+    conn.pragma_update(None, "user_version", 17).unwrap();
     drop(conn);
     let error = format!("{:#}", Store::open(tmp.path()).err().unwrap());
     assert!(
-        error.contains("schema version 16 is newer than this kilnd (15)"),
+        error.contains("schema version 17 is newer than this kilnd (16)"),
         "{error}"
     );
+}
+
+fn schema_sql(conn: &Connection) -> Vec<(String, String)> {
+    conn.prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+fn every_table(conn: &Connection) -> Vec<(String, Vec<Vec<Value>>)> {
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    tables
+        .into_iter()
+        .map(|t| {
+            let rows = table_snapshot(conn, &t);
+            (t, rows)
+        })
+        .collect()
+}
+
+/// Schema 15 to 16: a schema 15 database with checkpoints in every state, keys, pins
+/// and evidence (written by this Store's API; schema 15 is schema 16 without the
+/// barrier table, which is all migration 16 adds) keeps every row of every table and
+/// gains an empty `checkpoint_barrier`, and its schema is the fresh one.
+#[test]
+fn schema16_from_15_keeps_every_row_and_adds_an_empty_barrier() {
+    let f = fixture();
+    let dir = f._tmp.path().to_path_buf();
+    let Fixture { _tmp, store, .. } = f;
+    drop(store);
+    let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+    conn.execute_batch("DROP TABLE checkpoint_barrier; PRAGMA user_version = 15;")
+        .unwrap();
+    let before = every_table(&conn);
+    assert!(before.iter().any(|(t, rows)| t == "checkpoints" && rows.len() >= 5));
+    drop(conn);
+    let store = Store::reopen_after_restart(&dir);
+    let conn = store.conn();
+    assert_eq!(
+        conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+            .unwrap(),
+        16
+    );
+    let mut after = every_table(&conn);
+    after.retain(|(t, _)| t != "checkpoint_barrier");
+    assert_eq!(after, before);
+    assert!(table_snapshot(&conn, "checkpoint_barrier").is_empty());
+    assert_eq!(schema_sql(&conn), schema_sql(&Store::open_in_memory().unwrap().conn()));
+}
+
+/// The marker is one row, kept from its first set, and counts as checkpoint state.
+#[test]
+fn the_barrier_marker_is_one_row_and_counts_as_state() {
+    let (store, _) = store();
+    assert!(!store.checkpoint_state_exists().unwrap());
+    store.mark_checkpoint_barrier().unwrap();
+    let first = table_snapshot(&store.conn(), "checkpoint_barrier");
+    store.mark_checkpoint_barrier().unwrap();
+    assert_eq!(table_snapshot(&store.conn(), "checkpoint_barrier"), first);
+    assert_eq!(first.len(), 1);
+    assert!(store.checkpoint_state_exists().unwrap());
+    assert!(store.checkpoint_barrier_marked().unwrap());
+    assert!(
+        store
+            .conn()
+            .execute("INSERT INTO checkpoint_barrier VALUES (2, 0)", [])
+            .is_err()
+    );
+    store.clear_checkpoint_barrier().unwrap();
+    assert!(!store.checkpoint_state_exists().unwrap());
 }
 
 #[test]

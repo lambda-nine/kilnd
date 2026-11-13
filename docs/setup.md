@@ -440,6 +440,11 @@ when an upgrade fails. Once checkpoints exist, a database restored without its a
 or artifacts without their rows, leaves unexplained artifacts that block new disk
 allocation until reconciled; they are never adopted or swept as free space.
 
+Schema 16 adds one table, the checkpoint barrier's durable marker (see
+[architecture.md](architecture.md#workspace-checkpoint-engine-milestone-c5a)); schema 15
+rows are unchanged and older binaries refuse schema 16. Rollback is the same database
+backup restore.
+
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart. On a Firecracker node this is a transaction; see above.
 - **State path:** `--state-dir` must be absolute. Its real ancestors must be

@@ -47,7 +47,7 @@ pub use checkpoint::{
     MIN_CHECKPOINT_EXPIRY_MS, MIN_CHECKPOINT_HISTORY_SECS,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -2017,14 +2017,17 @@ impl Store {
             tx.execute_batch(MIGRATE_V14)?;
         }
         // Checkpoint design 9: audit the existing sandbox membership as it stands before
-        // schema 15 changes anything. Schema 15 adds no membership column, so a schema
-        // 12-14 database keeps its aggregates byte for byte.
+        // schema 15 or 16 changes anything. Neither adds a membership column, so a
+        // schema 12-15 database keeps its aggregates byte for byte.
         if version >= 12 {
             verify_sandbox_membership(&tx).with_context(|| {
                 format!("schema {version} reservation membership does not match; refusing to migrate to schema {SCHEMA_VERSION}")
             })?;
         }
-        tx.execute_batch(checkpoint::MIGRATE_V15)?;
+        if version < 15 {
+            tx.execute_batch(checkpoint::MIGRATE_V15)?;
+        }
+        tx.execute_batch(checkpoint::MIGRATE_V16)?;
         audit_accounting_full(&tx)?;
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;

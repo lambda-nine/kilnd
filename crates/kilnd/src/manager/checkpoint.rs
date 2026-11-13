@@ -429,18 +429,39 @@ impl<R: Runtime> Manager<R> {
     }
 
     /// Sets or clears the checkpoint barrier, under the presence lock, so no prune
-    /// runs across the change (see [`Self::prune_under_barrier`]).
-    pub(super) fn set_checkpoint_barrier(&self, blocked: bool) {
+    /// runs across the change (see [`Self::prune_under_barrier`]). Its durable marker
+    /// (schema 16) is the obligation a restart reads, rows or none: setting blocks in
+    /// memory first, so nothing is admitted while the marker is written, and writes the
+    /// marker before the verdict is reported; clearing deletes the marker first, so a
+    /// failure keeps allocation blocked and a crash costs only one more inventory. With
+    /// nothing durable (`present` false, recounted at startup), clearing makes no query.
+    pub(super) fn set_checkpoint_barrier(&self, blocked: bool) -> Result<()> {
         let _presence = self.presence();
-        self.checkpoint
-            .barrier_blocked
-            .store(blocked, Ordering::Relaxed);
+        let engine = &self.checkpoint;
+        if blocked {
+            engine.barrier_blocked.store(true, Ordering::Relaxed);
+            self.db().mark_checkpoint_barrier()?;
+            engine.present.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        if engine.present.load(Ordering::Relaxed) {
+            self.db().clear_checkpoint_barrier()?;
+            engine.barrier_blocked.store(false, Ordering::Relaxed);
+            // The marker may have been the last durable state: the fast path returns.
+            // A failed recount leaves `present` set, which only costs queries.
+            if let Err(e) = self.recount_presence() {
+                warn!(error = %format!("{e:#}"), "could not recount checkpoint state after the barrier cleared");
+            }
+        } else {
+            engine.barrier_blocked.store(false, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Retention's prune. While the barrier is blocked it keeps every checkpoint row
-    /// and capture key: the barrier itself is only in memory, so those rows are the
-    /// durable obligation a restart reconciles; only a complete clean inventory, which
-    /// clears the barrier, lets prune remove the last one (design 10.2). The barrier
+    /// and capture key, with the barrier's marker (never pruned), for the restart to
+    /// reconcile; only a complete clean inventory, which clears the barrier, lets prune
+    /// remove the last one (design 10.2). The barrier
     /// read, the prune and the recount share the presence lock with the barrier's set
     /// and clear. Startup sets the barrier before main's first prune, so no prune ran
     /// before it was set.
@@ -1732,9 +1753,13 @@ impl<R: Runtime> Manager<R> {
                     warn!(error = %format!("{e:#}"), "could not resume checkpoint timers and removals");
                 }
                 if !blocked {
-                    manager.set_checkpoint_barrier(false);
-                    info!("checkpoint reconciliation is clean; new allocations are admitted");
-                    break;
+                    match manager.set_checkpoint_barrier(false) {
+                        Ok(()) => {
+                            info!("checkpoint reconciliation is clean; new allocations are admitted");
+                            break;
+                        }
+                        Err(e) => warn!(error = %format!("{e:#}"), "could not clear the checkpoint barrier's marker; allocation stays blocked"),
+                    }
                 }
                 delay = (delay * 2).min(limits.max_removal_retry);
             }

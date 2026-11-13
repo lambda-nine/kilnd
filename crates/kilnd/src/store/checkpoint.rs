@@ -17,7 +17,7 @@ use crate::checkpoint::{
 };
 use crate::model::{CheckpointProvenance, ImageIdentity};
 
-pub(super) use super::checkpoint_schema::MIGRATE_V15;
+pub(super) use super::checkpoint_schema::{MIGRATE_V15, MIGRATE_V16};
 
 /// The approved defaults (design 6.2; decision 4).
 pub const DEFAULT_MAX_CHECKPOINT_BYTES: u64 = 1 << 30;
@@ -2285,11 +2285,39 @@ impl Store {
         })
     }
 
-    /// Whether any durable checkpoint state exists: a row in any state, or a capture
-    /// key record. Read-only; the feature-off startup's only checkpoint query.
+    /// Whether any durable checkpoint state exists: a row in any state, a capture key
+    /// record, or the barrier's marker. Read-only; the feature-off startup's only
+    /// checkpoint query.
     pub fn checkpoint_state_exists(&self) -> Result<bool> {
         Ok(self.conn().query_row(
-            "SELECT EXISTS (SELECT 1 FROM checkpoints) OR EXISTS (SELECT 1 FROM checkpoint_requests)",
+            "SELECT EXISTS (SELECT 1 FROM checkpoints) OR EXISTS (SELECT 1 FROM checkpoint_requests)
+                 OR EXISTS (SELECT 1 FROM checkpoint_barrier)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Writes the checkpoint barrier's durable marker (schema 16), keeping the first
+    /// time it was set; committed before the call returns.
+    pub fn mark_checkpoint_barrier(&self) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO checkpoint_barrier (id, set_at_ms) VALUES (1, ?1)",
+            [now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the barrier's marker: only after a complete clean inventory.
+    pub fn clear_checkpoint_barrier(&self) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM checkpoint_barrier", [])?;
+        Ok(())
+    }
+
+    /// Whether the barrier's marker is set (tests and diagnostics).
+    pub fn checkpoint_barrier_marked(&self) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM checkpoint_barrier)",
             [],
             |r| r.get(0),
         )?)

@@ -460,3 +460,14 @@ CREATE TRIGGER create_requests_digest_version BEFORE INSERT ON create_requests
 WHEN NEW.digest_version IS NOT (SELECT CASE WHEN from_checkpoint IS NULL THEN 1 ELSE 2 END FROM sandboxes WHERE id = NEW.sandbox_id)
 BEGIN SELECT RAISE(ABORT, 'a create request digest is version 2 exactly for a create from a checkpoint'); END;
 PRAGMA user_version = 15;";
+
+// Schema 16 (C5a-1 round 5): the checkpoint barrier's durable obligation, apart from any
+// row. Reconciliation writes the one row when it blocks and only a complete clean
+// inventory deletes it; retention never touches it. Startup reads it in the same single
+// existence query as the checkpoint rows and keys.
+pub(super) const MIGRATE_V16: &str = "
+CREATE TABLE checkpoint_barrier (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    set_at_ms INTEGER NOT NULL CHECK (typeof(set_at_ms) = 'integer')
+);
+PRAGMA user_version = 16;";
