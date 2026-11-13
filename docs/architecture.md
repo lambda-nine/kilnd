@@ -1125,10 +1125,12 @@ does not disappear if the transport exits early. At the deadline kilnd
 cancels running executions (recorded as `CANCELED`); after a fixed 10-second
 reply deadline it stops waiting for transport replies but continues draining
 accepted create, compensation, and execution supervisors before removing the
-socket and exiting. Thus the reply deadline does not bound owned cleanup.
-Sandboxes keep running. Forced termination can still interrupt an operation;
-startup reconciliation handles the state it can identify. After all accepted
-operations drain, kilnd conditionally removes only its own socket generation and
+socket and exiting. Thus the reply deadline does not bound owned cleanup; a
+daemon-side limit of 240 s from the start of shutdown does, below the units'
+`TimeoutStopSec=300`: past it kilnd logs the operations still running and exits,
+and startup recovery owns what they leave. Sandboxes keep running. Forced
+termination can still interrupt an operation; startup reconciliation handles the
+state it can identify. After all accepted operations drain (or the limit), kilnd conditionally removes only its own socket generation and
 then releases the socket- and state-directory locks. A crash releases the
 kernel locks but can leave a stale socket for the next instance to probe.
 
@@ -1364,9 +1366,11 @@ switch gates only new work: an unkeyed capture, or a keyed one whose key has no 
 Checkpoints that already exist are maintained with it off (design 11.1): when startup's
 one existence check finds any row or capture key, expiry, removal, the cross-boot rebase
 of anchors and keys, and reconciliation all run, and a key with a record is answered from
-it. With it off and nothing durable, startup makes that one query and no helper call, and
-the only change on any request path is an in-memory capture flag on each sandbox slot
-that is never set. Creating a sandbox from a checkpoint is not reachable
+it. That presence is recounted before each barrier retry and after a prune removes rows
+or keys, under a lock C1's insert also takes, so it falls once the last row and key are
+pruned and never hides a capture admitted meanwhile. With it off and nothing durable,
+startup makes that one query and no helper call, and the only change on any request
+path is an in-memory capture flag on each sandbox slot that is never set. Creating a sandbox from a checkpoint is not reachable
 yet (milestone C5a-2).
 
 **Capture** (`capture_checkpoint`, design 4.1, 8.2 and 10). C0 resolves the required
@@ -1390,8 +1394,9 @@ capture's worker reaped and its storage absent. Shutdown is no exception: it ans
 waiter `ShuttingDown`, cancels the capture, takes the helper's reply, records
 `checkpoint_io` and removes the storage, with helper calls bounded by their own deadlines
 rather than by shutdown, so the source is released and the drain completes only after
-ABSENT (the drain waits for it past the shutdown grace; the unit's `TimeoutStopSec` is the
-outer bound, and startup removes whatever a killed daemon left). The capture runs as a tracked
+ABSENT (the drain waits for it past the shutdown grace, up to the daemon's 240 s drain
+limit; past it kilnd exits and startup recovery takes over, holding the source as
+**Startup** describes). The capture runs as a tracked
 operation. A caller that leaves before C1 commits stops it with nothing allocated (no
 row, charge, key or identity); from C1 on, a caller that leaves only detaches. Keyed captures use their own namespace
 (`kilnd.v1.checkpoint-request.1`, `idempotency::capture_request_digest`): the record is
@@ -1422,8 +1427,8 @@ activity sequence) and takes the same removal. A reboot rebases the READY, activ
 intent anchors once, by the wall time elapsed and clamped to the policy, as sandboxes do.
 
 **Startup** (design 10.2). The barrier reads every charged row first, then needs a helper
-session (with the feature on, a failed one blocks new allocations whatever the rows say;
-with it off, only when charged rows exist) and a complete inventory. An artifact, partial
+session (a failed one blocks new allocations whatever the rows say: the feature is on, or
+durable state exists) and a complete inventory. An artifact, partial
 or worker no charged row explains, or an incomplete or unavailable inventory, blocks new
 allocations, and so does any tracked helper activity its row does not explain: another
 generation, a capture that is not the CAPTURING row's own operation, a removal or
@@ -1433,8 +1438,14 @@ failed (a complete artifact without its READY row is discarded, never promoted).
 row is quarantined with its charge only on an authoritative answer (a record that does
 not match its seal, a corrupt or other-generation artifact, a partial, or nothing
 listed); an I/O failure, a withheld or busy artifact, a transport failure or an
-unexpected reply keeps it READY and charged and blocks new allocations. The sweeper then
-starts the removal of every DELETING row and failed capture. This barrier's block is its
+unexpected reply keeps it READY and charged and blocks new allocations. A sandbox that is
+the source of a charged CAPTURING checkpoint (not this process's live capture) is never
+removed first: before sandbox reconciliation, startup finds those sources and keeps a
+DELETING one DELETING (no garbage collection either), saying which checkpoint it waits
+for, and a later Delete or expiry of such a source does the same; allocation stays
+blocked while one waits. The sweeper then starts the removal of every DELETING row and
+failed capture; when a failed capture's removal stores ABSENT, its supervisor re-drives
+the held source's delete. This barrier's block is its
 own (`barrier_blocked`, apart from the sandbox reconciliation's and a removal's
 `admission_blocked`): while it is set, a tracked retry reruns the whole pass with backoff
 (the removal backoff, 1 s to 60 s by default), resumes timers and removals after each,

@@ -949,7 +949,15 @@ impl<R: Runtime> Manager<R> {
     }
 
     pub fn prune(&self) -> Result<crate::retention::Pruned> {
-        Ok(self.store.prune(&self.limits.retention, now_ms())?)
+        let pruned = self.store.prune(&self.limits.retention, now_ms())?;
+        // The last checkpoint row or key may be gone: with the feature off, that
+        // restores the no-query fast path (checkpoint design 11.1).
+        if (pruned.checkpoints != 0 || pruned.checkpoint_requests != 0)
+            && self.checkpoint.present.load(Ordering::Relaxed)
+        {
+            self.refresh_checkpoint_presence()?;
+        }
+        Ok(pruned)
     }
 
     pub fn runtime(&self) -> &R {
@@ -1027,12 +1035,21 @@ impl<R: Runtime> Manager<R> {
     /// removes a sandbox kilnd didn't create, and never marks anything lost
     /// unless the backend's list succeeded.
     pub async fn reconcile(&self) -> Result<Reconciled> {
+        // Checkpoint design 8.2: a source an interrupted capture may still read is not
+        // removed before that capture's storage is proved absent.
+        self.refresh_checkpoint_presence()?;
+        let held = self.held_sources()?;
         let cancel = CancellationToken::new();
         self.runtime
             .version(Instant::now() + self.limits.health_probe_timeout, &cancel)
             .await
             .map_err(backend)?;
         let sandboxes = self.store.sandboxes(true)?;
+        let held_backends: HashSet<&str> = sandboxes
+            .iter()
+            .filter(|s| held.contains_key(&s.id))
+            .filter_map(|s| s.backend_id.as_deref())
+            .collect();
         // Reconciliation may clean or explain only IDs whose lifecycle can
         // still own a backend. A compensated FAILED row retained for history
         // proved its former backend absent; if that ID reappears, it is
@@ -1066,6 +1083,7 @@ impl<R: Runtime> Manager<R> {
                 record.status == BackendStatus::Stale
                     && known.contains(*id)
                     && !fenced_ids.contains(*id)
+                    && !held_backends.contains(id.as_str())
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1124,7 +1142,8 @@ impl<R: Runtime> Manager<R> {
             }
             if s.is_fenced() {
                 if let Some(evidence) = fenced_evidence.remove(&s.id) {
-                    self.reconcile_fenced(s, evidence, &mut out).await?;
+                    let hold = held.get(&s.id);
+                    self.reconcile_fenced(s, evidence, hold, &mut out).await?;
                 }
                 continue;
             }
@@ -1162,6 +1181,12 @@ impl<R: Runtime> Manager<R> {
                         )?;
                         out.lost.push(s.id);
                     }
+                }
+                (SandboxState::Deleting, Some(b))
+                    if live.contains_key(b) && held.contains_key(&s.id) =>
+                {
+                    self.hold_deleting_source(&s.id, &held[&s.id])?;
+                    out.still_deleting.push(s.id);
                 }
                 (SandboxState::Deleting, Some(b)) if live.contains_key(b) => match self
                     .remove_legacy(b)
@@ -1441,6 +1466,7 @@ impl<R: Runtime> Manager<R> {
         &self,
         sandbox: Sandbox,
         evidence: FencedEvidence,
+        held: Option<&crate::checkpoint::CheckpointId>,
         out: &mut Reconciled,
     ) -> Result<()> {
         let id = sandbox.id.clone();
@@ -1494,6 +1520,11 @@ impl<R: Runtime> Manager<R> {
                 out.deleted.push(id.clone());
             }
             out.released.push(id);
+            return Ok(());
+        }
+        if let (SandboxState::Deleting, Some(checkpoint)) = (sandbox.state, held) {
+            self.hold_deleting_source(&id, checkpoint)?;
+            out.still_deleting.push(id);
             return Ok(());
         }
         match sandbox.state {
@@ -3019,6 +3050,11 @@ impl<R: Runtime> Manager<R> {
         let sandbox = self.prepare_delete(id, self.load(id)?)?;
         if sandbox.state == SandboxState::Deleted {
             return Ok(sandbox);
+        }
+        // Checkpoint design 8.2: an interrupted capture may still read this source.
+        if let Some(checkpoint) = self.held_sources()?.remove(id) {
+            let reason = self.hold_deleting_source(id, &checkpoint)?;
+            return Err(Error::Backend(format!("delete sandbox {id}: {reason}")));
         }
 
         if sandbox.is_fenced() {

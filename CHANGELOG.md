@@ -15,6 +15,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   blocks on a failed capability probe and on tracked helper activity no row explains,
   and retries until clean with no restart; shutdown removes a running capture before
   releasing its source; a caller that leaves before C1 allocates nothing.
+- Close three variants the checkpoint engine's recheck found: any durable checkpoint
+  state makes a failed helper session block allocation until a clean retry; presence
+  falls again when the last row and key are pruned (recounted under the lock C1's insert
+  takes), restoring the no-query path with the feature off; startup and Delete never
+  remove a source an interrupted capture may still read, the capture's removal re-drives
+  the source's delete, and shutdown stops draining after 240 s.
 - Add milestone C5a of workspace checkpoints, the daemon's engine, reachable only from
   Rust and off unless `Limits::checkpoints` is set: supervised capture (source gate
   against Exec, Delete and both expiries; READY only with the capture's own COMPLETE

@@ -20,7 +20,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::Connected;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::admission::{ConnectionLane, ConnectionPermit};
 use crate::lock::ExclusiveFileLock;
@@ -35,6 +35,10 @@ use crate::sys::socket::{
 /// How long to wait for in-flight requests after running executions were
 /// canceled, before exiting regardless.
 const FINAL_WAIT: Duration = Duration::from_secs(10);
+/// How long shutdown drains manager-owned operations in all before exiting anyway:
+/// below the units' `TimeoutStopSec=300`, so the daemon exits on its own terms, and
+/// startup recovery owns whatever is left.
+const SHUTDOWN_DRAIN_LIMIT: Duration = Duration::from_secs(240);
 const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// When a request's HTTP/2 headers reached the service, and the `grpc-timeout` those
@@ -470,6 +474,25 @@ async fn serve_with_final_wait<R: Runtime>(
     grace: Duration,
     final_wait: Duration,
 ) -> Result<()> {
+    serve_with_limits(
+        manager,
+        listener,
+        shutdown,
+        grace,
+        final_wait,
+        SHUTDOWN_DRAIN_LIMIT,
+    )
+    .await
+}
+
+async fn serve_with_limits<R: Runtime>(
+    manager: Arc<Manager<R>>,
+    listener: UnixListener,
+    shutdown: impl Future<Output = ()>,
+    grace: Duration,
+    final_wait: Duration,
+    drain_limit: Duration,
+) -> Result<()> {
     let admission = manager.admission().clone();
     let limits = manager.limits();
     let max_streams = limits.max_streams_per_connection;
@@ -542,6 +565,7 @@ async fn serve_with_final_wait<R: Runtime>(
         () = &mut shutdown => None,
     };
     let requested = server_result.is_none();
+    let started = tokio::time::Instant::now();
     info!(
         grace_secs = grace.as_secs(),
         "shutting down: refusing new work, waiting for requests and owned operations"
@@ -584,8 +608,14 @@ async fn serve_with_final_wait<R: Runtime>(
             }
         }
     }
-    if !operations_done {
-        operations.await;
+    if !operations_done
+        && tokio::time::timeout_at(started + drain_limit, &mut operations)
+            .await
+            .is_err()
+    {
+        error!(
+            "operations still running at the shutdown drain limit; exiting, startup recovers them"
+        );
     }
     match server_result {
         Some(result) => result.context("serve"),
@@ -1078,6 +1108,45 @@ mod tests {
         drop(store);
         let next = bind(&alternate, None).await.unwrap();
         drop(next);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_stops_at_its_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = tmp.path().join("run/kilnd.sock");
+        let fake = FakeRuntime::default();
+        let remove_gate = FakeGate::default();
+        fake.state().remove_before_delete = Some(remove_gate.clone());
+        let store = Store::open(&tmp.path().join("state")).unwrap();
+        store.reject_ready_updates().unwrap();
+        let manager = Arc::new(Manager::new(fake.clone(), store, Limits::default()));
+        // A create's compensation that never finishes: its removal is never released.
+        let waiter = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.create(CreateRequest::default()).await }
+        });
+        remove_gate.entered().await;
+        waiter.abort();
+        let BoundSocket {
+            listener,
+            path_guard: _path_guard,
+        } = bind(&socket, None).await.unwrap();
+        let server = tokio::spawn(serve_with_limits(
+            manager.clone(),
+            listener,
+            async {},
+            Duration::ZERO,
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("shutdown stops draining at its limit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(manager.list(true).unwrap()[0].state, SandboxState::Deleting);
+        remove_gate.release();
     }
 
     #[tokio::test]

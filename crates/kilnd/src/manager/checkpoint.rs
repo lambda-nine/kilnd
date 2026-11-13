@@ -243,6 +243,9 @@ pub(super) struct CheckpointEngine {
     /// Durable checkpoint state exists (a row or a capture key): it is maintained,
     /// and its keys answered, with the feature off (design 11.1).
     pub(super) present: AtomicBool,
+    /// Held around C1's insert and every recount of `present`, so a recount that finds
+    /// nothing can never hide a capture admitted while it ran.
+    presence: Mutex<()>,
     /// The checkpoint barrier's part of the allocation block (design 10.2), apart from
     /// `Manager::admission_blocked`. Only startup and the barrier retry write it.
     pub(super) barrier_blocked: AtomicBool,
@@ -377,6 +380,73 @@ impl<R: Runtime> Manager<R> {
     pub(super) fn allocation_blocked(&self) -> bool {
         self.admission_blocked.load(Ordering::Relaxed)
             || self.checkpoint.barrier_blocked.load(Ordering::Relaxed)
+    }
+
+    /// Recounts whether durable checkpoint state exists: at startup, before each
+    /// barrier retry, and after a prune removed rows or keys. C1 inserts under the same
+    /// lock, so it either committed before the read, which sees it, or sets `present`
+    /// after it.
+    pub(super) fn refresh_checkpoint_presence(&self) -> Result<()> {
+        let _presence = self
+            .checkpoint
+            .presence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let exists = self.db().checkpoint_state_exists()?;
+        self.checkpoint.present.store(exists, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn live_captures(&self) -> HashSet<String> {
+        self.checkpoint
+            .captures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// The charged CAPTURING checkpoints that are not this process's live captures, by
+    /// source sandbox: a helper worker may still read each source, so its storage must
+    /// be proved absent before the source is removed (design 8.2). Nothing maintained,
+    /// no query.
+    pub(super) fn held_sources(&self) -> Result<HashMap<String, CheckpointId>> {
+        if !self.maintained() {
+            return Ok(HashMap::new());
+        }
+        let live = self.live_captures();
+        Ok(self
+            .db()
+            .unsettled_checkpoints()?
+            .into_iter()
+            .filter(|c| {
+                c.state == CheckpointState::Capturing
+                    && c.is_charged()
+                    && !live.contains(c.id.as_str())
+            })
+            .map(|c| (c.source_sandbox_id, c.id))
+            .collect())
+    }
+
+    /// Keeps a held source DELETING, saying why; its removal resumes once the capture
+    /// is released (see [`Self::spawn_removal`]).
+    pub(super) fn hold_deleting_source(
+        &self,
+        id: &str,
+        checkpoint: &CheckpointId,
+    ) -> Result<String> {
+        let reason =
+            format!("held until checkpoint {checkpoint}'s capture storage is proved absent");
+        warn!(sandbox = %id, checkpoint = %checkpoint, "source removal held until its interrupted capture is absent");
+        self.store.compare_and_set_sandbox_state(
+            id,
+            SandboxState::Deleting,
+            SandboxState::Deleting,
+            None,
+            Some(&reason),
+        )?;
+        Ok(reason)
     }
 
     fn maintenance_limits(&self) -> CheckpointLimits {
@@ -753,17 +823,23 @@ impl<R: Runtime> Manager<R> {
         if waiter_gone.is_cancelled() {
             return send(Err(departed()));
         }
+        let presence = self
+            .checkpoint
+            .presence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let reserved = self.db().reserve_checkpoint(
             &new,
             &limits.budgets,
             self.sandbox_budgets(),
             admission.as_ref(),
         );
+        if matches!(reserved, Ok(ReserveCheckpoint::Inserted(_))) {
+            self.checkpoint.present.store(true, Ordering::Relaxed);
+        }
+        drop(presence);
         let checkpoint = match reserved {
-            Ok(ReserveCheckpoint::Inserted(c)) => {
-                self.checkpoint.present.store(true, Ordering::Relaxed);
-                *c
-            }
+            Ok(ReserveCheckpoint::Inserted(c)) => *c,
             Ok(refused) => {
                 self.checkpoint
                     .rejected_captures
@@ -1299,14 +1375,15 @@ impl<R: Runtime> Manager<R> {
     /// pin on it) must always reach ABSENT. `first` gets the first attempt's answer;
     /// `release_request_id` releases the capture key once DELETED, before answering.
     /// `cancel` bounds the helper calls and ends the retries: shutdown for a background
-    /// supervisor (startup resumes it), never for a capture's own cleanup.
+    /// supervisor (startup resumes it), never for a capture's own cleanup. Returns the
+    /// released row.
     async fn remove_until_absent(
         &self,
         id: &str,
         mut first: Option<oneshot::Sender<Result<Checkpoint>>>,
         release_request_id: bool,
         cancel: &CancellationToken,
-    ) {
+    ) -> Option<Checkpoint> {
         let limits = self.maintenance_limits();
         let mut delay = limits.removal_retry;
         let mut answer = |result: Result<Checkpoint>| {
@@ -1324,16 +1401,23 @@ impl<R: Runtime> Manager<R> {
                     if let Err(e) = &released {
                         warn!(checkpoint = %id, error = %format!("{e:#}"), "could not release the deleted checkpoint's capture key");
                     }
-                    return answer(released.map(|()| *c).map_err(Error::from));
+                    answer(released.map(|()| (*c).clone()).map_err(Error::from));
+                    return Some(*c);
                 }
-                Removal::NotRemovable(c) => return answer(Err(not_removable(&c))),
-                Removal::Blocked(e) => return answer(Err(e)),
+                Removal::NotRemovable(c) => {
+                    answer(Err(not_removable(&c)));
+                    return None;
+                }
+                Removal::Blocked(e) => {
+                    answer(Err(e));
+                    return None;
+                }
                 Removal::Retry(e) => e,
             };
             warn!(checkpoint = %id, error = %error, delay_ms = delay.as_millis() as u64, "checkpoint removal will be retried; its charge is kept");
             answer(Err(error));
             tokio::select! {
-                () = cancel.cancelled() => return,
+                () = cancel.cancelled() => return None,
                 () = tokio::time::sleep(delay) => {}
             }
             delay = (delay * 2).min(limits.max_removal_retry);
@@ -1363,7 +1447,7 @@ impl<R: Runtime> Manager<R> {
         let id = id.to_string();
         self.operations.spawn(async move {
             let cancel = manager.shutting_down.child_token();
-            manager
+            let released = manager
                 .remove_until_absent(&id, first, release_request_id, &cancel)
                 .await;
             manager
@@ -1372,6 +1456,17 @@ impl<R: Runtime> Manager<R> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id);
+            // A failed capture's source whose removal was held for this ABSENT (after a
+            // restart) is removed now; a failure leaves it DELETING for a later Delete.
+            let Some(c) = released.filter(|c| c.failure.is_some()) else {
+                return;
+            };
+            let source = c.source_sandbox_id.as_str();
+            if matches!(manager.store.sandbox(source), Ok(Some(s)) if s.state == SandboxState::Deleting)
+                && let Err(e) = manager.delete(source).await
+            {
+                warn!(sandbox = %source, error = %e, "the held source's delete failed; it stays DELETING");
+            }
         });
         true
     }
@@ -1569,7 +1664,11 @@ impl<R: Runtime> Manager<R> {
                     () = manager.shutting_down.cancelled() => break,
                     () = tokio::time::sleep(delay) => {}
                 }
-                let blocked = manager.reconcile_checkpoints().await.unwrap_or_else(|e| {
+                let pass = match manager.refresh_checkpoint_presence() {
+                    Ok(()) => manager.reconcile_checkpoints().await,
+                    Err(e) => Err(e),
+                };
+                let blocked = pass.unwrap_or_else(|e| {
                     warn!(error = %format!("{e:#}"), "checkpoint reconciliation failed; allocation stays blocked");
                     true
                 });
@@ -1602,11 +1701,9 @@ impl<R: Runtime> Manager<R> {
     /// C4 is discarded, never promoted); a READY row whose artifact is authoritatively
     /// missing, corrupt or another generation's is quarantined; anything unknown keeps
     /// its row and charge and blocks allocation. Returns whether allocation stays
-    /// blocked. With the feature off and no durable state: one existence check.
+    /// blocked. With the feature off and no durable state (`present`, recounted by the
+    /// caller): no query.
     pub(super) async fn reconcile_checkpoints(&self) -> Result<bool> {
-        if self.db().checkpoint_state_exists()? {
-            self.checkpoint.present.store(true, Ordering::Relaxed);
-        }
         if !self.maintained() {
             return Ok(false);
         }
@@ -1632,24 +1729,13 @@ impl<R: Runtime> Manager<R> {
         for c in charged {
             rows.entry(c.id.to_string()).or_insert(c);
         }
-        let live: HashSet<String> = self
-            .checkpoint
-            .captures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect();
+        let live = self.live_captures();
         let session = match self.checkpoint_session().await {
             Ok(s) => s,
             Err(e) => {
-                // Enabled, storage no row names may exist whatever the rows say; off,
-                // only charged rows need the helper.
-                let blocked = self.limits.checkpoints.is_some() || !rows.is_empty();
-                if blocked {
-                    warn!(error = %e, "checkpoint reconciliation could not reach the helper; allocation blocked");
-                }
-                return Ok(blocked);
+                // On, or with any durable state: storage no row names may exist.
+                warn!(error = %e, "checkpoint reconciliation could not reach the helper; allocation blocked");
+                return Ok(true);
             }
         };
         let mut blocked = false;
@@ -1703,16 +1789,22 @@ impl<R: Runtime> Manager<R> {
             }
         }
         for c in rows.values() {
-            if c.state == CheckpointState::Capturing
-                && c.failure.is_none()
-                && !live.contains(c.id.as_str())
-            {
+            if c.state != CheckpointState::Capturing || live.contains(c.id.as_str()) {
+                continue;
+            }
+            if c.failure.is_none() {
                 self.db().record_checkpoint_failure_token(
                     c.id.as_str(),
                     CheckpointReason::Io.token(),
                     "kilnd stopped during the capture; its storage is removed",
                     false,
                 )?;
+            }
+            // Its source's removal waits for this capture's ABSENT: until then, block.
+            let source = self.store.sandbox(&c.source_sandbox_id)?;
+            if source.is_some_and(|s| s.state == SandboxState::Deleting) {
+                warn!(checkpoint = %c.id, sandbox = %c.source_sandbox_id, "a source waits for its interrupted capture's removal; allocation blocked");
+                blocked = true;
             }
         }
         for c in rows.values().filter(|c| c.state == CheckpointState::Ready) {

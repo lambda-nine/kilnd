@@ -244,10 +244,11 @@ authority, exactly as for sandbox reservations: a mismatch or invalid evidence d
 accounting and refuses capture and sandbox Create, and never frees capacity. The
 evidence is the helper's certification, not an independent ledger. The engine keeps a
 capture's source gated until the helper proves the capture's worker reaped and its
-storage absent, shutdown included, and treats an artifact or helper operation it cannot
+storage absent, shutdown and a restart after a forced stop included (startup removes no
+source a charged, interrupted capture may still read), and treats an artifact or helper operation it cannot
 prove its own (a generation mismatch, an unreadable header, an inventory entry or tracked
 capture, removal, reader or tombstone no row explains, an inventory or capability probe
-that fails) as blocking new allocations, never as free space; an inspection that cannot
+that fails while any checkpoint state exists) as blocking new allocations, never as free space; an inspection that cannot
 read an artifact keeps it charged and blocks rather than condemning it.
 
 ## What it relies on kiln for
