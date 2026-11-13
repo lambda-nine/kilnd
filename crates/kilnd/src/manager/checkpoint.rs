@@ -364,6 +364,9 @@ fn may_see(c: &Checkpoint, uid: u32) -> bool {
 /// A capture that never sealed: CAPTURING, or DELETING through D1 from CAPTURING. Only
 /// the READY transition writes a seal, so a READY-origin DELETING row always has one.
 /// Until its release (authoritative ABSENT), a helper worker may still read its source.
+/// QUARANTINED is reached only from a sealed READY row (reconciliation's Inspect), so
+/// it never needs the hold; the store's broader CAPTURING to QUARANTINED transition is
+/// unused, and a caller that used it would have to extend this predicate.
 fn capture_origin(c: &Checkpoint) -> bool {
     c.seal.is_none()
         && matches!(
@@ -407,14 +410,54 @@ impl<R: Runtime> Manager<R> {
     /// lock, so it either committed before the read, which sees it, or sets `present`
     /// after it.
     pub(super) fn refresh_checkpoint_presence(&self) -> Result<()> {
-        let _presence = self
-            .checkpoint
+        let _presence = self.presence();
+        self.recount_presence()
+    }
+
+    fn presence(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.checkpoint
             .presence
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Under the presence lock.
+    fn recount_presence(&self) -> Result<()> {
         let exists = self.db().checkpoint_state_exists()?;
         self.checkpoint.present.store(exists, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Sets or clears the checkpoint barrier, under the presence lock, so no prune
+    /// runs across the change (see [`Self::prune_under_barrier`]).
+    pub(super) fn set_checkpoint_barrier(&self, blocked: bool) {
+        let _presence = self.presence();
+        self.checkpoint
+            .barrier_blocked
+            .store(blocked, Ordering::Relaxed);
+    }
+
+    /// Retention's prune. While the barrier is blocked it keeps every checkpoint row
+    /// and capture key: the barrier itself is only in memory, so those rows are the
+    /// durable obligation a restart reconciles; only a complete clean inventory, which
+    /// clears the barrier, lets prune remove the last one (design 10.2). The barrier
+    /// read, the prune and the recount share the presence lock with the barrier's set
+    /// and clear. Startup sets the barrier before main's first prune, so no prune ran
+    /// before it was set.
+    pub(super) fn prune_under_barrier(&self) -> Result<crate::retention::Pruned> {
+        let _presence = self.presence();
+        let blocked = self.checkpoint.barrier_blocked.load(Ordering::Relaxed);
+        let pruned = self
+            .store
+            .prune_history(&self.limits.retention, now_ms(), !blocked)?;
+        // The last checkpoint row or key may be gone: with the feature off and the
+        // barrier clean, that restores the no-query fast path (checkpoint design 11.1).
+        if (pruned.checkpoints != 0 || pruned.checkpoint_requests != 0)
+            && self.checkpoint.present.load(Ordering::Relaxed)
+        {
+            self.recount_presence()?;
+        }
+        Ok(pruned)
     }
 
     fn live_captures(&self) -> HashSet<String> {
@@ -839,11 +882,7 @@ impl<R: Runtime> Manager<R> {
         if waiter_gone.is_cancelled() {
             return send(Err(departed()));
         }
-        let presence = self
-            .checkpoint
-            .presence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let presence = self.presence();
         let reserved = self.db().reserve_checkpoint(
             &new,
             &limits.budgets,
@@ -1693,10 +1732,7 @@ impl<R: Runtime> Manager<R> {
                     warn!(error = %format!("{e:#}"), "could not resume checkpoint timers and removals");
                 }
                 if !blocked {
-                    manager
-                        .checkpoint
-                        .barrier_blocked
-                        .store(false, Ordering::Relaxed);
+                    manager.set_checkpoint_barrier(false);
                     info!("checkpoint reconciliation is clean; new allocations are admitted");
                     break;
                 }
@@ -1859,6 +1895,10 @@ impl<R: Runtime> Manager<R> {
             match intact {
                 Ok(true) => {}
                 Ok(false) => {
+                    // The only quarantine: QUARANTINED is reached from a sealed READY
+                    // row alone, never an unsealed capture, whose source hold
+                    // (`holds_its_source`) covers only CAPTURING and DELETING.
+                    debug_assert!(c.seal.is_some(), "quarantine of an unsealed row");
                     warn!(checkpoint = %c.id, "READY checkpoint's artifact is missing or does not match; quarantined, charge kept");
                     self.db().record_checkpoint_failure_token(
                         c.id.as_str(),

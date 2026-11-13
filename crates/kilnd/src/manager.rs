@@ -949,15 +949,7 @@ impl<R: Runtime> Manager<R> {
     }
 
     pub fn prune(&self) -> Result<crate::retention::Pruned> {
-        let pruned = self.store.prune(&self.limits.retention, now_ms())?;
-        // The last checkpoint row or key may be gone: with the feature off, that
-        // restores the no-query fast path (checkpoint design 11.1).
-        if (pruned.checkpoints != 0 || pruned.checkpoint_requests != 0)
-            && self.checkpoint.present.load(Ordering::Relaxed)
-        {
-            self.refresh_checkpoint_presence()?;
-        }
-        Ok(pruned)
+        self.prune_under_barrier()
     }
 
     pub fn runtime(&self) -> &R {
@@ -1255,9 +1247,7 @@ impl<R: Runtime> Manager<R> {
         out.checkpoints_blocked = self.reconcile_checkpoints().await?;
         self.admission_blocked
             .store(out.admission_blocked, Ordering::Relaxed);
-        self.checkpoint
-            .barrier_blocked
-            .store(out.checkpoints_blocked, Ordering::Relaxed);
+        self.set_checkpoint_barrier(out.checkpoints_blocked);
         out.admission_blocked |= out.checkpoints_blocked;
         out.unmanaged = live.into_keys().filter(|b| !known.contains(b)).collect();
         out.unmanaged.sort();

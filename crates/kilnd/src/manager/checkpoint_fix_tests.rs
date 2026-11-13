@@ -1085,10 +1085,11 @@ async fn pruning_after_a_failed_session_keeps_the_barrier_until_a_clean_inventor
     let (r, _) = startup_like_main(&m).await;
     assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
     age_out(&m, &c);
-    assert_eq!(m.prune().unwrap().checkpoints, 1);
-    assert!(!m.checkpoint.present.load(Ordering::Relaxed));
-    // Falling presence is no inventory: the retry keeps asking the helper. (With the
-    // feature off, the retry backs off on the default 1 s .. 60 s schedule.)
+    // Round 4: while blocked, retention keeps the row, the barrier's durable obligation.
+    assert_eq!(m.prune().unwrap().checkpoints, 0);
+    assert!(m.checkpoint.present.load(Ordering::Relaxed));
+    // The retry keeps asking the helper. (With the feature off, the retry backs off
+    // on the default 1 s .. 60 s schedule.)
     let before = calls(&fake, "capabilities");
     until_slow("a retry session", || calls(&fake, "capabilities") > before).await;
     assert!(create_is_blocked(&m).await);
@@ -1126,11 +1127,12 @@ async fn startup_prune_keeps_the_barrier_retry_running() {
     fake.checkpoints(|g| g.unavailable = true);
     let m = on_disk(&dir, &fake, &clock, &limits);
     age_out(&m, &c);
-    // Reconcile blocks, then startup's prune removes the last row before
-    // start_checkpoints: the retry starts anyway.
+    // Reconcile blocks, then startup's prune runs before start_checkpoints: it keeps
+    // the aged-out row while the barrier is blocked (round 4), and the retry starts.
     let (r, _) = startup_like_main(&m).await;
     assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
-    assert!(!m.checkpoint.present.load(Ordering::Relaxed));
+    assert!(m.store.checkpoint_state_exists().unwrap());
+    assert!(m.checkpoint.present.load(Ordering::Relaxed));
     assert!(m.checkpoint.barrier_retrying.load(Ordering::Relaxed));
     let inventories = calls(&fake, "inventory");
     fake.checkpoints(|g| g.unavailable = false);
@@ -1261,4 +1263,81 @@ async fn a_ready_checkpoint_deleting_holds_no_source() {
         fake.state().removed.contains(&backend),
         "a sealed checkpoint's source is removed as usual"
     );
+}
+
+// --- Round 4 (third recheck) ------------------------------------------------------------
+
+/// The barrier is only in memory, so a restart after retention removed its last row
+/// would forget it. While blocked, prune keeps checkpoint rows: the restart still
+/// reconciles, and blocks while the helper still reports an unexplained artifact.
+#[tokio::test]
+async fn a_restart_after_a_blocked_prune_still_reconciles() {
+    let (_tmp, dir, fake, clock, limits, _, c) = feature_off_with_settled_history().await;
+    fake.checkpoints(|g| {
+        g.inventory_extra.push(CheckpointId::random());
+        g.unavailable = true;
+    });
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+
+    age_out(&m, &c);
+    m.prune().unwrap();
+    assert!(m.checkpoint.barrier_blocked.load(Ordering::Relaxed));
+    assert!(create_is_blocked(&m).await);
+
+    let limits = stop(m).await;
+    let inventories = calls(&fake, "inventory");
+    // The helper is healthy again, but its unexplained artifact is still present.
+    fake.checkpoints(|g| g.unavailable = false);
+
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    assert!(calls(&fake, "inventory") > inventories);
+    assert!(create_is_blocked(&m).await);
+    assert!(m.store.checkpoint_state_exists().unwrap());
+}
+
+/// Control: once a clean inventory clears the barrier, prune removes the last row and
+/// the feature-off no-query fast path returns.
+#[tokio::test]
+async fn a_cleared_barrier_lets_prune_remove_the_last_row() {
+    let (_tmp, dir, fake, clock, limits, s, c) = feature_off_with_settled_history().await;
+    fake.checkpoints(|g| g.unavailable = true);
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked, "{r:?}");
+    fake.checkpoints(|g| g.unavailable = false);
+    until_allocation_opens(&m, "the retry clears once the helper recovers").await;
+    assert!(!m.checkpoint.barrier_blocked.load(Ordering::Relaxed));
+    age_out(&m, &c);
+    assert_eq!(m.prune().unwrap().checkpoints, 1);
+    assert!(!m.store.checkpoint_state_exists().unwrap());
+    assert!(!m.checkpoint.present.load(Ordering::Relaxed));
+    assert!(!m.maintained());
+    m.checkpoint.store_calls.store(0, Ordering::Relaxed);
+    let e = capture(&m, &s, 1000).await.unwrap_err();
+    assert_eq!(reason(&e), Some("backend_unsupported:workspace_checkpoint"));
+    m.create_owned(CreateRequest::default(), 1001)
+        .await
+        .unwrap();
+    assert_eq!(m.checkpoint.store_calls.load(Ordering::Relaxed), 0);
+}
+
+/// Blocked with no durable state (now unreachable through prune, forced here): a
+/// sandbox Delete may query the checkpoint store, and allocation stays blocked.
+#[tokio::test]
+async fn a_sandbox_delete_while_blocked_without_rows_stays_fail_closed() {
+    let (_tmp, dir, fake, clock, limits, s, _) = feature_off_with_settled_history().await;
+    fake.checkpoints(|g| g.unavailable = true);
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked, "{r:?}");
+    m.checkpoint.present.store(false, Ordering::Relaxed);
+    m.checkpoint.store_calls.store(0, Ordering::Relaxed);
+    m.delete(&s.id).await.unwrap();
+    assert!(m.checkpoint.store_calls.load(Ordering::Relaxed) > 0);
+    assert!(m.checkpoint.barrier_blocked.load(Ordering::Relaxed));
+    assert!(create_is_blocked(&m).await);
 }

@@ -3307,6 +3307,13 @@ impl Store {
     /// One atomic prune: terminal executions, then terminal uncharged sandbox
     /// history and its terminal children. Unknown states and unfinished rows stay.
     pub fn prune(&self, policy: &Retention, now: i64) -> Result<Pruned> {
+        self.prune_history(policy, now, true)
+    }
+
+    /// [`Self::prune`]; with `checkpoints` false, every checkpoint row and capture key
+    /// stays: while the checkpoint barrier is blocked they are its durable obligation,
+    /// so a restart still reconciles (checkpoint design 10.2).
+    pub fn prune_history(&self, policy: &Retention, now: i64, checkpoints: bool) -> Result<Pruned> {
         let cutoff = |secs: u64| -> Result<i64> {
             let ms = secs
                 .checked_mul(1000)
@@ -3360,8 +3367,10 @@ impl Store {
                     cutoff_boottime_ms: *cutoff,
                 },
             )?;
-            result.checkpoint_requests =
-                checkpoint::prune_checkpoint_requests(&tx, boot_id, *cutoff)?;
+            if checkpoints {
+                result.checkpoint_requests =
+                    checkpoint::prune_checkpoint_requests(&tx, boot_id, *cutoff)?;
+            }
         }
         tx.execute_batch("CREATE TEMP TABLE retention_sandboxes (id TEXT PRIMARY KEY);")?;
         // R4: a row with a record is pinned, outside both the age and the count.
@@ -3403,8 +3412,10 @@ impl Store {
         store_membership(&tx, all.minus(removed), settled.minus(removed))?;
         // Terminal checkpoint history: age only, at least a day (design 6.2); caps refuse
         // new work instead of pruning early.
-        let checkpoint_cutoff = cutoff(policy.sandbox_max_age_secs.max(MIN_CHECKPOINT_HISTORY_SECS))?;
-        result.checkpoints = checkpoint::prune_checkpoints(&tx, checkpoint_cutoff)?;
+        if checkpoints {
+            let checkpoint_cutoff = cutoff(policy.sandbox_max_age_secs.max(MIN_CHECKPOINT_HISTORY_SECS))?;
+            result.checkpoints = checkpoint::prune_checkpoints(&tx, checkpoint_cutoff)?;
+        }
         tx.commit()?;
         Ok(result)
     }

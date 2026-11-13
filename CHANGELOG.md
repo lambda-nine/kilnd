@@ -21,6 +21,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   takes), restoring the no-query path with the feature off; startup and Delete never
   remove a source an interrupted capture may still read, the capture's removal re-drives
   the source's delete, and shutdown stops draining after 240 s.
+- Close the checkpoint engine's third recheck: while the checkpoint barrier is blocked,
+  retention keeps every checkpoint row and capture key, so a restart before a clean
+  inventory still reconciles instead of admitting allocations beside an unexplained
+  artifact.
 - Close the checkpoint engine's second recheck: pruning the last row no longer clears a
   blocked barrier without a clean inventory, and startup keeps its retry running; a
   capture canceled by checkpoint Delete (D1) keeps its source held until ABSENT, and

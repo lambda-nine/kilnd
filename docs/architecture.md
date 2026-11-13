@@ -1372,7 +1372,11 @@ or keys, under a lock C1's insert also takes, so it falls once the last row and 
 pruned and never hides a capture admitted meanwhile. Falling presence never discharges a
 blocked barrier: while `barrier_blocked` is set the engine counts as maintained, so its
 retry (started at startup even if startup's prune just removed the last row) still takes
-a fresh session and a complete inventory, and only a clean one clears it. With it off and nothing durable,
+a fresh session and a complete inventory, and only a clean one clears it. The barrier
+itself is only in memory, so while it is blocked retention keeps every checkpoint row and
+capture key: they stay the durable obligation, a restart sees them and reconciles again,
+and only once a clean inventory clears the barrier may a prune remove the last one (the
+barrier's set and clear and that prune share the presence lock). With it off and nothing durable,
 startup makes that one query and no helper call, and the only change on any request
 path is an in-memory capture flag on each sandbox slot that is never set. Creating a sandbox from a checkpoint is not reachable
 yet (milestone C5a-2).
