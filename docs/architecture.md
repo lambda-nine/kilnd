@@ -1387,10 +1387,20 @@ rows it reconciles again; a crash after a clean inventory but before the delete 
 more inventory. A backend without the checkpoint group cannot inventory, so it never
 clears an outstanding marker: it reports the barrier blocked, logs why and runs no retry,
 and the operator switches back to a checkpoint backend, whose clean inventory clears it.
-A DELETING row whose removal found an artifact it cannot prove the row's (its failure
-token `checkpoint_corrupt` or `checkpoint_generation_mismatch`, C3) also blocks every
-pass until a removal proves the target ABSENT, so the in-memory block that removal set
-survives a restart. While blocked, retention also keeps every checkpoint row and capture key and
+A pass is clean only beside sealed rows and running captures: every charged row must be
+READY (its Inspect matching its seal) or QUARANTINED (design 10.2's verdict, its charge S
+kept), or a CAPTURING row whose capture runs in this process. Any other charged row (a
+dead or failed CAPTURING row, any DELETING row, whatever its failure token) has storage
+no removal has yet proved ABSENT, so the pass blocks until that removal releases the row;
+startup after a crash therefore blocks briefly while its resumed removals settle, and no
+failure token is read for admission. A removal whose helper answers Retained with
+`checkpoint_corrupt` or `checkpoint_generation_mismatch` (C3) arms the barrier itself
+(blocked in memory, then the marker) and starts its retry, whose backoff paces further
+removal attempts; once a removal proves ABSENT, a released row wakes the retry and its
+clean pass reopens allocation with no restart. That retry only ever clears the barrier's
+own flag, never the reconciliation latch `admission_blocked`. Each arm is counted, and a
+clear is refused when anything armed after the clearing pass's own arm, so a clean
+verdict that raced a Retained one cannot discharge it. While blocked, retention also keeps every checkpoint row and capture key and
 never touches the marker; only once a clean inventory clears the barrier may a prune
 remove the last row (the barrier's set and clear and that prune share the presence
 lock). With it off and nothing durable,

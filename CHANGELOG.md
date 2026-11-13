@@ -21,6 +21,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   takes), restoring the no-query path with the feature off; startup and Delete never
   remove a source an interrupted capture may still read, the capture's removal re-drives
   the source's delete, and shutdown stops draining after 240 s.
+- Close the checkpoint engine's sixth recheck with one rule: a checkpoint pass is clean
+  only if every charged row is sealed (READY or QUARANTINED) or a capture running in
+  this process, so a dead or failed capture and any DELETING row block allocation until
+  their removal proves ABSENT, across a restart too; a removal that finds an artifact it
+  cannot prove its row's arms the durable barrier and its retry, and that retry's clean
+  pass reopens allocation without a restart; a stale clean verdict cannot clear a later
+  arm.
 - Close the checkpoint engine's fifth recheck: the barrier's marker is written ahead,
   before any checkpoint helper pass at startup or in the retry, so a crash after a
   blocking verdict cannot lose it; a backend without checkpoints keeps an outstanding

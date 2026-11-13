@@ -1247,7 +1247,7 @@ impl<R: Runtime> Manager<R> {
         out.checkpoints_blocked = self.reconcile_checkpoints().await?;
         self.admission_blocked
             .store(out.admission_blocked, Ordering::Relaxed);
-        self.set_checkpoint_barrier(out.checkpoints_blocked)?;
+        out.checkpoints_blocked = self.set_checkpoint_barrier(out.checkpoints_blocked)?;
         out.admission_blocked |= out.checkpoints_blocked;
         out.unmanaged = live.into_keys().filter(|b| !known.contains(b)).collect();
         out.unmanaged.sort();

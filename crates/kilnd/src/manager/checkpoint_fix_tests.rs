@@ -187,7 +187,7 @@ async fn feature_off_still_expires_existing_checkpoints() {
 }
 
 #[tokio::test]
-async fn feature_off_resumes_a_pending_removal_and_create_is_not_blocked() {
+async fn feature_off_resumes_a_pending_removal_then_admits() {
     let (_tmp, dir, m, fake, clock) = persistent().await;
     let s = source(&m, 1000).await;
     let c = capture(&m, &s, 1000).await.unwrap();
@@ -198,19 +198,16 @@ async fn feature_off_resumes_a_pending_removal_and_create_is_not_blocked() {
     let limits = off(stop(m).await);
     let m = on_disk(&dir, &fake, &clock, &limits);
     let (r, _) = startup_like_main(&m).await;
-    assert!(
-        !r.checkpoints_blocked && !r.admission_blocked,
-        "a DELETING row the helper accounts for blocks nothing: {r:?}"
-    );
+    // Round 7: a charged DELETING row's storage is not yet proved absent, so startup
+    // blocks until its resumed removal settles; the barrier retry then reopens.
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
     until("the resumed removal", || {
         row(&m, c.id.as_str()).state == CheckpointState::Deleted
     })
     .await;
     assert_eq!(charge(&m), (0, 0));
-    assert!(
-        !create_is_blocked(&m).await,
-        "another user's ordinary Create"
-    );
+    until_allocation_opens(&m, "another user's ordinary Create").await;
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
 }
 
 // --- HIGH 3: capture keys from an earlier boot age out --------------------------------
@@ -578,7 +575,18 @@ async fn tracked_activity_that_matches_its_row_does_not_block() {
             },
         ),
     ];
-    for case in cases {
+    // Round 7: the CAPTURING and DELETING rows block the pass by their state alone, so
+    // the activity itself is checked against its row.
+    let live = m.live_captures();
+    for case in &cases {
+        let row = m.store.checkpoint(case.checkpoint.as_str()).unwrap();
+        assert_eq!(m.unexplained(case, row.as_ref(), &live).unwrap(), None, "{case:?}");
+    }
+    // With those two removed, the whole pass is clean beside the others' activity.
+    for c in [&capturing, &deleting] {
+        m.delete_checkpoint(c.id.as_str(), 1000, false).await.unwrap();
+    }
+    for case in &cases[2..] {
         fake.checkpoints(|g| g.inventory_tracked = vec![case.clone()]);
         assert!(!m.reconcile_checkpoints().await.unwrap(), "{case:?}");
     }
@@ -1695,9 +1703,10 @@ async fn an_enabled_clean_startup_arms_then_clears() {
     }
 }
 
-/// Audit gap: a removal that finds an artifact it cannot prove its row's blocks
-/// allocation (C3), and its row records why. A restart must not admit before that
-/// row's removal proves ABSENT, and once it does, allocation reopens.
+/// A removal that finds an artifact it cannot prove its row's (C3) arms the durable
+/// barrier, not only an in-memory latch (round 7): a restart blocks on the marker and on
+/// the charged DELETING row, before its resumed removal answers. Once a removal proves
+/// ABSENT, the barrier's retry reopens allocation with no restart.
 #[tokio::test]
 async fn a_removal_that_found_a_foreign_artifact_keeps_the_restart_blocked() {
     use crate::checkpoint::Reason;
@@ -1709,40 +1718,267 @@ async fn a_removal_that_found_a_foreign_artifact_keeps_the_restart_blocked() {
         startup_like_main(&m).await;
         let s = m.create_owned(CreateRequest::default(), 1000).await.unwrap();
         let c = m.capture_checkpoint(req(&s), 1000, None, None).await.unwrap();
-        fake.checkpoints(|g| g.removals.push_back(FakeRemoval::Retained(scripted)));
+        // The barrier retry's pass is held, so this process stays blocked meanwhile.
+        let held = FakeGate::default();
+        fake.checkpoints(|g| {
+            g.removals.push_back(FakeRemoval::Retained(scripted));
+            g.inventory_gate = Some(held.clone());
+        });
         m.delete_checkpoint(c.id.as_str(), 1000, false)
             .await
             .unwrap_err();
         assert!(create_is_blocked(&m).await);
+        assert!(!m.admission_blocked.load(Ordering::Relaxed), "the barrier's own part");
+        assert!(m.store.checkpoint_barrier_marked().unwrap(), "{scripted:?}: durable");
         let limits = off(stop(m).await);
 
         // Still not provably its row's; the restart's own removal is held.
         let gate = FakeGate::default();
         fake.checkpoints(|g| {
+            g.inventory_gate = None;
             g.removals.push_back(FakeRemoval::Retained(scripted));
             g.remove_gate = Some(gate.clone());
         });
         let m = on_disk(&dir, &fake, &clock, &limits);
         let (r, _) = startup_like_main(&m).await;
         assert!(r.checkpoints_blocked && r.admission_blocked, "{scripted:?}: {r:?}");
+        gate.entered().await;
         assert!(
             create_is_blocked(&m).await,
             "{scripted:?}: admitted before the removal answered"
         );
-        gate.entered().await;
         gate.release();
-        until_slow("the restart's removal answered", || {
-            m.admission_blocked.load(Ordering::Relaxed)
-        })
-        .await;
-        assert!(create_is_blocked(&m).await, "{scripted:?}");
-        let limits = stop(m).await;
-
-        // Control: the next removal proves ABSENT, and allocation reopens.
-        let m = on_disk(&dir, &fake, &clock, &limits);
-        startup_like_main(&m).await;
+        // Retained again, then the retry's next removal proves ABSENT: allocation
+        // reopens in this process.
         until_allocation_opens(&m, "the foreign artifact's row is released").await;
         assert_eq!(row(&m, c.id.as_str()).state, CheckpointState::Deleted);
+        assert!(!m.store.checkpoint_barrier_marked().unwrap());
+        assert!(calls(&fake, "remove") >= 3, "{scripted:?}");
         stop(m).await;
     }
+}
+
+// --- Round 7: a pass is clean only beside sealed rows and running captures -----------
+
+/// Recheck 6's PoC, corrected: a failed CAPTURING row keeps its capture's own failure,
+/// so no token tells startup about the retained corrupt artifact. The row's state does:
+/// a charged capture that is not running blocks until its removal proves ABSENT, so the
+/// marker is kept and Create refused while the resumed removal is held.
+#[tokio::test]
+async fn a_failed_capture_with_a_retained_artifact_keeps_the_restart_blocked() {
+    use crate::checkpoint::Reason;
+
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    let m = on_disk(&dir, &fake, &clock, &test_limits());
+    startup_like_main(&m).await;
+    let source = m.create_owned(CreateRequest::default(), 1000).await.unwrap();
+    let held = FakeGate::default();
+    fake.checkpoints(|g| {
+        g.capture_lose_reply = true;
+        g.removals.push_back(FakeRemoval::Retained(Reason::Corrupt));
+        g.inventory_gate = Some(held.clone());
+    });
+    m.capture_checkpoint(req(&source), 1000, None, None)
+        .await
+        .unwrap_err();
+    until_slow("the retained corrupt artifact blocks allocation", || {
+        m.allocation_blocked()
+    })
+    .await;
+    let checkpoint = only(&m);
+    assert_eq!(checkpoint.state, CheckpointState::Capturing);
+    assert_ne!(checkpoint.failure.as_ref().unwrap().token, Reason::Corrupt.token());
+    assert!(create_is_blocked(&m).await);
+    // As the PoC: the marker already armed (the verdict's own arm is tested below).
+    m.store.mark_checkpoint_barrier().unwrap();
+    let limits = off(stop(m).await);
+
+    let gate = FakeGate::default();
+    fake.checkpoints(|g| {
+        g.inventory_gate = None;
+        g.remove_gate = Some(gate.clone());
+    });
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (reconciled, _) = startup_like_main(&m).await;
+    assert!(
+        reconciled.checkpoints_blocked && reconciled.admission_blocked,
+        "{reconciled:?}"
+    );
+    gate.entered().await;
+    assert!(create_is_blocked(&m).await, "admitted before the removal answered");
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+    gate.release();
+    until_allocation_opens(&m, "the failed capture's storage proved absent").await;
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
+    stop(m).await;
+}
+
+/// The runtime Retained verdict, crash before and after its marker write: the charged
+/// row alone re-derives the block (before), and row and marker both do (after).
+#[tokio::test]
+async fn a_runtime_retained_verdict_survives_a_restart_with_or_without_its_marker() {
+    use crate::checkpoint::Reason;
+    for marker_landed in [false, true] {
+        let (_tmp, dir) = state_dir();
+        let fake = FakeRuntime::default().with_checkpoints();
+        let clock = ManualClock::default();
+        let m = on_disk(&dir, &fake, &clock, &test_limits());
+        startup_like_main(&m).await;
+        let s = m.create_owned(CreateRequest::default(), 1000).await.unwrap();
+        let c = m.capture_checkpoint(req(&s), 1000, None, None).await.unwrap();
+        let held = FakeGate::default();
+        fake.checkpoints(|g| {
+            g.removals.push_back(FakeRemoval::Retained(Reason::Corrupt));
+            g.inventory_gate = Some(held.clone());
+        });
+        m.delete_checkpoint(c.id.as_str(), 1000, false)
+            .await
+            .unwrap_err();
+        assert!(m.store.checkpoint_barrier_marked().unwrap());
+        if !marker_landed {
+            m.store.clear_checkpoint_barrier().unwrap();
+        }
+        let limits = stop(m).await;
+
+        let gate = FakeGate::default();
+        fake.checkpoints(|g| {
+            g.inventory_gate = None;
+            g.remove_gate = Some(gate.clone());
+        });
+        let m = on_disk(&dir, &fake, &clock, &limits);
+        let (r, _) = startup_like_main(&m).await;
+        assert!(r.checkpoints_blocked, "marker landed {marker_landed}: {r:?}");
+        gate.entered().await;
+        assert!(create_is_blocked(&m).await, "marker landed {marker_landed}");
+        assert!(m.store.checkpoint_barrier_marked().unwrap());
+        gate.release();
+        until_allocation_opens(&m, "the row proved absent").await;
+        stop(m).await;
+    }
+}
+
+/// A DELETING row that was a failed capture keeps the capture's own token; its state
+/// alone blocks the restart until the removal answers ABSENT.
+#[tokio::test]
+async fn a_deleting_failed_capture_with_its_original_token_blocks() {
+    use crate::checkpoint::Reason;
+
+    let (_tmp, dir) = state_dir();
+    let fake = FakeRuntime::default().with_checkpoints();
+    let clock = ManualClock::default();
+    let m = on_disk(&dir, &fake, &clock, &test_limits());
+    startup_like_main(&m).await;
+    let s = m.create_owned(CreateRequest::default(), 1000).await.unwrap();
+    let held = FakeGate::default();
+    fake.checkpoints(|g| {
+        g.capture_lose_reply = true;
+        g.removals.push_back(FakeRemoval::Retained(Reason::Corrupt));
+        g.inventory_gate = Some(held.clone());
+    });
+    m.capture_checkpoint(req(&s), 1000, None, None)
+        .await
+        .unwrap_err();
+    until_slow("the capture's cleanup answered", || m.allocation_blocked()).await;
+    let id = only(&m).id;
+    m.store
+        .publish_checkpoint_delete_intent(id.as_str(), DeletionReason::Requested)
+        .unwrap();
+    let failed = row(&m, id.as_str());
+    assert_eq!(failed.state, CheckpointState::Deleting);
+    let token = failed.failure.unwrap().token;
+    assert_ne!(token, Reason::Corrupt.token());
+    assert_ne!(token, Reason::GenerationMismatch.token());
+    m.store.clear_checkpoint_barrier().unwrap();
+    let limits = stop(m).await;
+
+    let gate = FakeGate::default();
+    fake.checkpoints(|g| {
+        g.inventory_gate = None;
+        g.remove_gate = Some(gate.clone());
+    });
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    let (r, _) = startup_like_main(&m).await;
+    assert!(r.checkpoints_blocked && r.admission_blocked, "{r:?}");
+    gate.entered().await;
+    assert!(create_is_blocked(&m).await);
+    gate.release();
+    until_allocation_opens(&m, "the DELETING failed capture proved absent").await;
+    assert_eq!(row(&m, id.as_str()).state, CheckpointState::Deleted);
+    stop(m).await;
+}
+
+/// The barrier retry's clean pass reopens what the barrier blocked, and only that: a
+/// non-checkpoint cause (`admission_blocked`) stays until startup recomputes it.
+#[tokio::test]
+async fn a_clean_retry_reopens_only_the_barriers_own_block() {
+    use crate::checkpoint::Reason;
+    for other_cause in [false, true] {
+        let (m, fake, _) = engine();
+        let s = source(&m, 1000).await;
+        let c = capture(&m, &s, 1000).await.unwrap();
+        m.admission_blocked.store(other_cause, Ordering::Relaxed);
+        fake.checkpoints(|g| g.removals.push_back(FakeRemoval::Retained(Reason::Corrupt)));
+        m.delete_checkpoint(c.id.as_str(), 1000, false)
+            .await
+            .unwrap_err();
+        assert!(m.allocation_blocked());
+        until("the retry's clean pass", || {
+            !m.checkpoint.barrier_blocked.load(Ordering::Relaxed)
+        })
+        .await;
+        assert_eq!(row(&m, c.id.as_str()).state, CheckpointState::Deleted);
+        assert_eq!(m.allocation_blocked(), other_cause);
+        assert_eq!(m.admission_blocked.load(Ordering::Relaxed), other_cause);
+    }
+}
+
+/// A capture running in this process is explained by its live CAPTURING row: with the
+/// feature on, the barrier's retry clears beside it and Create is admitted while it
+/// runs (the same row with no live capture, after a restart, blocks).
+#[tokio::test]
+async fn a_live_capture_does_not_block_create() {
+    let (m, fake, _) = engine();
+    let s = source(&m, 1000).await;
+    let gate = gate_capture(&fake);
+    let capturing = tokio::spawn({
+        let m = Arc::clone(&m);
+        let s = s.clone();
+        async move { capture(&m, &s, 1000).await }
+    });
+    gate.entered().await;
+    assert_eq!(only(&m).state, CheckpointState::Capturing);
+    // A transient fault blocks the barrier; the retry then passes beside the capture.
+    fake.checkpoints(|g| g.inventory_incomplete = true);
+    assert!(m.reconcile_checkpoints().await.unwrap());
+    m.spawn_barrier_retry();
+    assert!(create_is_blocked(&m).await);
+    fake.checkpoints(|g| g.inventory_incomplete = false);
+    until_allocation_opens(&m, "the live capture kept the barrier blocked").await;
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
+    gate.release();
+    assert_eq!(
+        capturing.await.unwrap().unwrap().state,
+        CheckpointState::Ready
+    );
+}
+
+/// A clean verdict that began before a removal's Retained arm cannot discharge it: the
+/// clear is refused, and the next pass decides.
+#[tokio::test]
+async fn a_stale_clean_verdict_cannot_clear_a_later_arm() {
+    let (m, _fake, _) = engine();
+    let s = source(&m, 1000).await;
+    capture(&m, &s, 1000).await.unwrap();
+    assert!(!m.reconcile_checkpoints().await.unwrap());
+    // A removal's Retained verdict lands after the pass armed, before its clear.
+    assert!(m.set_checkpoint_barrier(true).unwrap());
+    assert!(m.set_checkpoint_barrier(false).unwrap(), "the stale clear is refused");
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+    assert!(m.allocation_blocked());
+    assert!(!m.reconcile_checkpoints().await.unwrap());
+    assert!(!m.set_checkpoint_barrier(false).unwrap());
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
+    assert!(!m.allocation_blocked());
 }

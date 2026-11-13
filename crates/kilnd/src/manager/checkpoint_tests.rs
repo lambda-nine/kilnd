@@ -828,6 +828,9 @@ async fn generation_mismatch_or_corrupt_keeps_the_charge_records_it_and_blocks_a
             .delete_checkpoint(c.id.as_str(), 1000, false)
             .await
             .unwrap_err();
+        // Round 7: the verdict armed the durable barrier (its own flag, not the latch).
+        assert!(m.store.checkpoint_barrier_marked().unwrap());
+        assert!(!m.admission_blocked.load(Ordering::Relaxed));
         assert_eq!(reason(&e), Some("checkpoint_corrupt"));
         assert!(matches!(e, Error::Refused(RefusalCode::DataLoss, _)));
         let kept = row(&m, c.id.as_str());
@@ -843,9 +846,17 @@ async fn generation_mismatch_or_corrupt_keeps_the_charge_records_it_and_blocks_a
             capture(&m, &s, 1000).await,
             Err(Error::FailedPrecondition(_))
         ));
-        // No background retrier hides it.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(calls(&fake, "remove"), 1);
+        // Round 7: the verdict armed the durable barrier, and its retry (not a hidden
+        // removal retrier) asks again with backoff; once a removal proves ABSENT, a
+        // clean pass reopens allocation with no restart.
+        until("the barrier retry's removal proves ABSENT", || {
+            row(&m, c.id.as_str()).state == CheckpointState::Deleted
+        })
+        .await;
+        until("allocation reopens", || !m.allocation_blocked()).await;
+        assert!(!m.store.checkpoint_barrier_marked().unwrap());
+        assert_eq!(calls(&fake, "remove"), 2);
+        m.create_owned(CreateRequest::default(), 1000).await.unwrap();
     }
 }
 

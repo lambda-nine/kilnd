@@ -247,9 +247,17 @@ pub(super) struct CheckpointEngine {
     /// nothing can never hide a capture admitted while it ran.
     presence: Mutex<()>,
     /// The checkpoint barrier's part of the allocation block (design 10.2), apart from
-    /// `Manager::admission_blocked`. Only startup and the barrier retry write it.
+    /// `Manager::admission_blocked`. Startup and the barrier retry set and clear it;
+    /// a removal's Retained verdict sets it.
     pub(super) barrier_blocked: AtomicBool,
     barrier_retrying: AtomicBool,
+    /// Every arm of the barrier counts here; `pass_arm` is the count at the latest
+    /// pass's own arm. A clear is refused once anything armed after that pass began
+    /// (a removal's Retained verdict), so a stale clean verdict cannot discharge it.
+    arms: AtomicU64,
+    pass_arm: AtomicU64,
+    /// Wakes the barrier retry early: a removal settled, or one found retained state.
+    barrier_kick: tokio::sync::Notify,
     pub(super) rejected_captures: AtomicU64,
     pub(super) expired: AtomicU64,
     /// The engine's store calls (tests: the feature off makes none on request paths).
@@ -324,7 +332,7 @@ enum Removal {
     /// Worth retrying later: busy, helper unavailable, stale epoch.
     Retry(Error),
     /// The helper found an artifact under the name it cannot prove this row's: kept
-    /// charged, admission blocked, retried only by an operator.
+    /// charged and the barrier armed; its retry's backoff paces the next attempt.
     Blocked(Error),
 }
 
@@ -433,17 +441,21 @@ impl<R: Runtime> Manager<R> {
     /// (schema 16) is the obligation a restart reads, rows or none: setting blocks in
     /// memory first, so nothing is admitted while the marker is written. The pass arms
     /// it (write-ahead) before it asks the helper anything, so no verdict exists before
-    /// the marker does; clearing deletes the marker first, so a failure keeps
-    /// allocation blocked and a crash costs only one more inventory. With nothing
-    /// durable (`present` false, recounted at startup), clearing makes no query.
-    pub(super) fn set_checkpoint_barrier(&self, blocked: bool) -> Result<()> {
+    /// the marker does, and so does a removal's Retained verdict; clearing deletes the
+    /// marker first, so a failure keeps allocation blocked and a crash costs only one
+    /// more inventory. A clear is refused, and the barrier stays blocked, when anything
+    /// armed it after the latest pass's own arm: that pass's clean verdict is stale.
+    /// With nothing durable (`present` false, recounted at startup), clearing makes no
+    /// query. Returns whether the barrier is blocked afterwards.
+    pub(super) fn set_checkpoint_barrier(&self, blocked: bool) -> Result<bool> {
         let _presence = self.presence();
         let engine = &self.checkpoint;
         if blocked {
-            engine.barrier_blocked.store(true, Ordering::Relaxed);
-            self.db().mark_checkpoint_barrier()?;
-            engine.present.store(true, Ordering::Relaxed);
-            return Ok(());
+            self.arm_barrier_locked(false)?;
+            return Ok(true);
+        }
+        if engine.arms.load(Ordering::SeqCst) != engine.pass_arm.load(Ordering::SeqCst) {
+            return Ok(true);
         }
         if engine.present.load(Ordering::Relaxed) {
             self.db().clear_checkpoint_barrier()?;
@@ -456,6 +468,20 @@ impl<R: Runtime> Manager<R> {
         } else {
             engine.barrier_blocked.store(false, Ordering::Relaxed);
         }
+        Ok(false)
+    }
+
+    /// Under the presence lock: blocks in memory, counts the arm (as the pass's own
+    /// when `pass`), then commits the marker.
+    fn arm_barrier_locked(&self, pass: bool) -> Result<()> {
+        let engine = &self.checkpoint;
+        engine.barrier_blocked.store(true, Ordering::SeqCst);
+        let arm = engine.arms.fetch_add(1, Ordering::SeqCst) + 1;
+        if pass {
+            engine.pass_arm.store(arm, Ordering::SeqCst);
+        }
+        self.db().mark_checkpoint_barrier()?;
+        engine.present.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -985,8 +1011,10 @@ impl<R: Runtime> Manager<R> {
         // The source stays gated until the capture's worker is proved gone (design 8.2:
         // stop the reader before the source's storage is removed), through shutdown
         // too: each helper call is bounded by its own deadline, not by shutdown.
-        self.remove_until_absent(&id, None, false, &CancellationToken::new())
+        let released = self
+            .remove_until_absent(&id, None, false, &CancellationToken::new())
             .await;
+        self.barrier_after_removal(released.is_some());
         drop(flag);
     }
 
@@ -1290,7 +1318,11 @@ impl<R: Runtime> Manager<R> {
                 match self.removal_attempt(id).await {
                     Removal::Released(_) => {}
                     Removal::NotRemovable(row) => return Err(not_removable(&row)),
-                    Removal::Retry(e) | Removal::Blocked(e) => return Err(e),
+                    Removal::Retry(e) => return Err(e),
+                    Removal::Blocked(e) => {
+                        self.barrier_after_removal(false);
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -1395,15 +1427,20 @@ impl<R: Runtime> Manager<R> {
                 RemoveReply::Retained { reason, detail }
                     if matches!(reason, Reason::GenerationMismatch | Reason::Corrupt) =>
                 {
-                    // C3: not this row's artifact to prove absent. Record it, keep the
-                    // charge, and stop new allocations (an unexplained artifact).
+                    // C3: not this row's artifact to prove absent. Keep the charge and
+                    // arm the barrier (durable, blocked in memory first): its retry's
+                    // pass holds it while this row is charged, and a clean pass after
+                    // the row proves ABSENT reopens admission. The row's reason is for
+                    // readers only; a restart blocks on the charged row itself.
                     if row.state == CheckpointState::Deleting {
                         let _ = self
                             .db()
                             .record_checkpoint_removal_failure(id, reason, &detail);
                     }
-                    self.admission_blocked.store(true, Ordering::Relaxed);
-                    warn!(checkpoint = %id, reason = reason.token(), "checkpoint removal found an artifact it cannot prove this row's; charge kept and admission blocked");
+                    if let Err(e) = self.set_checkpoint_barrier(true) {
+                        warn!(checkpoint = %id, error = %format!("{e:#}"), "could not write the checkpoint barrier's marker; allocation stays blocked in memory");
+                    }
+                    warn!(checkpoint = %id, reason = reason.token(), "checkpoint removal found an artifact it cannot prove this row's; charge kept and allocation blocked");
                     return Ok(Removal::Blocked(
                         CheckpointReason::Corrupt
                             .error(format!("checkpoint {id}: {}: {detail}", reason.token())),
@@ -1533,6 +1570,7 @@ impl<R: Runtime> Manager<R> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id);
+            manager.barrier_after_removal(released.is_some());
             // A capture's source whose removal was held for this ABSENT (a failed or
             // D1-canceled capture, after a restart) is removed now; a failure leaves it
             // DELETING for a later Delete. A sealed (READY-origin) row never held one.
@@ -1720,6 +1758,18 @@ impl<R: Runtime> Manager<R> {
         Ok(())
     }
 
+    /// After a removal settled or was blocked: a blocked barrier gets its retry (a
+    /// Retained verdict armed it), whose backoff paces the next removal attempt, and
+    /// an early pass once a row was released (it may make the pass clean).
+    fn barrier_after_removal(self: &Arc<Self>, released: bool) {
+        if self.checkpoint.barrier_blocked.load(Ordering::SeqCst) {
+            self.spawn_barrier_retry();
+            if released {
+                self.checkpoint.barrier_kick.notify_one();
+            }
+        }
+    }
+
     /// While the barrier is blocked: its pass again with backoff, each followed by the
     /// timers and removals it may have made due, until a clean pass clears the
     /// checkpoint part of the allocation block (never `admission_blocked`). Delete, Get,
@@ -1729,7 +1779,7 @@ impl<R: Runtime> Manager<R> {
         if !engine.barrier_blocked.load(Ordering::Relaxed)
             || !self.runtime.checkpoint_backend()
             || self.shutting_down.is_cancelled()
-            || engine.barrier_retrying.swap(true, Ordering::Relaxed)
+            || engine.barrier_retrying.swap(true, Ordering::SeqCst)
         {
             return;
         }
@@ -1741,6 +1791,7 @@ impl<R: Runtime> Manager<R> {
                 tokio::select! {
                     () = manager.shutting_down.cancelled() => break,
                     () = tokio::time::sleep(delay) => {}
+                    () = manager.checkpoint.barrier_kick.notified() => {}
                 }
                 let pass = match manager.refresh_checkpoint_presence() {
                     Ok(()) => manager.reconcile_checkpoints().await,
@@ -1755,10 +1806,12 @@ impl<R: Runtime> Manager<R> {
                 }
                 if !blocked {
                     match manager.set_checkpoint_barrier(false) {
-                        Ok(()) => {
+                        Ok(false) => {
                             info!("checkpoint reconciliation is clean; new allocations are admitted");
                             break;
                         }
+                        // Armed again since this pass began: the next pass decides.
+                        Ok(true) => {}
                         Err(e) => warn!(error = %format!("{e:#}"), "could not clear the checkpoint barrier's marker; allocation stays blocked"),
                     }
                 }
@@ -1767,7 +1820,9 @@ impl<R: Runtime> Manager<R> {
             manager
                 .checkpoint
                 .barrier_retrying
-                .store(false, Ordering::Relaxed);
+                .store(false, Ordering::SeqCst);
+            // An arm that raced this retry's exit found it still running: retry again.
+            manager.spawn_barrier_retry();
         });
     }
 
@@ -1775,8 +1830,10 @@ impl<R: Runtime> Manager<R> {
 
     /// The barrier, at startup and in its retry. It reads every charged row first, then
     /// needs a session, a complete inventory whose every entry names a charged row and
-    /// whose every tracked operation, reader and tombstone its row explains, and an
-    /// Inspect of every READY row. An interrupted capture is failed (C3 complete without
+    /// whose every tracked operation, reader and tombstone its row explains, an
+    /// Inspect of every READY row, and no charged row other than a sealed one or a
+    /// capture running in this process: a dead or failed CAPTURING row and any DELETING
+    /// row block until their removal proves ABSENT. An interrupted capture is failed (C3 complete without
     /// C4 is discarded, never promoted); a READY row whose artifact is authoritatively
     /// missing, corrupt or another generation's is quarantined; anything unknown keeps
     /// its row and charge and blocks allocation. Returns whether allocation stays
@@ -1810,7 +1867,10 @@ impl<R: Runtime> Manager<R> {
         // Write-ahead: the obligation is durable, and allocation blocked, before the
         // pass can observe anything that blocks, so a crash at any point in the pass
         // leaves a restart that reconciles. A complete clean pass lets the caller clear it.
-        self.set_checkpoint_barrier(true)?;
+        {
+            let _presence = self.presence();
+            self.arm_barrier_locked(true)?;
+        }
         let mut rows: BTreeMap<String, Checkpoint> = BTreeMap::new();
         let charged = self.db().unsettled_checkpoints()?.into_iter().chain(
             self.db()
@@ -1881,16 +1941,20 @@ impl<R: Runtime> Manager<R> {
             }
         }
         for c in rows.values() {
-            // C3's unexplained artifact: a removal found one it cannot prove this row's
-            // and blocked allocation in memory. The reason its row records keeps that
-            // across a restart, until a removal proves the target ABSENT.
-            if c.state == CheckpointState::Deleting
-                && c.failure.as_ref().is_some_and(|f| {
-                    f.token == Reason::Corrupt.token()
-                        || f.token == Reason::GenerationMismatch.token()
-                })
+            // The clean rule: every charged row is sealed (READY, inspected below, or
+            // QUARANTINED, design 10.2's verdict with its charge S kept) or a capture
+            // this process is running. Any other charged row (CAPTURING dead or failed, DELETING
+            // whatever its reason) has storage no removal has yet proved ABSENT, so the
+            // barrier holds until that removal releases the row and a later pass is
+            // clean. No failure token is read for this.
+            let running = c.state == CheckpointState::Capturing
+                && c.failure.is_none()
+                && live.contains(c.id.as_str());
+            if c.is_charged()
+                && !running
+                && !matches!(c.state, CheckpointState::Ready | CheckpointState::Quarantined)
             {
-                warn!(checkpoint = %c.id, "a removal found an artifact it cannot prove this row's; allocation blocked until a removal proves it absent");
+                warn!(checkpoint = %c.id, state = c.state.as_str(), "a checkpoint's storage is not yet proved absent; allocation blocked until its removal settles");
                 blocked = true;
             }
             if !holds_its_source(c) || live.contains(c.id.as_str()) {

@@ -475,8 +475,11 @@ async fn run() {
     let _ = capturing.await;
     drop(m);
     let m = manager(&state, &socket, &clock, &scene.image);
+    // A capture the crash left charged blocks the restart's allocation until its
+    // removal proves ABSENT (round 7); the barrier retry's clean pass then reopens it.
+    let left_charged = m.store.checkpoint(&cid).unwrap().unwrap().is_charged();
     let reconciled = m.reconcile().await.unwrap();
-    assert!(!reconciled.checkpoints_blocked, "{reconciled:?}");
+    assert_eq!(reconciled.checkpoints_blocked, left_charged, "{reconciled:?}");
     m.rebase_expiry_clocks().unwrap();
     m.rebuild_expiry().unwrap();
     m.start_checkpoints().unwrap();
@@ -484,9 +487,11 @@ async fn run() {
         m.store.checkpoint(&cid).unwrap().unwrap().state == CheckpointState::Failed
     })
     .await;
+    until("allocation reopens after the removal", 120, || !m.allocation_blocked()).await;
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
     assert_eq!(charged(&m), (0, 0));
     assert!(scene.listed().is_empty(), "{:?}", scene.listed());
-    eprintln!("C5a VM 6 PASS");
+    eprintln!("C5a VM 6 PASS (left charged by the crash: {left_charged})");
 
     // Cleanup through the manager, then the helper.
     for id in [s.id.clone(), big.id.clone()] {
