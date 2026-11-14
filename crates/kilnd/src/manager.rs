@@ -1039,6 +1039,10 @@ impl<R: Runtime> Manager<R> {
             .version(Instant::now() + self.limits.health_probe_timeout, &cancel)
             .await
             .map_err(backend)?;
+        // Checkpoint design 10: a fork's final restore outcome is settled before the
+        // legacy CREATING rule below could discard it; one whose reader may still run
+        // stays CREATING for the barrier's pass.
+        let kept_forks = self.settle_interrupted_forks().await?;
         let sandboxes = self.store.sandboxes(true)?;
         let held_backends: HashSet<&str> = sandboxes
             .iter()
@@ -1149,6 +1153,7 @@ impl<R: Runtime> Manager<R> {
                 .map(|r| r.status)
                 == Some(BackendStatus::Running);
             match (s.state, &s.backend_id) {
+                (SandboxState::Creating, None) if kept_forks.contains(&s.id) => {}
                 (SandboxState::Creating, None) => {
                     self.store.set_sandbox_state(
                         &s.id,
@@ -2298,9 +2303,7 @@ impl<R: Runtime> Manager<R> {
     ) -> Result<Sandbox> {
         self.check_serving()?;
         if self.allocation_blocked() {
-            return Err(Error::FailedPrecondition(
-                "backend resources no row explains block new sandboxes until reconciled".into(),
-            ));
+            return Err(allocation_barrier());
         }
         // Resolved once, before preparation: an invalid policy allocates nothing.
         let expiry = crate::expiry::resolve_expiry(req.expiry, &self.limits.expiry)
@@ -2403,6 +2406,13 @@ impl<R: Runtime> Manager<R> {
         if let Some(plan) = &fork {
             self.fork_recheck(plan, &sandbox.spec)?;
         }
+        // The barrier's admission and this reservation are one step under the barrier's
+        // lock (checkpoint design 8.3, 10.2): a barrier raised during the awaits above
+        // refuses here, and one raised after this commit sees the row.
+        let gate = self.barrier_gate();
+        if self.allocation_blocked() {
+            return Err(allocation_barrier());
+        }
         let reserved = match &fork {
             None => self
                 .store
@@ -2422,6 +2432,7 @@ impl<R: Runtime> Manager<R> {
                 &plan.reader,
             ),
         };
+        drop(gate);
         drop(default_env);
         // The durable count now holds whatever this transaction did.
         if let Some(keyed) = keyed.as_mut() {
@@ -4555,6 +4566,12 @@ fn ready(s: &Sandbox) -> Result<()> {
             format!("sandbox {} is {}, not ready", s.id, s.state.as_str()),
         )))
     }
+}
+
+fn allocation_barrier() -> Error {
+    Error::FailedPrecondition(
+        "backend resources no row explains block new sandboxes until reconciled".into(),
+    )
 }
 
 fn backend(e: RuntimeError) -> Error {

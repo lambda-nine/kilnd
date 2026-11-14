@@ -458,6 +458,13 @@ impl<R: Runtime> Manager<R> {
         self.recount_presence()
     }
 
+    /// The barrier's admission lock (the presence lock): an accepting reservation
+    /// holds it with its `allocation_blocked` check, so a barrier armed under it is
+    /// wholly before (refusing) or after (seeing the row) that commit. Memory only.
+    pub(super) fn barrier_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.presence()
+    }
+
     fn presence(&self) -> std::sync::MutexGuard<'_, ()> {
         self.checkpoint
             .presence
@@ -976,6 +983,12 @@ impl<R: Runtime> Manager<R> {
             return send(Err(departed()));
         }
         let presence = self.presence();
+        if self.allocation_blocked() {
+            drop(presence);
+            return send(Err(Error::FailedPrecondition(
+                "backend resources or checkpoint artifacts no row explains block new allocations until reconciled".into(),
+            )));
+        }
         let reserved = self.db().reserve_checkpoint(
             &new,
             &limits.budgets,

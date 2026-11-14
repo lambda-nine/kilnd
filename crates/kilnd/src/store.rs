@@ -2778,6 +2778,22 @@ impl Store {
         Ok(())
     }
 
+    /// A fork's restored backend (checkpoint design 10), recorded on its CREATING row
+    /// before its pin is released: from here the row owns that exact backend, which
+    /// READY publishes or compensation removes, after a restart too.
+    pub fn record_fork_backend(&self, id: &str, backend_id: &str) -> Result<()> {
+        let n = self.conn().execute(
+            "UPDATE sandboxes SET backend_id = ?2, updated_at_ms = ?3
+             WHERE id = ?1 AND state = 'creating' AND backend_id IS NULL
+               AND accounting_kind = 'legacy' AND from_checkpoint IS NOT NULL",
+            params![id, backend_id, now_ms()],
+        )?;
+        if n != 1 {
+            bail!("sandbox {id} is not a CREATING fork without a backend ID");
+        }
+        Ok(())
+    }
+
     /// C7: publishes READY, the exact backend ID and the ready receipt in one
     /// update. Only a CREATING row can take it, so a lost race never overwrites a
     /// newer state. Returns whether this call published.

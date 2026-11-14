@@ -263,13 +263,16 @@ impl<R: Runtime> Manager<R> {
         info!(sandbox = %sandbox.id, checkpoint = %checkpoint, owner_uid = sandbox.owner_uid, "creating sandbox from checkpoint");
         let restored = self.restore_reader(&sandbox, &plan).await;
         let sandbox_id = sandbox.id.clone();
-        let refused = |reason: CheckpointReason, detail: &str| {
-            // A Delete or expiry that canceled it is why it failed.
-            let reason = if cancel.is_cancelled() {
+        // A Delete or expiry that canceled it is why it failed; the stored diagnostic
+        // carries the same token as the error (design 7.3).
+        let reason_of = |reason: CheckpointReason| {
+            if cancel.is_cancelled() {
                 CheckpointReason::NotReady
             } else {
                 reason
-            };
+            }
+        };
+        let refused = |reason: CheckpointReason, detail: &str| {
             reason.error(format!(
                 "create sandbox {sandbox_id} from checkpoint {checkpoint}: {detail}"
             ))
@@ -280,6 +283,13 @@ impl<R: Runtime> Manager<R> {
                 evidence,
             }) => {
                 restoring.settled = true;
+                // The exact backend is the row's before the pin can go, so a restart
+                // finds it there or in the helper's record (design 10).
+                if let Err(e) = self.store.record_fork_backend(&sandbox.id, &backend_id) {
+                    return Err(self
+                        .compensate_failed_publication(&sandbox.id, &backend_id, e)
+                        .await);
+                }
                 // The copy is complete: the pin goes, even if READY never comes (8.2).
                 self.release_fork_pin(&sandbox.id, &plan, &evidence).await;
                 return self
@@ -292,37 +302,76 @@ impl<R: Runtime> Manager<R> {
                 evidence,
             }) => {
                 restoring.settled = true;
+                let reason = reason_of(CheckpointReason::from_helper(reason));
+                // Settled before the pin goes: a restart finds it here or in the record.
+                // Unrecorded, the pin and record stay for the barrier's pass to settle.
+                if let Err(e) =
+                    self.fork_not_created(&plan.checkpoint, &sandbox.id, reason, &detail)
+                {
+                    restoring.settled = false;
+                    return Err(e);
+                }
                 self.release_fork_pin(&sandbox.id, &plan, &evidence).await;
-                self.store.fail_create_definitely(&sandbox.id, &detail)?;
-                return Err(refused(CheckpointReason::from_helper(reason), &detail));
+                return Err(refused(reason, &detail));
             }
             Restored::Refused(reason, detail) => {
                 // Nothing ran, but no fact says so: the pin waits for the checkpoint's
                 // ABSENT (C4's strict rule; its lifetime is never paused).
                 restoring.settled = true;
-                self.store.fail_create_definitely(&sandbox.id, &detail)?;
+                let reason = reason_of(reason);
+                self.store
+                    .fail_create_definitely(&sandbox.id, &fork_failure(reason, &detail))?;
                 return Err(refused(reason, &detail));
             }
             Restored::Final(RestoreReply::Ambiguous { reason, detail, .. }) => {
                 // The reader was reaped, but kiln may have allocated: a legacy ambiguous
                 // create, charged; READER_ENDED `unknown` never releases the pin.
                 restoring.settled = true;
-                (CheckpointReason::from_helper(reason), detail)
+                (reason_of(CheckpointReason::from_helper(reason)), detail)
             }
             Restored::Unproven(detail) => {
                 restoring.settled = true;
-                (CheckpointReason::Io, detail)
+                (reason_of(CheckpointReason::Io), detail)
             }
             Restored::Final(RestoreReply::Pending) | Restored::Abandoned => {
                 // Shutdown with the reader's end unknown: CREATING and charged for
-                // startup, which fails the row and inspects the pin's reader.
+                // startup, which settles it from the reader's record.
                 return Err(Error::ShuttingDown);
             }
         };
         warn!(sandbox = %sandbox.id, checkpoint = %checkpoint, reason = reason.token(), detail = %detail, "sandbox creation from checkpoint failed");
-        self.store
-            .set_sandbox_state(&sandbox.id, SandboxState::Failed, None, Some(&detail))?;
+        self.store.set_sandbox_state(
+            &sandbox.id,
+            SandboxState::Failed,
+            None,
+            Some(&fork_failure(reason, &detail)),
+        )?;
         Err(refused(reason, &detail))
+    }
+
+    /// A restore that proved nothing was allocated: the row fails definitely (its
+    /// reservation released), and restore-proven corruption first quarantines the
+    /// checkpoint, charge kept, so no new fork is admitted (design 10.2's verdict).
+    fn fork_not_created(
+        &self,
+        c: &Checkpoint,
+        sandbox: &str,
+        reason: CheckpointReason,
+        detail: &str,
+    ) -> Result<()> {
+        if reason == CheckpointReason::Corrupt
+            && self.db().record_checkpoint_failure_token(
+                c.id.as_str(),
+                reason.token(),
+                &format!("a restore found the artifact corrupt: {detail}"),
+                true,
+            )?
+        {
+            warn!(checkpoint = %c.id, sandbox, "a restore proved the checkpoint corrupt; quarantined, charge kept");
+        }
+        self.store
+            .fail_create_definitely(sandbox, &fork_failure(reason, detail))?;
+        Ok(())
     }
 
     /// The helper's `Restore` in its own task (a panic there is a lost reply, not a
@@ -585,11 +634,11 @@ impl<R: Runtime> Manager<R> {
 
     /// The pass's fork rule (startup and the barrier retry). A live pin whose fork is
     /// not restoring in this process (`restoring`, from the pass's snapshot) is settled
-    /// from its reader's record when the helper still has it: a final `Created` or
-    /// `NotCreated` releases the pin with its evidence. A reader still running with no
-    /// supervisor blocks the pass; a dead epoch's reader died with its helper, and a
-    /// retired or ambiguous one cannot run: their pins wait for the checkpoint's ABSENT
-    /// (C4's strict rule) without blocking. Returns whether the pass is blocked.
+    /// from its reader's record (see [`Self::settle_orphaned_fork`]); a dead epoch's
+    /// reader died with its helper, so its row (if still CREATING) fails as ambiguous
+    /// and its pin waits for the checkpoint's ABSENT (C4's strict rule) without
+    /// blocking. A reader still running with no supervisor, or one the helper cannot
+    /// be asked about, blocks the pass. Returns whether the pass is blocked.
     pub(in crate::manager) async fn reconcile_fork_pins(
         &self,
         pins: &[(Checkpoint, CheckpointPin)],
@@ -598,36 +647,208 @@ impl<R: Runtime> Manager<R> {
     ) -> Result<bool> {
         let mut blocked = false;
         for (c, pin) in pins {
-            if restoring.contains(&pin.sandbox_id)
-                || pin.reader.helper_epoch != session.epoch
-                || pin.reader.boot_id != session.boot
-            {
+            if restoring.contains(&pin.sandbox_id) {
                 continue;
             }
-            match self.inspect_reader(c, &pin.reader).await {
-                Ok(Some(Restored::Final(
-                    RestoreReply::Created { evidence, .. }
-                    | RestoreReply::NotCreated { evidence, .. },
-                ))) => match self.db().release_checkpoint_pin(&pin.sandbox_id, &evidence) {
-                    Ok(_) => {
-                        info!(sandbox = %pin.sandbox_id, checkpoint = %c.id, "released a fork's pin from its reader's settled record");
-                        self.checkpoint_timer_refresh(c.id.as_str());
-                    }
-                    Err(e) => {
-                        warn!(sandbox = %pin.sandbox_id, error = %format!("{e:#}"), "a fork's settled reader evidence was refused; its pin waits for the checkpoint's removal")
-                    }
-                },
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    warn!(sandbox = %pin.sandbox_id, checkpoint = %c.id, "a restore reader runs with no fork supervising it; allocation blocked until it settles");
-                    blocked = true;
-                }
-                Err(e) => {
-                    warn!(sandbox = %pin.sandbox_id, checkpoint = %c.id, error = %e, "could not inspect a fork's reader; allocation blocked");
-                    blocked = true;
-                }
-            }
+            let inspected =
+                if pin.reader.helper_epoch == session.epoch && pin.reader.boot_id == session.boot {
+                    self.inspect_reader(c, &pin.reader).await
+                } else {
+                    Ok(Some(Restored::Unproven(
+                        "the helper restarted during the restore; its reader ended with it".into(),
+                    )))
+                };
+            blocked |= self.settle_orphaned_fork(c, pin, inspected).await;
         }
         Ok(blocked)
     }
+
+    /// Startup, before the sandbox pass (design 10): every CREATING fork is settled
+    /// from what is durably known, so its exact backend is owned before inventory and
+    /// its reservation is never left to the legacy no-ID ambiguity while a final
+    /// answer exists. A recorded backend is compensated; otherwise the reader's
+    /// record, in the pin's own live helper epoch, settles it. A fork whose reader
+    /// still runs, or whose helper cannot be asked, stays CREATING (and is returned)
+    /// for the barrier's pass, which then blocks allocation; the rest (a dead epoch, a
+    /// retired or ambiguous reader) is left to the legacy rule.
+    pub(in crate::manager) async fn settle_interrupted_forks(&self) -> Result<HashSet<String>> {
+        let mut kept = HashSet::new();
+        if !self.maintained() {
+            return Ok(kept);
+        }
+        let mut session = None;
+        for s in self.store.sandboxes(true)? {
+            if s.state != SandboxState::Creating
+                || s.lifecycle.from_checkpoint.is_none()
+                || s.backend != self.runtime.name()
+            {
+                continue;
+            }
+            if let Some(backend_id) = &s.backend_id {
+                self.compensate_lost_fork(&s.id, backend_id).await;
+                continue;
+            }
+            let Some(pin) = self
+                .db()
+                .checkpoint_pin(&s.id)?
+                .filter(|p| p.released_at_ms.is_none())
+            else {
+                continue;
+            };
+            if session.is_none() {
+                session = Some(self.checkpoint_session().await);
+            }
+            let live = match session.as_ref() {
+                Some(Ok(session)) => {
+                    pin.reader.helper_epoch == session.epoch && pin.reader.boot_id == session.boot
+                }
+                _ => {
+                    warn!(sandbox = %s.id, "the checkpoint helper cannot be asked about an interrupted fork; kept CREATING for the barrier's pass");
+                    kept.insert(s.id);
+                    continue;
+                }
+            };
+            let Some(c) = self.db().checkpoint(pin.checkpoint.as_str())? else {
+                continue;
+            };
+            if live {
+                let inspected = self.inspect_reader(&c, &pin.reader).await;
+                if self.settle_orphaned_fork(&c, &pin, inspected).await {
+                    kept.insert(s.id);
+                }
+            }
+        }
+        Ok(kept)
+    }
+
+    /// A fork no supervisor in this process owns, settled from its reader's record,
+    /// sandbox first and pin second, so every crash point leaves a fact to resume
+    /// from: `Created` compensates that exact backend (a fork whose waiter and READY
+    /// checks were lost is a failed create, as legacy compensation makes it);
+    /// `NotCreated` fails it definitely, releasing its reservation; an ambiguous or
+    /// unproven end fails a still-CREATING row as a legacy ambiguous create, charged.
+    /// Returns whether the reader may still run (it blocks, and the row stays).
+    async fn settle_orphaned_fork(
+        &self,
+        c: &Checkpoint,
+        pin: &CheckpointPin,
+        inspected: Result<Option<Restored>>,
+    ) -> bool {
+        let id = pin.sandbox_id.as_str();
+        let restored = match inspected {
+            Ok(Some(restored)) => restored,
+            Ok(None) => {
+                warn!(sandbox = id, checkpoint = %c.id, "a restore reader runs with no fork supervising it; allocation blocked until it settles");
+                return true;
+            }
+            Err(e) => {
+                warn!(sandbox = id, checkpoint = %c.id, error = %e, "could not inspect a fork's reader; allocation blocked");
+                return true;
+            }
+        };
+        let row = self.store.sandbox(id).ok().flatten();
+        let creating = row
+            .as_ref()
+            .is_some_and(|s| s.state == SandboxState::Creating);
+        let evidence = match restored {
+            Restored::Final(RestoreReply::Created {
+                backend_id,
+                evidence,
+            }) => {
+                if creating
+                    && row
+                        .and_then(|s| s.backend_id)
+                        .is_none_or(|recorded| recorded == backend_id)
+                {
+                    self.compensate_lost_fork(id, &backend_id).await;
+                }
+                evidence
+            }
+            Restored::Final(RestoreReply::NotCreated {
+                reason,
+                detail,
+                evidence,
+            }) => {
+                let reason = CheckpointReason::from_helper(reason);
+                if creating && let Err(e) = self.fork_not_created(c, id, reason, &detail) {
+                    warn!(sandbox = id, error = %format!("{e:#}"), "could not record a fork's settled NotCreated; its pin is kept");
+                    return false;
+                }
+                evidence
+            }
+            Restored::Final(RestoreReply::Ambiguous { reason, detail, .. }) => {
+                self.fail_orphaned_fork(
+                    creating,
+                    id,
+                    CheckpointReason::from_helper(reason),
+                    &detail,
+                );
+                return false;
+            }
+            Restored::Unproven(detail) => {
+                self.fail_orphaned_fork(creating, id, CheckpointReason::Io, &detail);
+                return false;
+            }
+            Restored::Final(RestoreReply::Pending)
+            | Restored::Refused(..)
+            | Restored::Abandoned => {
+                return false;
+            }
+        };
+        match self.db().release_checkpoint_pin(id, &evidence) {
+            Ok(_) => {
+                info!(sandbox = id, checkpoint = %c.id, "settled a fork and released its pin from its reader's record");
+                self.checkpoint_timer_refresh(c.id.as_str());
+            }
+            Err(e) => {
+                warn!(sandbox = id, error = %format!("{e:#}"), "a fork's settled reader evidence was refused; its pin waits for the checkpoint's removal")
+            }
+        }
+        false
+    }
+
+    /// An orphaned fork whose reader ended without proof either way: a still-CREATING
+    /// row fails as a legacy ambiguous create (charged; its pin waits for ABSENT).
+    fn fail_orphaned_fork(&self, creating: bool, id: &str, reason: CheckpointReason, detail: &str) {
+        if !creating {
+            return;
+        }
+        let failure = fork_failure(reason, &format!("kilnd lost the fork: {detail}"));
+        if let Err(e) = self
+            .store
+            .set_sandbox_state(id, SandboxState::Failed, None, Some(&failure))
+        {
+            warn!(sandbox = id, error = %format!("{e:#}"), "could not fail an orphaned fork");
+        }
+    }
+
+    /// An orphaned fork's exact restored backend is removed, as a failed publication's
+    /// is; a failed removal stays DELETING and charged, which Delete and startup retry.
+    async fn compensate_lost_fork(&self, id: &str, backend_id: &str) {
+        let reason = fork_failure(
+            CheckpointReason::Io,
+            "kilnd lost the fork before it was ready",
+        );
+        match self.compensate_legacy_create(id, backend_id, &reason).await {
+            Ok(()) => {
+                warn!(
+                    sandbox = id,
+                    backend_id, "compensated a fork that lost its supervisor before READY"
+                );
+            }
+            Err(e) => {
+                warn!(sandbox = id, backend_id, error = %e, "an orphaned fork's backend could not be removed; kept DELETING and charged");
+            }
+        }
+    }
+}
+
+/// A fork failure's stored diagnostic: the same `checkpoint_*` token as its error,
+/// then the bounded detail (design 7.3), so a keyed retry's FAILED row stays typed.
+fn fork_failure(reason: CheckpointReason, detail: &str) -> String {
+    format!(
+        "{}: {}",
+        reason.token(),
+        crate::checkpoint::bounded_detail(detail)
+    )
 }

@@ -5,6 +5,7 @@
 //! cancellation, the pass's fork rule, ownership loss and crash recovery.
 
 use super::*;
+use crate::checkpoint::wire::RestoreReply;
 use crate::runtime::fake::FakeRestore;
 use crate::store::CheckpointPin;
 
@@ -687,6 +688,13 @@ async fn not_created_fails_definitely_and_releases_the_pin() {
     assert_eq!(reason(&e), Some("checkpoint_image_unavailable"), "{e:?}");
     let f = forks_of(&m, &c).pop().unwrap();
     assert_eq!(f.state, SandboxState::Failed);
+    assert!(
+        f.failure_reason
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with("checkpoint_image_unavailable:")),
+        "the durable failure lost its typed reason token: {:?}",
+        f.failure_reason
+    );
     assert_eq!(f.create_certainty, CreateCertainty::DefinitelyNotCreated);
     assert_eq!(m.store_resources_for_test(), before, "reservation released");
     assert_eq!(
@@ -694,6 +702,99 @@ async fn not_created_fails_definitely_and_releases_the_pin() {
         Some("not_started")
     );
     assert_eq!(restores(&m), 0);
+}
+
+/// Design 7.3: every stored fork failure (NotCreated, a typed refusal, ambiguous)
+/// carries the returned error's token, so a keyed retry's FAILED row is still typed.
+#[tokio::test]
+async fn stored_fork_failures_keep_the_returned_token() {
+    let (m, fake, _) = engine();
+    let (_, c) = ready(&m, 1000).await;
+    let cases = [
+        (
+            "nc",
+            FakeRestore::NotCreated(Reason::ImageUnavailable),
+            "checkpoint_image_unavailable",
+        ),
+        (
+            "refused",
+            FakeRestore::Refuse(CheckpointErrorKind::Workers),
+            "checkpoint_workers",
+        ),
+        (
+            "ambiguous",
+            FakeRestore::Ambiguous(Reason::Io),
+            "checkpoint_io",
+        ),
+    ];
+    for (key, outcome, token) in cases {
+        script(&fake, &[outcome]);
+        let r = fork_req(&c);
+        let k = fork_key(key, &r);
+        let first = m.create_keyed(Ok(r.clone()), 1000, k.clone(), None).await;
+        let stored = match first {
+            Ok(row) => row,
+            Err(e) => {
+                assert_eq!(reason(&e), Some(token), "{e:?}");
+                m.create_keyed(Ok(r.clone()), 1000, k.clone(), None)
+                    .await
+                    .unwrap()
+            }
+        };
+        let retried = m.create_keyed(Ok(r), 1000, k, None).await.unwrap();
+        assert_eq!(retried.id, stored.id);
+        assert_eq!(retried.state, SandboxState::Failed);
+        let failure = retried.failure_reason.unwrap_or_default();
+        assert!(
+            failure.starts_with(&format!("{token}: ")),
+            "{key}: stored {failure:?}"
+        );
+    }
+}
+
+/// Restore-proven corruption quarantines the checkpoint at once (charge kept): no new
+/// fork is admitted or pinned, and the owner's Delete still reaches ABSENT.
+#[tokio::test]
+async fn restore_detected_corruption_quarantines_the_checkpoint() {
+    let (m, fake, _) = engine();
+    let (_, c) = ready(&m, 1000).await;
+    let before = charge(&m);
+    script(&fake, &[FakeRestore::NotCreated(Reason::Corrupt)]);
+
+    let error = fork(&m, &c, 1000).await.unwrap_err();
+    assert_eq!(reason(&error), Some("checkpoint_corrupt"), "{error:?}");
+    let checkpoint = row(&m, c.id.as_str());
+    assert_eq!(
+        checkpoint.state,
+        CheckpointState::Quarantined,
+        "restore proved corrupt content but the checkpoint remained usable: {checkpoint:?}"
+    );
+    assert_eq!(
+        checkpoint.failure.as_ref().map(|f| f.token.as_str()),
+        Some("checkpoint_corrupt")
+    );
+    assert_eq!(charge(&m), before, "quarantine must retain the charge");
+    let f = forks_of(&m, &c).pop().unwrap();
+    assert_eq!(f.create_certainty, CreateCertainty::DefinitelyNotCreated);
+    assert!(
+        f.failure_reason
+            .unwrap()
+            .starts_with("checkpoint_corrupt: ")
+    );
+    // No new fork: refused before anything is reserved or pinned.
+    let pins = m.store.checkpoint_pins(c.id.as_str()).unwrap().len();
+    let e = fork(&m, &c, 1000).await.unwrap_err();
+    assert_eq!(reason(&e), Some("checkpoint_corrupt"), "{e:?}");
+    assert_eq!(m.store.checkpoint_pins(c.id.as_str()).unwrap().len(), pins);
+    assert_eq!(calls(&fake, "restore"), 1);
+    // The owner's Delete reaches ABSENT and releases the charge.
+    let d = m
+        .delete_checkpoint(c.id.as_str(), 1000, false)
+        .await
+        .unwrap();
+    assert_eq!(d.state, CheckpointState::Deleted);
+    assert_eq!(charge(&m), (0, 0));
+    assert!(!m.allocation_blocked());
 }
 
 #[tokio::test]
@@ -940,6 +1041,75 @@ async fn checkpoint_delete_during_the_preflight_await_allocates_nothing() {
     assert_eq!(m.store_resources_for_test().sandboxes, before.1.sandboxes);
     assert_eq!(calls(&fake, "restore"), 0);
     assert!(m.store.checkpoint_pins(c.id.as_str()).unwrap().is_empty());
+}
+
+/// The adversarial review's HIGH 2: a barrier raised while a fork's preflight awaits refuses at the
+/// accepting reservation: no row, pin, charge or Restore.
+#[tokio::test]
+async fn allocation_barrier_raised_during_fork_preflight_blocks_reservation() {
+    let (m, fake, _) = engine();
+    let (_, c) = ready(&m, 1000).await;
+    let before = (rows(&m), m.store_resources_for_test());
+    let gate = FakeGate::default();
+    fake.checkpoints(|g| g.capabilities_gate = Some(gate.clone()));
+    let running = spawn_fork(&m, &c, 1000);
+    gate.entered().await;
+
+    assert!(m.set_checkpoint_barrier(true).unwrap());
+    gate.release();
+
+    let error = running.await.unwrap().unwrap_err();
+    assert!(matches!(error, Error::FailedPrecondition(_)), "{error:?}");
+    assert_eq!(rows(&m), before.0, "a blocked fork wrote a sandbox row");
+    assert_eq!(
+        m.store_resources_for_test(),
+        before.1,
+        "a blocked fork changed accounting"
+    );
+    assert_eq!(calls(&fake, "restore"), 0);
+    assert!(m.store.checkpoint_pins(c.id.as_str()).unwrap().is_empty());
+}
+
+/// The same for an ordinary create (paused in its preparation) and a capture (paused
+/// asking for its source): the barrier's admission is atomic with every reservation.
+#[tokio::test]
+async fn allocation_barrier_raised_during_a_create_or_capture_preflight_blocks_it() {
+    let (m, fake, _) = engine_with(FakeRuntime::fenced().with_checkpoints(), test_limits());
+    let gate = FakeGate::default();
+    fake.state().fenced.prepare_gate = Some(gate.clone());
+    let before = (rows(&m), m.store_resources_for_test());
+    let running = tokio::spawn({
+        let m = Arc::clone(&m);
+        async move { m.create_owned(CreateRequest::default(), 1000).await }
+    });
+    gate.entered().await;
+    assert!(m.set_checkpoint_barrier(true).unwrap());
+    gate.release();
+    let error = running.await.unwrap().unwrap_err();
+    assert!(matches!(error, Error::FailedPrecondition(_)), "{error:?}");
+    assert_eq!((rows(&m), m.store_resources_for_test()), before);
+    assert!(fake.state().fenced.allocations.is_empty());
+
+    let (m, fake, _) = engine();
+    let s = source(&m, 1000).await;
+    let before = (charge(&m), m.store.unsettled_checkpoints().unwrap().len());
+    let gate = FakeGate::default();
+    fake.checkpoints(|g| g.source_gate = Some(gate.clone()));
+    let running = tokio::spawn({
+        let m = Arc::clone(&m);
+        let r = req(&s);
+        async move { m.capture_checkpoint(r, 1000, None, None).await }
+    });
+    gate.entered().await;
+    assert!(m.set_checkpoint_barrier(true).unwrap());
+    gate.release();
+    let error = running.await.unwrap().unwrap_err();
+    assert!(matches!(error, Error::FailedPrecondition(_)), "{error:?}");
+    assert_eq!(
+        (charge(&m), m.store.unsettled_checkpoints().unwrap().len()),
+        before
+    );
+    assert_eq!(calls(&fake, "capture"), 0);
 }
 
 #[tokio::test]
@@ -1249,9 +1419,10 @@ async fn a_crash_mid_restore_blocks_until_the_orphaned_reader_settles() {
     drop(m);
     let m = on_disk(&dir, &fake, &clock, &limits);
     let reconciled = m.reconcile().await.unwrap();
-    // The reader runs with no supervisor: the restart blocks allocation.
+    // The reader runs with no supervisor: the restart blocks allocation, and the row
+    // stays CREATING (charged) for the reader's final answer.
     assert!(reconciled.checkpoints_blocked, "{reconciled:?}");
-    assert_eq!(m.load(&f.id).unwrap().state, SandboxState::Failed);
+    assert_eq!(m.load(&f.id).unwrap().state, SandboxState::Creating);
     m.rebase_expiry_clocks().unwrap();
     m.rebuild_expiry().unwrap();
     m.start_checkpoints().unwrap();
@@ -1260,7 +1431,8 @@ async fn a_crash_mid_restore_blocks_until_the_orphaned_reader_settles() {
         m.create_owned(CreateRequest::default(), 2000).await,
         Err(Error::FailedPrecondition(_))
     ));
-    // It settles (the backend made): the retry's pass releases the pin and clears.
+    // It settles (the backend made): the retry's pass compensates that exact backend,
+    // releases the pin and clears.
     gate.release();
     orphan.await.unwrap();
     until("the barrier clears", || !m.allocation_blocked()).await;
@@ -1268,45 +1440,197 @@ async fn a_crash_mid_restore_blocks_until_the_orphaned_reader_settles() {
         pin_of(&m, &f.id).unwrap().released_by.as_deref(),
         Some("complete")
     );
-    // The backend it made is the legacy ambiguity: the next start reports it
-    // unmanaged, as for any interrupted kiln create, and the FAILED row stays charged.
-    let charged = m.store_resources_for_test();
+    compensated(&m, &f);
+    // Nothing is left for the next start: no unmanaged backend, nothing charged.
     let limits = m.limits.clone();
     m.begin_shutdown();
     m.drain_operations().await;
     drop(m);
     let m = on_disk(&dir, &fake, &clock, &limits);
     let reconciled = m.reconcile().await.unwrap();
-    assert_eq!(reconciled.unmanaged.len(), 1, "{reconciled:?}");
-    assert_eq!(m.store_resources_for_test(), charged);
+    assert!(reconciled.unmanaged.is_empty(), "{reconciled:?}");
+    compensated(&m, &f);
+    deleted_with_nothing_left(&m, &f).await;
 }
 
+/// A fork the restart (or the pass) settled from a `Created` record: its exact backend
+/// removed, the row FAILED with its typed reason and released, Delete reaching DELETED.
+fn compensated(m: &M, f: &Sandbox) {
+    let row = m.load(&f.id).unwrap();
+    assert_eq!(row.state, SandboxState::Failed, "{row:?}");
+    assert_ne!(
+        row.accounting.release,
+        ReservationRelease::Charged,
+        "{row:?}"
+    );
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("checkpoint_io: ") && r.ends_with("backend removed")),
+        "{row:?}"
+    );
+    assert!(row.backend_id.is_some());
+    assert!(!row.is_charged(), "{row:?}");
+}
+
+/// Delete releases whatever the settlement left, and no pin of the fork stays live.
+async fn deleted_with_nothing_left(m: &M, f: &Sandbox) {
+    let d = m.delete(&f.id).await.unwrap();
+    assert!(matches!(d.state, SandboxState::Deleted), "{d:?}");
+    assert!(pin_of(m, &f.id).unwrap().released_at_ms.is_some());
+}
+
+/// The adversarial review's HIGH 1, `Created`: the helper settled the restore and the daemon died
+/// before the backend ID reached the row. Startup reads the record before the legacy
+/// CREATING rule: that exact backend is compensated and the pin released.
 #[tokio::test]
-async fn a_crash_after_the_copy_and_before_ready_releases_the_pin_at_startup() {
+async fn a_crash_after_the_copy_and_before_ready_compensates_the_exact_backend_at_startup() {
     let (_tmp, dir, m, fake, clock) = on_disk_engine().await;
     let (s, c) = ready(&m, 1000).await;
     let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
     let (f, reader) = committed_fork(&m, &c, &s, epoch, boot);
     orphan_restore(&fake, &c, &f, &reader).await.unwrap();
-    let limits = m.limits.clone();
-    m.begin_shutdown();
-    m.drain_operations().await;
-    drop(m);
-    let m = on_disk(&dir, &fake, &clock, &limits);
+    let m = stop_and_reopen(m, &dir, &fake, &clock);
     let reconciled = m.reconcile().await.unwrap();
-    // The pin is released from the reader's settled COMPLETE; the fork's row is the
-    // legacy interrupted create (FAILED, still charged), its backend unmanaged.
     assert!(!reconciled.checkpoints_blocked, "{reconciled:?}");
-    assert_eq!(reconciled.unmanaged.len(), 1, "{reconciled:?}");
-    assert_eq!(
-        m.load(&f.id).unwrap().accounting.release,
-        ReservationRelease::Charged
-    );
-    assert_eq!(m.load(&f.id).unwrap().state, SandboxState::Failed);
+    assert!(reconciled.unmanaged.is_empty(), "{reconciled:?}");
     assert_eq!(
         pin_of(&m, &f.id).unwrap().released_by.as_deref(),
         Some("complete")
     );
+    compensated(&m, &f);
+    deleted_with_nothing_left(&m, &f).await;
+}
+
+/// The adversarial review's HIGH 1, `NotCreated`: the record proves nothing was allocated, so the
+/// restart fails the fork definitely and releases its reservation, then the pin.
+#[tokio::test]
+async fn a_crash_after_known_not_created_releases_the_reservation_at_startup() {
+    let (_tmp, dir, m, fake, clock) = on_disk_engine().await;
+    let (s, c) = ready(&m, 1000).await;
+    let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
+    let (f, reader) = committed_fork(&m, &c, &s, epoch, boot);
+    script(&fake, &[FakeRestore::NotCreated(Reason::ImageUnavailable)]);
+    orphan_restore(&fake, &c, &f, &reader).await.unwrap();
+    let before = m.store_resources_for_test();
+    let m = stop_and_reopen(m, &dir, &fake, &clock);
+    let reconciled = m.reconcile().await.unwrap();
+    let recovered = m.load(&f.id).unwrap();
+    assert_eq!(recovered.state, SandboxState::Failed, "{reconciled:?}");
+    assert_eq!(
+        recovered.create_certainty,
+        CreateCertainty::DefinitelyNotCreated,
+        "the helper's final NotCreated outcome was discarded: {reconciled:?}"
+    );
+    assert!(
+        recovered
+            .failure_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("checkpoint_image_unavailable: ")),
+        "{recovered:?}"
+    );
+    assert!(!recovered.is_charged());
+    assert_eq!(m.store_resources_for_test().sandboxes, before.sandboxes - 1);
+    assert_eq!(
+        pin_of(&m, &f.id).unwrap().released_by.as_deref(),
+        Some("not_started")
+    );
+    assert!(reconciled.unmanaged.is_empty() && !reconciled.checkpoints_blocked);
+    deleted_with_nothing_left(&m, &f).await;
+}
+
+/// Crashes between each new write and the pin's release: after the backend ID was
+/// recorded, after the pin was released too (before the acknowledgment), and after
+/// NotCreated's definite failure. Each restart ends settled: exact charge, no live pin,
+/// no unmanaged backend, Delete releasing.
+#[tokio::test]
+async fn a_crash_between_each_settlement_write_and_the_pin_release_recovers() {
+    for (case, outcome) in [
+        ("recorded", None),
+        ("released", None),
+        ("not created", Some(Reason::ImageUnavailable)),
+    ] {
+        let (_tmp, dir, m, fake, clock) = on_disk_engine().await;
+        let (s, c) = ready(&m, 1000).await;
+        let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
+        let (f, reader) = committed_fork(&m, &c, &s, epoch, boot);
+        if let Some(reason) = outcome {
+            script(&fake, &[FakeRestore::NotCreated(reason)]);
+        }
+        orphan_restore(&fake, &c, &f, &reader).await.unwrap();
+        let reply = settled_record(&fake, &c, &reader).await;
+        match (&reply, case) {
+            (
+                RestoreReply::Created {
+                    backend_id,
+                    evidence,
+                },
+                _,
+            ) => {
+                m.store.record_fork_backend(&f.id, backend_id).unwrap();
+                if case == "released" {
+                    m.store.release_checkpoint_pin(&f.id, evidence).unwrap();
+                }
+            }
+            (RestoreReply::NotCreated { .. }, _) => {
+                m.store
+                    .fail_create_definitely(&f.id, "checkpoint_image_unavailable: scripted")
+                    .unwrap();
+            }
+            other => panic!("{other:?}"),
+        }
+        let m = stop_and_reopen(m, &dir, &fake, &clock);
+        let reconciled = m.reconcile().await.unwrap();
+        assert!(reconciled.unmanaged.is_empty(), "{case}: {reconciled:?}");
+        assert!(!reconciled.checkpoints_blocked, "{case}: {reconciled:?}");
+        let row = m.load(&f.id).unwrap();
+        assert!(!row.is_charged(), "{case}: {row:?}");
+        if outcome.is_none() {
+            compensated(&m, &f);
+        } else {
+            assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
+        }
+        deleted_with_nothing_left(&m, &f).await;
+        settled(&m, &c);
+    }
+}
+
+/// The reader's settled record, as the helper keeps it until acknowledged.
+async fn settled_record(
+    fake: &FakeRuntime,
+    c: &Checkpoint,
+    reader: &HelperDispatch,
+) -> RestoreReply {
+    let reply = fake
+        .checkpoint(
+            Some(reader.helper_epoch),
+            CheckpointOperation::Inspect {
+                target: c.target(),
+                verify: false,
+                operation: Some(reader.operation),
+            },
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let CheckpointResponse::Inspected(view) = reply else {
+        panic!("{reply:?}")
+    };
+    match view.operation {
+        Some(crate::checkpoint::wire::OperationState::Settled(reply)) => match *reply {
+            CheckpointResponse::Restored(r) => *r,
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+fn stop_and_reopen(m: M, dir: &std::path::Path, fake: &FakeRuntime, clock: &ManualClock) -> M {
+    let limits = m.limits.clone();
+    m.begin_shutdown();
+    drop(m);
+    on_disk(dir, fake, clock, &limits)
 }
 
 #[tokio::test]
