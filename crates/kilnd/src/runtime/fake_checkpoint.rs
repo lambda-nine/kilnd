@@ -92,6 +92,9 @@ pub struct FakeCheckpoints {
     pub inspect_io: bool,
     /// Every operation the daemon sent, as `kind` or `kind <id>`.
     pub calls: Vec<String>,
+    /// One-shot: the next operation whose call starts with this panics, after it is
+    /// recorded (a supervisor's unexpected panic, unwinding through the daemon).
+    pub panic_on: Option<&'static str>,
 }
 
 impl Default for FakeCheckpoints {
@@ -118,6 +121,7 @@ impl Default for FakeCheckpoints {
             workers: BTreeMap::new(),
             tombstones: BTreeSet::new(),
             inventory_extra: Vec::new(),
+            panic_on: None,
             inventory_tracked: Vec::new(),
             inventory_incomplete: false,
             unreadable: BTreeSet::new(),
@@ -292,6 +296,13 @@ impl FakeRuntime {
                 Op::Acknowledge { target, .. } => format!("acknowledge {}", target.checkpoint),
                 Op::Source { backend_id } => format!("source {backend_id}"),
             });
+            let panics = group
+                .panic_on
+                .take_if(|p| group.calls.last().is_some_and(|c| c.starts_with(*p)));
+            if panics.is_some() {
+                drop(state);
+                panic!("scripted helper panic");
+            }
             if group.unavailable {
                 return Err(unavailable());
             }

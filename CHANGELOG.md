@@ -21,10 +21,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   takes), restoring the no-query path with the feature off; startup and Delete never
   remove a source an interrupted capture may still read, the capture's removal re-drives
   the source's delete, and shutdown stops draining after 240 s.
-- Close the checkpoint engine's sixth recheck with one rule: a checkpoint pass is clean
-  only if every charged row is sealed (READY or QUARANTINED) or a capture running in
-  this process, so a dead or failed capture and any DELETING row block allocation until
-  their removal proves ABSENT, across a restart too; a removal that finds an artifact it
+- Close the checkpoint engine's sixth recheck with one rule: a checkpoint pass (at
+  startup or in the barrier's retry) is clean only if every charged row is sealed (READY
+  or QUARANTINED) or a capture running in this process, so such a pass, a restart's
+  included, keeps allocation blocked beside a dead or failed capture or a DELETING row
+  until its removal proves ABSENT (a pass rule, not a lifetime rule: see the ninth
+  round below); a removal that finds an artifact it
   cannot prove its row's arms the durable barrier and its retry, and that retry's clean
   pass reopens allocation without a restart; a stale clean verdict cannot clear a later
   arm.
@@ -33,6 +35,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   capture failure, intent into DELETING and retryable removal, so a capture that fails
   or a row deleted while the pass awaits the helper refuses the stale clear; the retry
   passes again promptly.
+- Close the checkpoint engine's invariant ruling: the pass rule above governs what a
+  pass may call clean, and after a clean clear Create may run beside a failed capture or
+  a DELETING row while this process owns its cleanup and its charge stays counted.
+  Losing that ownership arms the barrier: a capture failure that cannot be recorded, and
+  any capture or removal supervisor that ends (a panic included) leaving a charged
+  unsealed or DELETING row no other supervisor owns, outside shutdown. The barrier's pass
+  then records the dead capture and resumes its removal.
 - Close the checkpoint engine's fifth recheck: the barrier's marker is written ahead,
   before any checkpoint helper pass at startup or in the retry, so a crash after a
   blocking verdict cannot lose it; a backend without checkpoints keeps an outstanding

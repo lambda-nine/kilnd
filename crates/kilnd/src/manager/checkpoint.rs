@@ -292,9 +292,10 @@ impl Drop for WorkerPermit<'_> {
 }
 
 /// Clears the source's capture flag and resumes its idle timer from its old activity
-/// (design 8.2: capture is not a renewal).
+/// (design 8.2: capture is not a renewal). Its `captures` entry goes on every exit,
+/// unwind included, and an unwinding capture takes the exit check first.
 struct CapturingFlag<'a, R: Runtime> {
-    manager: &'a Manager<R>,
+    manager: &'a Arc<Manager<R>>,
     slot: Arc<Slot>,
     source: String,
     checkpoint: Option<String>,
@@ -308,6 +309,9 @@ impl<R: Runtime> Drop for CapturingFlag<'_, R> {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         if let Some(id) = &self.checkpoint {
+            if std::thread::panicking() {
+                self.manager.exit_check(id, true);
+            }
             // No longer a running capture: a pass that copied it as one is stale.
             self.manager.epoch_transition(|| {
                 self.manager
@@ -319,6 +323,27 @@ impl<R: Runtime> Drop for CapturingFlag<'_, R> {
             });
         }
         self.manager.expiry_refresh(&self.source);
+    }
+}
+
+/// A removal supervisor's `retrying` entry, cleared on every exit, unwind included;
+/// an unwinding supervisor also takes the exit check.
+struct Supervising<R: Runtime> {
+    manager: Arc<Manager<R>>,
+    id: String,
+}
+
+impl<R: Runtime> Drop for Supervising<R> {
+    fn drop(&mut self) {
+        self.manager
+            .checkpoint
+            .retrying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+        if std::thread::panicking() {
+            self.manager.exit_check(&self.id, false);
+        }
     }
 }
 
@@ -1013,7 +1038,14 @@ impl<R: Runtime> Manager<R> {
                 .record_checkpoint_failure_token(&id, reason.token(), &detail, false)
         });
         if let Err(e) = recorded {
-            warn!(checkpoint = %id, error = %format!("{e:#}"), "could not record the capture failure");
+            // Unrecorded, the row is not removable, so this supervisor cannot keep it:
+            // block now (memory first, the marker best effort). The barrier's retry
+            // passes, with backoff until a restart, fail the dead capture and resume
+            // its removal.
+            warn!(checkpoint = %id, error = %format!("{e:#}"), "could not record the capture failure; allocation blocked until the barrier's pass records it");
+            if let Err(e) = self.set_checkpoint_barrier(true) {
+                warn!(checkpoint = %id, error = %format!("{e:#}"), "could not write the checkpoint barrier's marker; allocation stays blocked in memory");
+            }
         }
         send(match &key {
             Some(_) => self
@@ -1032,6 +1064,9 @@ impl<R: Runtime> Manager<R> {
             .remove_until_absent(&id, None, false, &CancellationToken::new())
             .await;
         self.barrier_after_removal(released.is_some());
+        if released.is_none() {
+            self.exit_check(&id, true);
+        }
         drop(flag);
     }
 
@@ -1576,6 +1611,10 @@ impl<R: Runtime> Manager<R> {
         {
             return false;
         }
+        let supervising = Supervising {
+            manager: Arc::clone(self),
+            id: id.to_string(),
+        };
         let manager = Arc::clone(self);
         let id = id.to_string();
         self.operations.spawn(async move {
@@ -1583,13 +1622,11 @@ impl<R: Runtime> Manager<R> {
             let released = manager
                 .remove_until_absent(&id, first, release_request_id, &cancel)
                 .await;
-            manager
-                .checkpoint
-                .retrying
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
+            drop(supervising);
             manager.barrier_after_removal(released.is_some());
+            if released.is_none() {
+                manager.exit_check(&id, false);
+            }
             // A capture's source whose removal was held for this ABSENT (a failed or
             // D1-canceled capture, after a restart) is removed now; a failure leaves it
             // DELETING for a later Delete. A sealed (READY-origin) row never held one.
@@ -1792,6 +1829,45 @@ impl<R: Runtime> Manager<R> {
         }
     }
 
+    /// The exit check, before a capture's or removal's supervision of `id` ends without
+    /// a release. A charged row still CAPTURING or DELETING that no other supervisor
+    /// owns (`capture`: the capture's own entry is not one) has lost its tracking, and
+    /// arms the barrier, whose passes fail a dead capture and resume its removal (R1).
+    /// A blocked barrier (a Retained verdict armed it) and shutdown (startup's pass
+    /// covers the row) need nothing more; an unreadable row counts as lost.
+    fn exit_check(self: &Arc<Self>, id: &str, capture: bool) {
+        let engine = &self.checkpoint;
+        if self.shutting_down.is_cancelled() || engine.barrier_blocked.load(Ordering::SeqCst) {
+            return self.spawn_barrier_retry();
+        }
+        let owned = engine
+            .retrying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+            || (!capture
+                && engine
+                    .captures
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(id));
+        let lost = match self.db().checkpoint(id) {
+            Ok(Some(c)) => {
+                c.is_charged()
+                    && matches!(c.state, CheckpointState::Capturing | CheckpointState::Deleting)
+            }
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        if lost && !owned {
+            warn!(checkpoint = %id, "a charged checkpoint left its supervisor untracked; allocation blocked until the barrier's pass adopts it");
+            if let Err(e) = self.set_checkpoint_barrier(true) {
+                warn!(checkpoint = %id, error = %format!("{e:#}"), "could not write the checkpoint barrier's marker; allocation stays blocked in memory");
+            }
+            self.spawn_barrier_retry();
+        }
+    }
+
     /// While the barrier is blocked: its pass again with backoff, each followed by the
     /// timers and removals it may have made due, until a clean pass clears the
     /// checkpoint part of the allocation block (never `admission_blocked`). Delete, Get,
@@ -1975,7 +2051,9 @@ impl<R: Runtime> Manager<R> {
             // this process is running. Any other charged row (CAPTURING dead or failed, DELETING
             // whatever its reason) has storage no removal has yet proved ABSENT, so the
             // barrier holds until that removal releases the row and a later pass is
-            // clean. No failure token is read for this.
+            // clean. No failure token is read for this. R1 rules what a pass may call
+            // clean, not a row's lifetime: after a clean clear, Create may run beside
+            // such a row while this process tracks its cleanup (see `exit_check`).
             let running = c.state == CheckpointState::Capturing
                 && c.failure.is_none()
                 && live.contains(c.id.as_str());

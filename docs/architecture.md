@@ -1393,7 +1393,20 @@ kept), or a CAPTURING row whose capture runs in this process. Any other charged 
 dead or failed CAPTURING row, any DELETING row, whatever its failure token) has storage
 no removal has yet proved ABSENT, so the pass blocks until that removal releases the row;
 startup after a crash therefore blocks briefly while its resumed removals settle, and no
-failure token is read for admission. A removal whose helper answers Retained with
+failure token is read for admission. This rule (R1) governs what a pass, at startup or in
+the barrier's retry, may call clean; it is not a rule for a row's whole lifetime. After a
+clean clear, a capture that fails or a row that enters DELETING does not arm the barrier
+by itself: Create may run beside that unsealed or DELETING charged row while this process
+owns its cleanup (the capture's own cleanup, or the row's removal supervisor) and its
+charge stays intact, counted in the shared admission total and in Health. What arms it is
+losing that ownership or an untrusted verdict: a Retained `checkpoint_corrupt` or
+`checkpoint_generation_mismatch` removal (below), a capture whose failure cannot be
+recorded (its row is then not removable, so its cleanup cannot keep it), or a capture or
+removal supervisor that ends, by returning or by a panic, leaving a charged CAPTURING or
+DELETING row that no other supervisor owns, outside shutdown (startup's pass covers
+those). The exit check arms in memory first, then writes the marker, and starts the
+retry, whose pass fails the dead capture and resumes its removal; the record and the pass
+retry with backoff until they succeed or shutdown hands the row to startup. A removal whose helper answers Retained with
 `checkpoint_corrupt` or `checkpoint_generation_mismatch` (C3) arms the barrier itself
 (blocked in memory, then the marker) and starts its retry, whose passes re-drive the
 retained removal: at the retry's backoff (up to `max_removal_retry`), or sooner when
@@ -1462,8 +1475,12 @@ current epoch, asks the helper to remove, and releases only with that removal's 
 evidence, which also releases every live pin. `checkpoint_busy`, an unavailable helper or
 a lost reply keeps the row DELETING and charged and is retried with backoff until ABSENT;
 `checkpoint_generation_mismatch` and `checkpoint_corrupt` are recorded on the DELETING row,
-keep the charge and block new allocations (sandboxes and captures) until an operator
-reconciles. Delete of a FAILED row makes it DELETED; Delete is idempotent; the capture key
+keep the charge and arm the barrier, blocking new allocations (sandboxes and captures)
+until a removal proves ABSENT and a clean pass clears it. An ordinary removal (running,
+or retrying after a busy, unavailable or lost reply) keeps the charge but blocks nothing
+by itself once a clean pass cleared the barrier, because its supervisor still owns it; a
+supervisor that ends without a release and leaves its row charged and unowned arms the
+barrier (the exit check above). Delete of a FAILED row makes it DELETED; Delete is idempotent; the capture key
 is released only from DELETED.
 
 **Expiry** (design 8.1). One timer per charged READY or QUARANTINED checkpoint on the

@@ -2115,3 +2115,229 @@ async fn a_stale_clean_verdict_cannot_clear_a_later_arm() {
     assert!(!m.store.checkpoint_barrier_marked().unwrap());
     assert!(!m.allocation_blocked());
 }
+
+// --- Round 9: the narrowed rule (R1 is a pass rule) and the exit check ----------------
+
+/// G1: B1's durable failure write fails (SQLite's writer lock is held across it, past
+/// the store's busy timeout). The unfailed CAPTURING row is not removable, so the
+/// capture's own cleanup cannot keep it: the barrier arms at once, and its retry's pass
+/// records the dead capture's failure, resumes its removal and releases it once.
+#[tokio::test]
+async fn a_failed_failure_write_arms_and_the_barrier_adopts_the_capture() {
+    use crate::checkpoint::Reason;
+
+    let (_tmp, dir, m, fake, _) = persistent().await;
+    let source = source(&m, 1000).await;
+    let sources_disk = m.store_resources_for_test().disk_bytes;
+    let gate = gate_capture(&fake);
+    let capturing = tokio::spawn({
+        let m = Arc::clone(&m);
+        let source = source.clone();
+        async move { capture(&m, &source, 1000).await }
+    });
+    gate.entered().await;
+    let checkpoint = only(&m);
+    fake.checkpoints(|g| {
+        g.capture_fail = Some((Reason::Io, "capture failed while B1 is locked".into()));
+    });
+    let external = rusqlite::Connection::open(dir.join("kilnd.db")).unwrap();
+    external.execute_batch("BEGIN IMMEDIATE").unwrap();
+    gate.release();
+    assert!(capturing.await.unwrap().is_err());
+    assert!(
+        m.allocation_blocked(),
+        "the unrecorded failure left the charged capture with nothing blocking"
+    );
+    external.execute_batch("ROLLBACK").unwrap();
+    assert!(create_is_blocked(&m).await);
+
+    until_slow("the barrier's pass records the dead capture's failure", || {
+        row(&m, checkpoint.id.as_str()).failure.is_some()
+    })
+    .await;
+    until_slow("the adopted removal releases the row", || {
+        !row(&m, checkpoint.id.as_str()).is_charged()
+    })
+    .await;
+    until_allocation_opens(&m, "the adopted capture was released").await;
+    assert_eq!(calls(&fake, "remove"), 1, "one removal proved it absent");
+    assert!(!fake.checkpoints(|g| g.staging.contains(checkpoint.id.as_str())));
+    assert_eq!(charge(&m), (0, 0), "released exactly once");
+    assert_eq!(
+        m.store_resources_for_test().disk_bytes,
+        2 * sources_disk,
+        "the source and the Create above; the capture's R returned once"
+    );
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
+    assert!(!m.live_captures().contains(checkpoint.id.as_str()));
+    assert!(m.checkpoint.retrying.lock().unwrap().is_empty());
+}
+
+const X: u64 = 1 << 30;
+
+/// A node whose shared disk budget is two sources plus `retained`, and whose removal
+/// retries wait 30 s, so a tracked cleanup stays in its backoff while the test looks.
+fn overlap_engine(retained: u64) -> (M, FakeRuntime) {
+    let mut limits = test_limits();
+    limits.default_disk_bytes = X;
+    limits.max_node_disk_bytes = 2 * X + retained;
+    let ck = limits.checkpoints.as_mut().unwrap();
+    ck.budgets.max_size_bytes = X / 2;
+    ck.removal_retry = Duration::from_secs(30);
+    ck.max_removal_retry = Duration::from_secs(30);
+    let (m, fake, _) = engine_with(FakeRuntime::default().with_checkpoints(), limits);
+    (m, fake)
+}
+
+async fn create_disk(m: &M, disk_bytes: u64) -> Result<Sandbox> {
+    let req = CreateRequest {
+        disk_bytes,
+        ..CreateRequest::default()
+    };
+    m.create_owned(req, 2000).await
+}
+
+/// The narrowed rule's positive half: after a clean clear, Create is admitted beside a
+/// cleanup this process tracks, the retained charge is never spent (one byte past the
+/// boundary is refused) and Health reports it; ABSENT then returns it exactly once.
+async fn admits_beside_a_tracked_cleanup(m: &M, id: &str, retained: u64) {
+    assert_eq!(charge(m), (1, retained));
+    assert!(!m.allocation_blocked());
+    assert!(matches!(
+        create_disk(m, X + 1).await,
+        Err(Error::ResourceExhausted(_))
+    ));
+    let health = m.health().await.unwrap();
+    assert!(health.serving, "{}", health.detail);
+    assert_eq!(health.node_resources.reserved.disk_bytes, X + retained);
+    create_disk(m, X).await.expect("Create beside the tracked cleanup");
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.disk_bytes,
+        2 * X + retained
+    );
+
+    // ABSENT (an explicit Delete's removal), then the capacity is back once.
+    m.delete_checkpoint(id, 1000, false).await.unwrap();
+    assert_eq!(row(m, id).state, CheckpointState::Deleted);
+    assert_eq!(charge(m), (0, 0));
+    assert_eq!(
+        m.health().await.unwrap().node_resources.reserved.disk_bytes,
+        2 * X
+    );
+    assert!(matches!(
+        create_disk(m, retained + 1).await,
+        Err(Error::ResourceExhausted(_))
+    ));
+    m.delete_checkpoint(id, 1000, false).await.unwrap();
+    assert_eq!(charge(m), (0, 0), "a second Delete releases nothing");
+    create_disk(m, retained).await.expect("exactly R or S came back");
+    assert!(!m.allocation_blocked());
+}
+
+#[tokio::test]
+async fn after_a_clean_clear_create_is_admitted_beside_a_tracked_failed_capture() {
+    use crate::checkpoint::Reason;
+
+    let (m, fake) = overlap_engine(X / 2);
+    let source = source(&m, 1000).await;
+    let gate = gate_capture(&fake);
+    let capturing = tokio::spawn({
+        let m = Arc::clone(&m);
+        let source = source.clone();
+        async move { capture(&m, &source, 1000).await }
+    });
+    gate.entered().await;
+    let checkpoint = only(&m);
+    assert!(!m.reconcile_checkpoints().await.unwrap());
+    assert!(!m.set_checkpoint_barrier(false).unwrap());
+
+    fake.checkpoints(|g| {
+        g.capture_fail = Some((Reason::Io, "capture failed after the clean clear".into()));
+        g.removals.push_back(FakeRemoval::Unavailable);
+    });
+    gate.release();
+    assert!(capturing.await.unwrap().is_err());
+    until("the failed capture's retryable removal", || {
+        calls(&fake, "remove") >= 1
+    })
+    .await;
+    let failed = row(&m, checkpoint.id.as_str());
+    assert_eq!(failed.state, CheckpointState::Capturing);
+    assert!(failed.is_charged() && failed.failure.is_some());
+    assert!(
+        m.live_captures().contains(checkpoint.id.as_str()),
+        "the capture's own cleanup still tracks it"
+    );
+    admits_beside_a_tracked_cleanup(&m, checkpoint.id.as_str(), X / 2).await;
+}
+
+#[tokio::test]
+async fn after_a_clean_clear_create_is_admitted_beside_a_retrying_deleting_row() {
+    let s = X / 4;
+    let (m, fake) = overlap_engine(s);
+    fake.checkpoints(|g| g.charge_bytes = s);
+    let source = source(&m, 1000).await;
+    let ready = capture(&m, &source, 1000).await.unwrap();
+    assert!(!m.reconcile_checkpoints().await.unwrap());
+    assert!(!m.set_checkpoint_barrier(false).unwrap());
+
+    fake.checkpoints(|g| g.removals.push_back(FakeRemoval::Unavailable));
+    m.delete_checkpoint(ready.id.as_str(), 1000, false)
+        .await
+        .unwrap_err();
+    let deleting = row(&m, ready.id.as_str());
+    assert_eq!(deleting.state, CheckpointState::Deleting);
+    assert!(deleting.is_charged());
+    assert!(
+        m.checkpoint
+            .retrying
+            .lock()
+            .unwrap()
+            .contains(ready.id.as_str()),
+        "its removal supervisor tracks it"
+    );
+    admits_beside_a_tracked_cleanup(&m, ready.id.as_str(), s).await;
+}
+
+/// G2: a supervisor that panics (the fake helper panics inside its call) clears its
+/// map entry on the unwind and arms the barrier while its row is charged; the
+/// barrier's pass then adopts the row, releases it and reopens Create.
+#[tokio::test]
+async fn a_panicking_supervisor_arms_the_barrier_and_leaves_no_entry() {
+    // A capture's supervisor, after C1.
+    let (m, fake, _) = engine();
+    let s = source(&m, 1000).await;
+    fake.checkpoints(|g| g.panic_on = Some("capture"));
+    assert!(capture(&m, &s, 1000).await.is_err());
+    let c = only(&m);
+    until("the capture's unwind", || {
+        !m.live_captures().contains(c.id.as_str())
+    })
+    .await;
+    assert!(m.allocation_blocked() && m.store.checkpoint_barrier_marked().unwrap());
+    assert!(create_is_blocked(&m).await);
+    until_allocation_opens(&m, "the panicked capture was adopted").await;
+    assert!(!row(&m, c.id.as_str()).is_charged());
+    assert_eq!(charge(&m), (0, 0));
+
+    // A removal supervisor, for a READY row's Delete.
+    let ready = capture(&m, &s, 1000).await.unwrap();
+    fake.checkpoints(|g| g.panic_on = Some("remove"));
+    m.delete_checkpoint(ready.id.as_str(), 1000, false)
+        .await
+        .unwrap_err();
+    assert!(
+        !m.checkpoint
+            .retrying
+            .lock()
+            .unwrap()
+            .contains(ready.id.as_str()),
+        "the unwind cleared its entry"
+    );
+    assert!(m.allocation_blocked() && m.store.checkpoint_barrier_marked().unwrap());
+    assert_eq!(row(&m, ready.id.as_str()).state, CheckpointState::Deleting);
+    until_allocation_opens(&m, "the panicked removal was adopted").await;
+    assert_eq!(row(&m, ready.id.as_str()).state, CheckpointState::Deleted);
+    assert_eq!(charge(&m), (0, 0));
+    assert!(m.checkpoint.retrying.lock().unwrap().is_empty());
+}
