@@ -700,7 +700,7 @@ async fn admission_resource_bounds_plateau_and_recover() {
 
     let mut create_client = client.clone();
     let sandbox_id = create_client
-        .create_sandbox(pb::CreateSandboxRequest {
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(),
             spec: None,
             expiry: None,
             request_id: String::new(),

@@ -111,7 +111,8 @@ pub struct Limits {
     /// `--exec-stream-buffer-bytes` and `--exec-stream-chunk-bytes`.
     pub exec_stream: crate::exec_stream::StreamBuffer,
     /// Workspace checkpoints (milestone C5a): `None`, the default, is the feature off.
-    /// There is no flag yet; only Rust callers and tests set it.
+    /// `--enable-workspace-checkpoints` sets the design's limits (testing only for now:
+    /// nothing advertises the feature and no headroom check runs yet).
     pub checkpoints: Option<CheckpointLimits>,
 }
 
@@ -4816,7 +4817,8 @@ fn may_use(sandbox: &Sandbox, uid: u32) -> bool {
 
 mod checkpoint;
 pub use checkpoint::{
-    CaptureKey, CaptureRequest, CheckpointCode, CheckpointLimits, CheckpointReason,
+    CaptureKey, CaptureRequest, CheckpointCode, CheckpointExpiryView, CheckpointLimits,
+    CheckpointReason,
     DEFAULT_CHECKPOINT_IDLE_MS, DEFAULT_CHECKPOINT_LIFETIME_MS, EXCLUDED_PATHS,
     resolve_checkpoint_expiry,
 };

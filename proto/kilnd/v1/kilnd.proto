@@ -98,6 +98,48 @@ service KilndService {
   // transport deadline is a disconnect. A daemon crash ends the stream without
   // ExecFinished; after restart the execution is INTERRUPTED.
   rpc ExecStream(ExecStreamRequest) returns (stream ExecStreamResponse);
+
+  // Workspace checkpoints (FEATURE_WORKSPACE_CHECKPOINT). Every refusal is typed
+  // (FEATURE_TYPED_REASONS): UNIMPLEMENTED backend_unsupported:workspace_checkpoint
+  // (not enabled, or a backend without checkpoints, Firecracker included);
+  // FAILED_PRECONDITION sandbox_unsupported:workspace_checkpoint, checkpoint_busy,
+  // checkpoint_not_ready, checkpoint_expired, checkpoint_layout_unsupported,
+  // checkpoint_metadata_unsupported, checkpoint_image_unavailable; INVALID_ARGUMENT
+  // checkpoint_spec_mismatch, checkpoint_disk_too_small, checkpoint_expiry_required;
+  // RESOURCE_EXHAUSTED checkpoint_quota, checkpoint_size_limit, checkpoint_workers;
+  // DATA_LOSS checkpoint_corrupt; UNAVAILABLE checkpoint_io; DEADLINE_EXCEEDED
+  // checkpoint_in_flight. A foreign ID is NOT_FOUND, like a missing one; root sees and
+  // uses every checkpoint. Existing checkpoints stay readable and deletable when the
+  // feature is withdrawn; only new captures and forks need it.
+
+  // Captures a READY sandbox's persistent workspace as an immutable checkpoint and
+  // waits until the capture settles. The checkpoint is owned and charged to the
+  // caller's uid (root's captures are root's). expiry is required. A running or
+  // queued execution in the sandbox fails checkpoint_busy at once, and nothing waits;
+  // while the capture runs, a new Exec fails checkpoint_busy. Canceling or timing out
+  // the RPC only stops waiting: an admitted capture continues. Unkeyed: the READY
+  // checkpoint, or the typed reason it failed; retrying may capture a later state and
+  // make another checkpoint. With request_id (the Create grammar, in a namespace of its
+  // own per uid), the original call and every retry of an equal request return OK with
+  // the same checkpoint in whatever state it settled, FAILED and DELETED included; a
+  // different request fails ALREADY_EXISTS request_id_conflict, a retry whose deadline
+  // passes first DEADLINE_EXCEEDED checkpoint_in_flight, and a caller at its
+  // request-record cap RESOURCE_EXHAUSTED request_id_quota.
+  rpc CheckpointSandbox(CheckpointSandboxRequest) returns (CheckpointSandboxResponse);
+
+  // Returns one checkpoint. On a usable READY checkpoint it restarts the idle timer
+  // (never the lifetime); one already due is expired instead and returned DELETING.
+  rpc GetCheckpoint(GetCheckpointRequest) returns (GetCheckpointResponse);
+
+  // Stable newest-first pages, side-effect free: listing never keeps a checkpoint.
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+
+  // Removes a checkpoint: DELETING stops new forks at once, a running capture or
+  // restore from it is canceled, and the artifact is removed once no reader remains;
+  // its charge is released only when its absence is proved. A failed attempt keeps it
+  // DELETING and charged and is retried by kilnd. Deleting a DELETED checkpoint
+  // succeeds; sandboxes created from it are never affected.
+  rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (DeleteCheckpointResponse);
 }
 
 message HealthRequest {}
@@ -168,6 +210,11 @@ enum Feature {
   FEATURE_TYPED_REASONS = 7;
   // DeleteSandboxRequest.release_request_id and Sandbox.request_id_released.
   FEATURE_REQUEST_ID_RELEASE = 8;
+  // The checkpoint RPCs, CreateSandboxRequest.from_checkpoint, Sandbox.from_checkpoint
+  // and checkpoint_content_sha256, ApiLimits.checkpoint and AdmissionStats.checkpoints.
+  // Dynamic: listed only while the operator enables it and the backend's probes pass,
+  // and RuntimeCapabilities.checkpoint agrees with it.
+  FEATURE_WORKSPACE_CHECKPOINT = 9;
 }
 
 // Caps, minimums and defaults a client could hit. A field whose feature is not
@@ -199,6 +246,36 @@ message ApiLimits {
   uint64 stream_buffer_bytes = 17;
   uint64 min_sandbox_lifetime_ms = 18;
   uint64 min_sandbox_idle_ms = 19;
+  // FEATURE_WORKSPACE_CHECKPOINT.
+  CheckpointLimits checkpoint = 20;
+}
+
+// What a capture, fork or checkpoint expiry may use (FEATURE_WORKSPACE_CHECKPOINT).
+message CheckpointLimits {
+  // The most one checkpoint may charge.
+  uint64 max_size_bytes = 1;
+  uint32 max_entries = 2;
+  uint64 max_manifest_bytes = 3;
+  uint32 max_path_bytes = 4;
+  uint32 max_directory_depth = 5;
+  uint32 max_link_target_bytes = 6;
+  uint32 max_xattrs_per_entry = 7;
+  uint32 max_xattr_bytes_per_entry = 8;
+  // Used for a zero field of the capture's required ExpiryPolicy.
+  uint64 default_lifetime_ms = 9;
+  uint64 max_lifetime_ms = 10;
+  uint64 default_idle_ms = 11;
+  uint64 max_idle_ms = 12;
+  uint64 min_lifetime_ms = 13;
+  uint64 min_idle_ms = 14;
+  uint64 operation_timeout_ms = 15;
+  uint64 helper_timeout_ceiling_ms = 16;
+  // 0: no ancestry/depth limit in v1.
+  uint32 max_fork_depth = 17;
+  uint64 worker_memory_bytes = 18;
+  uint32 worker_max_fds = 19;
+  // The least time a capture request record is kept.
+  uint64 request_retention_ms = 20;
 }
 
 // Generic facts about this daemon's execution backend. Clients check these
@@ -208,6 +285,7 @@ message RuntimeCapabilities {
   repeated NetworkMode network_modes = 1;
   // False when any interruption after dispatch retires the sandbox.
   bool interruption_preserves_session = 2;
+  // Agrees with FEATURE_WORKSPACE_CHECKPOINT in features.
   bool checkpoint = 3;
   // This daemon's static features plus the dynamic ones its backend has
   // currently proven. Absent means unsupported. Read it only from a SERVING
@@ -260,6 +338,8 @@ message NodeResourceStats {
   uint64 accounting_generation = 17;
   // When the authority's snapshot was observed; zero when it has none.
   int64 accounting_observed_at_unix_ms = 18;
+  // Breakdown only; already included in reserved_disk_bytes (field 8).
+  uint64 checkpoint_reserved_disk_bytes = 19;
 }
 
 // Current use and cumulative admission rejections since daemon startup.
@@ -294,6 +374,44 @@ message AdmissionStats {
   uint64 max_create_requests_per_uid = 23;
   uint64 caller_create_requests = 24;
   uint64 rejected_create_requests = 25;
+  // FEATURE_WORKSPACE_CHECKPOINT.
+  CheckpointStats checkpoints = 26;
+}
+
+// Checkpoint use (FEATURE_WORKSPACE_CHECKPOINT). Count and bytes include charged
+// partial, quarantined and deleting checkpoints; records include terminal history.
+// "Caller" is the calling uid's own, root's included. Rejections and expirations count
+// since daemon startup; the rest is current. Stats stay visible for cleanup while the
+// feature is withdrawn; the limits describe new work only while it is listed.
+message CheckpointStats {
+  uint64 max_count = 1;
+  uint64 current_count = 2;
+  uint64 max_count_per_uid = 3;
+  uint64 caller_count = 4;
+  uint64 max_bytes = 5;
+  uint64 reserved_bytes = 6;
+  uint64 max_bytes_per_uid = 7;
+  uint64 caller_reserved_bytes = 8;
+  uint64 max_workers = 9;
+  uint64 current_workers = 10;
+  uint64 max_workers_per_uid = 11;
+  uint64 caller_workers = 12;
+  uint64 pending_deletes = 13;
+  uint64 rejected_captures = 14;
+  uint64 rejected_forks = 15;
+  uint64 max_records = 16;
+  uint64 current_records = 17;
+  uint64 max_records_per_uid = 18;
+  uint64 caller_records = 19;
+  uint64 max_request_records = 20;
+  uint64 request_records = 21;
+  uint64 max_request_records_per_uid = 22;
+  uint64 caller_request_records = 23;
+  uint64 max_cleanup_workers = 24;
+  uint64 current_cleanup_workers = 25;
+  // Checkpoints whose lifetime or idle timeout expired them. An addition after the
+  // design's last field (26 follows its 25), not part of its Appendix A.
+  uint64 expired = 26;
 }
 
 enum SandboxState {
@@ -419,6 +537,11 @@ message Sandbox {
   // The create request record was given up through release_request_id: a new
   // create with request_id makes a new sandbox.
   bool request_id_released = 19;
+  // The checkpoint this sandbox was created from, and that checkpoint's content
+  // digest (lowercase hex), recorded once at creation. Empty for every other sandbox.
+  // Provenance only: deleting either side never affects the other.
+  string from_checkpoint = 20;
+  string checkpoint_content_sha256 = 21;
 }
 
 // Sent: each nonzero field is used as given; it must be at least 10 s
@@ -485,6 +608,16 @@ message CreateSandboxRequest {
   // (sandbox_feature_probe_failed, retryable); a keyed create's original and
   // retries return its FAILED row.
   repeated EnvVar default_env = 4;
+  // Empty: unchanged legacy create. Otherwise a checkpoint ID: the new sandbox starts
+  // with that checkpoint's workspace. Its spec must match the checkpoint's image,
+  // read_only_root and writable_paths (else INVALID_ARGUMENT checkpoint_spec_mismatch)
+  // and its disk must hold the checkpoint's size_bytes (checkpoint_disk_too_small);
+  // limits, network, labels, default_env and expiry may differ, and nothing else is
+  // inherited. The checkpoint must be READY and unexpired. A request_id's digest
+  // covers this field (kilnd.v1.create-request.2; an empty field keeps version 1).
+  // Needs FEATURE_WORKSPACE_CHECKPOINT: an older daemon ignores it and creates an
+  // ordinary sandbox.
+  string from_checkpoint = 5;
 }
 
 // One environment variable.
@@ -822,4 +955,125 @@ message ExecFinished {
   Execution execution = 1;
   LiveDelivery stdout = 2;
   LiveDelivery stderr = 3;
+}
+
+enum CheckpointState {
+  CHECKPOINT_STATE_UNSPECIFIED = 0;
+  // The capture is running. It is charged max_size_bytes.
+  CHECKPOINT_STATE_CAPTURING = 1;
+  // Complete and verified: forks may start from it. It is charged size_bytes.
+  CHECKPOINT_STATE_READY = 2;
+  // A Delete, expiry or failed capture is removing it; still charged.
+  CHECKPOINT_STATE_DELETING = 3;
+  // Removed and released. The record stays for history.
+  CHECKPOINT_STATE_DELETED = 4;
+  // The capture failed and its storage was proved absent; see failure_reason.
+  CHECKPOINT_STATE_FAILED = 5;
+  // Its artifact is missing or corrupt: charged, refused for forks, deletable.
+  CHECKPOINT_STATE_QUARANTINED = 6;
+}
+
+enum CheckpointScope {
+  CHECKPOINT_SCOPE_UNSPECIFIED = 0;
+  // The sandbox's persistent overlay (its writes over the image).
+  CHECKPOINT_SCOPE_PERSISTENT_OVERLAY = 1;
+}
+
+message CheckpointExpiryStatus {
+  ExpiryPolicy effective = 1;
+  // Wall-clock projections of monotonic deadlines, computed when read. 0: none (not
+  // yet READY, or settled).
+  int64 lifetime_expires_at_unix_ms = 2;
+  // 0: none, or paused.
+  int64 idle_expires_at_unix_ms = 3;
+  // 0 before READY.
+  int64 last_activity_at_unix_ms = 4;
+  // Paused by restore pins, not by Get.
+  bool idle_paused = 5;
+}
+
+message CheckpointSandboxRequest {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
+  string sandbox_id = 1;
+  // Optional; separate from Create keys. Same grammar as CreateSandboxRequest's.
+  string request_id = 2;
+  // Required; {} selects finite defaults (ApiLimits.checkpoint). A nonzero field is
+  // at least 10 s and at most 7 days (lifetime) or 24 hours (idle).
+  ExpiryPolicy expiry = 3;
+  // 0: min(source disk, checkpoint limit). Larger fails checkpoint_size_limit.
+  uint64 max_size_bytes = 4;
+}
+
+message CheckpointSandboxResponse {
+  Checkpoint checkpoint = 1;
+}
+
+message Checkpoint {
+  // cp- + 32 lowercase hex digits.
+  string id = 1;
+  CheckpointState state = 2;
+  uint32 owner_uid = 3;
+  // Source provenance; may be deleted.
+  string sandbox_id = 4;
+  int64 created_at_unix_ms = 5;
+  // 0 until READY.
+  int64 ready_at_unix_ms = 6;
+  // S; 0 until sealed, retained in history.
+  uint64 size_bytes = 7;
+  uint64 logical_bytes = 8;
+  uint64 allocated_bytes = 9;
+  // Lowercase hex, 64 chars; empty unsealed.
+  string content_sha256 = 10;
+  string image = 11;
+  string image_content_sha256 = 12;
+  bool read_only_root = 13;
+  // Normalized configured path set.
+  repeated string writable_paths = 14;
+  repeated string excluded_paths = 15;
+  CheckpointScope scope = 16;
+  CheckpointExpiryStatus expiry = 17;
+  // Token + redacted detail, no file data.
+  string failure_reason = 18;
+  DeletionReason deletion_reason = 19;
+  string request_id = 20;
+  bool request_id_released = 21;
+  uint32 format_version = 22;
+  // R, resolved once at capture acceptance.
+  uint64 max_size_bytes = 23;
+}
+
+message GetCheckpointRequest {
+  // cp- + 32 lowercase hex digits.
+  string id = 1;
+}
+
+message GetCheckpointResponse {
+  Checkpoint checkpoint = 1;
+}
+
+message ListCheckpointsRequest {
+  // Empty: all authorized checkpoints. Otherwise only those captured from this
+  // sandbox ID (which may since be deleted).
+  string sandbox_id = 1;
+  // Bounded; 0 uses existing legacy-list all-or-RESOURCE_EXHAUSTED behavior.
+  uint32 page_size = 2;
+  // From next_page_token, for the same caller and sandbox_id.
+  string page_token = 3;
+}
+
+message ListCheckpointsResponse {
+  repeated Checkpoint checkpoints = 1;
+  string next_page_token = 2;
+}
+
+message DeleteCheckpointRequest {
+  // cp- + 32 lowercase hex digits.
+  string id = 1;
+  // Only effective once DELETED: give up the capture request record, so a later
+  // capture with that request_id makes a new checkpoint. Irreversible.
+  bool release_request_id = 2;
+}
+
+message DeleteCheckpointResponse {
+  Checkpoint checkpoint = 1;
 }

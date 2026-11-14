@@ -445,6 +445,12 @@ Schema 16 adds one table, the checkpoint barrier's durable marker (see
 rows are unchanged and older binaries refuse schema 16. Rollback is the same database
 backup restore.
 
+`--enable-workspace-checkpoints` (default off) serves the checkpoint RPCs and creates from
+a checkpoint. **Use it only in tests and explicit staging for now:** Health does not yet
+advertise the feature and captures and forks are admitted without the free-space headroom
+check (see [architecture.md](architecture.md#workspace-checkpoint-api-milestone-c5b-1)).
+The root helper must also run with its checkpoint group enabled.
+
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart. On a Firecracker node this is a transaction; see above.
 - **State path:** `--state-dir` must be absolute. Its real ancestors must be

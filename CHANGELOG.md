@@ -48,6 +48,22 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   an empty `--writable` path is refused, and a non-UTF-8 word is refused except in a
   `--writable` path. New direct tests cover capture's required `--generation` and
   `--max-bytes` and the retention rule that keeps a CREATING fork's checkpoint and pin.
+- Add milestone C5b-1 of workspace checkpoints: the API. New RPCs `CheckpointSandbox`,
+  `GetCheckpoint`, `ListCheckpoints` and `DeleteCheckpoint`; `CreateSandboxRequest.
+  from_checkpoint` (field 5) and `Sandbox.from_checkpoint` / `checkpoint_content_sha256`
+  (20/21); and, defined but not yet filled, `FEATURE_WORKSPACE_CHECKPOINT = 9`,
+  `ApiLimits.checkpoint`, `AdmissionStats.checkpoints` (`CheckpointStats`, with `expired`
+  as field 26 beyond the design's appendix) and `NodeResourceStats.
+  checkpoint_reserved_disk_bytes`. Every refusal is typed, with design 7.3's code. A
+  keyed fork's digest is version 2; version 1 digests are unchanged. List pages are
+  newest first with caller- and filter-bound continuations. New `kilndctl checkpoint
+  create|get|ls|rm`. **`--enable-workspace-checkpoints` (default off) is for testing
+  only:** this release advertises nothing and runs no free-space headroom check before a
+  capture or fork; discovery, Health's checkpoint stats and the headroom check come next.
+  With the flag off and no checkpoint state, every checkpoint RPC is refused
+  `backend_unsupported:workspace_checkpoint` before any store query; existing
+  checkpoints stay readable and deletable. The exit check's ownership read now shares
+  one lock with the leaving supervisor's removal, for any runtime.
 - Harden the checkpoint engine (C5a-1 adversarial review: eight HIGH, one MEDIUM).
   Delete and expiry hand removal to a supervisor before awaiting, so a departed caller
   never strands a charged row; existing checkpoints are expired, removed, rebased and

@@ -377,7 +377,7 @@ async fn every_rpc_over_the_socket() {
         ..Default::default()
     };
     let sandbox = c
-        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
             spec: Some(spec),
             expiry: None,
         })
@@ -534,7 +534,7 @@ async fn every_rpc_over_the_socket() {
         ..Default::default()
     };
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
             spec: Some(mixed),
             expiry: None,
         })
@@ -543,7 +543,7 @@ async fn every_rpc_over_the_socket() {
     assert_eq!(err.code(), Code::InvalidArgument);
     fake.state().fail_create = Some("no image".into());
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -568,7 +568,7 @@ async fn every_rpc_over_the_socket() {
         backend.fail_create_definitely = Some("image missing".into());
     }
     let err = c
-        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -641,7 +641,7 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
     ));
     let mut c = client(path).await;
     let oversize = c
-        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
             spec: Some(pb::SandboxSpec {
                 labels: [("test".into(), "x".repeat(256))].into(),
                 ..Default::default()
@@ -656,7 +656,7 @@ async fn wire_message_caps_reject_oversize_decode_and_encode_without_losing_owne
     // The response cap can fail only after a successful owned operation.
     // Its durable result is still inspectable and is not compensated away.
     let response = c
-        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
             spec: Some(pb::SandboxSpec {
                 labels: [("test".into(), "x".repeat(70))].into(),
                 ..Default::default()
@@ -705,7 +705,7 @@ async fn ownership_comes_from_the_kernel_credentials_of_the_socket() {
     let mut c = client(socket.clone()).await;
 
     let mine = c
-        .create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
             spec: None,
             expiry: None,
         })
@@ -972,7 +972,7 @@ async fn graceful_shutdown_drains_a_create_after_its_rpc_disconnects() {
     ));
     let mut c = client(socket.clone()).await;
     let request = tokio::spawn(async move {
-        c.create_sandbox(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+        c.create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
             spec: None,
             expiry: None,
         })

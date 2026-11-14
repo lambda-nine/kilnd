@@ -212,6 +212,15 @@ struct Args {
     /// The most data one ExecStream OutputChunk carries, in bytes (1 to 65536).
     #[arg(long, default_value_t = 32 * 1024)]
     exec_stream_chunk_bytes: usize,
+    /// For testing only: serve the workspace checkpoint RPCs and creates from a
+    /// checkpoint, with the design's limits (1 GiB per checkpoint; 32 checkpoints and
+    /// 4 GiB per uid; 128 and 8 GiB per node; 24 h lifetime and 1 h idle by default, at
+    /// most 7 days; two capture/restore workers, one per uid). Until feature discovery
+    /// and the free-space headroom check land, Health does not advertise the feature
+    /// and captures and forks are admitted without a physical headroom check, so leave
+    /// this off outside tests and explicit staging.
+    #[arg(long)]
+    enable_workspace_checkpoints: bool,
     /// On SIGTERM, how long running requests may finish before executions are
     /// canceled, in seconds.
     #[arg(long, default_value_t = 30)]
@@ -684,6 +693,9 @@ fn validated_limits(args: &Args) -> Result<Limits> {
             rescan: Duration::from_secs(args.expiry_rescan_secs),
             max_concurrent_deletes: args.max_concurrent_expiry_deletes,
         },
+        checkpoints: args
+            .enable_workspace_checkpoints
+            .then(kilnd::manager::CheckpointLimits::default),
         ..Limits::default()
     };
     validate_expiry(&limits.expiry, args)?;
@@ -1107,6 +1119,24 @@ mod tests {
             error.contains("kilnd-fctest") && !error.contains("differs from"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn workspace_checkpoints_are_off_unless_enabled_and_then_take_the_design_s_limits() {
+        let args = Args::try_parse_from(["kilnd"]).unwrap();
+        assert_eq!(validated_limits(&args).unwrap().checkpoints, None);
+        let args = Args::try_parse_from(["kilnd", "--enable-workspace-checkpoints"]).unwrap();
+        let c = validated_limits(&args).unwrap().checkpoints.unwrap();
+        let b = c.budgets;
+        assert_eq!(b.max_size_bytes, 1 << 30);
+        assert_eq!((b.max_per_uid, b.max_bytes_per_uid), (32, 4 << 30));
+        assert_eq!((b.max_node, b.max_bytes_node), (128, 8 << 30));
+        assert_eq!(
+            (c.default_lifetime_ms, c.default_idle_ms),
+            (86_400_000, 3_600_000)
+        );
+        assert_eq!(kilnd::store::MAX_CHECKPOINT_LIFETIME_MS, 7 * 86_400_000);
+        assert_eq!((c.max_workers, c.max_workers_per_uid), (2, 1));
     }
 
     #[test]

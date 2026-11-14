@@ -13,7 +13,7 @@ use crate::manager::{
     RefusalCode,
 };
 use crate::model::{
-    CancelReason, Captured, DeletionReason, Execution, ExecutionMode, ExecutionState, Network,
+    CancelReason, Digest, Captured, DeletionReason, Execution, ExecutionMode, ExecutionState, Network,
     Sandbox, SandboxSpec, SandboxState,
 };
 use crate::runtime::Runtime;
@@ -117,7 +117,12 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             let sandbox = self
                 .manager
                 .create_owned(
-                    create_request(req.spec.unwrap_or_default(), expiry, req.default_env)?,
+                    create_request_from(
+                        req.spec.unwrap_or_default(),
+                        expiry,
+                        req.default_env,
+                        req.from_checkpoint,
+                    )?,
                     uid,
                 )
                 .await
@@ -130,16 +135,23 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         // conversion errors are validation, reported only after the lookups.
         crate::idempotency::validate_request_id(&req.request_id)
             .map_err(Status::invalid_argument)?;
+        // Digest version 1 for an empty from_checkpoint (its bytes unchanged), version
+        // 2 for a fork (checkpoint design 7.2).
         let key = CreateKey {
-            sha256: crate::idempotency::request_digest(&req),
+            sha256: crate::idempotency::create_digest(&req, Some(&req.from_checkpoint)),
             request_id: req.request_id.clone(),
         };
         let expiry = req.expiry.map(|e| crate::expiry::RequestedExpiry {
             max_lifetime_ms: e.max_lifetime_ms,
             idle_timeout_ms: e.idle_timeout_ms,
         });
-        let converted = create_request(req.spec.unwrap_or_default(), expiry, req.default_env)
-            .map_err(|s| s.message().to_string());
+        let converted = create_request_from(
+            req.spec.unwrap_or_default(),
+            expiry,
+            req.default_env,
+            req.from_checkpoint,
+        )
+        .map_err(|s| s.message().to_string());
         let sandbox = self
             .manager
             .create_keyed(converted, uid, key, deadline)
@@ -335,6 +347,34 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             .await
             .map_err(status)?;
         Ok(Response::new(ExecStreamBody::new(start)))
+    }
+
+    async fn checkpoint_sandbox(
+        &self,
+        req: Request<pb::CheckpointSandboxRequest>,
+    ) -> Result<Response<pb::CheckpointSandboxResponse>, Status> {
+        self.checkpoint_sandbox_rpc(req).await
+    }
+
+    async fn get_checkpoint(
+        &self,
+        req: Request<pb::GetCheckpointRequest>,
+    ) -> Result<Response<pb::GetCheckpointResponse>, Status> {
+        self.get_checkpoint_rpc(req).await
+    }
+
+    async fn list_checkpoints(
+        &self,
+        req: Request<pb::ListCheckpointsRequest>,
+    ) -> Result<Response<pb::ListCheckpointsResponse>, Status> {
+        self.list_checkpoints_rpc(req).await
+    }
+
+    async fn delete_checkpoint(
+        &self,
+        req: Request<pb::DeleteCheckpointRequest>,
+    ) -> Result<Response<pb::DeleteCheckpointResponse>, Status> {
+        self.delete_checkpoint_rpc(req).await
     }
 
     async fn get_execution(
@@ -591,6 +631,9 @@ fn api_limits_pb(l: &Limits, features: &[Feature]) -> pb::ApiLimits {
         },
         min_sandbox_lifetime_ms: crate::expiry::MIN_EXPIRY_MS,
         min_sandbox_idle_ms: crate::expiry::MIN_EXPIRY_MS,
+        // Filled only while FEATURE_WORKSPACE_CHECKPOINT is listed, which this daemon
+        // does not yet do (checkpoint milestone C5b-2).
+        checkpoint: None,
     }
 }
 
@@ -664,6 +707,8 @@ fn node_resources_pb(s: crate::manager::NodeResourceSnapshot) -> pb::NodeResourc
         accounting_status: status.into(),
         accounting_generation: generation,
         accounting_observed_at_unix_ms: observed_at_ms,
+        // The checkpoint breakdown arrives with feature discovery (C5b-2).
+        checkpoint_reserved_disk_bytes: 0,
     }
 }
 
@@ -824,10 +869,22 @@ fn env_vars(env: Vec<pb::EnvVar>) -> Vec<crate::exec_env::EnvVar> {
         .collect()
 }
 
+/// A create with no `from_checkpoint` (tests).
+#[cfg(test)]
 fn create_request(
     spec: pb::SandboxSpec,
     expiry: Option<crate::expiry::RequestedExpiry>,
     default_env: Vec<pb::EnvVar>,
+) -> Result<CreateRequest, Status> {
+    create_request_from(spec, expiry, default_env, String::new())
+}
+
+/// As [`create_request`], with `CreateSandboxRequest.from_checkpoint` (field 5).
+fn create_request_from(
+    spec: pb::SandboxSpec,
+    expiry: Option<crate::expiry::RequestedExpiry>,
+    default_env: Vec<pb::EnvVar>,
+    from_checkpoint: String,
 ) -> Result<CreateRequest, Status> {
     let limits = spec.limits.unwrap_or_default();
     let net = spec.network.unwrap_or_default();
@@ -857,7 +914,8 @@ fn create_request(
         labels: spec.labels.into_iter().collect::<BTreeMap<_, _>>(),
         expiry,
         default_env: env_vars(default_env),
-        from_checkpoint: None,
+        // Empty: the legacy create, exactly as before.
+        from_checkpoint: (!from_checkpoint.is_empty()).then_some(from_checkpoint),
     })
 }
 
@@ -903,6 +961,7 @@ pub fn sandbox_pb(s: Sandbox) -> pb::Sandbox {
         Some(DeletionReason::ExpiredLifetime) => pb::DeletionReason::ExpiredLifetime,
     };
     let policy = s.lifecycle.expiry;
+    let provenance = s.lifecycle.from_checkpoint.clone();
     let expiry = pb::ExpiryStatus {
         effective: Some(pb::ExpiryPolicy {
             max_lifetime_ms: policy.max_lifetime_ms.unwrap_or(0),
@@ -938,6 +997,12 @@ pub fn sandbox_pb(s: Sandbox) -> pb::Sandbox {
         }),
         runtime_profile: s.accounting.runtime_profile,
         runtime_artifact_digest: s.accounting.runtime_artifact_digest,
+        from_checkpoint: provenance
+            .as_ref()
+            .map_or_else(String::new, |p| p.checkpoint.as_str().to_string()),
+        checkpoint_content_sha256: provenance
+            .as_ref()
+            .map_or_else(String::new, |p| p.content_sha256.to_string()),
     }
 }
 
@@ -1120,7 +1185,7 @@ mod tests {
         ];
         for spec in invalid {
             let error = service
-                .create_sandbox(as_root(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+                .create_sandbox(as_root(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
                     spec: Some(spec),
                     expiry: None,
                 }))
@@ -1719,7 +1784,7 @@ mod tests {
         let handler = tokio::spawn(async move {
             KilndService::create_sandbox(
                 service.as_ref(),
-                as_root(pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+                as_root(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
                     spec: None,
                     expiry: None,
                 }),
@@ -2543,7 +2608,7 @@ mod tests {
             async move {
                 service
                     .create_sandbox(as_uid(
-                        pb::CreateSandboxRequest { default_env: Vec::new(), request_id: String::new(),
+                        pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
                             spec: Some(pb::SandboxSpec {
                                 labels: (0..labels)
                                     .map(|n| (format!("label{n}"), "x".repeat(200)))
@@ -2741,6 +2806,14 @@ mod tests {
         );
         assert!(list_pages_as(&service, 1002, true, 1).await.is_empty());
     }
+}
+
+mod checkpoint;
+
+/// A ListCheckpoints continuation, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn checkpoint_token_for_tests(uid: u32, sandbox_id: &str, last: i64) -> String {
+    checkpoint::checkpoint_token(uid, sandbox_id, last)
 }
 
 #[cfg(test)]

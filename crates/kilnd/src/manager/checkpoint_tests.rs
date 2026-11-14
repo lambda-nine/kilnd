@@ -1569,3 +1569,6 @@ mod fix;
 
 #[path = "fork_tests.rs"]
 mod fork;
+
+#[path = "checkpoint_api_tests.rs"]
+mod api;

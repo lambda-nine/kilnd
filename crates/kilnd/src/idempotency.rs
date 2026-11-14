@@ -229,7 +229,7 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default();
-        pb::CreateSandboxRequest {
+        pb::CreateSandboxRequest { from_checkpoint: String::new(),
             spec,
             expiry,
             request_id: r["request_id"].as_str().unwrap_or("").into(),

@@ -77,6 +77,10 @@ enum Command {
     },
     /// Record activity on a ready sandbox, restarting its idle timeout.
     Renew { id: String },
+    /// Workspace checkpoints: capture a sandbox's files, show, list and delete them.
+    /// Needs a kilnd started with --enable-workspace-checkpoints (testing only for now).
+    #[command(subcommand)]
+    Checkpoint(CheckpointCommand),
     /// Create a sandbox, run one command in it, and delete it.
     Run {
         #[command(flatten)]
@@ -85,6 +89,48 @@ enum Command {
         opts: ExecOpts,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckpointCommand {
+    /// Capture a ready sandbox's workspace (its writes over the image) and print the
+    /// checkpoint's ID. Fails at once if a command is running or waiting in it.
+    Create {
+        sandbox: String,
+        /// Delete the checkpoint this long after it became ready, like 2h or 7d (10s to
+        /// 7d). kilnd's default (24h) if omitted; a checkpoint always expires.
+        #[arg(long, value_name = "DURATION")]
+        max_lifetime: Option<String>,
+        /// Delete it after this long without a get or a create from it, like 30m (10s to
+        /// 24h). kilnd's default (1h) if omitted.
+        #[arg(long, value_name = "DURATION")]
+        idle_timeout: Option<String>,
+        /// The most it may hold, like 512M; the sandbox's disk limit or kilnd's
+        /// per-checkpoint limit, whichever is less, if omitted.
+        #[arg(long, value_name = "SIZE")]
+        max_size: Option<String>,
+        /// Make the capture idempotent: retrying with the same ID and options returns the
+        /// same checkpoint, in whatever state it settled. 1-64 printable ASCII characters
+        /// without spaces, private to your uid and separate from create request IDs.
+        #[arg(long, value_name = "ID")]
+        request_id: Option<String>,
+    },
+    /// Show a checkpoint. Showing a ready checkpoint restarts its idle timeout.
+    Get { id: String },
+    /// List checkpoints, newest first.
+    Ls {
+        /// Only checkpoints captured from this sandbox.
+        #[arg(long, value_name = "SANDBOX")]
+        sandbox: Option<String>,
+    },
+    /// Delete a checkpoint. Sandboxes created from it are not affected.
+    Rm {
+        id: String,
+        /// If the checkpoint ends DELETED, also give up its capture request ID, so a later
+        /// capture with that ID makes a new checkpoint. Irreversible.
+        #[arg(long)]
+        release_request_id: bool,
     },
 }
 
@@ -507,6 +553,7 @@ async fn run(cli: Cli) -> Result<u8> {
             println!("{} {}", s.id, sandbox_state(s.state));
             Ok(0)
         }
+        Command::Checkpoint(command) => checkpoint(&mut client, command).await,
         Command::Run {
             create: args,
             opts,
@@ -636,12 +683,233 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
             spec: Some(spec),
             expiry,
             request_id,
+            from_checkpoint: String::new(),
         })
         .await
         .map_err(rpc)?
         .into_inner()
         .sandbox
         .context("response has no sandbox")
+}
+
+/// The capture request `checkpoint create` sends.
+fn capture_request(
+    sandbox: String,
+    max_lifetime: Option<&str>,
+    idle_timeout: Option<&str>,
+    max_size: Option<&str>,
+    request_id: Option<String>,
+) -> Result<pb::CheckpointSandboxRequest> {
+    Ok(pb::CheckpointSandboxRequest {
+        sandbox_id: sandbox,
+        request_id: request_id.unwrap_or_default(),
+        // Always sent: a checkpoint's expiry is required, and zero fields take
+        // kilnd's defaults.
+        expiry: Some(pb::ExpiryPolicy {
+            max_lifetime_ms: max_lifetime.map(parse_long_duration_ms).transpose()?.unwrap_or(0),
+            idle_timeout_ms: idle_timeout.map(parse_long_duration_ms).transpose()?.unwrap_or(0),
+        }),
+        max_size_bytes: max_size.map(parse_size).transpose()?.unwrap_or(0),
+    })
+}
+
+/// `kilndctl checkpoint ...`. The checkpoint RPCs need no feature check before they are
+/// sent: a kilnd without them answers UNIMPLEMENTED, and no field is silently dropped.
+async fn checkpoint(client: &mut KilndServiceClient<Channel>, command: CheckpointCommand) -> Result<u8> {
+    match command {
+        CheckpointCommand::Create {
+            sandbox,
+            max_lifetime,
+            idle_timeout,
+            max_size,
+            request_id,
+        } => {
+            let request = capture_request(
+                sandbox,
+                max_lifetime.as_deref(),
+                idle_timeout.as_deref(),
+                max_size.as_deref(),
+                request_id,
+            )?;
+            let c = client
+                .checkpoint_sandbox(request)
+                .await
+                .map_err(rpc)?
+                .into_inner()
+                .checkpoint
+                .context("response has no checkpoint")?;
+            println!("{}", c.id);
+            // A keyed retry answers with the settled checkpoint, whatever its state.
+            if c.state != pb::CheckpointState::Ready as i32 {
+                eprintln!(
+                    "kilndctl: checkpoint {} is {}{}",
+                    c.id,
+                    checkpoint_state(c.state),
+                    if c.failure_reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", c.failure_reason)
+                    }
+                );
+                return Ok(1);
+            }
+            Ok(0)
+        }
+        CheckpointCommand::Get { id } => {
+            let c = client
+                .get_checkpoint(pb::GetCheckpointRequest { id })
+                .await
+                .map_err(rpc)?
+                .into_inner()
+                .checkpoint
+                .context("response has no checkpoint")?;
+            print_checkpoint(&c);
+            Ok(0)
+        }
+        CheckpointCommand::Ls { sandbox } => {
+            println!(
+                "{:<35}  {:<11}  {:<19}  {:>9}  {:<20}  EXPIRES",
+                "ID", "STATE", "SANDBOX", "SIZE", "CREATED"
+            );
+            let mut page_token = String::new();
+            loop {
+                let r = client
+                    .list_checkpoints(pb::ListCheckpointsRequest {
+                        sandbox_id: sandbox.clone().unwrap_or_default(),
+                        page_size: 100,
+                        page_token,
+                    })
+                    .await
+                    .map_err(rpc)?
+                    .into_inner();
+                for c in &r.checkpoints {
+                    println!(
+                        "{:<35}  {:<11}  {:<19}  {:>9}  {:<20}  {}",
+                        c.id,
+                        checkpoint_state(c.state),
+                        c.sandbox_id,
+                        size_mib(c.size_bytes),
+                        time(c.created_at_unix_ms),
+                        time(next_expiry(c))
+                    );
+                }
+                page_token = r.next_page_token;
+                if page_token.is_empty() {
+                    break;
+                }
+            }
+            Ok(0)
+        }
+        CheckpointCommand::Rm {
+            id,
+            release_request_id,
+        } => {
+            let c = client
+                .delete_checkpoint(pb::DeleteCheckpointRequest {
+                    id,
+                    release_request_id,
+                })
+                .await
+                .map_err(rpc)?
+                .into_inner()
+                .checkpoint
+                .context("response has no checkpoint")?;
+            println!("{} {}", c.id, checkpoint_state(c.state));
+            Ok(0)
+        }
+    }
+}
+
+/// The sooner of a checkpoint's two deadlines, or 0.
+fn next_expiry(c: &pb::Checkpoint) -> i64 {
+    let e = c.expiry.unwrap_or_default();
+    match (e.lifetime_expires_at_unix_ms, e.idle_expires_at_unix_ms) {
+        (0, idle) => idle,
+        (lifetime, 0) => lifetime,
+        (lifetime, idle) => lifetime.min(idle),
+    }
+}
+
+/// A byte count as whole MiB, rounded up, or `-` for none.
+fn size_mib(bytes: u64) -> String {
+    if bytes == 0 {
+        "-".into()
+    } else {
+        format!("{} MiB", bytes.div_ceil(1 << 20))
+    }
+}
+
+fn print_checkpoint(c: &pb::Checkpoint) {
+    println!("id:         {}", c.id);
+    println!("state:      {}", checkpoint_state(c.state));
+    println!("sandbox:    {}", c.sandbox_id);
+    println!("owner:      {}", c.owner_uid);
+    println!("created:    {}", time(c.created_at_unix_ms));
+    if c.ready_at_unix_ms != 0 {
+        println!("ready:      {}", time(c.ready_at_unix_ms));
+    }
+    if !c.failure_reason.is_empty() {
+        println!("reason:     {}", c.failure_reason);
+    }
+    if c.deletion_reason != pb::DeletionReason::Unspecified as i32 {
+        println!("deleted by: {}", deletion_reason(c.deletion_reason));
+    }
+    if !c.request_id.is_empty() {
+        println!(
+            "request id: {}{}",
+            c.request_id,
+            if c.request_id_released {
+                " (released)"
+            } else {
+                ""
+            }
+        );
+    }
+    println!(
+        "size:       {} bytes charged (at most {}), {} logical, {} allocated",
+        c.size_bytes, c.max_size_bytes, c.logical_bytes, c.allocated_bytes
+    );
+    if !c.content_sha256.is_empty() {
+        println!("content:    sha256 {}", c.content_sha256);
+    }
+    println!("image:      {} (sha256 {})", c.image, c.image_content_sha256);
+    if c.read_only_root {
+        println!("read-only:  yes, writable {}", c.writable_paths.join(" "));
+    }
+    println!("excluded:   {}", c.excluded_paths.join(" "));
+    println!("format:     {}", c.format_version);
+    if let Some(e) = &c.expiry {
+        let policy = e.effective.unwrap_or_default();
+        println!(
+            "expiry:     lifetime {} s, idle {} s",
+            policy.max_lifetime_ms / 1000,
+            policy.idle_timeout_ms / 1000
+        );
+        if e.lifetime_expires_at_unix_ms != 0 {
+            println!(
+                "expires:    {} (lifetime)",
+                time(e.lifetime_expires_at_unix_ms)
+            );
+        }
+        if e.idle_paused {
+            println!("idle:       paused while a sandbox is being created from it");
+        } else if e.idle_expires_at_unix_ms != 0 {
+            println!("expires:    {} (idle)", time(e.idle_expires_at_unix_ms));
+        }
+        if e.last_activity_at_unix_ms != 0 {
+            println!("activity:   {}", time(e.last_activity_at_unix_ms));
+        }
+    }
+}
+
+fn checkpoint_state(v: i32) -> String {
+    pb::CheckpointState::try_from(v)
+        .map(|s| {
+            s.as_str_name()
+                .trim_start_matches("CHECKPOINT_STATE_")
+                .to_lowercase()
+        })
+        .unwrap_or_else(|_| format!("unknown({v})"))
 }
 
 /// Design section 1: a client uses a feature only from a fresh SERVING Health
@@ -970,6 +1238,12 @@ fn print_sandbox(s: &pb::Sandbox) {
             }
         );
     }
+    if !s.from_checkpoint.is_empty() {
+        println!(
+            "from:       {} (sha256 {})",
+            s.from_checkpoint, s.checkpoint_content_sha256
+        );
+    }
     if !s.default_env_names.is_empty() {
         println!(
             "env:        {} (sha256 {})",
@@ -1286,6 +1560,71 @@ fn time(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_commands_parse_and_a_capture_always_sends_an_expiry() {
+        let cli = Cli::try_parse_from([
+            "kilndctl",
+            "checkpoint",
+            "create",
+            "sb-0123456789abcdef",
+            "--max-lifetime",
+            "2h",
+            "--max-size",
+            "512M",
+            "--request-id",
+            "k1",
+        ])
+        .unwrap();
+        let Command::Checkpoint(CheckpointCommand::Create {
+            sandbox,
+            max_lifetime,
+            idle_timeout,
+            max_size,
+            request_id,
+        }) = cli.command
+        else {
+            panic!("not checkpoint create");
+        };
+        let r = capture_request(
+            sandbox,
+            max_lifetime.as_deref(),
+            idle_timeout.as_deref(),
+            max_size.as_deref(),
+            request_id,
+        )
+        .unwrap();
+        assert_eq!(r.sandbox_id, "sb-0123456789abcdef");
+        assert_eq!(r.request_id, "k1");
+        assert_eq!(r.max_size_bytes, 512 << 20);
+        let e = r.expiry.unwrap();
+        assert_eq!((e.max_lifetime_ms, e.idle_timeout_ms), (7_200_000, 0));
+        // No flags: still an (empty) policy, so kilnd's finite defaults apply.
+        let r = capture_request("sb-0123456789abcdef".into(), None, None, None, None).unwrap();
+        assert_eq!(r.expiry, Some(pb::ExpiryPolicy::default()));
+        assert_eq!((r.max_size_bytes, r.request_id.as_str()), (0, ""));
+        assert!(capture_request("s".into(), Some("soon"), None, None, None).is_err());
+        for argv in [
+            &["kilndctl", "checkpoint", "get", "cp-0"][..],
+            &["kilndctl", "checkpoint", "ls"],
+            &["kilndctl", "checkpoint", "ls", "--sandbox", "sb-0123456789abcdef"],
+            &["kilndctl", "checkpoint", "rm", "cp-0", "--release-request-id"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        assert!(Cli::try_parse_from(["kilndctl", "checkpoint", "create"]).is_err());
+        assert_eq!(checkpoint_state(pb::CheckpointState::Quarantined as i32), "quarantined");
+        assert_eq!(size_mib(0), "-");
+        assert_eq!(size_mib(1), "1 MiB");
+        let mut c = pb::Checkpoint::default();
+        assert_eq!(next_expiry(&c), 0);
+        c.expiry = Some(pb::CheckpointExpiryStatus {
+            lifetime_expires_at_unix_ms: 50,
+            idle_expires_at_unix_ms: 20,
+            ..Default::default()
+        });
+        assert_eq!(next_expiry(&c), 20);
+    }
 
     #[test]
     fn env_flags_take_values_or_inherit_them_and_parse_with_run() {

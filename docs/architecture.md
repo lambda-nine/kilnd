@@ -1405,7 +1405,11 @@ recorded (its row is then not removable, so its cleanup cannot keep it), or a ca
 removal supervisor that ends, by returning or by a panic, leaving a charged CAPTURING or
 DELETING row that no other supervisor owns, outside shutdown (startup's pass covers
 those). The exit check arms in memory first, then writes the marker, and starts the
-retry, whose pass fails the dead capture and resumes its removal; the record and the pass
+retry. A supervisor's leaving (its `captures` or `retrying` entry removed), its read of
+whether the other supervisor still owns the row and the arm are one critical section
+under the presence and ownership locks, so of two supervisors leaving at once the later
+always sees the earlier gone, on any runtime, and no allocation is admitted between the
+removal and the arm. The retry, whose pass fails the dead capture and resumes its removal; the record and the pass
 retry with backoff until they succeed or shutdown hands the row to startup. A removal whose helper answers Retained with
 `checkpoint_corrupt` or `checkpoint_generation_mismatch` (C3) arms the barrier itself
 (blocked in memory, then the marker) and starts its retry, whose passes re-drive the
@@ -1643,6 +1647,67 @@ each pair.
 **Typed reasons.** `CheckpointReason` carries each design 7.3 token with exactly one code
 (`CheckpointReason::code`); `Error::Refused` gains `InvalidArgument` and `DataLoss` so C5b
 maps each to its status without reshaping.
+
+## Workspace checkpoint API (milestone C5b-1)
+
+`--enable-workspace-checkpoints` (default off) sets `Limits.checkpoints` to the design's
+limits: 1 GiB per checkpoint; 32 checkpoints and 4 GiB per uid; 128 and 8 GiB per node;
+24 h lifetime and 1 h idle by default, at most 7 days and 24 h; two capture/restore workers
+and one per uid. **It is for testing and explicit staging only.** This milestone does not
+advertise `FEATURE_WORKSPACE_CHECKPOINT` or `RuntimeCapabilities.checkpoint`, and captures
+and forks are admitted without the design 6.3 free-space headroom check (XFS and its loop
+backing filesystem). Feature discovery, its probes, Health's checkpoint stats and limits,
+and the headroom check follow in C5b-2; C6 is the gate for switching it on.
+
+**RPCs.** `service/checkpoint.rs` maps the four RPCs onto the C5a engine, which owns
+ownership, keys, admission, supervision and every reason; the service converts messages,
+computes keys and pages lists.
+
+| RPC | Permit class | Engine | Refusals (gRPC code, `kilnd-reason`) |
+|---|---|---|---|
+| `CheckpointSandbox` | Ordinary | `capture_checkpoint(req, caller uid, key, grpc-timeout deadline)` | NOT_FOUND (foreign or missing source); `INVALID_ARGUMENT checkpoint_expiry_required` and range errors; UNIMPLEMENTED `backend_unsupported:workspace_checkpoint`; `FAILED_PRECONDITION checkpoint_busy`, `sandbox_unsupported:workspace_checkpoint`, `checkpoint_image_unavailable`, sandbox-state reasons; `RESOURCE_EXHAUSTED checkpoint_size_limit`, `checkpoint_quota`, `checkpoint_workers`, `request_id_quota`; `ALREADY_EXISTS request_id_conflict`; `DEADLINE_EXCEEDED checkpoint_in_flight`; a failed capture's typed reason (`checkpoint_layout_unsupported`, `checkpoint_metadata_unsupported`, `checkpoint_corrupt`, `checkpoint_io`, ...) |
+| `GetCheckpoint` | Cleanup | `get_checkpoint(id, uid)`: refreshes idle on a usable READY row; a due row is expired, never resurrected | NOT_FOUND |
+| `ListCheckpoints` | Ordinary | `list_checkpoints(uid, source, before_seq, count)`: owner (unless root) and source filters before paging | `INVALID_ARGUMENT` (page size, token, filter grammar); `RESOURCE_EXHAUSTED` (legacy list past the bounds) |
+| `DeleteCheckpoint` | Cleanup | `delete_checkpoint(id, uid, release_request_id)`: DELETING, cancel captures and restores, supervised removal | NOT_FOUND; a removal's `checkpoint_io`, `checkpoint_busy` or `checkpoint_corrupt` (kept DELETING and charged, retried by kilnd) |
+| `CreateSandbox` + `from_checkpoint` | Ordinary | `create_owned` / `create_keyed` with `CreateRequest.from_checkpoint`; the fork preflight (C5a-2) | UNIMPLEMENTED `backend_unsupported:workspace_checkpoint` (off, or Firecracker, before prepare); NOT_FOUND; `FAILED_PRECONDITION checkpoint_not_ready`, `checkpoint_expired`, `sandbox_unsupported:workspace_checkpoint`; `INVALID_ARGUMENT checkpoint_spec_mismatch`, `checkpoint_disk_too_small`; `DATA_LOSS checkpoint_corrupt`; `RESOURCE_EXHAUSTED checkpoint_workers` and the sandbox budgets |
+
+Each `CheckpointReason` reaches the wire with exactly its code (`CheckpointReason::code`),
+the token as the trailer and the message's prefix (`every_checkpoint_reason_maps_to_one_status_and_trailer`).
+GetCheckpoint and DeleteCheckpoint are cleanup-class, like GetSandbox and DeleteSandbox, so a
+reserved connection can still inspect and remove what it holds.
+
+**Keys.** A capture key is `idempotency::validate_request_id` plus
+`capture_request_digest` (`kilnd.v1.checkpoint-request.1`) of the request as sent; the
+engine answers a recorded key before looking at the source, its policy or the feature. A
+create key is `idempotency::create_digest(req, from_checkpoint)`: version 1
+(`kilnd.v1.create-request.1`, unchanged bytes and goldens) when the field is empty, version 2
+(`kilnd.v1.create-request.2`) for a fork, so the same spec with and without
+`from_checkpoint` conflicts under one key.
+
+**Lists.** Newest first by creation sequence; `page_size` 0 is the legacy complete list or
+`RESOURCE_EXHAUSTED`; the count and byte bounds are ListSandboxes' (`--max-list-page-size`,
+`--max-list-response-bytes`). A continuation is `c1:<uid>:<filter tag>:<last sequence>`, each
+field fixed-width hex, where the filter tag is the first 8 bytes of SHA-256 of the
+`sandbox_id` filter (0 for none): it is bound to the caller and the filter, and names the
+last row returned, so a later capture never shifts a page. Listing has no side effect.
+
+**Feature off.** With `Limits.checkpoints` unset and nothing durable to maintain (no
+checkpoint row, capture key or barrier), every checkpoint RPC, and a create with
+`from_checkpoint`, is refused UNIMPLEMENTED `backend_unsupported:workspace_checkpoint`
+before any store query (`Manager::checkpoint_rpc_gate`, an atomic read). With durable
+state, Get, List and Delete are served and keyed retries (capture and fork) answered from
+their records (design 11.1); a new capture or fork is refused. Every existing RPC is
+unchanged: `Sandbox.from_checkpoint` and `checkpoint_content_sha256` are empty, so proto3
+encodes nothing for them.
+
+**Cancellation and deadlines.** Unchanged from the engine: a dropped or timed-out
+CheckpointSandbox or DeleteCheckpoint only detaches its waiter; a keyed capture retry
+whose `grpc-timeout` passes while the original runs answers `checkpoint_in_flight`.
+
+**Runtime.** The gRPC server runs on the daemon's one current-thread runtime and adds no
+thread. The exit check's two ownership maps (`captures`, `retrying`) are nonetheless read
+under one ownership lock in the same critical section as the leaving supervisor's own
+removal and the arm (`supervisor_exit`), which closes the backlog's multi-thread item.
 ## Limits and defaults
 
 | Setting | Default | Flag |
@@ -1694,6 +1759,7 @@ maps each to its status without reshaping.
 | ExecStream live queue / chunk (queue at least two chunks with their overhead and idle deque slots, 65,984 bytes for 32 KiB chunks; chunk at most 64 KiB) | 256 KiB / 32 KiB | `--exec-stream-buffer-bytes`, `--exec-stream-chunk-bytes` |
 | Helper live message | 16 KiB data | (code) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
+| Workspace checkpoints (testing only until C5b-2 and C6): 1 GiB each; 32 / 4 GiB per uid; 128 / 8 GiB per node; 24 h / 1 h default lifetime / idle, at most 7 d / 24 h; 2 workers, 1 per uid | off | `--enable-workspace-checkpoints` |
 
 Startup validates limits before opening state or binding: required counts,
 bytes and times are nonzero (the per-sandbox queue may be zero), semaphore and
