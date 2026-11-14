@@ -6,6 +6,17 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone C5a-2 of workspace checkpoints: create a sandbox from a checkpoint
+  (fork), reachable only from Rust (`CreateRequest.from_checkpoint`) and off unless
+  `Limits::checkpoints` is set. The preflight refuses before any allocation, a
+  Firecracker backend first (`backend_unsupported:workspace_checkpoint`, before
+  prepare); a foreign checkpoint is `NotFound`. One transaction commits the CREATING row,
+  its reservation, a version 2 key record (`kilnd.v1.create-request.2`; version 1 digests
+  are unchanged), the provenance, the checkpoint's image identity and the read-pin; the
+  helper's `Restore` then makes the backend before READY. A reader's `complete` or
+  `not_started` evidence releases the pin; otherwise the checkpoint's removal does.
+  Checkpoint Delete and expiry fail running forks before READY; a fork supervisor that
+  loses its reader arms the checkpoint barrier, whose pass settles orphaned readers.
 - Harden the checkpoint engine (C5a-1 adversarial review: eight HIGH, one MEDIUM).
   Delete and expiry hand removal to a supervisor before awaiting, so a departed caller
   never strands a charged row; existing checkpoints are expired, removed, rebased and

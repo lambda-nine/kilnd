@@ -1254,6 +1254,10 @@ async fn a_pin_under_a_dead_epoch_pauses_idle_but_lifetime_still_reaches_absent(
             checkpoint: c.id.clone(),
             content_sha256: c.seal.as_ref().unwrap().content_sha256,
         }),
+        image_identity: Some(crate::model::ImageIdentity {
+            content_sha256: c.image_content_sha256,
+            checkpoint_format_version: c.format_version,
+        }),
         ..SandboxLifecycle::default()
     };
     let reader = HelperDispatch {
@@ -1562,3 +1566,6 @@ async fn a_reboot_rebases_checkpoint_anchors_without_extending_lifetime() {
 
 #[path = "checkpoint_fix_tests.rs"]
 mod fix;
+
+#[path = "fork_tests.rs"]
+mod fork;

@@ -261,7 +261,11 @@ pub(super) struct CheckpointEngine {
     pass_epoch: AtomicU64,
     /// Wakes the barrier retry early: a removal settled, or one found retained state.
     barrier_kick: tokio::sync::Notify,
+    /// Forks restoring in this process, by checkpoint ID, then fork sandbox ID: a
+    /// checkpoint's Delete or expiry cancels them before READY (design 8.2).
+    restores: Mutex<HashMap<String, HashMap<String, CancellationToken>>>,
     pub(super) rejected_captures: AtomicU64,
+    pub(super) rejected_forks: AtomicU64,
     pub(super) expired: AtomicU64,
     /// The engine's store calls (tests: the feature off makes none on request paths).
     #[cfg(test)]
@@ -1357,6 +1361,7 @@ impl<R: Runtime> Manager<R> {
                         .publish_checkpoint_delete_intent(id, DeletionReason::Requested)
                 })?;
                 self.cancel_capture(id);
+                self.cancel_restores(id);
                 self.checkpoint_timer_refresh(id);
                 let (tx, rx) = oneshot::channel();
                 if self.spawn_removal(id, Some(tx), release_request_id) {
@@ -1769,6 +1774,7 @@ impl<R: Runtime> Manager<R> {
                 self.checkpoint.expired.fetch_add(1, Ordering::Relaxed);
                 info!(checkpoint = %id, "checkpoint expired; deleting");
                 self.cancel_capture(id);
+                self.cancel_restores(id);
                 self.checkpoint_timer_refresh(id);
                 self.spawn_removal(id, None, false);
             }
@@ -1973,7 +1979,7 @@ impl<R: Runtime> Manager<R> {
         // under the presence lock at the pass's epoch: anything that moves it later
         // makes the caller's clear refuse this verdict.
         let mut rows: BTreeMap<String, Checkpoint> = BTreeMap::new();
-        let live = {
+        let (live, restoring, pins) = {
             let _presence = self.presence();
             self.arm_barrier_locked(true)?;
             let charged = self.db().unsettled_checkpoints()?.into_iter().chain(
@@ -1985,7 +1991,23 @@ impl<R: Runtime> Manager<R> {
             for c in charged {
                 rows.entry(c.id.to_string()).or_insert(c);
             }
-            self.live_captures()
+            // Pins are admitted only on READY rows and outlive it into DELETING.
+            let mut pins = Vec::new();
+            for c in rows.values().filter(|c| {
+                matches!(
+                    c.state,
+                    CheckpointState::Ready
+                        | CheckpointState::Quarantined
+                        | CheckpointState::Deleting
+                )
+            }) {
+                for pin in self.db().checkpoint_pins(c.id.as_str())? {
+                    if pin.released_at_ms.is_none() {
+                        pins.push((c.clone(), pin));
+                    }
+                }
+            }
+            (self.live_captures(), self.live_restores(), pins)
         };
         let session = match self.checkpoint_session().await {
             Ok(s) => s,
@@ -2135,6 +2157,9 @@ impl<R: Runtime> Manager<R> {
                 }
             }
         }
+        blocked |= self
+            .reconcile_fork_pins(&pins, &restoring, session)
+            .await?;
         Ok(blocked)
     }
 
@@ -2236,6 +2261,9 @@ fn settled_capture(row: Checkpoint) -> Result<Checkpoint> {
     }
     Ok(row)
 }
+
+#[path = "fork.rs"]
+mod fork;
 
 #[cfg(test)]
 #[path = "checkpoint_tests.rs"]

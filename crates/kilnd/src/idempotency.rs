@@ -44,6 +44,11 @@ pub fn validate_request_id(request_id: &str) -> Result<(), String> {
 /// The bytes follow the Phase 1b canonical JSON contract (sorted keys, fixed escapes,
 /// integers only), through the same encoder the spec digests use.
 pub fn canonical_request(req: &pb::CreateSandboxRequest) -> Vec<u8> {
+    canonical_json(&request_value(req))
+}
+
+/// Version 1's object, before encoding.
+fn request_value(req: &pb::CreateSandboxRequest) -> Value {
     let spec = req.spec.clone().unwrap_or_default();
     let limits = spec.limits.unwrap_or_default();
     let network = spec.network.unwrap_or_default();
@@ -69,7 +74,7 @@ pub fn canonical_request(req: &pb::CreateSandboxRequest) -> Vec<u8> {
         .into_iter()
         .map(|(name, value)| json!([name, value]))
         .collect();
-    let value = json!({
+    json!({
         "default_env": Value::Array(default_env),
         "expiry": expiry,
         "spec": {
@@ -88,20 +93,47 @@ pub fn canonical_request(req: &pb::CreateSandboxRequest) -> Vec<u8> {
             "read_only_root": spec.read_only_root,
             "writable_paths": spec.writable_paths,
         },
-    });
+    })
+}
+
+fn canonical_json(value: &Value) -> Vec<u8> {
     // Strings, booleans and integers well within range at depth 3: the encoder's
     // only refusals (floats, depth past 32) cannot happen here.
-    crate::firecracker::canonical(&value).expect("a create request always has canonical JSON")
+    crate::firecracker::canonical(value).expect("a create request always has canonical JSON")
 }
 
 /// `request_sha256`: SHA-256 over the domain, one zero byte and the canonical JSON.
 pub fn request_digest(req: &pb::CreateSandboxRequest) -> Digest {
-    let json = canonical_request(req);
-    let mut input = Vec::with_capacity(DIGEST_DOMAIN.len() + 1 + json.len());
-    input.extend_from_slice(DIGEST_DOMAIN);
+    domain_digest(DIGEST_DOMAIN, &canonical_request(req))
+}
+
+fn domain_digest(domain: &[u8], json: &[u8]) -> Digest {
+    let mut input = Vec::with_capacity(domain.len() + 1 + json.len());
+    input.extend_from_slice(domain);
     input.push(0);
-    input.extend_from_slice(&json);
+    input.extend_from_slice(json);
     Digest::of(&input)
+}
+
+/// Digest version 2's domain (checkpoint design 7.2): a create from a checkpoint.
+pub const FORK_DIGEST_DOMAIN: &[u8] = b"kilnd.v1.create-request.2";
+
+/// Version 2's canonical JSON: version 1's object plus `from_checkpoint`, the ID as
+/// sent. The ID suffices: a checkpoint's content never changes and its ID is never
+/// reused; nothing mutable (expiry, activity, defaults, its digest) is hashed.
+pub fn canonical_fork_request(req: &pb::CreateSandboxRequest, from_checkpoint: &str) -> Vec<u8> {
+    let mut value = request_value(req);
+    value["from_checkpoint"] = Value::String(from_checkpoint.into());
+    canonical_json(&value)
+}
+
+/// A create key's digest: version 2 for a nonempty `from_checkpoint`, otherwise
+/// version 1, whose bytes and goldens are unchanged.
+pub fn create_digest(req: &pb::CreateSandboxRequest, from_checkpoint: Option<&str>) -> Digest {
+    match from_checkpoint.filter(|c| !c.is_empty()) {
+        None => request_digest(req),
+        Some(c) => domain_digest(FORK_DIGEST_DOMAIN, &canonical_fork_request(req, c)),
+    }
 }
 
 /// The capture digest's domain (checkpoint design 7.1), independent of create keys.
@@ -295,6 +327,47 @@ mod tests {
             .map(|(k, v)| (k.into(), v.into()))
             .collect();
         assert_eq!(request_digest(&x), request_digest(&y));
+    }
+
+    /// Digest version 2 (checkpoint design 7.2): its own domain, version 1's object
+    /// plus `from_checkpoint`; an absent or empty one is version 1, byte for byte.
+    #[test]
+    fn fork_digest_is_version_2_and_leaves_version_1_alone() {
+        let goldens: Value = serde_json::from_str(GOLDENS).unwrap();
+        for case in goldens["cases"].as_array().unwrap() {
+            let req = request(case);
+            assert_eq!(create_digest(&req, None), request_digest(&req));
+            assert_eq!(create_digest(&req, Some("")), request_digest(&req));
+            assert_eq!(
+                create_digest(&req, None).to_string(),
+                case["request_sha256"].as_str().unwrap()
+            );
+        }
+        let req = pb::CreateSandboxRequest {
+            spec: Some(pb::SandboxSpec {
+                image: "alpine".into(),
+                limits: Some(pb::ResourceLimits {
+                    disk_bytes: 1 << 30,
+                    ..Default::default()
+                }),
+                writable_paths: vec!["/workspace".into()],
+                read_only_root: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let from = "cp-0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            String::from_utf8(canonical_fork_request(&req, from)).unwrap(),
+            r#"{"default_env":[],"expiry":null,"from_checkpoint":"cp-0123456789abcdef0123456789abcdef","spec":{"image":"alpine","labels":{},"limits":{"cpu_millis":0,"disk_bytes":1073741824,"memory_bytes":0,"pids":0},"network":{"allow":[],"mode":0},"read_only_root":true,"writable_paths":["/workspace"]}}"#
+        );
+        let v2 = create_digest(&req, Some(from));
+        assert_eq!(
+            v2.to_string(),
+            "9901226746587bea21397c98d45a6075365365dd26cb073e6d8be9f0c5200f1b"
+        );
+        assert_ne!(v2, request_digest(&req));
+        assert_ne!(v2, create_digest(&req, Some("cp-0123456789abcdef0123456789abcdee")));
     }
 
     #[test]

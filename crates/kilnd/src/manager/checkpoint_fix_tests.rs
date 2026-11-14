@@ -80,6 +80,10 @@ fn pin(m: &M, s: &Sandbox, c: &Checkpoint) -> HelperDispatch {
             checkpoint: c.id.clone(),
             content_sha256: c.seal.as_ref().unwrap().content_sha256,
         }),
+        image_identity: Some(crate::model::ImageIdentity {
+            content_sha256: c.image_content_sha256,
+            checkpoint_format_version: c.format_version,
+        }),
         ..SandboxLifecycle::default()
     };
     let reader = HelperDispatch {

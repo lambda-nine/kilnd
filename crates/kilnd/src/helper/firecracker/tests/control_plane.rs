@@ -2107,6 +2107,7 @@ async fn b3r_01_real_manager_paused_after_c1_keeps_an_exact_path_past_a_prefence
             manager
                 .create(CreateRequest {
                     default_env: Vec::new(),
+                    from_checkpoint: None,
                     image: "alpine".into(),
                     memory_bytes: 512 * MIB,
                     cpu_millis: 1000,

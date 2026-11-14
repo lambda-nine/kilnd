@@ -857,6 +857,7 @@ fn create_request(
         labels: spec.labels.into_iter().collect::<BTreeMap<_, _>>(),
         expiry,
         default_env: env_vars(default_env),
+        from_checkpoint: None,
     })
 }
 

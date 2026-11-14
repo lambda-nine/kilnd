@@ -147,6 +147,10 @@ impl Runtime for KilnRuntime {
         true
     }
 
+    async fn restored_exec_features(&self, backend_id: &str) -> Option<u32> {
+        self.sandbox_exec_features(backend_id).await
+    }
+
     /// The checkpoint group through the root helper. A reply that does not match its
     /// request is an error, never evidence.
     async fn checkpoint(

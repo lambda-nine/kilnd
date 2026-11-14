@@ -679,6 +679,16 @@ pub trait Runtime: Send + Sync + 'static {
         false
     }
 
+    /// What a sandbox restored by the checkpoint group's `Restore` advertises, read once
+    /// before its READY publication as `create`'s own probe is (design 4.1). `None`:
+    /// unknown, so it takes no exec options.
+    fn restored_exec_features(
+        &self,
+        _backend_id: &str,
+    ) -> impl Future<Output = Option<u32>> + Send {
+        async { None }
+    }
+
     /// The root helper's checkpoint group (milestone C3), with each reply checked
     /// against its request (`CheckpointResponse::check`). Nothing reaches it before C5:
     /// no RPC, Health field or feature mentions checkpoints. A backend without them

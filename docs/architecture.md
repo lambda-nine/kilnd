@@ -1431,8 +1431,8 @@ never touches the marker; only once a clean inventory clears the barrier may a p
 remove the last row (the barrier's set and clear and that prune share the presence
 lock). With it off and nothing durable,
 startup makes that one query and no helper call, and the only change on any request
-path is an in-memory capture flag on each sandbox slot that is never set. Creating a sandbox from a checkpoint is not reachable
-yet (milestone C5a-2).
+path is an in-memory capture flag on each sandbox slot that is never set. Creating a
+sandbox from a checkpoint is **Fork** below (milestone C5a-2).
 
 **Capture** (`capture_checkpoint`, design 4.1, 8.2 and 10). C0 resolves the required
 expiry policy (24 h lifetime and 1 h idle by default, 10 s to 7 days and 24 h), finds
@@ -1518,6 +1518,67 @@ own (`barrier_blocked`, apart from the sandbox reconciliation's and a removal's
 (the removal backoff, 1 s to 60 s by default), resumes timers and removals after each,
 and clears only the barrier's block after a clean pass, with no restart. Delete, Get,
 List and removals stay available meanwhile.
+
+**Fork** (`crates/kilnd/src/manager/fork.rs`, design 4.2, 7.2, 8.2, 10 and 11.1). A
+create whose `CreateRequest.from_checkpoint` names a checkpoint (Rust only; no proto
+field yet) is an ordinary create in every respect but two: its admitting transaction is
+`reserve_fork_sandbox`, and its backend is made by the helper's `Restore` (kiln's `create
+--from-checkpoint`) instead of `Runtime::create`. An empty or absent field is the legacy
+create, unchanged, with no checkpoint query. After the spec's defaults are resolved and
+before `prepare_create` (which on Firecracker would issue an allocation token), the
+preflight refuses in this order, allocating nothing: the feature off or a backend without
+the checkpoint group (`backend_unsupported:workspace_checkpoint`, UNIMPLEMENTED); another
+user's or a missing checkpoint (`NotFound`, indistinguishable; root may fork anyone's into
+a root-owned sandbox); QUARANTINED (`checkpoint_corrupt`); not READY
+(`checkpoint_not_ready`); due (`checkpoint_expired`, after expiring it into DELETING);
+another format; another image name, root-write policy or canonical writable-path set
+(`checkpoint_spec_mismatch`); disk below S (`checkpoint_disk_too_small`); no restore
+worker (`checkpoint_workers`, the capture workers' 2 per node and 1 per uid); no helper
+session. A keyed create's record is still answered before all of this (M2). The
+accepting transaction then commits the CREATING row and its full reservation (the shared
+disk budget, beside every checkpoint charge), the key record with digest version 2
+(`kilnd.v1.create-request.2`: version 1's canonical object plus `from_checkpoint`;
+`idempotency::create_digest`), the immutable provenance (checkpoint ID and content
+digest), the checkpoint's image identity (so a fork can be checkpointed in turn) and the
+durable pin naming the reader's nonce, epoch and boot, after rechecking the checkpoint
+READY with the same content; any refusal commits nothing. The fork's supervisor
+registers in the live restore set with no await since that commit, sends `Restore` (in
+its own task: a panic there is a lost reply) and settles as a legacy create:
+`Created` releases the pin with its READER_ENDED `complete` (the copy is done, whatever
+READY's fate), probes the restored sandbox's exec features and publishes READY;
+`NotCreated` releases the pin with `not_started` and fails the create as definitely not
+created; `Ambiguous` fails it as an ambiguous legacy create (charged) and keeps the pin,
+since `unknown` never releases one; a typed helper refusal fails it definitely and keeps
+the pin (no fact says the reader never ran); a pending or lost reply is followed by
+inspecting the reader's nonce with backoff until its record settles, the helper's epoch
+is gone or the nonce is retired (ambiguous, pin kept). A kept pin pauses only idle
+expiry; lifetime still reaches DELETING, and the removal's ABSENT releases every pin on
+the checkpoint. Delete and expiry of the checkpoint (D1) cancel its restores: the
+helper's tombstoning removal stops the reader, which answers `not_created`, and a fork
+whose copy finished first is compensated (its backend removed) instead of published,
+since the cancellation is checked again after the feature probe with no await before
+READY. Source Delete, a departed waiter and shutdown never cancel a restore (the drain
+waits for it).
+
+Fork ownership extends the rule above: the supervisor owns its CREATING row, pin,
+worker permit and live-set entry until the outcome. Leaving the live set moves the
+checkpoint epoch, on every exit, unwind included, so a pass that snapshotted the fork as
+live cannot clear. A supervisor that leaves while its reader's end is unknown (a panic,
+outside shutdown) with its pin still live arms the barrier. Every pass then applies the
+fork rule to the live pins in its snapshot whose fork is not restoring in this process:
+a pin from the helper's current epoch has its reader's nonce inspected; a settled
+`Created` or `NotCreated` record releases the pin with its evidence, a reader still
+running with no supervisor blocks the pass, and a retired or ambiguous one keeps its pin
+without blocking (no reader can run). A dead epoch's pin is never asked about: its reader
+died with its helper, and only the checkpoint's ABSENT releases it (C4). A fork row the
+crash left CREATING settles at startup as any interrupted kiln create (FAILED, charged),
+and a backend its orphaned restore made is reported unmanaged, as for any create; the
+daemon never adopts it (general legacy-create recovery is out of scope). These races are
+only free of interleavings because `main.rs` runs every manager task on one
+current-thread runtime: the commit and the live-set registration, and the cancellation
+check and READY's publication, each have no await between them, and so do Delete's and
+expiry's intent and cancellation. A multi-threaded embedding would need one lock across
+each pair.
 
 **Typed reasons.** `CheckpointReason` carries each design 7.3 token with exactly one code
 (`CheckpointReason::code`); `Error::Refused` gains `InvalidArgument` and `DataLoss` so C5b

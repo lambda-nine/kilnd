@@ -511,3 +511,181 @@ async fn run() {
     );
     eprintln!("C5a VM PASS");
 }
+
+/// Root only, on the prepared VM: C5a-2's fork through the real helper `Restore` and
+/// the installed kiln's `create --from-checkpoint`.
+///
+/// ```text
+/// sudo TEST_BINARY --ignored --exact manager::checkpoint_vm_tests::c5a2_vm_fork --test-threads=1 --nocapture
+/// ```
+#[test]
+#[ignore = "root on the prepared VM with kiln's checkpoint format installed"]
+fn c5a2_vm_fork() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run_fork());
+}
+
+async fn out(m: &Arc<Manager<KilnRuntime>>, id: &str, script: &str) -> String {
+    let r = m.exec(exec(id, script)).await.unwrap();
+    assert_eq!(r.exit_code, Some(0), "{script}: {r:?}");
+    String::from_utf8_lossy(&r.stdout.data).into_owned()
+}
+
+async fn run_fork() {
+    let mut scene = Scene::new();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        tmp.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let state = tmp.path().join("state");
+    let socket = tmp.path().join("helper.sock");
+    let helper = start_helper(&socket);
+    let clock = ManualClock::default();
+    let m = manager(&state, &socket, &clock, &scene.image);
+    scene.instance = Some(m.store.identity().unwrap().instance_id.to_string());
+    m.reconcile().await.unwrap();
+
+    // 1. A real capture of a workspace with a file, a symlink, a hardlink, a mode and
+    // a deleted lower file.
+    let s = m
+        .create_owned(CreateRequest::default(), 1000)
+        .await
+        .unwrap();
+    out(
+        &m,
+        &s.id,
+        "mkdir -p /root/w/d && echo hello > /root/w/a && ln -s a /root/w/l && ln /root/w/a /root/w/h \
+         && echo deep > /root/w/d/x && chmod 0640 /root/w/d/x && rm /etc/motd",
+    )
+    .await;
+    let c = m
+        .capture_checkpoint(capture_req(&s.id, 0), 1000, None, None)
+        .await
+        .unwrap();
+    assert_eq!(c.state, CheckpointState::Ready, "{c:?}");
+    let seal = c.seal.clone().unwrap();
+    eprintln!("C5a-2 VM 1: READY {} S={}", c.id, seal.charge_bytes);
+
+    // 2. A real fork: helper Restore, kiln create --from-checkpoint, READY.
+    let started = std::time::Instant::now();
+    let f = m
+        .create_owned(
+            CreateRequest {
+                from_checkpoint: Some(c.id.to_string()),
+                ..CreateRequest::default()
+            },
+            1000,
+        )
+        .await
+        .unwrap();
+    eprintln!(
+        "C5a-2 VM 2: fork {} READY in {} ms",
+        f.id,
+        started.elapsed().as_millis()
+    );
+    assert_eq!(f.state, SandboxState::Ready, "{f:?}");
+    let p = f.lifecycle.from_checkpoint.clone().unwrap();
+    assert_eq!(p.checkpoint, c.id);
+    assert_eq!(p.content_sha256, seal.content_sha256);
+    assert_eq!(
+        f.lifecycle.image_identity.unwrap().content_sha256,
+        c.image_content_sha256
+    );
+    let pin = m.store.checkpoint_pin(&f.id).unwrap().unwrap();
+    assert_eq!(pin.released_by.as_deref(), Some("complete"));
+    let seen = out(
+        &m,
+        &f.id,
+        "cat /root/w/a; readlink /root/w/l; stat -c '%h %a' /root/w/a /root/w/d/x; cat /root/w/d/x; \
+         test ! -e /etc/motd && echo motd-gone",
+    )
+    .await;
+    assert_eq!(seen, "hello\na\n2 644\n1 640\ndeep\nmotd-gone\n", "{seen:?}");
+    eprintln!("C5a-2 VM 2 PASS: files present in the fork");
+
+    // 3. Independence: a write in the fork is not in the source, and back.
+    out(&m, &f.id, "echo fork > /root/w/a").await;
+    out(&m, &s.id, "echo source > /root/w/d/x").await;
+    assert_eq!(out(&m, &s.id, "cat /root/w/a").await, "hello\n");
+    assert_eq!(out(&m, &f.id, "cat /root/w/d/x").await, "deep\n");
+    eprintln!("C5a-2 VM 3 PASS: independent");
+
+    // 4. The fork checkpointed in turn (its identity recorded: no `source` read).
+    let c2 = m
+        .capture_checkpoint(capture_req(&f.id, 0), 1000, None, None)
+        .await
+        .unwrap();
+    assert_eq!(c2.state, CheckpointState::Ready, "{c2:?}");
+    assert_eq!(c2.image_content_sha256, c.image_content_sha256);
+    eprintln!("C5a-2 VM 4 PASS: fork captured as {}", c2.id);
+
+    // 5. Delete both checkpoints with the fork live: ABSENT, released, fork running.
+    for id in [c.id.as_str(), c2.id.as_str()] {
+        let d = m.delete_checkpoint(id, 1000, false).await.unwrap();
+        assert_eq!(d.state, CheckpointState::Deleted);
+    }
+    assert_eq!(charged(&m), (0, 0));
+    assert!(scene.listed().is_empty(), "{:?}", scene.listed());
+    assert_eq!(out(&m, &f.id, "cat /root/w/a").await, "fork\n");
+    eprintln!("C5a-2 VM 5 PASS: checkpoints ABSENT, fork live");
+
+    // 6. A fork that does not fit the checkpoint is refused before any allocation.
+    let c3 = m
+        .capture_checkpoint(capture_req(&s.id, 0), 1000, None, None)
+        .await
+        .unwrap();
+    let runs = std::fs::read_dir(RUNS).unwrap().count();
+    let e = m
+        .create_owned(
+            CreateRequest {
+                from_checkpoint: Some(c3.id.to_string()),
+                disk_bytes: c3.seal.as_ref().unwrap().charge_bytes - 1,
+                ..CreateRequest::default()
+            },
+            1000,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(token(&e), Some("checkpoint_disk_too_small"), "{e:?}");
+    let e = m
+        .create_owned(
+            CreateRequest {
+                from_checkpoint: Some(c3.id.to_string()),
+                ..CreateRequest::default()
+            },
+            2000,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::NotFound(_)), "{e:?}");
+    assert_eq!(std::fs::read_dir(RUNS).unwrap().count(), runs);
+    m.delete_checkpoint(c3.id.as_str(), 1000, false)
+        .await
+        .unwrap();
+    assert!(scene.listed().is_empty(), "{:?}", scene.listed());
+    eprintln!("C5a-2 VM 6 PASS: refusals allocate nothing");
+
+    // Cleanup through the manager, then the helper.
+    for id in [f.id.clone(), s.id.clone()] {
+        assert_eq!(m.delete(&id).await.unwrap().state, SandboxState::Deleted);
+    }
+    assert_eq!(charged(&m), (0, 0));
+    m.begin_shutdown();
+    m.drain_operations().await;
+    drop(m);
+    helper.stop.cancel();
+    helper.task.await.unwrap().unwrap();
+    helper.node.shutdown().await;
+    assert!(
+        std::fs::read_dir(RUNS)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|e| e.file_name() == ".checkpoints")
+    );
+    eprintln!("C5a-2 VM PASS");
+}

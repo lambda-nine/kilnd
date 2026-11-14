@@ -207,6 +207,10 @@ fn fork_row(c: &Checkpoint, owner_uid: u32) -> Sandbox {
         checkpoint: c.id.clone(),
         content_sha256: c.seal.as_ref().unwrap().content_sha256,
     });
+    s.lifecycle.image_identity = Some(crate::model::ImageIdentity {
+        content_sha256: c.image_content_sha256,
+        checkpoint_format_version: c.format_version,
+    });
     s
 }
 

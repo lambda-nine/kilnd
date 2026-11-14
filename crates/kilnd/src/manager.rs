@@ -30,8 +30,8 @@ use crate::runtime::{
     Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt,
 };
 use crate::store::{
-    ExecutionResult, ReleaseRequestId, RequestAdmission, ReserveSandbox, SandboxBudgets,
-    SandboxResources, Store,
+    ExecutionResult, ReleaseRequestId, RequestAdmission, ReserveFork, ReserveSandbox,
+    SandboxBudgets, SandboxResources, Store,
 };
 use crate::validation::{
     MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, validate_allowlist_entry, validate_argv,
@@ -205,6 +205,9 @@ pub struct CreateRequest {
     pub expiry: Option<RequestedExpiry>,
     /// `CreateSandboxRequest.default_env` as sent; values are redacted from `Debug`.
     pub default_env: Vec<crate::exec_env::EnvVar>,
+    /// Create from this workspace checkpoint (checkpoint design 7.2), Rust only until
+    /// the proto field exists; `None` is every legacy create, unchanged.
+    pub from_checkpoint: Option<String>,
 }
 
 /// A keyed create's identity within its owner's scope (design 3).
@@ -2306,7 +2309,14 @@ impl<R: Runtime> Manager<R> {
         // Firecracker issues a token) and before any row.
         let default_env = std::mem::take(&mut req.default_env);
         let (default_env_names, default_env_sha256) = self.check_default_env(&default_env)?;
+        let from_checkpoint = req.from_checkpoint.take().filter(|c| !c.is_empty());
         let spec = self.resolve_spec(req)?;
+        // Checkpoint design 7.2 and 11.1: a create from a checkpoint is checked, and a
+        // backend without checkpoints refuses, before prepare and before any row.
+        let fork = match from_checkpoint.as_deref() {
+            None => None,
+            Some(id) => Some(self.fork_preflight(id, &spec, owner_uid).await?),
+        };
         // Design 9.1 (B7): preparation names no allocation. A fenced backend's
         // authority issues the token inside its preflight (RTC-2).
         let prepare_context = PrepareContext {
@@ -2374,6 +2384,8 @@ impl<R: Runtime> Manager<R> {
                 request_id: keyed.as_ref().map(|k| k.request_id.clone()),
                 default_env_names,
                 default_env_sha256,
+                from_checkpoint: fork.as_ref().and_then(|f| f.provenance()),
+                image_identity: fork.as_ref().map(|f| f.identity()),
                 ..SandboxLifecycle::default()
             },
         };
@@ -2386,18 +2398,37 @@ impl<R: Runtime> Manager<R> {
         // trace for reconciliation. Count and every resource sum are checked with
         // this insert in one SQLite transaction; for a keyed create, so are the
         // durable request records, and the record commits with the row.
-        let reserved = self.store.reserve_sandbox_with_env(
-            &sandbox,
-            self.sandbox_budgets(),
-            admission.as_ref(),
-            &default_env,
-        );
+        let reserved = match &fork {
+            None => self
+                .store
+                .reserve_sandbox_with_env(
+                    &sandbox,
+                    self.sandbox_budgets(),
+                    admission.as_ref(),
+                    &default_env,
+                )
+                .map(ReserveFork::Sandbox),
+            // Design 7.2: the row, reservation, key record, provenance and pin together.
+            Some(plan) => self.db().reserve_fork_sandbox(
+                &sandbox,
+                self.sandbox_budgets(),
+                admission.as_ref(),
+                &default_env,
+                &plan.reader,
+            ),
+        };
         drop(default_env);
         // The durable count now holds whatever this transaction did.
         if let Some(keyed) = keyed.as_mut() {
             drop(keyed.pending.take());
         }
-        match reserved? {
+        let reserved = match reserved? {
+            ReserveFork::Sandbox(reserved) => reserved,
+            ReserveFork::Refused(refusal) => {
+                return Err(self.fork_refusal(from_checkpoint.as_deref().unwrap_or(""), refusal));
+            }
+        };
+        match reserved {
             ReserveSandbox::Inserted => {
                 let _ = committed.set(sandbox.id.clone());
             }
@@ -2413,6 +2444,10 @@ impl<R: Runtime> Manager<R> {
                     exhausted.resource, exhausted.reserved, exhausted.requested, exhausted.limit
                 )));
             }
+        }
+        if let Some(plan) = fork {
+            // No await since the commit: the restore is registered before any Delete.
+            return self.finish_fork(sandbox, plan).await;
         }
         info!(sandbox = %sandbox.id, image = %sandbox.spec.image, owner_uid, "creating sandbox");
         // Isolate a backend panic from the supervisor so the database still

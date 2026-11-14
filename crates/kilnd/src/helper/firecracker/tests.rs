@@ -1554,6 +1554,7 @@ async fn exit2_real_manager_publishes_charged_failure_and_only_a_fence_releases_
     fixture.fault("L.fence.sync_fail");
     let request = CreateRequest {
         default_env: Vec::new(),
+        from_checkpoint: None,
         image: "alpine".into(),
         memory_bytes: 512 * MIB,
         cpu_millis: 1000,

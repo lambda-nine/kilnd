@@ -1331,9 +1331,15 @@ pub(super) fn check_fork(
     if seal.content_sha256 != from.content_sha256 {
         return Ok(Err(ForkRefusal::Changed));
     }
+    // A fork runs the checkpoint's image identity (C5a-2), so it may be captured too.
+    let identity = crate::model::ImageIdentity {
+        content_sha256: c.image_content_sha256,
+        checkpoint_format_version: c.format_version,
+    };
     if s.spec.image != c.image
         || s.spec.read_only_root != c.read_only_root
         || normalized_paths(&s.spec.writable_paths) != c.writable_paths
+        || s.lifecycle.image_identity != Some(identity)
     {
         return Ok(Err(ForkRefusal::SpecMismatch));
     }

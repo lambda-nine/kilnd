@@ -35,7 +35,7 @@ use crate::model::{
 
 #[path = "fake_checkpoint.rs"]
 mod checkpoint;
-pub use checkpoint::{FakeCheckpoints, FakeRemoval, fake_image_sha};
+pub use checkpoint::{FakeCheckpoints, FakeRemoval, FakeRestore, fake_image_sha};
 
 /// A deterministic one-shot pause for lifecycle tests. Tests wait for
 /// `entered`, cancel a caller or begin shutdown, then explicitly `release`.
@@ -270,6 +270,8 @@ pub struct FakeState {
     pub remove_hold: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// C5a: the scripted root helper checkpoint group; `None` has none.
     pub checkpoints: Option<FakeCheckpoints>,
+    /// C5a-2: one-shot pause in a restored sandbox's exec-feature probe.
+    pub restored_features_gate: Option<FakeGate>,
     next: u64,
 }
 
@@ -316,6 +318,7 @@ impl Default for FakeState {
             max_active_removes: 0,
             remove_hold: None,
             checkpoints: None,
+            restored_features_gate: None,
             next: 0,
         }
     }
@@ -907,6 +910,14 @@ impl Runtime for FakeRuntime {
     fn checkpoint_backend(&self) -> bool {
         let state = self.state();
         state.mode != FakeEvidenceMode::Fenced && state.checkpoints.is_some()
+    }
+
+    async fn restored_exec_features(&self, _backend_id: &str) -> Option<u32> {
+        let gate = self.state().restored_features_gate.take();
+        if let Some(gate) = gate {
+            gate.hold().await;
+        }
+        self.state().create_exec_features
     }
 
     async fn checkpoint(
