@@ -742,3 +742,6 @@ async fn run_fork() {
     );
     eprintln!("C5a-2 VM PASS");
 }
+
+#[path = "checkpoint_vm_api_tests.rs"]
+mod api;
