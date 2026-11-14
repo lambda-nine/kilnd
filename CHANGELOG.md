@@ -30,6 +30,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   stable start time, so an Exec's arguments can no longer pose as a checkpoint reader.
   Stored fork failures keep their `checkpoint_*` token, and a restore that proves the
   artifact corrupt quarantines the checkpoint.
+- Settle checkpoint forks from their rows (C5a-2 adversarial review recheck: one HIGH,
+  three MEDIUM, one LOW). Startup and every barrier pass settle each CREATING fork no
+  supervisor owns from its reader's record even after the checkpoint's Delete or expiry
+  released its pin, and allocation stays blocked until each is settled; a fork with a
+  recorded backend is compensated, never failed beside it; a failed settlement write
+  keeps allocation blocked; an interrupted fork's stored failure keeps its
+  `checkpoint_*` token; and the helper's worker scan follows kiln's full command grammar
+  (required options and capture's source, no repeats, nothing after `--` where kiln takes
+  nothing, empty words kept).
 - Harden the checkpoint engine (C5a-1 adversarial review: eight HIGH, one MEDIUM).
   Delete and expiry hand removal to a supervisor before awaiting, so a departed caller
   never strands a charged row; existing checkpoints are expired, removed, rebased and

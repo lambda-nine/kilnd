@@ -1576,9 +1576,12 @@ unproven) begins with the returned error's token, `checkpoint_<reason>: detail`
 The helper's untracked-worker scan (C3) admits a process as evidence only when its
 arguments parse, exactly as kiln's top-level grammar, as an artifact reader: `kiln
 checkpoint capture|inspect|rm` with its `--instance` and `--checkpoint`, or `kiln create`
-with `--from-checkpoint=I/C`, each option in its place, kiln's own options only, each
-once, and nothing at or after `--` (so `kiln exec ID -- ARGV`, whose argv is an Exec
-caller's, never is); and only when its running image (`/proc/PID/exe`) is the trusted
+with `--from-checkpoint=I/C`, as kiln's parser (clap) takes them: kiln's own options
+only, each once but `--writable` and `--allow`, numbers that parse, a value that does not
+look like an option, `--writable` only with `--read-only`, every required option, and
+exactly the subcommand's positional words (capture's source sandbox, none elsewhere),
+every word after the first `--` being one, empty words included (so `kiln exec ID --
+ARGV`, whose argv is an Exec caller's, never is); and only when its running image (`/proc/PID/exe`) is the trusted
 kiln executable (device and inode) and its start time (`stat` field 22) is the same
 before its arguments were read and after its image was, so argv text, another binary or
 a reused PID is no evidence. A process whose image the helper may not inspect (a
@@ -1597,26 +1600,37 @@ removal of its checkpoint answer busy.
 Fork ownership extends the rule above: the supervisor owns its CREATING row, pin,
 worker permit and live-set entry until the outcome. Leaving the live set moves the
 checkpoint epoch, on every exit, unwind included, so a pass that snapshotted the fork as
-live cannot clear. A supervisor that leaves while its reader's end is unknown (a panic,
-outside shutdown) with its pin still live arms the barrier. Every pass then applies the
-fork rule to the live pins in its snapshot whose fork is not restoring in this process:
-a pin from the helper's current epoch has its reader's nonce inspected and its fork
-settled from the record, sandbox first and pin second: a settled `Created` compensates
-that exact backend if the row is still CREATING (cleanup intent as DELETING with the
-backend ID, removal, then FAILED, which releases the reservation; a failed removal stays
-DELETING and charged for Delete and startup to retry), a settled `NotCreated` fails a
-still-CREATING row definitely, and either then releases the pin with its evidence; a
-reader still running with no supervisor blocks the pass, and a retired or ambiguous one
-fails a still-CREATING row as an ambiguous create and keeps its pin without blocking (no
-reader can run). A dead epoch's pin is never asked about: its reader died with its
-helper, its still-CREATING row fails as ambiguous, and only the checkpoint's ABSENT
-releases the pin (C4). Startup applies the same settlement before its sandbox pass
-(`settle_interrupted_forks`), so the legacy rule (an interrupted CREATING row without a
-backend ID becomes FAILED and stays charged) never discards a final answer: a CREATING
-fork with a recorded backend ID is compensated, one whose reader's record is final is
-settled from it, and one whose reader may still run, or whose helper cannot be asked,
-stays CREATING for the barrier's pass. A restored backend is compensated rather than
-adopted: the waiter, the exec-feature proof and the Delete-intent check READY needs were
+live cannot clear. A supervisor that leaves while its row is still CREATING (a panic, or
+a settlement write that failed), or while its reader's end is unknown with its pin still
+live, arms the barrier (outside shutdown). The fork rule is driven by fork rows, not by
+live pins alone: every pass takes, in its snapshot, every CREATING fork row and every
+live pin, and settles each fork not restoring in this process, sandbox first and pin
+second. A row with a recorded backend ID is compensated first (cleanup intent as
+DELETING with the backend ID, removal, then FAILED, which releases the reservation; a
+failed removal stays DELETING and charged for Delete and startup to retry); such a row is
+never failed beside its backend. Otherwise the fork's pin row is its settlement handle,
+live or already released: the reader's nonce, helper epoch and boot. The checkpoint's
+ABSENT releases every live pin, and may do so before any pass settled an orphaned fork,
+but only after the helper's removal reaped every reader of that artifact (and kiln's
+removal took the artifact's exclusive lock), so the reader's record is final by then and
+the row is settled from it all the same; ABSENT is unchanged, so no checkpoint is ever
+removed under a reader that may still run, and Delete and expiry never wait for a fork.
+In the pin's own live helper epoch the reader's nonce is inspected: a settled `Created`
+compensates that exact backend, a settled `NotCreated` fails the row definitely, and
+either then releases a live pin with its evidence (an ABSENT-released one answers
+`AlreadyReleased`); a retired or ambiguous reader fails the row as an ambiguous create,
+typed, and keeps its pin without blocking (no reader can run). A dead epoch's pin is
+never asked about: its reader died with its helper, its row fails as ambiguous, typed,
+and only the checkpoint's ABSENT releases the pin (C4). The pass is blocked while any
+such row stays CREATING (a reader still running, a helper that cannot be asked, or a
+settlement write that failed), and retention never prunes a checkpoint row while a
+CREATING fork's pin names it. Startup applies the same settlement before its sandbox
+pass (`settle_interrupted_forks`), so the legacy rule (an interrupted CREATING row
+without a backend ID becomes FAILED and stays charged) never discards a final answer;
+the forks it cannot settle stay CREATING for the barrier's pass, and a fork row that
+still reaches the legacy rule keeps the `checkpoint_io` token. A restored backend is
+compensated rather than adopted: the waiter, the exec-feature proof and the Delete-intent
+check READY needs were
 lost with the supervisor, and the exact backend ID is all compensation needs. These races are
 only free of interleavings because `main.rs` runs every manager task on one
 current-thread runtime: the commit and the live-set registration, and the cancellation
