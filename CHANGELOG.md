@@ -17,6 +17,8 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   `not_started` evidence releases the pin; otherwise the checkpoint's removal does.
   Checkpoint Delete and expiry fail running forks before READY; a fork supervisor that
   loses its reader arms the checkpoint barrier, whose pass settles orphaned readers.
+  The helper no longer counts a restored sandbox's init (forked from its shim, with the
+  shim's arguments) as a reader, so a checkpoint can be removed while its forks run.
 - Harden the checkpoint engine (C5a-1 adversarial review: eight HIGH, one MEDIUM).
   Delete and expiry hand removal to a supervisor before awaiting, so a departed caller
   never strands a charged row; existing checkpoints are expired, removed, rebased and

@@ -1535,7 +1535,9 @@ another format; another image name, root-write policy or canonical writable-path
 (`checkpoint_spec_mismatch`); disk below S (`checkpoint_disk_too_small`); no restore
 worker (`checkpoint_workers`, the capture workers' 2 per node and 1 per uid); no helper
 session. A keyed create's record is still answered before all of this (M2). The
-accepting transaction then commits the CREATING row and its full reservation (the shared
+checkpoint checks run again on the current row just before the accepting transaction,
+with no await in between, so a checkpoint that became due while the preflight and
+prepare awaited is expired there, not pinned. The accepting transaction then commits the CREATING row and its full reservation (the shared
 disk budget, beside every checkpoint charge), the key record with digest version 2
 (`kilnd.v1.create-request.2`: version 1's canonical object plus `from_checkpoint`;
 `idempotency::create_digest`), the immutable provenance (checkpoint ID and content
@@ -1559,6 +1561,14 @@ whose copy finished first is compensated (its backend removed) instead of publis
 since the cancellation is checked again after the feature probe with no await before
 READY. Source Delete, a departed waiter and shutdown never cancel a restore (the drain
 waits for it).
+
+The helper's untracked-worker scan (C3) counts a restored sandbox's processes as part
+of the sandbox, not as readers: its shim, which `setsid` made a session leader, and any
+process in that shim's session naming the same artifact (kiln's container init is forked
+from the shim without exec and keeps its arguments). Neither reads the artifact after
+the restore, and during it the shim holds the artifact's lock, which keeps kiln's own
+removal busy; the helper's own `kiln create` CLI runs in the helper's session and still
+counts. Without this, a live fork made every removal of its checkpoint answer busy.
 
 Fork ownership extends the rule above: the supervisor owns its CREATING row, pin,
 worker permit and live-set entry until the outcome. Leaving the live set moves the
