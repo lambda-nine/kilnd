@@ -581,12 +581,26 @@ async fn run() {
     assert!(listed(&restarted, scene.instance).await.is_empty());
     assert_eq!(scene.sh(&big, "true").0, 0);
 
-    // 7. A live process naming an artifact (root's own command, say) blocks absence.
+    // 7. A live process of the trusted image whose arguments are kiln's grammar for an
+    // artifact reader blocks absence until it is gone. The real kiln exits at once, so
+    // this node trusts the interpreter, which runs a script named `checkpoint`: its argv
+    // is `python3 checkpoint inspect --instance=I --checkpoint=C`. (Step 6 saw the real
+    // kiln worker itself through the scan.)
     let five = scene.target(5);
-    let mut stray = Command::new("/usr/bin/python3")
+    let python = "/usr/bin/python3";
+    let watching = Node::new(Arc::new(
+        KilnWorkers::new(kiln_bin().into()).with_trusted_image(python.into()),
+    ))
+    .unwrap();
+    let scripts = tempfile::tempdir().unwrap();
+    std::fs::write(
+        scripts.path().join("checkpoint"),
+        "import time; time.sleep(60)\n",
+    )
+    .unwrap();
+    let mut stray = Command::new(python)
+        .current_dir(scripts.path())
         .args([
-            "-c",
-            "import time; time.sleep(60)",
             "checkpoint",
             "inspect",
             &format!("--instance={}", five.instance),
@@ -595,10 +609,11 @@ async fn run() {
         .spawn()
         .unwrap();
     std::thread::sleep(Duration::from_millis(300));
-    assert!(!absent(&restarted, &five).await);
+    assert!(!absent(&watching, &five).await);
     stray.kill().unwrap();
     stray.wait().unwrap();
-    assert!(absent(&restarted, &five).await);
+    assert!(absent(&watching, &five).await);
+    watching.shutdown().await;
 
     node.shutdown().await;
     restarted.shutdown().await;
