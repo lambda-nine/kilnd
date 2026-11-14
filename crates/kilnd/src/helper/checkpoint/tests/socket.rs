@@ -8,6 +8,8 @@ use crate::runtime::kiln::KilnRuntime;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+const PYTHON: &str = "/usr/bin/python3";
+
 const CAPS_WITH_LEASE: &str =
     "4b494c4e45584f00010002001d0000007f000000010001000500080000000000302e312e306769742074657374";
 
@@ -90,7 +92,9 @@ async fn helper(enabled: bool) -> Helper {
     let socket = dir.join("helper.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let uid = unsafe { libc::geteuid() };
-    let node = enabled.then(|| Node::new(Arc::new(KilnWorkers::new(bin.clone()))).unwrap());
+    // The fixture kiln is a Python script, so its processes' image is the interpreter.
+    let workers = KilnWorkers::new(bin.clone()).with_trusted_image(PYTHON.into());
+    let node = enabled.then(|| Node::new(Arc::new(workers)).unwrap());
     let stop = CancellationToken::new();
     let task = tokio::spawn(crate::helper::serve_with_groups(
         listener,
@@ -433,10 +437,17 @@ async fn a_live_process_naming_the_artifact_blocks_absence() {
         checkpoint: CheckpointId::random(),
         ..target()
     };
-    let mut stray = std::process::Command::new("/usr/bin/python3")
+    // A process of the trusted image whose arguments are kiln's grammar: the
+    // interpreter runs a script named `checkpoint`, so its argv is
+    // `python3 checkpoint rm --instance=I --checkpoint=C`.
+    std::fs::write(
+        helper.dir.join("checkpoint"),
+        "import time; time.sleep(60)\n",
+    )
+    .unwrap();
+    let mut stray = std::process::Command::new(PYTHON)
+        .current_dir(&helper.dir)
         .args([
-            "-c",
-            "import time; time.sleep(60)",
             "checkpoint",
             "rm",
             &format!("--instance={INSTANCE}"),

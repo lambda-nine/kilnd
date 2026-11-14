@@ -81,6 +81,8 @@ pub struct KilnWorkers {
     bin: KilnBinary,
     cgroup_root: PathBuf,
     runs: PathBuf,
+    /// The executable whose processes the scan trusts, when not `bin` (tests only).
+    trusted_image: Option<PathBuf>,
 }
 
 impl KilnWorkers {
@@ -89,7 +91,15 @@ impl KilnWorkers {
             bin: KilnBinary::new(bin),
             cgroup_root: PathBuf::from("/sys/fs/cgroup/kiln"),
             runs: PathBuf::from(KILN_RUNS),
+            trusted_image: None,
         }
+    }
+
+    /// Another trusted executable for the process scan, for tests whose kiln is a script.
+    #[cfg(test)]
+    pub fn with_trusted_image(mut self, image: PathBuf) -> Self {
+        self.trusted_image = Some(image);
+        self
     }
 
     /// Another runs directory, for tests.
@@ -120,7 +130,14 @@ impl Workers for KilnWorkers {
     }
 
     fn processes(&self) -> io::Result<Vec<ProcessArgs>> {
-        process_table(kiln_identity(&self.bin)?)
+        let kiln = match &self.trusted_image {
+            Some(image) => {
+                let meta = std::fs::metadata(image)?;
+                (meta.dev(), meta.ino())
+            }
+            None => kiln_identity(&self.bin)?,
+        };
+        process_table(kiln)
     }
 
     fn support(&self, deadline: Instant, cancel: CancellationToken) -> SupportFuture {
