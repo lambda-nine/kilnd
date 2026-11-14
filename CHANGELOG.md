@@ -19,6 +19,17 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   loses its reader arms the checkpoint barrier, whose pass settles orphaned readers.
   The helper no longer counts a restored sandbox's init (forked from its shim, with the
   shim's arguments) as a reader, so a checkpoint can be removed while its forks run.
+- Harden checkpoint forks (C5a-2 adversarial review: three HIGH, two MEDIUM). A fork's
+  final restore outcome is durable before its pin is released: `Created` records the
+  exact backend on the row, `NotCreated` fails it definitely and releases the
+  reservation; startup settles interrupted forks from that row or the helper's record
+  before the legacy CREATING rule, compensating a restored backend instead of reporting
+  it unmanaged. The allocation barrier's admission is now atomic with the reservation of
+  every create and capture. The helper's untracked-worker scan parses kiln's exact
+  command grammar (never past `--`) and requires the trusted kiln executable with a
+  stable start time, so an Exec's arguments can no longer pose as a checkpoint reader.
+  Stored fork failures keep their `checkpoint_*` token, and a restore that proves the
+  artifact corrupt quarantines the checkpoint.
 - Harden the checkpoint engine (C5a-1 adversarial review: eight HIGH, one MEDIUM).
   Delete and expiry hand removal to a supervisor before awaiting, so a departed caller
   never strands a charged row; existing checkpoints are expired, removed, rebased and

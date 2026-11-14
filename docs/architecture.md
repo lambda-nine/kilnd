@@ -1543,13 +1543,22 @@ disk budget, beside every checkpoint charge), the key record with digest version
 `idempotency::create_digest`), the immutable provenance (checkpoint ID and content
 digest), the checkpoint's image identity (so a fork can be checkpointed in turn) and the
 durable pin naming the reader's nonce, epoch and boot, after rechecking the checkpoint
-READY with the same content; any refusal commits nothing. The fork's supervisor
+READY with the same content; any refusal commits nothing. The checkpoint barrier's
+admission is part of that step for every create, fork or not (and for a capture's C1):
+the reservation runs under the barrier's admission lock (the presence lock, memory only)
+with its `allocation_blocked` check, so a barrier armed while a preflight or prepare
+awaited refuses there, and one armed after the commit sees the row. The fork's supervisor
 registers in the live restore set with no await since that commit, sends `Restore` (in
-its own task: a panic there is a lost reply) and settles as a legacy create:
-`Created` releases the pin with its READER_ENDED `complete` (the copy is done, whatever
-READY's fate), probes the restored sandbox's exec features and publishes READY;
-`NotCreated` releases the pin with `not_started` and fails the create as definitely not
-created; `Ambiguous` fails it as an ambiguous legacy create (charged) and keeps the pin,
+its own task: a panic there is a lost reply) and settles as a legacy create, the
+sandbox's outcome always durable before its pin is released (so every crash point leaves
+a row or a helper record to resume from): `Created` first records the exact backend ID
+on the CREATING row, then releases the pin with its READER_ENDED `complete` (the copy is
+done, whatever READY's fate), probes the restored sandbox's exec features and publishes
+READY; `NotCreated` first fails the create as definitely not created (its reservation
+released), then releases the pin with `not_started`, and a `checkpoint_corrupt` (or
+generation mismatch) answer first quarantines the checkpoint (QUARANTINED, typed
+`checkpoint_corrupt` failure, charge kept), so no further fork is admitted while owner
+or root Delete still reaches ABSENT; `Ambiguous` fails it as an ambiguous legacy create (charged) and keeps the pin,
 since `unknown` never releases one; a typed helper refusal fails it definitely and keeps
 the pin (no fact says the reader never ran); a pending or lost reply is followed by
 inspecting the reader's nonce with backoff until its record settles, the helper's epoch
@@ -1560,15 +1569,30 @@ helper's tombstoning removal stops the reader, which answers `not_created`, and 
 whose copy finished first is compensated (its backend removed) instead of published,
 since the cancellation is checked again after the feature probe with no await before
 READY. Source Delete, a departed waiter and shutdown never cancel a restore (the drain
-waits for it).
+waits for it). Every stored fork failure (`NotCreated`, a typed refusal, ambiguous or
+unproven) begins with the returned error's token, `checkpoint_<reason>: detail`
+(bounded), so a keyed retry's FAILED row stays typed (design 7.3).
 
-The helper's untracked-worker scan (C3) counts a restored sandbox's processes as part
-of the sandbox, not as readers: its shim, which `setsid` made a session leader, and any
-process in that shim's session naming the same artifact (kiln's container init is forked
-from the shim without exec and keeps its arguments). Neither reads the artifact after
-the restore, and during it the shim holds the artifact's lock, which keeps kiln's own
-removal busy; the helper's own `kiln create` CLI runs in the helper's session and still
-counts. Without this, a live fork made every removal of its checkpoint answer busy.
+The helper's untracked-worker scan (C3) admits a process as evidence only when its
+arguments parse, exactly as kiln's top-level grammar, as an artifact reader: `kiln
+checkpoint capture|inspect|rm` with its `--instance` and `--checkpoint`, or `kiln create`
+with `--from-checkpoint=I/C`, each option in its place, kiln's own options only, each
+once, and nothing at or after `--` (so `kiln exec ID -- ARGV`, whose argv is an Exec
+caller's, never is); and only when its running image (`/proc/PID/exe`) is the trusted
+kiln executable (device and inode) and its start time (`stat` field 22) is the same
+before its arguments were read and after its image was, so argv text, another binary or
+a reused PID is no evidence. A process whose image the helper may not inspect (a
+non-dumpable sandbox init, or one with capabilities beyond the helper's) is skipped;
+any other read failure fails the scan. Both conditions are needed: `kiln exec` is the
+same root binary. The artifact's flock remains the primary defense against removal under
+a reader. The scan still counts a restored sandbox's processes as part of the sandbox,
+not as readers: its shim, which `setsid` made a session leader, and any process in that
+shim's session naming the same artifact (kiln's container init is forked from the shim
+without exec and keeps its arguments, and is non-dumpable, so a workload cannot rewrite
+them). Neither reads the artifact after the restore, and during it the shim holds the
+artifact's lock, which keeps kiln's own removal busy; the helper's own `kiln create` CLI
+runs in the helper's session and still counts. Without this, a live fork made every
+removal of its checkpoint answer busy.
 
 Fork ownership extends the rule above: the supervisor owns its CREATING row, pin,
 worker permit and live-set entry until the outcome. Leaving the live set moves the
@@ -1576,14 +1600,24 @@ checkpoint epoch, on every exit, unwind included, so a pass that snapshotted the
 live cannot clear. A supervisor that leaves while its reader's end is unknown (a panic,
 outside shutdown) with its pin still live arms the barrier. Every pass then applies the
 fork rule to the live pins in its snapshot whose fork is not restoring in this process:
-a pin from the helper's current epoch has its reader's nonce inspected; a settled
-`Created` or `NotCreated` record releases the pin with its evidence, a reader still
-running with no supervisor blocks the pass, and a retired or ambiguous one keeps its pin
-without blocking (no reader can run). A dead epoch's pin is never asked about: its reader
-died with its helper, and only the checkpoint's ABSENT releases it (C4). A fork row the
-crash left CREATING settles at startup as any interrupted kiln create (FAILED, charged),
-and a backend its orphaned restore made is reported unmanaged, as for any create; the
-daemon never adopts it (general legacy-create recovery is out of scope). These races are
+a pin from the helper's current epoch has its reader's nonce inspected and its fork
+settled from the record, sandbox first and pin second: a settled `Created` compensates
+that exact backend if the row is still CREATING (cleanup intent as DELETING with the
+backend ID, removal, then FAILED, which releases the reservation; a failed removal stays
+DELETING and charged for Delete and startup to retry), a settled `NotCreated` fails a
+still-CREATING row definitely, and either then releases the pin with its evidence; a
+reader still running with no supervisor blocks the pass, and a retired or ambiguous one
+fails a still-CREATING row as an ambiguous create and keeps its pin without blocking (no
+reader can run). A dead epoch's pin is never asked about: its reader died with its
+helper, its still-CREATING row fails as ambiguous, and only the checkpoint's ABSENT
+releases the pin (C4). Startup applies the same settlement before its sandbox pass
+(`settle_interrupted_forks`), so the legacy rule (an interrupted CREATING row without a
+backend ID becomes FAILED and stays charged) never discards a final answer: a CREATING
+fork with a recorded backend ID is compensated, one whose reader's record is final is
+settled from it, and one whose reader may still run, or whose helper cannot be asked,
+stays CREATING for the barrier's pass. A restored backend is compensated rather than
+adopted: the waiter, the exec-feature proof and the Delete-intent check READY needs were
+lost with the supervisor, and the exact backend ID is all compensation needs. These races are
 only free of interleavings because `main.rs` runs every manager task on one
 current-thread runtime: the commit and the live-set registration, and the cancellation
 check and READY's publication, each have no await between them, and so do Delete's and
