@@ -21,12 +21,15 @@ use crate::service::Service;
 
 const OWNER: u32 = 1000;
 const STRANGER: u32 = 1001;
+/// The API socket's group. Both callers run in it, as members of a deployment's socket
+/// group would, so the socket is reachable and kilnd authorizes by the peer's uid.
+const SOCKET_GID: u32 = OWNER;
 
-/// `kilndctl --socket SOCKET ARGS` as `uid` (and that gid, no other groups).
+/// `kilndctl --socket SOCKET ARGS` as `uid`, with gid `SOCKET_GID` and no other groups.
 async fn ctl(bin: &std::path::Path, socket: &std::path::Path, uid: u32, args: &[&str]) -> (i32, String, String) {
-    let id = uid.to_string();
+    let (id, gid) = (uid.to_string(), SOCKET_GID.to_string());
     let out = tokio::process::Command::new("setpriv")
-        .args(["--reuid", &id, "--regid", &id, "--clear-groups"])
+        .args(["--reuid", &id, "--regid", &gid, "--clear-groups"])
         .arg(bin)
         .arg("--socket")
         .arg(socket)
@@ -100,7 +103,7 @@ async fn run_api() {
     .unwrap();
     std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let socket = public.path().join("api").join("kilnd.sock");
-    let bound = crate::server::bind(&socket, Some(OWNER)).await.unwrap();
+    let bound = crate::server::bind(&socket, Some(SOCKET_GID)).await.unwrap();
     let stop = CancellationToken::new();
     let server = tokio::spawn(crate::server::serve(
         Arc::clone(&m),
