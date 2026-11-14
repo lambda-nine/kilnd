@@ -1964,6 +1964,139 @@ async fn a_live_capture_does_not_block_create() {
     );
 }
 
+/// The pass snapshots both the row and the live-capture map before inventory. A live
+/// capture can fail after that snapshot; a retryable cleanup failure does not arm the
+/// barrier, so the stale clean verdict must not admit beside the now-failed row.
+#[tokio::test]
+async fn a_capture_that_fails_after_the_pass_snapshot_must_not_clear() {
+    use crate::checkpoint::Reason;
+
+    let mut limits = test_limits();
+    let checkpoints = limits.checkpoints.as_mut().unwrap();
+    checkpoints.removal_retry = Duration::from_secs(30);
+    checkpoints.max_removal_retry = Duration::from_secs(30);
+    let (m, fake, _) = engine_with(FakeRuntime::default().with_checkpoints(), limits);
+    let source = source(&m, 1000).await;
+    let capture_gate = gate_capture(&fake);
+    let capturing = tokio::spawn({
+        let m = Arc::clone(&m);
+        let source = source.clone();
+        async move { capture(&m, &source, 1000).await }
+    });
+    capture_gate.entered().await;
+    let checkpoint = only(&m);
+
+    let inventory_gate = FakeGate::default();
+    fake.checkpoints(|g| {
+        g.capture_fail = Some((Reason::Io, "capture failed after the pass snapshot".into()));
+        g.removals.push_back(FakeRemoval::Unavailable);
+        g.inventory_gate = Some(inventory_gate.clone());
+    });
+    let pass = tokio::spawn({
+        let m = Arc::clone(&m);
+        async move { m.reconcile_checkpoints().await }
+    });
+    inventory_gate.entered().await;
+
+    // The pass already copied CAPTURING/no-failure and the live map. Fail the capture;
+    // its first cleanup cannot reach the helper, then waits in its retry backoff.
+    capture_gate.release();
+    assert!(capturing.await.unwrap().is_err());
+    until("the capture failure is durable", || {
+        row(&m, checkpoint.id.as_str()).failure.is_some()
+    })
+    .await;
+    let failed = row(&m, checkpoint.id.as_str());
+    assert_eq!(failed.state, CheckpointState::Capturing);
+    assert!(failed.is_charged() && failed.failure.is_some());
+
+    inventory_gate.release();
+    assert!(!pass.await.unwrap().unwrap(), "the stale pass called itself clean");
+    // The failure moved the epoch after the pass's snapshot: its clear is refused.
+    let still_blocked = m.set_checkpoint_barrier(false).unwrap();
+    assert!(
+        create_is_blocked(&m).await,
+        "Create entered beside the failed charged capture"
+    );
+    assert!(still_blocked && m.allocation_blocked());
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+}
+
+/// The same race for a sealed row: READY in the pass's snapshot, then deleted while the
+/// pass awaits inventory, its first removal a retryable failure. The DELETING row is
+/// charged and not proved absent, so the stale clean verdict must not admit beside it.
+#[tokio::test]
+async fn a_ready_row_deleted_after_the_pass_snapshot_must_not_clear() {
+    let mut limits = test_limits();
+    let checkpoints = limits.checkpoints.as_mut().unwrap();
+    checkpoints.removal_retry = Duration::from_secs(30);
+    checkpoints.max_removal_retry = Duration::from_secs(30);
+    let (m, fake, _) = engine_with(FakeRuntime::default().with_checkpoints(), limits);
+    let source = source(&m, 1000).await;
+    let ready = capture(&m, &source, 1000).await.unwrap();
+
+    let inventory_gate = FakeGate::default();
+    fake.checkpoints(|g| {
+        g.removals.push_back(FakeRemoval::Unavailable);
+        g.inventory_gate = Some(inventory_gate.clone());
+    });
+    let pass = tokio::spawn({
+        let m = Arc::clone(&m);
+        async move { m.reconcile_checkpoints().await }
+    });
+    inventory_gate.entered().await;
+
+    // The pass already copied the READY row. Delete it; its first removal cannot reach
+    // the helper, then waits in its retry backoff.
+    m.delete_checkpoint(ready.id.as_str(), 1000, false)
+        .await
+        .unwrap_err();
+    let deleting = row(&m, ready.id.as_str());
+    assert_eq!(deleting.state, CheckpointState::Deleting);
+    assert!(deleting.is_charged());
+
+    inventory_gate.release();
+    assert!(!pass.await.unwrap().unwrap(), "the stale pass called itself clean");
+    let still_blocked = m.set_checkpoint_barrier(false).unwrap();
+    assert!(
+        create_is_blocked(&m).await,
+        "Create entered beside the charged DELETING row"
+    );
+    assert!(still_blocked && m.allocation_blocked());
+    assert!(m.store.checkpoint_barrier_marked().unwrap());
+}
+
+/// Liveness: a refused clear is followed by a clean one once nothing changes. The
+/// barrier's retry pass copies a READY row, which is then deleted and proved absent
+/// while the pass awaits inventory. That pass's clear is refused (the epoch moved);
+/// the retry passes again, finds nothing charged, and reopens Create.
+#[tokio::test]
+async fn a_refused_clear_is_followed_by_a_clean_one() {
+    let (m, fake, _) = engine();
+    let s = source(&m, 1000).await;
+    let c = capture(&m, &s, 1000).await.unwrap();
+    let inventory_gate = FakeGate::default();
+    let inventories = |fake: &FakeRuntime| {
+        fake.checkpoints(|g| g.calls.iter().filter(|c| c.starts_with("inventory")).count())
+    };
+    fake.checkpoints(|g| g.inventory_gate = Some(inventory_gate.clone()));
+    let before = inventories(&fake);
+    assert!(m.set_checkpoint_barrier(true).unwrap());
+    m.spawn_barrier_retry();
+    inventory_gate.entered().await;
+
+    m.delete_checkpoint(c.id.as_str(), 1000, false).await.unwrap();
+    assert_eq!(row(&m, c.id.as_str()).state, CheckpointState::Deleted);
+    inventory_gate.release();
+    until_allocation_opens(&m, "the refused clear was not followed by a clean pass").await;
+    assert!(!m.store.checkpoint_barrier_marked().unwrap());
+    assert_eq!(
+        inventories(&fake) - before,
+        2,
+        "one refused clear, then one clean pass that cleared"
+    );
+}
+
 /// A clean verdict that began before a removal's Retained arm cannot discharge it: the
 /// clear is refused, and the next pass decides.
 #[tokio::test]

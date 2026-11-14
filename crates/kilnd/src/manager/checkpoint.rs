@@ -251,11 +251,14 @@ pub(super) struct CheckpointEngine {
     /// a removal's Retained verdict sets it.
     pub(super) barrier_blocked: AtomicBool,
     barrier_retrying: AtomicBool,
-    /// Every arm of the barrier counts here; `pass_arm` is the count at the latest
-    /// pass's own arm. A clear is refused once anything armed after that pass began
-    /// (a removal's Retained verdict), so a stale clean verdict cannot discharge it.
-    arms: AtomicU64,
-    pass_arm: AtomicU64,
+    /// The checkpoint state epoch, moved under the presence lock with every arm and
+    /// every transition that can make a charged row stop being one a pass explains
+    /// (a capture's failure or end, an intent into DELETING, a retryable removal).
+    /// `pass_epoch` is the epoch at the latest pass's snapshot of rows and live
+    /// captures; a clear is refused once the epoch moved past it, so a clean verdict
+    /// on a stale snapshot cannot discharge the barrier.
+    epoch: AtomicU64,
+    pass_epoch: AtomicU64,
     /// Wakes the barrier retry early: a removal settled, or one found retained state.
     barrier_kick: tokio::sync::Notify,
     pub(super) rejected_captures: AtomicU64,
@@ -305,12 +308,15 @@ impl<R: Runtime> Drop for CapturingFlag<'_, R> {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         if let Some(id) = &self.checkpoint {
-            self.manager
-                .checkpoint
-                .captures
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(id);
+            // No longer a running capture: a pass that copied it as one is stale.
+            self.manager.epoch_transition(|| {
+                self.manager
+                    .checkpoint
+                    .captures
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(id)
+            });
         }
         self.manager.expiry_refresh(&self.source);
     }
@@ -332,7 +338,8 @@ enum Removal {
     /// Worth retrying later: busy, helper unavailable, stale epoch.
     Retry(Error),
     /// The helper found an artifact under the name it cannot prove this row's: kept
-    /// charged and the barrier armed; its retry's backoff paces the next attempt.
+    /// charged and the barrier armed; the barrier retry's passes re-drive it (its
+    /// backoff, or sooner when another row's release wakes the retry).
     Blocked(Error),
 }
 
@@ -443,8 +450,9 @@ impl<R: Runtime> Manager<R> {
     /// it (write-ahead) before it asks the helper anything, so no verdict exists before
     /// the marker does, and so does a removal's Retained verdict; clearing deletes the
     /// marker first, so a failure keeps allocation blocked and a crash costs only one
-    /// more inventory. A clear is refused, and the barrier stays blocked, when anything
-    /// armed it after the latest pass's own arm: that pass's clean verdict is stale.
+    /// more inventory. A clear is refused, and the barrier stays blocked, when the
+    /// epoch moved after the latest pass's snapshot (an arm, or a charged row leaving
+    /// what that pass explained): that pass's clean verdict is stale.
     /// With nothing durable (`present` false, recounted at startup), clearing makes no
     /// query. Returns whether the barrier is blocked afterwards.
     pub(super) fn set_checkpoint_barrier(&self, blocked: bool) -> Result<bool> {
@@ -454,7 +462,7 @@ impl<R: Runtime> Manager<R> {
             self.arm_barrier_locked(false)?;
             return Ok(true);
         }
-        if engine.arms.load(Ordering::SeqCst) != engine.pass_arm.load(Ordering::SeqCst) {
+        if engine.epoch.load(Ordering::SeqCst) != engine.pass_epoch.load(Ordering::SeqCst) {
             return Ok(true);
         }
         if engine.present.load(Ordering::Relaxed) {
@@ -471,18 +479,26 @@ impl<R: Runtime> Manager<R> {
         Ok(false)
     }
 
-    /// Under the presence lock: blocks in memory, counts the arm (as the pass's own
-    /// when `pass`), then commits the marker.
+    /// Under the presence lock: blocks in memory, moves the epoch (and takes it as the
+    /// pass's snapshot epoch when `pass`), then commits the marker.
     fn arm_barrier_locked(&self, pass: bool) -> Result<()> {
         let engine = &self.checkpoint;
         engine.barrier_blocked.store(true, Ordering::SeqCst);
-        let arm = engine.arms.fetch_add(1, Ordering::SeqCst) + 1;
+        let epoch = engine.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         if pass {
-            engine.pass_arm.store(arm, Ordering::SeqCst);
+            engine.pass_epoch.store(epoch, Ordering::SeqCst);
         }
         self.db().mark_checkpoint_barrier()?;
         engine.present.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Makes `transition` visible with the epoch moved, under the presence lock, so a
+    /// pass's snapshot sees both or neither and a clear after it is refused.
+    fn epoch_transition<T>(&self, transition: impl FnOnce() -> T) -> T {
+        let _presence = self.presence();
+        self.checkpoint.epoch.fetch_add(1, Ordering::SeqCst);
+        transition()
     }
 
     /// Retention's prune. While the barrier is blocked it keeps every checkpoint row
@@ -992,9 +1008,10 @@ impl<R: Runtime> Manager<R> {
         };
         warn!(checkpoint = %id, reason = reason.token(), detail = %detail, "capture failed; removing its storage");
         // Keyed callers get the row (failure recorded); unkeyed the typed reason.
-        let recorded =
+        let recorded = self.epoch_transition(|| {
             self.db()
-                .record_checkpoint_failure_token(&id, reason.token(), &detail, false);
+                .record_checkpoint_failure_token(&id, reason.token(), &detail, false)
+        });
         if let Err(e) = recorded {
             warn!(checkpoint = %id, error = %format!("{e:#}"), "could not record the capture failure");
         }
@@ -1300,8 +1317,10 @@ impl<R: Runtime> Manager<R> {
             | CheckpointState::Ready
             | CheckpointState::Quarantined
             | CheckpointState::Deleting => {
-                self.db()
-                    .publish_checkpoint_delete_intent(id, DeletionReason::Requested)?;
+                self.epoch_transition(|| {
+                    self.db()
+                        .publish_checkpoint_delete_intent(id, DeletionReason::Requested)
+                })?;
                 self.cancel_capture(id);
                 self.checkpoint_timer_refresh(id);
                 let (tx, rx) = oneshot::channel();
@@ -1375,7 +1394,7 @@ impl<R: Runtime> Manager<R> {
         let _one = lock.lock().await;
         match self.removal_attempt_locked(id, cancel).await {
             Ok(removal) => removal,
-            Err(e) => Removal::Retry(e),
+            Err(e) => self.epoch_transition(|| Removal::Retry(e)),
         }
     }
 
@@ -1701,8 +1720,9 @@ impl<R: Runtime> Manager<R> {
             Ok(match self.checkpoint_due(&c, pinned) {
                 Some((due, reason)) if due <= now => {
                     let seq = (reason == DeletionReason::ExpiredIdle).then_some(c.activity_seq);
-                    self.db()
-                        .publish_checkpoint_expiry_intent(id, reason, seq)?
+                    self.epoch_transition(|| {
+                        self.db().publish_checkpoint_expiry_intent(id, reason, seq)
+                    })?
                 }
                 _ => false,
             })
@@ -1759,8 +1779,10 @@ impl<R: Runtime> Manager<R> {
     }
 
     /// After a removal settled or was blocked: a blocked barrier gets its retry (a
-    /// Retained verdict armed it), whose backoff paces the next removal attempt, and
-    /// an early pass once a row was released (it may make the pass clean).
+    /// Retained verdict armed it), whose passes re-drive retained rows, and an early
+    /// pass once a row was released (it may make the pass clean). That early pass
+    /// re-drives every retained row too, so their pace is the backoff or the finite
+    /// rows' releases, whichever is sooner; a Retained verdict itself never wakes it.
     fn barrier_after_removal(self: &Arc<Self>, released: bool) {
         if self.checkpoint.barrier_blocked.load(Ordering::SeqCst) {
             self.spawn_barrier_retry();
@@ -1810,8 +1832,12 @@ impl<R: Runtime> Manager<R> {
                             info!("checkpoint reconciliation is clean; new allocations are admitted");
                             break;
                         }
-                        // Armed again since this pass began: the next pass decides.
-                        Ok(true) => {}
+                        // The epoch moved since this pass's snapshot: the next pass
+                        // decides, soon (the backoff's floor, not its doubling).
+                        Ok(true) => {
+                            delay = limits.removal_retry;
+                            continue;
+                        }
                         Err(e) => warn!(error = %format!("{e:#}"), "could not clear the checkpoint barrier's marker; allocation stays blocked"),
                     }
                 }
@@ -1867,21 +1893,24 @@ impl<R: Runtime> Manager<R> {
         // Write-ahead: the obligation is durable, and allocation blocked, before the
         // pass can observe anything that blocks, so a crash at any point in the pass
         // leaves a restart that reconciles. A complete clean pass lets the caller clear it.
-        {
+        // The arm, the charged rows and the live captures are one snapshot, taken
+        // under the presence lock at the pass's epoch: anything that moves it later
+        // makes the caller's clear refuse this verdict.
+        let mut rows: BTreeMap<String, Checkpoint> = BTreeMap::new();
+        let live = {
             let _presence = self.presence();
             self.arm_barrier_locked(true)?;
-        }
-        let mut rows: BTreeMap<String, Checkpoint> = BTreeMap::new();
-        let charged = self.db().unsettled_checkpoints()?.into_iter().chain(
-            self.db()
-                .checkpoint_expiry_rows()?
-                .into_iter()
-                .map(|(c, _)| c),
-        );
-        for c in charged {
-            rows.entry(c.id.to_string()).or_insert(c);
-        }
-        let live = self.live_captures();
+            let charged = self.db().unsettled_checkpoints()?.into_iter().chain(
+                self.db()
+                    .checkpoint_expiry_rows()?
+                    .into_iter()
+                    .map(|(c, _)| c),
+            );
+            for c in charged {
+                rows.entry(c.id.to_string()).or_insert(c);
+            }
+            self.live_captures()
+        };
         let session = match self.checkpoint_session().await {
             Ok(s) => s,
             Err(e) => {

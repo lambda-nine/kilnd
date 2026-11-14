@@ -1395,12 +1395,25 @@ no removal has yet proved ABSENT, so the pass blocks until that removal releases
 startup after a crash therefore blocks briefly while its resumed removals settle, and no
 failure token is read for admission. A removal whose helper answers Retained with
 `checkpoint_corrupt` or `checkpoint_generation_mismatch` (C3) arms the barrier itself
-(blocked in memory, then the marker) and starts its retry, whose backoff paces further
-removal attempts; once a removal proves ABSENT, a released row wakes the retry and its
-clean pass reopens allocation with no restart. That retry only ever clears the barrier's
-own flag, never the reconciliation latch `admission_blocked`. Each arm is counted, and a
-clear is refused when anything armed after the clearing pass's own arm, so a clean
-verdict that raced a Retained one cannot discharge it. While blocked, retention also keeps every checkpoint row and capture key and
+(blocked in memory, then the marker) and starts its retry, whose passes re-drive the
+retained removal: at the retry's backoff (up to `max_removal_retry`), or sooner when
+another row's release wakes the retry, since every pass resumes every pending removal; a
+Retained verdict never wakes it. Once a removal proves ABSENT, a released row wakes the
+retry and its clean pass reopens allocation with no restart. That retry only ever clears
+the barrier's own flag, never the reconciliation latch `admission_blocked`. A pass's
+verdict is about one snapshot: under the presence lock it arms, copies the charged rows
+and the live captures, and records the checkpoint epoch. The epoch moves under the same
+lock with every arm and with every transition that can make a charged row stop being one
+a pass explains, made visible in the same critical section: a capture's recorded failure
+or its leaving the live set, a delete or expiry intent into DELETING, and a retryable
+removal attempt (a new capture does not move it). A clear is refused while the epoch
+differs from the clearing pass's snapshot, so a clean verdict on a stale snapshot (a
+capture that failed, or a READY row deleted, while the pass awaited the helper) cannot
+discharge the barrier; the retry then passes again at its backoff's floor. The epoch
+moves only on finite transitions of existing rows (a retryable removal recurs only for a
+charged row, which blocks the next pass anyway), so once they settle a pass's clear
+succeeds. Passes never overlap: startup's runs before the retry, which is one task.
+While blocked, retention also keeps every checkpoint row and capture key and
 never touches the marker; only once a clean inventory clears the barrier may a prune
 remove the last row (the barrier's set and clear and that prune share the presence
 lock). With it off and nothing durable,

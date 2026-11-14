@@ -28,6 +28,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   cannot prove its row's arms the durable barrier and its retry, and that retry's clean
   pass reopens allocation without a restart; a stale clean verdict cannot clear a later
   arm.
+- Close the checkpoint engine's seventh recheck: a barrier pass's verdict is tied to a
+  state epoch taken with its snapshot of rows and live captures, and moved by every
+  capture failure, intent into DELETING and retryable removal, so a capture that fails
+  or a row deleted while the pass awaits the helper refuses the stale clear; the retry
+  passes again promptly.
 - Close the checkpoint engine's fifth recheck: the barrier's marker is written ahead,
   before any checkpoint helper pass at startup or in the retry, so a crash after a
   blocking verdict cannot lose it; a backend without checkpoints keeps an outstanding
