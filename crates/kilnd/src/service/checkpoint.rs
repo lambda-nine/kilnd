@@ -93,7 +93,11 @@ impl<R: Runtime> Service<R> {
         let count = match req.page_size {
             0 => limits.max_list_page_size,
             n if n <= limits.max_list_page_size => n,
-            _ => return Err(Status::invalid_argument("page_size exceeds server maximum")),
+            _ => {
+                return Err(Status::invalid_argument(
+                    kilnd_api::PAGE_SIZE_EXCEEDS_MAXIMUM,
+                ));
+            }
         };
         let before = if req.page_token.is_empty() {
             None

@@ -1173,6 +1173,41 @@ fn counts_row(conn: &Connection, owner: i64) -> Result<CheckpointCounts> {
     })
 }
 
+/// One statement per list shape (owner or root, source or not, continuation or not;
+/// C5b-1 adversarial review MEDIUM 2): with optional `?n IS NULL OR …` predicates SQLite
+/// scanned the global creation-sequence index, so a small page cost the node's whole
+/// history. Each shape names its predicates and its index: an owner's page searches
+/// `checkpoints_owner_seq` (work bounded by the caller's own rows, a source filter
+/// included), root's source page `checkpoints_source_seq`, root's unfiltered page the
+/// creation sequence's own index.
+pub(super) fn page_sql(owner: bool, source: bool, cursor: bool) -> String {
+    let index = match (owner, source) {
+        (true, _) => " INDEXED BY checkpoints_owner_seq",
+        (false, true) => " INDEXED BY checkpoints_source_seq",
+        (false, false) => "",
+    };
+    let mut terms = Vec::with_capacity(3);
+    for (present, term) in [
+        (owner, "owner_uid"),
+        (source, "source_sandbox_id"),
+        (cursor, "creation_seq"),
+    ] {
+        if present {
+            let op = if term == "creation_seq" { "<" } else { "=" };
+            terms.push(format!("{term} {op} ?{}", terms.len() + 1));
+        }
+    }
+    let filter = if terms.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", terms.join(" AND "))
+    };
+    format!(
+        "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints{index}{filter} ORDER BY creation_seq DESC LIMIT ?{}",
+        terms.len() + 1
+    )
+}
+
 fn usage(conn: &Connection, owner_uid: u32) -> Result<CheckpointUsage> {
     Ok(CheckpointUsage {
         node: counts_row(conn, -1)?,
@@ -1682,17 +1717,22 @@ impl Store {
         before_seq: Option<i64>,
         limit: u32,
     ) -> Result<CheckpointPage> {
+        let sql = page_sql(owner.is_some(), source.is_some(), before_seq.is_some());
+        let fetch = i64::from(limit) + 1;
         self.audited_read(|conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
-                 WHERE (?1 IS NULL OR owner_uid = ?1) AND (?2 IS NULL OR source_sandbox_id = ?2)
-                   AND (?3 IS NULL OR creation_seq < ?3)
-                 ORDER BY creation_seq DESC LIMIT ?4"
-            ))?;
-            let rows = stmt.query_map(
-                params![owner, source, before_seq, i64::from(limit) + 1],
-                checkpoint_row,
-            )?;
+            let mut stmt = conn.prepare(&sql)?;
+            let mut args: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(4);
+            if let Some(owner) = &owner {
+                args.push(owner);
+            }
+            if let Some(source) = &source {
+                args.push(source);
+            }
+            if let Some(before_seq) = &before_seq {
+                args.push(before_seq);
+            }
+            args.push(&fetch);
+            let rows = stmt.query_map(args.as_slice(), checkpoint_row)?;
             let mut rows: Vec<Checkpoint> = rows.map(|r| r?).collect::<Result<_>>()?;
             let has_more = rows.len() > usize::try_from(limit)?;
             rows.truncate(usize::try_from(limit)?);

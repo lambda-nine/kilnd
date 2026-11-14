@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
@@ -2080,9 +2080,10 @@ impl<R: Runtime> Manager<R> {
         self.check_serving()?;
         let (result_tx, result_rx) = oneshot::channel();
         let manager = Arc::clone(self);
+        let (departure, waiter_gone) = fork_departure(&req);
         self.operations.spawn(async move {
             let result = Arc::clone(&manager)
-                .create_supervised(req, owner_uid, None, &OnceLock::new())
+                .create_supervised(req, owner_uid, None, &OnceLock::new(), waiter_gone)
                 .await;
             if let Ok(sandbox) = &result {
                 manager.expiry_refresh(&sandbox.id);
@@ -2094,7 +2095,11 @@ impl<R: Runtime> Manager<R> {
                 }
             }
         });
-        result_rx.await.map_err(|_| {
+        let answer = result_rx.await;
+        if let Some(departure) = departure {
+            departure.disarm();
+        }
+        answer.map_err(|_| {
             Error::Internal(anyhow::anyhow!(
                 "create supervisor stopped without a result"
             ))
@@ -2167,10 +2172,11 @@ impl<R: Runtime> Manager<R> {
                 sha256: key.sha256,
                 pending: Some(pending),
             };
+            let (departure, waiter_gone) = fork_departure(&admitted);
             self.operations.spawn(async move {
                 let committed = OnceLock::new();
                 let result = Arc::clone(&manager)
-                    .create_supervised(admitted, owner_uid, Some(keyed), &committed)
+                    .create_supervised(admitted, owner_uid, Some(keyed), &committed, waiter_gone)
                     .await;
                 // The same answer for the original and every retry: once the row
                 // committed, the settled row, never the error the backend gave.
@@ -2190,7 +2196,11 @@ impl<R: Runtime> Manager<R> {
                     }
                 }
             });
-            match result_rx.await.map_err(|_| {
+            let answer = result_rx.await;
+            if let Some(departure) = departure {
+                departure.disarm();
+            }
+            match answer.map_err(|_| {
                 Error::Internal(anyhow::anyhow!("create supervisor stopped without a result"))
             })? {
                 // Design 3.1: the loser of a primary-key race allocated nothing and
@@ -2311,7 +2321,16 @@ impl<R: Runtime> Manager<R> {
         owner_uid: u32,
         mut keyed: Option<KeyedOperation>,
         committed: &OnceLock<String>,
+        waiter_gone: Option<CancellationToken>,
     ) -> Result<Sandbox> {
+        // Checkpoint design 8.2, forks only (`waiter_gone` is `None` for every other
+        // create): before the accepting transaction a departed caller means no
+        // operation, so no row, pin, charge, key record or Restore.
+        let departed = || match &waiter_gone {
+            Some(gone) if gone.is_cancelled() => Err(CheckpointReason::NotReady
+                .error("the caller departed before the fork was admitted")),
+            _ => Ok(()),
+        };
         self.check_serving()?;
         if self.allocation_blocked() {
             return Err(allocation_barrier());
@@ -2331,6 +2350,7 @@ impl<R: Runtime> Manager<R> {
             None => None,
             Some(id) => Some(self.fork_preflight(id, &spec, owner_uid).await?),
         };
+        departed()?;
         // Design 9.1 (B7): preparation names no allocation. A fenced backend's
         // authority issues the token inside its preflight (RTC-2).
         let prepare_context = PrepareContext {
@@ -2343,6 +2363,7 @@ impl<R: Runtime> Manager<R> {
         // create_owned still refuses here, before any reservation or allocation.
         self.check_serving()?;
         let prepared = prepared?;
+        departed()?;
         // Built after preparation and before C1: the helper's token for a fenced plan,
         // or for kiln a legacy random ID that records no allocation. The manager never
         // invents a fenced token, and a plan whose token contradicts its regime stops here.
@@ -2424,6 +2445,9 @@ impl<R: Runtime> Manager<R> {
         if self.allocation_blocked() {
             return Err(allocation_barrier());
         }
+        // The last look, with no await before the commit: from here a departure only
+        // detaches the waiter.
+        departed()?;
         let reserved = match &fork {
             None => self
                 .store
@@ -4593,6 +4617,18 @@ fn ready(s: &Sandbox) -> Result<()> {
             format!("sandbox {} is {}, not ready", s.id, s.state.as_str()),
         )))
     }
+}
+
+/// A fork's waiter link (checkpoint design 8.2): the guard the waiter holds, which
+/// marks the caller departed when its future is dropped, and the token the supervisor
+/// checks up to its accepting transaction. `None` for an ordinary create, whose
+/// supervisor runs whatever the waiter does, as before.
+fn fork_departure(req: &CreateRequest) -> (Option<DropGuard>, Option<CancellationToken>) {
+    if req.from_checkpoint.as_deref().is_none_or(str::is_empty) {
+        return (None, None);
+    }
+    let gone = CancellationToken::new();
+    (Some(gone.clone().drop_guard()), Some(gone))
 }
 
 fn allocation_barrier() -> Error {

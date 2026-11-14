@@ -196,7 +196,11 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             None => limits.max_list_page_size,
             Some(0) => 100.min(limits.max_list_page_size),
             Some(n) if n <= limits.max_list_page_size => n,
-            Some(_) => return Err(Status::invalid_argument("page_size exceeds server maximum")),
+            Some(_) => {
+                return Err(Status::invalid_argument(
+                    kilnd_api::PAGE_SIZE_EXCEEDS_MAXIMUM,
+                ));
+            }
         };
         let (upper, before) = if req.page_token.is_empty() {
             (None, None)

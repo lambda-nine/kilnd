@@ -917,6 +917,91 @@ async fn a_canceled_capture_rpc_only_detaches_and_a_keyed_retry_reports_in_fligh
     api_exec(&s, &src.id, 1000).await.unwrap();
 }
 
+/// C5b-1 adversarial review MEDIUM 1 (design 8.2): a fork whose caller departs before
+/// durable admission is no operation. Paused in the fresh helper-capabilities preflight,
+/// unkeyed and keyed, then canceled: no row, pin, charge, key record or Restore, ever.
+#[tokio::test]
+async fn a_fork_canceled_before_admission_leaves_nothing() {
+    let (m, fake, _) = engine();
+    let s = api(&m);
+    let src = api_source(&s, 1000).await;
+    let c = api_capture(&s, &src.id, 1000).await.unwrap();
+    let rows = |m: &M| m.store.sandboxes(true).unwrap().len();
+    let before = (rows(&m), m.store_resources_for_test(), charge(&m));
+    let restores = calls(&fake, "restore");
+    for request_id in ["", "canceled-before-admit"] {
+        let gate = FakeGate::default();
+        fake.checkpoints(|g| g.capabilities_gate = Some(gate.clone()));
+        let mut msg = fork_msg(&c.id);
+        msg.request_id = request_id.into();
+        let waiter = {
+            let s = Arc::clone(&s);
+            tokio::spawn(async move { s.create_sandbox(as_uid(msg, 1000)).await })
+        };
+        gate.entered().await;
+        assert_eq!(rows(&m), before.0, "not admitted yet");
+        waiter.abort();
+        let _ = waiter.await;
+        gate.release();
+        // Long enough for a detached supervisor to have committed and restored.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            (rows(&m), m.store_resources_for_test(), charge(&m)),
+            before,
+            "{request_id:?}: no row and no charge"
+        );
+        assert_eq!(
+            calls(&fake, "restore"),
+            restores,
+            "{request_id:?}: no Restore"
+        );
+        assert!(m.store.checkpoint_pins(&c.id).unwrap().is_empty());
+        assert!(
+            m.store
+                .create_request(1000, "canceled-before-admit")
+                .unwrap()
+                .is_none()
+        );
+        assert!(m.checkpoint.restores.lock().unwrap().is_empty());
+    }
+    // The key is free: a new attempt with it forks, and the checkpoint is intact.
+    let mut msg = fork_msg(&c.id);
+    msg.request_id = "canceled-before-admit".into();
+    let fork = s
+        .create_sandbox(as_uid(msg, 1000))
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_eq!(sandbox_state(&fork), pb::SandboxState::Ready);
+    assert_eq!(calls(&fake, "restore"), restores + 1);
+}
+
+/// Ordinary Create is unchanged by MEDIUM 1's fix: a create whose caller departs while
+/// it prepares still runs to READY under its supervisor.
+#[tokio::test]
+async fn an_ordinary_create_still_completes_after_its_caller_departs() {
+    let (m, fake, _) = engine_with(FakeRuntime::fenced().with_checkpoints(), test_limits());
+    let s = api(&m);
+    let gate = FakeGate::default();
+    fake.state().fenced.prepare_gate = Some(gate.clone());
+    let before = m.store.sandboxes(true).unwrap().len();
+    let waiter = {
+        let s = Arc::clone(&s);
+        tokio::spawn(async move { api_source(&s, 1000).await })
+    };
+    gate.entered().await;
+    waiter.abort();
+    let _ = waiter.await;
+    gate.release();
+    until("the detached create's READY", || {
+        let rows = m.store.sandboxes(true).unwrap();
+        rows.len() == before + 1 && rows.iter().all(|r| r.state == SandboxState::Ready)
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_canceled_delete_rpc_leaves_the_removal_running() {
     let (m, fake, _) = engine();
@@ -1192,6 +1277,38 @@ async fn firecracker_refuses_capture_and_fork_before_any_allocation() {
 }
 
 // --- Lists -----------------------------------------------------------------------------
+
+/// C5b-1 adversarial review LOW, the daemon's side: a page above a valid small cap is
+/// refused with exactly the constant kilndctl halves on, and the halved sizes it sends
+/// are served.
+#[tokio::test]
+async fn a_page_above_the_cap_is_refused_with_the_shared_message() {
+    for cap in [1, 3] {
+        let mut limits = test_limits();
+        limits.max_list_page_size = cap;
+        let (m, _, _) = engine_with(FakeRuntime::default().with_checkpoints(), limits);
+        startup(&m).await;
+        let s = api(&m);
+        let src = api_source(&s, 1000).await;
+        api_capture(&s, &src.id, 1000).await.unwrap();
+        let e = api_list(&s, 1000, "", 100, "").await.unwrap_err();
+        assert_eq!(e.code(), Code::InvalidArgument);
+        assert_eq!(e.message(), kilnd_api::PAGE_SIZE_EXCEEDS_MAXIMUM);
+        let mut size = 100;
+        while api_list(&s, 1000, "", size, "").await.is_err() {
+            size /= 2;
+        }
+        assert!(size >= 1 && size <= cap, "cap {cap}: {size}");
+        assert_eq!(
+            api_list(&s, 1000, "", size, "")
+                .await
+                .unwrap()
+                .checkpoints
+                .len(),
+            1
+        );
+    }
+}
 
 #[tokio::test]
 async fn list_pages_are_newest_first_filter_bound_and_bounded() {

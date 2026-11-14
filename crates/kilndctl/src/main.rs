@@ -123,6 +123,10 @@ enum CheckpointCommand {
         /// Only checkpoints captured from this sandbox.
         #[arg(long, value_name = "SANDBOX")]
         sandbox: Option<String>,
+        /// Checkpoints per request, 1 to 1000. Without it kilndctl asks for 100 and
+        /// halves that while kilnd's own --max-list-page-size is lower.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1000))]
+        page_size: Option<u32>,
     },
     /// Delete a checkpoint. Sandboxes created from it are not affected.
     Rm {
@@ -766,22 +770,27 @@ async fn checkpoint(client: &mut KilndServiceClient<Channel>, command: Checkpoin
             print_checkpoint(&c);
             Ok(0)
         }
-        CheckpointCommand::Ls { sandbox } => {
+        CheckpointCommand::Ls { sandbox, page_size } => {
             println!(
                 "{:<35}  {:<11}  {:<19}  {:>9}  {:<20}  EXPIRES",
                 "ID", "STATE", "SANDBOX", "SIZE", "CREATED"
             );
+            let mut pages = PageSize::new(page_size);
             let mut page_token = String::new();
             loop {
-                let r = client
+                let r = match client
                     .list_checkpoints(pb::ListCheckpointsRequest {
                         sandbox_id: sandbox.clone().unwrap_or_default(),
-                        page_size: 100,
-                        page_token,
+                        page_size: pages.size,
+                        page_token: page_token.clone(),
                     })
                     .await
-                    .map_err(rpc)?
-                    .into_inner();
+                {
+                    Ok(r) => r.into_inner(),
+                    Err(s) if pages.shrink(&s) => continue,
+                    Err(s) => return Err(rpc(s)),
+                };
+                pages.answered = true;
                 for c in &r.checkpoints {
                     println!(
                         "{:<35}  {:<11}  {:<19}  {:>9}  {:<20}  {}",
@@ -1425,6 +1434,40 @@ fn sandbox_reusable(v: Option<bool>) -> &'static str {
     }
 }
 
+/// `checkpoint ls`'s page size. kilnd refuses a page above its `--max-list-page-size`
+/// (1 to 1,000), which Health does not advertise, and `page_size` 0 asks for the whole
+/// list or `RESOURCE_EXHAUSTED`. So without `--page-size` it starts at 100 and halves
+/// on kilnd's exact page-cap refusal, only before the first page, never below 1.
+struct PageSize {
+    size: u32,
+    explicit: bool,
+    answered: bool,
+}
+
+impl PageSize {
+    fn new(explicit: Option<u32>) -> Self {
+        Self {
+            size: explicit.unwrap_or(100),
+            explicit: explicit.is_some(),
+            answered: false,
+        }
+    }
+
+    /// Whether to retry the refused request with a smaller page.
+    fn shrink(&mut self, refusal: &tonic::Status) -> bool {
+        if self.explicit
+            || self.answered
+            || self.size <= 1
+            || refusal.code() != tonic::Code::InvalidArgument
+            || refusal.message() != kilnd_api::PAGE_SIZE_EXCEEDS_MAXIMUM
+        {
+            return false;
+        }
+        self.size /= 2;
+        true
+    }
+}
+
 fn rpc(s: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!(
         "{}: {}",
@@ -1560,6 +1603,46 @@ fn time(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C5b-1 adversarial review LOW: `checkpoint ls` against every valid page cap. The
+    /// daemon's side of the refusal is pinned by kilnd's own test of the same constant.
+    #[test]
+    fn checkpoint_ls_finds_a_page_under_any_valid_cap() {
+        let cap_refusal = || tonic::Status::invalid_argument(kilnd_api::PAGE_SIZE_EXCEEDS_MAXIMUM);
+        for cap in 1..=1000u32 {
+            let mut pages = PageSize::new(None);
+            let mut tries = 1;
+            while pages.size > cap {
+                assert!(pages.shrink(&cap_refusal()), "cap {cap}");
+                tries += 1;
+            }
+            assert!(
+                pages.size >= 1 && tries <= 8,
+                "cap {cap}: {} after {tries}",
+                pages.size
+            );
+        }
+        // Any other refusal, a later page, or an explicit size is returned as is.
+        let mut pages = PageSize::new(None);
+        assert!(!pages.shrink(&tonic::Status::invalid_argument("page_token is invalid")));
+        assert!(!pages.shrink(&tonic::Status::resource_exhausted(
+            kilnd_api::PAGE_SIZE_EXCEEDS_MAXIMUM
+        )));
+        pages.answered = true;
+        assert!(!pages.shrink(&cap_refusal()));
+        let mut pages = PageSize::new(Some(7));
+        assert_eq!(pages.size, 7);
+        assert!(!pages.shrink(&cap_refusal()));
+        let mut pages = PageSize::new(None);
+        pages.size = 1;
+        assert!(!pages.shrink(&cap_refusal()), "never 0");
+        let cli = Cli::try_parse_from(["kilndctl", "checkpoint", "ls", "--page-size", "1000"]);
+        assert!(cli.is_ok());
+        for bad in ["0", "1001"] {
+            let cli = Cli::try_parse_from(["kilndctl", "checkpoint", "ls", "--page-size", bad]);
+            assert!(cli.is_err(), "--page-size {bad}");
+        }
+    }
 
     #[test]
     fn checkpoint_commands_parse_and_a_capture_always_sends_an_expiry() {

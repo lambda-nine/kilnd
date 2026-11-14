@@ -2565,3 +2565,131 @@ fn wrong_epoch_facts_past_the_triggers_are_caught_by_the_audits() {
         }
     }
 }
+
+/// C5b-1 adversarial review MEDIUM 2: every `ListCheckpoints` shape searches its index,
+/// so a small page costs work bounded by the page and the caller's own rows, never by
+/// the node's retained history. Over the production table and indexes (no triggers, so
+/// rows can be loaded directly) at the design's 32,768-record history: the plan of each
+/// shape, and its SQLite VM steps for a foreign caller's empty page and an old
+/// continuation. The pre-fix statement is measured alongside, so the bound discriminates.
+#[test]
+fn every_list_shape_searches_its_index_at_retained_history_scale() {
+    use rusqlite::StatementStatus;
+    const RECORDS: i64 = 32_768;
+    let store = Store::open_in_memory().unwrap();
+    let ddl: Vec<String> = {
+        let conn = store.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master WHERE tbl_name = 'checkpoints'
+                 AND type IN ('table', 'index') AND sql IS NOT NULL ORDER BY type DESC",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    let scratch = Connection::open_in_memory().unwrap();
+    // No evidence table here: the foreign keys are not what is measured.
+    scratch
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF; CREATE TEMP TABLE checkpoint_quarantine (id TEXT PRIMARY KEY)",
+        )
+        .unwrap();
+    for sql in &ddl {
+        scratch.execute_batch(sql).unwrap();
+    }
+    // Every row is uid 1000's, across 64 sources; uid 2000 has none.
+    scratch
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+             INSERT INTO checkpoints (id, creation_seq, owner_uid, instance_id, generation,
+                 format_version, source_sandbox_id, source_backend, source_backend_id,
+                 capture_operation, capture_helper_epoch, capture_boot_id, max_size_bytes, image,
+                 image_content_sha256, read_only_root, writable_paths, excluded_paths,
+                 expiry_lifetime_ms, expiry_idle_ms, state, created_at_ms, updated_at_ms)
+             SELECT printf('cp-%032x', i), i, 1000, printf('%032x', 1), 1, 1,
+                 printf('sb-%016x', i % 64), 'kiln', 'b', printf('%032x', i), printf('%032x', 1),
+                 printf('%032x', 1), 65536, 'alpine', printf('%064x', 1), 0, '[]', '[]',
+                 86400000, 3600000, 'capturing', 0, 0 FROM n",
+            [RECORDS],
+        )
+        .unwrap();
+    let source = "sb-0000000000000003";
+    let steps = |sql: &str, args: &[&dyn rusqlite::ToSql]| -> (usize, i32, String) {
+        let plan: Vec<String> = scratch
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(args, |r| r.get(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let mut stmt = scratch.prepare(sql).unwrap();
+        let rows = stmt.query_map(args, |_| Ok(())).unwrap().count();
+        (
+            rows,
+            stmt.get_status(StatementStatus::VmStep),
+            plan.join(" | "),
+        )
+    };
+    // (owner, source, cursor) → the index its plan must search.
+    for (owner, with_source, cursor, index) in [
+        (Some(2000_i64), false, None, "checkpoints_owner_seq"),
+        (Some(2000), true, None, "checkpoints_owner_seq"),
+        (Some(2000), false, Some(3_i64), "checkpoints_owner_seq"),
+        (Some(1000), false, Some(3), "checkpoints_owner_seq"),
+        (Some(1000), true, Some(3), "checkpoints_owner_seq"),
+        (None, true, None, "checkpoints_source_seq"),
+        (None, true, Some(3), "checkpoints_source_seq"),
+        (None, false, Some(3), "sqlite_autoindex_checkpoints_2"),
+    ] {
+        let sql = page_sql(owner.is_some(), with_source, cursor.is_some());
+        let limit = 3_i64;
+        let mut args: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if let Some(owner) = &owner {
+            args.push(owner);
+        }
+        if with_source {
+            args.push(&source);
+        }
+        if let Some(cursor) = &cursor {
+            args.push(cursor);
+        }
+        args.push(&limit);
+        let (rows, vm, plan) = steps(&sql, &args);
+        let shape = format!("owner {owner:?}, source {with_source}, cursor {cursor:?}");
+        assert!(
+            plan.starts_with(&format!("SEARCH checkpoints USING INDEX {index} (")),
+            "{shape}: {plan}"
+        );
+        assert!(!plan.contains("SCAN"), "{shape}: {plan}");
+        assert!(
+            vm < 2_000,
+            "{shape}: {vm} VM steps for {rows} rows ({plan})"
+        );
+        println!("{shape}: {rows} rows, {vm} VM steps, {plan}");
+    }
+    // Root's unfiltered first page walks the sequence index newest first and stops at
+    // the limit.
+    let (rows, vm, plan) = steps(&page_sql(false, false, false), &[&3_i64]);
+    assert_eq!(rows, 3);
+    assert!(
+        plan.starts_with("SCAN checkpoints USING INDEX sqlite_autoindex_checkpoints_2"),
+        "{plan}"
+    );
+    assert!(vm < 2_000, "root first page: {vm} VM steps");
+    // The C5b-1 statement on the same data: history-linear for both cases.
+    let old = format!(
+        "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints
+         WHERE (?1 IS NULL OR owner_uid = ?1) AND (?2 IS NULL OR source_sandbox_id = ?2)
+           AND (?3 IS NULL OR creation_seq < ?3)
+         ORDER BY creation_seq DESC LIMIT ?4"
+    );
+    let none: Option<String> = None;
+    for (owner, cursor) in [(2000_i64, None), (1000, Some(3_i64))] {
+        let (_, vm, plan) = steps(&old, &[&owner, &none, &cursor, &3_i64]);
+        assert!(vm > 100_000, "old shape, owner {owner}: {vm} ({plan})");
+        println!("pre-fix shape, owner {owner}, cursor {cursor:?}: {vm} VM steps, {plan}");
+    }
+}
