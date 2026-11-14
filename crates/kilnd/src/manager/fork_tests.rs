@@ -1300,6 +1300,18 @@ fn committed_fork(
     epoch: Id128,
     boot: Id128,
 ) -> (Sandbox, HelperDispatch) {
+    committed_keyed_fork(m, c, s, epoch, boot, None)
+}
+
+/// The same, with its create key's record committed beside it.
+fn committed_keyed_fork(
+    m: &M,
+    c: &Checkpoint,
+    s: &Sandbox,
+    epoch: Id128,
+    boot: Id128,
+    key: Option<&CreateKey>,
+) -> (Sandbox, HelperDispatch) {
     let mut fork = m.store.sandbox(&s.id).unwrap().unwrap();
     fork.id = new_id("sb");
     fork.state = SandboxState::Creating;
@@ -1313,6 +1325,7 @@ fn committed_fork(
             content_sha256: c.image_content_sha256,
             checkpoint_format_version: c.format_version,
         }),
+        request_id: key.map(|k| k.request_id.clone()),
         ..SandboxLifecycle::default()
     };
     let reader = HelperDispatch {
@@ -1320,9 +1333,14 @@ fn committed_fork(
         helper_epoch: epoch,
         boot_id: boot,
     };
+    let admission = key.map(|k| crate::store::RequestAdmission {
+        sha256: k.sha256,
+        max_per_uid: m.limits.create_requests.max_per_uid,
+        max_node: m.limits.create_requests.max_node,
+    });
     let reserved = m
         .store
-        .reserve_fork_sandbox(&fork, m.sandbox_budgets(), None, &[], &reader)
+        .reserve_fork_sandbox(&fork, m.sandbox_budgets(), admission.as_ref(), &[], &reader)
         .unwrap();
     assert!(
         matches!(
@@ -1706,4 +1724,327 @@ async fn a_checkpoint_due_during_the_preflight_await_is_expired_not_pinned() {
         m.store_resources_for_test().disk_bytes,
         before.1.disk_bytes - S
     );
+}
+
+// --- Fix round 2 (the adversarial review's recheck 1) --------------------------------------
+
+/// The production retry pacing (1 s, doubling to 60 s), so the barrier's pass runs on
+/// its own schedule and the checkpoint's removal lands before it.
+fn r2_prod_pacing() -> Limits {
+    Limits {
+        checkpoints: Some(CheckpointLimits::default()),
+        ..test_limits()
+    }
+}
+
+async fn r2_until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..3000 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn record_of(fake: &FakeRuntime, reader: &HelperDispatch) -> Option<RestoreReply> {
+    fake.checkpoints(|g| g.restore_records.get(&reader.operation).cloned())
+}
+
+/// The recheck's HIGH: a restart keeps a fork CREATING while its reader runs; then the
+/// checkpoint's Delete or its lifetime expiry reaches ABSENT, which releases the pin,
+/// before any pass consumed the reader's record (`NotCreated`, the reader stopped by
+/// the removal's tombstone; or `Created`, the reader done first). The pass is driven
+/// by the CREATING row, not the pin: it settles the fork from the record (definite
+/// failure, or that exact backend compensated) and only then clears. Each ends with
+/// the exact charge, Delete reaching DELETED, and no unmanaged backend on the next start.
+#[tokio::test]
+async fn checkpoint_absent_before_the_pass_still_settles_a_kept_fork() {
+    for (created, expiry) in [(false, false), (false, true), (true, false), (true, true)] {
+        let case = format!("created {created}, expiry {expiry}");
+        let (tmp, dir) = state_dir();
+        let fake = FakeRuntime::default().with_checkpoints();
+        let clock = ManualClock::default();
+        let m = on_disk(&dir, &fake, &clock, &r2_prod_pacing());
+        m.reconcile().await.unwrap();
+        m.start_checkpoints().unwrap();
+        let s = source(&m, 1000).await;
+        let c = m
+            .capture_checkpoint(short(&s, 60, 10), 1000, None, None)
+            .await
+            .unwrap();
+        let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
+        let (f, reader) = committed_fork(&m, &c, &s, epoch, boot);
+        let gate = gate_restore(&fake);
+        let orphan = orphan_restore(&fake, &c, &f, &reader);
+        gate.entered().await;
+        let m = restart(m, &dir, &fake, &clock).await;
+        assert_eq!(
+            m.load(&f.id).unwrap().state,
+            SandboxState::Creating,
+            "{case}"
+        );
+        assert!(m.allocation_blocked(), "{case}");
+        let mut orphan = Some(orphan);
+        if created {
+            gate.release();
+            orphan.take().unwrap().await.unwrap();
+            assert!(matches!(
+                record_of(&fake, &reader),
+                Some(RestoreReply::Created { .. })
+            ));
+        }
+        if expiry {
+            clock.advance(61 * SEC);
+            m.expire_checkpoints_due();
+        } else {
+            m.delete_checkpoint(c.id.as_str(), 1000, false)
+                .await
+                .unwrap();
+        }
+        r2_until("the checkpoint's ABSENT", || {
+            row(&m, c.id.as_str()).state == CheckpointState::Deleted
+        })
+        .await;
+        if let Some(orphan) = orphan {
+            orphan.await.unwrap();
+        }
+        // ABSENT came first: it, not the reader's evidence, released the pin.
+        assert_eq!(
+            pin_of(&m, &f.id).unwrap().released_by.as_deref(),
+            Some("absent"),
+            "{case}"
+        );
+        let record = record_of(&fake, &reader).unwrap();
+        // The barrier clears only once the row is settled.
+        r2_until("the barrier clears", || !m.allocation_blocked()).await;
+        let settled_row = m.load(&f.id).unwrap();
+        assert_ne!(settled_row.state, SandboxState::Creating, "{case}");
+        match record {
+            RestoreReply::Created { backend_id, .. } => {
+                compensated(&m, &f);
+                assert_eq!(settled_row.backend_id.as_deref(), Some(backend_id.as_str()));
+                assert!(!fake.state().sandboxes.contains_key(&backend_id), "{case}");
+            }
+            RestoreReply::NotCreated { .. } => {
+                assert_eq!(
+                    settled_row.create_certainty,
+                    CreateCertainty::DefinitelyNotCreated,
+                    "{case}: {settled_row:?}"
+                );
+                assert!(!settled_row.is_charged(), "{case}");
+                assert!(
+                    settled_row
+                        .failure_reason
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with("checkpoint_")),
+                    "{case}: {settled_row:?}"
+                );
+            }
+            other => panic!("{case}: {other:?}"),
+        }
+        assert_eq!(charge(&m), (0, 0), "{case}");
+        deleted_with_nothing_left(&m, &f).await;
+        let m = stop_and_reopen(m, &dir, &fake, &clock);
+        let reconciled = m.reconcile().await.unwrap();
+        assert!(reconciled.unmanaged.is_empty(), "{case}: {reconciled:?}");
+        assert!(!reconciled.checkpoints_blocked, "{case}: {reconciled:?}");
+        drop((gate, tmp));
+    }
+}
+
+/// The recheck's HIGH, a crash at each step of the row-driven path once ABSENT has
+/// released the pin: before any settlement, after compensation's intent (DELETING with
+/// the exact backend, not yet removed), and after the settlement write. Each restart
+/// ends with the exact charge, no unmanaged backend, nothing blocked and Delete
+/// reaching DELETED.
+#[tokio::test]
+async fn a_crash_at_each_step_after_absent_released_the_pin_recovers() {
+    for (case, not_created) in [
+        ("before", false),
+        ("before", true),
+        ("intent", false),
+        ("settled", false),
+        ("settled", true),
+    ] {
+        let case = format!("{case}, not created {not_created}");
+        let (_tmp, dir, m, fake, clock) = on_disk_engine().await;
+        let (s, c) = ready(&m, 1000).await;
+        let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
+        let (f, reader) = committed_fork(&m, &c, &s, epoch, boot);
+        if not_created {
+            script(&fake, &[FakeRestore::NotCreated(Reason::ImageUnavailable)]);
+        }
+        orphan_restore(&fake, &c, &f, &reader).await.unwrap();
+        let reply = settled_record(&fake, &c, &reader).await;
+        m.delete_checkpoint(c.id.as_str(), 1000, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            pin_of(&m, &f.id).unwrap().released_by.as_deref(),
+            Some("absent")
+        );
+        assert_eq!(m.load(&f.id).unwrap().state, SandboxState::Creating);
+        match (case.as_str(), &reply) {
+            (c, RestoreReply::Created { backend_id, .. }) if c.starts_with("intent") => {
+                m.store
+                    .set_sandbox_state(
+                        &f.id,
+                        SandboxState::Deleting,
+                        Some(backend_id),
+                        Some("checkpoint_io: kilnd lost the fork before it was ready"),
+                    )
+                    .unwrap();
+            }
+            (c, _) if c.starts_with("settled") => {
+                assert!(!m.reconcile_checkpoints().await.unwrap(), "{case}");
+                assert_ne!(m.load(&f.id).unwrap().state, SandboxState::Creating);
+            }
+            _ => {}
+        }
+        let m = stop_and_reopen(m, &dir, &fake, &clock);
+        let reconciled = m.reconcile().await.unwrap();
+        assert!(reconciled.unmanaged.is_empty(), "{case}: {reconciled:?}");
+        assert!(!reconciled.checkpoints_blocked, "{case}: {reconciled:?}");
+        let row = m.load(&f.id).unwrap();
+        assert!(!row.is_charged(), "{case}: {row:?}");
+        match &reply {
+            RestoreReply::Created { backend_id, .. } => {
+                assert!(!fake.state().sandboxes.contains_key(backend_id), "{case}");
+            }
+            _ => assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated),
+        }
+        assert_eq!(charge(&m), (0, 0), "{case}");
+        let d = m.delete(&f.id).await.unwrap();
+        assert_eq!(d.state, SandboxState::Deleted, "{case}");
+    }
+}
+
+/// The recheck's M1 remainder: a keyed fork dispatched in a helper epoch that has since
+/// ended is settled at startup with its typed failure (not the legacy text), and a
+/// keyed retry returns that FAILED row.
+#[tokio::test]
+async fn a_dead_epoch_fork_at_startup_keeps_its_token_for_a_keyed_retry() {
+    let (_tmp, dir, m, fake, clock) = on_disk_engine().await;
+    let (s, c) = ready(&m, 1000).await;
+    let r = fork_req(&c);
+    let k = fork_key("dead-epoch", &r);
+    let boot = fake.checkpoints(|g| g.boot);
+    let (f, _) = committed_keyed_fork(&m, &c, &s, Id128::random(), boot, Some(&k));
+    let m = restart(m, &dir, &fake, &clock).await;
+    let retried = m.create_keyed(Ok(r), 1000, k, None).await.unwrap();
+    assert_eq!(retried.id, f.id);
+    assert_eq!(retried.state, SandboxState::Failed);
+    assert!(
+        retried
+            .failure_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("checkpoint_io: ")),
+        "{retried:?}"
+    );
+    assert!(!m.allocation_blocked());
+}
+
+/// The recheck's MEDIUM: an orphaned CREATING fork whose backend ID is recorded (its
+/// supervisor unwound between the record and the pin's release) and whose helper then
+/// restarted. The pass never fails such a row beside its backend: it compensates that
+/// exact backend, so the reservation goes only with it.
+#[tokio::test]
+async fn an_orphan_with_a_recorded_backend_is_compensated_not_failed() {
+    let (m, fake, _) = engine();
+    let (s, c) = ready(&m, 1000).await;
+    let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
+    let (f, reader) = committed_fork(&m, &c, &s, epoch, boot);
+    orphan_restore(&fake, &c, &f, &reader).await.unwrap();
+    let backend = match settled_record(&fake, &c, &reader).await {
+        RestoreReply::Created { backend_id, .. } => backend_id,
+        other => panic!("{other:?}"),
+    };
+    m.store.record_fork_backend(&f.id, &backend).unwrap();
+    fake.checkpoints(|g| g.restart());
+    assert!(!m.reconcile_checkpoints().await.unwrap());
+    assert!(!fake.state().sandboxes.contains_key(&backend));
+    compensated(&m, &f);
+    // The dead epoch's pin waits for ABSENT, as C4's strict rule says.
+    assert!(pin_of(&m, &f.id).unwrap().released_at_ms.is_none());
+    m.delete_checkpoint(c.id.as_str(), 1000, false)
+        .await
+        .unwrap();
+    deleted_with_nothing_left(&m, &f).await;
+    assert_eq!(charge(&m), (0, 0));
+}
+
+/// The recheck's MEDIUM: a settlement write that fails (injected: a trigger refusing
+/// the fork row's FAILED write) leaves the row CREATING, and the pass is blocked, not
+/// clean, until a later pass records it: for the pass's `NotCreated` and unproven
+/// (dead epoch) rules, and for a live supervisor whose ambiguous FAILED write failed
+/// (its exit arms the barrier).
+#[tokio::test]
+async fn a_failed_settlement_write_keeps_allocation_blocked() {
+    for case in ["not created", "unproven", "live ambiguous"] {
+        let (_tmp, dir, m, fake, _clock) = on_disk_engine().await;
+        let (s, c) = ready(&m, 1000).await;
+        let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
+        let external = rusqlite::Connection::open(dir.join("kilnd.db")).unwrap();
+        let inject = |id: &str| {
+            external
+                .execute_batch(&format!(
+                    "CREATE TRIGGER inject_fork_failure BEFORE UPDATE OF state ON sandboxes
+                     WHEN NEW.id = '{id}' AND NEW.state = 'failed'
+                     BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;"
+                ))
+                .unwrap();
+        };
+        let f = if case == "live ambiguous" {
+            m.start_checkpoints().unwrap();
+            script(&fake, &[FakeRestore::Ambiguous(Reason::Io)]);
+            let gate = gate_restore(&fake);
+            let running = spawn_fork(&m, &c, 1000);
+            gate.entered().await;
+            let f = forks_of(&m, &c).pop().unwrap();
+            inject(&f.id);
+            gate.release();
+            assert!(running.await.unwrap().is_err());
+            assert!(m.allocation_blocked(), "{case}: the exit check arms");
+            f
+        } else {
+            let (f, reader) = committed_fork(&m, &c, &s, epoch, boot);
+            if case == "not created" {
+                script(&fake, &[FakeRestore::NotCreated(Reason::ImageUnavailable)]);
+                orphan_restore(&fake, &c, &f, &reader).await.unwrap();
+            } else {
+                fake.checkpoints(|g| g.restart());
+            }
+            inject(&f.id);
+            assert!(
+                m.reconcile_checkpoints().await.unwrap(),
+                "{case}: a pass beside an unsettled fork is blocked"
+            );
+            f
+        };
+        assert_eq!(
+            m.load(&f.id).unwrap().state,
+            SandboxState::Creating,
+            "{case}"
+        );
+        external
+            .execute_batch("DROP TRIGGER inject_fork_failure")
+            .unwrap();
+        if case == "live ambiguous" {
+            r2_until("the barrier clears", || !m.allocation_blocked()).await;
+        } else {
+            assert!(!m.reconcile_checkpoints().await.unwrap(), "{case}");
+        }
+        let row = m.load(&f.id).unwrap();
+        assert_eq!(row.state, SandboxState::Failed, "{case}");
+        assert!(
+            row.failure_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("checkpoint_")),
+            "{case}: {row:?}"
+        );
+        if case == "not created" {
+            assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
+        }
+    }
 }

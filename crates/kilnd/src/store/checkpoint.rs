@@ -1248,7 +1248,8 @@ pub(super) fn insert_evidence(
 
 /// Prunes terminal checkpoint history, in prune's transaction after its full audit:
 /// released, unquarantined rows with no capture key and no pins left, last changed
-/// before `cutoff_ms`. Their released pins go first; their evidence after them.
+/// before `cutoff_ms`. Their released pins go first; their evidence after them. A
+/// CREATING fork's pin, released or not, is its settlement handle: it keeps its row.
 pub(super) fn prune_checkpoints(tx: &Connection, cutoff_ms: i64) -> Result<usize> {
     tx.execute_batch("CREATE TEMP TABLE retention_checkpoints (id TEXT PRIMARY KEY);")?;
     tx.execute(
@@ -1257,6 +1258,8 @@ pub(super) fn prune_checkpoints(tx: &Connection, cutoff_ms: i64) -> Result<usize
            AND id NOT IN (SELECT id FROM temp.checkpoint_quarantine)
            AND NOT EXISTS (SELECT 1 FROM checkpoint_requests WHERE checkpoint_id = checkpoints.id)
            AND NOT EXISTS (SELECT 1 FROM checkpoint_pins WHERE checkpoint_id = checkpoints.id AND released_at_ms IS NULL)
+           AND NOT EXISTS (SELECT 1 FROM checkpoint_pins p JOIN sandboxes s ON s.id = p.sandbox_id
+                           WHERE p.checkpoint_id = checkpoints.id AND s.state = 'creating')
            AND updated_at_ms <= ?1",
         [cutoff_ms],
     )?;
@@ -1738,6 +1741,18 @@ impl Store {
             ))?;
             let rows = stmt.query_map([checkpoint], pin_row)?;
             rows.map(|r| r?).collect()
+        })
+    }
+
+    /// The CREATING fork rows of `backend` (design 10): each is settled by its
+    /// supervisor or, unowned, by startup and the barrier's pass, whatever its pin.
+    pub fn creating_forks(&self, backend: &str) -> Result<Vec<String>> {
+        self.audited_read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM sandboxes WHERE state = 'creating' AND from_checkpoint IS NOT NULL AND backend = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([backend], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
     }
 

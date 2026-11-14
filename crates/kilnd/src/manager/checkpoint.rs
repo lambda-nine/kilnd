@@ -1992,7 +1992,7 @@ impl<R: Runtime> Manager<R> {
         // under the presence lock at the pass's epoch: anything that moves it later
         // makes the caller's clear refuse this verdict.
         let mut rows: BTreeMap<String, Checkpoint> = BTreeMap::new();
-        let (live, restoring, pins) = {
+        let (live, restoring, forks) = {
             let _presence = self.presence();
             self.arm_barrier_locked(true)?;
             let charged = self.db().unsettled_checkpoints()?.into_iter().chain(
@@ -2004,8 +2004,15 @@ impl<R: Runtime> Manager<R> {
             for c in charged {
                 rows.entry(c.id.to_string()).or_insert(c);
             }
-            // Pins are admitted only on READY rows and outlive it into DELETING.
-            let mut pins = Vec::new();
+            // The forks to settle (design 10): every CREATING fork row, whatever its
+            // pin (the checkpoint's ABSENT may have released it), and every live pin,
+            // whose row may be settled already. Pins are admitted only on READY rows
+            // and outlive it into DELETING.
+            let mut forks: BTreeSet<String> = self
+                .db()
+                .creating_forks(self.runtime.name())?
+                .into_iter()
+                .collect();
             for c in rows.values().filter(|c| {
                 matches!(
                     c.state,
@@ -2016,11 +2023,11 @@ impl<R: Runtime> Manager<R> {
             }) {
                 for pin in self.db().checkpoint_pins(c.id.as_str())? {
                     if pin.released_at_ms.is_none() {
-                        pins.push((c.clone(), pin));
+                        forks.insert(pin.sandbox_id);
                     }
                 }
             }
-            (self.live_captures(), self.live_restores(), pins)
+            (self.live_captures(), self.live_restores(), forks)
         };
         let session = match self.checkpoint_session().await {
             Ok(s) => s,
@@ -2170,9 +2177,10 @@ impl<R: Runtime> Manager<R> {
                 }
             }
         }
-        blocked |= self
-            .reconcile_fork_pins(&pins, &restoring, session)
-            .await?;
+        blocked |= !self
+            .reconcile_forks(&forks, &restoring, Some(session))
+            .await?
+            .is_empty();
         Ok(blocked)
     }
 

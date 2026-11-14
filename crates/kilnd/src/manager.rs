@@ -2,7 +2,7 @@
 //! records every transition in the store. The gRPC layer is a thin
 //! translation on top of this.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -1155,11 +1155,17 @@ impl<R: Runtime> Manager<R> {
             match (s.state, &s.backend_id) {
                 (SandboxState::Creating, None) if kept_forks.contains(&s.id) => {}
                 (SandboxState::Creating, None) => {
+                    // A fork's stored failure keeps its `checkpoint_*` token (design 7.3).
+                    let fork = s.lifecycle.from_checkpoint.is_some();
+                    let reason = format!(
+                        "{}kilnd stopped while the sandbox was being created",
+                        if fork { "checkpoint_io: " } else { "" }
+                    );
                     self.store.set_sandbox_state(
                         &s.id,
                         SandboxState::Failed,
                         None,
-                        Some("kilnd stopped while the sandbox was being created"),
+                        Some(&reason),
                     )?;
                     out.failed.push(s.id);
                 }
