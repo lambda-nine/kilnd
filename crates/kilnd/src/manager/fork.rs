@@ -141,6 +141,26 @@ impl<R: Runtime> Manager<R> {
         })
     }
 
+    /// The preflight's checks again, on the checkpoint as it stands, after the
+    /// preflight's and prepare's awaits and with none before the accepting
+    /// transaction: a checkpoint that became due meanwhile is expired, not pinned.
+    pub(in crate::manager) fn fork_recheck(
+        self: &Arc<Self>,
+        plan: &ForkPlan<'_>,
+        spec: &SandboxSpec,
+    ) -> Result<()> {
+        let id = plan.checkpoint.id.as_str();
+        let c = self
+            .db()
+            .checkpoint(id)?
+            .ok_or_else(|| Error::NotFound(format!("checkpoint {id}")))?;
+        self.fork_compatible(&c, spec).inspect_err(|_| {
+            self.checkpoint
+                .rejected_forks
+                .fetch_add(1, Ordering::Relaxed);
+        })
+    }
+
     /// The checkpoint's state and the resolved spec's compatibility with it. A due
     /// checkpoint is expired here, into DELETING, before any fork is admitted (8.1).
     fn fork_compatible(self: &Arc<Self>, c: &Checkpoint, spec: &SandboxSpec) -> Result<()> {

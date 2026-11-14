@@ -2398,6 +2398,11 @@ impl<R: Runtime> Manager<R> {
         // trace for reconciliation. Count and every resource sum are checked with
         // this insert in one SQLite transaction; for a keyed create, so are the
         // durable request records, and the record commits with the row.
+        // The preflight and prepare awaited: a checkpoint that became due meanwhile is
+        // expired now, with no await before the accepting transaction (design 8.1).
+        if let Some(plan) = &fork {
+            self.fork_recheck(plan, &sandbox.spec)?;
+        }
         let reserved = match &fork {
             None => self
                 .store

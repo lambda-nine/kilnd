@@ -1345,3 +1345,41 @@ async fn a_crash_after_ready_keeps_the_fork() {
     assert!(!m.allocation_blocked());
     settled(&m, &c);
 }
+
+/// The independent review's MEDIUM: a checkpoint that becomes due while the preflight
+/// awaits the helper is expired before the accepting transaction, never pinned.
+#[tokio::test]
+async fn a_checkpoint_due_during_the_preflight_await_is_expired_not_pinned() {
+    let (m, fake, clock) = engine();
+    let s = source(&m, 1000).await;
+    let c = m
+        .capture_checkpoint(short(&s, 60, 10), 1000, None, None)
+        .await
+        .unwrap();
+    clock.advance(9 * SEC);
+    let before = (rows(&m), m.store_resources_for_test());
+    let gate = FakeGate::default();
+    fake.checkpoints(|g| g.capabilities_gate = Some(gate.clone()));
+    let running = spawn_fork(&m, &c, 1000);
+    gate.entered().await;
+    // Idle passes while the preflight waits, and no sweeper runs before it resumes.
+    clock.advance(2 * SEC);
+    gate.release();
+    let e = running.await.unwrap().unwrap_err();
+    assert_eq!(reason(&e), Some("checkpoint_expired"), "{e:?}");
+    assert_eq!(rows(&m), before.0);
+    assert_eq!(calls(&fake, "restore"), 0);
+    assert!(m.store.checkpoint_pins(c.id.as_str()).unwrap().is_empty());
+    until("the expired checkpoint's removal", || {
+        row(&m, c.id.as_str()).state == CheckpointState::Deleted
+    })
+    .await;
+    assert_eq!(
+        row(&m, c.id.as_str()).deletion_reason,
+        Some(DeletionReason::ExpiredIdle)
+    );
+    assert_eq!(
+        m.store_resources_for_test().disk_bytes,
+        before.1.disk_bytes - S
+    );
+}
