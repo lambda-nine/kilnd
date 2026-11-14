@@ -580,68 +580,104 @@ pub fn parse_inventory(text: &str) -> Result<Vec<InventoryLine>, String> {
     Ok(out)
 }
 
-/// The long options after a kiln subcommand, as kiln's parser (clap) takes them: an
-/// option in `values` as `--name=V` or `--name V`, one in `flags` alone, at most
-/// `positionals` other words, and nothing at or after `--`. `None` where kiln itself
-/// would refuse the command line (an unknown or short option, a missing value, an
-/// extra word), so such a process reads nothing.
-fn options<'a>(
-    args: &'a [String],
-    values: &[&str],
-    flags: &[&str],
-    mut positionals: usize,
-) -> Option<Vec<(&'a str, &'a str)>> {
-    let mut out = Vec::new();
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            break;
-        }
-        if !arg.starts_with('-') {
-            positionals = positionals.checked_sub(1)?;
-            continue;
-        }
-        match arg.split_once('=') {
-            Some((name, value)) if values.contains(&name) => out.push((name, value)),
-            None if values.contains(&arg.as_str()) => out.push((arg.as_str(), args.next()?)),
-            None if flags.contains(&arg.as_str()) => {}
-            _ => return None,
-        }
-    }
-    Some(out)
+/// How kiln's parser (clap 4) takes one long option of a subcommand.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opt {
+    /// A value, at most once.
+    Text,
+    /// A value, any number of times (kiln's `Vec` options).
+    Repeated,
+    /// A `u64` or `u16` value, at most once.
+    U64,
+    U16,
+    /// No value, at most once.
+    Flag,
 }
 
-/// The one value of `name`; kiln refuses a repeated one.
-fn single<'a>(options: &[(&str, &'a str)], name: &str) -> Option<&'a str> {
-    let mut found = options.iter().filter(|(n, _)| *n == name);
-    let (_, value) = found.next()?;
-    found.next().is_none().then_some(*value)
+/// The long options after a kiln subcommand, exactly as kiln's parser takes them: an
+/// option as `--name=V` or `--name V` (where V does not look like an option), a flag
+/// alone, numbers that parse, nothing repeated but a `Repeated` option, and exactly
+/// `positionals` other words, every word after the first `--` (or a lone `-`) being
+/// one. `None` where kiln itself would refuse the command line (an unknown or short
+/// option, a missing or malformed value, a repeat, a missing or extra word).
+fn options<'a>(
+    args: &'a [String],
+    spec: &[(&str, Opt)],
+    positionals: usize,
+) -> Option<Vec<(&'a str, &'a str)>> {
+    let mut out: Vec<(&str, &str)> = Vec::new();
+    let mut words = 0;
+    let mut escaped = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if escaped || arg == "-" || !arg.starts_with('-') {
+            words += 1;
+            continue;
+        }
+        if arg == "--" {
+            escaped = true;
+            continue;
+        }
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg.as_str(), None),
+        };
+        let (_, kind) = spec.iter().find(|(n, _)| *n == name)?;
+        let value = match (kind, inline) {
+            (Opt::Flag, None) => "",
+            (Opt::Flag, Some(_)) => return None,
+            (_, Some(value)) => value,
+            (_, None) => args.next().filter(|v| *v == "-" || !v.starts_with('-'))?,
+        };
+        let parses = match kind {
+            Opt::U64 => value.parse::<u64>().is_ok(),
+            Opt::U16 => value.parse::<u16>().is_ok(),
+            _ => true,
+        };
+        if !parses || (*kind != Opt::Repeated && out.iter().any(|(n, _)| *n == name)) {
+            return None;
+        }
+        out.push((name, value));
+    }
+    (words == positionals).then_some(out)
+}
+
+/// The value of `name`, given at most once by [`options`].
+fn value<'a>(options: &[(&str, &'a str)], name: &str) -> Option<&'a str> {
+    options.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
 }
 
 /// The artifact a kiln command line reads, parsed exactly as kiln's top-level grammar
 /// (kiln `runtime/src/main.rs`, no global options): `checkpoint capture|inspect|rm`
-/// with its `--instance` and `--checkpoint`, or `create` with `--from-checkpoint=I/C`
-/// (the bool). Anything else, `exec` and `run` included, reads no artifact, and no
-/// word at or after `--` is ever an option.
+/// with its required options and capture's source sandbox, or `create` with
+/// `--from-checkpoint=I/C` (the bool). Anything else, `exec` and `run` included,
+/// reads no artifact, and no word after `--` is ever an option.
 fn artifact_reader(argv: &[String]) -> Option<(&str, &str, bool)> {
+    use Opt::{Flag, Repeated, Text, U16, U64};
     let (command, rest) = argv.get(1..)?.split_first()?;
     match command.as_str() {
         "checkpoint" => {
             let (sub, rest) = rest.split_first()?;
-            let (values, flags, positionals): (&[&str], &[&str], usize) = match sub.as_str() {
-                "capture" => (
-                    &["--instance", "--checkpoint", "--generation", "--max-bytes"],
-                    &[],
-                    1,
-                ),
-                "inspect" => (&["--instance", "--checkpoint"], &["--verify"], 0),
-                "rm" => (&["--instance", "--checkpoint", "--generation"], &[], 0),
-                _ => return None,
-            };
-            let options = options(rest, values, flags, positionals)?;
+            let identity = [("--instance", Text), ("--checkpoint", Text)];
+            let (extra, required, positionals): (&[(&str, Opt)], &[&str], usize) =
+                match sub.as_str() {
+                    "capture" => (
+                        &[("--generation", U64), ("--max-bytes", U64)],
+                        &["--generation", "--max-bytes"],
+                        1,
+                    ),
+                    "inspect" => (&[("--verify", Flag)], &[], 0),
+                    "rm" => (&[("--generation", U64)], &[], 0),
+                    _ => return None,
+                };
+            let spec: Vec<(&str, Opt)> = identity.iter().chain(extra).copied().collect();
+            let options = options(rest, &spec, positionals)?;
+            if !required.iter().all(|r| value(&options, r).is_some()) {
+                return None;
+            }
             Some((
-                single(&options, "--instance")?,
-                single(&options, "--checkpoint")?,
+                value(&options, "--instance")?,
+                value(&options, "--checkpoint")?,
                 false,
             ))
         }
@@ -649,22 +685,26 @@ fn artifact_reader(argv: &[String]) -> Option<(&str, &str, bool)> {
             let options = options(
                 rest,
                 &[
-                    "--require-exec-protocol",
-                    "--hostname",
-                    "--image",
-                    "--memory",
-                    "--cpus",
-                    "--pids",
-                    "--disk",
-                    "--writable",
-                    "--net",
-                    "--allow",
-                    "--from-checkpoint",
+                    ("--require-exec-protocol", U16),
+                    ("--hostname", Text),
+                    ("--image", Text),
+                    ("--memory", Text),
+                    ("--cpus", Text),
+                    ("--pids", Text),
+                    ("--disk", Text),
+                    ("--read-only", Flag),
+                    ("--writable", Repeated),
+                    ("--net", Text),
+                    ("--allow", Repeated),
+                    ("--from-checkpoint", Text),
                 ],
-                &["--read-only"],
                 0,
             )?;
-            let (instance, checkpoint) = single(&options, "--from-checkpoint")?.split_once('/')?;
+            // kiln: `--writable` requires `--read-only`.
+            if value(&options, "--writable").is_some() && value(&options, "--read-only").is_none() {
+                return None;
+            }
+            let (instance, checkpoint) = value(&options, "--from-checkpoint")?.split_once('/')?;
             Some((instance, checkpoint, true))
         }
         _ => None,
@@ -775,9 +815,12 @@ pub fn scan(
             Err(e) => return Err(e),
         };
         let argv: Vec<String> = match cmdline(pid) {
+            // NUL-terminated words; an empty word is a word, as kiln's parser sees it.
+            Ok(cmdline) if cmdline.is_empty() => Vec::new(),
             Ok(cmdline) => cmdline
+                .strip_suffix(&[0])
+                .unwrap_or(&cmdline)
                 .split(|b| *b == 0)
-                .filter(|a| !a.is_empty())
                 .map(|a| String::from_utf8_lossy(a).into_owned())
                 .collect(),
             Err(e) if gone(&e) => continue,

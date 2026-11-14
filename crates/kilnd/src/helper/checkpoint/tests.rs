@@ -847,6 +847,8 @@ async fn untracked_processes_block_absence_until_they_are_gone() {
             &instance,
             &checkpoint,
             "--generation=1",
+            "--max-bytes=4096",
+            "0123456789abcdef",
         ],
     )]));
     let reply = call(&node, remove(&target(), Id128::random())).await;
@@ -1041,6 +1043,109 @@ fn only_kiln_s_own_grammar_names_an_artifact() {
     for p in &not_named {
         assert_eq!(named_artifact(p), None, "{:?}", p.argv);
     }
+}
+
+/// The adversarial review's recheck LOW: kiln's own parser (clap 4) refuses these, so
+/// none names an artifact: capture without its source, a repeated non-identity
+/// option, a word after `--` where kiln takes none, an empty word, a value that is
+/// not a number, a value that looks like an option, a flag with a value, and
+/// `--writable` without `--read-only`. The forms kiln accepts stay named: capture's
+/// source after `--`, a trailing `--`, a repeated `--allow`, a lone `-` as a word.
+#[test]
+fn kiln_refused_command_lines_name_nothing() {
+    let a = |argv: &[&str]| process(false, argv);
+    let (i, c) = (INSTANCE, CHECKPOINT);
+    let inst = format!("--instance={i}");
+    let cp = format!("--checkpoint={c}");
+    let from = format!("--from-checkpoint={i}/{c}");
+    let k = "/usr/local/bin/kiln";
+    let capture = |tail: &[&str]| {
+        let mut argv = vec![k, "checkpoint", "capture", &inst, &cp, "--generation=1"];
+        argv.extend_from_slice(tail);
+        a(&argv)
+    };
+    let refused = [
+        // The report's three forms.
+        a(&[k, "checkpoint", "capture", &inst, &cp]),
+        a(&[
+            k,
+            "checkpoint",
+            "rm",
+            &inst,
+            &cp,
+            "--generation=1",
+            "--generation=2",
+        ]),
+        a(&[k, "create", &from, "--", "garbage"]),
+        // The rest of kiln's grammar.
+        capture(&["--max-bytes=9"]),
+        capture(&["--max-bytes=9", "ab12", "cd34"]),
+        capture(&["--max-bytes=9", "--", "ab12", "--"]),
+        capture(&["--max-bytes=x", "ab12"]),
+        capture(&["--max-bytes", "-1", "ab12"]),
+        a(&[k, "checkpoint", "rm", &inst, &cp, ""]),
+        a(&[k, "checkpoint", "rm", &inst, &cp, "--", "x"]),
+        a(&[k, "checkpoint", "rm", &inst, &cp, &inst]),
+        a(&[k, "checkpoint", "rm", "--instance", "--", &cp]),
+        a(&[
+            k,
+            "checkpoint",
+            "inspect",
+            &inst,
+            &cp,
+            "--verify",
+            "--verify",
+        ]),
+        a(&[k, "checkpoint", "inspect", &inst, &cp, "--verify=true"]),
+        a(&[k, "checkpoint", "inspect", &inst]),
+        a(&[k, "create", &from, ""]),
+        a(&[k, "create", &from, "--image=a", "--image=b"]),
+        a(&[k, "create", &from, "--read-only", "--read-only"]),
+        a(&[k, "create", &from, "--writable=/w"]),
+        a(&[k, "create", &from, "--require-exec-protocol=70000"]),
+        a(&[k, "create", "--from-checkpoint", "-x/C"]),
+    ];
+    for p in &refused {
+        assert_eq!(named_artifact(p), None, "{:?}", p.argv);
+    }
+    let named = [
+        capture(&["--max-bytes=9", "--", "ab12"]),
+        capture(&["--max-bytes=9", "--", "-x"]),
+        capture(&["--max-bytes=+9", "-"]),
+        capture(&["--max-bytes=9", ""]),
+        capture(&["ab12", "--max-bytes", "9", "--"]),
+        a(&[k, "checkpoint", "rm", &inst, &cp, "--"]),
+        a(&[k, "create", &from, "--allow=a", "--allow=b", "--"]),
+        a(&[
+            k,
+            "create",
+            "--writable=/a",
+            "--read-only",
+            "--writable=/b",
+            &from,
+        ]),
+    ];
+    for p in &named {
+        assert_eq!(
+            named_artifact(p),
+            Some((i.to_string(), c.to_string())),
+            "{:?}",
+            p.argv
+        );
+    }
+    // The scan keeps an empty word (`\0\0`), as kiln's parser sees it: this `rm` has
+    // a stray empty word, which kiln refuses, so the process reads nothing.
+    let cmdline = format!("kiln\0checkpoint\0rm\0{inst}\0{cp}\0\0");
+    let stat = "1 (kiln) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0".to_string();
+    let scanned = kiln::scan(
+        [10],
+        (7, 42),
+        |_| Ok(stat.clone()),
+        |_| Ok(cmdline.clone().into_bytes()),
+        |_| Ok((7, 42)),
+    )
+    .unwrap();
+    assert!(scanned.is_empty(), "{scanned:?}");
 }
 
 /// Provenance: only the trusted kiln image counts, read with the same start time before
