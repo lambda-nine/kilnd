@@ -285,7 +285,12 @@ impl<R: Runtime> Manager<R> {
                 // finds it there or in the helper's record (design 10).
                 if let Err(e) = self.store.record_fork_backend(&sandbox.id, &backend_id) {
                     return Err(self
-                        .compensate_failed_publication(&sandbox.id, &backend_id, e)
+                        .compensate_failed_publication_as(
+                            &sandbox.id,
+                            &backend_id,
+                            e,
+                            Some(CheckpointReason::Io),
+                        )
                         .await);
                 }
                 // The copy is complete: the pin goes, even if READY never comes (8.2).
@@ -567,7 +572,12 @@ impl<R: Runtime> Manager<R> {
             .publish_legacy_ready(&sandbox.id, backend_id, exec_features)
         {
             return Err(self
-                .compensate_failed_publication(&sandbox.id, backend_id, e)
+                .compensate_failed_publication_as(
+                    &sandbox.id,
+                    backend_id,
+                    e,
+                    Some(CheckpointReason::Io),
+                )
                 .await);
         }
         info!(sandbox = %sandbox.id, backend_id, checkpoint, "sandbox ready from checkpoint");

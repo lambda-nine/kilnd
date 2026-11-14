@@ -1153,7 +1153,11 @@ impl<R: Runtime> Manager<R> {
                 .map(|r| r.status)
                 == Some(BackendStatus::Running);
             match (s.state, &s.backend_id) {
-                (SandboxState::Creating, None) if kept_forks.contains(&s.id) => {}
+                // Row-driven settlement kept this fork CREATING (its reader may run, its
+                // helper could not be asked, or its exact backend's compensation failed):
+                // the barrier's pass owns it, with or without a recorded backend ID, so it
+                // never becomes READY or FAILED here (C5a-2 recheck 2).
+                (SandboxState::Creating, _) if kept_forks.contains(&s.id) => {}
                 (SandboxState::Creating, None) => {
                     // A fork's stored failure keeps its `checkpoint_*` token (design 7.3).
                     let fork = s.lifecycle.from_checkpoint.is_some();
@@ -2768,19 +2772,35 @@ impl<R: Runtime> Manager<R> {
         backend_id: &str,
         publication: anyhow::Error,
     ) -> Error {
-        let publication_reason = format!("record ready state failed: {publication:#}");
-        match self
-            .compensate_legacy_create(sandbox_id, backend_id, &publication_reason)
+        self.compensate_failed_publication_as(sandbox_id, backend_id, publication, None)
             .await
-        {
-            Ok(()) => {
-                warn!(sandbox = %sandbox_id, backend_id = %backend_id, "ready publication failed; removed backend sandbox");
-                Error::Internal(publication)
-            }
-            Err(reason) => {
-                warn!(sandbox = %sandbox_id, backend_id = %backend_id, "ready publication and compensation failed");
-                Error::Internal(anyhow::anyhow!("{reason}"))
-            }
+    }
+
+    /// As [`Self::compensate_failed_publication`]; a fork's (`token` set) stored reason
+    /// starts with that `checkpoint_*` token and its error carries it (design 7.3), so
+    /// a keyed retry returns a typed FAILED row.
+    pub(super) async fn compensate_failed_publication_as(
+        &self,
+        sandbox_id: &str,
+        backend_id: &str,
+        publication: anyhow::Error,
+        token: Option<checkpoint::CheckpointReason>,
+    ) -> Error {
+        let prefix = token.map_or(String::new(), |t| format!("{}: ", t.token()));
+        let publication_reason = format!("{prefix}record ready state failed: {publication:#}");
+        let outcome = self
+            .compensate_legacy_create(sandbox_id, backend_id, &publication_reason)
+            .await;
+        if outcome.is_ok() {
+            warn!(sandbox = %sandbox_id, backend_id = %backend_id, "ready publication failed; removed backend sandbox");
+        } else {
+            warn!(sandbox = %sandbox_id, backend_id = %backend_id, "ready publication and compensation failed");
+        }
+        match (outcome, token) {
+            (Ok(()), Some(t)) => t.error(format!("{publication_reason}; backend removed")),
+            (Err(reason), Some(t)) => t.error(reason),
+            (Ok(()), None) => Error::Internal(publication),
+            (Err(reason), None) => Error::Internal(anyhow::anyhow!("{reason}")),
         }
     }
 

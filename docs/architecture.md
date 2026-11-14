@@ -1577,8 +1577,10 @@ The helper's untracked-worker scan (C3) admits a process as evidence only when i
 arguments parse, exactly as kiln's top-level grammar, as an artifact reader: `kiln
 checkpoint capture|inspect|rm` with its `--instance` and `--checkpoint`, or `kiln create`
 with `--from-checkpoint=I/C`, as kiln's parser (clap) takes them: kiln's own options
-only, each once but `--writable` and `--allow`, numbers that parse, a value that does not
-look like an option, `--writable` only with `--read-only`, every required option, and
+only, each once but `--writable` and `--allow`, numbers as clap's parsers take them
+(`u64` as Rust parses it; `--require-exec-protocol` as an in-range `i64`, so `-0` too), a
+value that does not look like an option, a nonempty `--writable` path and only with
+`--read-only`, UTF-8 in every word but a `--writable` path, every required option, and
 exactly the subcommand's positional words (capture's source sandbox, none elsewhere),
 every word after the first `--` being one, empty words included (so `kiln exec ID --
 ARGV`, whose argv is an Exec caller's, never is); and only when its running image (`/proc/PID/exe`) is the trusted

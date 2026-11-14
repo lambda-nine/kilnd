@@ -585,10 +585,15 @@ pub fn parse_inventory(text: &str) -> Result<Vec<InventoryLine>, String> {
 enum Opt {
     /// A value, at most once.
     Text,
-    /// A value, any number of times (kiln's `Vec` options).
+    /// A value, any number of times (kiln's `Vec<String>` options).
     Repeated,
-    /// A `u64` or `u16` value, at most once.
+    /// A nonempty value, any number of times (kiln's `Vec<PathBuf>`: clap refuses an
+    /// empty path).
+    Paths,
+    /// A `u64` value (clap's unsigned parser: Rust's, so `+9` too), at most once.
     U64,
+    /// A `u16` value through clap's signed parser (an `i64` in range, so `+1` and `-0`
+    /// too), at most once.
     U16,
     /// No value, at most once.
     Flag,
@@ -596,7 +601,7 @@ enum Opt {
 
 /// The long options after a kiln subcommand, exactly as kiln's parser takes them: an
 /// option as `--name=V` or `--name V` (where V does not look like an option), a flag
-/// alone, numbers that parse, nothing repeated but a `Repeated` option, and exactly
+/// alone, numbers that parse, nothing repeated but a `Repeated`/`Paths` option, and exactly
 /// `positionals` other words, every word after the first `--` (or a lone `-`) being
 /// one. `None` where kiln itself would refuse the command line (an unknown or short
 /// option, a missing or malformed value, a repeat, a missing or extra word).
@@ -631,10 +636,14 @@ fn options<'a>(
         };
         let parses = match kind {
             Opt::U64 => value.parse::<u64>().is_ok(),
-            Opt::U16 => value.parse::<u16>().is_ok(),
+            Opt::U16 => value
+                .parse::<i64>()
+                .is_ok_and(|v| (0..=i64::from(u16::MAX)).contains(&v)),
+            Opt::Paths => !value.is_empty(),
             _ => true,
         };
-        if !parses || (*kind != Opt::Repeated && out.iter().any(|(n, _)| *n == name)) {
+        let repeatable = matches!(kind, Opt::Repeated | Opt::Paths);
+        if !parses || (!repeatable && out.iter().any(|(n, _)| *n == name)) {
             return None;
         }
         out.push((name, value));
@@ -653,7 +662,7 @@ fn value<'a>(options: &[(&str, &'a str)], name: &str) -> Option<&'a str> {
 /// `--from-checkpoint=I/C` (the bool). Anything else, `exec` and `run` included,
 /// reads no artifact, and no word after `--` is ever an option.
 fn artifact_reader(argv: &[String]) -> Option<(&str, &str, bool)> {
-    use Opt::{Flag, Repeated, Text, U16, U64};
+    use Opt::{Flag, Paths, Repeated, Text, U16, U64};
     let (command, rest) = argv.get(1..)?.split_first()?;
     match command.as_str() {
         "checkpoint" => {
@@ -693,7 +702,7 @@ fn artifact_reader(argv: &[String]) -> Option<(&str, &str, bool)> {
                     ("--pids", Text),
                     ("--disk", Text),
                     ("--read-only", Flag),
-                    ("--writable", Repeated),
+                    ("--writable", Paths),
                     ("--net", Text),
                     ("--allow", Repeated),
                     ("--from-checkpoint", Text),
@@ -814,20 +823,28 @@ pub fn scan(
             Err(e) if gone(&e) => continue,
             Err(e) => return Err(e),
         };
-        let argv: Vec<String> = match cmdline(pid) {
-            // NUL-terminated words; an empty word is a word, as kiln's parser sees it.
-            Ok(cmdline) if cmdline.is_empty() => Vec::new(),
-            Ok(cmdline) => cmdline
-                .strip_suffix(&[0])
-                .unwrap_or(&cmdline)
-                .split(|b| *b == 0)
-                .map(|a| String::from_utf8_lossy(a).into_owned())
-                .collect(),
+        let cmdline = match cmdline(pid) {
+            Ok(cmdline) => cmdline,
             Err(e) if gone(&e) => continue,
             Err(e) => return Err(e),
         };
+        // NUL-terminated words; an empty word is a word, as kiln's parser sees it.
+        let words: Vec<&[u8]> = if cmdline.is_empty() {
+            Vec::new()
+        } else {
+            cmdline
+                .strip_suffix(&[0])
+                .unwrap_or(&cmdline)
+                .split(|b| *b == 0)
+                .collect()
+        };
+        let argv: Vec<String> = words
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
         // Kernel threads and zombies have no arguments; most processes read nothing.
-        if artifact_reader(&argv).is_none() {
+        // kiln refuses a non-UTF-8 word anywhere but a `--writable` path.
+        if artifact_reader(&argv).is_none() || !utf8_where_kiln_needs_it(&words) {
             continue;
         }
         match image(pid) {
@@ -852,6 +869,22 @@ pub fn scan(
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn process_table(_kiln: (u64, u64)) -> io::Result<Vec<ProcessArgs>> {
     Err(io::Error::other("no process table on this platform"))
+}
+
+/// Whether every word kiln parses as a `String` is UTF-8 (clap refuses one that is
+/// not), so only a `--writable` path (`PathBuf`: `--writable=P` or the word after
+/// `--writable`, before any `--`) may hold other bytes; so may the program name, which
+/// clap never parses. Called only for a command line [`artifact_reader`] accepts, whose
+/// `--writable` values are option values.
+fn utf8_where_kiln_needs_it(words: &[&[u8]]) -> bool {
+    let mut escaped = false;
+    let mut path_next = false;
+    words.iter().skip(1).all(|word| {
+        let path = !escaped && (path_next || word.starts_with(b"--writable="));
+        path_next = !escaped && *word == b"--writable";
+        escaped |= *word == b"--";
+        path || std::str::from_utf8(word).is_ok()
+    })
 }
 
 /// The reason token at the start of a `kiln create` cause line (exit 124), or none.

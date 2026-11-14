@@ -3524,6 +3524,18 @@ impl Store {
         Ok(())
     }
 
+    /// Fails a fork's backend-ID write (`record_fork_backend`) and nothing else.
+    #[cfg(test)]
+    pub(crate) fn reject_fork_backend_writes(&self) -> Result<()> {
+        self.conn().execute_batch(
+            "CREATE TEMP TRIGGER reject_fork_backend_writes
+             BEFORE UPDATE OF backend_id ON sandboxes
+             WHEN NEW.state = 'creating' AND OLD.backend_id IS NULL
+             BEGIN SELECT RAISE(FAIL, 'injected fork backend write failure'); END;",
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn reject_failed_updates(&self) -> Result<()> {
         self.conn().execute_batch(

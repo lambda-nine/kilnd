@@ -1148,6 +1148,93 @@ fn kiln_refused_command_lines_name_nothing() {
     assert!(scanned.is_empty(), "{scanned:?}");
 }
 
+/// C5a-2 recheck 2 (LOW): the three edge forms where the scan's parser differed from
+/// kiln's clap grammar at kiln `c55d8bb`, and capture's required options alone. Each
+/// refused line below fails exactly one rule, so removing that rule names it.
+#[test]
+fn kiln_s_clap_edges_and_capture_s_required_options() {
+    let (i, c) = (INSTANCE, CHECKPOINT);
+    let inst = format!("--instance={i}");
+    let cp = format!("--checkpoint={c}");
+    let from = format!("--from-checkpoint={i}/{c}");
+    let k = "/usr/local/bin/kiln";
+    let a = |argv: &[&str]| named_artifact(&process(false, argv));
+    let expected = Some((i.to_string(), c.to_string()));
+    // Capture's `--generation` and `--max-bytes` are required: each line has the
+    // source positional and every other option right, and lacks just one of them.
+    assert_eq!(
+        a(&[k, "checkpoint", "capture", &inst, &cp, "--generation=1", "ab12"]),
+        None
+    );
+    assert_eq!(
+        a(&[k, "checkpoint", "capture", &inst, &cp, "--max-bytes=9", "ab12"]),
+        None
+    );
+    assert_eq!(
+        a(&[k, "checkpoint", "capture", &inst, &cp, "--generation=1", "--max-bytes=9", "ab12"]),
+        expected
+    );
+    // `--require-exec-protocol` is clap's signed `u16` parser: `-0` and `+1` parse.
+    for v in ["-0", "+1", "0", "65535"] {
+        let opt = format!("--require-exec-protocol={v}");
+        assert_eq!(a(&[k, "create", &opt, &from]), expected, "{v}");
+    }
+    for v in ["-1", "65536", "x", ""] {
+        let opt = format!("--require-exec-protocol={v}");
+        assert_eq!(a(&[k, "create", &opt, &from]), None, "{v}");
+    }
+    // A `--writable` path is a `PathBuf`: clap refuses an empty one, either form.
+    assert_eq!(a(&[k, "create", "--read-only", "--writable=", &from]), None);
+    assert_eq!(a(&[k, "create", "--read-only", "--writable", "", &from]), None);
+    assert_eq!(a(&[k, "create", "--read-only", "--writable=/w", &from]), expected);
+    // Non-UTF-8: kiln refuses it in a `String` (an option value or a positional), and
+    // takes it in a `--writable` path and the program name, which it never parses.
+    let stat = "1 (kiln) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0".to_string();
+    let scan = |cmdline: Vec<u8>| {
+        kiln::scan(
+            [10],
+            (7, 42),
+            |_| Ok(stat.clone()),
+            |_| Ok(cmdline.clone()),
+            |_| Ok((7, 42)),
+        )
+        .unwrap()
+    };
+    let words = |w: &[&[u8]]| {
+        let mut out = Vec::new();
+        for word in w {
+            out.extend_from_slice(word);
+            out.push(0);
+        }
+        out
+    };
+    let (inst, cp, from) = (inst.as_bytes(), cp.as_bytes(), from.as_bytes());
+    let gen_ = b"--generation=1".as_slice();
+    let max = b"--max-bytes=9".as_slice();
+    let refused: [&[&[u8]]; 4] = [
+        // The capture's source positional.
+        &[b"kiln", b"checkpoint", b"capture", inst, cp, gen_, max, b"ab\xff"],
+        // A String option's inline and separate value.
+        &[b"kiln", b"create", b"--hostname=h\xff", from],
+        &[b"kiln", b"create", b"--image", b"a\xff", from],
+        // After `--`, a word is a positional even if it reads like `--writable=`.
+        &[b"kiln", b"checkpoint", b"capture", inst, cp, gen_, max, b"--", b"--writable=\xff"],
+    ];
+    for argv in refused {
+        assert!(scan(words(argv)).is_empty(), "{argv:?}");
+    }
+    let named: [&[&[u8]]; 3] = [
+        &[b"kiln", b"create", b"--read-only", b"--writable=/w\xff", from],
+        &[b"kiln", b"create", b"--read-only", b"--writable", b"/w\xff", from],
+        &[b"/usr/bin/kiln\xff", b"checkpoint", b"capture", inst, cp, gen_, max, b"ab12"],
+    ];
+    for argv in named {
+        let scanned = scan(words(argv));
+        assert_eq!(scanned.len(), 1, "{argv:?}");
+        assert!(named_artifact(&scanned[0]).is_some(), "{argv:?}");
+    }
+}
+
 /// Provenance: only the trusted kiln image counts, read with the same start time before
 /// the arguments and after the image; a reused PID, another binary (an Exec's own
 /// command), an image the helper may not inspect or a process gone mid-scan is skipped,

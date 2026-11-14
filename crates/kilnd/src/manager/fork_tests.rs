@@ -2048,3 +2048,115 @@ async fn a_failed_settlement_write_keeps_allocation_blocked() {
         }
     }
 }
+
+
+/// C5a-2 recheck 2 (MEDIUM, the reviewer's reproduction): startup must not publish a CREATING fork that
+/// row-driven settlement deliberately kept blocked after both its DELETING write
+/// and exact-backend removal failed.
+#[tokio::test]
+async fn startup_does_not_promote_a_kept_recorded_backend_fork() {
+    let (_tmp, dir, m, fake, clock) = on_disk_engine().await;
+    let (s, c) = ready(&m, 1000).await;
+    let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
+    let (f, reader) = committed_fork(&m, &c, &s, epoch, boot);
+    orphan_restore(&fake, &c, &f, &reader).await.unwrap();
+    let backend = match settled_record(&fake, &c, &reader).await {
+        RestoreReply::Created { backend_id, .. } => backend_id,
+        other => panic!("{other:?}"),
+    };
+    m.store.record_fork_backend(&f.id, &backend).unwrap();
+
+    let external = rusqlite::Connection::open(dir.join("kilnd.db")).unwrap();
+    external
+        .execute_batch(&format!(
+            "CREATE TRIGGER inject_deleting_failure BEFORE UPDATE OF state ON sandboxes
+             WHEN NEW.id = '{}' AND NEW.state = 'deleting'
+             BEGIN SELECT RAISE(ABORT, 'injected deleting write failure'); END;",
+            f.id
+        ))
+        .unwrap();
+    fake.state().fail_remove = true;
+
+    let m = stop_and_reopen(m, &dir, &fake, &clock);
+    let reconciled = m.reconcile().await.unwrap();
+    let row = m.load(&f.id).unwrap();
+
+    assert_eq!(
+        row.state,
+        SandboxState::Creating,
+        "settlement kept this fork blocked, so legacy startup must not publish it: {row:?}; {reconciled:?}"
+    );
+    assert!(row.is_charged());
+    assert!(fake.state().sandboxes.contains_key(&backend));
+}
+
+/// C5a-2 recheck 2 (MEDIUM, the reviewer's reproduction): every durable fork failure, including failed READY
+/// publication after Created, must keep a checkpoint_* token for keyed retries.
+#[tokio::test]
+async fn failed_fork_publication_keeps_a_typed_failure_for_keyed_retry() {
+    let (m, fake, _) = engine();
+    let (_, c) = ready(&m, 1000).await;
+    let request = fork_req(&c);
+    let key = fork_key("typed-publication", &request);
+    m.store.reject_ready_updates().unwrap();
+
+    let first = m
+        .create_keyed(Ok(request.clone()), 1000, key.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(first.state, SandboxState::Failed);
+    assert!(fake.state().sandboxes.len() == 1, "only the source remains");
+    let row = forks_of(&m, &c).pop().unwrap();
+    assert_eq!(row.state, SandboxState::Failed);
+    let retried = m
+        .create_keyed(Ok(request), 1000, key, None)
+        .await
+        .unwrap();
+    assert_eq!(retried.id, row.id);
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("checkpoint_")),
+        "fork failure lost its typed token: {row:?}; retry: {retried:?}"
+    );
+    assert!(
+        retried
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("checkpoint_"))
+    );
+}
+
+/// The same rule for the other publication write: a failed backend-ID write after
+/// `Created` compensates the exact backend, and the FAILED row, the first answer and
+/// a keyed retry all carry `checkpoint_io`.
+#[tokio::test]
+async fn a_failed_fork_backend_write_keeps_a_typed_failure_for_keyed_retry() {
+    let (m, fake, _) = engine();
+    let (_, c) = ready(&m, 1000).await;
+    let request = fork_req(&c);
+    let key = fork_key("typed-backend-write", &request);
+    m.store.reject_fork_backend_writes().unwrap();
+    let first = m
+        .create_keyed(Ok(request.clone()), 1000, key.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(first.state, SandboxState::Failed);
+    assert_eq!(fake.state().sandboxes.len(), 1, "only the source remains");
+    let typed = |s: &Sandbox| {
+        s.failure_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("checkpoint_io: "))
+    };
+    assert!(typed(&first), "{first:?}");
+    let retried = m.create_keyed(Ok(request), 1000, key, None).await.unwrap();
+    assert_eq!(retried.id, first.id);
+    assert!(typed(&retried), "{retried:?}");
+    // Unkeyed, the error itself is typed.
+    let err = m.create_owned(fork_req(&c), 1000).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Refused(RefusalCode::Unavailable, r) if r.reason() == Some("checkpoint_io")),
+        "{err:?}"
+    );
+    assert_eq!(fake.state().sandboxes.len(), 1);
+}

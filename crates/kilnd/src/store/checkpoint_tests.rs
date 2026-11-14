@@ -1607,6 +1607,43 @@ fn prune_keeps_charged_keyed_and_pinned_checkpoints_and_drops_old_history() {
     assert!(!store.accounting_snapshot().unwrap().1);
 }
 
+/// C5a-2 recheck 2 (LOW): a CREATING fork's pin, released by its checkpoint's ABSENT,
+/// is the fork's settlement handle, so retention keeps that pin and its checkpoint row
+/// while the fork stays CREATING, and drops them once the fork settles. Without the
+/// guard, the first prune below removes both.
+#[test]
+fn retention_keeps_a_creating_fork_s_released_pin_and_checkpoint() {
+    let (store, clock) = store();
+    let s = source(&store, 1000);
+    let c = ready(&store, &s, 1000, 1 << 20);
+    let fork = fork_row(&c, 1000);
+    store
+        .reserve_fork_sandbox(&fork, roomy(), None, &[], &dispatch())
+        .unwrap();
+    let deleted = remove(&store, &c);
+    assert_eq!(deleted.state, CheckpointState::Deleted);
+    let pin = store.checkpoint_pin(&fork.id).unwrap().unwrap();
+    assert_eq!(pin.released_by.as_deref(), Some("absent"));
+    assert_eq!(
+        store.sandbox(&fork.id).unwrap().unwrap().state,
+        SandboxState::Creating
+    );
+    clock.advance(2 * 86_400_000);
+    let later = now_ms() + 9 * 86_400_000;
+    let pruned = store.prune(&Retention::default(), later).unwrap();
+    assert_eq!(pruned.checkpoints, 0, "the CREATING fork's handle stays");
+    assert!(store.checkpoint(c.id.as_str()).unwrap().is_some());
+    assert_eq!(store.checkpoint_pin(&fork.id).unwrap(), Some(pin));
+    // Settled, the fork no longer needs it: the old history goes.
+    store
+        .set_sandbox_state(&fork.id, SandboxState::Failed, None, Some("checkpoint_io: x"))
+        .unwrap();
+    let pruned = store.prune(&Retention::default(), later).unwrap();
+    assert_eq!(pruned.checkpoints, 1);
+    assert!(store.checkpoint(c.id.as_str()).unwrap().is_none());
+    assert!(store.checkpoint_pin(&fork.id).unwrap().is_none());
+}
+
 // --- SQL tampering -----------------------------------------------------------------
 
 /// A disk store with one checkpoint in each interesting state and a live pin.

@@ -39,6 +39,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   `checkpoint_*` token; and the helper's worker scan follows kiln's full command grammar
   (required options and capture's source, no repeats, nothing after `--` where kiln takes
   nothing, empty words kept).
+- Close the C5a-2 recheck-2 follow-ups (two MEDIUM, two LOW). Startup leaves every
+  CREATING fork that row-driven settlement kept for the barrier's pass alone, with or
+  without a recorded backend ID, so a fork whose compensation failed never becomes READY
+  at startup. A fork whose backend-ID or READY write fails stores, returns and replays
+  `checkpoint_io: …` for keyed retries. The helper's worker scan now matches kiln's clap
+  grammar on three more edges: `--require-exec-protocol` takes clap's signed form (`-0`),
+  an empty `--writable` path is refused, and a non-UTF-8 word is refused except in a
+  `--writable` path. New direct tests cover capture's required `--generation` and
+  `--max-bytes` and the retention rule that keeps a CREATING fork's checkpoint and pin.
 - Harden the checkpoint engine (C5a-1 adversarial review: eight HIGH, one MEDIUM).
   Delete and expiry hand removal to a supervisor before awaiting, so a departed caller
   never strands a charged row; existing checkpoints are expired, removed, rebased and
