@@ -28,9 +28,34 @@ pub type SupportFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>
 /// One live process's arguments, for the untracked-worker scan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessArgs {
-    /// `setsid` made it a session leader: a kiln sandbox shim, never a worker.
-    pub session_leader: bool,
+    /// Part of a restored kiln sandbox, never a worker: the shim `setsid` made a
+    /// session leader, or a process of that shim's session (the sandbox's init, which
+    /// the shim forks without exec and so keeps its arguments). See [`shim_sessions`].
+    pub in_shim_session: bool,
     pub argv: Vec<String>,
+}
+
+/// Marks the processes of restored sandboxes, from `(pid, session, argv)`: a session
+/// leader whose arguments name a `--from-checkpoint` create is a sandbox shim, and a
+/// process in its session naming the same artifact is one of its forks (kiln's
+/// container init keeps the shim's arguments). Neither reads the artifact once the
+/// restore is done, and during the restore the shim holds the artifact's lock, which
+/// keeps kiln's own removal busy. A `kiln create` CLI the helper started is in the
+/// helper's session, never a shim's, so it still counts.
+pub fn shim_sessions(processes: Vec<(u32, u32, Vec<String>)>) -> Vec<ProcessArgs> {
+    let shims: std::collections::HashMap<u32, String> = processes
+        .iter()
+        .filter(|(pid, session, _)| pid == session)
+        .filter_map(|(pid, _, argv)| Some((*pid, flag(argv, "--from-checkpoint")?.to_string())))
+        .collect();
+    processes
+        .into_iter()
+        .map(|(_, session, argv)| ProcessArgs {
+            in_shim_session: flag(&argv, "--from-checkpoint")
+                .is_some_and(|source| shims.get(&session).is_some_and(|s| s == source)),
+            argv,
+        })
+        .collect()
 }
 
 /// How the checkpoint node starts workers and reads the process table. Tests replace
@@ -556,8 +581,8 @@ pub fn named_artifact(process: &ProcessArgs) -> Option<(String, String)> {
     let argv = &process.argv;
     if let Some(source) = flag(argv, "--from-checkpoint") {
         // A restoring shim holds the artifact's lock, which keeps kiln's removal busy;
-        // once restored it never reads it again. Only the CLI is a worker.
-        if process.session_leader {
+        // once restored neither it nor its forks read it again. Only the CLI is a worker.
+        if process.in_shim_session {
             return None;
         }
         let (instance, checkpoint) = source.split_once('/')?;
@@ -618,16 +643,17 @@ pub(crate) fn process_table() -> io::Result<Vec<ProcessArgs>> {
             .and_then(|(_, rest)| rest.split_whitespace().nth(3))
             .and_then(|s| s.parse::<u32>().ok())
             .ok_or_else(|| io::Error::other("malformed process stat"))?;
-        out.push(ProcessArgs {
-            session_leader: session == pid,
-            argv: cmdline
+        out.push((
+            pid,
+            session,
+            cmdline
                 .split(|b| *b == 0)
                 .filter(|a| !a.is_empty())
                 .map(|a| String::from_utf8_lossy(a).into_owned())
                 .collect(),
-        });
+        ));
     }
-    Ok(out)
+    Ok(shim_sessions(out))
 }
 
 /// Production runs on Linux only: elsewhere no scan can prove anything.

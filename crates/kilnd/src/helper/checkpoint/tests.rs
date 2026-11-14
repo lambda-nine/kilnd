@@ -823,9 +823,9 @@ async fn an_unkillable_worker_keeps_its_slot_and_blocks_absence() {
     assert_eq!(node.copy.available_permits(), COPY_WORKERS - 1);
 }
 
-fn process(session_leader: bool, argv: &[&str]) -> ProcessArgs {
+fn process(in_shim_session: bool, argv: &[&str]) -> ProcessArgs {
     ProcessArgs {
-        session_leader,
+        in_shim_session,
         argv: argv.iter().map(|a| a.to_string()).collect(),
     }
 }
@@ -1252,7 +1252,7 @@ fn the_kiln_adapter_parses_strictly() {
         ),
     ] {
         let found = named_artifact(&ProcessArgs {
-            session_leader: false,
+            in_shim_session: false,
             argv,
         });
         assert_eq!(found.is_some(), named);
@@ -2056,3 +2056,36 @@ mod socket;
 // copies and removes its own image, sandboxes, artifacts and stray processes.
 #[allow(clippy::disallowed_methods)]
 mod vm;
+
+/// A restored sandbox's shim and its forks (kiln's init keeps the shim's arguments) are
+/// never workers; the helper's own `kiln create` CLI, in another session, still is, and
+/// so is a fork-like process in a shim's session that names another artifact.
+#[test]
+fn a_restored_sandboxs_shim_session_is_not_a_worker() {
+    let i = "cfdd1e01548633a05025f0a8f6756041";
+    let c = "cp-0970a1bc7073dde76d6e6d8b21dc1736";
+    let other = "cp-0970a1bc7073dde76d6e6d8b21dc1737";
+    let create = |source: &str| {
+        vec![
+            "/usr/local/bin/kiln".to_string(),
+            "create".into(),
+            "--image=alpine".into(),
+            format!("--from-checkpoint={i}/{source}"),
+        ]
+    };
+    let table = kiln::shim_sessions(vec![
+        (7471, 7471, create(c)), // the shim, setsid
+        (7472, 7471, create(c)), // its init, forked without exec
+        (7473, 7471, create(other)), // names another artifact: counts
+        (900, 800, create(c)), // the helper's CLI, in the helper's session
+        (800, 800, vec!["kilnd-helper".into()]),
+        (7480, 7480, vec!["sh".into()]),
+        (7481, 7480, create(c)), // a session whose leader is not a shim
+    ]);
+    let named: Vec<bool> = table.iter().map(|p| named_artifact(p).is_some()).collect();
+    assert_eq!(named, [false, false, true, true, false, false, true]);
+    assert_eq!(
+        named_artifact(&table[3]),
+        Some((i.to_string(), c.to_string()))
+    );
+}
