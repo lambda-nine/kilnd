@@ -910,6 +910,189 @@ async fn untracked_processes_block_absence_until_they_are_gone() {
     ));
 }
 
+/// An ordinary Exec command's caller-controlled argv follows `--` on the
+/// privileged `kiln exec` command line. It is not checkpoint-worker evidence.
+#[tokio::test]
+async fn exec_argv_cannot_impersonate_a_checkpoint_worker() {
+    let (node, fake) = setup();
+    let source = format!("{INSTANCE}/{CHECKPOINT}");
+    let exec = vec![
+        "/usr/local/bin/kiln".to_string(),
+        "exec".into(),
+        "--protocol=1".into(),
+        "0123456789abcdef".into(),
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        "sleep 120; :".into(),
+        format!("--from-checkpoint={source}"),
+    ];
+    let table = kiln::shim_sessions(vec![
+        (800, 800, vec!["kilnd-helper".into()]),
+        (900, 800, exec),
+    ]);
+    fake.set_processes(Some(table));
+
+    let reply = call(&node, remove(&target(), Id128::random())).await;
+    assert!(
+        matches!(removed(&reply), RemoveReply::Absent { .. }),
+        "caller-controlled Exec argv falsely retained the checkpoint: {reply:?}"
+    );
+}
+
+/// kiln's top-level grammar, exactly: the subcommand first, its options in place, and
+/// nothing at or after `--` (every subcommand); a real worker and a restore reader are
+/// still named.
+#[test]
+fn only_kiln_s_own_grammar_names_an_artifact() {
+    let a = |words: &[&str]| -> ProcessArgs { process(false, words) };
+    let i = INSTANCE;
+    let c = CHECKPOINT;
+    let inst = format!("--instance={i}");
+    let cp = format!("--checkpoint={c}");
+    let from = format!("--from-checkpoint={i}/{c}");
+    let k = "/usr/local/bin/kiln";
+    let named = [
+        a(&[
+            k,
+            "checkpoint",
+            "capture",
+            &inst,
+            &cp,
+            "--generation=1",
+            "--max-bytes=9",
+            "ab12",
+        ]),
+        a(&[k, "checkpoint", "inspect", &inst, &cp, "--verify"]),
+        a(&[
+            k,
+            "checkpoint",
+            "rm",
+            "--instance",
+            i,
+            "--checkpoint",
+            c,
+            "--generation",
+            "2",
+        ]),
+        a(&[
+            k,
+            "create",
+            "--image=alpine",
+            "--read-only",
+            "--writable=/w",
+            &from,
+        ]),
+        a(&[
+            k,
+            "create",
+            "--image",
+            "alpine",
+            "--from-checkpoint",
+            &format!("{i}/{c}"),
+        ]),
+    ];
+    for p in &named {
+        assert_eq!(
+            named_artifact(p),
+            Some((i.to_string(), c.to_string())),
+            "{:?}",
+            p.argv
+        );
+    }
+    let not_named = [
+        // After `--`, in every subcommand: never an option.
+        a(&[k, "exec", "ab12", "--", &from]),
+        a(&[
+            k,
+            "exec",
+            "--protocol=1",
+            "ab12",
+            "--",
+            "kiln",
+            "checkpoint",
+            "rm",
+            &inst,
+            &cp,
+        ]),
+        a(&[k, "run", "--", "sh", &from]),
+        a(&[k, "create", "--image=alpine", "--", &from]),
+        a(&[k, "checkpoint", "capture", &inst, "--", &cp, "ab12"]),
+        a(&[k, "checkpoint", "inspect", &inst, "--", &cp]),
+        a(&[k, "checkpoint", "rm", "--", &inst, &cp]),
+        // Not kiln's grammar: no global options, the subcommand in its place, kiln's
+        // own options only, each once, and no stray words.
+        a(&[k, "exec", &from, "ab12", "--", "true"]),
+        a(&[k, &from, "create"]),
+        a(&[k, "run", &from, "--", "true"]),
+        a(&[k, "checkpoint", &inst, &cp, "capture", "ab12"]),
+        a(&[k, "checkpoint", "ls", &inst, &cp]),
+        a(&[k, "checkpoint", "inspect", &inst, &cp, "ab12"]),
+        a(&[k, "checkpoint", "inspect", &inst, &cp, "--max-bytes=1"]),
+        a(&[k, "checkpoint", "rm", &inst, &cp, &cp]),
+        a(&[k, "create", &from, &from]),
+        a(&[k, "create", "--image=alpine", "stray", &from]),
+        a(&[k, "create", "-x", &from]),
+        a(&[k, "create", "--image"]),
+        a(&[k, "image", "inspect", &from]),
+        a(&[k]),
+        a(&[]),
+    ];
+    for p in &not_named {
+        assert_eq!(named_artifact(p), None, "{:?}", p.argv);
+    }
+}
+
+/// Provenance: only the trusted kiln image counts, read with the same start time before
+/// the arguments and after the image; a reused PID, another binary (an Exec's own
+/// command), an image the helper may not inspect or a process gone mid-scan is skipped,
+/// and an unexpected read failure fails the scan.
+#[test]
+fn only_the_trusted_kiln_image_with_a_stable_start_is_evidence() {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::io;
+    let kiln = (7, 42);
+    let worker =
+        format!("kiln\0checkpoint\0rm\0--instance={INSTANCE}\0--checkpoint={CHECKPOINT}\0");
+    let stat = |session: u32, start: u64| {
+        format!("1 (kiln (x) y) S 1 1 {session} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0")
+    };
+    // pid -> (image or errno, start times for the two reads)
+    type Entry = (Result<(u64, u64), i32>, [u64; 2]);
+    let table: HashMap<u32, Entry> = HashMap::from([
+        (10, (Ok(kiln), [500, 500])),      // the real worker
+        (11, (Ok(kiln), [500, 900])),      // PID reused mid-scan
+        (12, (Ok((7, 43)), [500, 500])),   // another binary
+        (13, (Err(libc::EACCES), [5, 5])), // not inspectable
+        (14, (Err(libc::ESRCH), [5, 5])),  // gone
+    ]);
+    let read = RefCell::new(HashSet::new());
+    let scanned = kiln::scan(
+        [10, 11, 12, 13, 14],
+        kiln,
+        |pid| {
+            // A PID's first read gives its first start time; a later one the second.
+            let first = read.borrow_mut().insert(pid);
+            Ok(stat(pid, table[&pid].1[usize::from(!first)]))
+        },
+        |_| Ok(worker.clone().into_bytes()),
+        |pid| table[&pid].0.map_err(io::Error::from_raw_os_error),
+    )
+    .unwrap();
+    assert_eq!(scanned.len(), 1, "{scanned:?}");
+    assert!(named_artifact(&scanned[0]).is_some());
+    // Any other failure proves nothing: the scan fails.
+    let failed = kiln::scan(
+        [10],
+        kiln,
+        |pid| Ok(stat(pid, 5)),
+        |_| Ok(worker.clone().into_bytes()),
+        |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+    );
+    assert!(failed.is_err());
+}
+
 #[tokio::test]
 async fn kiln_failures_keep_the_charge() {
     for (act, expected) in [

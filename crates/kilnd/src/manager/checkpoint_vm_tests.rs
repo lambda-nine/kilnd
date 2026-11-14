@@ -670,6 +670,59 @@ async fn run_fork() {
     assert!(scene.listed().is_empty(), "{:?}", scene.listed());
     eprintln!("C5a-2 VM 6 PASS: refusals allocate nothing");
 
+    // 7. Fix round 1 (HIGH 3): a real Exec whose own arguments, after `kiln exec`'s
+    // `--`, name a checkpoint is no worker: that checkpoint's Delete reaches ABSENT
+    // while the Exec runs.
+    let c4 = m
+        .capture_checkpoint(capture_req(&s.id, 0), 1000, None, None)
+        .await
+        .unwrap();
+    let named = format!(
+        "--from-checkpoint={}/{}",
+        scene.instance.as_ref().unwrap(),
+        c4.id
+    );
+    let running = tokio::spawn({
+        let m = Arc::clone(&m);
+        let mut request = exec(&f.id, "sleep 6");
+        request
+            .argv
+            .extend(["exec-spoof".to_string(), named.clone()]);
+        async move { m.exec(request).await }
+    });
+    let spoofing = || {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                std::fs::read(e.path().join("cmdline")).is_ok_and(|c| {
+                    let argv: Vec<&[u8]> = c.split(|b| *b == 0).collect();
+                    argv.contains(&b"exec".as_slice()) && argv.contains(&named.as_bytes())
+                })
+            })
+    };
+    for _ in 0..100 {
+        if spoofing() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        spoofing(),
+        "the kiln exec naming the checkpoint never started"
+    );
+    let d = m
+        .delete_checkpoint(c4.id.as_str(), 1000, false)
+        .await
+        .unwrap();
+    assert_eq!(d.state, CheckpointState::Deleted, "{d:?}");
+    assert!(spoofing(), "the Exec ended before the Delete proved ABSENT");
+    assert!(scene.listed().is_empty(), "{:?}", scene.listed());
+    let r = running.await.unwrap().unwrap();
+    assert_eq!(r.exit_code, Some(0), "{r:?}");
+    assert_eq!(charged(&m), (0, 0));
+    eprintln!("C5a-2 VM 7 PASS: an Exec's argv naming a checkpoint does not keep it");
+
     // Cleanup through the manager, then the helper.
     for id in [f.id.clone(), s.id.clone()] {
         assert_eq!(m.delete(&id).await.unwrap().state, SandboxState::Deleted);

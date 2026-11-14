@@ -204,7 +204,8 @@ fn binding(target: &ArtifactTarget, source: &str, limit: u64) -> CaptureBinding 
 }
 
 fn named(target: &ArtifactTarget) -> bool {
-    kiln::process_table().unwrap().iter().any(|p| {
+    let kiln = kiln::kiln_identity(&crate::process::KilnBinary::new(kiln_bin().into())).unwrap();
+    kiln::process_table(kiln).unwrap().iter().any(|p| {
         kiln::named_artifact(p).is_some_and(|(i, c)| {
             i == target.instance.to_string() && c == target.checkpoint.as_str()
         })

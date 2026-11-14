@@ -25,7 +25,8 @@ pub const WORKER_OUTPUT: usize = 1 << 20;
 pub type WorkerFuture = Pin<Box<dyn Future<Output = io::Result<Outcome>> + Send>>;
 pub type SupportFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
-/// One live process's arguments, for the untracked-worker scan.
+/// One live process's arguments, for the untracked-worker scan: only a process running
+/// the trusted kiln executable whose arguments read an artifact (see [`process_table`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessArgs {
     /// Part of a restored kiln sandbox, never a worker: the shim `setsid` made a
@@ -46,13 +47,13 @@ pub fn shim_sessions(processes: Vec<(u32, u32, Vec<String>)>) -> Vec<ProcessArgs
     let shims: std::collections::HashMap<u32, String> = processes
         .iter()
         .filter(|(pid, session, _)| pid == session)
-        .filter_map(|(pid, _, argv)| Some((*pid, flag(argv, "--from-checkpoint")?.to_string())))
+        .filter_map(|(pid, _, argv)| Some((*pid, source_text(argv)?)))
         .collect();
     processes
         .into_iter()
         .map(|(_, session, argv)| ProcessArgs {
-            in_shim_session: flag(&argv, "--from-checkpoint")
-                .is_some_and(|source| shims.get(&session).is_some_and(|s| s == source)),
+            in_shim_session: source_text(&argv)
+                .is_some_and(|source| shims.get(&session).is_some_and(|s| *s == source)),
             argv,
         })
         .collect()
@@ -119,7 +120,7 @@ impl Workers for KilnWorkers {
     }
 
     fn processes(&self) -> io::Result<Vec<ProcessArgs>> {
-        process_table()
+        process_table(kiln_identity(&self.bin)?)
     }
 
     fn support(&self, deadline: Instant, cancel: CancellationToken) -> SupportFuture {
@@ -562,39 +563,125 @@ pub fn parse_inventory(text: &str) -> Result<Vec<InventoryLine>, String> {
     Ok(out)
 }
 
-/// The value of `--flag V` or `--flag=V`.
-fn flag<'a>(argv: &'a [String], name: &str) -> Option<&'a str> {
-    argv.iter().enumerate().find_map(|(i, arg)| {
-        if arg == name {
-            argv.get(i + 1).map(String::as_str)
-        } else {
-            arg.strip_prefix(name)?.strip_prefix('=')
+/// The long options after a kiln subcommand, as kiln's parser (clap) takes them: an
+/// option in `values` as `--name=V` or `--name V`, one in `flags` alone, at most
+/// `positionals` other words, and nothing at or after `--`. `None` where kiln itself
+/// would refuse the command line (an unknown or short option, a missing value, an
+/// extra word), so such a process reads nothing.
+fn options<'a>(
+    args: &'a [String],
+    values: &[&str],
+    flags: &[&str],
+    mut positionals: usize,
+) -> Option<Vec<(&'a str, &'a str)>> {
+    let mut out = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
         }
-    })
+        if !arg.starts_with('-') {
+            positionals = positionals.checked_sub(1)?;
+            continue;
+        }
+        match arg.split_once('=') {
+            Some((name, value)) if values.contains(&name) => out.push((name, value)),
+            None if values.contains(&arg.as_str()) => out.push((arg.as_str(), args.next()?)),
+            None if flags.contains(&arg.as_str()) => {}
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
-/// The artifact a process's arguments name, if any: a `checkpoint` subcommand with an
-/// instance and checkpoint, or a `--from-checkpoint` create that is not a sandbox shim.
-/// Matching is on arguments alone, whatever the executable, so a root operator's own
-/// command blocks absence too.
-pub fn named_artifact(process: &ProcessArgs) -> Option<(String, String)> {
-    let argv = &process.argv;
-    if let Some(source) = flag(argv, "--from-checkpoint") {
-        // A restoring shim holds the artifact's lock, which keeps kiln's removal busy;
-        // once restored neither it nor its forks read it again. Only the CLI is a worker.
-        if process.in_shim_session {
-            return None;
+/// The one value of `name`; kiln refuses a repeated one.
+fn single<'a>(options: &[(&str, &'a str)], name: &str) -> Option<&'a str> {
+    let mut found = options.iter().filter(|(n, _)| *n == name);
+    let (_, value) = found.next()?;
+    found.next().is_none().then_some(*value)
+}
+
+/// The artifact a kiln command line reads, parsed exactly as kiln's top-level grammar
+/// (kiln `runtime/src/main.rs`, no global options): `checkpoint capture|inspect|rm`
+/// with its `--instance` and `--checkpoint`, or `create` with `--from-checkpoint=I/C`
+/// (the bool). Anything else, `exec` and `run` included, reads no artifact, and no
+/// word at or after `--` is ever an option.
+fn artifact_reader(argv: &[String]) -> Option<(&str, &str, bool)> {
+    let (command, rest) = argv.get(1..)?.split_first()?;
+    match command.as_str() {
+        "checkpoint" => {
+            let (sub, rest) = rest.split_first()?;
+            let (values, flags, positionals): (&[&str], &[&str], usize) = match sub.as_str() {
+                "capture" => (
+                    &["--instance", "--checkpoint", "--generation", "--max-bytes"],
+                    &[],
+                    1,
+                ),
+                "inspect" => (&["--instance", "--checkpoint"], &["--verify"], 0),
+                "rm" => (&["--instance", "--checkpoint", "--generation"], &[], 0),
+                _ => return None,
+            };
+            let options = options(rest, values, flags, positionals)?;
+            Some((
+                single(&options, "--instance")?,
+                single(&options, "--checkpoint")?,
+                false,
+            ))
         }
-        let (instance, checkpoint) = source.split_once('/')?;
-        return Some((instance.into(), checkpoint.into()));
+        "create" => {
+            let options = options(
+                rest,
+                &[
+                    "--require-exec-protocol",
+                    "--hostname",
+                    "--image",
+                    "--memory",
+                    "--cpus",
+                    "--pids",
+                    "--disk",
+                    "--writable",
+                    "--net",
+                    "--allow",
+                    "--from-checkpoint",
+                ],
+                &["--read-only"],
+                0,
+            )?;
+            let (instance, checkpoint) = single(&options, "--from-checkpoint")?.split_once('/')?;
+            Some((instance, checkpoint, true))
+        }
+        _ => None,
     }
-    if argv.iter().any(|arg| arg == "checkpoint") {
-        return Some((
-            flag(argv, "--instance")?.into(),
-            flag(argv, "--checkpoint")?.into(),
-        ));
+}
+
+/// A `create --from-checkpoint` command line's source, `I/C`.
+fn source_text(argv: &[String]) -> Option<String> {
+    match artifact_reader(argv)? {
+        (instance, checkpoint, true) => Some(format!("{instance}/{checkpoint}")),
+        _ => None,
     }
-    None
+}
+
+/// The artifact a process reads, if any (see [`artifact_reader`]): a `checkpoint`
+/// worker, or a `--from-checkpoint` create that is not a restored sandbox's shim. The
+/// table holds only processes of the trusted kiln executable, so a root operator's own
+/// kiln command blocks absence too, while an Exec's caller-controlled arguments (after
+/// `kiln exec`'s `--`, or another binary's) never do.
+pub fn named_artifact(process: &ProcessArgs) -> Option<(String, String)> {
+    let (instance, checkpoint, restore) = artifact_reader(&process.argv)?;
+    // A restoring shim holds the artifact's lock, which keeps kiln's removal busy;
+    // once restored neither it nor its forks read it again. Only the CLI is a worker.
+    if restore && process.in_shim_session {
+        return None;
+    }
+    Some((instance.into(), checkpoint.into()))
+}
+
+/// The trusted kiln executable's identity (device, inode), which a process's `exe` must
+/// be for its arguments to be evidence.
+pub fn kiln_identity(bin: &KilnBinary) -> io::Result<(u64, u64)> {
+    let meta = std::fs::metadata(bin.verified()?)?;
+    Ok((meta.dev(), meta.ino()))
 }
 
 /// The most process directories one scan reads; a busier host fails the scan, and so
@@ -602,63 +689,108 @@ pub fn named_artifact(process: &ProcessArgs) -> Option<(String, String)> {
 #[cfg(target_os = "linux")]
 const MAX_PROCESSES: usize = 65_536;
 
-/// Every live process's arguments and session leadership, read beneath the helper's
-/// private procfs instance (`crate::sys::procfs`: no link followed, no mount crossed).
-/// A process that exits during the scan is skipped; any other failure fails the scan.
+/// Every live artifact-reading kiln process's arguments and session leadership, read
+/// beneath the helper's private procfs instance (`crate::sys::procfs`: no link followed
+/// but `exe`, no mount crossed). See [`scan`].
 #[cfg(target_os = "linux")]
-pub(crate) fn process_table() -> io::Result<Vec<ProcessArgs>> {
+pub(crate) fn process_table(kiln: (u64, u64)) -> io::Result<Vec<ProcessArgs>> {
     use crate::sys::procfs;
-    use std::io::Read;
+    let pids = procfs::read_root_dir(MAX_PROCESSES)?
+        .into_iter()
+        .filter_map(|entry| std::str::from_utf8(&entry.name).ok()?.parse::<u32>().ok());
+    scan(
+        pids,
+        kiln,
+        |pid| procfs::read_to_string(&format!("{pid}/stat")),
+        |pid| {
+            let mut cmdline = Vec::new();
+            procfs::open(&format!("{pid}/cmdline"), libc::O_RDONLY)?
+                .take(256 << 10)
+                .read_to_end(&mut cmdline)?;
+            Ok(cmdline)
+        },
+        |pid| {
+            let meta =
+                procfs::open_image(i32::try_from(pid).map_err(io::Error::other)?)?.metadata()?;
+            Ok((meta.dev(), meta.ino()))
+        },
+    )
+}
+
+/// The scan over `pids`, with the three procfs reads. A process counts only when its
+/// arguments read an artifact ([`artifact_reader`]), its running image (`exe`) is the
+/// trusted kiln executable (`kiln`: device and inode) and its start time (`stat` field
+/// 22) is the same before its arguments were read and after its image was: argv text,
+/// another binary or a reused PID is no evidence. A process that exits during the scan,
+/// or whose image the helper may not inspect (a non-dumpable sandbox init, or one with
+/// capabilities beyond the helper's), is skipped; any other failure fails the scan.
+pub fn scan(
+    pids: impl IntoIterator<Item = u32>,
+    kiln: (u64, u64),
+    stat: impl Fn(u32) -> io::Result<String>,
+    cmdline: impl Fn(u32) -> io::Result<Vec<u8>>,
+    image: impl Fn(u32) -> io::Result<(u64, u64)>,
+) -> io::Result<Vec<ProcessArgs>> {
     let gone = |e: &io::Error| {
         e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
     };
-    let mut out = Vec::new();
-    for entry in procfs::read_root_dir(MAX_PROCESSES)? {
-        let Some(pid) = std::str::from_utf8(&entry.name)
-            .ok()
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let mut cmdline = Vec::new();
-        match procfs::open(&format!("{pid}/cmdline"), libc::O_RDONLY)
-            .and_then(|f| f.take(256 << 10).read_to_end(&mut cmdline))
-        {
-            Ok(_) => {}
-            Err(e) if gone(&e) => continue,
-            Err(e) => return Err(e),
-        }
-        // Kernel threads and zombies have no arguments and can do nothing more.
-        if cmdline.is_empty() {
-            continue;
-        }
-        let stat = match procfs::read_to_string(&format!("{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(e) if gone(&e) => continue,
-            Err(e) => return Err(e),
-        };
-        // `comm` may hold spaces and parentheses; the fields follow its last ')'.
-        let session = stat
+    // `comm` may hold spaces and parentheses; the fields follow its last ')': the
+    // session (field 6) and the start time (field 22).
+    let identity = |pid: u32| -> io::Result<(u32, u64)> {
+        let stat = stat(pid)?;
+        let fields: Vec<&str> = stat
             .rsplit_once(')')
-            .and_then(|(_, rest)| rest.split_whitespace().nth(3))
-            .and_then(|s| s.parse::<u32>().ok())
-            .ok_or_else(|| io::Error::other("malformed process stat"))?;
-        out.push((
-            pid,
-            session,
-            cmdline
+            .map(|(_, rest)| rest.split_whitespace().collect())
+            .unwrap_or_default();
+        match (
+            fields.get(3).map(|s| s.parse::<u32>()),
+            fields.get(19).map(|s| s.parse::<u64>()),
+        ) {
+            (Some(Ok(session)), Some(Ok(start))) => Ok((session, start)),
+            _ => Err(io::Error::other("malformed process stat")),
+        }
+    };
+    let mut out = Vec::new();
+    for pid in pids {
+        let (session, start) = match identity(pid) {
+            Ok(identity) => identity,
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        let argv: Vec<String> = match cmdline(pid) {
+            Ok(cmdline) => cmdline
                 .split(|b| *b == 0)
                 .filter(|a| !a.is_empty())
                 .map(|a| String::from_utf8_lossy(a).into_owned())
                 .collect(),
-        ));
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        // Kernel threads and zombies have no arguments; most processes read nothing.
+        if artifact_reader(&argv).is_none() {
+            continue;
+        }
+        match image(pid) {
+            Ok(image) if image == kiln => {}
+            Ok(_) => continue,
+            Err(e) if gone(&e) || matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+        match identity(pid) {
+            Ok((_, again)) if again == start => out.push((pid, session, argv)),
+            Ok(_) => {}
+            Err(e) if gone(&e) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(shim_sessions(out))
 }
 
 /// Production runs on Linux only: elsewhere no scan can prove anything.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn process_table() -> io::Result<Vec<ProcessArgs>> {
+pub(crate) fn process_table(_kiln: (u64, u64)) -> io::Result<Vec<ProcessArgs>> {
     Err(io::Error::other("no process table on this platform"))
 }
 
