@@ -489,7 +489,8 @@ fn c6b_hostile_names_depth_and_counts_hold_their_limits() {
 async fn entry_limit() {
     let w = World::start(json!({})).await;
     let files = |n: usize| format!("mkdir -p /root/w/n && cd /root/w/n && seq 1 {n} | sed 's/^/f/' | xargs touch");
-    let src = w.source(1 << 30, &files(1000)).await;
+    // 2 GiB disks: a 1 GiB disk's project quota allows only 65,536 inodes.
+    let src = w.source(2 << 30, &files(1000)).await;
     let c = w.ok(json!({ "op": "capture", "id": src, "lifetime_ms": 3_600_000 })).await;
     let cp = c["id"].as_str().unwrap().to_string();
     let base = w.cp_col(&cp, "entry_count").parse::<usize>().unwrap() - 1000;
@@ -497,12 +498,20 @@ async fn entry_limit() {
     w.ok(json!({ "op": "delete", "id": src })).await;
     let mut seen = Vec::new();
     for (n, fits) in [(65_536 - base, true), (65_537 - base, false)] {
-        let src = w.source(1 << 30, &files(n)).await;
+        let src = w.source(2 << 30, &files(n)).await;
         let r = w.rpc(OWNER, json!({ "op": "capture", "id": src, "lifetime_ms": 3_600_000 })).await;
-        if fits {
+        // At exactly 65,536 entries the 16 KiB-per-entry allowance alone reaches the 1 GiB
+        // cap, so the size rule may answer first; record which bound refused.
+        if fits && r.get("error").is_some() {
+            let reason = refused(&r);
+            assert_eq!(reason, "checkpoint_size_limit", "{r}");
+            w.until("settled", 60, |w| w.charge() == (0, 0)).await;
+            seen.push(json!({ "files": n, "entries": 65_536, "outcome": reason,
+                              "message": r["error"]["message"] }));
+        } else if fits {
             let cp = ok(&r)["id"].as_str().unwrap().to_string();
             assert_eq!(w.cp_col(&cp, "entry_count"), "65536");
-            let f = w.ok(json!({ "op": "create", "from_checkpoint": cp, "disk_bytes": 1u64 << 30 })).await;
+            let f = w.ok(json!({ "op": "create", "from_checkpoint": cp, "disk_bytes": 2u64 << 30 })).await;
             let fid = f["id"].as_str().unwrap().to_string();
             assert_eq!(
                 w.sh(&fid, COUNT_LISTING).await["stdout"],
@@ -711,6 +720,7 @@ fn shim_of(backend_id: &str) -> u32 {
 fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
     run(async {
         let w = World::start(json!({})).await;
+        let at_start = kiln_ids();
         let mut seen = serde_json::Map::new();
         // 1. A manifest edited on disk: the fork refuses it corrupt and the checkpoint is
         // quarantined with its charge.
@@ -802,6 +812,24 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
             assert_ne!(outcome["capture"], "captured", "{path}: {outcome}");
             seen.insert(format!("writable {path}"), outcome);
         }
+        // The failed creates' shims may be seen as stale only later: collect every stale
+        // run that appeared during the test, waiting up to 20 s for them.
+        let mut collected = Vec::new();
+        for _ in 0..100 {
+            let stale: Vec<String> = kiln_ids()
+                .into_iter()
+                .filter(|(id, st)| st == "stale" && !at_start.iter().any(|(b, _)| b == id))
+                .map(|(id, _)| id)
+                .collect();
+            if !stale.is_empty() {
+                collected.extend(gc_new_stale_runs(&at_start));
+            }
+            if collected.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        seen.insert("stale_runs_collected".into(), json!(collected));
         matrix("hostile artifact and process attacks", Value::Object(seen));
         w.finish().await;
     });
