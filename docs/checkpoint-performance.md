@@ -118,11 +118,21 @@ probes' own statvfs and checks.
   `ApiLimits.checkpoint.operation_timeout_ms`), within the helper's 300 s ceiling: under
   these conditions the largest admissible workspace (65,536 entries) would take about 37 s
   warm, inside it. `kilndctl` sets no gRPC deadline of its own. A client that sets one must
-  allow for this; kiln-harness's capture deadline should be at least the operation timeout.
+  allow for this; a harness client's capture deadline should be at least the operation timeout.
 - **The per-entry allowance dominates the charge.** At 50,000 entries the charge is about
   4.7 times the physical use (987 MiB against 208 MiB), so the 1 GiB per-checkpoint cap is
   in effect an entry cap of about 60,000 entries for small files. Whether 16 KiB per entry is
   the right allowance is a tuning question for enablement; C6b changes no limit.
+
+## Workload survey (design 13.1), limited scope
+
+How often harness workloads use ACLs, special files or more than 1 GiB was surveyed read
+only over the kiln-harness repository's `evals/` seed trees (29 tasks, 371 entries, 1.3 MiB):
+no ACL or other xattr, no FIFO, socket or device node, no symlink, no setuid file, no file
+over 58 KiB, at most 7 levels deep. No retained live-eval workspaces were found to survey.
+This says nothing about real agent workspaces, which may clone repositories, install
+dependencies and build; it says only that the shipped eval seeds sit far inside every
+checkpoint limit.
 
 ## Daemon overhead on the fake runtime (Mac, not a VM number)
 
