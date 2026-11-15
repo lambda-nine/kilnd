@@ -9,15 +9,19 @@
 #     ledger test on ordinary runs but passes `--list` through, and whose `[env]` forces
 #     CI empty and KILND_BLESS_CHECKPOINT_CONTRACT=1; the wire golden stays unchanged;
 #  b. a workspace `.cargo/config` and a parent directory's `.cargo/config.toml`;
-#  c. a $CARGO_HOME config with `[env]`, a target runner or linker, or a build key build.sh
-#     does not override (`build.jobs`);
+#  c. a $CARGO_HOME config with `[env]`, a target runner or linker, or a `build` key;
 #  d. CARGO_TARGET_<host>_RUNNER, CARGO_TARGET_<host>_LINKER, CARGO_BUILD_JOBS and
 #     CARGO_ENV_CI set, even empty, KILND_BLESS_CHECKPOINT_CONTRACT set to 1 or empty, and
 #     RUSTDOC or CLIPPY_CONF_DIR set;
 #  e. C6a recheck 2 HIGH 3: a relative CARGO_HOME whose config's `[env]` forces blessing,
 #     with build.sh run by its absolute path from another directory (the wire golden's
 #     SHA-256 stays unchanged); a relative CARGO_HOME only the caller's directory has; and a
-#     relative HOME.
+#     relative HOME;
+#  f. C6a recheck 3: a $CARGO_HOME config whose `include` brings in a blessing `[env]` (the
+#     wire golden's SHA-256 stays unchanged), and ones with `alias`, `profile` or a key no
+#     Cargo knows; CARGO_ALIAS_CLIPPY replacing clippy. A config of only allowed keys gets
+#     past the check (to the profile check, with Python 3.11 or later; refused unread
+#     before that).
 # dependency-gate-regressions.sh runs it for each toolchain.
 set -eu
 toolchain=${1:-}
@@ -142,6 +146,52 @@ refused "a CARGO_HOME relative to the caller's directory only" \
     from_elsewhere caller-only-home default check
 refused "a relative HOME, with CARGO_HOME unset" "HOME=relative-home is not absolute" \
     env -u CARGO_HOME HOME=relative-home sh scripts/build.sh ${toolchain:+"+$toolchain"} default check
+[ "$(sha256 "$golden")" = "$golden_sha" ] || fail "the wire golden's SHA-256 changed"
+
+# f. An allowlist of top-level keys, and no aliases.
+include_home=$scratch/include-cargo-home
+mkdir "$include_home"
+ln -s "${CARGO_HOME:-$HOME/.cargo}/registry" "$include_home/registry"
+printf 'include = ["bless.toml"]\n' >"$include_home/config.toml"
+printf '[env]\nKILND_BLESS_CHECKPOINT_CONTRACT = "1"\nCI = { value = "", force = true }\n' \
+    >"$include_home/bless.toml"
+refused "a \$CARGO_HOME config whose include blesses" "$(cd "$include_home" && pwd -P)/config.toml " \
+    env CI=true CARGO_HOME="$include_home" sh scripts/build.sh ${toolchain:+"+$toolchain"} default test \
+    -p kilnd --lib bless_checkpoint_contract -- --ignored --nocapture
+[ "$(sha256 "$golden")" = "$golden_sha" ] || fail "the wire golden's SHA-256 changed"
+rm "$include_home/bless.toml"
+for body in '[alias]\nclippy = "test --no-run"' '[profile.dev]\ndebug-assertions = false' \
+    'future-key = true'; do
+    printf "$body\n" >"$include_home/config.toml"
+    refused "a \$CARGO_HOME config with $(head -n 2 "$include_home/config.toml" | tr '\n' ' ')" \
+        "$(cd "$include_home" && pwd -P)/config.toml " env CARGO_HOME="$include_home" sh scripts/build.sh \
+        ${toolchain:+"+$toolchain"} default check
+done
+refused "CARGO_ALIAS_CLIPPY='test --no-run'" "CARGO_ALIAS_CLIPPY is set; build.sh runs cargo in a closed configuration" \
+    env CARGO_ALIAS_CLIPPY='test --no-run' sh scripts/build.sh ${toolchain:+"+$toolchain"} default clippy --all-targets
+cat >"$include_home/config.toml" <<'CONFIG'
+[http]
+timeout = 30
+[net]
+retry = 3
+[registry]
+default = "crates-io"
+[registries.example]
+index = "sparse+https://example.invalid/index/"
+[term]
+color = "never"
+[cargo-new]
+vcs = "none"
+[source.example-mirror]
+registry = "sparse+https://example.invalid/mirror/"
+CONFIG
+if python3 -I -c 'import tomllib' 2>/dev/null; then
+    allowed_message="no-such-profile is not a profile in dependency-gate.json"
+else
+    allowed_message="$(cd "$include_home" && pwd -P)/config.toml cannot be checked without Python 3.11"
+fi
+refused "a \$CARGO_HOME config of allowed keys only (past the config check)" "$allowed_message" \
+    env CARGO_HOME="$include_home" sh scripts/build.sh ${toolchain:+"+$toolchain"} no-such-profile check
 [ "$(sha256 "$golden")" = "$golden_sha" ] || fail "the wire golden's SHA-256 changed"
 
 if [ "$failed" -ne 0 ]; then

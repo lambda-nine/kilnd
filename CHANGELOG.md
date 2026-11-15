@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Allow only known-safe Cargo configuration keys, and refuse aliases (C6a recheck 3).
+  `build.sh` checked `$CARGO_HOME`'s config against a list of denied tables, so Cargo
+  1.99's `include` could bring in an `[env]` that ran the bless writer, and a
+  `CARGO_ALIAS_CLIPPY` could replace the lint gate. The config may now set only `http`,
+  `net`, `registry`, `registries`, `term`, `cargo-new` and `source`, and any
+  `CARGO_ALIAS_*` variable is refused.
 - Read a Btrfs `subvol=` path whole (C6a recheck 3 HIGH 2). The mountinfo parser split
   the options at every comma, so a subvolume with a comma in its name (`/@var,archive`)
   looked like a bind mount and an empty flag-off node refused to upgrade. Btrfs prints

@@ -31,15 +31,18 @@
 # clippy-driver and rustc: `--cfg`, response files) and for build and check; for test it
 # goes to the test harness, which compiles nothing.
 #
-# A closed Cargo configuration too (C6a recheck 1 HIGH 5 and 6): a Cargo runner can list
-# a test without running it, and a config `[env]` reaches every test process. build.sh
+# A closed Cargo configuration too (C6a recheck 1 HIGH 5 and 6, recheck 3): a Cargo runner
+# can list a test without running it, a config `[env]` reaches every test process, an
+# `include` brings in another file's tables, and an alias can replace a command. build.sh
 # refuses, before cargo runs, any `.cargo/config` or `.cargo/config.toml` in the
 # repository or a parent directory other than $CARGO_HOME's own; a $CARGO_HOME config
-# with an `[env]` table, a `target` key other than rustflags/rustdocflags, or a `build`
-# key other than those this file overrides (rustflags, rustdocflags, rustc and the two
-# wrappers); any CARGO_TARGET_*_RUNNER, CARGO_TARGET_*_LINKER, CARGO_BUILD_* or
-# CARGO_ENV_* variable, set at all; and KILND_BLESS_CHECKPOINT_CONTRACT, which only the
-# ignored bless_checkpoint_contract test, run locally by name, may use. It also
+# with any top-level key but http, net, registry, registries, term, cargo-new and source
+# (an allowlist, so a key a later Cargo adds is refused too; it needs Python 3.11's tomllib
+# to read one, and refuses unread otherwise); any CARGO_TARGET_*_RUNNER,
+# CARGO_TARGET_*_LINKER, CARGO_BUILD_*, CARGO_ENV_* or CARGO_ALIAS_* variable, set at all;
+# and KILND_BLESS_CHECKPOINT_CONTRACT, which only the ignored bless_checkpoint_contract
+# test, run locally by name, may use. Registry and source replacement settings are inside
+# the trusted toolchain, as cargo, rustc and the crates they fetch are. It also
 # passes `--config target.TRIPLE.runner=["/bin/sh", "-c", 'exec "$0" "$@"']`, a
 # pass-through, for the host and every --target (Cargo refuses an empty runner).
 #
@@ -148,6 +151,8 @@ for name in $(awk 'BEGIN { for (name in ENVIRON) print name }'); do
             fi ;;
         CARGO_TARGET_*_RUNNER | CARGO_TARGET_*_LINKER | CARGO_BUILD_* | CARGO_ENV_*)
             refuse "$name is set; build.sh runs cargo in a closed configuration, because a runner or linker can report tests that never ran (C6a recheck 1 HIGH 5). Unset it" ;;
+        CARGO_ALIAS_*)
+            refuse "$name is set; build.sh runs cargo in a closed configuration, because an alias can replace a command, clippy's lint gate included (C6a recheck 3). Unset it" ;;
         KILND_BLESS_CHECKPOINT_CONTRACT)
             refuse "$name is set; build.sh never blesses goldens. Bless them locally with the ignored bless_checkpoint_contract test (docs/checkpoint-rollout-gate.md) and review the diff" ;;
     esac
@@ -183,13 +188,13 @@ try:
     config = tomllib.loads(open(path, encoding="utf-8").read())
 except (OSError, ValueError) as error:
     refuse("is unreadable: %s" % error)
-overridden = {"rustflags", "rustdocflags", "rustc", "rustc-wrapper", "rustc-workspace-wrapper"}
-found = ["[env]"] if "env" in config else []
-found += ["build." + k for k in config.get("build", {}) if k not in overridden]
-found += ["target.%s.%s" % (t, k) for t, table in config.get("target", {}).items()
-          for k in (table if isinstance(table, dict) else {"": None}) if k not in ("rustflags", "rustdocflags")]
+# Network, registry, source and terminal settings: none changes what is compiled, run or
+# written. Every other key, include, alias, env, build, target, profile and any future one
+# among them, is refused.
+allowed = {"http", "net", "registry", "registries", "term", "cargo-new", "source"}
+found = sorted(k for k in config if k not in allowed)
 if found:
-    refuse("sets " + ", ".join(found))
+    refuse("sets %s; only %s may be set" % (", ".join(found), ", ".join(sorted(allowed))))
 ' "$cargo_home/$name" || exit 2
 done
 

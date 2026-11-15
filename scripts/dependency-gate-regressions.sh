@@ -97,8 +97,9 @@
 # 12. C6a recheck 1 HIGH 5 and 6, scripts/build-config-regressions.sh: build.sh refuses a
 #    workspace or parent-directory Cargo config (the recheck's runner and [env] PoC
 #    among them, leaving the wire golden unchanged), a $CARGO_HOME config with a runner,
-#    linker, [env] or build key, the runner, linker, build and env variables, and the
-#    bless variable.
+#    linker, [env] or build key, or any top-level key outside its allowlist (include and
+#    alias among them, recheck 3), the runner, linker, build, env and alias variables, and
+#    the bless variable.
 #
 # Default toolchains: 1.88.0 and 1.99.0. It resolves fs-err and parking_lot from the
 # registry and vendors the locked crates (the network, or cargo's cache), so it is not
