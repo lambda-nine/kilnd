@@ -65,8 +65,8 @@
 #    c. The same cfg from a Cargo config file (`build.rustflags` and a
 #       `target.'cfg(all())'` table) and a config `rustc-wrapper`: in the workspace,
 #       build.sh refuses the file (C6a recheck 1 HIGH 5); as $CARGO_HOME's own config,
-#       build.sh's closed environment overrides them, and the feature's test is not
-#       compiled.
+#       it refuses it too, because build and target are outside that config's
+#       allowlist (C6a recheck 3).
 #    d. A raw cargo build with that RUSTFLAGS: the workspace build scripts' backstop
 #       refuses the `--cfg`.
 # 9. Recheck 3 HIGH-2, the break-it reviewer's path-module PoC (path-module-sink.sh): its exact
@@ -755,7 +755,7 @@ rustc-wrapper = "/nonexistent/rustc-wrapper"
 rustflags = ["--cfg", "feature=\"ambient-poc\""]
 EOF
     # In the workspace, refused outright (C6a recheck 1 HIGH 5); as $CARGO_HOME's own
-    # config, which build.sh allows these keys in, overridden.
+    # config, refused too: build and target are outside its allowlist (C6a recheck 3).
     expect_build_refused "a workspace Cargo config file" \
         "$(pwd -P)/.cargo/config.toml is a Cargo configuration file" \
         sh scripts/build.sh "+$toolchain" default test -p kilnd --lib "$ambient_test" -- --exact
@@ -763,15 +763,13 @@ EOF
     mkdir -p "$home"
     mv .cargo/config.toml "$home/config.toml"
     rm -r .cargo
-    ln -s "${CARGO_HOME:-$HOME/.cargo}/registry" "$home/registry"
-    if CARGO_HOME=$home sh scripts/build.sh "+$toolchain" default test -p kilnd --lib "$ambient_test" -- --exact \
-        >"$scratch/build.log" 2>&1 && grep -q '^running 0 tests' "$scratch/build.log" &&
-        ! grep -q 'unreviewed_feature_entered_default_profile' "$scratch/build.log"; then
-        echo "build.sh's closed environment overrides \$CARGO_HOME's config: the feature's test is not compiled"
+    if python3 -I -c 'import tomllib' 2>/dev/null; then
+        home_message="$(cd "$home" && pwd -P)/config.toml sets build, target; only"
     else
-        cat "$scratch/build.log" >&2
-        fail "a Cargo config file reached build.sh's build"
+        home_message="$(cd "$home" && pwd -P)/config.toml cannot be checked without Python 3.11"
     fi
+    expect_build_refused "the same config as \$CARGO_HOME's" "$home_message" \
+        env CARGO_HOME="$home" sh scripts/build.sh "+$toolchain" default test -p kilnd --lib "$ambient_test" -- --exact
     rm -r "$home"
 
     echo "-- a raw cargo build with that RUSTFLAGS:"
