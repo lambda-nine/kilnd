@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Accept ordinary mount layouts below the registry's path (C6a recheck 3). The inventory
+  walk allowed one mount point on the way and refused any other change of device, so a
+  separately mounted `/var` with another filesystem lower down, or a Btrfs subvolume
+  nested in `/var`'s and not mounted by itself, kept an empty flag-off node from
+  upgrading. Any number of whole-filesystem or Btrfs self-mounts may now sit above the
+  registry, and a device change with no mount entry is accepted as a nested subvolume when
+  it is inode 256 on the parent's own Btrfs mount. Bind mounts of a subtree, and any mount
+  at the registry or instance directory, are still refused.
 - Allow only known-safe Cargo configuration keys, and refuse aliases (C6a recheck 3).
   `build.sh` checked `$CARGO_HOME`'s config against a list of denied tables, so Cargo
   1.99's `include` could bring in an `[env]` that ran the bless writer, and a

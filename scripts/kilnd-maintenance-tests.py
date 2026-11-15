@@ -1713,21 +1713,103 @@ _os.fsync = _racing_fsync
         self.assertIn('cannot inventory the checkpoint artifacts of kilnd.service',
                       '\n'.join(self.messages))
 
-    def test_inventory_allows_one_whole_filesystem_mount_among_the_ancestors(self):
+    def test_inventory_allows_whole_filesystem_mounts_above_the_registry(self):
+        """Recheck 3: any number of whole filesystems and Btrfs subvolumes may be mounted above
+        the registry; neither the registry nor the instance directory may be a mount point."""
         instance = self.w.identity('kilnd.service')
         os.mkdir(self.artifact_dir() + '/cp-a')
         changes = device_changes(self.scratch)
         point = changes[0] if changes else self.scratch + '/var'
         lines = [mountinfo_line(1, '/', os.lstat('/')), self.mount_at(point)]
-        with open(self.m.MOUNTINFO, 'w') as file:
-            file.write(''.join(lines))
-        self.assertEqual([e['name'] for e in self.m.checkpoint_inventory(instance)], ['cp-a'])
-        for second in (self.scratch + '/var/lib', self.m.CHECKPOINTS_ROOT,
-                       self.m.CHECKPOINTS_ROOT + '/' + instance):
+
+        def inventory(*extra):
             with open(self.m.MOUNTINFO, 'w') as file:
-                file.write(''.join([*lines, self.mount_at(second)]))
+                file.write(''.join([*lines, *extra]))
+            return [e['name'] for e in self.m.checkpoint_inventory(instance)]
+        self.assertEqual(inventory(), ['cp-a'])
+        var, lib = self.scratch + '/var', self.scratch + '/var/lib'
+        self.assertEqual(inventory(self.mount_at(var), self.mount_at(lib)), ['cp-a'],
+                         '/var and a second filesystem below it')
+        self.fake_fstat(var, ino=256)
+        self.assertEqual(inventory(self.mount_at(var, root='/@var', fstype='btrfs', device='0:9999',
+                                                 options='rw,subvolid=257,subvol=/@var'),
+                                   self.mount_at(lib)), ['cp-a'], 'a subvolume, then ext4')
+        self.m.os.fstat = os.fstat
+        for second in (self.m.CHECKPOINTS_ROOT, self.m.CHECKPOINTS_ROOT + '/' + instance):
             with self.assertRaisesRegex(OSError, 'is a mount point', msg=second):
+                inventory(self.mount_at(var), self.mount_at(second))
+        with self.assertRaisesRegex(OSError, 'var/lib is a mount point'):
+            inventory(self.mount_at(var), self.mount_at(lib, root='/sub'))
+
+    def nested_subvolume(self, path, ino=256, fstype='btrfs', same_mount=True):
+        """path as a Btrfs subvolume nested in its parent's and not mounted by itself: a device
+        of its own, which what it holds shares, and no mountinfo entry. Every mount on the way is fstype, and an fd's mount
+        is the one its real device belongs to, or another for path unless same_mount."""
+        inode, real = os.stat(path).st_ino, os.fstat
+        below = {os.stat(os.path.join(top, name)).st_ino
+                 for top, names, _files in os.walk(path) for name in names}
+
+        def fstat(fd):
+            meta = real(fd)
+            if meta.st_ino not in (inode, *below):
+                return meta
+            fields = list(meta[:10])
+            fields[2] += 1  # the subvolume's device, and so everything in it
+            fields[1] = ino if meta.st_ino == inode else fields[1]
+            return os.stat_result(fields)
+        self.m.os.fstat = fstat
+        points = ['/', *device_changes(self.scratch)]
+        with open(self.m.MOUNTINFO, 'w') as file:
+            file.write(''.join(mountinfo_line(os.lstat(p).st_dev, p, os.lstat(p), fstype=fstype)
+                               for p in points))
+        self.m.mount_id = lambda fd: (
+            'elsewhere' if not same_mount and os.fstat(fd).st_ino == inode
+            else str(os.fstat(fd).st_dev))
+
+    def test_an_empty_flag_off_node_with_a_nested_btrfs_subvolume_upgrades(self):
+        """Recheck 3: /var/lib/kiln as a subvolume nested in /var's, not separately mounted."""
+        self.assertFalse(os.path.exists(self.m.CHECKPOINTS_ROOT))
+        self.nested_subvolume(self.scratch + '/var/lib')
+        self.upgrade()
+        self.assertEqual(self.w.images(), {i: 'new' for i in self.m.IMAGES})
+
+    def test_inventory_reads_through_nested_btrfs_subvolumes(self):
+        instance = self.w.identity('kilnd.service')
+        os.mkdir(self.artifact_dir() + '/cp-a')
+        for path in ('/var', '/var/lib'):
+            self.nested_subvolume(self.scratch + path)
+            self.assertEqual([e['name'] for e in self.m.checkpoint_inventory(instance)], ['cp-a'],
+                             path)
+
+    def test_inventory_refuses_a_device_change_that_is_not_a_nested_btrfs_subvolume(self):
+        instance = self.w.identity('kilnd.service')
+        self.artifact_dir()
+        lib = self.scratch + '/var/lib'
+        for what, path, shape in (
+                ('inode 256 on another filesystem', lib, dict(fstype='ext4')),
+                ('inode 256 on xfs', lib, dict(fstype='xfs')),
+                ('btrfs, not a subvolume root', lib, dict(ino=257)),
+                ('btrfs, but another mount', lib, dict(same_mount=False)),
+                ('the registry as a nested subvolume', self.m.CHECKPOINTS_ROOT, {}),
+                ('the instance directory as a nested subvolume',
+                 self.m.CHECKPOINTS_ROOT + '/' + instance, {})):
+            self.nested_subvolume(path, **shape)
+            with self.assertRaisesRegex(OSError, 'is on another filesystem', msg=what):
                 self.m.checkpoint_inventory(instance)
+        self.upgrade(2)
+        self.assertIn('cannot inventory the checkpoint artifacts of kilnd.service',
+                      '\n'.join(self.messages))
+
+    def test_mount_id_reads_fdinfo(self):
+        self.m.FDINFO = self.scratch + '/fdinfo'
+        os.mkdir(self.m.FDINFO)
+        with open(self.m.FDINFO + '/7', 'w') as file:
+            file.write('pos:\t0\nflags:\t02100000\nmnt_id:\t31\nino:\t256\n')
+        self.assertEqual(self.m.mount_id(7), '31')
+        with open(self.m.FDINFO + '/8', 'w') as file:
+            file.write('pos:\t0\n')
+        with self.assertRaisesRegex(OSError, 'has no mnt_id'):
+            self.m.mount_id(8)
 
     def test_inventory_refuses_a_group_writable_ancestor(self):
         self.artifact_dir()

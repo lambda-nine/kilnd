@@ -72,6 +72,7 @@ INSPECT_DIR = '/run'
 STATE_PARENT = '/var/lib'
 PROC = '/proc'
 MOUNTINFO = '/proc/self/mountinfo'
+FDINFO = '/proc/self/fdinfo'
 BTRFS_SUBVOLUME_ROOT = 256  # BTRFS_FIRST_FREE_OBJECTID: every subvolume's root inode
 STAGE = BIN + '/.kilnd-upgrade'
 MANAGED_FILES = {
@@ -1295,7 +1296,7 @@ def discard_transaction():
 
 def mount_points():
     """Each mount point's stack of (major:minor, root, Btrfs subvolume or None), in mountinfo's
-    order, the top last. The subvolume is a btrfs mount's subvol= path, from its superblock
+    order, the top last, and each mount ID's filesystem type. The subvolume is a btrfs mount's subvol= path, from its superblock
     options or, without one there, its mount options. Btrfs prints subvol= after every other
     option, none of which holds a name, and escapes only space, tab, newline and backslash
     in it, so the path is all the text after the field's first subvol=, commas and all."""
@@ -1305,7 +1306,7 @@ def mount_points():
     def subvol(options):
         found = re.search(r'(?:^|,)subvol=', options)
         return decode(options[found.end():]) if found else None
-    mounts = {}
+    mounts, types = {}, {}
     with open(MOUNTINFO, 'rb') as file:
         lines = file.read().decode('utf-8', 'surrogateescape').splitlines()
     for line in lines:
@@ -1318,15 +1319,26 @@ def mount_points():
             subvolume = subvol(fields[end + 3])
             subvolume = subvol(fields[5]) if subvolume is None else subvolume
         mounts.setdefault(decode(fields[4]), []).append((fields[2], decode(fields[3]), subvolume))
-    return mounts
+        types[fields[0]] = fields[end + 1]
+    return mounts, types
+
+
+def mount_id(fd):
+    """The ID of the mount fd was opened on, as mountinfo numbers it."""
+    with open('%s/%d' % (FDINFO, fd)) as file:
+        for line in file:
+            if line.startswith('mnt_id:'):
+                return line.split()[1]
+    raise OSError(errno.EINVAL, '%s/%d has no mnt_id' % (FDINFO, fd))
 
 
 def checkpoint_inventory(instance):
     """The top level of the instance's registry directory, by name, type and inode. Root walks
     from / without following a link: every ancestor must be root's and writable by no one else,
-    the registry and instance directories root's alone, and the only mount point on the way the
-    whole filesystem the registry is on. An absent directory is empty."""
-    mounts = mount_points()
+    the registry and instance directories root's alone and no mount points, and every mount
+    point above them a whole filesystem or a Btrfs subvolume, never a bind mount of a subtree.
+    An absent directory is empty."""
+    mounts, types = mount_points()
     parts = CHECKPOINTS_ROOT.split('/')
     if not CHECKPOINTS_ROOT.startswith('/') or any(p in ('', '.', '..') for p in parts[1:]):
         raise OSError(errno.EINVAL, '%s is not a plain absolute path' % CHECKPOINTS_ROOT)
@@ -1338,7 +1350,6 @@ def checkpoint_inventory(instance):
             anchor = os.fstat(fds[0])
             if anchor.st_uid not in (0, REGISTRY_UID) or anchor.st_mode & 0o022:
                 raise OSError(errno.EPERM, "/ is not root's, or others can write it")
-            mounted = None
             for index, component in enumerate(components):
                 fds.append(os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                    dir_fd=fds[-1]))
@@ -1359,11 +1370,16 @@ def checkpoint_inventory(instance):
                     # root below the subvolume's is a bind mount of a subtree, as anywhere.
                     whole = whole or (subvolume is not None and root == subvolume
                                       and meta.st_ino == BTRFS_SUBVOLUME_ROOT)
-                    if mounted is not None or index >= protected or not whole:
+                    if index >= protected or not whole:
                         raise OSError(errno.EXDEV, '%s is a mount point (bind mount?)' % where)
-                    mounted = where
                 elif meta.st_dev != above.st_dev:
-                    raise OSError(errno.EXDEV, '%s is on another filesystem' % where)
+                    # Not a mount point, so on its parent's mount: only a Btrfs subvolume
+                    # nested in its parent's has a device of its own there. The fds' mount IDs
+                    # prove the one mount, and mountinfo gives that mount's type.
+                    if index >= protected or meta.st_ino != BTRFS_SUBVOLUME_ROOT or \
+                            mount_id(fds[-1]) != mount_id(fds[-2]) or \
+                            types.get(mount_id(fds[-2])) != 'btrfs':
+                        raise OSError(errno.EXDEV, '%s is on another filesystem' % where)
         except FileNotFoundError:
             return []
         with os.scandir(fds[-1]) as entries:
