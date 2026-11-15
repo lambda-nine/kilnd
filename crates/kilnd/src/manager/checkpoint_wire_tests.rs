@@ -1178,15 +1178,15 @@ fn proto_rows(proto: &str, wanted: &BTreeSet<&str>) -> Result<BTreeMap<String, V
         match open.clone() {
             None => {
                 let words: Vec<&str> = line.split_whitespace().collect();
-                if let (0, [kind @ ("message" | "enum"), name, "{"]) = (depth, &words[..]) {
-                    if wanted.contains(name) {
-                        if found.contains_key(*name) {
-                            return Err(err("defined twice"));
-                        }
-                        found.insert(name.to_string(), Vec::new());
-                        open = Some((name.to_string(), *kind == "message"));
-                        continue;
+                if let (0, [kind @ ("message" | "enum"), name, "{"]) = (depth, &words[..])
+                    && wanted.contains(name)
+                {
+                    if found.contains_key(*name) {
+                        return Err(err("defined twice"));
                     }
+                    found.insert(name.to_string(), Vec::new());
+                    open = Some((name.to_string(), *kind == "message"));
+                    continue;
                 }
                 depth += line.matches('{').count();
                 depth = depth
