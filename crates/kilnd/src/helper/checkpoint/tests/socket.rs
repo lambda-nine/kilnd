@@ -93,7 +93,9 @@ async fn helper(enabled: bool) -> Helper {
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let uid = unsafe { libc::geteuid() };
     // The fixture kiln is a Python script, so its processes' image is the interpreter.
-    let workers = KilnWorkers::new(bin.clone()).with_trusted_image(PYTHON.into());
+    let workers = KilnWorkers::new(bin.clone())
+        .with_trusted_image(PYTHON.into())
+        .without_storage_probes();
     let node = enabled.then(|| Node::new(Arc::new(workers)).unwrap());
     let stop = CancellationToken::new();
     let task = tokio::spawn(crate::helper::serve_with_groups(

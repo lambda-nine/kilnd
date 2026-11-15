@@ -1752,6 +1752,18 @@ impl Store {
         })
     }
 
+    /// Checkpoints in DELETING: removals not yet proved absent (Health).
+    pub fn checkpoint_pending_deletes(&self) -> Result<u64> {
+        self.audited_read(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM checkpoints WHERE state = 'deleting'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(u64::try_from(n)?)
+        })
+    }
+
     /// The node's and `owner_uid`'s counters, after the audit that vouches for them.
     pub fn checkpoint_usage(&self, owner_uid: u32) -> Result<CheckpointUsage> {
         self.audited_read(|conn| usage(conn, owner_uid))

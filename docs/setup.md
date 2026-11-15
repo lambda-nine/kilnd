@@ -446,10 +446,13 @@ rows are unchanged and older binaries refuse schema 16. Rollback is the same dat
 backup restore.
 
 `--enable-workspace-checkpoints` (default off) serves the checkpoint RPCs and creates from
-a checkpoint. **Use it only in tests and explicit staging for now:** Health does not yet
-advertise the feature and captures and forks are admitted without the free-space headroom
-check (see [architecture.md](architecture.md#workspace-checkpoint-api-milestone-c5b-1)).
-The root helper must also run with its checkpoint group enabled.
+a checkpoint. **Use it only in tests and explicit staging for now:** the acceptance and
+rollout gate is still to come. Health lists `workspace_checkpoint` only while the root
+helper's checkpoint checks pass (see
+[architecture.md](architecture.md#checkpoint-discovery-and-capacity-milestone-c5b-2)),
+and every capture and create from a checkpoint must leave `--checkpoint-headroom-bytes`
+(default 1 GiB) free on kiln's runs filesystem and on its loop device's backing
+filesystem. The root helper must also run with its checkpoint group enabled.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart. On a Firecracker node this is a transaction; see above.

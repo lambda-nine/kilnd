@@ -193,6 +193,11 @@ struct CreateArgs {
     /// them. Needs a kilnd that lists sandbox_default_env.
     #[arg(long, value_name = "NAME[=VALUE]")]
     default_env: Vec<String>,
+    /// Start from a checkpoint's workspace (see `kilndctl checkpoint`). The image,
+    /// --read-only and --writable must match the checkpoint's, and --disk must hold it.
+    /// Needs a kilnd that lists workspace_checkpoint.
+    #[arg(long, value_name = "CHECKPOINT")]
+    from_checkpoint: Option<String>,
 }
 
 #[derive(Args)]
@@ -362,6 +367,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     );
                 }
             }
+            print_checkpoint_health(&h);
             let streams = h
                 .runtime_capabilities
                 .as_ref()
@@ -654,6 +660,16 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
         // An older daemon would ignore it and run every command without it.
         require_feature(client, pb::Feature::SandboxDefaultEnv, "--default-env").await?;
     }
+    let from_checkpoint = a.from_checkpoint.unwrap_or_default();
+    if !from_checkpoint.is_empty() {
+        // An older daemon ignores from_checkpoint and would create an empty sandbox.
+        require_feature(
+            client,
+            pb::Feature::WorkspaceCheckpoint,
+            "--from-checkpoint",
+        )
+        .await?;
+    }
     let request_id = a.request_id.unwrap_or_default();
     if !request_id.is_empty() {
         // An older daemon ignores request_id and would create a second sandbox on a
@@ -687,7 +703,7 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
             spec: Some(spec),
             expiry,
             request_id,
-            from_checkpoint: String::new(),
+            from_checkpoint,
         })
         .await
         .map_err(rpc)?
@@ -840,6 +856,76 @@ fn next_expiry(c: &pb::Checkpoint) -> i64 {
 }
 
 /// A byte count as whole MiB, rounded up, or `-` for none.
+/// Health's checkpoint lines: the stats whenever kilnd reports them (also while the
+/// feature is withdrawn, for cleanup), the limits only while it is listed.
+fn print_checkpoint_health(h: &pb::HealthResponse) {
+    if let Some(c) = h.admission.as_ref().and_then(|a| a.checkpoints) {
+        println!(
+            "checkpoints:        node {}/{}, {}/{} bytes; yours {}/{}, {}/{} bytes; {} deleting",
+            c.current_count,
+            c.max_count,
+            c.reserved_bytes,
+            c.max_bytes,
+            c.caller_count,
+            c.max_count_per_uid,
+            c.caller_reserved_bytes,
+            c.max_bytes_per_uid,
+            c.pending_deletes
+        );
+        println!(
+            "                    workers {}/{} (yours {}/{}), cleanup {}/{}, records {}/{} (yours {}/{}), request records {}/{} (yours {}/{})",
+            c.current_workers,
+            c.max_workers,
+            c.caller_workers,
+            c.max_workers_per_uid,
+            c.current_cleanup_workers,
+            c.max_cleanup_workers,
+            c.current_records,
+            c.max_records,
+            c.caller_records,
+            c.max_records_per_uid,
+            c.request_records,
+            c.max_request_records,
+            c.caller_request_records,
+            c.max_request_records_per_uid
+        );
+        println!(
+            "                    {} captures and {} forks refused, {} expired",
+            c.rejected_captures, c.rejected_forks, c.expired
+        );
+    }
+    let limits = h
+        .runtime_capabilities
+        .as_ref()
+        .and_then(|c| c.limits.as_ref())
+        .and_then(|l| l.checkpoint.as_ref());
+    if let Some(l) = limits {
+        println!(
+            "checkpoint limits:  {} bytes each; lifetime {} (at most {}), idle {} (at most {})",
+            l.max_size_bytes,
+            duration_text(l.default_lifetime_ms),
+            duration_text(l.max_lifetime_ms),
+            duration_text(l.default_idle_ms),
+            duration_text(l.max_idle_ms)
+        );
+    }
+}
+
+/// Whole days, hours, minutes or seconds, else milliseconds.
+fn duration_text(ms: u64) -> String {
+    for (unit, size) in [
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("m", 60_000),
+        ("s", 1000),
+    ] {
+        if ms != 0 && ms.is_multiple_of(size) {
+            return format!("{}{unit}", ms / size);
+        }
+    }
+    format!("{ms}ms")
+}
+
 fn size_mib(bytes: u64) -> String {
     if bytes == 0 {
         "-".into()
@@ -1603,6 +1689,69 @@ fn time(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `create --from-checkpoint` needs a SERVING Health that lists
+    /// workspace_checkpoint: an older daemon would ignore field 5 and create an empty
+    /// sandbox.
+    #[test]
+    fn create_from_a_checkpoint_needs_the_feature() {
+        let cli = Cli::try_parse_from([
+            "kilndctl",
+            "create",
+            "--from-checkpoint",
+            "cp-0123456789abcdef0123456789abcdef",
+        ])
+        .unwrap();
+        let Command::Create(args) = cli.command else {
+            panic!("not create");
+        };
+        assert_eq!(
+            args.from_checkpoint.as_deref(),
+            Some("cp-0123456789abcdef0123456789abcdef")
+        );
+        let serving = pb::health_response::Status::Serving as i32;
+        let health = |features: Vec<i32>, status: i32| pb::HealthResponse {
+            status,
+            version: "0.1.0".into(),
+            runtime_capabilities: Some(pb::RuntimeCapabilities {
+                features,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let older = health(vec![pb::Feature::SandboxExpiry as i32], serving);
+        let error = check_feature(
+            &older,
+            pb::Feature::WorkspaceCheckpoint,
+            "--from-checkpoint",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("does not advertise workspace_checkpoint"),
+            "{error}"
+        );
+        let listed = vec![pb::Feature::WorkspaceCheckpoint as i32];
+        check_feature(
+            &health(listed.clone(), serving),
+            pb::Feature::WorkspaceCheckpoint,
+            "x",
+        )
+        .unwrap();
+        let degraded = pb::health_response::Status::Degraded as i32;
+        assert!(
+            check_feature(
+                &health(listed, degraded),
+                pb::Feature::WorkspaceCheckpoint,
+                "x"
+            )
+            .is_err()
+        );
+        assert_eq!(duration_text(86_400_000), "1d");
+        assert_eq!(duration_text(3_600_000), "1h");
+        assert_eq!(duration_text(90_000), "90s");
+        assert_eq!(duration_text(1500), "1500ms");
+    }
 
     /// C5b-1 adversarial review LOW: `checkpoint ls` against every valid page cap. The
     /// daemon's side of the refusal is pinned by kilnd's own test of the same constant.

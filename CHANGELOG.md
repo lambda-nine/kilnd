@@ -6,6 +6,26 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone C5b-2 of workspace checkpoints: discovery and capacity. With
+  `--enable-workspace-checkpoints`, Health lists `FEATURE_WORKSPACE_CHECKPOINT` with
+  `RuntimeCapabilities.checkpoint` and `ApiLimits.checkpoint` only while the root
+  helper's checkpoint probes pass (the CLI's leases, listing and removal; XFS with
+  project quotas at kiln's runs; a trusted image registry; the checkpoint format; known
+  free space on runs and its loop backing), and withdraws them when one fails; Firecracker
+  never lists them. Health reports `CheckpointStats` and
+  `checkpoint_reserved_disk_bytes` while checkpoints are on or any exist. New
+  `--checkpoint-headroom-bytes` (default 1 GiB): a capture or create from a checkpoint is
+  refused `checkpoint_quota` unless that much stays free after it and every other
+  admitted one, and `checkpoint_io` when free space is unknown. A capture's size limit
+  is rounded down to 512 bytes. The helper's checkpoint `capabilities` reply gains an
+  optional `storage` field. New `kilndctl create --from-checkpoint`, refused unless Health
+  lists the feature, and checkpoint lines in `kilndctl health`. The flag stays testing
+  only; with it off, Health and every RPC are unchanged.
+- Fix three checkpoint API defects (C5b-1 adversarial review: two MEDIUM, one LOW). A
+  create from a checkpoint whose caller leaves before its row commits is no operation;
+  ListCheckpoints pages search the owner's or source's index instead of the node's
+  history; `kilndctl checkpoint ls` works against any `--max-list-page-size` and takes
+  `--page-size`.
 - Add milestone C5a-2 of workspace checkpoints: create a sandbox from a checkpoint
   (fork), reachable only from Rust (`CreateRequest.from_checkpoint`) and off unless
   `Limits::checkpoints` is set. The preflight refuses before any allocation, a

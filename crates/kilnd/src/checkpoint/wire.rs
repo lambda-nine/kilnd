@@ -157,6 +157,22 @@ pub struct CheckpointCapabilities {
     /// workers, or root's own commands. While any exists, no absence is certified for
     /// the artifact it names.
     pub untracked_workers: u32,
+    /// Free space where captures and restores write (design 6.3), read fresh for this
+    /// reply. Absent from an older helper, and `None` when the runs filesystem could not
+    /// be read: capacity unknown.
+    #[serde(default)]
+    pub storage: Option<StorageFree>,
+}
+
+/// `statvfs` `f_bavail * f_frsize` of kiln's runs filesystem and of the filesystem
+/// holding its loop device's backing file, both found by the helper itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageFree {
+    pub runs_free_bytes: u64,
+    /// `None` when the backing filesystem could not be found or read (also when runs
+    /// is not on a loop device): capacity unknown, never "no backing".
+    pub backing_free_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

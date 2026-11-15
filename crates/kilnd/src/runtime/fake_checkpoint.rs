@@ -14,7 +14,7 @@ use super::{FakeGate, FakeRuntime};
 use crate::checkpoint::wire::{
     Activity, ArtifactInspectReply, ArtifactView, CaptureReply, CheckpointCapabilities,
     CheckpointError, CheckpointErrorKind, CheckpointOperation, CheckpointResponse, InventoryEntry,
-    InventoryReply, ItemKind, OperationState, RemoveReply, RestoreReply, SourceReply,
+    InventoryReply, ItemKind, OperationState, RemoveReply, RestoreReply, SourceReply, StorageFree,
     TrackedArtifact,
 };
 use crate::checkpoint::{
@@ -125,6 +125,12 @@ pub struct FakeCheckpoints {
     pub retired: BTreeSet<Id128>,
     /// One-shot pause before the next `capabilities` answers.
     pub capabilities_gate: Option<FakeGate>,
+    /// What `capabilities` reports as free space (C5b-2); plenty by default.
+    pub storage: Option<StorageFree>,
+    /// `unsupported_reason` when `supported` is false.
+    pub unsupported_reason: &'static str,
+    /// The checkpoint format `capabilities` reports.
+    pub format_version: u32,
 }
 
 impl Default for FakeCheckpoints {
@@ -158,6 +164,12 @@ impl Default for FakeCheckpoints {
             restore_records: BTreeMap::new(),
             retired: BTreeSet::new(),
             capabilities_gate: None,
+            storage: Some(StorageFree {
+                runs_free_bytes: 1 << 50,
+                backing_free_bytes: Some(1 << 50),
+            }),
+            unsupported_reason: "kiln without leases",
+            format_version: crate::checkpoint::FORMAT_VERSION,
             inventory_tracked: Vec::new(),
             inventory_incomplete: false,
             unreadable: BTreeSet::new(),
@@ -373,14 +385,15 @@ impl FakeRuntime {
                             enabled: true,
                             helper_epoch: Some(group.epoch),
                             boot_id: Some(group.boot),
-                            format_version: crate::checkpoint::FORMAT_VERSION,
+                            format_version: group.format_version,
                             supported: group.supported,
                             unsupported_reason: (!group.supported)
-                                .then(|| "kiln without leases".into()),
+                                .then(|| group.unsupported_reason.into()),
                             limits: crate::helper::checkpoint::limits(),
                             copy_workers_busy: 0,
                             cleanup_workers_busy: 0,
                             untracked_workers: 0,
+                            storage: group.storage,
                         },
                     )));
                 }

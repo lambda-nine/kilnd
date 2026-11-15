@@ -315,9 +315,31 @@ reply is byte-identical, an older helper closes the connection on the unknown va
 and the whole frame must be strict JSON as for Firecracker. Only the `kilnd` account may
 use it. **It is off by default:** without `kilnd-helper --enable-checkpoints`,
 `capabilities` answers `enabled: false` and every other operation `disabled`. The daemon's
-engine (milestone C5a) calls it only when `Limits::checkpoints` is set, which no flag
-does yet: there is no RPC, Health field or feature for checkpoints, and
-`RuntimeCapabilities.checkpoint` stays false.
+engine (milestone C5a) calls it only when `Limits::checkpoints` is set
+(`kilnd --enable-workspace-checkpoints`, testing only), and only on a kiln backend.
+
+**Support and capacity (C5b-2).** `supported` is true only when the CLI grants leases
+(bit `0x40`), lists `kiln checkpoint ls` format 1 and checks generations on removal, kiln's
+runs directory (`/var/lib/kiln/runs`) is an XFS mount (`statfs` type and the helper's own
+mountinfo) with project quotas (`prjquota` or `pquota`), and kiln's image registry root is
+absent or a real root-owned directory closed to group and others (kiln's own trust rule);
+otherwise `unsupported_reason` says which failed. `storage`, read afresh for every reply, is
+`{runs_free_bytes, backing_free_bytes}`: `statvfs` `f_bavail * f_frsize` of the runs
+filesystem and of the filesystem holding its loop device's backing file. The helper finds
+both itself, from its fixed runs path, its mountinfo's device for that mount and the loop
+device's sysfs `loop/backing_file`; no path comes from the daemon. A value that cannot be
+read is never 0 or a guess: `storage` is `null` when runs cannot be read, and
+`backing_free_bytes` is `null` when the backing cannot be found or read (including when
+runs is not on a loop device). The daemon treats either as unknown capacity: Health
+withdraws `FEATURE_WORKSPACE_CHECKPOINT` and new captures and forks are refused
+`UNAVAILABLE checkpoint_io`.
+
+**Mixed versions.** `storage` is optional on the wire (`#[serde(default)]`) and the group
+version is unchanged. A newer daemon reading an older helper's reply sees no `storage`:
+capacity unknown, so it fails closed as above. An older daemon (C5b-1) reading a newer
+helper's reply refuses it (`deny_unknown_fields`), so its checkpoint calls fail and it
+captures and forks nothing; maintenance retries, as for an unreachable helper. The daemon
+and helper ship together and no release enables checkpoints, so this also fails closed.
 
 No request carries a path, flag, command, descriptor or environment. Artifacts are named
 by typed IDs (`ArtifactTarget`: a 32-hex instance, `cp-` and 32 hex, a nonzero
@@ -328,7 +350,7 @@ before its future returns).
 
 | Operation | Budget | Lane | Does |
 | --- | --- | --- | --- |
-| `capabilities` | 5 s | recovery | Group version, this helper's epoch and boot ID, whether the CLI grants leases (bit `0x40`) and lists `kiln checkpoint ls` format 1, limits, workers in use, untracked workers |
+| `capabilities` | 5 s | recovery | Group version, this helper's epoch and boot ID, whether checkpoints are supported (below), limits, workers in use, untracked workers, and `storage` (below) |
 | `capture {binding}` | 300 s | copy | `kiln checkpoint capture` for `{target, operation nonce, source backend, R}`: `complete {evidence}`, `failed {reason, detail}` or `pending` |
 | `restore {target, content_sha256, reader, spec}` | 300 s | copy | `kiln checkpoint inspect` (same generation and content digest), then `kiln create --from-checkpoint`: `created`, `not_created` or `ambiguous`, each with the reader's evidence |
 | `inspect {target, verify, operation?}` | 30 s (300 s with `verify`) | cleanup (copy) | The namespace's view of the artifact, this epoch's activity on it, and an operation nonce's state |

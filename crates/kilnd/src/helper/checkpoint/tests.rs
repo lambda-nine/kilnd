@@ -2420,6 +2420,129 @@ fn source_is_refused_when_disabled_and_by_an_older_helper() {
     assert!(serde_json::from_slice::<CheckpointRequest>(unknown.as_bytes()).is_err());
 }
 
+/// C5b-2 storage probes: the runs mount from mountinfo (escaped mount points, the
+/// topmost entry, XFS and project quota options, the device), the loop backing file's
+/// text, and kiln's registry trust rule.
+#[test]
+fn storage_probes_read_the_runs_mount_its_backing_and_the_registry() {
+    use kiln::{RunsMount, backing_path, registry_trusted, runs_mount};
+    let runs = Path::new("/var/lib/kiln/runs");
+    let info = "\
+22 1 252:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw
+98 22 7:0 / /var/lib/kiln/runs rw,relatime shared:50 - xfs /dev/loop0 rw,attr2,inode64,logbufs=8,prjquota
+99 22 7:1 / /var/lib/kiln/runs2 rw - xfs /dev/loop1 rw,prjquota
+";
+    assert_eq!(
+        runs_mount(info, runs),
+        Ok(RunsMount {
+            fstype: "xfs".into(),
+            project_quota: true,
+            device: (7, 0)
+        })
+    );
+    // The topmost of two mounts at runs wins; `pquota` counts; noquota does not.
+    let stacked = format!("{info}100 98 7:2 / /var/lib/kiln/runs rw - xfs /dev/loop2 rw,noquota\n");
+    assert!(!runs_mount(&stacked, runs).unwrap().project_quota);
+    let p = info.replace("prjquota\n99", "pquota\n99");
+    assert!(runs_mount(&p, runs).unwrap().project_quota);
+    // Octal escapes in the mount point; another path is not runs.
+    let spaced = "98 22 7:0 / /var/lib/kiln/my\\040runs rw - xfs /dev/loop0 rw,prjquota\n";
+    assert!(runs_mount(spaced, Path::new("/var/lib/kiln/my runs")).is_ok());
+    assert!(runs_mount(spaced, runs).is_err(), "not a mount point");
+    assert!(
+        runs_mount(
+            "98 22 7:x / /var/lib/kiln/runs rw - xfs /dev/loop0 rw\n",
+            runs
+        )
+        .is_err()
+    );
+    let ext4 = "98 22 252:3 / /var/lib/kiln/runs rw - ext4 /dev/vdb rw\n";
+    assert_eq!(runs_mount(ext4, runs).unwrap().fstype, "ext4");
+
+    assert_eq!(
+        backing_path("/var/lib/kiln/storage.xfs\n"),
+        Some(PathBuf::from("/var/lib/kiln/storage.xfs"))
+    );
+    for bad in [
+        "",
+        "\n",
+        "relative.img\n",
+        "/var/lib/kiln/storage.xfs (deleted)\n",
+        "/a\n/b\n",
+    ] {
+        assert_eq!(backing_path(bad), None, "{bad:?}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(registry_trusted(std::fs::symlink_metadata(dir.path().join("absent"))).is_ok());
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+    assert!(
+        registry_trusted(std::fs::symlink_metadata(&link)).is_err(),
+        "symlink"
+    );
+    let file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+    assert!(
+        registry_trusted(std::fs::symlink_metadata(file.path())).is_err(),
+        "not a directory"
+    );
+    // Not root's (this test runs unprivileged), so refused whatever its mode.
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(registry_trusted(std::fs::symlink_metadata(dir.path())).is_err());
+    }
+}
+
+/// C5b-2 wire: `storage` is optional on the Capabilities reply. An older helper's reply
+/// (no field) parses with capacity unknown; a newer one parses under the daemon's
+/// `deny_unknown_fields` type; a field this daemon does not know is still refused.
+#[test]
+fn capabilities_storage_is_optional_and_strict() {
+    let reply = |storage: Option<StorageFree>| CheckpointCapabilities {
+        group_version: GROUP_VERSION,
+        enabled: true,
+        helper_epoch: Some(Id128::random()),
+        boot_id: Some(Id128::random()),
+        format_version: crate::checkpoint::FORMAT_VERSION,
+        supported: true,
+        unsupported_reason: None,
+        limits: limits(),
+        copy_workers_busy: 0,
+        cleanup_workers_busy: 0,
+        untracked_workers: 0,
+        storage,
+    };
+    let new = reply(Some(StorageFree {
+        runs_free_bytes: 1 << 34,
+        backing_free_bytes: None,
+    }));
+    let text = serde_json::to_string(&new).unwrap();
+    assert!(
+        text.contains(r#""storage":{"runs_free_bytes":17179869184,"backing_free_bytes":null}"#)
+    );
+    assert_eq!(
+        serde_json::from_str::<CheckpointCapabilities>(&text).unwrap(),
+        new
+    );
+    let mut old: serde_json::Value = serde_json::to_value(reply(None)).unwrap();
+    old.as_object_mut().unwrap().remove("storage");
+    let parsed: CheckpointCapabilities = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(parsed.storage, None);
+    old.as_object_mut()
+        .unwrap()
+        .insert("storagex".into(), serde_json::json!(1));
+    assert!(serde_json::from_value::<CheckpointCapabilities>(old).is_err());
+    let extra = text.replace(
+        r#""backing_free_bytes":null"#,
+        r#""backing_free_bytes":null,"x":1"#,
+    );
+    assert!(serde_json::from_str::<CheckpointCapabilities>(&extra).is_err());
+    // A disabled helper reports no capacity.
+    match disabled(&CheckpointOperation::Capabilities) {
+        CheckpointResponse::Capabilities(caps) => assert_eq!(caps.storage, None),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[cfg(test)]
 // Approved (design 7.1): test fixtures, compiled only under cfg(test). They write their
 // fixture CLI, spawn and signal their own stray processes and remove their scratch files.

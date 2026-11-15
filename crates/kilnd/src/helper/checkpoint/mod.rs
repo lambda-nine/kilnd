@@ -1321,6 +1321,7 @@ impl Node {
             copy_workers_busy: busy(&self.copy, COPY_WORKERS),
             cleanup_workers_busy: busy(&self.cleanup, CLEANUP_WORKERS),
             untracked_workers: u32::try_from(untracked).unwrap_or(u32::MAX),
+            storage: self.workers.storage(),
         }))
     }
 }
@@ -1375,6 +1376,7 @@ pub fn disabled(operation: &CheckpointOperation) -> CheckpointResponse {
                 copy_workers_busy: 0,
                 cleanup_workers_busy: 0,
                 untracked_workers: 0,
+                storage: None,
             }))
         }
         _ => error(

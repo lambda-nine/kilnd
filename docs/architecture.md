@@ -1653,11 +1653,9 @@ maps each to its status without reshaping.
 `--enable-workspace-checkpoints` (default off) sets `Limits.checkpoints` to the design's
 limits: 1 GiB per checkpoint; 32 checkpoints and 4 GiB per uid; 128 and 8 GiB per node;
 24 h lifetime and 1 h idle by default, at most 7 days and 24 h; two capture/restore workers
-and one per uid. **It is for testing and explicit staging only.** This milestone does not
-advertise `FEATURE_WORKSPACE_CHECKPOINT` or `RuntimeCapabilities.checkpoint`, and captures
-and forks are admitted without the design 6.3 free-space headroom check (XFS and its loop
-backing filesystem). Feature discovery, its probes, Health's checkpoint stats and limits,
-and the headroom check follow in C5b-2; C6 is the gate for switching it on.
+and one per uid. **It is for testing and explicit staging only;** C6 is the gate for
+switching it on. Discovery, Health's checkpoint stats and limits and the headroom check
+are C5b-2's (next section).
 
 **RPCs.** `service/checkpoint.rs` maps the four RPCs onto the C5a engine, which owns
 ownership, keys, admission, supervision and every reason; the service converts messages,
@@ -1708,6 +1706,58 @@ whose `grpc-timeout` passes while the original runs answers `checkpoint_in_fligh
 thread. The exit check's two ownership maps (`captures`, `retrying`) are nonetheless read
 under one ownership lock in the same critical section as the leaving supervisor's own
 removal and the arm (`supervisor_exit`), which closes the backlog's multi-thread item.
+
+## Checkpoint discovery and capacity (milestone C5b-2)
+
+`manager/capacity.rs`. **Discovery.** With `--enable-workspace-checkpoints` on a kiln
+backend, every Health probe (cached like the rest of it: `--health-success-cache-secs`,
+`--health-failure-cache-secs`) also asks the root helper's checkpoint `capabilities`,
+beside the backend probe and under the same deadline. `FEATURE_WORKSPACE_CHECKPOINT`,
+`RuntimeCapabilities.checkpoint` and `ApiLimits.checkpoint` are listed together, and only
+while that answer passes every probe:
+
+| Probe (from the helper's answer) | Fails as | Admission refusal |
+|---|---|---|
+| helper reachable, group enabled | no reply / `enabled: false` | `UNAVAILABLE checkpoint_io` / `UNIMPLEMENTED backend_unsupported:workspace_checkpoint` |
+| CLI: leases, `checkpoint ls` format 1, generation-checked `rm` | `supported: false` | `FAILED_PRECONDITION sandbox_unsupported:workspace_checkpoint` |
+| runs is XFS with project quotas | `supported: false` | as above |
+| kiln's image registry root trusted | `supported: false` | as above |
+| checkpoint format = 1 | `format_version` | as above |
+| free space on runs and its loop backing known | `storage` or `backing_free_bytes` null | `UNAVAILABLE checkpoint_io` |
+
+A failed check, a helper error or a probe that misses the deadline withdraws only these
+three (Health stays SERVING, with `workspace checkpoints withdrawn: <why>` in `detail`);
+a failed backend probe withdraws every dynamic feature as before. The next probe that
+passes advertises them again. Firecracker has no checkpoint group, is never probed and
+never advertises. New captures and forks never read the cached bit: each asks the helper
+afresh and applies the same checks, so a withdrawn feature refuses new work at once, and
+a daemon that has not probed yet still admits. With the flag off nothing is probed or
+read, and Health is byte-for-byte as before.
+
+**Stats.** `AdmissionStats.checkpoints` (`CheckpointStats`, Appendix A plus `expired`) and
+`NodeResourceStats.checkpoint_reserved_disk_bytes` (the node's checkpoint charges, already
+inside `reserved_disk_bytes`) are present while the flag is on or any checkpoint state
+exists (rows, keys or the barrier), so cleanup stays visible with the feature withdrawn
+or the flag turned off; with the flag off and nothing durable they are absent and no
+checkpoint state is read. Caller fields are the peer uid's own. `current_cleanup_workers`
+is the helper's busy cleanup lane at the latest probe (0 with the flag off). Limits
+describe new work and appear only while the feature is listed.
+
+**Headroom (design 6.3).** A capture (charge R) or fork (charge S, the bytes its restore
+writes) is admitted only if `min(runs_free, backing_free)` from its fresh answer is at least
+`--checkpoint-headroom-bytes` (default 1 GiB) + pending + the charge; otherwise
+`RESOURCE_EXHAUSTED checkpoint_quota`, before any row, pin, key record or helper work.
+*Pending* is every charge admitted here whose bytes that answer may not show: those still
+running, and those that settled after the answer was asked for (a sample takes the
+settlement sequence before the helper call; settled charges are kept while an older
+sample is outstanding). The check and the registration are one critical section with no
+await before the accepting transaction (capture's C1 under the presence lock, a fork's
+under the barrier lock), so two admissions cannot both spend the same free bytes.
+Counting a running operation's whole charge is conservative: bytes it already wrote are
+counted twice until it settles. Ordinary Create is unaffected. A capture's R is rounded
+down to a multiple of 512 bytes at admission, so kiln's project quota (R in 512-byte
+units, rounded up) equals the charge exactly.
+
 ## Limits and defaults
 
 | Setting | Default | Flag |
@@ -1759,7 +1809,7 @@ removal and the arm (`supervisor_exit`), which closes the backlog's multi-thread
 | ExecStream live queue / chunk (queue at least two chunks with their overhead and idle deque slots, 65,984 bytes for 32 KiB chunks; chunk at most 64 KiB) | 256 KiB / 32 KiB | `--exec-stream-buffer-bytes`, `--exec-stream-chunk-bytes` |
 | Helper live message | 16 KiB data | (code) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
-| Workspace checkpoints (testing only until C5b-2 and C6): 1 GiB each; 32 / 4 GiB per uid; 128 / 8 GiB per node; 24 h / 1 h default lifetime / idle, at most 7 d / 24 h; 2 workers, 1 per uid | off | `--enable-workspace-checkpoints` |
+| Workspace checkpoints (testing only until C6): 1 GiB each; 32 / 4 GiB per uid; 128 / 8 GiB per node; 24 h / 1 h default lifetime / idle, at most 7 d / 24 h; 2 workers, 1 per uid | off | `--enable-workspace-checkpoints` |
 
 Startup validates limits before opening state or binding: required counts,
 bytes and times are nonzero (the per-sandbox queue may be zero), semaphore and

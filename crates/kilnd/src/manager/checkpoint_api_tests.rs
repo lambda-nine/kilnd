@@ -778,11 +778,11 @@ async fn quotas_admit_x_and_refuse_x_plus_one() {
     refused(&e, Code::ResourceExhausted, "checkpoint_size_limit");
     assert_eq!(calls(&fake, "capture"), captures);
     assert_eq!(charge(&m), (0, 0));
-    // Bytes per uid: X = 2S. S, then S + 1 (charged R while capturing) is refused,
-    // then S is admitted: exactly X.
+    // Bytes per uid: X = 2S. S, then S + 512 (charged R while capturing; R is a
+    // multiple of 512 bytes, C5b-2) is refused, then S is admitted: exactly X.
     s.checkpoint_sandbox(as_uid(sized(S), 1000)).await.unwrap();
     let e = s
-        .checkpoint_sandbox(as_uid(sized(S + 1), 1000))
+        .checkpoint_sandbox(as_uid(sized(S + 512), 1000))
         .await
         .unwrap_err();
     refused(&e, Code::ResourceExhausted, "checkpoint_quota");
@@ -1422,3 +1422,71 @@ async fn of_two_supervisors_leaving_the_later_sees_the_earlier_gone_and_arms() {
         assert!(m.checkpoint.retrying.lock().unwrap().is_empty());
     }
 }
+
+// --- C5b-2: flag-off Health golden ----------------------------------------------------
+
+/// The flag-off Health response over a fixed history (uids 1000 and 1001, a keyed
+/// create, an exec, a delete), encoded, as uids 1000 and 1001. Its digest is
+/// the same on `c7d921f` (before discovery and stats) and after: flag-off Health is
+/// byte-for-byte unchanged, and it reads no checkpoint state.
+#[tokio::test]
+async fn flag_off_health_bytes_are_unchanged() {
+    let mut limits = test_limits();
+    limits.checkpoints = None;
+    let (m, fake, _) = engine_with(FakeRuntime::default().with_checkpoints(), limits);
+    startup(&m).await;
+    let s = api(&m);
+    let a = api_source(&s, 1000).await;
+    api_source(&s, 1001).await;
+    let keyed = pb::CreateSandboxRequest {
+        request_id: "golden".into(),
+        ..Default::default()
+    };
+    s.create_sandbox(as_uid(keyed, 1001)).await.unwrap();
+    api_exec(&s, &a.id, 1000).await.unwrap();
+    s.delete_sandbox(as_uid(
+        pb::DeleteSandboxRequest {
+            id: a.id.clone(),
+            release_request_id: false,
+        },
+        1000,
+    ))
+    .await
+    .unwrap();
+    m.checkpoint
+        .store_calls
+        .swap(0, std::sync::atomic::Ordering::Relaxed);
+    let mut digests = Vec::new();
+    for request in [
+        as_uid(pb::HealthRequest {}, 1000),
+        as_uid(pb::HealthRequest {}, 1001),
+    ] {
+        let mut h = s.health(request).await.unwrap().into_inner();
+        // The only fields that vary between runs: the start time.
+        h.started_at_unix_ms = 0;
+        let bytes = h.encode_to_vec();
+        digests.push(crate::model::Digest::of(&bytes).to_string());
+    }
+    println!("flag-off Health digests: {digests:?}");
+    assert_eq!(
+        m.checkpoint
+            .store_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "Health reads no checkpoint state"
+    );
+    assert!(
+        fake.checkpoints(|g| g.calls.is_empty()),
+        "nor asks the helper"
+    );
+    assert_eq!(digests, FLAG_OFF_HEALTH);
+}
+
+/// Recorded on `c7d921f` with this test (`c5b2-flag-off-health-on-c7d921f.log`).
+const FLAG_OFF_HEALTH: [&str; 2] = [
+    "ad2203b3d39cc65aade581a080cda1c27b4db6f788ea3093ecd7f3fe31bb8f29",
+    "0a63a10916645b40ea0d2d597d48cdde29dc395aace05e0b24020c277ad0923a",
+];
+
+#[path = "checkpoint_discovery_tests.rs"]
+mod discovery;

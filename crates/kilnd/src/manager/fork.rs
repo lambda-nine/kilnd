@@ -31,6 +31,11 @@ pub(in crate::manager) struct ForkPlan<'a> {
     /// The pin's reader: its nonce, and the helper epoch and boot it is dispatched in.
     pub(in crate::manager) reader: HelperDispatch,
     _worker: WorkerPermit<'a>,
+    /// The preflight's fresh helper answer, for the headroom check (design 6.3); its
+    /// sample ends at the check.
+    admission: Option<super::capacity::Admission<'a>>,
+    /// The restore's charge against headroom, from admission until the fork settles.
+    headroom: Option<super::capacity::HeadroomCharge<'a>>,
 }
 
 impl ForkPlan<'_> {
@@ -40,6 +45,21 @@ impl ForkPlan<'_> {
             checkpoint: self.checkpoint.id.clone(),
             content_sha256: self.checkpoint.seal.as_ref()?.content_sha256,
         })
+    }
+
+    /// Design 6.3, under the barrier's lock with no await before the accepting
+    /// transaction: the restore's S against the preflight's free space, less what other
+    /// admitted captures and forks may still write. Counted until the fork settles.
+    pub(in crate::manager) fn admit_headroom(&mut self, headroom: u64) -> Result<()> {
+        let charge = self
+            .checkpoint
+            .seal
+            .as_ref()
+            .map_or(u64::MAX, |s| s.charge_bytes);
+        if let Some(admission) = self.admission.take() {
+            self.headroom = Some(admission.admit(headroom, charge)?);
+        }
+        Ok(())
     }
 
     /// A fork runs the checkpoint's image identity, so it can be captured in turn.
@@ -126,7 +146,8 @@ impl<R: Runtime> Manager<R> {
         let worker = self
             .take_capture_worker(owner_uid, &limits)
             .map_err(refused)?;
-        let session = self.checkpoint_session().await.map_err(refused)?;
+        let admission = self.admission_probe().await.map_err(refused)?;
+        let session = admission.session;
         Ok(ForkPlan {
             checkpoint: c,
             reader: HelperDispatch {
@@ -136,6 +157,8 @@ impl<R: Runtime> Manager<R> {
             },
             session,
             _worker: worker,
+            admission: Some(admission),
+            headroom: None,
         })
     }
 

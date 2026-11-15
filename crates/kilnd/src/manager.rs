@@ -111,8 +111,8 @@ pub struct Limits {
     /// `--exec-stream-buffer-bytes` and `--exec-stream-chunk-bytes`.
     pub exec_stream: crate::exec_stream::StreamBuffer,
     /// Workspace checkpoints (milestone C5a): `None`, the default, is the feature off.
-    /// `--enable-workspace-checkpoints` sets the design's limits (testing only for now:
-    /// nothing advertises the feature and no headroom check runs yet).
+    /// `--enable-workspace-checkpoints` sets the design's limits (testing only until the
+    /// C6 rollout gate; discovery and the headroom check are `manager/capacity.rs`).
     pub checkpoints: Option<CheckpointLimits>,
 }
 
@@ -378,6 +378,9 @@ pub enum Feature {
     ExecStream,
     TypedReasons,
     RequestIdRelease,
+    /// Dynamic: workspace checkpoints, listed only while the operator enables them and
+    /// the latest Health probe's checkpoint checks passed (checkpoint design 7).
+    WorkspaceCheckpoint,
 }
 
 /// Facts the backend proved in its latest successful probe (design section 1).
@@ -551,6 +554,8 @@ struct Probed {
     node: Option<std::result::Result<(NodeTotals, i64), String>>,
     /// The dynamic features this probe proved.
     dynamic: ProvenFeatures,
+    /// Checkpoint discovery's verdict, `None` unless enabled on a checkpoint backend.
+    checkpoint: Option<std::result::Result<(), String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1834,6 +1839,15 @@ impl<R: Runtime> Manager<R> {
                         let cancel = CancellationToken::new();
                         let runtime_manager = manager.clone();
                         let probe_cancel = cancel.clone();
+                        // Checkpoint discovery runs beside the probe, under the same
+                        // deadline; its failure withdraws only its own feature.
+                        let discovery = {
+                            let manager = manager.clone();
+                            let cancel = cancel.clone();
+                            tokio::spawn(async move {
+                                manager.checkpoint_discovery(deadline, &cancel).await
+                            })
+                        };
                         let mut task = tokio::spawn(async move {
                             let runtime = &runtime_manager.runtime;
                             let version = runtime.version(deadline, &probe_cancel).await?;
@@ -1856,6 +1870,7 @@ impl<R: Runtime> Manager<R> {
                                 version,
                                 node,
                                 dynamic,
+                                checkpoint: None,
                             })
                         });
                         let result = tokio::select! {
@@ -1877,6 +1892,25 @@ impl<R: Runtime> Manager<R> {
                                 Err("version probe canceled during shutdown".into())
                             },
                         };
+                        let mut discovery = discovery;
+                        let checkpoint = tokio::select! {
+                            biased;
+                            joined = &mut discovery => joined.unwrap_or_else(|e| {
+                                Some(Err(format!("checkpoint probe task failed: {e}")))
+                            }),
+                            () = tokio::time::sleep_until(deadline) => {
+                                cancel.cancel();
+                                let _ = discovery.await;
+                                Some(Err("checkpoint probe timed out".into()))
+                            },
+                        };
+                        let result = result.map(|mut probed: Probed| {
+                            if matches!(checkpoint, Some(Ok(()))) {
+                                probed.dynamic.0.push(Feature::WorkspaceCheckpoint);
+                            }
+                            probed.checkpoint = checkpoint;
+                            probed
+                        });
                         {
                             let mut state = manager.health_probe.lock().unwrap();
                             // Fail closed: only a fresh success republishes dynamic features.
@@ -1897,7 +1931,15 @@ impl<R: Runtime> Manager<R> {
             }
         };
         let (mut serving, backend_version, node, mut detail) = match probe {
-            Ok(probed) => (true, probed.version, probed.node, String::new()),
+            Ok(probed) => (
+                true,
+                probed.version,
+                probed.node,
+                match probed.checkpoint {
+                    Some(Err(why)) => format!("workspace checkpoints withdrawn: {why}"),
+                    _ => String::new(),
+                },
+            ),
             Err(e) => (false, String::new(), None, format!("backend: {e}")),
         };
         let finalization_failures = self.finalization_failures.load(Ordering::Relaxed);
@@ -1950,7 +1992,9 @@ impl<R: Runtime> Manager<R> {
                 over_budget.join(", ")
             ));
         }
-        let capabilities = self.runtime.capabilities();
+        let mut capabilities = self.runtime.capabilities();
+        // Design Appendix A: agrees with FEATURE_WORKSPACE_CHECKPOINT.
+        capabilities.checkpoint = self.has_feature(Feature::WorkspaceCheckpoint);
         let (mut limits, mut reserved) = (limits, reserved);
         let accounting = match (capabilities.accounting, node) {
             (AccountingAuthority::LocalLegacy, _) => NodeAccountingStatus::LocalLegacy,
@@ -2346,7 +2390,7 @@ impl<R: Runtime> Manager<R> {
         let spec = self.resolve_spec(req)?;
         // Checkpoint design 7.2 and 11.1: a create from a checkpoint is checked, and a
         // backend without checkpoints refuses, before prepare and before any row.
-        let fork = match from_checkpoint.as_deref() {
+        let mut fork = match from_checkpoint.as_deref() {
             None => None,
             Some(id) => Some(self.fork_preflight(id, &spec, owner_uid).await?),
         };
@@ -2448,6 +2492,14 @@ impl<R: Runtime> Manager<R> {
         // The last look, with no await before the commit: from here a departure only
         // detaches the waiter.
         departed()?;
+        if let (Some(plan), Some(limits)) = (fork.as_mut(), self.limits.checkpoints.as_ref()) {
+            plan.admit_headroom(limits.headroom_bytes)
+                .inspect_err(|_| {
+                    self.checkpoint
+                        .rejected_forks
+                        .fetch_add(1, Ordering::Relaxed);
+                })?;
+        }
         let reserved = match &fork {
             None => self
                 .store
@@ -4854,7 +4906,7 @@ fn may_use(sandbox: &Sandbox, uid: u32) -> bool {
 mod checkpoint;
 pub use checkpoint::{
     CaptureKey, CaptureRequest, CheckpointCode, CheckpointExpiryView, CheckpointLimits,
-    CheckpointReason,
+    CheckpointReason, CheckpointStats,
     DEFAULT_CHECKPOINT_IDLE_MS, DEFAULT_CHECKPOINT_LIFETIME_MS, EXCLUDED_PATHS,
     resolve_checkpoint_expiry,
 };

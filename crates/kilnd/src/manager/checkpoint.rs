@@ -4,7 +4,8 @@
 //! reconciliation. It drives C3's helper group through `Runtime::checkpoint` and C4's
 //! store. The checkpoint RPCs (`service/checkpoint.rs`, C5b-1) reach it; it is off
 //! unless `Limits::checkpoints` is set (`--enable-workspace-checkpoints`, testing only
-//! until feature discovery and the headroom check land), and nothing advertises it yet.
+//! until the C6 rollout gate). Discovery, headroom and Health's stats are `capacity.rs`
+//! (C5b-2).
 //!
 //! Lock order (design 8.3): a capture takes the source's exec mutex (try-lock), then the
 //! short admission gate, then short store transactions; nothing awaits under the gate,
@@ -50,6 +51,9 @@ pub struct CheckpointLimits {
     /// A retried removal's first and largest backoff.
     pub removal_retry: Duration,
     pub max_removal_retry: Duration,
+    /// Free space captures and forks leave on the runs filesystem and its loop backing
+    /// (design 6.3; `--checkpoint-headroom-bytes`, default 1 GiB).
+    pub headroom_bytes: u64,
 }
 
 impl Default for CheckpointLimits {
@@ -64,6 +68,7 @@ impl Default for CheckpointLimits {
             cleanup_workers: 2,
             removal_retry: Duration::from_secs(1),
             max_removal_retry: Duration::from_secs(60),
+            headroom_bytes: 1 << 30,
         }
     }
 }
@@ -281,6 +286,10 @@ pub(super) struct CheckpointEngine {
     pub(super) rejected_captures: AtomicU64,
     pub(super) rejected_forks: AtomicU64,
     pub(super) expired: AtomicU64,
+    /// Charges whose bytes a free-space answer may not show yet (design 6.3).
+    headroom: Mutex<capacity::Headroom>,
+    /// The helper's busy cleanup workers at the latest discovery probe.
+    cleanup_busy: AtomicU64,
     /// The engine's store calls (tests: the feature off makes none on request paths).
     #[cfg(test)]
     pub(super) store_calls: std::sync::atomic::AtomicUsize,
@@ -645,36 +654,14 @@ impl<R: Runtime> Manager<R> {
             .await
     }
 
-    /// As [`Self::checkpoint_session`], canceled by `cancel`.
+    /// As [`Self::checkpoint_session`], canceled by `cancel`. Maintenance (removal,
+    /// reconciliation) needs only the session; new work also needs the format and the
+    /// capacity checks (`capacity::new_work`).
     async fn checkpoint_session_with(&self, cancel: &CancellationToken) -> Result<Session> {
-        let reply = self
-            .runtime
-            .checkpoint(
-                None,
-                CheckpointOperation::Capabilities,
-                Instant::now() + HELPER_QUICK_TIMEOUT,
-                cancel,
-            )
-            .await
-            .map_err(|e| helper_unavailable("root helper checkpoint capabilities", e))?;
-        match reply {
-            CheckpointResponse::Capabilities(caps) => match (caps.helper_epoch, caps.boot_id) {
-                (Some(epoch), Some(boot)) if caps.enabled && caps.supported => {
-                    Ok(Session { epoch, boot })
-                }
-                (Some(_), Some(_)) if caps.enabled => Err(CheckpointReason::SandboxUnsupported
-                    .error(format!(
-                        "the installed kiln cannot capture: {}",
-                        caps.unsupported_reason.as_deref().unwrap_or("unsupported")
-                    ))),
-                _ => Err(CheckpointReason::BackendUnsupported
-                    .error("the root helper's checkpoint group is disabled")),
-            },
-            other => Err(helper_unavailable(
-                "root helper checkpoint capabilities",
-                format!("unexpected reply {other:?}"),
-            )),
-        }
+        let caps = self
+            .checkpoint_caps(Instant::now() + HELPER_QUICK_TIMEOUT, cancel)
+            .await?;
+        capacity::session_of(&caps)
     }
 
     /// The source run's image identity, from its own records (C5a `source`). Only a
@@ -941,10 +928,16 @@ impl<R: Runtime> Manager<R> {
             checkpoint: None,
             check: false,
         };
-        let session = match self.checkpoint_session().await {
-            Ok(s) => s,
-            Err(e) => return send(Err(e)),
+        let probe = match self.admission_probe().await {
+            Ok(a) => a,
+            Err(e) => {
+                self.checkpoint
+                    .rejected_captures
+                    .fetch_add(1, Ordering::Relaxed);
+                return send(Err(e));
+            }
         };
+        let session = probe.session;
         let departed = || {
             CheckpointReason::NotReady.error("the caller departed before the capture was admitted")
         };
@@ -999,6 +992,19 @@ impl<R: Runtime> Manager<R> {
                 "backend resources or checkpoint artifacts no row explains block new allocations until reconciled".into(),
             )));
         }
+        // Design 6.3, with no await before C1: R against the fresh free space, less
+        // what other admitted captures and forks may still write. Held to the end.
+        let _headroom = match probe.admit(limits.headroom_bytes, r) {
+            Ok(charge) => charge,
+            Err(e) => {
+                drop(presence);
+                self.checkpoint
+                    .rejected_captures
+                    .fetch_add(1, Ordering::Relaxed);
+                return send(Err(e));
+            }
+        };
+        drop(probe);
         let reserved = self.db().reserve_checkpoint(
             &new,
             &limits.budgets,
@@ -1141,6 +1147,9 @@ impl<R: Runtime> Manager<R> {
                 "max_size_bytes {r} exceeds the limit {cap} (the source's disk or the per-checkpoint limit)"
             )));
         }
+        // kiln's project quota is R in 512-byte units rounded up (`div_ceil`), so R is
+        // rounded down here and the quota equals the charge exactly (design 6.1).
+        let r = r - r % 512;
         if r < MIN_LIMIT_BYTES {
             return Err(Error::InvalidArgument(format!(
                 "max_size_bytes {r} is below the {MIN_LIMIT_BYTES}-byte minimum"
@@ -2374,6 +2383,10 @@ fn settled_capture(row: Checkpoint) -> Result<Checkpoint> {
 
 #[path = "fork.rs"]
 mod fork;
+
+#[path = "capacity.rs"]
+mod capacity;
+pub use capacity::CheckpointStats;
 
 #[cfg(test)]
 #[path = "checkpoint_tests.rs"]

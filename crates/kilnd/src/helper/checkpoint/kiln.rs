@@ -4,6 +4,7 @@
 //! cleared environment, parent-death SIGKILL, and a future that returns only after the
 //! child was reaped.
 use crate::checkpoint::CheckpointId;
+use crate::checkpoint::wire::StorageFree;
 use crate::helper::protocol::ItemKind;
 use crate::model::{Digest, Id128};
 use crate::process::{self, CaptureCompletion, Finish, KilnArgs, KilnBinary, Outcome};
@@ -72,15 +73,24 @@ pub trait Workers: Send + Sync + 'static {
     fn support(&self, deadline: Instant, cancel: CancellationToken) -> SupportFuture;
     /// One of a run's own metadata records ([`read_run_record`]), never the image.
     fn run_record(&self, backend_id: &str, record: RunRecord) -> io::Result<RecordRead>;
+    /// Free space on the runs filesystem and its loop backing, read now (design 6.3).
+    fn storage(&self) -> Option<StorageFree> {
+        None
+    }
 }
 
 /// kiln's run directories (kiln `docs/checkpoint-lease-v1.md`, "Run metadata").
 pub const KILN_RUNS: &str = "/var/lib/kiln/runs";
+/// kiln's image registry root (kiln `docs/image-identity-v1.md`).
+pub const KILN_IMAGE_REGISTRY: &str = "/var/lib/kiln/image-registry";
 
 pub struct KilnWorkers {
     bin: KilnBinary,
     cgroup_root: PathBuf,
     runs: PathBuf,
+    registry: PathBuf,
+    /// False only for socket tests whose host has no kiln storage.
+    storage_probes: bool,
     /// The executable whose processes the scan trusts, when not `bin` (tests only).
     trusted_image: Option<PathBuf>,
 }
@@ -91,6 +101,8 @@ impl KilnWorkers {
             bin: KilnBinary::new(bin),
             cgroup_root: PathBuf::from("/sys/fs/cgroup/kiln"),
             runs: PathBuf::from(KILN_RUNS),
+            registry: PathBuf::from(KILN_IMAGE_REGISTRY),
+            storage_probes: true,
             trusted_image: None,
         }
     }
@@ -99,6 +111,14 @@ impl KilnWorkers {
     #[cfg(test)]
     pub fn with_trusted_image(mut self, image: PathBuf) -> Self {
         self.trusted_image = Some(image);
+        self
+    }
+
+    /// No storage probes (tests on a host without kiln's XFS runs): supported as far as
+    /// the CLI goes, capacity unknown.
+    #[cfg(test)]
+    pub fn without_storage_probes(mut self) -> Self {
+        self.storage_probes = false;
         self
     }
 
@@ -143,7 +163,15 @@ impl Workers for KilnWorkers {
     fn support(&self, deadline: Instant, cancel: CancellationToken) -> SupportFuture {
         let bin = self.bin.clone();
         let cgroup_root = self.cgroup_root.clone();
+        // Design 6.3 and 7: captures need XFS project quotas where kiln's runs live, and
+        // image identity needs kiln's registry root to be trustworthy.
+        let storage = if self.storage_probes {
+            storage_support(&self.runs, &self.registry)
+        } else {
+            Ok(())
+        };
         Box::pin(async move {
+            storage?;
             let core = kilnd_exec_core::runtime::kiln_direct::DirectKiln::new(&bin, &cgroup_root);
             let caps = core
                 .capabilities(None, deadline, &cancel)
@@ -194,6 +222,191 @@ impl Workers for KilnWorkers {
     fn run_record(&self, backend_id: &str, record: RunRecord) -> io::Result<RecordRead> {
         read_run_record(&self.runs, backend_id, record)
     }
+
+    fn storage(&self) -> Option<StorageFree> {
+        self.storage_probes
+            .then(|| storage_free(&self.runs))
+            .flatten()
+    }
+}
+
+// --- Storage probes (C5b-2, design 6.3) ----------------------------------------------
+
+/// XFS's `f_type`.
+pub const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
+/// The loop driver's block major.
+pub const LOOP_MAJOR: u32 = 7;
+
+/// The runs filesystem's mount, from the helper's own mountinfo: the last (topmost)
+/// entry mounted exactly at `runs`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunsMount {
+    pub fstype: String,
+    /// `prjquota` or `pquota` among the super options.
+    pub project_quota: bool,
+    pub device: (u32, u32),
+}
+
+/// Parses `/proc/<pid>/mountinfo` (proc(5)) for the entry at `runs`. Mount points are
+/// octal-escaped (`\040` for a space); an entry with a malformed device is refused.
+pub fn runs_mount(mountinfo: &str, runs: &Path) -> Result<RunsMount, String> {
+    let unescape = |field: &str| -> Vec<u8> {
+        let bytes = field.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let octal = bytes
+                .get(i + 1..i + 4)
+                .filter(|d| bytes[i] == b'\\' && d.iter().all(|b| (b'0'..=b'7').contains(b)));
+            match octal {
+                Some(d) => {
+                    out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+                    i += 4;
+                }
+                None => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let mut found = None;
+    for line in mountinfo.lines() {
+        let Some((head, tail)) = line.split_once(" - ") else {
+            continue;
+        };
+        let head: Vec<&str> = head.split(' ').collect();
+        let tail: Vec<&str> = tail.split(' ').collect();
+        if head.len() < 5 || tail.len() < 3 || unescape(head[4]) != runs.as_os_str().as_bytes() {
+            continue;
+        }
+        let device = head[2]
+            .split_once(':')
+            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
+            .ok_or_else(|| format!("malformed device {:?} for {}", head[2], runs.display()))?;
+        found = Some(RunsMount {
+            fstype: tail[0].to_string(),
+            project_quota: tail[2].split(',').any(|o| o == "prjquota" || o == "pquota"),
+            device,
+        });
+    }
+    found.ok_or_else(|| format!("{} is not a mount point", runs.display()))
+}
+
+/// A loop device's `loop/backing_file` text: the path, or `None` if the file was
+/// deleted or the text is not one absolute path.
+pub fn backing_path(text: &str) -> Option<PathBuf> {
+    let path = text.strip_suffix('\n').unwrap_or(text);
+    (path.starts_with('/') && !path.ends_with(" (deleted)") && !path.contains('\n'))
+        .then(|| PathBuf::from(path))
+}
+
+/// Whether kiln's registry root is one kiln itself trusts (kiln `image.rs`,
+/// `trusted_registry`): absent (nothing registered yet), or a real directory owned by
+/// root and not group or other writable.
+pub fn registry_trusted(meta: io::Result<std::fs::Metadata>) -> Result<(), String> {
+    match meta {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("kiln's image registry: {e}")),
+        Ok(m) if m.file_type().is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0 => Ok(()),
+        Ok(_) => Err(
+            "kiln's image registry is not a root-owned directory closed to group and others".into(),
+        ),
+    }
+}
+
+/// The capability half of the storage probes: runs is XFS with project quotas, and the
+/// image registry is trusted.
+fn storage_support(runs: &Path, registry: &Path) -> Result<(), String> {
+    registry_trusted(std::fs::symlink_metadata(registry))?;
+    let mount = runs_mount(&own_mountinfo()?, runs)?;
+    if mount.fstype != "xfs" || filesystem_type(runs)? != XFS_SUPER_MAGIC {
+        return Err(format!("{} is not XFS", runs.display()));
+    }
+    if !mount.project_quota {
+        return Err(format!(
+            "{} is mounted without project quotas",
+            runs.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The capacity half: free bytes on runs and on its loop device's backing filesystem,
+/// each `None` when it cannot be read (and the backing's also when runs is not on a
+/// loop device), never a guess.
+fn storage_free(runs: &Path) -> Option<StorageFree> {
+    let runs_free_bytes = free_bytes(runs)?;
+    let backing_free_bytes = (|| {
+        let mount = runs_mount(&own_mountinfo().ok()?, runs).ok()?;
+        if mount.device.0 != LOOP_MAJOR {
+            return None;
+        }
+        let text = std::fs::read_to_string(format!(
+            "/sys/dev/block/{}:{}/loop/backing_file",
+            mount.device.0, mount.device.1
+        ))
+        .ok()?;
+        free_bytes(&backing_path(&text)?)
+    })();
+    Some(StorageFree {
+        runs_free_bytes,
+        backing_free_bytes,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn own_mountinfo() -> Result<String, String> {
+    crate::sys::procfs::read_to_string(&format!("{}/mountinfo", std::process::id()))
+        .map_err(|e| format!("mountinfo: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_type(path: &Path) -> Result<i64, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: a NUL-terminated path and a zeroed out-parameter of the right type.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut stat) } != 0 {
+        return Err(format!(
+            "statfs {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Ok(stat.f_type as i64)
+}
+
+#[cfg(target_os = "linux")]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: as in `filesystem_type`.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)
+}
+
+/// Production runs on Linux only: elsewhere nothing is known.
+#[cfg(not(target_os = "linux"))]
+fn own_mountinfo() -> Result<String, String> {
+    Err("no mountinfo on this platform".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn filesystem_type(_path: &Path) -> Result<i64, String> {
+    Err("no statfs on this platform".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn free_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 // --- A run's own records (C5a) -------------------------------------------------------

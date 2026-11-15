@@ -63,6 +63,15 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         admission.max_create_requests_per_uid = requests.max_per_uid;
         admission.caller_create_requests = requests.caller;
         admission.rejected_create_requests = requests.rejected;
+        // Checkpoint stats while checkpoints are on or any checkpoint state exists;
+        // otherwise absent, with no checkpoint store read (design Appendix A).
+        let checkpoints = self.manager.checkpoint_stats(uid).unwrap_or_else(|error| {
+            tracing::warn!(error = %format!("{error:#}"), "read checkpoint counts");
+            None
+        });
+        admission.checkpoints = checkpoints.map(checkpoint_stats_pb);
+        let mut node_resources = node_resources_pb(h.node_resources);
+        node_resources.checkpoint_reserved_disk_bytes = checkpoints.map_or(0, |c| c.reserved_bytes);
         let status = if h.shutting_down {
             pb::health_response::Status::ShuttingDown
         } else if h.serving {
@@ -80,7 +89,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             active_sandboxes: h.active_sandboxes,
             running_executions: h.running_executions,
             admission: Some(admission),
-            node_resources: Some(node_resources_pb(h.node_resources)),
+            node_resources: Some(node_resources),
             runtime_capabilities: Some(runtime_capabilities_pb(
                 h.capabilities,
                 &h.features,
@@ -588,6 +597,7 @@ fn feature_pb(f: Feature) -> pb::Feature {
         Feature::ExecStream => pb::Feature::ExecStream,
         Feature::TypedReasons => pb::Feature::TypedReasons,
         Feature::RequestIdRelease => pb::Feature::RequestIdRelease,
+        Feature::WorkspaceCheckpoint => pb::Feature::WorkspaceCheckpoint,
     }
 }
 
@@ -635,9 +645,75 @@ fn api_limits_pb(l: &Limits, features: &[Feature]) -> pb::ApiLimits {
         },
         min_sandbox_lifetime_ms: crate::expiry::MIN_EXPIRY_MS,
         min_sandbox_idle_ms: crate::expiry::MIN_EXPIRY_MS,
-        // Filled only while FEATURE_WORKSPACE_CHECKPOINT is listed, which this daemon
-        // does not yet do (checkpoint milestone C5b-2).
-        checkpoint: None,
+        // Limits describe new work only while the feature is listed (Appendix A).
+        checkpoint: l
+            .checkpoints
+            .as_ref()
+            .filter(|_| listed(Feature::WorkspaceCheckpoint))
+            .map(checkpoint_limits_pb),
+    }
+}
+
+/// `ApiLimits.checkpoint` (design 6.2 and Appendix A). The format bounds are kiln's
+/// format-1 codec's (`runtime/src/checkpoint/mod.rs`: a symlink target is at most
+/// 1,023 bytes, XFS's own bound); the worker bounds are the design's.
+fn checkpoint_limits_pb(c: &crate::manager::CheckpointLimits) -> pb::CheckpointLimits {
+    use crate::store::{
+        MAX_CHECKPOINT_IDLE_MS, MAX_CHECKPOINT_LIFETIME_MS, MIN_CHECKPOINT_EXPIRY_MS,
+        MIN_CHECKPOINT_HISTORY_SECS,
+    };
+    pb::CheckpointLimits {
+        max_size_bytes: c.budgets.max_size_bytes,
+        max_entries: 65_536,
+        max_manifest_bytes: 16 << 20,
+        max_path_bytes: 4096,
+        max_directory_depth: 128,
+        max_link_target_bytes: 1023,
+        max_xattrs_per_entry: 32,
+        max_xattr_bytes_per_entry: 4096,
+        default_lifetime_ms: c.default_lifetime_ms,
+        max_lifetime_ms: MAX_CHECKPOINT_LIFETIME_MS,
+        default_idle_ms: c.default_idle_ms,
+        max_idle_ms: MAX_CHECKPOINT_IDLE_MS,
+        min_lifetime_ms: MIN_CHECKPOINT_EXPIRY_MS,
+        min_idle_ms: MIN_CHECKPOINT_EXPIRY_MS,
+        operation_timeout_ms: u64::try_from(c.operation_timeout.as_millis()).unwrap_or(u64::MAX),
+        helper_timeout_ceiling_ms: u64::from(crate::checkpoint::HELPER_CEILING_MS),
+        max_fork_depth: 0,
+        worker_memory_bytes: 64 << 20,
+        worker_max_fds: 256,
+        request_retention_ms: MIN_CHECKPOINT_HISTORY_SECS * 1000,
+    }
+}
+
+fn checkpoint_stats_pb(s: crate::manager::CheckpointStats) -> pb::CheckpointStats {
+    pb::CheckpointStats {
+        max_count: s.max_count,
+        current_count: s.current_count,
+        max_count_per_uid: s.max_count_per_uid,
+        caller_count: s.caller_count,
+        max_bytes: s.max_bytes,
+        reserved_bytes: s.reserved_bytes,
+        max_bytes_per_uid: s.max_bytes_per_uid,
+        caller_reserved_bytes: s.caller_reserved_bytes,
+        max_workers: s.max_workers,
+        current_workers: s.current_workers,
+        max_workers_per_uid: s.max_workers_per_uid,
+        caller_workers: s.caller_workers,
+        pending_deletes: s.pending_deletes,
+        rejected_captures: s.rejected_captures,
+        rejected_forks: s.rejected_forks,
+        max_records: s.max_records,
+        current_records: s.current_records,
+        max_records_per_uid: s.max_records_per_uid,
+        caller_records: s.caller_records,
+        max_request_records: s.max_request_records,
+        request_records: s.request_records,
+        max_request_records_per_uid: s.max_request_records_per_uid,
+        caller_request_records: s.caller_request_records,
+        max_cleanup_workers: s.max_cleanup_workers,
+        current_cleanup_workers: s.current_cleanup_workers,
+        expired: s.expired,
     }
 }
 
@@ -711,7 +787,7 @@ fn node_resources_pb(s: crate::manager::NodeResourceSnapshot) -> pb::NodeResourc
         accounting_status: status.into(),
         accounting_generation: generation,
         accounting_observed_at_unix_ms: observed_at_ms,
-        // The checkpoint breakdown arrives with feature discovery (C5b-2).
+        // Health fills the checkpoint breakdown from the checkpoint stats.
         checkpoint_reserved_disk_bytes: 0,
     }
 }
