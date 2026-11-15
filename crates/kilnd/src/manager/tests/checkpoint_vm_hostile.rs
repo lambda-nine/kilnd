@@ -61,8 +61,8 @@ const LISTING: &str = "for p in /root/w /workspace; do [ -e \"$p\" ] || [ -L \"$
       if [ \"$t\" = directory ]; then stat -c '%n|%F|%a|%u|%g' \"$f\"; \
       else stat -c '%n|%F|%a|%u|%g|%s|%h|%y' \"$f\"; fi; \
       [ -L \"$f\" ] && printf 'link %s\\n' \"$(readlink \"$f\")\"; \
-      [ -f \"$f\" ] && [ ! -L \"$f\" ] && sha256sum < \"$f\"; \
-    done; done";
+      if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then sha256sum < \"$f\"; fi; \
+    done; done; true";
 
 /// A command whose output the fork must reproduce.
 const BEHAVIOR: &str = "cd /root/w 2>/dev/null && (ls -la; for f in *; do [ -f \"$f\" ] && head -c 64 \"$f\"; echo; done) 2>&1 | sed 's/ [A-Z][a-z][a-z] [ 0-9][0-9] [0-9:]* / /'";
@@ -644,6 +644,37 @@ fn c6b_hostile_callers_two_uids_get_only_their_own() {
     });
 }
 
+/// `kiln ls`: (ID, status) of every run.
+fn kiln_ids() -> Vec<(String, String)> {
+    let out = std::process::Command::new(kiln_bin()).arg("ls").output().unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            Some((f.first()?.to_string(), f.get(1)?.to_string()))
+        })
+        .collect()
+}
+
+/// Root's `kiln gc` of the stale runs that appeared since `before`; their IDs.
+fn gc_new_stale_runs(before: &[(String, String)]) -> Vec<String> {
+    let stale: Vec<String> = kiln_ids()
+        .into_iter()
+        .filter(|(id, status)| status == "stale" && !before.iter().any(|(b, _)| b == id))
+        .map(|(id, _)| id)
+        .collect();
+    if !stale.is_empty() {
+        let out = std::process::Command::new(kiln_bin())
+            .arg("gc")
+            .args(&stale)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    stale
+}
+
 /// The shim pid `kiln ls` reports for a backend.
 fn shim_of(backend_id: &str) -> u32 {
     let out = std::process::Command::new(kiln_bin()).arg("ls").output().unwrap();
@@ -732,9 +763,13 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
         seen.insert("direct_kiln_exec".into(), direct_reason);
         // 4. Writable paths over reserved ones, at create (a source can't have them).
         for path in ["/dev/shm/x", "/proc/x", "/sys/fs/cgroup/x"] {
+            let runs_before = kiln_ids();
             let r = w
                 .rpc(OWNER, json!({ "op": "create", "read_only_root": true, "writable_paths": [path] }))
                 .await;
+            // kiln may refuse such a path only after allocating, leaving a stale run that
+            // kilnd cannot name: root's `kiln gc` of exactly the new stale IDs removes it.
+            let stale = gc_new_stale_runs(&runs_before);
             let outcome = match r.get("ok") {
                 Some(s) => {
                     let id = s["id"].as_str().unwrap().to_string();
@@ -746,7 +781,7 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
                     w.ok(json!({ "op": "delete", "id": id })).await;
                     json!({ "create": "ok", "capture": o })
                 }
-                None => json!({ "create": r["error"] }),
+                None => json!({ "create": r["error"], "stale_runs_gc": stale }),
             };
             assert_ne!(outcome["capture"], "captured", "{path}: {outcome}");
             seen.insert(format!("writable {path}"), outcome);

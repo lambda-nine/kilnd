@@ -25,7 +25,7 @@ const TREE: &str = "cd /root && find repo | LC_ALL=C sort | while IFS= read -r f
     if [ -d \"$f\" ] && [ ! -L \"$f\" ]; then stat -c '%n|%F|%a|%u|%g' \"$f\"; \
     else stat -c '%n|%F|%a|%u|%g|%s|%h|%y' \"$f\"; fi; \
     [ -L \"$f\" ] && printf 'link %s\\n' \"$(readlink \"$f\")\"; \
-    [ -f \"$f\" ] && [ ! -L \"$f\" ] && sha256sum < \"$f\"; done";
+    if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then sha256sum < \"$f\"; fi; done; true";
 
 fn keyed_create(key: &str) -> Value {
     json!({ "op": "create", "request_id": key, "lifetime_ms": 120 * MIN, "idle_ms": 30 * MIN })
