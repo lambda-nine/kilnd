@@ -2705,3 +2705,102 @@ fn every_list_shape_searches_its_index_at_retained_history_scale() {
         println!("pre-fix shape, owner {owner}, cursor {cursor:?}: {vm} VM steps, {plan}");
     }
 }
+
+/// Maintenance's read-only busy query must use the real state and live-pin encodings.
+#[test]
+fn maintenance_busy_query_matches_the_schema() {
+    let tmp = private_dir();
+    let store = Store::open(tmp.path()).unwrap();
+    store.set_clock(std::sync::Arc::new(ManualClock::default()));
+    let src = source(&store, 1000);
+    let capturing = inserted(reserve(&store, &new_checkpoint(&src, 1000, GIB)));
+    let idle = ready(&store, &src, 1000, 1 << 20);
+    let deleting = ready(&store, &src, 1000, 1 << 20);
+    store
+        .publish_checkpoint_delete_intent(deleting.id.as_str(), DeletionReason::Requested)
+        .unwrap();
+    let deleted = remove(&store, &ready(&store, &src, 1000, 1 << 20));
+    assert_eq!(deleted.state, CheckpointState::Deleted);
+    let failed = inserted(reserve(&store, &new_checkpoint(&src, 1000, GIB)));
+    store
+        .record_checkpoint_failure(failed.id.as_str(), Reason::Io, "capture failed", false)
+        .unwrap();
+    let removal = dispatch();
+    store
+        .record_checkpoint_removal(failed.id.as_str(), &removal)
+        .unwrap();
+    assert!(matches!(
+        store
+            .settle_checkpoint_absence(failed.id.as_str(), &absent(&failed, &removal))
+            .unwrap(),
+        SettleAbsence::Released(c) if c.state == CheckpointState::Failed
+    ));
+    let pinned = ready(&store, &src, 1000, 1 << 20);
+    let fork = fork_row(&pinned, 1000);
+    assert_eq!(
+        store
+            .reserve_fork_sandbox(&fork, roomy(), None, &[], &dispatch())
+            .unwrap(),
+        ReserveFork::Sandbox(ReserveSandbox::Inserted)
+    );
+    // A released pin on an otherwise READY checkpoint is idle.
+    let reader = dispatch();
+    let finished_fork = fork_row(&idle, 1000);
+    store
+        .reserve_fork_sandbox(&finished_fork, roomy(), None, &[], &reader)
+        .unwrap();
+    store
+        .release_checkpoint_pin(
+            &finished_fork.id,
+            &evidence(
+                &idle,
+                &reader,
+                Fact::ReaderEnded {
+                    copy: CopyOutcome::Complete,
+                },
+            ),
+        )
+        .unwrap();
+    let script = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/kilnd-maintenance.py"),
+    )
+    .unwrap();
+    let marked = script
+        .split_once("# BEGIN checkpoint-busy SQL")
+        .unwrap()
+        .1
+        .split_once("# END checkpoint-busy SQL")
+        .unwrap()
+        .0
+        .trim();
+    let sql = marked
+        .strip_prefix("sql = \"\"\"")
+        .unwrap()
+        .strip_suffix("\"\"\"")
+        .unwrap();
+    let db = Connection::open_with_flags(
+        tmp.path().join("kilnd.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let version: i64 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 16);
+    // The query has no parameters and returns one (checkpoint ID, kind) per busy row.
+    let mut actual: Vec<(String, String)> = db
+        .prepare(sql)
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut expected = vec![
+        (capturing.id.to_string(), "capturing".to_string()),
+        (deleting.id.to_string(), "deleting".to_string()),
+        (pinned.id.to_string(), "fork pin".to_string()),
+    ];
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}

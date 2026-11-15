@@ -15,9 +15,15 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
+import stat
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
+from contextlib import closing
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.dirname(HERE)
@@ -66,6 +72,7 @@ class World:
         m.TXN_DIR = self.lib + '/upgrade'
         m.JOURNAL = m.TXN_DIR + '/journal.json'
         m.FAILED_DIR = self.lib + '/failed-upgrades'
+        m.CHECKPOINTS_ROOT = root + '/var/lib/checkpoints'
         m.UNIT_DIR = self.etc
         m.FENCE_DIR = root + '/libexec/kilnd'
         m.SETTLE_SECONDS = 0
@@ -235,7 +242,9 @@ class World:
             raise RuntimeError(result.stderr)
         return result
 
-    def as_account(self, _account, _op, state, *_args, **_kwargs):
+    def as_account(self, _account, op, state, *_args, **_kwargs):
+        if op == 'checkpoints':
+            return {'instance': None, 'busy': []}
         with open(state + '/kilnd.db') as file:
             return {'schema': int(file.read())}
 
@@ -370,13 +379,15 @@ class World:
 
 
 class Case(unittest.TestCase):
+    world = World
+
     def setUp(self):
         self.scratch = tempfile.mkdtemp(prefix='kilnd-maint-')
         self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
         for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             self.addCleanup(signal.signal, number, signal.getsignal(number))
         self.addCleanup(signal.signal, signal.SIGPIPE, signal.getsignal(signal.SIGPIPE))
-        self.w = World(self.scratch)
+        self.w = self.world(self.scratch)
         self.m = self.w.m
         self.before_rows = self.w.load_rows()
         self.m.log = lambda _message: None
@@ -405,6 +416,252 @@ class Case(unittest.TestCase):
         self.assertTrue(os.path.exists(m.WINDOW_RECORD), 'the record is the retry state')
         self.assertEqual(os.path.exists(m.JOURNAL), journal)
         self.assertEqual(os.path.exists(m.STAGE), journal)
+
+
+class CheckpointWorld(World):
+    """Real SQLite state and account queries, with the same fake services and images."""
+
+    def write_schema(self, unit, schema):
+        # SQLite on macOS cannot safely be reused after fork; migrations run in a fresh
+        # process, as the real init-state does, including in crash_at's child.
+        subprocess.run([sys.executable, '-I', '-c',
+                        'import os, sqlite3, sys; '
+                        'db = sqlite3.connect(sys.argv[1]); '
+                        'db.execute("PRAGMA user_version = " + sys.argv[2]); '
+                        'db.close(); os.chmod(sys.argv[1], 0o600)',
+                        self.state[unit] + '/kilnd.db', str(schema)], check=True)
+
+    def schema(self, unit):
+        return self.as_account(None, 'schema', self.state[unit])['schema']
+
+    def as_account(self, _account, op, state, *_args, **_kwargs):
+        # Run the real account code unprivileged; only the UID switch is faked.
+        result = subprocess.run([sys.executable, '-I', '-c', self.m.ACCOUNT_CHILD,
+                                 op or 'schema', state], capture_output=True, text=True, check=False)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip())
+        return json.loads(result.stdout)
+
+
+class Checkpoints(Case):
+    world = CheckpointWorld
+
+    def setUp(self):
+        super().setUp()
+        self.messages = []
+        self.m.log = self.messages.append
+        for unit in self.w.state:
+            self.w.write_schema(unit, 16)
+            with closing(sqlite3.connect(self.w.state[unit] + '/kilnd.db')) as db, db:
+                db.executescript("""
+                    CREATE TABLE daemon_identity (id INTEGER PRIMARY KEY, instance_id TEXT);
+                    CREATE TABLE checkpoints (id TEXT PRIMARY KEY, state TEXT);
+                    CREATE TABLE checkpoint_pins (checkpoint_id TEXT, released_at_ms INTEGER);
+                """)
+                db.execute('INSERT INTO daemon_identity VALUES (1, ?)', (self.w.identity(unit),))
+
+    def checkpoint(self, state, number=1, pin=False, released=False, unit='kilnd.service'):
+        identity = 'cp-%032x' % number
+        with closing(sqlite3.connect(self.w.state[unit] + '/kilnd.db')) as db, db:
+            db.execute('INSERT INTO checkpoints VALUES (?, ?)', (identity, state))
+            if pin:
+                db.execute('INSERT INTO checkpoint_pins VALUES (?, ?)',
+                           (identity, 1 if released else None))
+        return identity
+
+    def artifact_dir(self, unit='kilnd.service'):
+        path = os.path.join(self.m.CHECKPOINTS_ROOT, self.w.identity(unit))
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def upgrade(self, code=None):
+        with mock.patch.object(sys, 'argv', ['kilnd-maintenance', 'upgrade', '--bin-dir',
+                                            self.w.new, '--deploy-dir', self.w.deploy]):
+            self.m.require_root = lambda: None
+            if code is None:
+                self.m.main()
+            else:
+                with self.assertRaises(SystemExit) as caught:
+                    self.m.main()
+                self.assertEqual(caught.exception.code, code)
+        self.assert_clean()
+        if code is not None:
+            self.assertEqual(self.w.images(), {i: 'old' for i in self.m.IMAGES})
+            self.assertEqual(self.w.load_rows(), self.before_rows)
+            for unit in self.w.state:
+                self.assertEqual(self.w.schema(unit), 16)
+            for name, path in self.m.MANAGED_FILES.items():
+                with open(path) as file:
+                    self.assertEqual(file.read(), 'old ' + name)
+
+    def busy(self, state, pin=False):
+        identity = self.checkpoint(state, pin=pin)
+        self.upgrade(2)
+        message = '\n'.join(self.messages)
+        self.assertIn('kilnd.service has 1 busy checkpoints: ' + identity, message)
+        self.assertIn('fork pin' if pin else state, message)
+        self.assertIn('start kilnd, let those checkpoints settle (kilndctl checkpoint ls), and retry',
+                      message)
+        self.assertFalse([c for c in self.w.calls if c[0] == 'run'
+                          and 'restore-enrollments' in c])
+
+    def test_capturing_refuses(self):
+        self.busy('capturing')
+
+    def test_deleting_refuses(self):
+        self.busy('deleting')
+
+    def test_live_pin_refuses(self):
+        self.busy('ready', pin=True)
+
+    def test_busy_message_limits_ids_and_counts_all(self):
+        ids = [self.checkpoint('capturing', n) for n in range(7)]
+        self.upgrade(2)
+        message = '\n'.join(self.messages)
+        self.assertIn('has 7 busy checkpoints', message)
+        for identity in ids[:5]:
+            self.assertIn(identity, message)
+        for identity in ids[5:]:
+            self.assertNotIn(identity, message)
+
+    def test_schema14_without_checkpoint_tables_proceeds(self):
+        for unit in self.w.state:
+            self.w.write_schema(unit, 14)
+            with closing(sqlite3.connect(self.w.state[unit] + '/kilnd.db')) as db, db:
+                db.executescript('DROP TABLE checkpoints; DROP TABLE checkpoint_pins;')
+        self.upgrade()
+
+    def test_missing_checkpoint_table_proceeds(self):
+        for unit in self.w.state:
+            with closing(sqlite3.connect(self.w.state[unit] + '/kilnd.db')) as db, db:
+                db.executescript('DROP TABLE checkpoints; DROP TABLE checkpoint_pins;')
+        self.upgrade()
+
+    def test_idle_checkpoints_inventory_is_journaled(self):
+        for n, state in enumerate(('ready', 'deleted', 'failed', 'quarantined')):
+            self.checkpoint(state, n, pin=state == 'ready', released=True)
+        directory = self.artifact_dir()
+        os.mkdir(directory + '/cp-b')
+        with open(directory + '/cp-a', 'w') as file:
+            file.write('immutable')
+        os.symlink('/does-not-exist', directory + '/cp-link')
+        real_phase = self.m.set_phase
+        captured = []
+
+        def phase(journal, name):
+            real_phase(journal, name)
+            if name == 'replacing':
+                captured.append(self.m.read_json(self.m.JOURNAL)['instances'])
+        self.m.set_phase = phase
+        self.upgrade()
+        kept = captured[0]['kilnd.service']
+        self.assertEqual(kept['instance'], self.w.identity('kilnd.service'))
+        self.assertIsNone(captured[0][INSTANCE]['checkpoints'])
+        self.assertEqual([e['name'] for e in kept['checkpoints']], ['cp-a', 'cp-b', 'cp-link'])
+        for entry in kept['checkpoints']:
+            meta = os.lstat(directory + '/' + entry['name'])
+            self.assertEqual(entry, {'name': entry['name'], 'type': stat.S_IFMT(meta.st_mode),
+                                     'st_ino': meta.st_ino, 'st_mtime_ns': meta.st_mtime_ns})
+
+    def fail_after_start(self, change):
+        real_settle = self.m.settle
+        self.w.faults['migrate'] = True
+
+        def settle(running, health=True):
+            if health:
+                self.assertTrue(all(self.w.load_units().values()))
+                change()
+                raise RuntimeError('injected failure after start')
+            return real_settle(running, health=health)
+        self.m.settle = settle
+
+    def test_rollback_added_artifact_is_exit3_and_complete(self):
+        directory = self.artifact_dir()
+        self.fail_after_start(lambda: os.mkdir(directory + '/cp-new'))
+        self.upgrade(3)
+        self.assertIn("added 'cp-new'", '\n'.join(self.messages))
+        self.assertIn('see docs/checkpoints.md', '\n'.join(self.messages))
+        self.assertTrue(os.path.isdir(directory + '/cp-new'), 'never swept')
+
+    def test_rollback_missing_artifact_is_exit3_and_complete(self):
+        directory = self.artifact_dir()
+        os.mkdir(directory + '/cp-old')
+        self.fail_after_start(lambda: os.rmdir(directory + '/cp-old'))
+        self.upgrade(3)
+        self.assertIn("missing 'cp-old'", '\n'.join(self.messages))
+
+    def test_rollback_changed_artifact_is_exit3_and_complete(self):
+        directory = self.artifact_dir()
+        os.mkdir(directory + '/cp-old')
+        meta = os.stat(directory + '/cp-old')
+        self.fail_after_start(lambda: os.utime(directory + '/cp-old',
+                                             ns=(meta.st_atime_ns, meta.st_mtime_ns + 1)))
+        self.upgrade(3)
+        self.assertIn("changed 'cp-old'", '\n'.join(self.messages))
+
+    def test_rollback_unchanged_inventory_is_exit1(self):
+        os.mkdir(self.artifact_dir() + '/cp-old')
+        self.fail_after_start(lambda: None)
+        self.upgrade(1)
+        self.assertFalse(any('checkpoint artifacts' in m for m in self.messages))
+
+    def test_rollback_empty_directory_appeared_is_exit3(self):
+        directory = os.path.join(self.m.CHECKPOINTS_ROOT, self.w.identity('kilnd.service'))
+        self.fail_after_start(lambda: os.makedirs(directory))
+        self.upgrade(3)
+        self.assertIn("changed '<directory>'", '\n'.join(self.messages))
+
+    def test_boot_rollback_logs_artifact_difference(self):
+        directory = self.artifact_dir()
+        self.w.faults['migrate'] = True
+        self.assertEqual(self.w.crash_at('settling:', lambda: self.m.cmd_upgrade(self.w.upgrade_args())),
+                         CRASHED)
+        os.mkdir(directory + '/cp-new')
+        self.w.reboot()
+        self.m.cmd_recover(argparse.Namespace(boot=True))
+        self.assertIn("added 'cp-new'", '\n'.join(self.messages))
+        self.assertEqual(self.m.read_json(self.m.WINDOW_RECORD)['stage'], 'restored')
+        self.messages.clear()
+        with self.assertRaises(SystemExit) as caught:
+            self.m.cmd_recover(argparse.Namespace(boot=False))
+        self.assertEqual(caught.exception.code, 3, 'the first command after boot reports it')
+        self.assertIn("added 'cp-new'", '\n'.join(self.messages))
+        self.m.cmd_recover(argparse.Namespace(boot=False))
+        self.assert_clean()
+        self.assertEqual(self.w.images(), {i: 'old' for i in self.m.IMAGES})
+
+    def test_recover_after_a_killed_upgrade_with_artifact_difference_is_exit3(self):
+        directory = self.artifact_dir()
+        self.w.faults['migrate'] = True
+        self.assertEqual(self.w.crash_at('settling:', lambda: self.m.cmd_upgrade(self.w.upgrade_args())),
+                         CRASHED)
+        os.mkdir(directory + '/cp-new')
+        with self.assertRaises(SystemExit) as caught:
+            self.m.cmd_recover(argparse.Namespace(boot=False))
+        self.assertEqual(caught.exception.code, 3)
+        self.assertIn("added 'cp-new'", '\n'.join(self.messages))
+        self.assert_clean()
+        self.assertEqual(self.w.images(), {i: 'old' for i in self.m.IMAGES})
+        self.m.cmd_recover(argparse.Namespace(boot=False))
+
+    def test_account_reads_are_readonly_and_do_not_follow_db_links(self):
+        state = self.w.state['kilnd.service']
+        path = state + '/kilnd.db'
+        before = os.stat(path)
+        self.w.as_account(None, 'checkpoints', state)
+        after = os.stat(path)
+        self.assertEqual((before.st_mtime_ns, before.st_size), (after.st_mtime_ns, after.st_size))
+        os.rename(path, path + '.real')
+        os.symlink(path + '.real', path)
+        with self.assertRaises(RuntimeError):
+            self.w.as_account(None, 'checkpoints', state)
+
+    def test_inventory_does_not_follow_instance_link(self):
+        directory = self.artifact_dir()
+        os.rmdir(directory)
+        os.symlink(self.scratch, directory)
+        with self.assertRaises(OSError):
+            self.m.checkpoint_inventory(self.w.identity('kilnd.service'))
 
 
 class Restore(Case):

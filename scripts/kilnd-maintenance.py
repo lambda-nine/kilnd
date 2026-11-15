@@ -8,8 +8,9 @@
   install-fence                  installs the boot guard, for scripts/install.sh
   needs-transaction              exit 0 if this node can only be changed by `upgrade`
 
-Exit status: 0 done, 1 failed and undone, 2 refused with nothing changed, 3 recovery required:
-something could not be put back, its record is kept, and `recover` tries again.
+Exit status: 0 done, 1 failed and undone, 2 refused with nothing changed, 3 recovery required
+or rolled back with changed checkpoint artifacts. Incomplete rollbacks keep a record for
+`recover`; artifact differences need reconciliation, not recovery.
 
 Enrollment and refreshing need the node lock, which only a stopped helper leaves free,
 and every enrolled instance may connect to the helper's socket. So activation is made
@@ -62,6 +63,7 @@ MASK_DIR = '/run/systemd/system.control'
 TXN_DIR = '/var/lib/kilnd-helper/upgrade'
 JOURNAL = TXN_DIR + '/journal.json'
 FAILED_DIR = '/var/lib/kilnd-helper/failed-upgrades'
+CHECKPOINTS_ROOT = '/var/lib/kiln/runs/.checkpoints'
 STAGE = BIN + '/.kilnd-upgrade'
 MANAGED_FILES = {
     'kilnd-helper.socket': '/etc/systemd/system/kilnd-helper.socket',
@@ -429,6 +431,7 @@ def close_window(window):
 # file, sharing nothing with root but the descriptors named on its command line.
 ACCOUNT_CHILD = r'''
 import json, os, sqlite3, stat, sys
+from urllib.parse import quote
 NAMES = ('kilnd.db', 'kilnd.db-wal', 'kilnd.db-shm', 'kilnd.db-journal')
 op, state = sys.argv[1], sys.argv[2]
 def path(name): return os.path.join(state, name)
@@ -490,6 +493,34 @@ elif op == 'restore':
         os.replace(temporary, path(name))
     fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
     os.fsync(fd)
+elif op == 'checkpoints':
+    result = {'instance': None, 'busy': []}
+    if os.path.lexists(path('kilnd.db')):
+        fd = os.open(path('kilnd.db'), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise SystemExit('kilnd.db is not a regular file')
+            db = sqlite3.connect('file:' + quote(path('kilnd.db')) + '?mode=ro', uri=True, timeout=5)
+            try:
+                tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                if 'daemon_identity' in tables:
+                    row = db.execute('SELECT instance_id FROM daemon_identity WHERE id = 1').fetchone()
+                    result['instance'] = row[0] if row else None
+                if db.execute('PRAGMA user_version').fetchone()[0] >= 15 and 'checkpoints' in tables:
+                    # BEGIN checkpoint-busy SQL
+                    sql = """SELECT c.id, CASE WHEN c.state IN ('capturing', 'deleting')
+                        THEN c.state ELSE 'fork pin' END AS kind FROM checkpoints AS c
+                        WHERE c.state IN ('capturing', 'deleting') OR EXISTS (
+                            SELECT 1 FROM checkpoint_pins AS p
+                            WHERE p.checkpoint_id = c.id AND p.released_at_ms IS NULL)
+                        ORDER BY c.id"""
+                    # END checkpoint-busy SQL
+                    result['busy'] = [{'id': r[0], 'kind': r[1]} for r in db.execute(sql)]
+            finally:
+                db.close()
+        finally:
+            os.close(fd)
+    print(json.dumps(result))
 elif op == 'schema':
     print(json.dumps({'schema': schema()}))
 '''
@@ -825,6 +856,9 @@ def cmd_upgrade(args):
             log('the upgrade failed: %s' % failure)
             raise RecoveryRequired('the rollback is incomplete: fix what it reported, '
                                    'then run scripts/upgrade.sh --recover') from failure
+        if journal.get('checkpoint_changes'):
+            log_checkpoint_changes(journal)
+            raise SystemExit(3) from failure
         if isinstance(failure, Refused):
             raise
         if isinstance(failure, Interrupted):
@@ -884,11 +918,33 @@ def upgrade_transaction(args, journal, window):
             report = snapshot_state(account, state, destination)
         except (OSError, RuntimeError) as error:
             raise Refused('cannot keep a copy of %s: %s' % (state, error)) from None
+        try:
+            checkpoints = as_account(account, 'checkpoints', state)
+        except (OSError, RuntimeError) as error:
+            raise Refused('cannot inspect the checkpoints of %s: %s' % (unit, error)) from None
+        if checkpoints['busy']:
+            busy = checkpoints['busy']
+            raise Refused('%s has %d busy checkpoints: %s; start kilnd, let those checkpoints '
+                          'settle (kilndctl checkpoint ls), and retry'
+                          % (unit, len(busy), ', '.join('%s (%s)' % (c['id'], c['kind'])
+                                                       for c in busy[:5])))
+        identity = checkpoints['instance'] or enrolled.get(unit)
+        if identity is None:
+            identity = init_state(installed_kilnd, state, account)
+        if not re.fullmatch(r'[0-9a-f]{32}', identity):
+            raise Refused('%s has an invalid checkpoint instance ID' % unit)
+        try:
+            inventory = checkpoint_inventory(identity)
+        except OSError as error:
+            raise Refused('cannot inventory the checkpoint artifacts of %s: %s'
+                          % (unit, error)) from None
         journal['instances'][unit] = {
             'state': state,
             'account': account,
             'schema': report['schema'],
             'snapshot': destination,
+            'instance': identity,
+            'checkpoints': inventory,
         }
     os.mkdir(TXN_DIR + '/files', 0o700)
     fsync_dir(TXN_DIR)
@@ -1008,6 +1064,48 @@ def discard_transaction():
         fsync_dir(parent)
 
 
+def checkpoint_inventory(instance):
+    """Root lists only the registry's top level, never following an artifact or instance link."""
+    try:
+        fd = os.open(os.path.join(CHECKPOINTS_ROOT, instance),
+                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        with os.scandir(fd) as entries:
+            result = []
+            for entry in entries:
+                meta = entry.stat(follow_symlinks=False)
+                result.append({'name': entry.name, 'type': stat.S_IFMT(meta.st_mode),
+                               'st_ino': meta.st_ino, 'st_mtime_ns': meta.st_mtime_ns})
+            return sorted(result, key=lambda e: e['name'])
+    finally:
+        os.close(fd)
+
+
+def compare_checkpoints(unit, kept, journal):
+    if 'checkpoints' not in kept:
+        return  # Journals from before checkpoint inventories remain recoverable.
+    before, after = kept['checkpoints'], checkpoint_inventory(kept['instance'])
+    if before == after:
+        return
+    old, new = ({e['name']: e for e in entries or []} for entries in (before, after))
+    changes = {'added': sorted(new.keys() - old.keys()), 'missing': sorted(old.keys() - new.keys()),
+               'changed': sorted(n for n in old.keys() & new.keys() if old[n] != new[n])}
+    if not any(changes.values()):
+        changes['changed'] = ['<directory>']
+    journal.setdefault('checkpoint_changes', {})[unit] = changes
+
+
+def log_checkpoint_changes(journal):
+    for unit, changes in journal.get('checkpoint_changes', {}).items():
+        details = ', '.join('%s %s' % (kind, ', '.join(map(repr, names)))
+                            for kind, names in changes.items() if names)
+        log('rolled back, but the checkpoint artifacts of %s changed during the window: %s; '
+            'kilnd blocks new disk work or quarantines rows until they are reconciled; '
+            'see docs/checkpoints.md' % (unit, details))
+
+
 def rollback(journal, window, boot=False):
     """Undoes an upgrade from whatever point it reached. Safe to repeat. Returns True only when
     the node is whole. A step that fails returns False and keeps the journal, the stage and the
@@ -1068,6 +1166,8 @@ def rollback(journal, window, boot=False):
             for unit, kept in journal['instances'].items():
                 attempt('restore the state of ' + unit,
                         lambda u=unit, k=kept: restore_instance(u, k, journal.get('started')))
+                attempt('check the checkpoint artifacts of ' + unit,
+                        lambda u=unit, k=kept: compare_checkpoints(u, k, journal))
         if errors:
             return False
         if os.path.isdir(TXN_DIR):
@@ -1078,6 +1178,8 @@ def rollback(journal, window, boot=False):
     if boot:
         if window.record is not None:
             attempt('record the rollback', window.mark_restored)
+        if not errors:
+            log_checkpoint_changes(journal)
         return not errors
     if window.record is not None:
         errors.extend(window.release())
@@ -1133,6 +1235,9 @@ def finish_interrupted(boot=False):
         if not complete:
             raise RecoveryRequired('the rollback is incomplete: fix what it reported, '
                                    'then run scripts/upgrade.sh --recover')
+        if not boot and journal.get('checkpoint_changes'):
+            log_checkpoint_changes(journal)
+            raise SystemExit(3)
         return
     # Stopped before its journal existed, so nothing had been replaced.
     interrupted_upgrade = os.path.exists(TXN_DIR) or os.path.exists(STAGE)
