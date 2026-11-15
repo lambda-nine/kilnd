@@ -750,3 +750,7 @@ async fn run_fork() {
 
 #[path = "checkpoint_vm_api_tests.rs"]
 mod api;
+
+#[path = "checkpoint_vm_harness.rs"]
+mod harness;
+
