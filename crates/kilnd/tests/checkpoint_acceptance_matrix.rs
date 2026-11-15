@@ -126,7 +126,7 @@ const CASE_IDS: [&str; 102] = [
     "11.2.8-legacy-behavior",
 ];
 
-const FINDING_IDS: [&str; 62] = [
+const FINDING_IDS: [&str; 63] = [
     "C3-H1",
     "C3-M1",
     "C3-r1-H1",
@@ -189,6 +189,7 @@ const FINDING_IDS: [&str; 62] = [
     "C5b2-M1",
     "C5b2-L1",
     "C5b2-r1-M1",
+    "C6b-V16",
 ];
 
 fn matrix() -> Value {

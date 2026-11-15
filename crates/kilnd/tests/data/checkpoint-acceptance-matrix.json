@@ -1,8 +1,8 @@
 {
   "format": 1,
   "notes": [
-    "Checkpoint acceptance ledger: design crash rows, §11.2 cases and C3–C5b-2 review findings; the integration test pins IDs and coverage structure. Full-suite build.sh test runs check fully qualified references against the compiled registry and ignored status, not semantic sufficiency.",
-    "Planned VM slots are outstanding acceptance work; kiln-only tests are outside this tree. Unrated nonblocking observations are LOW, except the moderate VM coverage observation (MEDIUM); original reported severities are otherwise retained."
+    "Checkpoint acceptance ledger: design crash rows, §11.2 cases and C3–C5b-2 review findings and C6b VM findings; the integration test pins IDs and coverage structure. Full-suite build.sh test runs check fully qualified references against the compiled registry and ignored status, not semantic sufficiency.",
+    "C6b replaced every planned VM slot with VM scenario names (crash matrix, hostile set, client fixtures); the remaining gaps are kiln-side cases, the Firecracker half of legacy behavior and two recorded LOWs. Unrated nonblocking observations are LOW, except the moderate VM coverage observation (MEDIUM); original reported severities are otherwise retained."
   ],
   "crash_points": [
     {
@@ -20,7 +20,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::crash_after_c1_before_the_helper_settles_failed_with_no_recapture"
       ],
-      "vm": "planned:C6b:V1"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v1_daemon_death_after_c1_before_dispatch_fails_without_recapture"
+      ]
     },
     {
       "id": "mid-copy",
@@ -28,7 +30,11 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::crash_mid_copy_reaps_the_worker_removes_staging_and_fails"
       ],
-      "vm": "planned:C6b:V2/V3/V4"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v2_daemon_death_mid_copy_reaps_the_worker_and_fails",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v3_helper_death_mid_copy_new_epoch_reaps_and_fails",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v4_copy_worker_death_fails_typed_and_removes_staging"
+      ]
     },
     {
       "id": "c3-complete-c4-missing",
@@ -36,7 +42,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::crash_between_complete_and_ready_discards_the_artifact"
       ],
-      "vm": "planned:C6b:V5"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v5_complete_without_ready_is_discarded_never_promoted"
+      ]
     },
     {
       "id": "c4-committed-reply-lost",
@@ -44,7 +52,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::crash_after_ready_keeps_it_and_a_key_retry_returns_it"
       ],
-      "vm": "planned:C6b:V6"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v6_ready_with_the_reply_lost_is_returned_by_the_key"
+      ]
     },
     {
       "id": "fork-pin-not-dispatched",
@@ -52,7 +62,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::fork::a_crash_after_the_pin_and_before_dispatch_retires_the_reader_and_keeps_the_pin"
       ],
-      "vm": "planned:C6b:V9"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v9_pin_committed_not_dispatched_retires_the_reader_and_releases_on_absent"
+      ]
     },
     {
       "id": "mid-restore",
@@ -61,7 +73,11 @@
         "kilnd::manager::checkpoint::tests::fork::a_crash_mid_restore_blocks_until_the_orphaned_reader_settles",
         "kilnd::manager::checkpoint::tests::fork::an_ambiguous_restore_stays_charged_and_its_pin_waits_for_absent"
       ],
-      "vm": "planned:C6b:V10/V11/V13"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v10_daemon_death_mid_restore_reaps_the_reader_before_the_pin",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v11_restore_worker_death_fails_the_fork_and_keeps_the_checkpoint",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v13_helper_death_mid_restore_keeps_the_pin_until_absent"
+      ]
     },
     {
       "id": "restored-ready-missing",
@@ -70,7 +86,9 @@
         "kilnd::manager::checkpoint::tests::fork::a_crash_after_the_copy_and_before_ready_compensates_the_exact_backend_at_startup",
         "kilnd::manager::checkpoint::tests::fork::a_crash_between_each_settlement_write_and_the_pin_release_recovers"
       ],
-      "vm": "planned:C6b:V12"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v12_restored_without_ready_is_compensated_never_promoted"
+      ]
     },
     {
       "id": "d1-interrupted",
@@ -79,7 +97,9 @@
         "kilnd::manager::checkpoint::tests::crash_after_d1_or_after_d2_completes_the_removal",
         "kilnd::manager::checkpoint::tests::fix::checkpoint_d1_keeps_the_interrupted_capture_source_held"
       ],
-      "vm": "planned:C6b:V7"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v7_deletion_interrupted_after_d1_completes_on_restart"
+      ]
     },
     {
       "id": "d2-complete-d3-missing",
@@ -87,7 +107,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::crash_after_d1_or_after_d2_completes_the_removal"
       ],
-      "vm": "planned:C6b:V8"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v8_absent_without_d3_is_reinspected_and_released_once"
+      ]
     },
     {
       "id": "ready-artifact-corrupt",
@@ -96,7 +118,10 @@
         "kilnd::manager::checkpoint::tests::a_ready_row_with_a_missing_artifact_is_quarantined_until_deleted",
         "kilnd::manager::checkpoint::tests::fix::authoritative_inspect_results_still_quarantine"
       ],
-      "vm": "planned:C6b:V16"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v16_corrupt_payload_quarantines_and_delete_releases",
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
+      ]
     },
     {
       "id": "unexplained-files",
@@ -105,7 +130,9 @@
         "kilnd::manager::checkpoint::tests::unexplained_artifacts_or_an_incomplete_inventory_block_allocation",
         "kilnd::manager::checkpoint::tests::fix::an_unexplained_tracked_operation_blocks_allocation"
       ],
-      "vm": "planned:C6b:V15"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v15_stale_backup_blocks_admission_and_never_adopts"
+      ]
     }
   ],
   "cases": [
@@ -113,84 +140,111 @@
       "id": "11.2.1-round-trips",
       "design": "§11.2 item 1: Round trips: lower/upper modifications and removals, directory replacement, whiteouts/opacity, rename, nested forks, uid/gid extrema, setuid/sticky modes, nanosecond mtime, non-UTF-8 names, internal hardlinks/symlinks, empty upper and zero-length files; logical manifests, real commands and independence",
       "mac": [],
-      "vm": "planned:C6b:round-trips",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip",
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation",
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_names_depth_and_counts_hold_their_limits",
+        "kilnd::manager::checkpoint_vm_tests::clients::c6b_f1_rewind_on_real_kiln"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-acl",
       "design": "§11.2 item 2: ACLs",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-file-capabilities",
       "design": "§11.2 item 2: File capabilities",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-socket",
       "design": "§11.2 item 2: Socket",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-fifo",
       "design": "§11.2 item 2: FIFO",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-device",
       "design": "§11.2 item 2: Device",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-unknown-xattrs",
       "design": "§11.2 item 2: Unknown xattrs",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-redirect",
       "design": "§11.2 item 2: Overlay redirect",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-metacopy",
       "design": "§11.2 item 2: Overlay metacopy",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-index",
       "design": "§11.2 item 2: Overlay index",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-protected-tree",
       "design": "§11.2 item 2: Protected-tree edits",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_protected_trees_and_sentinels_are_unchanged"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.2-overlapping-writable-paths",
       "design": "§11.2 item 2: Overlapping reserved writable paths",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
+      ],
       "kiln": true
     },
     {
@@ -200,7 +254,7 @@
         "kilnd::manager::checkpoint::tests::source_record_problems_refuse_before_any_reservation",
         "kilnd::manager::checkpoint::tests::a_disabled_helper_group_or_old_kiln_refuses_before_reserving"
       ],
-      "vm": "planned:C6b:hostile-content"
+      "vm": null
     },
     {
       "id": "11.2.2-wrong-image-generation",
@@ -257,155 +311,197 @@
       "id": "11.2.3-symlink-parents",
       "design": "§11.2 item 3: Symlink every parent",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-absolute-link-targets",
       "design": "§11.2 item 3: Absolute link targets",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-dot-dot-link-targets",
       "design": "§11.2 item 3: Dot-dot link targets",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-hardlink-chains",
       "design": "§11.2 item 3: Hardlink chains",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-hardlink-cycles",
       "design": "§11.2 item 3: Hardlink cycles",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-hardlink-outside",
       "design": "§11.2 item 3: Hardlinks outside the object",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-duplicate-paths",
       "design": "§11.2 item 3: Duplicate paths",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-root-replacement",
       "design": "§11.2 item 3: Root replacement",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip",
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_protected_trees_and_sentinels_are_unchanged"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-forged-type",
       "design": "§11.2 item 3: Forged payload type",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-forged-size",
       "design": "§11.2 item 3: Forged payload size",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-mount-crossing",
       "design": "§11.2 item 3: Mount crossing",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
     },
     {
       "id": "11.2.3-malformed-base64",
       "design": "§11.2 item 3: Malformed base64",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-malformed-json",
       "design": "§11.2 item 3: Malformed JSON",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-depth",
       "design": "§11.2 item 3: Huge depth",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_names_depth_and_counts_hold_their_limits"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-count",
       "design": "§11.2 item 3: Huge entry count",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_names_depth_and_counts_hold_their_limits"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-sparse",
       "design": "§11.2 item 3: Giant sparse files",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_sizes_sparse_and_inode_bombs_hold_their_limits"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-inode-bombs",
       "design": "§11.2 item 3: Inode bombs",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_sizes_sparse_and_inode_bombs_hold_their_limits"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-sentinels",
       "design": "§11.2 item 3: Host sentinels and other users unchanged",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_protected_trees_and_sentinels_are_unchanged",
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-fuzz-parsing",
       "design": "§11.2 item 3: Fuzz parsing",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
     },
     {
       "id": "11.2.3-fuzz-materialization",
       "design": "§11.2 item 3: Fuzz materialization",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
     },
     {
       "id": "11.2.3-arbitrary-device",
       "design": "§11.2 item 3: Root accepts no arbitrary device number",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.3-external-fd",
       "design": "§11.2 item 3: Root accepts no external FD",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
     },
     {
       "id": "11.2.4-queued-exec",
@@ -413,20 +509,27 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::capture_and_exec_exclude_each_other"
       ],
-      "vm": "planned:C6b:hostile-callers"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::clients::c6b_f1_rewind_on_real_kiln"
+      ]
     },
     {
       "id": "11.2.4-queued-exec-stream",
       "design": "§11.2 item 4: Capture against queued ExecStream",
-      "mac": [],
-      "vm": "planned:C6b:hostile-callers",
-      "gap": "No direct checkpoint capture versus queued ExecStream regression identified; Exec coverage alone does not prove the stream gate."
+      "mac": [
+        "kilnd::manager::checkpoint::tests::c6b_gaps::capture_refuses_busy_while_an_exec_stream_is_queued_behind_a_running_exec"
+      ],
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::clients::c6b_f1_rewind_on_real_kiln"
+      ]
     },
     {
       "id": "11.2.4-direct-kiln-exec",
       "design": "§11.2 item 4: Capture against direct kiln Exec",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
+      ],
       "kiln": true
     },
     {
@@ -455,7 +558,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::source_lifetime_expiry_cancels_a_capture_and_idle_waits_for_it"
       ],
-      "vm": "planned:C6b:hostile-callers"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::clients::c6b_f3_eval_reset_on_real_kiln"
+      ]
     },
     {
       "id": "11.2.4-source-lifetime-expiry",
@@ -482,10 +587,10 @@
       "id": "11.2.4-fork-get",
       "design": "§11.2 item 4: Fork against checkpoint Get",
       "mac": [
-        "kilnd::manager::checkpoint::tests::a_pin_under_a_dead_epoch_pauses_idle_but_lifetime_still_reaches_absent"
+        "kilnd::manager::checkpoint::tests::a_pin_under_a_dead_epoch_pauses_idle_but_lifetime_still_reaches_absent",
+        "kilnd::manager::checkpoint::tests::c6b_gaps::a_fork_racing_get_of_its_checkpoint_has_one_consistent_winner"
       ],
-      "vm": "planned:C6b:hostile-callers",
-      "gap": "Pin/Get retention is covered, but no direct concurrent fork-versus-Get winner regression identified."
+      "vm": null
     },
     {
       "id": "11.2.4-fork-idle-expiry",
@@ -513,7 +618,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::fork::concurrent_captures_and_forks_never_overspend_the_shared_disk"
       ],
-      "vm": "planned:C6b:hostile-callers"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::clients::c6b_f2_best_of_four_on_real_kiln"
+      ]
     },
     {
       "id": "11.2.4-disconnect-helper",
@@ -522,7 +629,10 @@
         "kilnd::manager::checkpoint::tests::fork::a_lost_or_pending_reply_follows_the_reader_to_its_record",
         "kilnd::manager::checkpoint::tests::removal_retries_busy_and_unavailable_until_absent_keeping_the_charge"
       ],
-      "vm": "planned:C6b:hostile-callers"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v3_helper_death_mid_copy_new_epoch_reaps_and_fails",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v13_helper_death_mid_restore_keeps_the_pin_until_absent"
+      ]
     },
     {
       "id": "11.2.4-downgrade-helper",
@@ -531,7 +641,7 @@
         "kilnd::manager::checkpoint::tests::api::discovery::an_older_helper_keeps_the_broad_removal_gate",
         "kilnd::manager::checkpoint::tests::api::discovery::discovery_advertises_after_its_probes_and_withdraws_on_each_failure"
       ],
-      "vm": "planned:C6b:hostile-callers"
+      "vm": null
     },
     {
       "id": "11.2.4-kill-worker",
@@ -539,28 +649,35 @@
       "mac": [
         "kilnd::helper::checkpoint::tests::an_unkillable_worker_keeps_its_slot_and_blocks_absence"
       ],
-      "vm": "planned:C6b:V4/V11"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v4_copy_worker_death_fails_typed_and_removes_staging",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v11_restore_worker_death_fails_the_fork_and_keeps_the_checkpoint"
+      ]
     },
     {
       "id": "11.2.4-kill-pid1",
       "design": "§11.2 item 4: Kill PID 1",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.4-output-queue",
       "design": "§11.2 item 4: Fill output queue; Health and Delete retain progress",
-      "mac": [],
-      "vm": "planned:C6b:hostile-callers",
-      "gap": "No checkpoint-specific full output queue liveness regression identified."
+      "mac": [
+        "kilnd::manager::checkpoint::tests::c6b_gaps::a_full_exec_stream_output_queue_never_stalls_checkpoint_health_or_delete"
+      ],
+      "vm": null
     },
     {
       "id": "11.2.4-control-queue",
       "design": "§11.2 item 4: Fill control queue; Health and Delete retain progress",
-      "mac": [],
-      "vm": "planned:C6b:hostile-callers",
-      "gap": "No checkpoint-specific full control queue liveness regression identified."
+      "mac": [
+        "kilnd::manager::checkpoint::tests::c6b_gaps::a_full_control_queue_never_stalls_checkpoint_health_or_delete"
+      ],
+      "vm": null
     },
     {
       "id": "11.2.4-deadline",
@@ -569,7 +686,7 @@
         "kilnd::helper::checkpoint::tests::socket::a_hung_worker_is_killed_and_reaped_at_its_deadline",
         "kilnd::helper::checkpoint::tests::lanes_refuse_at_once_and_cleanup_never_waits_for_copying"
       ],
-      "vm": "planned:C6b:hostile-callers"
+      "vm": null
     },
     {
       "id": "11.2.4-shutdown",
@@ -578,7 +695,7 @@
         "kilnd::manager::checkpoint::tests::fix::shutdown_keeps_the_source_gated_until_the_capture_is_absent",
         "kilnd::manager::checkpoint::tests::fork::source_delete_departed_waiter_and_shutdown_never_disturb_a_restore"
       ],
-      "vm": "planned:C6b:hostile-callers"
+      "vm": null
     },
     {
       "id": "11.2.5-uid-caps",
@@ -588,7 +705,9 @@
         "kilnd::manager::checkpoint::tests::fork::concurrent_captures_and_forks_never_overspend_the_shared_disk",
         "kilnd::manager::checkpoint::tests::api::quotas_admit_x_and_refuse_x_plus_one"
       ],
-      "vm": "planned:C6b:accounting"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_callers_two_uids_get_only_their_own"
+      ]
     },
     {
       "id": "11.2.5-node-caps",
@@ -597,7 +716,7 @@
         "kilnd::store::checkpoint::tests::concurrent_admissions_never_overspend_caps_or_the_shared_disk",
         "kilnd::manager::checkpoint::tests::api::quotas_admit_x_and_refuse_x_plus_one"
       ],
-      "vm": "planned:C6b:accounting"
+      "vm": null
     },
     {
       "id": "11.2.5-lowered-budgets",
@@ -606,56 +725,65 @@
         "kilnd::store::checkpoint::tests::admission_enforces_every_cap_and_the_shared_disk_budget",
         "kilnd::manager::checkpoint::tests::api::lowered_budgets_block_new_captures_but_keep_what_is_charged"
       ],
-      "vm": "planned:C6b:accounting"
+      "vm": null
     },
     {
       "id": "11.2.5-sparse-physical",
       "design": "§11.2 item 5: Logical versus physical sparse bytes",
       "mac": [],
-      "vm": "planned:C6b:accounting",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_sizes_sparse_and_inode_bombs_hold_their_limits"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.5-reflink-divergence",
       "design": "§11.2 item 5: Reflink then full divergence",
       "mac": [],
-      "vm": "planned:C6b:accounting",
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "The pinned kiln 8735907 has no reflink path: every capture and fork copies, so there is no shared extent to diverge (C6 plan, Pinned kiln). Revisit with a reflink-capable kiln."
     },
     {
       "id": "11.2.5-metadata-exhaustion",
       "design": "§11.2 item 5: Metadata-only exhaustion",
       "mac": [],
-      "vm": "planned:C6b:accounting",
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
     },
     {
       "id": "11.2.5-inode-exhaustion",
       "design": "§11.2 item 5: Inode exhaustion",
       "mac": [],
-      "vm": "planned:C6b:accounting",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_sizes_sparse_and_inode_bombs_hold_their_limits"
+      ],
       "kiln": true
     },
     {
       "id": "11.2.5-small-project-quota",
       "design": "§11.2 item 5: Small project quota",
       "mac": [],
-      "vm": "planned:C6b:accounting",
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
     },
     {
       "id": "11.2.5-enospc-fsync",
       "design": "§11.2 item 5: ENOSPC at file fsync",
       "mac": [],
-      "vm": "planned:C6b:accounting",
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
     },
     {
       "id": "11.2.5-enospc-rename",
       "design": "§11.2 item 5: ENOSPC at rename",
       "mac": [],
-      "vm": "planned:C6b:accounting",
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
     },
     {
       "id": "11.2.5-worker-fd-absence",
@@ -696,7 +824,14 @@
         "kilnd::manager::checkpoint::tests::crash_between_complete_and_ready_discards_the_artifact",
         "kilnd::manager::checkpoint::tests::crash_after_ready_keeps_it_and_a_key_retry_returns_it"
       ],
-      "vm": "planned:C6b:V1/V2/V3/V4/V5/V6"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v1_daemon_death_after_c1_before_dispatch_fails_without_recapture",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v2_daemon_death_mid_copy_reaps_the_worker_and_fails",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v3_helper_death_mid_copy_new_epoch_reaps_and_fails",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v4_copy_worker_death_fails_typed_and_removes_staging",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v5_complete_without_ready_is_discarded_never_promoted",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v6_ready_with_the_reply_lost_is_returned_by_the_key"
+      ]
     },
     {
       "id": "11.2.6-delete-boundaries",
@@ -704,7 +839,10 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::crash_after_d1_or_after_d2_completes_the_removal"
       ],
-      "vm": "planned:C6b:V7/V8"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v7_deletion_interrupted_after_d1_completes_on_restart",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v8_absent_without_d3_is_reinspected_and_released_once"
+      ]
     },
     {
       "id": "11.2.6-fork-pin-dispatch",
@@ -712,7 +850,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::fork::a_crash_after_the_pin_and_before_dispatch_retires_the_reader_and_keeps_the_pin"
       ],
-      "vm": "planned:C6b:V9"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v9_pin_committed_not_dispatched_retires_the_reader_and_releases_on_absent"
+      ]
     },
     {
       "id": "11.2.6-restore-publication",
@@ -720,7 +860,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::fork::a_crash_after_the_copy_and_before_ready_compensates_the_exact_backend_at_startup"
       ],
-      "vm": "planned:C6b:V12"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v12_restored_without_ready_is_compensated_never_promoted"
+      ]
     },
     {
       "id": "11.2.6-reboot",
@@ -728,8 +870,10 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::a_reboot_rebases_checkpoint_anchors_without_extending_lifetime"
       ],
-      "vm": "planned:C6b:V14",
-      "gap": "Clock-rebase simulation exists; real reboot with both READY and partial artifacts remains planned."
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v14_reboot_arm",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v14_reboot_verify"
+      ]
     },
     {
       "id": "11.2.6-mismatched-backups",
@@ -737,8 +881,9 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::unexplained_artifacts_or_an_incomplete_inventory_block_allocation"
       ],
-      "vm": "planned:C6b:V15",
-      "gap": "Unknown-artifact admission refusal is covered; no real mismatched-backup restoration regression identified."
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v15_stale_backup_blocks_admission_and_never_adopts"
+      ]
     },
     {
       "id": "11.2.6-stale-helper-epochs",
@@ -747,7 +892,10 @@
         "kilnd::helper::checkpoint::tests::epochs_and_retired_nonces_refuse_before_any_worker",
         "kilnd::manager::checkpoint::tests::fork::a_crash_with_a_helper_restart_leaves_a_dead_epoch_pin_for_absent"
       ],
-      "vm": "planned:C6b:V3/V13"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v3_helper_death_mid_copy_new_epoch_reaps_and_fails",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v13_helper_death_mid_restore_keeps_the_pin_until_absent"
+      ]
     },
     {
       "id": "11.2.6-unknown-objects",
@@ -756,7 +904,9 @@
         "kilnd::manager::checkpoint::tests::unexplained_artifacts_or_an_incomplete_inventory_block_allocation",
         "kilnd::manager::checkpoint::tests::fix::an_unexplained_tracked_operation_blocks_allocation"
       ],
-      "vm": "planned:C6b:V15"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v15_stale_backup_blocks_admission_and_never_adopts"
+      ]
     },
     {
       "id": "11.2.6-barrier-interruption",
@@ -765,7 +915,9 @@
         "kilnd::manager::checkpoint::tests::fix::a_crash_inside_the_pass_keeps_the_restart_reconciling",
         "kilnd::manager::checkpoint::tests::fix::a_crash_after_the_blocking_verdict_cannot_lose_the_obligation"
       ],
-      "vm": "planned:C6b:V17"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v17_death_during_the_barrier_inventory_reruns_it"
+      ]
     },
     {
       "id": "11.2.7-foreign-ids",
@@ -908,17 +1060,18 @@
       "design": "§11.2 item 7: Wall-clock jumps",
       "mac": [
         "kilnd::manager::checkpoint::tests::a_reboot_rebases_checkpoint_anchors_without_extending_lifetime",
-        "kilnd::manager::checkpoint::tests::lifetime_and_idle_expiry_take_the_same_removal_and_get_refreshes_only_idle"
+        "kilnd::manager::checkpoint::tests::lifetime_and_idle_expiry_take_the_same_removal_and_get_refreshes_only_idle",
+        "kilnd::manager::checkpoint::tests::c6b_gaps::checkpoint_expiry_follows_boottime_not_wall_clock_jumps"
       ],
-      "vm": "planned:C6b:retention",
-      "gap": "Boot rebasing and normal expiry are covered, but no checkpoint-specific forward/backward wall-clock jump regression identified."
+      "vm": null
     },
     {
       "id": "11.2.7-suspend",
       "design": "§11.2 item 7: Suspend",
-      "mac": [],
-      "vm": "planned:C6b:retention",
-      "gap": "No checkpoint-specific suspend/resume regression identified."
+      "mac": [
+        "kilnd::manager::checkpoint::tests::c6b_gaps::checkpoint_expiry_counts_suspended_time_toward_lifetime_and_idle"
+      ],
+      "vm": null
     },
     {
       "id": "11.2.7-reboot",
@@ -927,7 +1080,10 @@
         "kilnd::manager::checkpoint::tests::a_reboot_rebases_checkpoint_anchors_without_extending_lifetime",
         "kilnd::manager::checkpoint::tests::fix::capture_keys_from_an_earlier_boot_age_out_after_restart"
       ],
-      "vm": "planned:C6b:V14"
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v14_reboot_arm",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v14_reboot_verify"
+      ]
     },
     {
       "id": "11.2.7-list-no-refresh",
@@ -967,8 +1123,10 @@
         "kilnd::manager::checkpoint::tests::off_by_default_nothing_changes_and_nothing_is_called",
         "kilnd::manager::checkpoint::tests::fork::feature_off_refuses_a_fork_without_a_store_query_and_create_is_unchanged"
       ],
-      "vm": "planned:C6b:legacy-backends",
-      "gap": "Feature-off kiln controls exist; a combined real-backend Create/Exec equivalence check on both kiln and Firecracker remains planned."
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::clients::c6b_legacy_create_and_exec_are_unchanged_with_the_flag"
+      ],
+      "gap": "Kiln: Create, Exec, Get and Delete compared with the flag off and on through the real socket (VM). Firecracker: contract tests only, no VM run (the isolated Firecracker test deployment is not started in the guest)."
     }
   ],
   "findings": [
@@ -1004,9 +1162,9 @@
       "severity": "HIGH",
       "summary": "A remover could delete a replacement generation after checking a stale inode.",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": null,
       "kiln": true,
-      "gap": "Replacement-inode race regression belongs to kiln; no direct kilnd-tree test drives the pathname-rebinding interleaving."
+      "gap": "Replacement-inode race regression belongs to kiln; no direct kilnd-tree test drives the pathname-rebinding interleaving. Stays with kiln's own tests: no kilnd VM scenario drives kiln's internal interleavings."
     },
     {
       "id": "C3-r1-L1",
@@ -1014,9 +1172,9 @@
       "severity": "LOW",
       "summary": "Unchecked removal stopped sweeping malformed staging/removing names.",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": null,
       "kiln": true,
-      "gap": "Malformed-name unchecked-removal regression belongs to kiln and is not checked by this ledger test."
+      "gap": "Malformed-name unchecked-removal regression belongs to kiln and is not checked by this ledger test. Stays with kiln's own tests: no kilnd VM scenario drives kiln's internal interleavings."
     },
     {
       "id": "C3-r1-L2",
@@ -1045,9 +1203,9 @@
       "severity": "LOW",
       "summary": "The universal directory-lock safety description overstated staging-failure cleanup.",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": null,
       "kiln": true,
-      "gap": "Kiln staging failure cleanup can unlink its unique name without its lock; no kilnd-tree regression or documentation guard pins the narrowed invariant."
+      "gap": "Kiln staging failure cleanup can unlink its unique name without its lock; no kilnd-tree regression or documentation guard pins the narrowed invariant. Stays with kiln's own tests: no kilnd VM scenario drives kiln's internal interleavings."
     },
     {
       "id": "C3-r2-L3",
@@ -1055,9 +1213,9 @@
       "severity": "LOW",
       "summary": "The stale-removal regression could pass on an unrelated busy refusal.",
       "mac": [],
-      "vm": "planned:C6b:hostile-content",
+      "vm": null,
       "kiln": true,
-      "gap": "The kiln replacement-generation regression needs an assertion distinguishing pathname rebinding from unrelated lock contention; it is outside this tree."
+      "gap": "The kiln replacement-generation regression needs an assertion distinguishing pathname rebinding from unrelated lock contention; it is outside this tree. Stays with kiln's own tests: no kilnd VM scenario drives kiln's internal interleavings."
     },
     {
       "id": "C4-H1",
@@ -1385,8 +1543,12 @@
       "mac": [
         "kilnd::manager::checkpoint::tests::fix::a_failed_capture_with_a_retained_artifact_keeps_the_restart_blocked"
       ],
-      "vm": "planned:C6b:V2/V3/V4/V17",
-      "gap": "The fake covers row and barrier logic; real process-crash residue and blocked restart have not been demonstrated by the existing VM engine test.",
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v2_daemon_death_mid_copy_reaps_the_worker_and_fails",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v3_helper_death_mid_copy_new_epoch_reaps_and_fails",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v4_copy_worker_death_fails_typed_and_removes_staging",
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v17_death_during_the_barrier_inventory_reruns_it"
+      ],
       "classification": "observation"
     },
     {
@@ -1666,6 +1828,19 @@
         "kilndctl::bin::tests::run_reports_exec_first_and_cleanup_second"
       ],
       "vm": null
+    },
+    {
+      "id": "C6b-V16",
+      "review": "C6b VM crash matrix",
+      "severity": "MEDIUM",
+      "summary": "A restore that found the artifact corrupt after allocating (kiln checks object digests in the shim) left the checkpoint READY instead of QUARANTINED, so later forks were admitted and failed the same way.",
+      "mac": [
+        "kilnd::manager::checkpoint::tests::fork::an_ambiguous_corrupt_restore_quarantines_the_checkpoint_and_keeps_its_charge",
+        "kilnd::manager::checkpoint::tests::fork::an_ambiguous_io_restore_leaves_the_checkpoint_ready"
+      ],
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::crash::c6b_v16_corrupt_payload_quarantines_and_delete_releases"
+      ]
     }
   ]
 }
