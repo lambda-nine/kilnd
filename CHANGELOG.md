@@ -6,6 +6,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- `kilndctl run` calls a command finished only when the daemon's execution record shows
+  it ran to its end (EXITED, or TIMED_OUT). A FAILED, CANCELED or INTERRUPTED record
+  followed by a failed cleanup says "Exec reported FAILED (kilndctl exit 125), but
+  cleanup failed"; exit codes are unchanged (C6a recheck 1 LOW).
 - Fix the C6a adversarial review's maintenance findings (four HIGH). The upgrade's
   checkpoint check now covers every configured or enrolled instance, stopped ones too; it
   reads root's snapshot through a copy the instance's account can read but not change,

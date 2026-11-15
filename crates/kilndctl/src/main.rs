@@ -621,22 +621,38 @@ fn run_outcome(
         Ok(ExecExit::Mapped(code)) => Err(anyhow::anyhow!(
             "Exec returned kilndctl exit {code}, but cleanup failed\n{note}"
         )),
+        Ok(ExecExit::Reported(code, state)) => Err(anyhow::anyhow!(
+            "Exec reported {} (kilndctl exit {code}), but cleanup failed\n{note}",
+            execution_state(state).to_uppercase()
+        )),
     }
 }
 
-/// Exec's exit code: `Finished` from the daemon's execution record, `Mapped` from a
-/// status kilndctl turned into a code (a deadline is 124), which may have come before
-/// any execution started.
+/// Exec's exit code: `Finished` from a daemon execution record of a command that ran to
+/// its end (EXITED, or TIMED_OUT and killed), `Reported` from any other record (FAILED
+/// may mean the backend never ran it; CANCELED, INTERRUPTED) with its state, and `Mapped`
+/// from a status kilndctl turned into a code (a deadline is 124), which may have come
+/// before any execution started.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ExecExit {
     Finished(u8),
+    Reported(u8, i32),
     Mapped(u8),
 }
 
 impl ExecExit {
     fn code(self) -> u8 {
         match self {
-            Self::Finished(code) | Self::Mapped(code) => code,
+            Self::Finished(code) | Self::Reported(code, _) | Self::Mapped(code) => code,
+        }
+    }
+
+    /// The exit for a daemon execution record, after reporting it.
+    fn of(e: &pb::Execution, opts: &ExecOpts) -> Self {
+        let code = report_execution(e, opts);
+        match pb::ExecutionState::try_from(e.state) {
+            Ok(pb::ExecutionState::Exited | pb::ExecutionState::TimedOut) => Self::Finished(code),
+            _ => Self::Reported(code, e.state),
         }
     }
 }
@@ -1231,7 +1247,7 @@ async fn exec(
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     )?;
-    Ok(ExecExit::Finished(report_execution(&e, opts)))
+    Ok(ExecExit::of(&e, opts))
 }
 
 /// `exec --stream`: live bytes as they come, gaps on stderr, then the same report and
@@ -1321,7 +1337,7 @@ async fn exec_streamed(
                     &mut std::io::sink(),
                     &mut std::io::stderr().lock(),
                 )?;
-                return Ok(ExecExit::Finished(report_execution(&e, opts)));
+                return Ok(ExecExit::of(&e, opts));
             }
         }
     }
@@ -2363,6 +2379,50 @@ mod tests {
                 .starts_with("the command finished (kilndctl exit 124), but cleanup failed\n"),
             "{e:#}"
         );
+    }
+
+    /// A record of a command that never ran to an end (FAILED can mean the backend never
+    /// ran it) is never called finished either (C6a recheck 1 LOW); exit codes unchanged.
+    #[test]
+    fn run_never_calls_an_unfinished_execution_finished() {
+        let sb = "sb-0123456789abcdef";
+        #[derive(Parser)]
+        struct Exec {
+            #[command(flatten)]
+            opts: ExecOpts,
+        }
+        let opts = Exec::try_parse_from(["exec"]).unwrap().opts;
+        let record = |state: pb::ExecutionState| pb::Execution {
+            state: state.into(),
+            exit_code: (state == pb::ExecutionState::Exited).then_some(3),
+            ..Default::default()
+        };
+        for (state, code, name) in [
+            (pb::ExecutionState::Failed, EXIT_FAILED, "FAILED"),
+            (pb::ExecutionState::Canceled, EXIT_FAILED, "CANCELED"),
+            (pb::ExecutionState::Interrupted, EXIT_FAILED, "INTERRUPTED"),
+        ] {
+            let exit = ExecExit::of(&record(state), &opts);
+            assert_eq!(exit.code(), code);
+            let busy = tonic::Status::failed_precondition("sandbox is busy");
+            let e = format!("{:#}", run_outcome(sb, Ok(exit), Err(busy)).unwrap_err());
+            assert!(
+                e.starts_with(&format!(
+                    "Exec reported {name} (kilndctl exit {code}), but cleanup failed\n"
+                )),
+                "{e}"
+            );
+            assert!(!e.contains("finished"), "{e}");
+        }
+        for (state, code) in [
+            (pb::ExecutionState::Exited, 3),
+            (pb::ExecutionState::TimedOut, EXIT_TIMED_OUT),
+        ] {
+            assert_eq!(
+                ExecExit::of(&record(state), &opts),
+                ExecExit::Finished(code)
+            );
+        }
     }
 
     fn lost_unknown_status() -> tonic::Status {
