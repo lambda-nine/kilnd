@@ -1341,17 +1341,26 @@ impl World {
             .collect()
     }
 
-    /// Waits for a worker of the current helper (a descendant of its process, so never
-    /// a restored sandbox's shim) whose arguments contain `word` (e.g. `capture` or
-    /// `--from-checkpoint`) and returns its pid.
+    /// Waits for a worker of the current helper (a descendant of its process) whose
+    /// arguments contain `word` (e.g. `capture` or `--from-checkpoint`), and returns the
+    /// outermost one: the CLI, never a restored sandbox's shim it started.
     pub(super) async fn worker(&self, word: &str, secs: u64) -> u32 {
         let end = StdInstant::now() + Duration::from_secs(secs);
         let helper = self.helper.as_ref().expect("a helper").pid as u32;
         loop {
-            if let Some((pid, _)) = self.workers().into_iter().find(|(pid, argv)| {
-                argv.iter().any(|a| a.contains(word)) && descends_from(*pid, helper)
-            }) {
-                return pid;
+            let matches: Vec<u32> = self
+                .workers()
+                .into_iter()
+                .filter(|(pid, argv)| {
+                    argv.iter().any(|a| a.contains(word)) && descends_from(*pid, helper)
+                })
+                .map(|(pid, _)| pid)
+                .collect();
+            if let Some(pid) = matches
+                .iter()
+                .find(|pid| !matches.iter().any(|other| other != *pid && descends_from(**pid, *other)))
+            {
+                return *pid;
             }
             assert!(StdInstant::now() < end, "no {word} worker in {secs} s");
             tokio::time::sleep(Duration::from_millis(10)).await;

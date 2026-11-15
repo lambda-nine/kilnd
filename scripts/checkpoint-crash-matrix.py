@@ -161,7 +161,9 @@ def main():
     parser.add_argument('--evidence', required=True)
     parser.add_argument('--set', required=True, choices=sorted(SETS))
     parser.add_argument('--only', action='append', default=[])
-    parser.add_argument('--timeout', type=int, default=900, help='seconds per scenario')
+    parser.add_argument('--timeout', type=int, default=600, help='seconds per scenario')
+    parser.add_argument('--stop-at-minutes', type=float, default=42,
+                        help='start no scenario past this VM uptime, so the restore starts on time')
     parser.add_argument('--ignore-uptime', action='store_true')
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -197,6 +199,10 @@ def main():
     log_path = os.path.join(evidence, 'tests-%s.log' % args.set)
     with open(log_path, 'a') as log:
         for module, name in chosen:
+            if not args.ignore_uptime and uptime_minutes() > args.stop_at_minutes:
+                print('stopping before %s: uptime %.1f min is past %.0f' % (
+                    name, uptime_minutes(), args.stop_at_minutes), flush=True)
+                break
             before = [] if name in NO_CHECK_BEFORE else host_problems(baseline, snapshot(binary))
             t0 = time.time()
             test = 'manager::checkpoint_vm_tests::%s::%s' % (module, name)
