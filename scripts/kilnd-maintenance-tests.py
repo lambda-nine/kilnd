@@ -149,6 +149,7 @@ class World:
         m.run = self.run
         m.as_account = self.as_account
         self.real_snapshot_state = m.snapshot_state
+        self.real_restore_state = m.restore_state
         self.real_standard_instances = getattr(m, 'standard_instances', None)
         m.snapshot_state = self.snapshot_state
         m.standard_instances = lambda: sorted(self.state)
@@ -517,8 +518,8 @@ class CheckpointWorld(World):
                                  op or 'schema', state, *map(str, args)], pass_fds=fds,
                                 capture_output=True, text=True, check=False)
         if result.returncode:
-            raise RuntimeError(result.stderr.strip())
-        return json.loads(result.stdout)
+            raise RuntimeError(result.stderr.strip() or 'exit %d' % result.returncode)
+        return json.loads(result.stdout) if result.stdout.strip() else {}
 
 
 class Checkpoints(Case):
@@ -918,6 +919,29 @@ class Checkpoints(Case):
         self.assertEqual(self.command('recover'), 3)
         self.accept()
 
+    def test_a_crash_restoring_a_later_instance_is_finished_before_the_hold(self):
+        """Every instance is restored before any artifact is compared, so the journal a
+        restore's marker writes never carries a difference found for an earlier instance:
+        that would hold the node (exit 3) with a later instance's state half restored."""
+        directory = self.artifact_dir()
+        self.fail_after_start(lambda: os.mkdir(directory + '/cp-new'))
+        real = self.m.restore_state
+
+        def restore(account, state, source):
+            if state == self.w.state[INSTANCE]:
+                os._exit(CRASHED)
+            return real(account, state, source)
+        self.m.restore_state = restore
+        self.assertEqual(self.w.crash_at('enrolled:', lambda: self.m.cmd_upgrade(
+            self.w.upgrade_args())), CRASHED)
+        self.m.restore_state = real
+        self.assertEqual(self.w.schema(INSTANCE), 99, 'killed before its restore')
+        self.assertEqual(self.command('recover'), 3)
+        self.assertEqual(self.w.schema(INSTANCE), 16, 'restored before the hold')
+        self.assertIn("added 'cp-new'", '\n'.join(self.messages))
+        self.assert_held()
+        self.accept()
+
     def test_old_journal_without_inventories_recovers(self):
         directory = self.artifact_dir()
         self.w.faults['migrate'] = True
@@ -1283,6 +1307,121 @@ _os.fsync = _racing_fsync
                           'the main file alone is half-written')
         with self.assertRaisesRegex(RuntimeError, 'readonly'):
             self.w.real_snapshot_state('kilnd', state, self.scratch + '/snapshot')
+
+    @staticmethod
+    def wal_database(directory, schema, prefix):
+        """A database whose second committed row is only in its WAL, its writer gone."""
+        os.mkdir(directory, 0o700)
+        subprocess.run([sys.executable, '-I', '-c', """if 1:
+            import os, sqlite3, sys
+            path, schema, prefix = sys.argv[1:]
+            db = sqlite3.connect(path + '/kilnd.db', isolation_level=None)
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('PRAGMA wal_autocheckpoint=0')
+            db.execute('PRAGMA user_version=' + schema)
+            db.execute('CREATE TABLE payload (value TEXT)')
+            db.execute('INSERT INTO payload VALUES (?)', (prefix + '-main',))
+            db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            db.execute('INSERT INTO payload VALUES (?)', (prefix + '-wal',))
+            for name in ('kilnd.db', 'kilnd.db-wal', 'kilnd.db-shm'):
+                os.chmod(path + '/' + name, 0o600)
+            os._exit(0)
+            """, directory, str(schema), prefix], check=True)
+
+    @staticmethod
+    def payload(state):
+        with closing(sqlite3.connect(state + '/kilnd.db')) as db:
+            return db.execute('SELECT value FROM payload ORDER BY rowid').fetchall()
+
+    def crashing_child(self, step):
+        """The account child, killed just after its step'th unlink, fsync or rename."""
+        return ('import os as _os\n'
+                '_steps = [0]\n'
+                'def _step(real):\n'
+                '    def wrapped(*args, **kwargs):\n'
+                '        try:\n'
+                '            return real(*args, **kwargs)\n'
+                '        finally:\n'
+                '            _steps[0] += 1\n'
+                '            if _steps[0] == %d:\n'
+                '                _os._exit(97)\n'
+                '    return wrapped\n'
+                '_os.unlink, _os.fsync, _os.replace = map(_step, (_os.unlink, _os.fsync, _os.replace))\n'
+                % step) + self.m.ACCOUNT_CHILD
+
+    def restore_crash_matrix(self, legacy):
+        """Recheck 2 H2: kill the restore after each of its steps, then retry from the journal;
+        every retry gives the snapshot's rows. legacy is an old journal's DB+WAL snapshot."""
+        m, child = self.m, self.m.ACCOUNT_CHILD
+        m.restore_state = self.w.real_restore_state
+        os.makedirs(m.TXN_DIR, exist_ok=True)
+        snapshot, live = self.scratch + '/old-snapshot', self.scratch + '/live'
+        self.wal_database(self.scratch + '/old', 15, 'old')
+        if legacy:
+            shutil.copytree(self.scratch + '/old', snapshot)
+        else:
+            self.w.real_snapshot_state('unused', self.scratch + '/old', snapshot)
+        self.assertEqual(sorted(os.listdir(snapshot)),
+                         ['kilnd.db', 'kilnd.db-shm', 'kilnd.db-wal'] if legacy else ['kilnd.db'])
+        self.wal_database(self.scratch + '/new', 16, 'new')
+        kept = {'account': 'unused', 'state': live, 'schema': 15, 'snapshot': snapshot}
+        step, crashed = 0, True
+        while crashed:
+            shutil.rmtree(live, ignore_errors=True)
+            shutil.copytree(self.scratch + '/new', live)
+            journal = {'started': False, 'instances': {'kilnd.service': kept}}
+            m.write_json(m.JOURNAL, journal)
+            real = m.restore_state
+            if step:
+                m.ACCOUNT_CHILD = self.crashing_child(step)
+            else:
+                # The marker is durable before the child starts: a crash there is redone too.
+                m.restore_state = mock.Mock(side_effect=RuntimeError('killed before the child'))
+            crashed = True
+            try:
+                m.restore_instance('kilnd.service', kept, journal)
+                crashed = False
+            except RuntimeError:
+                pass
+            finally:
+                m.ACCOUNT_CHILD, m.restore_state = child, real
+            if crashed:
+                journal = m.read_json(m.JOURNAL)
+                self.assertTrue(journal['restoring']['kilnd.service'], 'step %d' % step)
+                m.restore_instance('kilnd.service', kept, journal)
+            self.assertEqual(self.payload(live), [('old-main',), ('old-wal',)], 'step %d' % step)
+            self.assertEqual(m.read_json(m.JOURNAL)['restoring'], {}, 'step %d' % step)
+            self.assertFalse([n for n in os.listdir(live) if n.endswith('.restore')])
+            step += 1
+        self.assertGreater(step, 5)
+
+    def test_a_legacy_wal_restore_killed_after_any_step_is_redone(self):
+        self.restore_crash_matrix(legacy=True)
+
+    def test_a_single_file_restore_killed_after_any_step_is_redone(self):
+        self.restore_crash_matrix(legacy=False)
+
+    def test_a_restore_after_serving_sets_the_newer_state_aside_once(self):
+        m, child = self.m, self.m.ACCOUNT_CHILD
+        m.restore_state = self.w.real_restore_state
+        m.snapshot_state = self.w.real_snapshot_state
+        os.makedirs(m.TXN_DIR, exist_ok=True)
+        self.wal_database(self.scratch + '/old', 15, 'old')
+        self.wal_database(self.scratch + '/live', 16, 'new')
+        kept = {'account': 'unused', 'state': self.scratch + '/live', 'schema': 15,
+                'snapshot': self.scratch + '/old'}
+        journal = {'started': True, 'instances': {'kilnd.service': kept}}
+        m.write_json(m.JOURNAL, journal)
+        m.ACCOUNT_CHILD = self.crashing_child(5)
+        with self.assertRaises(RuntimeError):
+            m.restore_instance('kilnd.service', kept, journal)
+        m.ACCOUNT_CHILD = child
+        m.restore_instance('kilnd.service', kept, m.read_json(m.JOURNAL))
+        self.assertEqual(self.payload(kept['state']), [('old-main',), ('old-wal',)])
+        aside = os.listdir(m.FAILED_DIR)
+        self.assertEqual(len(aside), 1, 'the redo copies nothing aside')
+        self.assertEqual(self.payload(os.path.join(m.FAILED_DIR, aside[0], 'kilnd.service')),
+                         [('new-main',), ('new-wal',)])
 
     def forget_identity(self, unit='kilnd.service'):
         with closing(sqlite3.connect(self.w.state[unit] + '/kilnd.db')) as db, db:

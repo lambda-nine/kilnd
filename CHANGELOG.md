@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Make the rollback's state restore crash-consistent (C6a recheck 2 HIGH 2). The journal
+  marks an instance's restore before it touches the live state and clears the mark only
+  after the directory is synced; a retry that finds it redoes the whole restore rather than
+  trusting the live schema. The account stages and syncs every file before it removes the
+  sidecars the snapshot lacks and renames the database, then its WAL, in.
 - Close the upgrade's quiescence race (C6a recheck 2 HIGH 1). `kilnd init-state` gains
   `--refuse-busy-checkpoints`, which only the upgrade passes: it checks for busy
   checkpoints inside the migration's own IMMEDIATE transaction (or, at the current schema,

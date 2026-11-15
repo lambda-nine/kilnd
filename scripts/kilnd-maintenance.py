@@ -577,14 +577,11 @@ if op == 'snapshot':
     os.fsync(destination)
     print(json.dumps({'copied': ['kilnd.db']}))
 elif op == 'restore':
-    # One source descriptor per name in the snapshot, in NAMES order.
+    # One source descriptor per name in the snapshot, in NAMES order, never kilnd.db-shm.
+    # Every file is staged and synced first, then what the snapshot lacks goes (and the shm
+    # always), then the database and its WAL are renamed in. Root's journal marks the restore
+    # until the directory is synced, so a crash anywhere in here is met by doing it all again.
     names = sys.argv[3].split(',') if sys.argv[3] else []
-    for name in NAMES:
-        if name not in names:
-            try:
-                os.unlink(path(name))
-            except FileNotFoundError:
-                pass
     for name, source in zip(names, map(int, sys.argv[4:])):
         temporary = path(name + '.restore')
         try:
@@ -595,7 +592,14 @@ elif op == 'restore':
         copy(source, destination)
         os.fsync(destination)
         os.close(destination)
-        os.replace(temporary, path(name))
+    for name in NAMES:
+        if name not in names:
+            try:
+                os.unlink(path(name))
+            except FileNotFoundError:
+                pass
+    for name in names:
+        os.replace(path(name + '.restore'), path(name))
     fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
     os.fsync(fd)
 elif op == 'checkpoints':
@@ -674,7 +678,10 @@ def snapshot_state(account, state, destination):
 
 
 def restore_state(account, state, source):
-    names = [n for n in CHILD_NAMES if os.path.exists(os.path.join(source, n))]
+    """The snapshot's files in place of the live ones. An old journal's snapshot can hold a
+    WAL; its shm is never restored, as SQLite rebuilds one."""
+    names = [n for n in CHILD_NAMES
+             if n != 'kilnd.db-shm' and os.path.exists(os.path.join(source, n))]
     fds = [os.open(os.path.join(source, n), os.O_RDONLY) for n in names]
     try:
         as_account(account, 'restore', state, ','.join(names), *fds, fds=fds)
@@ -1406,7 +1413,10 @@ def rollback(journal, window, boot=False):
 
             for unit, kept in journal['instances'].items():
                 attempt('restore the state of ' + unit,
-                        lambda u=unit, k=kept: restore_instance(u, k, journal.get('started')))
+                        lambda u=unit, k=kept: restore_instance(u, k, journal))
+            # Only after every restore: the journal a restore's marker writes must never carry
+            # a difference, which holds the node, while another instance is still unrestored.
+            for unit, kept in journal['instances'].items():
                 attempt('check the checkpoint artifacts of ' + unit,
                         lambda u=unit, k=kept: compare_checkpoints(u, k, journal))
         if errors:
@@ -1435,24 +1445,32 @@ def rollback(journal, window, boot=False):
     return True
 
 
-def restore_instance(unit, kept, started):
+def restore_instance(unit, kept, journal):
     """Only a schema the old image can't open is put back. Otherwise the database in place
     is the newer truth, and replacing it could forget a reservation made since. If a daemon
-    served in between, what it wrote is kept for inspection instead of being lost silently."""
-    current = None
-    try:
-        current = as_account(kept['account'], 'schema', kept['state'])['schema']
-    except (OSError, RuntimeError, KeyError) as error:
-        log('rollback: reading %s: %s' % (kept['state'], error))
-    if current == kept['schema']:
-        return
-    if started:
-        os.makedirs(FAILED_DIR, mode=0o700, exist_ok=True)
-        aside = tempfile.mkdtemp(prefix=time.strftime('%Y%m%dT%H%M%S-'), dir=FAILED_DIR)
-        aside = os.path.join(aside, unit)
-        snapshot_state(kept['account'], kept['state'], aside)
-        log('%s had a newer schema, and may have served: what it held is in %s' % (unit, aside))
+    served in between, what it wrote is kept for inspection instead of being lost silently.
+    Once a restore has begun, its durable marker makes every retry redo all of it: a live
+    file restored beside one not yet restored is neither database, whatever its schema."""
+    restoring = journal.setdefault('restoring', {})
+    if not restoring.get(unit):
+        current = None
+        try:
+            current = as_account(kept['account'], 'schema', kept['state'])['schema']
+        except (OSError, RuntimeError, KeyError) as error:
+            log('rollback: reading %s: %s' % (kept['state'], error))
+        if current == kept['schema']:
+            return
+        if journal.get('started'):
+            os.makedirs(FAILED_DIR, mode=0o700, exist_ok=True)
+            aside = tempfile.mkdtemp(prefix=time.strftime('%Y%m%dT%H%M%S-'), dir=FAILED_DIR)
+            aside = os.path.join(aside, unit)
+            snapshot_state(kept['account'], kept['state'], aside)
+            log('%s had a newer schema, and may have served: what it held is in %s' % (unit, aside))
+        restoring[unit] = True
+        write_json(JOURNAL, journal)
     restore_state(kept['account'], kept['state'], kept['snapshot'])
+    del restoring[unit]
+    write_json(JOURNAL, journal)
 
 
 def finish_interrupted(boot=False):

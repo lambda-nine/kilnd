@@ -139,6 +139,14 @@ for every running instance as one transaction. With checkpoints it also:
   records none is refused (exit 2) if it has checkpoint state (schema 15 or later with a
   checkpoint table); start kilnd once so it records one. Older state with no ID has no
   checkpoints and is journaled without an inventory.
+- **Restores a snapshot all or nothing, across crashes.** Before a rollback touches an
+  instance's live state it records, durably in its journal, that the restore has begun
+  (after setting aside what a newer schema that may have served held). The account stages
+  and syncs every snapshot file first, removes the live `-wal`, `-shm` and `-journal` the
+  snapshot doesn't hold (the `-shm` always), renames the database and then its WAL in, and
+  syncs the directory; only then is the mark cleared. A retry that finds the mark redoes the
+  whole restore from the snapshot, whatever schema the live file shows, so an old journal's
+  snapshot with a WAL can't end up beside the failed upgrade's WAL.
 - **Records the instance's artifact inventory** beside its database snapshot: the name,
   type and inode of each entry at the top of `.checkpoints/<instance>/`. Root walks from
   `/`, opening every component without following a link, and refuses (exit 2) unless `/`
