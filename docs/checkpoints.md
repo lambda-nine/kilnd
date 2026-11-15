@@ -153,9 +153,16 @@ for every running instance as one transaction. With checkpoints it also:
   and every ancestor of the registry are root's and not group- or other-writable, the
   registry and instance directories are root's alone (`0700`), and at most one ancestor,
   and neither of those two, is a mount point: the mount root of a whole filesystem (its
-  mount source root is `/`, and its device is the one the walk opened), not a bind mount
-  of a subtree. Any other change of filesystem on the way is refused, and so is a
-  `/proc/self/mountinfo` the upgrade can't read. An absent instance directory and an
+  mount source root is `/`, and its device is the one the walk opened), or a Btrfs
+  subvolume mounted by itself, not a bind mount of a subtree. A Btrfs subvolume's
+  mountinfo root is its `subvol=` path (`/@var` for `/var` on a common layout), and `stat`
+  gives each subvolume a device of its own rather than mountinfo's, so such a mount is
+  accepted only when its type is `btrfs`, its root equals exactly the `subvol=` path in
+  its mount or superblock options, and the directory the walk opened is a subvolume root
+  (inode 256). A Btrfs mount rooted below its subvolume (`/@var/sub` with
+  `subvol=/@var`), or any other filesystem with a root other than `/`, is a bind mount
+  and refused. Any other change of filesystem on the way is refused, and so is a
+  `/proc/self/mountinfo` the upgrade can't read or parse. An absent instance directory and an
   empty one are the same inventory, and a changed modification time alone is not a
   difference.
 - **Checks the inventory after a rollback, and fails closed on a difference.** Artifacts

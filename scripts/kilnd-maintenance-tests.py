@@ -70,9 +70,10 @@ def safe_base():
     raise AssertionError('no scratch base the registry walk accepts')
 
 
-def mountinfo_line(number, path, meta, root='/'):
-    return '%d 1 %d:%d %s %s rw - fake fake rw\n' % (
-        number, os.major(meta.st_dev), os.minor(meta.st_dev), root, path)
+def mountinfo_line(number, path, meta, root='/', fstype='fake', options='rw', device=None):
+    return '%d 1 %s %s %s rw shared:1 - %s fake %s\n' % (
+        number, device or '%d:%d' % (os.major(meta.st_dev), os.minor(meta.st_dev)), root, path,
+        fstype, options)
 
 
 def write_mountinfo(path, root, extra=()):
@@ -992,8 +993,8 @@ class Checkpoints(Case):
                 self.m.checkpoint_inventory(instance)
             self.m.os.fstat = os.fstat
 
-    def fake_fstat(self, path, uid=None, dev=None):
-        """os.fstat as the walk sees it, with path's owner or device changed."""
+    def fake_fstat(self, path, uid=None, dev=None, ino=None):
+        """os.fstat as the walk sees it, with path's owner, device or inode changed."""
         inode = os.stat(path).st_ino
 
         def fstat(fd):
@@ -1003,6 +1004,7 @@ class Checkpoints(Case):
             fields = list(meta[:10])
             fields[4] = fields[4] if uid is None else uid
             fields[2] = fields[2] if dev is None else dev
+            fields[1] = fields[1] if ino is None else ino
             return os.stat_result(fields)
         self.m.os.fstat = fstat
 
@@ -1508,8 +1510,47 @@ _os.fsync = _racing_fsync
         """/ and at most the scratch filesystem's own mount point, then extra lines."""
         write_mountinfo(self.m.MOUNTINFO, self.scratch, extra)
 
-    def mount_at(self, path, root='/', number=9):
-        return mountinfo_line(number, path.replace(' ', '\\040'), os.stat(path), root)
+    def mount_at(self, path, root='/', number=9, **line):
+        return mountinfo_line(number, path.replace(' ', '\\040'), os.stat(path), root, **line)
+
+    def btrfs_var(self, root='/@var', subvol='/@var', ino=256, fstype='btrfs'):
+        """scratch/var as a Btrfs subvolume mounted by itself: stat gives a subvolume its own
+        device, never mountinfo's, so the line's device is another one."""
+        var = self.scratch + '/var'
+        self.fake_fstat(var, ino=ino)
+        self.mounts(self.mount_at(var, root=root, fstype=fstype, device='0:9999', options=(
+            'rw,relatime,ssd,space_cache=v2,subvolid=257' + (',subvol=' + subvol if subvol else ''))))
+
+    def test_an_empty_flag_off_node_on_a_btrfs_subvolume_upgrades(self):
+        """Recheck 2 H4: /var a Btrfs subvolume rooted at /@var, no checkpoint rows, no
+        registry. The upgrade proceeds as it would on any other filesystem."""
+        self.assertFalse(os.path.exists(self.m.CHECKPOINTS_ROOT))
+        self.btrfs_var()
+        self.upgrade()
+        self.assertEqual(self.w.images(), {i: 'new' for i in self.m.IMAGES})
+
+    def test_inventory_reads_a_registry_on_a_btrfs_subvolume(self):
+        os.mkdir(self.artifact_dir() + '/cp-a')
+        self.btrfs_var()
+        self.assertEqual([e['name'] for e in self.m.checkpoint_inventory(
+            self.w.identity('kilnd.service'))], ['cp-a'])
+
+    def test_inventory_refuses_what_only_looks_like_a_btrfs_subvolume(self):
+        instance = self.w.identity('kilnd.service')
+        self.artifact_dir()
+        for what, shape in (
+                ('a btrfs bind mount of a subdirectory', dict(root='/@var/sub')),
+                ('a btrfs root with no subvol=', dict(subvol=None)),
+                ('a btrfs subvol= other than the root', dict(subvol='/@other')),
+                ('a btrfs root that is not a subvolume root', dict(ino=257)),
+                ('an ext4 bind mount', dict(root='/sub', subvol=None, fstype='ext4')),
+                ('a subvol= on another filesystem', dict(fstype='ext4'))):
+            self.btrfs_var(**shape)
+            with self.assertRaisesRegex(OSError, 'var is a mount point', msg=what):
+                self.m.checkpoint_inventory(instance)
+        self.upgrade(2)
+        self.assertIn('cannot inventory the checkpoint artifacts of kilnd.service',
+                      '\n'.join(self.messages))
 
     def test_inventory_refuses_a_bind_mount_on_the_way(self):
         instance = self.w.identity('kilnd.service')

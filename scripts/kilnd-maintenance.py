@@ -72,6 +72,7 @@ INSPECT_DIR = '/run'
 STATE_PARENT = '/var/lib'
 PROC = '/proc'
 MOUNTINFO = '/proc/self/mountinfo'
+BTRFS_SUBVOLUME_ROOT = 256  # BTRFS_FIRST_FREE_OBJECTID: every subvolume's root inode
 STAGE = BIN + '/.kilnd-upgrade'
 MANAGED_FILES = {
     'kilnd-helper.socket': '/etc/systemd/system/kilnd-helper.socket',
@@ -1270,7 +1271,9 @@ def discard_transaction():
 
 
 def mount_points():
-    """Each mount point's stack of (major:minor, root), in mountinfo's order, the top last."""
+    """Each mount point's stack of (major:minor, root, Btrfs subvolume or None), in mountinfo's
+    order, the top last. The subvolume is a btrfs mount's subvol= path, from its mount or its
+    superblock options."""
     def decode(field):
         return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), field)
     mounts = {}
@@ -1278,9 +1281,13 @@ def mount_points():
         lines = file.read().decode('utf-8', 'surrogateescape').splitlines()
     for line in lines:
         fields = line.split(' ')
-        if len(fields) < 5 or not re.fullmatch(r'\d+:\d+', fields[2]):
+        end = fields.index('-', 6) if '-' in fields[6:] else len(fields)
+        if len(fields) < end + 4 or not re.fullmatch(r'\d+:\d+', fields[2]):
             raise OSError(errno.EINVAL, 'cannot parse %s: %r' % (MOUNTINFO, line))
-        mounts.setdefault(decode(fields[4]), []).append((fields[2], decode(fields[3])))
+        subvolumes = {decode(o[7:]) for o in (*fields[5].split(','), *fields[end + 3].split(','))
+                      if o.startswith('subvol=')}
+        subvolume = subvolumes.pop() if fields[end + 1] == 'btrfs' and len(subvolumes) == 1 else None
+        mounts.setdefault(decode(fields[4]), []).append((fields[2], decode(fields[3]), subvolume))
     return mounts
 
 
@@ -1313,9 +1320,16 @@ def checkpoint_inventory(instance):
                 elif meta.st_uid not in (0, REGISTRY_UID) or meta.st_mode & 0o022:
                     raise OSError(errno.EPERM, "%s is not root's, or others can write it" % where)
                 if where in mounts:
-                    device, root = mounts[where][-1]
-                    if mounted is not None or index >= protected or root != '/' \
-                            or device != '%d:%d' % (os.major(meta.st_dev), os.minor(meta.st_dev)):
+                    device, root, subvolume = mounts[where][-1]
+                    whole = root == '/' and \
+                        device == '%d:%d' % (os.major(meta.st_dev), os.minor(meta.st_dev))
+                    # A Btrfs subvolume mounted by itself shows its subvol= path as its root,
+                    # and stat gives each subvolume a device of its own, not mountinfo's: it is
+                    # known instead by its root directory, inode 256 in every subvolume. A
+                    # root below the subvolume's is a bind mount of a subtree, as anywhere.
+                    whole = whole or (subvolume is not None and root == subvolume
+                                      and meta.st_ino == BTRFS_SUBVOLUME_ROOT)
+                    if mounted is not None or index >= protected or not whole:
                         raise OSError(errno.EXDEV, '%s is a mount point (bind mount?)' % where)
                     mounted = where
                 elif meta.st_dev != above.st_dev:

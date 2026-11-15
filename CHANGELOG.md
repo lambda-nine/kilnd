@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Accept a Btrfs subvolume on the registry's path (C6a recheck 2 HIGH 4). The inventory's
+  mount check took a separately mounted subvolume (`/var` rooted at `/@var`) for a bind
+  mount and refused even an empty flag-off node. A `btrfs` mount whose root is exactly its
+  `subvol=` path, at a subvolume root, now counts as a whole filesystem; a Btrfs mount
+  rooted below its subvolume and any other non-`/` root are still refused.
 - Resolve `build.sh`'s paths before checking them (C6a recheck 2 HIGH 3). A relative
   `CARGO_HOME` was checked from the caller's directory but read by cargo from the
   repository, so its `[env]` could bless goldens. `build.sh` now changes to the repository
