@@ -1423,6 +1423,48 @@ async fn of_two_supervisors_leaving_the_later_sees_the_earlier_gone_and_arms() {
     }
 }
 
+/// The same rule on real threads: the two supervisors leave from two OS threads
+/// released together, many times, as a multi-thread runtime or an embedding could run
+/// them (the exit is synchronous, so plain threads race it truly; tasks it spawns go
+/// to this test's runtime). Each round must end with the row untracked and the barrier
+/// armed, never with both believing the other still owns it.
+#[tokio::test]
+async fn supervisors_leaving_on_two_threads_always_arm_once_neither_owns_the_row() {
+    const ROUNDS: usize = 200;
+    let runtime = tokio::runtime::Handle::current();
+    for round in 0..ROUNDS {
+        let (m, fake, _) = engine();
+        let s = source(&m, 1000).await;
+        let c = c1_only(&m, &fake, &s).await;
+        let id = c.id.to_string();
+        m.checkpoint
+            .captures
+            .lock()
+            .unwrap()
+            .insert(id.clone(), CancellationToken::new());
+        m.checkpoint.retrying.lock().unwrap().insert(id.clone());
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for who in [Supervisor::Capture, Supervisor::Removal] {
+                let (m, id, start, runtime) = (&m, &id, &start, &runtime);
+                scope.spawn(move || {
+                    let _context = runtime.enter();
+                    start.wait();
+                    m.supervisor_exit(id, who, true);
+                });
+            }
+        });
+        assert!(m.allocation_blocked(), "round {round}: nobody armed");
+        assert!(
+            m.store.checkpoint_barrier_marked().unwrap(),
+            "round {round}: no marker"
+        );
+        assert!(m.checkpoint.captures.lock().unwrap().is_empty());
+        assert!(m.checkpoint.retrying.lock().unwrap().is_empty());
+        m.begin_shutdown();
+    }
+}
+
 // --- C5b-2: flag-off Health golden ----------------------------------------------------
 
 /// The flag-off Health response over a fixed history (uids 1000 and 1001, a keyed
