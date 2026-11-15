@@ -18,7 +18,9 @@
 //! across forks is milestone C6b's, in the VM.
 //!
 //! `harness_contract_goldens_match` pins every fixture step, the typed reason table and
-//! flag-on Health in `tests/data/checkpoint-contract.json`.
+//! flag-on Health in `tests/data/checkpoint-contract.json`; `wire` pins the checkpoint
+//! messages' protobuf encoding in `tests/data/checkpoint-wire.json` and a previous
+//! client's decode of it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -82,9 +84,11 @@ fn turn_req(sandbox_id: &str, argv: &[&str]) -> pb::ExecStreamRequest {
 }
 
 /// Where the fixtures' injected clock starts: far past any host time, so a time the
-/// daemon took from it renders as `<t-N>`, and one the host clock stamped (sandbox and
-/// execution rows) as `<wall>`.
+/// daemon took from it renders as its exact offset from here, `<clock+N>`, and one the
+/// host clock stamped (sandbox and execution rows) as `<wall>`.
 const CLOCK_WALL_MS: i64 = 4_000_000_000_000;
+/// No fixture runs its clock this far; a time past it is no offset of the clock's.
+const CLOCK_SPAN_MS: i64 = 24 * 60 * MIN as i64;
 
 /// A daemon as the harness meets it: started, SERVING, with ExecStream and workspace
 /// checkpoints listed.
@@ -233,6 +237,10 @@ impl J {
 struct Placeholders {
     names: HashMap<String, String>,
     counts: BTreeMap<&'static str, usize>,
+    /// Test-only: added to every nonzero `Checkpoint.expiry.idle_expires_at_unix_ms`
+    /// before it renders, as a service that published a later deadline than it enforces
+    /// would (`the_golden_catches_a_published_idle_deadline_shift`).
+    idle_shift_ms: i64,
 }
 
 /// An ID or digest starting at `s` (already at a word boundary): its kind and length.
@@ -269,9 +277,10 @@ impl Placeholders {
         name
     }
 
-    /// `text` with every sandbox, execution and checkpoint ID, digest, 128-bit ID and
-    /// nonzero `*_unix_ms` time replaced. Host-clock times are all `<wall>`: their
-    /// equalities depend on how fast the test runs.
+    /// `text` with every sandbox, execution and checkpoint ID, digest and 128-bit ID
+    /// replaced, and every nonzero `*_unix_ms` time: the injected clock's as its exact
+    /// offset `<clock+N>`, the host clock's as `<wall>` (their values and equalities
+    /// depend on when and how fast the test runs).
     fn render(&mut self, text: &str) -> String {
         const TIME: &str = "_unix_ms: ";
         let b = text.as_bytes();
@@ -294,7 +303,12 @@ impl Placeholders {
                     .count();
                 match text[i..end].parse::<i64>().unwrap() {
                     0 => out.push('0'),
-                    t if t >= CLOCK_WALL_MS => out.push_str(&self.name("t", &text[i..end])),
+                    t if t >= CLOCK_WALL_MS => {
+                        let t = t + self.shift_at(&text[..i]);
+                        let offset = t - CLOCK_WALL_MS;
+                        assert!(offset < CLOCK_SPAN_MS, "{text}");
+                        out.push_str(&format!("<clock+{offset}>"));
+                    }
                     _ => out.push_str("<wall>"),
                 }
                 i = end;
@@ -305,6 +319,22 @@ impl Placeholders {
             i += c.len_utf8();
         }
         out
+    }
+
+    /// The test-only shift for the time whose field `before` ends with.
+    fn shift_at(&self, before: &str) -> i64 {
+        const IDLE: &str = "idle_expires_at_unix_ms: ";
+        const STATUS: &str = "ExpiryStatus {";
+        // The field is in both ExpiryStatus and CheckpointExpiryStatus; the nearest
+        // opener is its own.
+        let in_checkpoint = before
+            .rfind(STATUS)
+            .is_some_and(|at| before[..at].ends_with("Checkpoint"));
+        if self.idle_shift_ms != 0 && before.ends_with(IDLE) && in_checkpoint {
+            self.idle_shift_ms
+        } else {
+            0
+        }
     }
 
     fn debug(&mut self, value: &impl Debug) -> J {
@@ -404,6 +434,50 @@ impl Recorder {
 
 // --- Recorded RPCs ---------------------------------------------------------------------
 
+/// A checkpoint's published deadlines are its effective policy's offsets from their
+/// anchors (design Appendix A), checked before the recorder renders them: the lifetime
+/// from READY, idle from the last activity, and none on a row no timer holds or (idle)
+/// one a restore pins.
+#[track_caller]
+fn published_deadlines(c: &pb::Checkpoint) {
+    let x = c.expiry.unwrap();
+    let policy = x.effective.unwrap();
+    let after = |anchor: i64, ms: u64| anchor + i64::try_from(ms).unwrap();
+    let (lifetime, idle) = if state(c) == pb::CheckpointState::Ready {
+        (
+            after(c.ready_at_unix_ms, policy.max_lifetime_ms),
+            if x.idle_paused {
+                0
+            } else {
+                after(x.last_activity_at_unix_ms, policy.idle_timeout_ms)
+            },
+        )
+    } else {
+        (0, 0)
+    };
+    assert_eq!(
+        (x.lifetime_expires_at_unix_ms, x.idle_expires_at_unix_ms),
+        (lifetime, idle),
+        "{c:?}"
+    );
+}
+
+/// A live sandbox's published idle deadline is its policy's offset from its last
+/// activity (its lifetime's anchor, the creation on the daemon's clock, is not
+/// published).
+#[track_caller]
+fn published_sandbox_idle(s: &pb::Sandbox) {
+    let x = s.expiry.unwrap();
+    let idle = x.effective.unwrap().idle_timeout_ms;
+    if sandbox_state(s) == pb::SandboxState::Ready && !x.idle_paused {
+        assert_eq!(
+            x.idle_expires_at_unix_ms,
+            x.last_activity_at_unix_ms + i64::try_from(idle).unwrap(),
+            "{s:?}"
+        );
+    }
+}
+
 async fn rpc_create(
     s: &Api,
     rec: &mut Recorder,
@@ -414,6 +488,9 @@ async fn rpc_create(
         .create_sandbox(as_uid(msg.clone(), UID))
         .await
         .map(|r| r.into_inner().sandbox.unwrap());
+    if let Ok(sb) = &r {
+        published_sandbox_idle(sb);
+    }
     rec.call(label, "CreateSandbox", &msg, &r);
     r
 }
@@ -428,6 +505,14 @@ async fn rpc_capture(
         .checkpoint_sandbox(as_uid(msg.clone(), UID))
         .await
         .map(|r| r.into_inner().checkpoint.unwrap());
+    if let Ok(c) = &r {
+        assert_eq!(
+            c.expiry.unwrap().effective,
+            msg.expiry,
+            "the policy asked for"
+        );
+        published_deadlines(c);
+    }
     rec.call(label, "CheckpointSandbox", &msg, &r);
     r
 }
@@ -438,6 +523,9 @@ async fn rpc_get_checkpoint(s: &Api, rec: &mut Recorder, label: &str, id: &str) 
         .get_checkpoint(as_uid(msg.clone(), UID))
         .await
         .map(|r| r.into_inner().checkpoint.unwrap());
+    if let Ok(c) = &r {
+        published_deadlines(c);
+    }
     rec.call(label, "GetCheckpoint", &msg, &r);
     r.unwrap()
 }
@@ -458,6 +546,9 @@ async fn rpc_list_checkpoints(
         .list_checkpoints(as_uid(msg.clone(), UID))
         .await
         .map(|r| r.into_inner());
+    if let Ok(page) = &r {
+        page.checkpoints.iter().for_each(published_deadlines);
+    }
     rec.call(label, "ListCheckpoints", &msg, &r);
     r.unwrap().checkpoints
 }
@@ -476,6 +567,9 @@ async fn rpc_delete_checkpoint(
         .delete_checkpoint(as_uid(msg.clone(), UID))
         .await
         .map(|r| r.into_inner().checkpoint.unwrap());
+    if let Ok(c) = &r {
+        published_deadlines(c);
+    }
     rec.call(label, "DeleteCheckpoint", &msg, &r);
     let c = r.unwrap();
     assert_eq!(state(&c), pb::CheckpointState::Deleted, "{c:?}");
@@ -491,6 +585,9 @@ async fn rpc_get_sandbox(s: &Api, rec: &mut Recorder, label: &str, id: &str) -> 
         .get_sandbox(as_uid(msg.clone(), UID))
         .await
         .map(|r| r.into_inner());
+    if let Ok(got) = &r {
+        published_sandbox_idle(got.sandbox.as_ref().unwrap());
+    }
     rec.call(label, "GetSandbox", &msg, &r);
     r.unwrap().sandbox.unwrap()
 }
@@ -876,6 +973,9 @@ async fn f2_best_of_four(rec: &mut Recorder) {
         }
         gate.release();
         let (msg, r) = admitted.await.unwrap();
+        if let Ok(f) = &r {
+            published_sandbox_idle(f);
+        }
         rec.call(
             &format!("round {round}: branch {first}, admitted"),
             "CreateSandbox",
@@ -1135,8 +1235,77 @@ async fn f3_eval_reset_forks_per_run_and_reseeds_past_the_lifetime() {
 
 const BLESS: &str = "KILND_BLESS_CHECKPOINT_CONTRACT";
 
-fn golden_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/checkpoint-contract.json")
+fn data_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name)
+}
+
+/// Whether this run rewrites the goldens, from `KILND_BLESS_CHECKPOINT_CONTRACT` and `CI`:
+/// only when asked with `1`, and never under CI (any nonempty `CI`), where a rewritten
+/// golden would pass whatever the run produced.
+fn bless_requested(
+    bless: Option<&std::ffi::OsStr>,
+    ci: Option<&std::ffi::OsStr>,
+) -> Result<bool, String> {
+    if bless.is_none_or(|v| v != "1") {
+        return Ok(false);
+    }
+    if ci.is_some_and(|v| !v.is_empty()) {
+        return Err(format!(
+            "{BLESS}=1 is refused while CI is set: bless the goldens locally and review the diff"
+        ));
+    }
+    Ok(true)
+}
+
+/// Where `file` (a golden's text) differs from `golden`, or None when it is the same.
+fn golden_mismatch(golden: &J, file: &str) -> Option<String> {
+    if file == golden.text() {
+        return None;
+    }
+    Some(match serde_json::from_str::<serde_json::Value>(file) {
+        Err(_) => "the file is missing or not JSON".to_string(),
+        Ok(v) => golden
+            .first_difference("$", Some(&v))
+            .unwrap_or_else(|| "only its formatting differs".to_string()),
+    })
+}
+
+/// Compares `golden` with `tests/data/<name>`, or rewrites that file when blessing.
+#[track_caller]
+fn check_golden(name: &str, golden: &J) {
+    let path = data_path(name);
+    let blessing = bless_requested(
+        std::env::var_os(BLESS).as_deref(),
+        std::env::var_os("CI").as_deref(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    if blessing {
+        bless(&path, &golden.text());
+        return;
+    }
+    let file = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Some(what) = golden_mismatch(golden, &file) {
+        panic!(
+            "tests/data/{name} differs from this run: {what}. If the change is intended, rerun with {BLESS}=1 (not under CI) and review the diff."
+        );
+    }
+}
+
+#[test]
+fn blessing_needs_1_and_no_ci() {
+    use std::ffi::OsStr;
+    let os = |s: &'static str| Some(OsStr::new(s));
+    assert_eq!(bless_requested(None, None), Ok(false));
+    assert_eq!(bless_requested(os("0"), os("true")), Ok(false));
+    assert_eq!(bless_requested(os(""), None), Ok(false));
+    assert_eq!(bless_requested(os("1"), None), Ok(true));
+    assert_eq!(bless_requested(os("1"), os("")), Ok(true));
+    for ci in ["true", "1", "false"] {
+        let e = bless_requested(os("1"), os(ci)).unwrap_err();
+        assert!(e.contains("refused while CI is set"), "{e}");
+    }
 }
 
 /// The Firecracker shape refusing new captures and forks, as
@@ -1228,23 +1397,29 @@ async fn flag_on_health() -> J {
     ])
 }
 
-#[tokio::test]
-async fn harness_contract_goldens_match() {
+/// The contract golden as this run produces it; `idle_shift_ms` is the recorder's
+/// test-only shift of published checkpoint idle deadlines.
+async fn contract(idle_shift_ms: i64) -> J {
+    let recorder = || {
+        let mut rec = Recorder::default();
+        rec.names.idle_shift_ms = idle_shift_ms;
+        rec
+    };
     let mut fixtures = Vec::new();
     let mut refusals = Vec::new();
     for (name, rec) in [
         ("f1_rewind", {
-            let mut rec = Recorder::default();
+            let mut rec = recorder();
             f1_rewind(&mut rec).await;
             rec
         }),
         ("f2_best_of_four", {
-            let mut rec = Recorder::default();
+            let mut rec = recorder();
             f2_best_of_four(&mut rec).await;
             rec
         }),
         ("f3_eval_reset", {
-            let mut rec = Recorder::default();
+            let mut rec = recorder();
             f3_eval_reset(&mut rec).await;
             rec
         }),
@@ -1252,7 +1427,7 @@ async fn harness_contract_goldens_match() {
         refusals.extend(rec.refusals());
         fixtures.push((name.to_string(), J::A(rec.steps)));
     }
-    let mut fc = Recorder::default();
+    let mut fc = recorder();
     firecracker_refusals(&mut fc).await;
     refusals.extend(fc.refusals());
     // Every typed refusal the fixtures met carries the table's code.
@@ -1263,13 +1438,14 @@ async fn harness_contract_goldens_match() {
     }
     let notes = [
         "Recorded against the fake backend, which has no files: steps pin call sequences, provenance, digests, typed refusals, keys and accounting, not workspace content.",
-        "Volatile values are placeholders by first appearance within each section: <sb-N>, <ex-N>, <cp-N> IDs, <sha-N> digests, <id-N> 128-bit IDs and <t-N> nonzero *_unix_ms times from the daemon's clock. Equal placeholders are equal values.",
-        "<wall> is a nonzero time the host clock stamped (sandbox and execution rows); its equalities are not pinned.",
+        "Volatile values are placeholders by first appearance within each section: <sb-N>, <ex-N>, <cp-N> IDs, <sha-N> digests and <id-N> 128-bit IDs. Equal placeholders are equal values.",
+        "<clock+N> is a nonzero *_unix_ms time from the daemon's injected clock, as its exact offset N in ms from the clock's start: deadlines, activity, and checkpoint creation and READY times. The fixtures also check each published checkpoint deadline against its effective policy before recording it.",
+        "<wall> is a nonzero time the host clock stamped (sandbox and execution rows); neither its value nor its equalities are pinned.",
         "Messages are their Debug form. An error is its gRPC code, its kilnd-reason trailer and its message up to the first ':' after the token.",
-        "Flag-off Health is pinned byte for byte by flag_off_health_bytes_are_unchanged, not here.",
-        "Regenerate with KILND_BLESS_CHECKPOINT_CONTRACT=1 cargo test -p kilnd --lib harness_contract_goldens_match.",
+        "Flag-off Health is pinned byte for byte by flag_off_health_bytes_are_unchanged, and the checkpoint messages' protobuf encoding by checkpoint-wire.json, not here.",
+        "Regenerate with KILND_BLESS_CHECKPOINT_CONTRACT=1 scripts/build.sh default test -p kilnd --lib harness_contract_goldens_match (refused when CI is set).",
     ];
-    let golden = obj([
+    obj([
         ("format", J::N(1)),
         (
             "notes",
@@ -1281,28 +1457,30 @@ async fn harness_contract_goldens_match() {
             obj([("table", reason_table()), ("firecracker", J::A(fc.steps))]),
         ),
         ("health", flag_on_health().await),
-    ]);
-    let path = golden_path();
-    let text = golden.text();
-    if std::env::var_os(BLESS).is_some_and(|v| v == "1") {
-        bless(&path, &text);
-        return;
-    }
-    let file = std::fs::read_to_string(&path).unwrap_or_default();
-    if file == text {
-        return;
-    }
-    let parsed: Option<serde_json::Value> = serde_json::from_str(&file).ok();
-    let what = match &parsed {
-        None => "the file is missing or not JSON".to_string(),
-        Some(v) => golden
-            .first_difference("$", Some(v))
-            .unwrap_or_else(|| "only its formatting differs".to_string()),
-    };
-    panic!(
-        "tests/data/checkpoint-contract.json differs from this run: {what}. If the change is intended, rerun with {BLESS}=1 and review the diff."
-    );
+    ])
 }
+
+const CONTRACT: &str = "checkpoint-contract.json";
+
+#[tokio::test]
+async fn harness_contract_goldens_match() {
+    check_golden(CONTRACT, &contract(0).await);
+}
+
+/// A service that publishes a checkpoint's idle deadline 1 s later than the engine
+/// enforces it changes the golden (C6a adversarial review H8: `<wall>` normalization
+/// hid it).
+#[tokio::test]
+async fn the_golden_catches_a_published_idle_deadline_shift() {
+    let shifted = contract(1000).await;
+    let file = std::fs::read_to_string(data_path(CONTRACT)).unwrap();
+    let what =
+        golden_mismatch(&shifted, &file).expect("a 1 s later idle deadline is a contract change");
+    assert!(what.contains("idle_expires_at_unix_ms: <clock+"), "{what}");
+}
+
+#[path = "checkpoint_wire_tests.rs"]
+mod wire;
 
 #[cfg(test)]
 // Approved (design 7.1): a test fixture, compiled only under cfg(test). It rewrites its

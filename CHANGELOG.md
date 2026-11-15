@@ -15,6 +15,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   inodes only, and an absent instance directory is an empty one. A rollback that finds
   the artifacts changed keeps its record and every unit down, through `recover`, other
   commands and reboots, until `kilnd-maintenance.py accept-artifacts`.
+- Pin the checkpoint messages' protobuf encoding (C6a adversarial review, two HIGH).
+  `tests/data/checkpoint-wire.json` holds the wire bytes of every checkpoint message and of
+  a fork's create request, and a previous client with its field numbers written by hand
+  reads and writes them, so renumbering a field fails. The contract golden records the
+  fixture clock's times as exact offsets (`<clock+N>`) and checks each published deadline
+  against its policy. `KILND_BLESS_CHECKPOINT_CONTRACT=1` refuses to bless while `CI` is
+  set.
 - Add milestone C6a of workspace checkpoints: acceptance groundwork. The feature stays
   off by default and testing only. `scripts/upgrade.sh` refuses (exit 2, nothing changed)
   while any checkpoint is capturing or deleting or a fork is still restoring from one, and
