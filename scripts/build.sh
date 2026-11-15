@@ -38,11 +38,15 @@
 # repository or a parent directory other than $CARGO_HOME's own; a $CARGO_HOME config
 # with any top-level key but http, net, registry, registries, term, cargo-new and source
 # (an allowlist, so a key a later Cargo adds is refused too; it needs Python 3.11's tomllib
-# to read one, and refuses unread otherwise); any CARGO_TARGET_*_RUNNER,
-# CARGO_TARGET_*_LINKER, CARGO_BUILD_*, CARGO_ENV_* or CARGO_ALIAS_* variable, set at all;
-# and KILND_BLESS_CHECKPOINT_CONTRACT, which only the ignored bless_checkpoint_contract
-# test, run locally by name, may use. Registry and source replacement settings are inside
-# the trusted toolchain, as cargo, rustc and the crates they fetch are. It also
+# to read one, and refuses unread otherwise); a $CARGO_HOME credentials or credentials.toml
+# with anything but registry credentials (token, credential-provider, secret-key and
+# secret-key-subject under [registry] and [registries.NAME]; C6a recheck 4), since Cargo
+# can merge those files as configuration; any CARGO_TARGET_*_RUNNER,
+# CARGO_TARGET_*_LINKER, CARGO_BUILD_*, CARGO_ENV_* or CARGO_ALIAS_*
+# variable, set at all; and KILND_BLESS_CHECKPOINT_CONTRACT, which only the ignored
+# bless_checkpoint_contract test, run locally by name, may use. Registry and source
+# replacement settings are inside the trusted toolchain, as cargo, rustc and the crates
+# they fetch are: build.sh trusts them, it doesn't prove them. It also
 # passes `--config target.TRIPLE.runner=["/bin/sh", "-c", 'exec "$0" "$@"']`, a
 # pass-through, for the host and every --target (Cargo refuses an empty runner).
 #
@@ -188,13 +192,54 @@ try:
     config = tomllib.loads(open(path, encoding="utf-8").read())
 except (OSError, ValueError) as error:
     refuse("is unreadable: %s" % error)
-# Network, registry, source and terminal settings: none changes what is compiled, run or
-# written. Every other key, include, alias, env, build, target, profile and any future one
-# among them, is refused.
+# Network, registry, source and terminal settings sit inside the trusted-toolchain
+# boundary, not outside it: source replacement can change what is compiled, a registry
+# credential provider and net.git-fetch-with-cli run programs, and the http, net and
+# registry settings change where sources come from and how. build.sh proves none of
+# them; it trusts them as it trusts cargo and rustc (docs/checkpoint-rollout-gate.md).
+# Every other key, include, alias, env, build, target, profile and any future one among
+# them, is refused.
 allowed = {"http", "net", "registry", "registries", "term", "cargo-new", "source"}
 found = sorted(k for k in config if k not in allowed)
 if found:
     refuse("sets %s; only %s may be set" % (", ".join(found), ", ".join(sorted(allowed))))
+' "$cargo_home/$name" || exit 2
+done
+# The credentials files too (C6a recheck 4): Cargo can merge them as configuration, so a
+# [target] runner there runs every test. Only registry credentials may be in them.
+for name in credentials credentials.toml; do
+    [ -e "$cargo_home/$name" ] || [ -L "$cargo_home/$name" ] || continue
+    python3 -I -c '
+import sys
+path = sys.argv[1]
+def refuse(message):
+    sys.exit("scripts/build.sh: refused: %s %s; build.sh runs cargo in a closed configuration (C6a recheck 4)" % (path, message))
+try:
+    import tomllib
+except ImportError:
+    refuse("cannot be checked without Python 3.11 (tomllib)")
+try:
+    credentials = tomllib.loads(open(path, encoding="utf-8").read())
+except (OSError, ValueError) as error:
+    refuse("is unreadable: %s" % error)
+# Registry credentials only: [registry] and each [registries.NAME] hold nothing but these.
+keys = {"token", "credential-provider", "secret-key", "secret-key-subject"}
+found = sorted(k for k in credentials if k not in ("registry", "registries"))
+def check(where, table):
+    if not isinstance(table, dict):
+        found.append(where)
+    else:
+        found.extend("%s.%s" % (where, k) for k in sorted(table) if k not in keys)
+check("registry", credentials.get("registry", {}))
+registries = credentials.get("registries", {})
+if isinstance(registries, dict):
+    for registry in sorted(registries):
+        check("registries.%s" % registry, registries[registry])
+else:
+    found.append("registries")
+if found:
+    refuse("sets %s; a credentials file may hold only registry.KEY and registries.NAME.KEY for %s"
+           % (", ".join(found), ", ".join(sorted(keys))))
 ' "$cargo_home/$name" || exit 2
 done
 

@@ -6,6 +6,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Check `$CARGO_HOME`'s credentials files too (C6a recheck 4). Cargo 1.88 can merge
+  `credentials` or `credentials.toml` as general configuration during an authenticated
+  registry lookup, so a `[target]` runner there reached the bless writer. `build.sh` now
+  allows in them only `token`, `credential-provider`, `secret-key` and
+  `secret-key-subject` under `[registry]` and `[registries.NAME]`, read with `tomllib` or
+  refused unread. Its comment on the config allowlist now names the trusted-toolchain
+  boundary instead of claiming those settings change nothing.
 - Refuse a checkpoint inventory whose mount identity can't be read (C6a recheck 4). The
   walk caught `FileNotFoundError` around all of it, so a missing `/proc/self/fdinfo` entry
   for a nested Btrfs subvolume's descriptor read as an absent registry and an empty

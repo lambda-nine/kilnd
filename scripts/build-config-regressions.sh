@@ -22,6 +22,10 @@
 #     Cargo knows; CARGO_ALIAS_CLIPPY replacing clippy. A config of only allowed keys gets
 #     past the check (to the profile check, with Python 3.11 or later; refused unread
 #     before that).
+#  g. C6a recheck 4: a $CARGO_HOME credentials.toml, and separately a credentials, with a
+#     target runner, `[env]`, `include`, `[alias]`, a non-credential key in
+#     `[registries.NAME]` or a non-table `registry`. Credentials of tokens only get past
+#     the check (as in f).
 # dependency-gate-regressions.sh runs it for each toolchain.
 set -eu
 toolchain=${1:-}
@@ -192,6 +196,34 @@ else
 fi
 refused "a \$CARGO_HOME config of allowed keys only (past the config check)" "$allowed_message" \
     env CARGO_HOME="$include_home" sh scripts/build.sh ${toolchain:+"+$toolchain"} no-such-profile check
+[ "$(sha256 "$golden")" = "$golden_sha" ] || fail "the wire golden's SHA-256 changed"
+
+# g. The credentials files hold registry credentials only.
+credentials_home=$scratch/credentials-cargo-home
+mkdir "$credentials_home"
+ln -s "${CARGO_HOME:-$HOME/.cargo}/registry" "$credentials_home/registry"
+credentials_dir=$(cd "$credentials_home" && pwd -P)
+for name in credentials.toml credentials; do
+    for body in "[registry]\ntoken = \"x\"\n[target.$host]\nrunner = \"$scratch/runner.sh\"" \
+        '[registry]\ntoken = "x"\n[env]\nKILND_BLESS_CHECKPOINT_CONTRACT = "1"' \
+        'include = ["bless.toml"]' '[alias]\nclippy = "test --no-run"' \
+        '[registries.foo]\ntoken = "y"\nindex = "sparse+https://example.invalid/index/"' \
+        'registry = "x"'; do
+        printf "$body\n" >"$credentials_home/$name"
+        refused "a \$CARGO_HOME $name with $(tr '\n' ' ' <"$credentials_home/$name")" \
+            "$credentials_dir/$name " env CARGO_HOME="$credentials_home" sh scripts/build.sh \
+            ${toolchain:+"+$toolchain"} default check
+    done
+    rm "$credentials_home/$name"
+done
+printf '[registry]\ntoken = "x"\n[registries.foo]\ntoken = "y"\n' >"$credentials_home/credentials.toml"
+if python3 -I -c 'import tomllib' 2>/dev/null; then
+    allowed_message="no-such-profile is not a profile in dependency-gate.json"
+else
+    allowed_message="$credentials_dir/credentials.toml cannot be checked without Python 3.11"
+fi
+refused "a \$CARGO_HOME credentials.toml of tokens only (past the credentials check)" "$allowed_message" \
+    env CARGO_HOME="$credentials_home" sh scripts/build.sh ${toolchain:+"+$toolchain"} no-such-profile check
 [ "$(sha256 "$golden")" = "$golden_sha" ] || fail "the wire golden's SHA-256 changed"
 
 if [ "$failed" -ne 0 ]; then

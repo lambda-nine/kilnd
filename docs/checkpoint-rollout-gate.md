@@ -38,11 +38,15 @@ in the workspace or any parent directory other than `$CARGO_HOME`'s own, a `$CAR
 config with any top-level key but `http`, `net`, `registry`, `registries`, `term`,
 `cargo-new` and `source` (an allowlist: `include`, `alias`, `env`, `build`, `target`,
 `profile`, `unstable` and any key a later Cargo adds are refused, C6a recheck 3; reading
-one needs Python 3.11's `tomllib`, and without it the config is refused unread), and any
+one needs Python 3.11's `tomllib`, and without it the config is refused unread), a
+`$CARGO_HOME/credentials` or `credentials.toml`, which Cargo can merge as configuration, with
+anything but `token`, `credential-provider`, `secret-key` and `secret-key-subject` under
+`[registry]` and `[registries.NAME]` (C6a recheck 4, read the same way), and any
 `CARGO_TARGET_*_RUNNER`, `CARGO_TARGET_*_LINKER`, `CARGO_BUILD_*`, `CARGO_ENV_*` or
-`CARGO_ALIAS_*` variable, and it passes a pass-through runner for every target. Registry
-and source replacement settings stay allowed: like the toolchain's own binaries and the
-crates they fetch, they are inside the trusted toolchain, not something `build.sh` proves. It
+`CARGO_ALIAS_*` variable, and it passes a pass-through runner for every
+target. Registry and source replacement settings stay allowed: like the toolchain's own
+binaries and the crates they fetch, they are inside the trusted toolchain, not something
+`build.sh` proves. It
 checks the directories cargo will read (C6a recheck 2): it changes to the repository
 before any check, resolves `CARGO_HOME` (or `$HOME/.cargo`), `RUSTUP_HOME`, a path-valued
 `RUSTUP_TOOLCHAIN` or `+TOOLCHAIN`, `CARGO` and `CARGO_TARGET_DIR` to absolute paths and
