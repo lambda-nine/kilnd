@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Checkpoint acceptance on real kiln (C6b). A VM harness runs the daemon and the root
+  helper as SIGKILLable children of the test binary, with a test-only relay between them
+  that holds a named helper operation or its reply, and
+  `scripts/checkpoint-crash-matrix.py` runs each scenario alone with host checks before
+  and after: the crash matrix V1–V17 (a real reboot for V14), the hostile-content set and
+  two-uid callers, the rewind, best-of-N and eval-reset fixtures byte for byte, the kiln
+  half of the legacy check and the performance harness. The acceptance ledger names them
+  in place of every planned slot; `docs/checkpoint-performance.md` reports the numbers
+  with their conditions, and `docs/checkpoint-rollout-gate.md` has each criterion's
+  evidence. The feature stays off by default and for testing only.
 - Quarantine a checkpoint whose restore proves it corrupt after allocating (C6b V16).
   kiln's shim checks each object's digest after the new sandbox is allocated, so a
   corrupted artifact came back as an ambiguous restore, and only a restore that

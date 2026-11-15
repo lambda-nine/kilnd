@@ -227,3 +227,10 @@ like any sandbox of its disk size and needs the checkpoint's S free beyond the h
 it restores. Charged bytes are logical: S includes a 16 KiB allowance per entry, so many
 small files cost more than their data. Health's `checkpoint_reserved_disk_bytes` is the
 node's checkpoint charge, already inside `reserved_disk_bytes`.
+
+Measured on one test machine ([checkpoint-performance.md](checkpoint-performance.md)), the
+allowance is most of the charge for small files: 50,000 small files charged 987 MiB for
+208 MiB on disk, and the 1 GiB cap holds about 60,000 of them. Sparse files are charged by
+their logical size. Capture time grows with the number of entries (about 0.57 ms each
+there, two device flushes per entry), so a client's deadline for a large workspace must
+allow tens of seconds; kilnd's own bound is the operation timeout Health reports.

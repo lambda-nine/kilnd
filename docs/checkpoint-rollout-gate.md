@@ -1,7 +1,7 @@
 # Workspace checkpoint rollout gate
 
-**Status: draft (milestone C6a).** The criteria are fixed here; the evidence slots marked
-*pending* are filled by milestone C6b. Until every criterion holds, and the default is
+**Status: evidence filled in (milestone C6b); criterion 8 waits for C6b's adversarial
+review.** The criteria were fixed in C6a. Until every criterion holds, and the default is
 decided, `--enable-workspace-checkpoints` stays off by default and documented as testing
 only. Passing the gate does not by itself turn the feature on anywhere.
 
@@ -9,14 +9,14 @@ Each criterion is checkable: a test, a run with recorded conditions, or a docume
 
 | # | Criterion | Evidence | Status |
 |---|---|---|---|
-| 1 | Every crash point of the design's recovery table, every required-test case and every adversarial-review finding of milestones C3–C5b is named in the acceptance ledger with a passing test, a planned VM scenario, or an explicit accepted disposition | `crates/kilnd/tests/data/checkpoint-acceptance-matrix.json`; `checkpoint_acceptance_matrix` tests and build.sh compiled-registry check in CI | C6a |
-| 2 | The VM crash matrix passes on the pinned kiln and kernel, with the host check clean before and after every scenario: real process death of the daemon, the root helper and kiln's copy and restore workers at each capture, removal and fork boundary; a reboot; a stale database backup; a corrupt artifact; a kill during the startup barrier | `scripts/checkpoint-crash-matrix.py` run log | *pending (C6b)* |
-| 3 | Hostile workspace content (links, special files, ACLs, file capabilities, xattrs, names, depth, entry count, sparse and inode-heavy trees, protected paths) is refused before allocation or round-trips exactly, through kilnd's capture and fork on the pinned kiln, with host and other users' sandboxes unchanged; hostile callers (two real uids) get only their own checkpoints and budgets | VM run log | *pending (C6b)* |
-| 4 | The rewind, best-of-N and eval-reset client fixtures pass on the fake runtime (CI) and on real kiln (VM), the latter checking workspace content byte for byte | `manager::checkpoint::tests::api::clients` in CI; VM run log | Mac: C6a; VM: *pending (C6b)* |
+| 1 | Every crash point of the design's recovery table, every required-test case and every adversarial-review finding of milestones C3–C5b is named in the acceptance ledger with a passing test, a VM scenario, or an explicit accepted disposition | `crates/kilnd/tests/data/checkpoint-acceptance-matrix.json`; `checkpoint_acceptance_matrix` tests and build.sh compiled-registry check in CI | **Met.** No planned slot is left. Recorded gaps: the kiln-side cases and C3 findings that only kiln's own tests drive (each names the kiln test, or says there is none), the Firecracker half of legacy behavior (contract tests only, no VM run), V14's lack of partial staging across the real reboot, and two accepted LOWs (C3-r1-L2, C5a-r7-J2). C6b's own finding (C6b-V16) is fixed with its regressions |
+| 2 | The VM crash matrix passes on the pinned kiln and kernel, with the host check clean before and after every scenario: real process death of the daemon, the root helper and kiln's copy and restore workers at each capture, removal and fork boundary; a reboot; a stale database backup; a corrupt artifact; a kill during the startup barrier | `scripts/checkpoint-crash-matrix.py --set crash`, `v14-arm` and `v14-verify` run logs | **Met.** V1–V13, V15–V17 pass with clean host checks; V14 passes across a real guest reboot (two boot IDs); V16 passes after the C6b-V16 fix. V9, V11 and V13 hold the C5a-2 pin rule: an undispatched or ambiguous reader's pin is released only by its checkpoint's ABSENT |
+| 3 | Hostile workspace content (links, special files, ACLs, file capabilities, xattrs, names, depth, entry count, sparse and inode-heavy trees, protected paths) is refused before allocation or round-trips exactly, through kilnd's capture and fork on the pinned kiln, with host and other users' sandboxes unchanged; hostile callers (two real uids) get only their own checkpoints and budgets | `--set hostile` run logs | **Met,** with two notes. Walk-time refusals (special files, xattrs, depth, size) create the FAILED row and its charge first and release it with ABSENT evidence; refusals before C1 allocate nothing. The 65,536-entry bound cannot be reached separately under the 1 GiB cap: the 16 KiB-per-entry allowance refuses first (`checkpoint_size_limit`) |
+| 4 | The rewind, best-of-N and eval-reset client fixtures pass on the fake runtime (CI) and on real kiln (VM), the latter checking workspace content byte for byte | `manager::checkpoint::tests::api::clients` in CI; `--set clients` run logs | **Met.** F1–F3 pass on real kiln byte for byte; F3's seed ends by lifetime on the VM. The alpine image has no `git`, so no `git status` check |
 | 5 | The harness contract goldens are unchanged: fixture request and response shapes, every typed refusal's code and `kilnd-reason` token, and Health with the flag on; flag-off Health bytes unchanged | `crates/kilnd/tests/data/checkpoint-contract.json`; `flag_off_health_bytes_are_unchanged` | C6a |
-| 6 | A performance report is published with its conditions (hardware, kernel, kiln, filesystem and backing, cache state, concurrency, runs per cell, p50 and p95). No latency is promised | `docs/checkpoint-performance.md` | *pending (C6b)* |
+| 6 | A performance report is published with its conditions (hardware, kernel, kiln, filesystem and backing, cache state, concurrency, runs per cell, p50 and p95). No latency is promised | [checkpoint-performance.md](checkpoint-performance.md) | **Met** (one warm cell at n=8, labeled). Open tuning questions it raises, not changed: the per-entry allowance makes the 1 GiB cap an entry cap of about 60,000; a 50,000-entry capture takes about 28 s warm, inside the 120 s operation timeout |
 | 7 | Operator documentation covers enabling and disabling, cleanup, backup, upgrade and rollback with checkpoints present; the maintenance upgrade refuses while a checkpoint is in flight and checks the artifact inventory on rollback, with tests | [checkpoints.md](checkpoints.md); `scripts/kilnd-maintenance-tests.py`; `maintenance_busy_query_matches_the_schema` | C6a |
-| 8 | No HIGH or MEDIUM finding of the C6 adversarial reviews is open | review records | *pending* |
+| 8 | No HIGH or MEDIUM finding of the C6 adversarial reviews is open | review records | *pending: C6b's adversarial review* |
 | 9 | On the node itself, every discovery probe passes (Health lists `workspace_checkpoint`): helper group enabled, leases, format 1, generation-checked removal, XFS with project quotas on runs, trusted image registry, free space known; headroom configured | `kilndctl health` on the node | per node |
 | 10 | The node runs the kiln commit the gate was measured on, or a later one on which criteria 2–4 were rerun | `kiln --version` against the gate record | per node |
 
@@ -67,8 +67,9 @@ hand (`checkpoint_field_numbers_match_the_pinned_table`), which nothing blesses.
 
 | Item | Value |
 |---|---|
-| kilnd commit | *pending* |
+| kilnd commit | branch `checkpoint-c6b-vm-acceptance` (C6b); each VM run records its commit |
 | kiln commit | `8735907` (runtime identical to `c55d8bb`) |
 | Kernel | `6.8.0-149-generic` |
 | Filesystem | XFS with `prjquota` on a loop device, in a Lima `vz` guest on Apple silicon |
-| Date | *pending* |
+| Date | 2026-11-15 |
+| VM evidence | crash matrix, hostile set, client fixtures, the reboot and the performance runs, each with the shared VM gate passed before and after |
