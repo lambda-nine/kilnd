@@ -756,3 +756,8 @@ mod harness;
 
 #[path = "checkpoint_vm_crash.rs"]
 mod crash;
+
+// Linux only: raw upper xattrs, device nodes.
+#[cfg(target_os = "linux")]
+#[path = "checkpoint_vm_hostile.rs"]
+mod hostile;
