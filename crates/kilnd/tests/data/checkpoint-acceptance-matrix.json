@@ -404,7 +404,7 @@
       "mac": [],
       "vm": null,
       "kiln": true,
-      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
+      "gap": "kiln (repository kiln, crate kiln, commit c55d8bb): no test of the walker's \"crosses a mount\" refusal (runtime/src/checkpoint/walk.rs compares st_dev and STATX_MNT_ID); checkpoint::walk::tests::protected_paths_refuse_and_generated_entries_are_excluded covers entries beneath runtime mounts only. No kilnd test."
     },
     {
       "id": "11.2.3-malformed-base64",
@@ -476,7 +476,7 @@
       "mac": [],
       "vm": null,
       "kiln": true,
-      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
+      "gap": "kiln (repository kiln, crate kiln, commit c55d8bb): no fuzzer; hostile-input tests checkpoint::manifest::tests::hostile_structure_is_refused and checkpoint::manifest::tests::hostile_bytes_are_refused. No kilnd test."
     },
     {
       "id": "11.2.3-fuzz-materialization",
@@ -484,7 +484,7 @@
       "mac": [],
       "vm": null,
       "kiln": true,
-      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
+      "gap": "kiln (repository kiln, crate kiln, commit c55d8bb): no fuzzer; checkpoint::capture::tests::tampered_artifacts_are_corrupt_and_never_restored. kilnd covers only tampering through restore (V16, the tampered-manifest attack)."
     },
     {
       "id": "11.2.3-arbitrary-device",
@@ -501,7 +501,7 @@
       "mac": [],
       "vm": null,
       "kiln": true,
-      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
+      "gap": "kiln (repository kiln, crate kiln, commit c55d8bb): no test. No kilnd test."
     },
     {
       "id": "11.2.4-queued-exec",
@@ -560,7 +560,8 @@
       ],
       "vm": [
         "kilnd::manager::checkpoint_vm_tests::clients::c6b_f3_eval_reset_on_real_kiln"
-      ]
+      ],
+      "vm_note": "F3 on the VM ends its seed by lifetime once its idle timeout exceeds the lifetime; lifetime expiry on the Mac: kilnd::manager::checkpoint::tests::lifetime_and_idle_expiry_take_the_same_removal_and_get_refreshes_only_idle."
     },
     {
       "id": "11.2.4-source-lifetime-expiry",
@@ -742,7 +743,7 @@
       "mac": [],
       "vm": null,
       "kiln": true,
-      "gap": "The pinned kiln 8735907 has no reflink path: every capture and fork copies, so there is no shared extent to diverge (C6 plan, Pinned kiln). Revisit with a reflink-capable kiln."
+      "gap": "The pinned kiln 8735907 has no reflink path: every capture and fork copies, so there is no shared extent to diverge (C6 plan, Pinned kiln). kiln (repository kiln, crate kiln, commit c55d8bb): no test. Revisit with a reflink-capable kiln."
     },
     {
       "id": "11.2.5-metadata-exhaustion",
@@ -750,7 +751,7 @@
       "mac": [],
       "vm": null,
       "kiln": true,
-      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
+      "gap": "kiln (repository kiln, crate kiln, commit c55d8bb): checkpoint::walk::tests::bounded_user_xattrs_do_not_retain_gigabytes, checkpoint::walk::tests::listings_over_the_bounds_are_size_refusals and checkpoint::capture::tests::prepared_worst_case_within_the_worker_budget. No kilnd test."
     },
     {
       "id": "11.2.5-inode-exhaustion",
@@ -765,9 +766,11 @@
       "id": "11.2.5-small-project-quota",
       "design": "§11.2 item 5: Small project quota",
       "mac": [],
-      "vm": null,
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_names_depth_and_counts_hold_their_limits"
+      ],
       "kiln": true,
-      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
+      "gap": "kiln (repository kiln, crate kiln, commit c55d8bb): checkpoint::capture::tests::oversized_charge_is_never_published (a charge over R); the quota-full mapping (store.rs quota_full) has no direct test. kilnd's VM entry-limit case reached it (\"the checkpoint quota is full (complete)\", checkpoint_size_limit)."
     },
     {
       "id": "11.2.5-enospc-fsync",
@@ -775,7 +778,7 @@
       "mac": [],
       "vm": null,
       "kiln": true,
-      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
+      "gap": "kiln (repository kiln, crate kiln, commit c55d8bb): no test. No kilnd test."
     },
     {
       "id": "11.2.5-enospc-rename",
@@ -783,7 +786,7 @@
       "mac": [],
       "vm": null,
       "kiln": true,
-      "gap": "Exercised by kiln's own tests (kiln repository); no kilnd-tree test or VM scenario drives this case."
+      "gap": "kiln (repository kiln, crate kiln, commit c55d8bb): no test. No kilnd test."
     },
     {
       "id": "11.2.5-worker-fd-absence",
@@ -873,7 +876,8 @@
       "vm": [
         "kilnd::manager::checkpoint_vm_tests::crash::c6b_v14_reboot_arm",
         "kilnd::manager::checkpoint_vm_tests::crash::c6b_v14_reboot_verify"
-      ]
+      ],
+      "gap": "The real reboot (V14) held its capture at the relay, so no partial staging was on disk across the reboot; partial staging is covered across daemon, helper and worker death by V2-V4, and across a simulated restart on the Mac."
     },
     {
       "id": "11.2.6-mismatched-backups",
