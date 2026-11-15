@@ -58,10 +58,18 @@
 # The gate's guarantee covers builds made this way. A raw `cargo build` with other
 # feature flags or compiler flags builds what the gate has not reviewed; every workspace
 # crate's build script refuses a `--cfg` or `-Z` compiler flag as a backstop.
+#
+# Paths are settled first (C6a recheck 2 HIGH 3): build.sh changes to the repository before
+# any check, then resolves CARGO_HOME (or HOME/.cargo), RUSTUP_HOME, a RUSTUP_TOOLCHAIN or
+# +TOOLCHAIN path, CARGO and CARGO_TARGET_DIR to absolute paths and exports them, so the
+# checks and every cargo and rustc read the same directories. It refuses a non-absolute
+# HOME, a CARGO_HOME or RUSTUP_HOME it can't resolve, and a set RUSTDOC or CLIPPY_CONF_DIR
+# (another rustdoc, or a clippy.toml without the disallowed methods).
 set -eu
 # No pathname expansion: environment names and target triples are split, never globbed.
 set -f
-repo=$(cd "$(dirname -- "$0")/.." && pwd)
+repo=$(cd "$(dirname -- "$0")/.." && pwd -P)
+cd "$repo"
 usage() {
     echo "usage: $0 [+TOOLCHAIN] [--crt-static] PROFILE build|test|clippy|check [CARGO-ARGUMENT...] [-- TEST-ARGUMENT...]" >&2
     exit 2
@@ -71,8 +79,42 @@ refuse() {
     exit 2
 }
 
+# An existing directory, canonical, resolved from the repository; refused otherwise.
+resolved() { # NAME VALUE
+    (cd "$2" 2>/dev/null && pwd -P) || refuse "$1=$2 is not a directory build.sh can resolve; it reads the same paths cargo does"
+}
+case ${HOME:-} in
+    '' | /*) ;;
+    *) refuse "HOME=$HOME is not absolute" ;;
+esac
+if [ -n "${CARGO_HOME:-}" ]; then
+    CARGO_HOME=$(resolved CARGO_HOME "$CARGO_HOME")
+elif [ -n "${HOME:-}" ]; then
+    CARGO_HOME=$(resolved 'CARGO_HOME (unset, so HOME/.cargo)' "$HOME/.cargo")
+else
+    refuse "neither CARGO_HOME nor HOME is set"
+fi
+export CARGO_HOME
+if [ -n "${RUSTUP_HOME:-}" ]; then
+    RUSTUP_HOME=$(resolved RUSTUP_HOME "$RUSTUP_HOME")
+    export RUSTUP_HOME
+fi
+case ${RUSTUP_TOOLCHAIN:-} in
+    */*) RUSTUP_TOOLCHAIN=$(resolved RUSTUP_TOOLCHAIN "$RUSTUP_TOOLCHAIN"); export RUSTUP_TOOLCHAIN ;;
+esac
+if [ -n "${CARGO:-}" ]; then
+    cargo_dir=$(resolved CARGO "$(dirname -- "$CARGO")")
+    CARGO=$cargo_dir/$(basename -- "$CARGO")
+    export CARGO
+fi
+case ${CARGO_TARGET_DIR:-} in
+    '' | /*) ;;
+    *) CARGO_TARGET_DIR=$repo/$CARGO_TARGET_DIR; export CARGO_TARGET_DIR ;;
+esac
+
 toolchain=
 case ${1:-} in
+    +*/*) toolchain=+$(resolved +TOOLCHAIN "${1#+}"); shift ;;
     +*) toolchain=$1; shift ;;
 esac
 static=
@@ -100,7 +142,7 @@ for name in $(awk 'BEGIN { for (name in ENVIRON) print name }'); do
             CARGO_TARGET_*_RUSTFLAGS | CARGO_TARGET_*_RUSTDOCFLAGS | \
             CARGO_PROFILE_*_RUSTFLAGS | CARGO_HOST_RUSTFLAGS | \
             RUSTC | RUSTC_WRAPPER | RUSTC_WORKSPACE_WRAPPER | CARGO_BUILD_RUSTC* | \
-            RUSTC_BOOTSTRAP | CARGO_UNSTABLE_* | CLIPPY_ARGS)
+            RUSTC_BOOTSTRAP | CARGO_UNSTABLE_* | CLIPPY_ARGS | RUSTDOC | CLIPPY_CONF_DIR)
             if [ -n "$(printenv "$name" || true)" ]; then
                 refuse "$name is set; build.sh runs cargo in a closed compiler environment, because compiler flags, wrappers and unstable switches can compile code (a feature cfg) no reviewed profile selects (dependency-gate.json, design section 7.1). Unset it"
             fi ;;
@@ -112,9 +154,8 @@ for name in $(awk 'BEGIN { for (name in ENVIRON) print name }'); do
 done
 
 # The closed Cargo configuration: no config file but $CARGO_HOME's own, which is checked.
-cargo_home=${CARGO_HOME:-${HOME:-/nonexistent}/.cargo}
-cargo_home=$(cd "$cargo_home" 2>/dev/null && pwd -P || echo "$cargo_home")
-dir=$(cd "$repo" && pwd -P)
+cargo_home=$CARGO_HOME
+dir=$repo
 while :; do
     if [ "$dir/.cargo" != "$cargo_home" ] && [ "${dir%/}/.cargo" != "$cargo_home" ]; then
         for name in config config.toml; do
@@ -188,7 +229,7 @@ fi
 
 # The profile's features, checked against the workspace members' own feature tables.
 gate=$repo/dependency-gate.json
-members=$(cd "$repo" && cargo ${toolchain:+"$toolchain"} metadata --no-deps --format-version 1 --locked)
+members=$(cargo ${toolchain:+"$toolchain"} metadata --no-deps --format-version 1 --locked)
 features=$(printf '%s' "$members" | python3 -I -c '
 import json, re, sys
 gate, profile = sys.argv[1], sys.argv[2]
@@ -239,7 +280,6 @@ if [ "$command" = clippy ]; then
     set -- "$@" -- -D warnings -D clippy::disallowed_methods
 fi
 
-cd "$repo"
 if [ -n "$full_suite" ]; then
     cargo ${toolchain:+"$toolchain"} "$command" --no-run "$@"
     registry_dir=$(mktemp -d)

@@ -37,8 +37,12 @@ before cargo starts (C6a recheck 1): it refuses a `.cargo/config` or `.cargo/con
 in the workspace or any parent directory other than `$CARGO_HOME`'s own, a `$CARGO_HOME`
 config with an `[env]` table, a target runner or linker, or a `build` key it does not
 override, and any `CARGO_TARGET_*_RUNNER`, `CARGO_TARGET_*_LINKER`, `CARGO_BUILD_*` or
-`CARGO_ENV_*` variable, and it passes a pass-through runner for every target.
-`scripts/build-config-regressions.sh` holds it to that.
+`CARGO_ENV_*` variable, and it passes a pass-through runner for every target. It
+checks the directories cargo will read (C6a recheck 2): it changes to the repository
+before any check, resolves `CARGO_HOME` (or `$HOME/.cargo`), `RUSTUP_HOME`, a path-valued
+`RUSTUP_TOOLCHAIN` or `+TOOLCHAIN`, `CARGO` and `CARGO_TARGET_DIR` to absolute paths and
+exports them, and refuses a relative `HOME`, a `CARGO_HOME` it can't resolve, and a set
+`RUSTDOC` or `CLIPPY_CONF_DIR`. `scripts/build-config-regressions.sh` holds it to that.
 
 The contract and wire goldens (`checkpoint-contract.json`, `checkpoint-wire.json`) are
 only ever compared by the suite. The one writer is the ignored test

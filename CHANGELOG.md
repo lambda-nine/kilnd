@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Resolve `build.sh`'s paths before checking them (C6a recheck 2 HIGH 3). A relative
+  `CARGO_HOME` was checked from the caller's directory but read by cargo from the
+  repository, so its `[env]` could bless goldens. `build.sh` now changes to the repository
+  first, resolves `CARGO_HOME`, `RUSTUP_HOME`, a toolchain path, `CARGO` and
+  `CARGO_TARGET_DIR` to absolute paths and exports them, and refuses a relative `HOME` and a
+  set `RUSTDOC` or `CLIPPY_CONF_DIR`.
 - Make the rollback's state restore crash-consistent (C6a recheck 2 HIGH 2). The journal
   marks an instance's restore before it touches the live state and clears the mark only
   after the directory is synced; a retry that finds it redoes the whole restore rather than

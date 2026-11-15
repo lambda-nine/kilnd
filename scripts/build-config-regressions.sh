@@ -12,7 +12,12 @@
 #  c. a $CARGO_HOME config with `[env]`, a target runner or linker, or a build key build.sh
 #     does not override (`build.jobs`);
 #  d. CARGO_TARGET_<host>_RUNNER, CARGO_TARGET_<host>_LINKER, CARGO_BUILD_JOBS and
-#     CARGO_ENV_CI set, even empty, and KILND_BLESS_CHECKPOINT_CONTRACT set to 1 or empty.
+#     CARGO_ENV_CI set, even empty, KILND_BLESS_CHECKPOINT_CONTRACT set to 1 or empty, and
+#     RUSTDOC or CLIPPY_CONF_DIR set;
+#  e. C6a recheck 2 HIGH 3: a relative CARGO_HOME whose config's `[env]` forces blessing,
+#     with build.sh run by its absolute path from another directory (the wire golden's
+#     SHA-256 stays unchanged); a relative CARGO_HOME only the caller's directory has; and a
+#     relative HOME.
 # dependency-gate-regressions.sh runs it for each toolchain.
 set -eu
 toolchain=${1:-}
@@ -104,7 +109,40 @@ for value in 1 ''; do
         env KILND_BLESS_CHECKPOINT_CONTRACT="$value" sh scripts/build.sh ${toolchain:+"+$toolchain"} default test \
         -p kilnd --lib bless_checkpoint_contract -- --ignored
 done
+for assignment in RUSTDOC=/bin/false CLIPPY_CONF_DIR="$scratch"; do
+    refused "$assignment" "${assignment%%=*} is set; build.sh runs cargo in a closed compiler environment" \
+        env "$assignment" sh scripts/build.sh ${toolchain:+"+$toolchain"} default check
+done
 [ "$(cksum <"$golden")" = "$before" ] || fail "the wire golden changed"
+
+# e. Paths resolved from the repository, as cargo resolves them.
+sha256() {
+    python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+}
+golden_sha=$(sha256 "$golden")
+mkdir relative-cargo-home "$scratch/elsewhere" "$scratch/elsewhere/caller-only-home"
+cat >relative-cargo-home/config.toml <<'CONFIG'
+[target.'cfg(unix)']
+runner = "/bin/false"
+
+[env]
+KILND_BLESS_CHECKPOINT_CONTRACT = "1"
+CI = { value = "", force = true }
+CONFIG
+from_elsewhere() { # CARGO_HOME build.sh-argument...
+    (cd "$scratch/elsewhere" && CI=true CARGO_HOME=$1 && shift && export CI CARGO_HOME &&
+        exec "$here/scripts/build.sh" ${toolchain:+"+$toolchain"} "$@")
+}
+refused "a relative CARGO_HOME with a blessing [env], from another directory" \
+    "$here/relative-cargo-home/config.toml " from_elsewhere relative-cargo-home default test \
+    -p kilnd --lib bless_checkpoint_contract -- --ignored --nocapture
+[ "$(sha256 "$golden")" = "$golden_sha" ] || fail "the wire golden's SHA-256 changed"
+refused "a CARGO_HOME relative to the caller's directory only" \
+    "CARGO_HOME=caller-only-home is not a directory build.sh can resolve" \
+    from_elsewhere caller-only-home default check
+refused "a relative HOME, with CARGO_HOME unset" "HOME=relative-home is not absolute" \
+    env -u CARGO_HOME HOME=relative-home sh scripts/build.sh ${toolchain:+"+$toolchain"} default check
+[ "$(sha256 "$golden")" = "$golden_sha" ] || fail "the wire golden's SHA-256 changed"
 
 if [ "$failed" -ne 0 ]; then
     echo "closed Cargo configuration regressions: FAILED" >&2
