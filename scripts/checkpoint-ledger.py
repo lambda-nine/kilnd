@@ -7,14 +7,19 @@ from pathlib import Path
 
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 PATH = IDENT + r"(?:::" + IDENT + r")*"
+DOCTEST = re.compile(r"\S+\.rs - .+ \(line \d+\)(?: - [^:]+)?: test")
+SUMMARY = re.compile(r"(\d+) tests?, (\d+) benchmarks?")
 # Library, binary and doctest targets have distinct identities.
 RUN = re.compile(r"Running (unittests \S+|tests/\S+) \(.*[/\\]deps/(" + IDENT + r")-[0-9a-f]+\)")
 
 def registry(text, errors):
-    tests, binaries, current, count = set(), set(), None, 0
+    tests, binaries, current, count, doc_group = set(), set(), None, 0, None
     for line in text.splitlines():
         line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()  # Cargo color, including CI.
         running, doc = RUN.fullmatch(line), re.fullmatch(r"Doc-tests (" + IDENT + r")", line)
+        # Rustdoc lists merged and standalone doctests as separate groups under one header.
+        if current is None and doc_group and (DOCTEST.fullmatch(line) or SUMMARY.fullmatch(line)):
+            current, count = doc_group, 0
         if running or doc:
             if current is not None:
                 errors.append(f"unfinished binary: {current}")
@@ -23,18 +28,18 @@ def registry(text, errors):
             if current in binaries:
                 errors.append(f"duplicate binary name: {current}")
             binaries.add(current)
-            count = 0
+            count, doc_group = 0, None
         elif current is not None and (re.fullmatch(PATH + r": test", line) or (
-                current.endswith("::doc") and re.fullmatch(r"\S+\.rs - .+ \(line \d+\)(?: - [^:]+)?: test", line))):
+                current.endswith("::doc") and DOCTEST.fullmatch(line))):
             name = current + "::" + line[:-6]
             if name in tests:
                 errors.append(f"duplicate test: {name}")
             tests.add(name)
             count += 1
-        elif current is not None and (summary := re.fullmatch(r"(\d+) tests?, (\d+) benchmarks?", line)):
+        elif current is not None and (summary := SUMMARY.fullmatch(line)):
             if count != int(summary[1]) or int(summary[2]):
                 errors.append(f"invalid registry count: {current}: {line}")
-            current = None
+            doc_group, current = current if current.endswith("::doc") else None, None
         elif line and not (current is None and re.fullmatch(r"(?:(?:Compiling|Finished) .+|Blocking waiting for file lock on (?:build directory|package cache))", line)):
             errors.append(f"unparsable registry line: {line}")
     if current is not None or not binaries:
@@ -66,8 +71,10 @@ def self_test():
     assert not check(ledger, "\x1b[1;32m" + present + "\x1b[0m", empty, True)  # CI color
     assert not check(ledger, present + empty.replace("src/lib.rs", "src/main.rs"),
                      empty + empty.replace("src/lib.rs", "src/main.rs"), True)
-    doc = "Doc-tests kilnd\nsrc/sys.rs - sys::f (line 9): test\nsrc/a.rs - g (line 2) - compile fail: test\n2 tests, 0 benchmarks\n"
-    assert not check(ledger, present + doc, empty + "Doc-tests kilnd\n0 tests, 0 benchmarks\n", True)
+    doc = ("Doc-tests kilnd\nsrc/sys.rs - sys::f (line 9): test\n1 test, 0 benchmarks\n"  # merged, then
+           "src/a.rs - g (line 2) - compile fail: test\nsrc/a.rs - h (line 5): test\n2 tests, 0 benchmarks\n")
+    assert not check(ledger, present + doc, empty + "Doc-tests kilnd\n" + "0 tests, 0 benchmarks\n" * 2, True)
+    assert check(ledger, present + doc + "src/a.rs - x (line 1): test\n", empty, True)  # unfinished group
     assert check(ledger, present.replace("a::b", "src/a.rs - g (line 2)"), empty, True)  # not a doctest binary
     for listing, ignored in [(empty, empty), (present, present),  # cfg-disabled, ignored
                              (present.replace("a::b", "a::renamed"), empty),
