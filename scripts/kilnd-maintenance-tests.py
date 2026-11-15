@@ -45,6 +45,45 @@ def done(returncode=0, stdout='', stderr=''):
     return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def ancestry(path):
+    """/ and every directory down to path, which has no links in it."""
+    parts = path.strip('/').split('/') if path != '/' else []
+    return ['/', *('/' + '/'.join(parts[:n]) for n in range(1, len(parts) + 1))]
+
+
+def device_changes(path):
+    """The directories on the way to path that are on another device than their parent."""
+    chain = ancestry(path)
+    return [b for a, b in zip(chain, chain[1:]) if os.lstat(a).st_dev != os.lstat(b).st_dev]
+
+
+def safe_base():
+    """A scratch base the registry walk accepts: macOS's temporary directory is behind the /var
+    link, and Linux's /tmp is 1777, so the first candidate whose every ancestor is the test's
+    own or root's, writable by no one else, with at most one change of device."""
+    for base in (tempfile.gettempdir(), os.path.expanduser('~'), REPO):
+        base = os.path.realpath(base)
+        metas = [os.lstat(p) for p in ancestry(base)]
+        if all(m.st_uid in (0, os.getuid()) and not m.st_mode & 0o022 for m in metas) \
+                and len(device_changes(base)) <= 1:
+            return base
+    raise AssertionError('no scratch base the registry walk accepts')
+
+
+def mountinfo_line(number, path, meta, root='/'):
+    return '%d 1 %d:%d %s %s rw - fake fake rw\n' % (
+        number, os.major(meta.st_dev), os.minor(meta.st_dev), root, path)
+
+
+def write_mountinfo(path, root, extra=()):
+    """/ and the mount point of root's filesystem, if that isn't /'s, as /proc would list them."""
+    lines = [mountinfo_line(1, '/', os.lstat('/'))]
+    for point in device_changes(root):
+        lines.append(mountinfo_line(2, point, os.lstat(point)))
+    with open(path, 'w') as file:
+        file.write(''.join([*lines, *extra]))
+
+
 class World:
     """One fake node on disk, so it survives the child that crashes on it."""
 
@@ -61,8 +100,14 @@ class World:
         self.deploy = root + '/deploy'
         self.new = root + '/build'
         for path in (self.run_dir, root + '/var/lib', self.etc, self.deploy, self.new,
-                     root + '/bin', root + '/tmpfiles', root + '/libexec'):
+                     root + '/bin', root + '/tmpfiles', root + '/libexec', root + '/proc'):
             os.makedirs(path)
+        for path in (root + '/var', root + '/var/lib'):
+            os.chmod(path, 0o755)  # ancestors of the registry, whatever the umask
+        m.STATE_PARENT = root + '/var/lib'
+        m.PROC = root + '/proc'
+        m.MOUNTINFO = root + '/mountinfo'
+        write_mountinfo(m.MOUNTINFO, root)
         m.BIN = root + '/bin'
         m.STAGE = m.BIN + '/.kilnd-upgrade'
         m.LOCK = self.run_dir + '/lock'
@@ -103,7 +148,10 @@ class World:
         m.systemctl = self.systemctl
         m.run = self.run
         m.as_account = self.as_account
+        self.real_snapshot_state = m.snapshot_state
+        self.real_standard_instances = getattr(m, 'standard_instances', None)
         m.snapshot_state = self.snapshot_state
+        m.standard_instances = lambda: sorted(self.state)
         m.restore_state = self.restore_state
         m.instance_of = lambda unit: (self.state[unit], unit) if unit in self.state else None
         m.pwd = types.SimpleNamespace(
@@ -386,7 +434,7 @@ class Case(unittest.TestCase):
     world = World
 
     def setUp(self):
-        self.scratch = tempfile.mkdtemp(prefix='kilnd-maint-')
+        self.scratch = tempfile.mkdtemp(prefix='kilnd-maint-', dir=safe_base())
         self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
         for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             self.addCleanup(signal.signal, number, signal.getsignal(number))
@@ -672,7 +720,7 @@ class Checkpoints(Case):
         self.assertGreater(os.path.getsize(snapshot + '/kilnd.db-wal'), 0)
         before = sorted((n, os.stat(snapshot + '/' + n).st_mtime_ns) for n in os.listdir(snapshot))
         checked = self.m.inspect_snapshot('kilnd', snapshot)
-        self.assertEqual(checked, {'instance': '4' * 32, 'schema': 16,
+        self.assertEqual(checked, {'instance': '4' * 32, 'schema': 16, 'has_checkpoints': True,
                                    'busy': [{'id': 'cp-wal', 'kind': 'capturing'}]})
         after = sorted((n, os.stat(snapshot + '/' + n).st_mtime_ns) for n in os.listdir(snapshot))
         self.assertEqual(before, after, 'the snapshot itself is never opened by SQLite')
@@ -889,9 +937,25 @@ class Checkpoints(Case):
             with self.assertRaisesRegex(OSError, 'not private to root'):
                 self.m.checkpoint_inventory(instance)
             os.chmod(path, 0o700)
-        self.m.REGISTRY_UID = os.getuid() + 1
-        with self.assertRaisesRegex(OSError, 'not private to root'):
-            self.m.checkpoint_inventory(instance)
+        for path in (self.m.CHECKPOINTS_ROOT, directory):
+            self.fake_fstat(path, uid=os.getuid() + 1)
+            with self.assertRaisesRegex(OSError, 'not private to root'):
+                self.m.checkpoint_inventory(instance)
+            self.m.os.fstat = os.fstat
+
+    def fake_fstat(self, path, uid=None, dev=None):
+        """os.fstat as the walk sees it, with path's owner or device changed."""
+        inode = os.stat(path).st_ino
+
+        def fstat(fd):
+            meta = os.fstat(fd)
+            if meta.st_ino != inode:
+                return meta
+            fields = list(meta[:10])
+            fields[4] = fields[4] if uid is None else uid
+            fields[2] = fields[2] if dev is None else dev
+            return os.stat_result(fields)
+        self.m.os.fstat = fstat
 
     def test_inventory_refuses_another_filesystem(self):
         directory = self.artifact_dir()
@@ -908,6 +972,383 @@ class Checkpoints(Case):
         self.m.os.fstat = fstat
         with self.assertRaisesRegex(OSError, 'another filesystem'):
             self.m.checkpoint_inventory(self.w.identity('kilnd.service'))
+
+
+    def journal_at_replacing(self):
+        """The journal's instances as replacing begins, and the init-state runs before then."""
+        real_phase, captured = self.m.set_phase, {}
+
+        def phase(journal, name):
+            real_phase(journal, name)
+            if name == 'replacing':
+                captured['instances'] = self.m.read_json(self.m.JOURNAL)['instances']
+                captured['init'] = len([c for c in self.w.calls
+                                        if c[:1] == ('run',) and 'init-state' in c])
+        self.m.set_phase = phase
+        return captured
+
+    def orphan(self, identity=None, busy=None):
+        """A standard state directory no unit or enrollment names."""
+        unit = 'kilnd@orphan.service'
+        state = self.scratch + '/state-orphan'
+        os.mkdir(state, 0o700)
+        self.w.state[unit] = state
+        self.make_db(state + '/kilnd.db', identity or self.w.identity(unit), busy)
+        return unit, state
+
+    def test_orphan_state_with_busy_checkpoint_refuses(self):
+        """Recheck H1: a busy state directory with no unit or enrollment is still checked."""
+        unit, state = self.orphan(busy='capturing')
+        self.assertNotIn(unit, self.w.load_units())
+        self.assertNotIn(unit, [r['unit'] for r in self.w.load_rows()])
+        self.upgrade(2)
+        self.assertIn(unit + ' has 1 busy checkpoints: cp-' + 'a' * 32 + ' (capturing)',
+                      '\n'.join(self.messages))
+        with closing(sqlite3.connect(state + '/kilnd.db')) as db:
+            self.assertEqual(db.execute('SELECT id, state FROM checkpoints').fetchall(),
+                             [('cp-' + 'a' * 32, 'capturing')])
+
+    def test_standard_instances_lists_only_standard_state_dirs(self):
+        parent = self.scratch + '/lib'
+        for name in ('kilnd', 'kilnd-a1', 'kilnd-helper', 'kilnd-Bad', 'kilnd-x.y', 'kiln',
+                     'kilnd-' + 'b' * 17):
+            os.makedirs(parent + '/' + name)
+        open(parent + '/kilnd-f1', 'w').close()
+        self.m.STATE_PARENT = parent
+        standard = self.w.real_standard_instances
+        with self.assertRaisesRegex(self.m.Refused, 'kilnd-f1 is not a directory'):
+            standard()
+        os.unlink(parent + '/kilnd-f1')
+        self.assertEqual(standard(), ['kilnd.service', 'kilnd@a1.service'])
+        self.assertEqual(self.m.instance_of.__name__, '<lambda>', 'the world fakes it')
+        os.symlink(parent + '/kilnd-a1', parent + '/kilnd-l1')
+        with self.assertRaisesRegex(self.m.Refused, 'kilnd-l1 is not a directory'):
+            standard()
+
+    def without_account(self, unit):
+        real = self.m.pwd.getpwnam
+
+        def getpwnam(account):
+            if account == unit:
+                raise KeyError(account)
+            return real(account)
+        self.m.pwd = types.SimpleNamespace(getpwnam=getpwnam)
+
+    def test_orphan_without_account_refuses_checkpoint_schema(self):
+        unit, state = self.orphan()
+        self.without_account(unit)
+        self.upgrade(2)
+        self.assertIn('%s holds kilnd state of schema 15 or later, but account %s is gone'
+                      % (state, unit), '\n'.join(self.messages))
+        # From before checkpoints, it holds nothing the upgrade could break.
+        os.unlink(state + '/kilnd.db')
+        with closing(sqlite3.connect(state + '/kilnd.db')) as db:
+            db.execute('PRAGMA user_version = 14')
+            db.execute('CREATE TABLE t (x)')
+        self.upgrade()
+        self.assertEqual(self.w.images(), {i: 'new' for i in self.m.IMAGES})
+
+    def test_holds_checkpoint_schema_reads_only_the_header(self):
+        state = self.scratch + '/header'
+        os.mkdir(state)
+        held = self.m.holds_checkpoint_schema
+        self.assertFalse(held(state), 'no database')
+        open(state + '/kilnd.db', 'w').close()
+        self.assertFalse(held(state), 'empty')
+        with open(state + '/kilnd.db', 'wb') as file:
+            file.write(b'not a database' * 10)
+        self.assertTrue(held(state), 'unreadable counts as yes')
+        os.unlink(state + '/kilnd.db')
+        for version, expected in ((14, False), (15, True), (16, True)):
+            with closing(sqlite3.connect(state + '/kilnd.db')) as db:
+                db.execute('PRAGMA user_version = %d' % version)
+                db.execute('CREATE TABLE IF NOT EXISTS t (x)')
+            self.assertEqual(held(state), expected, version)
+        with open(state + '/kilnd.db-wal', 'wb') as file:
+            file.write(b'w')
+        self.assertTrue(held(state), 'a WAL may carry a migration')
+        os.unlink(state + '/kilnd.db-wal')
+        os.symlink('/dev/null', state + '/kilnd.db-wal')
+        self.assertTrue(held(state), 'a WAL that is not a file')
+        os.unlink(state + '/kilnd.db-wal')
+        os.rename(state + '/kilnd.db', state + '/real.db')
+        os.symlink(state + '/real.db', state + '/kilnd.db')
+        self.assertTrue(held(state), 'a link')
+        os.unlink(state + '/kilnd.db')
+        os.mkfifo(state + '/kilnd.db')
+        self.assertTrue(held(state), 'a FIFO, without blocking on it')
+
+    def fake_process(self, pid, uids, status=None):
+        os.makedirs('%s/%d' % (self.m.PROC, pid))
+        with open('%s/%d/status' % (self.m.PROC, pid), 'wb') as file:
+            file.write(status if status is not None else
+                       b'Name:\t\xffkilnd\nUid:\t%s\nGid:\t1000\t1000\t1000\t1000\n'
+                       % '\t'.join(map(str, uids)).encode())
+
+    def test_process_of_the_account_with_saved_uid_refuses(self):
+        """Recheck H2: a stopped unit doesn't prove its account has no writer left."""
+        os.makedirs(self.m.PROC + '/self')
+        self.fake_process(77, (1001, 1001, 1001, 1001))
+        self.fake_process(4242, (1001, 1001, 1000, 1001))
+        self.upgrade(2)
+        message = '\n'.join(self.messages)
+        self.assertIn('kilnd.service is stopped, but 1 processes still run as kilnd.service: '
+                      'pids 4242; stop them and retry', message)
+
+    def test_process_of_the_account_with_real_uid_refuses(self):
+        self.fake_process(4242, (1000, 1001, 1001, 1001))
+        self.upgrade(2)
+        self.assertIn('pids 4242', '\n'.join(self.messages))
+
+    def test_unreadable_process_table_refuses(self):
+        os.rmdir(self.m.PROC)
+        self.upgrade(2)
+        self.assertIn('cannot list processes in ' + self.m.PROC, '\n'.join(self.messages))
+        os.mkdir(self.m.PROC)
+        self.fake_process(4243, (), status=b'Name:\tkilnd\nGid:\t0\t0\t0\t0\n')
+        self.upgrade(2)
+        self.assertIn('4243/status has no Uid line', '\n'.join(self.messages))
+
+    def wal_only_busy_row(self):
+        """The default instance's state in WAL mode, a busy row only in its WAL, its writer open."""
+        state = self.w.state['kilnd.service']
+        db = sqlite3.connect(state + '/kilnd.db', isolation_level=None)
+        self.addCleanup(db.close)
+        db.executescript('PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;')
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        db.execute("INSERT INTO checkpoints VALUES ('cp-wal-only', 'capturing')")
+        for name in ('kilnd.db-wal', 'kilnd.db-shm'):
+            os.chmod(state + '/' + name, 0o600)
+        self.assertEqual(self.immutable_rows(state + '/kilnd.db'), [], 'only in the WAL')
+        return state
+
+    @staticmethod
+    def immutable_rows(path):
+        """The checkpoints in that one file, whatever WAL lies beside it."""
+        with closing(sqlite3.connect('file:%s?immutable=1' % path, uri=True)) as db:
+            return db.execute('SELECT id, state FROM checkpoints').fetchall()
+
+    def test_snapshot_is_one_sqlite_copy_of_db_and_wal(self):
+        state = self.wal_only_busy_row()
+        destination = self.scratch + '/snapshot'
+        self.w.real_snapshot_state('kilnd', state, destination)
+        self.assertEqual(os.listdir(destination), ['kilnd.db'])
+        self.assertEqual(self.immutable_rows(destination + '/kilnd.db'),
+                         [('cp-wal-only', 'capturing')])
+        self.assertEqual(stat.S_IMODE(os.stat(destination + '/kilnd.db').st_mode), 0o600)
+
+    def test_snapshot_of_absent_state_copies_nothing(self):
+        state = self.scratch + '/empty'
+        os.mkdir(state, 0o700)
+        report = self.w.real_snapshot_state('kilnd', state, self.scratch + '/snapshot')
+        self.assertEqual(report, {'copied': []})
+        self.assertEqual(os.listdir(self.scratch + '/snapshot'), [])
+
+    def test_checkpointing_the_wal_after_the_copy_still_refuses(self):
+        """Recheck H2's race: a surviving writer checkpoints the WAL into the main file just
+        after the copy first writes to root's descriptor. The copy must already be whole."""
+        state = self.wal_only_busy_row()
+        self.m.snapshot_state = self.w.real_snapshot_state
+        racing = r"""
+import os as _os, sqlite3 as _sqlite3, sys as _sys
+_fsync, _raced = _os.fsync, []
+def _racing_fsync(fd):
+    _fsync(fd)
+    if _sys.argv[1] == 'snapshot' and not _raced:
+        _raced.append(fd)
+        cx = _sqlite3.connect(_os.path.join(_sys.argv[2], 'kilnd.db'))
+        cx.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        cx.close()
+_os.fsync = _racing_fsync
+"""
+        self.m.ACCOUNT_CHILD = racing + self.m.ACCOUNT_CHILD
+        self.upgrade(2)
+        self.assertEqual(os.path.getsize(state + '/kilnd.db-wal'), 0, 'the race happened')
+        self.assertEqual(self.immutable_rows(state + '/kilnd.db'), [('cp-wal-only', 'capturing')])
+        self.assertIn('kilnd.service has 1 busy checkpoints: cp-wal-only (capturing)',
+                      '\n'.join(self.messages))
+
+    def test_snapshot_refuses_a_hot_journal(self):
+        """A writer killed mid-transaction leaves a hot journal and a half-written database,
+        which only a rollback the read-only copy can't make would undo: the copy is refused."""
+        state = self.scratch + '/hot'
+        os.mkdir(state, 0o700)
+        subprocess.run([sys.executable, '-I', '-c', """if 1:
+            import os, sqlite3, sys
+            path = sys.argv[1] + '/kilnd.db'
+            db = sqlite3.connect(path)
+            db.execute('CREATE TABLE checkpoints (id TEXT PRIMARY KEY, state TEXT)')
+            db.executemany('INSERT INTO checkpoints VALUES (?, ?)',
+                           [('cp-%04d' % n + 'x' * 400, 'ready') for n in range(3000)])
+            db.commit()
+            db.close()
+            os.chmod(path, 0o600)
+            db = sqlite3.connect(path, isolation_level=None)
+            db.execute('PRAGMA cache_size = 5')
+            db.execute('PRAGMA cache_spill = 1')
+            db.execute('BEGIN')
+            db.execute("UPDATE checkpoints SET state = 'capturing' || hex(randomblob(8))")
+            os._exit(0)
+            """, state], check=True)
+        self.assertGreater(os.path.getsize(state + '/kilnd.db-journal'), 0)
+        with closing(sqlite3.connect('file:%s/kilnd.db?immutable=1' % state, uri=True)) as db:
+            self.assertIn('capturing', {r[0][:9] for r in db.execute('SELECT state FROM checkpoints')},
+                          'the main file alone is half-written')
+        with self.assertRaisesRegex(RuntimeError, 'readonly'):
+            self.w.real_snapshot_state('kilnd', state, self.scratch + '/snapshot')
+
+    def forget_identity(self, unit='kilnd.service'):
+        with closing(sqlite3.connect(self.w.state[unit] + '/kilnd.db')) as db, db:
+            db.execute('DELETE FROM daemon_identity')
+
+    def unenroll(self):
+        self.w.save_rows([])
+        self.before_rows = []
+
+    def test_snapshot_identity_matching_the_enrollment_is_journaled(self):
+        captured = self.journal_at_replacing()
+        self.upgrade()
+        self.assertEqual(captured['instances']['kilnd.service']['instance'],
+                         self.w.identity('kilnd.service'))
+        self.assertEqual(captured['init'], 0, 'no init-state before the replacement')
+
+    def test_snapshot_identity_without_enrollment_is_journaled(self):
+        self.unenroll()
+        captured = self.journal_at_replacing()
+        self.upgrade()
+        for unit in ('kilnd.service', INSTANCE):
+            self.assertEqual(captured['instances'][unit]['instance'], self.w.identity(unit))
+            self.assertIn('checkpoints', captured['instances'][unit])
+        self.assertEqual(captured['init'], 0, 'no init-state before the replacement')
+
+    def test_no_identity_and_no_enrollment_with_checkpoints_refuses(self):
+        """Recheck H3: the identity is never read from the live state, which may be another."""
+        self.unenroll()
+        self.forget_identity()
+        steered = '2' * 32
+        self.swap_after_snapshot(steered)
+        os.mkdir(self.m.CHECKPOINTS_ROOT, 0o700)
+        os.mkdir(self.m.CHECKPOINTS_ROOT + '/' + steered, 0o700)
+        open(self.m.CHECKPOINTS_ROOT + '/' + steered + '/outside-sentinel', 'w').close()
+        inventoried = []
+        real_inventory = self.m.checkpoint_inventory
+        self.m.checkpoint_inventory = lambda i: inventoried.append(i) or real_inventory(i)
+        self.assertEqual(self.command('upgrade', '--bin-dir', self.w.new,
+                                      '--deploy-dir', self.w.deploy), 2)
+        self.assertIn('kilnd.service has checkpoint state but records no instance ID; start '
+                      'kilnd once so it records one, then retry', '\n'.join(self.messages))
+        self.assertEqual(inventoried, [])
+        self.assertFalse([c for c in self.w.calls if c[:1] == ('run',) and 'init-state' in c])
+        self.assertEqual(self.w.images(), {i: 'old' for i in self.m.IMAGES})
+
+    def test_no_identity_with_enrollment_and_checkpoints_refuses(self):
+        self.forget_identity()
+        self.upgrade(2)
+        self.assertIn('kilnd.service is enrolled as %s, but its state records no instance ID; '
+                      'start kilnd once and retry' % self.w.identity('kilnd.service'),
+                      '\n'.join(self.messages))
+
+    def test_no_identity_before_checkpoints_proceeds_without_inventory(self):
+        self.unenroll()
+        self.w.write_schema('kilnd.service', 14)
+        with closing(sqlite3.connect(self.w.state['kilnd.service'] + '/kilnd.db')) as db, db:
+            db.executescript('DROP TABLE checkpoints; DROP TABLE checkpoint_pins; '
+                             'DROP TABLE daemon_identity;')
+        captured = self.journal_at_replacing()
+        self.upgrade()
+        kept = captured['instances']['kilnd.service']
+        self.assertIsNone(kept['instance'])
+        self.assertNotIn('checkpoints', kept, 'nothing to inventory, or compare after a rollback')
+        self.assertEqual(captured['init'], 0, 'no init-state before the replacement')
+        self.assertEqual(self.w.images(), {i: 'new' for i in self.m.IMAGES})
+
+    def test_inventory_does_not_follow_an_ancestor_link(self):
+        """Recheck H4: the walk starts at /, so no component above the registry is followed."""
+        instance = self.w.identity('kilnd.service')
+        outside = self.scratch + '/outside'
+        os.makedirs(outside + '/runs/.checkpoints/' + instance, 0o700)
+        os.chmod(outside, 0o755)
+        os.chmod(outside + '/runs', 0o755)
+        open(outside + '/runs/.checkpoints/' + instance + '/outside-sentinel', 'w').close()
+        os.symlink(outside, self.scratch + '/kiln')
+        self.m.CHECKPOINTS_ROOT = self.scratch + '/kiln/runs/.checkpoints'
+        with self.assertRaises(OSError):
+            self.m.checkpoint_inventory(instance)
+        self.upgrade(2)
+        self.assertIn('cannot inventory the checkpoint artifacts of kilnd.service',
+                      '\n'.join(self.messages))
+
+    def mounts(self, *extra):
+        """/ and at most the scratch filesystem's own mount point, then extra lines."""
+        write_mountinfo(self.m.MOUNTINFO, self.scratch, extra)
+
+    def mount_at(self, path, root='/', number=9):
+        return mountinfo_line(number, path.replace(' ', '\\040'), os.stat(path), root)
+
+    def test_inventory_refuses_a_bind_mount_on_the_way(self):
+        instance = self.w.identity('kilnd.service')
+        self.artifact_dir()
+        ancestor = self.scratch + '/var'
+        self.mounts(self.mount_at(ancestor, root='/elsewhere'))
+        with self.assertRaisesRegex(OSError, 'var is a mount point'):
+            self.m.checkpoint_inventory(instance)
+        # The top of a stack is what the path reaches.
+        self.mounts(self.mount_at(ancestor), self.mount_at(ancestor, root='/elsewhere'))
+        with self.assertRaisesRegex(OSError, 'var is a mount point'):
+            self.m.checkpoint_inventory(instance)
+        self.upgrade(2)
+        self.assertIn('cannot inventory the checkpoint artifacts of kilnd.service',
+                      '\n'.join(self.messages))
+
+    def test_inventory_allows_one_whole_filesystem_mount_among_the_ancestors(self):
+        instance = self.w.identity('kilnd.service')
+        os.mkdir(self.artifact_dir() + '/cp-a')
+        changes = device_changes(self.scratch)
+        point = changes[0] if changes else self.scratch + '/var'
+        lines = [mountinfo_line(1, '/', os.lstat('/')), self.mount_at(point)]
+        with open(self.m.MOUNTINFO, 'w') as file:
+            file.write(''.join(lines))
+        self.assertEqual([e['name'] for e in self.m.checkpoint_inventory(instance)], ['cp-a'])
+        for second in (self.scratch + '/var/lib', self.m.CHECKPOINTS_ROOT,
+                       self.m.CHECKPOINTS_ROOT + '/' + instance):
+            with open(self.m.MOUNTINFO, 'w') as file:
+                file.write(''.join([*lines, self.mount_at(second)]))
+            with self.assertRaisesRegex(OSError, 'is a mount point', msg=second):
+                self.m.checkpoint_inventory(instance)
+
+    def test_inventory_refuses_a_group_writable_ancestor(self):
+        self.artifact_dir()
+        os.chmod(self.scratch + '/var/lib', 0o775)
+        with self.assertRaisesRegex(OSError, "var/lib is not root's, or others can write it"):
+            self.m.checkpoint_inventory(self.w.identity('kilnd.service'))
+
+    def test_inventory_refuses_an_ancestor_of_another_owner(self):
+        self.artifact_dir()
+        self.fake_fstat(self.scratch + '/var', uid=os.getuid() + 1)
+        with self.assertRaisesRegex(OSError, "var is not root's, or others can write it"):
+            self.m.checkpoint_inventory(self.w.identity('kilnd.service'))
+
+    def test_inventory_refuses_without_mountinfo(self):
+        self.artifact_dir()
+        instance = self.w.identity('kilnd.service')
+        self.m.MOUNTINFO = self.scratch + '/no-mountinfo'
+        with self.assertRaises(FileNotFoundError):
+            self.m.checkpoint_inventory(instance)
+        self.upgrade(2)
+        self.assertIn('cannot inventory the checkpoint artifacts of kilnd.service',
+                      '\n'.join(self.messages))
+        self.m.MOUNTINFO = self.scratch + '/mountinfo'
+        with open(self.m.MOUNTINFO, 'w') as file:
+            file.write('1 0 garbage\n')
+        with self.assertRaisesRegex(OSError, 'cannot parse'):
+            self.m.checkpoint_inventory(instance)
+
+    def test_inventory_refuses_a_registry_path_that_is_not_plain(self):
+        for root in ('var/lib/kiln/runs/.checkpoints', self.scratch + '/var/../var/lib/checkpoints',
+                     self.scratch + '//var/lib/checkpoints', self.scratch + '/./var/lib/checkpoints'):
+            self.m.CHECKPOINTS_ROOT = root
+            with self.assertRaisesRegex(OSError, 'not a plain absolute path', msg=root):
+                self.m.checkpoint_inventory(self.w.identity('kilnd.service'))
 
 
 class Restore(Case):

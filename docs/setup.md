@@ -239,9 +239,10 @@ scripts/upgrade.sh --recover        # finishes an upgrade killed partway
 2. It discovers every instance (`kilnd.service` and `kilnd@*`), records which are running,
    and stops them all, with activation unavailable as above.
 3. **Before replacing anything,** it refuses if the ledger can't be read or refreshed, if an
-   enrollment isn't a standard unit bound to its current account, if it can't keep a copy of
-   a running instance's database, or if any configured or enrolled instance, running or not,
-   has a checkpoint in flight.
+   enrollment isn't a standard unit bound to its current account, if a process of an
+   instance's account outlived its unit, if it can't keep a copy of a running instance's
+   database, or if any configured or enrolled instance, running or not, or any standard state
+   directory nothing names any more, has a checkpoint in flight.
 4. It moves the old images aside by rename, keeping their inodes, installs the new images and
    units, and refreshes every enrollment's image in one ledger transaction. An instance's ID,
    account and unit can't change, and an instance that isn't running is refreshed too.

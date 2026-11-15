@@ -105,20 +105,39 @@ for every running instance as one transaction. With checkpoints it also:
 
 - **Refuses to start while a checkpoint is in flight** (exit 2, nothing changed): any
   checkpoint `capturing` or `deleting`, or one with a fork still restoring from it, in
-  **any** configured or enrolled instance, running or stopped. Only the running instances
+  **any** configured or enrolled instance, running or stopped, and in any standard state
+  directory (`/var/lib/kilnd`, `/var/lib/kilnd-<name>`) that no unit or enrollment names
+  any more. Such a directory whose account is gone can't be inspected as that account, so
+  if its database header says schema 15 or later, or it has a non-empty WAL, the upgrade
+  refuses: restore the account or move the directory aside. Only the running instances
   are then snapshotted, migrated and started again. The daemons were stopped to take the
   snapshot, so they are started again; let those checkpoints settle (`kilndctl checkpoint
   ls`), then retry.
-- **Reads the snapshot, not the live state.** Root copies each instance's database, then
-  the instance's own account runs the query, unprivileged, on a copy of that snapshot that
-  only root can change. When the instance is enrolled, the snapshot's instance ID must be
-  the enrollment's (exit 2 otherwise), and that ID is what the journal records.
+- **Requires the instance's account to be quiet.** The units stop with `KillMode=process`,
+  so before each copy the upgrade refuses (exit 2) if any process still runs with the
+  account's UID as its real, effective, saved or filesystem UID, or if `/proc` can't be
+  read.
+- **Reads one coherent snapshot, not the live state.** The instance's own account takes one
+  SQLite backup of its database, which reads the database and its WAL in one read
+  transaction, so a checkpoint of the WAL during the copy can't hide a row; the snapshot is
+  that single `kilnd.db`. The account then runs the query, unprivileged, on a copy of that
+  snapshot that only root can change. When the instance is enrolled, the snapshot's
+  instance ID must be the enrollment's (exit 2 otherwise), and that ID is what the journal
+  records. The ID never comes from the live state: a running instance whose snapshot
+  records none is refused (exit 2) if it has checkpoint state (schema 15 or later with a
+  checkpoint table); start kilnd once so it records one. Older state with no ID has no
+  checkpoints and is journaled without an inventory.
 - **Records the instance's artifact inventory** beside its database snapshot: the name,
-  type and inode of each entry at the top of `.checkpoints/<instance>/`. Root opens every
-  component from `/var/lib/kiln/runs` without following a link and refuses (exit 2) a
-  registry or instance directory that is a link, isn't root's alone (`0700`), or is on
-  another filesystem. An absent instance directory and an empty one are the same
-  inventory, and a changed modification time alone is not a difference.
+  type and inode of each entry at the top of `.checkpoints/<instance>/`. Root walks from
+  `/`, opening every component without following a link, and refuses (exit 2) unless `/`
+  and every ancestor of the registry are root's and not group- or other-writable, the
+  registry and instance directories are root's alone (`0700`), and at most one ancestor,
+  and neither of those two, is a mount point: the mount root of a whole filesystem (its
+  mount source root is `/`, and its device is the one the walk opened), not a bind mount
+  of a subtree. Any other change of filesystem on the way is refused, and so is a
+  `/proc/self/mountinfo` the upgrade can't read. An absent instance directory and an
+  empty one are the same inventory, and a changed modification time alone is not a
+  difference.
 - **Checks the inventory after a rollback, and fails closed on a difference.** Artifacts
   are immutable, so the snapshot plus the artifacts on disk are a matching set unless the
   new daemon changed them before the upgrade failed (it may have run and served requests).
@@ -137,7 +156,12 @@ The messages, each prefixed `kilnd-maintenance: `:
 |---|---|
 | 2 | `refused, nothing changed: <unit> has <n> busy checkpoints: <id> (capturing), <id> (deleting), <id> (fork pin); start kilnd, let those checkpoints settle (kilndctl checkpoint ls), and retry` (at most five IDs) |
 | 2 | `refused, nothing changed: cannot inspect the checkpoints of <unit>: <error>` |
+| 2 | `refused, nothing changed: <state> holds kilnd state of schema 15 or later, but account <account> is gone, so it cannot be inspected safely; restore the account or move the directory aside, and retry` |
+| 2 | `refused, nothing changed: <unit> is stopped, but <n> processes still run as <account>: pids <pid>, …; stop them and retry` (at most ten PIDs) |
+| 2 | `refused, nothing changed: cannot list processes in /proc: <error>` |
 | 2 | `refused, nothing changed: <unit> is enrolled as <id>, but its state says <id>` |
+| 2 | `refused, nothing changed: <unit> is enrolled as <id>, but its state records no instance ID; start kilnd once and retry` |
+| 2 | `refused, nothing changed: <unit> has checkpoint state but records no instance ID; start kilnd once so it records one, then retry` |
 | 2 | `refused, nothing changed: <unit> has an invalid checkpoint instance ID` |
 | 2 | `refused, nothing changed: cannot inventory the checkpoint artifacts of <unit>: <error>` |
 | 3 | `rolled back, but the checkpoint artifacts of <unit> changed during the window: added '<name>', missing '<name>', changed '<name>'`, then `recovery required: kilnd stays stopped until the checkpoint artifacts are reconciled; then run kilnd-maintenance.py accept-artifacts (docs/checkpoints.md)` |

@@ -6,6 +6,17 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix the C6a recheck's maintenance findings (four HIGH). The upgrade's checkpoint check
+  also covers every standard state directory (`/var/lib/kilnd`, `/var/lib/kilnd-<name>`)
+  that no unit or enrollment names, and refuses one whose account is gone if it may hold
+  checkpoint state. Before each copy it refuses while any process still runs as the
+  instance's account (`KillMode=process` leaves them). The account now takes one SQLite
+  backup of its database and WAL, the rollback snapshot included, instead of copying the
+  files one by one. The instance ID comes only from that snapshot or the enrollment, never
+  the live state; checkpoint state without one is refused until kilnd has run once. The
+  artifact inventory walks from `/` without following links, requires root-owned ancestors
+  no one else can write, and refuses bind mounts and any mount point other than one whole
+  filesystem's root, or an unreadable `/proc/self/mountinfo`.
 - Pin the checkpoint wire contract's field numbers by hand (C6a recheck 1 HIGH). A table
   of every field of every checkpoint message, `NodeResourceStats`, the checkpoint fields
   of `RuntimeCapabilities`, `ApiLimits`, `AdmissionStats`, `Sandbox` and

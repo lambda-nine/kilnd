@@ -68,6 +68,10 @@ FAILED_DIR = '/var/lib/kilnd-helper/failed-upgrades'
 CHECKPOINTS_ROOT = '/var/lib/kiln/runs/.checkpoints'
 REGISTRY_UID = 0
 INSPECT_DIR = '/run'
+# Where every standard instance keeps its state, whether or not a unit or enrollment names it.
+STATE_PARENT = '/var/lib'
+PROC = '/proc'
+MOUNTINFO = '/proc/self/mountinfo'
 STAGE = BIN + '/.kilnd-upgrade'
 MANAGED_FILES = {
     'kilnd-helper.socket': '/etc/systemd/system/kilnd-helper.socket',
@@ -219,11 +223,84 @@ def daemon_units():
 def instance_of(unit):
     """A standard unit's state directory and account, or None for any other unit."""
     if unit == 'kilnd.service':
-        return '/var/lib/kilnd', 'kilnd'
+        return os.path.join(STATE_PARENT, 'kilnd'), 'kilnd'
     match = re.fullmatch(r'kilnd@([a-z0-9]+)\.service', unit)
     if match:
-        return '/var/lib/kilnd-' + match[1], 'kilnd-' + match[1]
+        return os.path.join(STATE_PARENT, 'kilnd-' + match[1]), 'kilnd-' + match[1]
     return None
+
+
+def standard_instances():
+    """Every standard state directory's unit, configured, enrolled or neither. The helper's own
+    directory is not an instance's. A standard name that isn't a plain directory is refused."""
+    found = []
+    with os.scandir(STATE_PARENT) as entries:
+        for entry in entries:
+            if entry.name == 'kilnd':
+                unit = 'kilnd.service'
+            elif entry.name.startswith('kilnd-') and entry.name != 'kilnd-helper' \
+                    and re.fullmatch(r'[a-z0-9]{1,16}', entry.name[6:]):
+                unit = 'kilnd@%s.service' % entry.name[6:]
+            else:
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                raise Refused('%s is not a directory' % entry.path)
+            found.append(unit)
+    return sorted(found)
+
+
+def holds_checkpoint_schema(state):
+    """Whether a state directory root can't inspect as its account may hold checkpoints. Root
+    reads only the database header, never through SQLite. Anything unclear counts as yes."""
+    database = os.path.join(state, 'kilnd.db')
+    if not os.path.lexists(database):
+        return False
+    try:
+        fd = os.open(database, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return True  # a link, or nothing root can read
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return True
+        header = os.read(fd, 100)
+    finally:
+        os.close(fd)
+    # A WAL can carry a migration, or the whole database, that the main file doesn't show yet.
+    wal = database + '-wal'
+    if os.path.lexists(wal):
+        meta = os.lstat(wal)
+        if not stat.S_ISREG(meta.st_mode) or meta.st_size:
+            return True
+    if not header:
+        return False
+    if len(header) < 64 or not header.startswith(b'SQLite format 3\x00'):
+        return True
+    return int.from_bytes(header[60:64], 'big') >= 15
+
+
+def account_processes(uid):
+    """Every process with uid as its real, effective, saved or filesystem UID."""
+    try:
+        names = os.listdir(PROC)
+    except OSError as error:
+        raise Refused('cannot list processes in %s: %s' % (PROC, error)) from None
+    found = []
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(PROC, name, 'status'), 'rb') as file:
+                lines = file.read().splitlines()  # bytes: a process names itself
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError as error:
+            raise Refused('cannot read %s/%s/status: %s' % (PROC, name, error)) from None
+        uids = next((line.split()[1:5] for line in lines if line.startswith(b'Uid:')), None)
+        if uids is None:
+            raise Refused('%s/%s/status has no Uid line' % (PROC, name))
+        if str(uid).encode() in uids:
+            found.append(int(name))
+    return sorted(found)
 
 
 def fsync_dir(path):
@@ -434,7 +511,7 @@ def close_window(window):
 # What an instance's account does in its own state directory. It starts from this one
 # file, sharing nothing with root but the descriptors named on its command line.
 ACCOUNT_CHILD = r'''
-import json, os, sqlite3, stat, sys
+import json, os, sqlite3, stat, sys, tempfile
 from urllib.parse import quote
 NAMES = ('kilnd.db', 'kilnd.db-wal', 'kilnd.db-shm', 'kilnd.db-journal')
 op, state = sys.argv[1], sys.argv[2]
@@ -457,24 +534,48 @@ def schema():
     finally:
         db.close()
 if op == 'snapshot':
-    # One destination descriptor per name, in order. Nothing here follows a link or
-    # blocks on a FIFO a hostile instance left behind.
-    copied = []
-    for name, destination in zip(NAMES, map(int, sys.argv[3:])):
-        if name.endswith('-shm'):
-            continue  # SQLite rebuilds it, and it means nothing without the live mapping.
+    # One destination descriptor, for kilnd.db: one SQLite backup, which reads the database and
+    # its WAL in one read transaction, so the copy is one snapshot whatever a writer does. Every
+    # file SQLite will open is checked first: nothing here follows a link or blocks on a FIFO a
+    # hostile instance left behind. A hot journal or any SQLite error fails the copy.
+    destination = int(sys.argv[3])
+    if not os.path.lexists(path('kilnd.db')):
+        print(json.dumps({'copied': []}))
+        raise SystemExit(0)
+    for name in NAMES:
         try:
             source = os.open(path(name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             continue
         seen = os.fstat(source)
+        os.close(source)
         if not stat.S_ISREG(seen.st_mode) or seen.st_nlink != 1 or seen.st_uid != os.getuid() \
                 or seen.st_mode & 0o077:
             raise SystemExit(name + ' is not a private regular file')
-        copy(source, destination)
-        os.fsync(destination)
-        copied.append(name)
-    print(json.dumps({'copied': copied}))
+    src = sqlite3.connect('file:' + quote(path('kilnd.db')) + '?mode=ro', uri=True, timeout=5)
+    try:
+        if hasattr(sqlite3.Connection, 'serialize'):
+            dst = sqlite3.connect(':memory:')
+            # An in-memory destination can't change its page size during the backup.
+            dst.execute('PRAGMA page_size = %d' % src.execute('PRAGMA page_size').fetchone()[0])
+            src.backup(dst)
+            data = dst.serialize()
+            dst.close()
+        else:
+            with tempfile.TemporaryDirectory() as scratch:
+                dst = sqlite3.connect(os.path.join(scratch, 'kilnd.db'))
+                src.backup(dst)
+                dst.close()
+                with open(os.path.join(scratch, 'kilnd.db'), 'rb') as file:
+                    data = file.read()
+    finally:
+        src.close()
+    if data[:16] != b'SQLite format 3\x00':
+        raise SystemExit('the copy of kilnd.db is not a database')
+    while data:
+        data = data[os.write(destination, data):]
+    os.fsync(destination)
+    print(json.dumps({'copied': ['kilnd.db']}))
 elif op == 'restore':
     # One source descriptor per name in the snapshot, in NAMES order.
     names = sys.argv[3].split(',') if sys.argv[3] else []
@@ -508,6 +609,7 @@ elif op == 'checkpoints':
     try:
         result['schema'] = db.execute('PRAGMA user_version').fetchone()[0]
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        result['has_checkpoints'] = 'checkpoints' in tables
         if 'daemon_identity' in tables:
             row = db.execute('SELECT instance_id FROM daemon_identity WHERE id = 1').fetchone()
             result['instance'] = row[0] if row else None
@@ -554,19 +656,17 @@ CHILD_NAMES = ('kilnd.db', 'kilnd.db-wal', 'kilnd.db-shm', 'kilnd.db-journal')
 
 
 def snapshot_state(account, state, destination):
+    """kilnd.db as one SQLite snapshot, WAL included, made by the account. The upgrade's copy
+    for its busy query and rollback, and a rollback's copy of what a newer schema held."""
     os.makedirs(destination, mode=0o700)
-    fds = [
-        os.open(os.path.join(destination, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        for name in CHILD_NAMES
-    ]
+    target = os.path.join(destination, 'kilnd.db')
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        report = as_account(account, 'snapshot', state, *fds, fds=fds)
+        report = as_account(account, 'snapshot', state, fd, fds=(fd,))
     finally:
-        for fd in fds:
-            os.close(fd)
-    for name in CHILD_NAMES:
-        if name not in report['copied']:
-            os.unlink(os.path.join(destination, name))
+        os.close(fd)
+    if 'kilnd.db' not in report['copied']:
+        os.unlink(target)
     fsync_dir(destination)
     return report
 
@@ -931,10 +1031,11 @@ def upgrade_transaction(args, journal, window):
         write_json(TXN_DIR + '/enrollments.json', rows)
         journal['rows'] = rows
     running = window.running_daemons()
-    # Every configured or enrolled instance's checkpoints are checked, running or not; only
-    # the running ones are snapshotted for the rollback, migrated and started again.
-    configured = (u for u in window.record['units'] if u not in ACTIVATION)
-    for unit in sorted({*configured, *enrolled}):
+    # Every configured or enrolled instance's checkpoints are checked, running or not, and so
+    # are those of a standard state directory nothing names any more; only the running ones
+    # are snapshotted for the rollback, migrated and started again.
+    configured = {u for u in window.record['units'] if u not in ACTIVATION}
+    for unit in sorted({*configured, *enrolled, *standard_instances()}):
         instance = instance_of(unit)
         if instance is None:
             if unit in running:
@@ -945,14 +1046,26 @@ def upgrade_transaction(args, journal, window):
         if unit not in running and not os.path.isdir(state):
             continue
         try:
-            pwd.getpwnam(account)
+            entry = pwd.getpwnam(account)
         except KeyError:
-            raise Refused('%s is %s, but account %s is gone' % (
-                unit, 'running' if unit in running else 'configured', account)) from None
+            if unit in configured or unit in enrolled:
+                raise Refused('%s is %s, but account %s is gone' % (
+                    unit, 'running' if unit in running else 'configured', account)) from None
+            if holds_checkpoint_schema(state):
+                raise Refused('%s holds kilnd state of schema 15 or later, but account %s is '
+                              'gone, so it cannot be inspected safely; restore the account or '
+                              'move the directory aside, and retry' % (state, account)) from None
+            continue
         if not os.path.isdir(state):
             if unit in enrolled:
                 raise Refused('%s is enrolled, but %s is missing' % (unit, state))
             continue
+        # KillMode=process: a stopped unit doesn't prove that nothing of its account still runs,
+        # and a surviving writer could change the state between the copy and the migration.
+        pids = account_processes(entry.pw_uid)
+        if pids:
+            raise Refused('%s is stopped, but %d processes still run as %s: pids %s; stop them '
+                          'and retry' % (unit, len(pids), account, ', '.join(map(str, pids[:10]))))
         destination = os.path.join(TXN_DIR, 'state' if unit in running else 'inspected', unit)
         os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
         try:
@@ -969,28 +1082,33 @@ def upgrade_transaction(args, journal, window):
                           'settle (kilndctl checkpoint ls), and retry'
                           % (unit, len(busy), ', '.join('%s (%s)' % (c['id'], c['kind'])
                                                        for c in busy[:5])))
-        identity = checkpoints['instance']
-        if identity is not None and unit in enrolled and identity != enrolled[unit]:
+        identity, expected = checkpoints['instance'], enrolled.get(unit)
+        if identity is not None and expected is not None and identity != expected:
             raise Refused('%s is enrolled as %s, but its state says %s'
-                          % (unit, enrolled[unit], identity))
+                          % (unit, expected, identity))
         if unit not in running:
             continue
-        identity = identity or enrolled.get(unit) or init_state(installed_kilnd, state, account)
-        if not isinstance(identity, str) or not re.fullmatch(r'[0-9a-f]{32}', identity):
-            raise Refused('%s has an invalid checkpoint instance ID' % unit)
-        try:
-            inventory = checkpoint_inventory(identity)
-        except OSError as error:
-            raise Refused('cannot inventory the checkpoint artifacts of %s: %s'
-                          % (unit, error)) from None
-        journal['instances'][unit] = {
-            'state': state,
-            'account': account,
-            'schema': checkpoints['schema'],
-            'snapshot': destination,
-            'instance': identity,
-            'checkpoints': inventory,
-        }
+        # The identity comes from the snapshot or the enrollment, never from the live state.
+        checkpointed = (checkpoints['schema'] or 0) >= 15 and checkpoints.get('has_checkpoints')
+        if identity is None and checkpointed:
+            if expected is not None:
+                raise Refused('%s is enrolled as %s, but its state records no instance ID; '
+                              'start kilnd once and retry' % (unit, expected))
+            raise Refused('%s has checkpoint state but records no instance ID; start kilnd once '
+                          'so it records one, then retry' % unit)
+        identity = identity or expected
+        kept = {'state': state, 'account': account, 'schema': checkpoints['schema'],
+                'snapshot': destination, 'instance': identity}
+        if identity is not None:
+            # Without one the state is from before checkpoints, and has none to inventory.
+            if not isinstance(identity, str) or not re.fullmatch(r'[0-9a-f]{32}', identity):
+                raise Refused('%s has an invalid checkpoint instance ID' % unit)
+            try:
+                kept['checkpoints'] = checkpoint_inventory(identity)
+            except OSError as error:
+                raise Refused('cannot inventory the checkpoint artifacts of %s: %s'
+                              % (unit, error)) from None
+        journal['instances'][unit] = kept
     os.mkdir(TXN_DIR + '/files', 0o700)
     fsync_dir(TXN_DIR)
     if os.path.isdir(os.path.join(TXN_DIR, 'state')):
@@ -1109,23 +1227,57 @@ def discard_transaction():
         fsync_dir(parent)
 
 
+def mount_points():
+    """Each mount point's stack of (major:minor, root), in mountinfo's order, the top last."""
+    def decode(field):
+        return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), field)
+    mounts = {}
+    with open(MOUNTINFO, 'rb') as file:
+        lines = file.read().decode('utf-8', 'surrogateescape').splitlines()
+    for line in lines:
+        fields = line.split(' ')
+        if len(fields) < 5 or not re.fullmatch(r'\d+:\d+', fields[2]):
+            raise OSError(errno.EINVAL, 'cannot parse %s: %r' % (MOUNTINFO, line))
+        mounts.setdefault(decode(fields[4]), []).append((fields[2], decode(fields[3])))
+    return mounts
+
+
 def checkpoint_inventory(instance):
-    """The top level of the instance's registry directory, by name, type and inode. Root opens
-    each component from the registry's trusted parent without following a link, and refuses
-    one that isn't root's alone or is on another filesystem. An absent directory is empty."""
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    parent, name = os.path.split(CHECKPOINTS_ROOT)
-    fds = []
+    """The top level of the instance's registry directory, by name, type and inode. Root walks
+    from / without following a link: every ancestor must be root's and writable by no one else,
+    the registry and instance directories root's alone, and the only mount point on the way the
+    whole filesystem the registry is on. An absent directory is empty."""
+    mounts = mount_points()
+    parts = CHECKPOINTS_ROOT.split('/')
+    if not CHECKPOINTS_ROOT.startswith('/') or any(p in ('', '.', '..') for p in parts[1:]):
+        raise OSError(errno.EINVAL, '%s is not a plain absolute path' % CHECKPOINTS_ROOT)
+    components = [*parts[1:], instance]
+    protected = len(components) - 2
+    fds = [os.open('/', os.O_RDONLY | os.O_DIRECTORY)]
     try:
         try:
-            fds.append(os.open(parent, flags))
-            for component in (name, instance):
-                fds.append(os.open(component, flags, dir_fd=fds[-1]))
+            anchor = os.fstat(fds[0])
+            if anchor.st_uid not in (0, REGISTRY_UID) or anchor.st_mode & 0o022:
+                raise OSError(errno.EPERM, "/ is not root's, or others can write it")
+            mounted = None
+            for index, component in enumerate(components):
+                fds.append(os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                   dir_fd=fds[-1]))
+                where = '/' + '/'.join(components[:index + 1])
                 meta, above = os.fstat(fds[-1]), os.fstat(fds[-2])
-                if meta.st_uid != REGISTRY_UID or meta.st_mode & 0o077:
-                    raise OSError(errno.EPERM, '%s is not private to root' % component)
-                if meta.st_dev != above.st_dev:
-                    raise OSError(errno.EXDEV, '%s is on another filesystem' % component)
+                if index >= protected:
+                    if meta.st_uid != REGISTRY_UID or meta.st_mode & 0o077:
+                        raise OSError(errno.EPERM, '%s is not private to root' % component)
+                elif meta.st_uid not in (0, REGISTRY_UID) or meta.st_mode & 0o022:
+                    raise OSError(errno.EPERM, "%s is not root's, or others can write it" % where)
+                if where in mounts:
+                    device, root = mounts[where][-1]
+                    if mounted is not None or index >= protected or root != '/' \
+                            or device != '%d:%d' % (os.major(meta.st_dev), os.minor(meta.st_dev)):
+                        raise OSError(errno.EXDEV, '%s is a mount point (bind mount?)' % where)
+                    mounted = where
+                elif meta.st_dev != above.st_dev:
+                    raise OSError(errno.EXDEV, '%s is on another filesystem' % where)
         except FileNotFoundError:
             return []
         with os.scandir(fds[-1]) as entries:
