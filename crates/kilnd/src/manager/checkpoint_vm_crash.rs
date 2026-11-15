@@ -443,12 +443,15 @@ fn c6b_v8_absent_without_d3_is_reinspected_and_released_once() {
 // ---------------------------------------------------------------------------------
 // Fork boundaries.
 
-/// V9: the fork pin committed, Restore never dispatched (held): the restart releases
-/// the pin after a no-reader proof and settles the fork's reservation by typed
-/// evidence; the checkpoint stays READY and forkable.
+/// V9: the fork pin committed, Restore never dispatched (held). As decided in C5a-2
+/// (`a_crash_after_the_pin_and_before_dispatch_retires_the_reader_and_keeps_the_pin`):
+/// the restart settles the fork like any interrupted legacy create and retires the
+/// reader, which can never start now; no fact says it never ran, so the pin stays
+/// without blocking anything, the checkpoint stays READY and forkable, and its Delete
+/// reaches ABSENT and releases the pin.
 #[test]
 #[ignore = "root on the prepared VM: C6b crash matrix"]
-fn c6b_v9_pin_committed_not_dispatched_is_released_by_no_reader_proof() {
+fn c6b_v9_pin_committed_not_dispatched_retires_the_reader_and_releases_on_absent() {
     run(async {
         let mut w = World::start(json!({})).await;
         let src = w.source(0, SMALL).await;
@@ -460,23 +463,29 @@ fn c6b_v9_pin_committed_not_dispatched_is_released_by_no_reader_proof() {
         assert_eq!(w.pin(&fork).as_deref(), Some(""), "a live pin");
         w.kill_daemon().await;
         let _ = pending.await;
+        let mark = w.relay.mark();
         let reconciled = w.start_daemon().await;
-        w.until("the pin released", 120, |w| {
-            w.pin(&fork).is_some_and(|p| !p.is_empty())
-        })
-        .await;
-        let released_by = w.pin(&fork).unwrap();
         w.until("the fork settled", 120, |w| {
             matches!(w.sandbox_state(&fork).as_str(), "failed" | "deleted")
         })
         .await;
+        assert_eq!(reconciled["checkpoints_blocked"], false, "{reconciled}");
+        assert!(w.relay.requests_since(mark, "checkpoint.restore").is_empty(), "dispatched after the restart");
+        assert_eq!(w.pin(&fork).as_deref(), Some(""), "the pin was released with no fact");
         assert_eq!(w.cp_state(&cp), "ready");
         let again = still_forkable(&w, &cp, "one", 0).await;
         source_usable(&w, &src, "one").await;
+        let d = w.ok(json!({ "op": "delete_checkpoint", "id": cp })).await;
+        assert_eq!(d["state"], "CHECKPOINT_STATE_DELETED", "{d}");
+        let released_by = w.pin(&fork).unwrap();
+        assert_eq!(released_by, "absent");
+        assert_eq!(w.charge(), (0, 0));
         matrix(
             "V9 pin committed, not dispatched",
-            json!({ "pin_released_by": released_by, "fork_state": w.sandbox_state(&fork),
-                    "checkpoint": "ready", "forked_again": again, "reconciled": reconciled }),
+            json!({ "fork_state": w.sandbox_state(&fork), "restores_after_restart": 0,
+                    "pin_after_restart": "live, nothing blocked", "checkpoint": "ready",
+                    "forked_again": again, "pin_released_by": released_by,
+                    "reconciled": reconciled }),
         );
         w.finish().await;
     });
@@ -541,9 +550,29 @@ fn c6b_v11_restore_worker_death_fails_the_fork_and_keeps_the_checkpoint() {
         let w = World::start(json!({})).await;
         let (src, cp, fork, pid, pending) = mid_restore(&w, "v11").await;
         kill_pid(pid);
+        // A keyed fork answers the FAILED sandbox with its typed reason, or refuses.
         let result = pending.await.unwrap();
-        let reason = refused(&result);
-        assert!(!reason.is_empty(), "untyped: {result}");
+        let reason = match result.get("ok") {
+            Some(f) => {
+                assert_eq!(f["state"], "SANDBOX_STATE_FAILED", "{result}");
+                f["failure_reason"].as_str().unwrap().to_string()
+            }
+            None => refused(&result),
+        };
+        assert!(reason.starts_with("checkpoint_"), "untyped: {result}");
+        // kiln's create may leave a child of the killed CLI finishing on its own (the
+        // restored sandbox's shim, in its own session); it is no worker, holds the
+        // artifact's lock, and goes with its run.
+        let killed_at = std::time::Instant::now();
+        let mut pin_while_child = None;
+        w.until("every process naming the artifact gone", 180, |w| {
+            if !w.workers().is_empty() {
+                pin_while_child = w.pin(&fork);
+            }
+            w.workers().is_empty()
+        })
+        .await;
+        let orphan_ms = killed_at.elapsed().as_millis() as u64;
         w.until("the pin released", 120, |w| {
             w.pin(&fork).is_some_and(|p| !p.is_empty())
         })
@@ -555,7 +584,10 @@ fn c6b_v11_restore_worker_death_fails_the_fork_and_keeps_the_checkpoint() {
         matrix(
             "V11 restore worker mid-restore",
             json!({ "client_reason": reason, "fork_state": w.sandbox_state(&fork),
-                    "checkpoint": "ready", "forked_again": again }),
+                    "checkpoint": "ready", "forked_again": again,
+                    "kiln_child_gone_after_ms": orphan_ms,
+                    "pin_while_the_child_ran": pin_while_child,
+                    "pin_released_by": w.pin(&fork) }),
         );
         w.finish().await;
     });

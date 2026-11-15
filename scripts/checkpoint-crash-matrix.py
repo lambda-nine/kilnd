@@ -45,7 +45,7 @@ CRASH = [
     'c6b_v6_ready_with_the_reply_lost_is_returned_by_the_key',
     'c6b_v7_deletion_interrupted_after_d1_completes_on_restart',
     'c6b_v8_absent_without_d3_is_reinspected_and_released_once',
-    'c6b_v9_pin_committed_not_dispatched_is_released_by_no_reader_proof',
+    'c6b_v9_pin_committed_not_dispatched_retires_the_reader_and_releases_on_absent',
     'c6b_v10_daemon_death_mid_restore_reaps_the_reader_before_the_pin',
     'c6b_v11_restore_worker_death_fails_the_fork_and_keeps_the_checkpoint',
     'c6b_v12_restored_without_ready_is_compensated_never_promoted',

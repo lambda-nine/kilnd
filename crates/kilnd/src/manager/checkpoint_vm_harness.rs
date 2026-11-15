@@ -1384,6 +1384,9 @@ impl World {
     /// Deletes every live sandbox and checkpoint through the API, stops the daemon and
     /// the helper, and leaves the scene to clean up the rest.
     pub(super) async fn finish(mut self) {
+        // A kiln child a scenario orphaned holds its artifact until it exits.
+        self.until("no process naming the artifacts", 180, |w| w.workers().is_empty())
+            .await;
         if self.daemon.is_none() {
             self.relay.clear_rules();
             self.start_daemon().await;
