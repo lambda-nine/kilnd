@@ -786,8 +786,13 @@ fn c6b_v16_corrupt_payload_quarantines_and_delete_releases() {
         let fork = w
             .rpc(OWNER, json!({ "op": "create", "from_checkpoint": cp }))
             .await;
+        eprintln!(
+            "C6B V16 fork of the corrupted checkpoint: {fork}; row {} {}",
+            w.cp_state(&cp),
+            w.cp_col(&cp, "failure_token")
+        );
         let reason = refused(&fork);
-        w.until("QUARANTINED", 120, |w| w.cp_state(&cp) == "quarantined")
+        w.until("QUARANTINED", 60, |w| w.cp_state(&cp) == "quarantined")
             .await;
         assert_eq!(w.charge(), charged, "charge released while quarantined");
         let again = w
