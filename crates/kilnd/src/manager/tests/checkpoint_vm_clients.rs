@@ -283,11 +283,13 @@ fn c6b_f3_eval_reset_on_real_kiln() {
         let s = w.ok(keyed_create("kiln-harness:f3-reseed")).await;
         let src = s["id"].as_str().unwrap().to_string();
         assert_eq!(turn(&w, &src, "mkdir -p /root/repo && printf seed > /root/repo/seed").await, 0);
+        // The re-seed is a new tree (new mtimes): the fork must equal it.
+        let reseed = tree(&w, &src).await;
         let c = w.ok(capture(&src, "kiln-harness:f3:reseed", 120 * MIN, 30 * MIN)).await;
         let reseeded = c["id"].as_str().unwrap().to_string();
         let f = w.ok(keyed_fork("kiln-harness:f3-after", &reseeded)).await;
         let id = f["id"].as_str().unwrap().to_string();
-        assert_eq!(tree(&w, &id).await, seed);
+        assert_eq!(tree(&w, &id).await, reseed);
         cleanup_sandbox(&w, &id).await;
         cleanup_sandbox(&w, &src).await;
         cleanup_checkpoint(&w, &reseeded).await;
