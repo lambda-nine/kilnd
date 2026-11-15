@@ -764,3 +764,7 @@ mod clients;
 #[cfg(target_os = "linux")]
 #[path = "checkpoint_vm_hostile.rs"]
 mod hostile;
+
+#[cfg(target_os = "linux")]
+#[path = "checkpoint_vm_perf.rs"]
+mod perf;
