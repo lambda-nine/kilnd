@@ -331,6 +331,11 @@ async fn check(w: &World, by: &Bystanders, c: Case) -> Value {
 }
 
 async fn run_cases(set: &str, cases: Vec<Case>) {
+    let results = case_results(cases).await;
+    matrix(set, Value::Array(results));
+}
+
+async fn case_results(cases: Vec<Case>) -> Vec<Value> {
     let w = World::start(json!({})).await;
     let by = bystanders(&w).await;
     let mut results = Vec::new();
@@ -338,8 +343,8 @@ async fn run_cases(set: &str, cases: Vec<Case>) {
         results.push(check(&w, &by, c).await);
     }
     by.finish(&w).await;
-    matrix(set, Value::Array(results));
     w.finish().await;
+    results
 }
 
 #[test]
@@ -470,23 +475,24 @@ fn c6b_hostile_names_depth_and_counts_hold_their_limits() {
         )
     };
     let layout = Refused("checkpoint_layout_unsupported");
-    run(run_cases(
-        "hostile names, depth and counts",
+    run(async {
+        let cases = case_results(
         vec![
             case("non-utf8-names", "printf a > \"/root/w/$(printf 'n\\377\\376')\" && mkdir \"/root/w/$(printf 'd\\200')\"", RoundTrip),
             case("name-255", &format!("printf a > /root/w/{}", "n".repeat(255)), RoundTrip),
             case("depth-126", &chain(124), RoundTrip),
             case("depth-128", &chain(126), Either),
             case("depth-130", &chain(128), layout),
-        ],
-    ));
-    run(entry_limit());
+        ]).await;
+        let limit = entry_limit().await;
+        matrix("hostile names, depth and counts", json!({ "cases": cases, "entry_limit": limit }));
+    });
 }
 
 /// The 65,536-entry bound exactly: a capture of a known tree gives the entries a fresh
 /// source contributes besides the files, so `65,536 - base` files fit and one more
 /// does not.
-async fn entry_limit() {
+async fn entry_limit() -> Value {
     let w = World::start(json!({})).await;
     let files = |n: usize| format!("mkdir -p /root/w/n && cd /root/w/n && seq 1 {n} | sed 's/^/f/' | xargs touch");
     // 2 GiB disks: a 1 GiB disk's project quota allows only 65,536 inodes.
@@ -527,8 +533,8 @@ async fn entry_limit() {
         }
         w.ok(json!({ "op": "delete", "id": src })).await;
     }
-    matrix("hostile entry limit", json!({ "base_entries": base, "cases": seen }));
     w.finish().await;
+    json!({ "base_entries": base, "cases": seen })
 }
 
 #[test]
