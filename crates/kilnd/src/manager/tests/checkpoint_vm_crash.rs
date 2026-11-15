@@ -760,7 +760,8 @@ fn c6b_v15_stale_backup_blocks_admission_and_never_adopts() {
         matrix(
             "V15 stale DB backup",
             json!({ "blocked": true, "adopted": false, "create_refused": create_reason,
-                    "capture_refused": capture_reason, "generation_removed": generation,
+                    "capture_refused": capture_reason, "create_error": create["error"],
+                    "capture_error": capture["error"], "generation_removed": generation,
                     "reopened_after_operator_cleanup": true }),
         );
         w.finish().await;
