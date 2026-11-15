@@ -252,9 +252,10 @@ fn c6b_f3_eval_reset_on_real_kiln() {
         let src = s["id"].as_str().unwrap().to_string();
         assert_eq!(turn(&w, &src, "mkdir -p /root/repo && printf seed > /root/repo/seed").await, 0);
         let seed = tree(&w, &src).await;
-        // A short lifetime, so the run ends past it; idle longer than a run.
+        // A short lifetime, so the run ends past it.
         let lifetime = 90_000;
-        let c = w.ok(capture(&src, "kiln-harness:f3:seed", lifetime, 20_000)).await;
+        // Idle longer than the lifetime, so the lifetime is what ends it.
+        let c = w.ok(capture(&src, "kiln-harness:f3:seed", lifetime, 2 * lifetime)).await;
         let cp = c["id"].as_str().unwrap().to_string();
         let digest = c["content_sha256"].as_str().unwrap().to_string();
         cleanup_sandbox(&w, &src).await;
@@ -294,6 +295,7 @@ fn c6b_f3_eval_reset_on_real_kiln() {
         cleanup_sandbox(&w, &src).await;
         cleanup_checkpoint(&w, &reseeded).await;
         w.until("the expired seed deleted", 120, |w| w.cp_state(&cp) == "deleted").await;
+        assert_eq!(w.cp_col(&cp, "deletion_reason"), "expired_lifetime");
         matrix(
             "F3 eval reset (real kiln)",
             json!({ "runs": 5, "same_digest_every_run": true, "no_run_saw_another": true,

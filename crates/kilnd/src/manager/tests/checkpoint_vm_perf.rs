@@ -483,6 +483,8 @@ fn c6b_perf() {
             "runs_mount": std::fs::read_to_string("/proc/self/mountinfo").unwrap().lines()
                 .find(|l| l.contains(" /var/lib/kiln/runs ")).unwrap_or("").to_string(),
             "loadavg": std::fs::read_to_string("/proc/loadavg").unwrap().trim(),
+            "disk": String::from_utf8_lossy(&std::process::Command::new("df").args(["-B1", "/", "/var/lib/kiln/runs"]).output().unwrap().stdout).to_string(),
+            "head": std::env::var("KILND_C6B_HEAD").unwrap_or_default(),
         });
         let result = match phase.as_str() {
             "warm" => warm(&w).await,
