@@ -751,20 +751,20 @@ async fn run_fork() {
 #[path = "checkpoint_vm_api_tests.rs"]
 mod api;
 
-#[path = "checkpoint_vm_harness.rs"]
+#[path = "tests/checkpoint_vm_harness.rs"]
 mod harness;
 
-#[path = "checkpoint_vm_crash.rs"]
+#[path = "tests/checkpoint_vm_crash.rs"]
 mod crash;
 
-#[path = "checkpoint_vm_clients.rs"]
+#[path = "tests/checkpoint_vm_clients.rs"]
 mod clients;
 
 // Linux only: raw upper xattrs, device nodes.
 #[cfg(target_os = "linux")]
-#[path = "checkpoint_vm_hostile.rs"]
+#[path = "tests/checkpoint_vm_hostile.rs"]
 mod hostile;
 
 #[cfg(target_os = "linux")]
-#[path = "checkpoint_vm_perf.rs"]
+#[path = "tests/checkpoint_vm_perf.rs"]
 mod perf;
