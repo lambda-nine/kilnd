@@ -22,6 +22,13 @@ SLOW = re.compile(r"test (.+) has been running for over \d+ seconds")
 DONE = re.compile(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; "
                   r"(\d+) filtered out; finished in \d+(?:\.\d+)?s")
 
+def doc_name(binary, name):
+    """A doctest by path, item and line: Linux's run adds its mode (`- compile fail`), its
+    --list does not."""
+    if not binary.endswith("::doc"):
+        return name
+    return re.sub(r"( \(line \d+\)) - (?:compile fail|compile|should panic)$", r"\1", name)
+
 def binary(running, doc):
     return (running[2] + ("::bin" if running[1].startswith("unittests ")
             and running[1] != "unittests src/lib.rs" else "")) if running else doc[1] + "::doc"
@@ -48,7 +55,7 @@ def executed(text, errors):
                 errors.append(f"a second test group: {current}")
             group = [int(start[1]), 0, 0]  # announced, passed, ignored
         elif group is not None and (result := RESULT.fullmatch(line)):
-            name = current + "::" + result[1]
+            name = current + "::" + doc_name(current, result[1])
             if name in results:
                 errors.append(f"ran twice: {name}")
             results[name] = "ok" if result[2] == "ok" else "ignored"
@@ -86,7 +93,7 @@ def registry(text, errors):
             count, doc_group = 0, None
         elif current is not None and (re.fullmatch(PATH + r": test", line) or (
                 current.endswith("::doc") and DOCTEST.fullmatch(line))):
-            name = current + "::" + line[:-6]
+            name = current + "::" + doc_name(current, line[:-6])
             if name in tests:
                 errors.append(f"duplicate test: {name}")
             tests.add(name)
@@ -161,6 +168,15 @@ def self_test():
            "src/a.rs - g (line 2) - compile fail: test\nsrc/a.rs - h (line 5): test\n2 tests, 0 benchmarks\n")
     doc_ignored = empty + "Doc-tests kilnd\n" + "0 tests, 0 benchmarks\n" * 2
     assert ok(present + doc, doc_ignored)
+    # As Linux rustdoc lists them (no mode) and runs them (with it).
+    linux_doc = ("Doc-tests kilnd\nsrc/sys.rs - f (line 9): test\n1 test, 0 benchmarks\n"
+                 "src/sys.rs - g (line 2): test\n1 test, 0 benchmarks\n")
+    linux_run = run_of(present, empty) + ("Doc-tests kilnd\nrunning 1 test\ntest src/sys.rs - f (line 9) - compile ... ok\n"
+                 "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+                 "running 1 test\ntest src/sys.rs - g (line 2) - compile fail ... ok\n"
+                 "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s\n")
+    assert not check(ledger, linux_run, present + linux_doc, doc_ignored, True)
+    assert check(ledger, linux_run.replace("(line 2) - compile fail", "(line 3) - compile fail"), present + linux_doc, doc_ignored, True)
     assert bad(present + doc + "src/a.rs - x (line 1): test\n", empty)  # unfinished group
     assert bad(present.replace("a::b", "src/a.rs - g (line 2)"), empty)  # not a doctest binary
     for listing, ignored in [(empty, empty), (present, present),  # cfg-disabled, ignored
