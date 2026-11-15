@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix three findings of the C5b-2 adversarial review (one HIGH, one MEDIUM, one LOW).
+  `kilndctl` uses one connection per command and never reconnects, so a feature check
+  always covers the request that needs it; a lost connection fails the command, saying
+  whether the request was sent, and `create --from-checkpoint` also fails, keeping the
+  sandbox, if the answer does not name the checkpoint. Checkpoint removal, expiry and
+  startup cleanup no longer depend on the probes only new work needs (XFS, project
+  quotas, registry trust, free space): the helper's `capabilities` reply gains an
+  optional `removal_supported`, and with an older helper removal keeps its previous gate.
+  Health's checkpoint stats count a charge whose release evidence was quarantined, as
+  node accounting does.
 - Add milestone C5b-2 of workspace checkpoints: discovery and capacity. With
   `--enable-workspace-checkpoints`, Health lists `FEATURE_WORKSPACE_CHECKPOINT` with
   `RuntimeCapabilities.checkpoint` and `ApiLimits.checkpoint` only while the root

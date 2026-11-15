@@ -480,6 +480,12 @@ option and `renew` first read Health and refuse, sending nothing, unless it is
 `SERVING` and lists `SANDBOX_EXPIRY`; `create --request-id` and
 `rm --release-request-id` do the same for `IDEMPOTENT_CREATE` and
 `REQUEST_ID_RELEASE`; a plain `create` sends no Health request.
+Every command uses one HTTP/2 connection and never dials again (C5b-2 adversarial review
+HIGH 1): a feature check answers only for the daemon that asked it, and a reconnecting
+channel would carry the gated request to a replacement, perhaps an older daemon that
+ignores the field. A connection lost before a request was handed to it fails the command
+with `connection to kilnd was lost; nothing was sent`; one lost after it, with `outcome
+unknown`. Nothing is retried.
 
 Refusals defined by the additions, and the existing "is X, not ready" refusals of
 Exec and RenewSandbox, carry a `kilnd-reason: <token>` metadata entry, and their
@@ -1734,12 +1740,27 @@ afresh and applies the same checks, so a withdrawn feature refuses new work at o
 a daemon that has not probed yet still admits. With the flag off nothing is probed or
 read, and Health is byte-for-byte as before.
 
+**Removal has its own gate (C5b-2 round 1).** Delete, expiry, the barrier's inventory pass
+and interrupted-fork settlement start no new work, so they need only the group, its
+epoch and a CLI that lists format 1 and checks generations on removal (the helper's
+`removal_supported`; `capacity::maintenance_session`), not XFS, project quotas, registry
+trust, leases or known free space. A host that fails one of those keeps removing what it
+holds and releasing its charges while the feature stays withdrawn and new work refused.
+An older helper's reply has no `removal_supported`, and removal then keeps the broad
+`supported` gate.
+
+**kilndctl.** `create --from-checkpoint` asks Health and sends Create on the same single
+connection (see "API discovery"), and then checks that the sandbox reports the checkpoint
+it asked for. A mismatch exits 1 naming the sandbox, which is kept.
+
 **Stats.** `AdmissionStats.checkpoints` (`CheckpointStats`, Appendix A plus `expired`) and
 `NodeResourceStats.checkpoint_reserved_disk_bytes` (the node's checkpoint charges, already
 inside `reserved_disk_bytes`) are present while the flag is on or any checkpoint state
 exists (rows, keys or the barrier), so cleanup stays visible with the feature withdrawn
 or the flag turned off; with the flag off and nothing durable they are absent and no
-checkpoint state is read. Caller fields are the peer uid's own. `current_cleanup_workers`
+checkpoint state is read. Count and bytes are the charged set node accounting keeps,
+including a checkpoint whose release evidence the audit quarantined (C5b-2 adversarial
+review LOW 1). Caller fields are the peer uid's own. `current_cleanup_workers`
 is the helper's busy cleanup lane at the latest probe (0 with the flag off). Limits
 describe new work and appear only while the feature is listed.
 
