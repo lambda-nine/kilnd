@@ -1764,9 +1764,35 @@ impl Store {
         })
     }
 
-    /// The node's and `owner_uid`'s counters, after the audit that vouches for them.
+    /// The node's and `owner_uid`'s counters, after the audit that vouches for them,
+    /// for Health. A checkpoint whose release evidence is quarantined still counts with
+    /// its charge, as node accounting keeps it ([`checkpoint_charge`]; C5b-2 adversarial
+    /// review LOW 1): the cached counters already dropped it when it was released.
     pub fn checkpoint_usage(&self, owner_uid: u32) -> Result<CheckpointUsage> {
-        self.audited_read(|conn| usage(conn, owner_uid))
+        self.audited_read(|conn| {
+            let mut u = usage(conn, owner_uid)?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT owner_uid, COALESCE(charge_bytes, max_size_bytes) FROM checkpoints
+                 WHERE release_evidence_id IS NOT NULL AND id IN (SELECT id FROM temp.checkpoint_quarantine)",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let bytes = u64::try_from(row.get::<_, i64>(1)?).context("negative charge")?;
+                let add = |c: &mut CheckpointCounts| -> Result<()> {
+                    c.live += 1;
+                    c.charged_bytes = c
+                        .charged_bytes
+                        .checked_add(bytes)
+                        .context("checkpoint charge overflow")?;
+                    Ok(())
+                };
+                add(&mut u.node)?;
+                if row.get::<_, i64>(0)? == i64::from(owner_uid) {
+                    add(&mut u.uid)?;
+                }
+            }
+            Ok(u)
+        })
     }
 
     /// Stored evidence, reloaded through [`SealedEvidence::decode`].

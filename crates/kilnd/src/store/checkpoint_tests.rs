@@ -2411,6 +2411,8 @@ fn wrong_epoch_facts_past_the_triggers_are_caught_by_the_audits() {
             let f = fixture();
             let src = f.source.clone();
             let charged_before = disk(&f.store);
+            let usage_before = usage(&f.store, 1000);
+            let deleting_charge = f.deleting.charge_bytes();
             {
                 let conn = Connection::open(f._tmp.path().join("kilnd.db")).unwrap();
                 checkpoint::register_evidence_validator(&conn).unwrap();
@@ -2537,6 +2539,16 @@ fn wrong_epoch_facts_past_the_triggers_are_caught_by_the_audits() {
             };
             store.set_clock(std::sync::Arc::new(ManualClock::default()));
             let (resources, degraded) = store.accounting_snapshot().unwrap();
+            if matches!(path, Path::Absent) {
+                // C5b-2 adversarial review LOW 1: Health's source keeps the
+                // quarantined release's charge and count, as node accounting does.
+                assert_eq!(deleting_charge, 8 << 20);
+                assert_eq!(
+                    usage(&store, 1000),
+                    usage_before,
+                    "Absent (restart {restart}): Health omitted the quarantined charge"
+                );
+            }
             assert!(degraded, "{path:?} (restart {restart}): not degraded");
             assert!(
                 resources.disk_bytes >= charged_before,
