@@ -573,21 +573,25 @@ fn c6b_v11_restore_worker_death_fails_the_fork_and_keeps_the_checkpoint() {
         })
         .await;
         let orphan_ms = killed_at.elapsed().as_millis() as u64;
-        w.until("the pin released", 120, |w| {
-            w.pin(&fork).is_some_and(|p| !p.is_empty())
-        })
-        .await;
+        // An ambiguous reader's pin is released only by its checkpoint's ABSENT
+        // (C5a-2, an_ambiguous_restore_stays_charged_and_its_pin_waits_for_absent).
+        let pin_after = w.pin(&fork);
         assert_ne!(w.sandbox_state(&fork), "ready");
         assert_eq!(w.cp_state(&cp), "ready");
         let again = still_forkable(&w, &cp, "one", 1 << 30).await;
         source_usable(&w, &src, "one").await;
+        let d = w.ok(json!({ "op": "delete_checkpoint", "id": cp })).await;
+        assert_eq!(d["state"], "CHECKPOINT_STATE_DELETED", "{d}");
+        assert!(w.pin(&fork).is_some_and(|p| !p.is_empty()), "the pin outlived ABSENT");
+        assert_eq!(w.charge(), (0, 0));
         matrix(
             "V11 restore worker mid-restore",
             json!({ "client_reason": reason, "fork_state": w.sandbox_state(&fork),
                     "checkpoint": "ready", "forked_again": again,
                     "kiln_child_gone_after_ms": orphan_ms,
                     "pin_while_the_child_ran": pin_while_child,
-                    "pin_released_by": w.pin(&fork) }),
+                    "pin_after_the_failure": pin_after,
+                    "pin_released_by_delete": w.pin(&fork) }),
         );
         w.finish().await;
     });
@@ -645,10 +649,11 @@ fn c6b_v13_helper_death_mid_restore_keeps_the_pin_until_absent() {
         assert_eq!(w.pin(&fork).as_deref(), Some(""));
         w.start_helper().await;
         w.until("the old reader gone", 120, |_| !alive(pid)).await;
-        w.until("the pin released", 180, |w| {
-            w.pin(&fork).is_some_and(|p| !p.is_empty())
-        })
-        .await;
+        w.until("the fork settled", 180, |w| w.sandbox_state(&fork) != "creating")
+            .await;
+        // The dead epoch's reader is ambiguous: its pin waits for ABSENT.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let pin_after = w.pin(&fork);
         let retry = w
             .rpc(
                 OWNER,
@@ -666,10 +671,16 @@ fn c6b_v13_helper_death_mid_restore_keeps_the_pin_until_absent() {
         );
         assert_eq!(w.cp_state(&cp), "ready");
         source_usable(&w, &src, "one").await;
+        let d = w.ok(json!({ "op": "delete_checkpoint", "id": cp })).await;
+        assert_eq!(d["state"], "CHECKPOINT_STATE_DELETED", "{d}");
+        let released = w.pin(&fork);
+        assert!(released.as_deref().is_some_and(|p| !p.is_empty()), "the pin outlived ABSENT");
+        assert_eq!(w.charge(), (0, 0));
         matrix(
             "V13 helper mid-restore",
-            json!({ "first": first.get("error"), "pin_released_by": w.pin(&fork),
-                    "keyed_retry": retry, "fork_state": w.sandbox_state(&fork) }),
+            json!({ "first": first, "pin_after_the_new_epoch": pin_after,
+                    "pin_released_by_delete": released, "keyed_retry": retry,
+                    "fork_state": w.sandbox_state(&fork) }),
         );
         w.finish().await;
     });
