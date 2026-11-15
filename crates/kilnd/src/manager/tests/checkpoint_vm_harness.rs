@@ -1149,6 +1149,10 @@ impl World {
         self.instance = instance.clone();
         self.scene.instance = Some(instance);
         self.daemon = Some(daemon);
+        // Clients read Health first, as the harness does: dynamic features such as
+        // ExecStream are proven there.
+        let h = self.rpc(OWNER, json!({ "op": "health" })).await;
+        assert!(h.get("ok").is_some(), "Health after start: {h}");
         serde_json::from_str(&reconciled).unwrap()
     }
 
