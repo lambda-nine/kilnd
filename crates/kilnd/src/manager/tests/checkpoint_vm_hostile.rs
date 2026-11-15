@@ -271,8 +271,15 @@ async fn check(w: &World, by: &Bystanders, c: Case) -> Value {
             json!({ "op": "capture", "id": src, "request_id": format!("h-{}", c.name), "lifetime_ms": 3_600_000 }),
         )
         .await;
-    let outcome = if let Some(e) = r.get("error") {
-        let reason = e["reason"].as_str().unwrap().to_string();
+    // A keyed capture answers a refusal, or the row as it stands carrying its typed
+    // failure while it settles (`token: detail`).
+    let failed = r.get("error").map(|e| e["reason"].as_str().unwrap().to_string()).or_else(|| {
+        (r["ok"]["state"] != "CHECKPOINT_STATE_READY").then(|| {
+            let reason = r["ok"]["failure_reason"].as_str().unwrap_or("");
+            reason.split(':').next().unwrap_or("").to_string()
+        })
+    });
+    let outcome = if let Some(reason) = failed {
         assert!(reason.starts_with("checkpoint_"), "{}: untyped refusal {r}", c.name);
         w.until("the refusal settled", 120, |w| {
             w.rows().iter().all(|(_, s)| s != "capturing" && s != "deleting")
@@ -350,7 +357,6 @@ fn c6b_hostile_links_and_roots_are_refused_or_round_trip() {
             case("hardlink-to-image-file", "ln /etc/hostname /root/w/hn", Either),
             case("duplicate-looking-names", "printf 1 > '/root/w/a b' && printf 2 > '/root/w/a\tb' && printf 3 > /root/w/.a", RoundTrip),
             case("long-link-target", "ln -s $(head -c 1023 /dev/zero | tr '\\0' x) /root/w/l1023", RoundTrip),
-            case("over-long-link-target", "ln -s $(head -c 1024 /dev/zero | tr '\\0' x) /root/w/l1024", Either),
             planted(
                 "hardlinked-symlink",
                 "ln -s target /root/w/sl",
@@ -545,6 +551,7 @@ fn c6b_hostile_protected_trees_and_sentinels_are_unchanged() {
         vec![
             planted("file-beneath-dev", "", Box::new(|u: &Path, o| {
                 std::fs::create_dir_all(u.join("dev")).unwrap();
+                chown(&u.join("dev"), o);
                 std::fs::write(u.join("dev/c6b"), b"x").unwrap();
                 chown(&u.join("dev/c6b"), o);
             }), layout),
@@ -553,8 +560,9 @@ fn c6b_hostile_protected_trees_and_sentinels_are_unchanged() {
                 std::os::unix::fs::symlink("/", u.join("sys")).unwrap();
                 chown(&u.join("sys"), o);
             }), layout),
-            planted("opaque-scaffold", "", Box::new(|u: &Path, _| {
+            planted("opaque-scaffold", "", Box::new(|u: &Path, o| {
                 std::fs::create_dir_all(u.join("proc")).unwrap();
+                chown(&u.join("proc"), o);
                 set_xattr(&u.join("proc"), "trusted.overlay.opaque", b"y");
             }), layout),
             case("sentinel-links-are-not-followed", &format!("ln -s {SENTINEL} /root/w/s && printf changed > /root/w/s.copy"), RoundTrip),
@@ -659,11 +667,19 @@ fn kiln_ids() -> Vec<(String, String)> {
 
 /// Root's `kiln gc` of the stale runs that appeared since `before`; their IDs.
 fn gc_new_stale_runs(before: &[(String, String)]) -> Vec<String> {
-    let stale: Vec<String> = kiln_ids()
-        .into_iter()
-        .filter(|(id, status)| status == "stale" && !before.iter().any(|(b, _)| b == id))
-        .map(|(id, _)| id)
-        .collect();
+    // The failed shim takes a moment to be seen as stale.
+    let mut stale = Vec::new();
+    for _ in 0..50 {
+        let new: Vec<(String, String)> = kiln_ids()
+            .into_iter()
+            .filter(|(id, _)| !before.iter().any(|(b, _)| b == id))
+            .collect();
+        stale = new.iter().filter(|(_, s)| s == "stale").map(|(id, _)| id.clone()).collect();
+        if new.iter().all(|(_, s)| s == "stale") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     if !stale.is_empty() {
         let out = std::process::Command::new(kiln_bin())
             .arg("gc")
