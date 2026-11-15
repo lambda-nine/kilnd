@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -206,14 +207,18 @@ def main():
             before = [] if name in NO_CHECK_BEFORE else host_problems(baseline, snapshot(binary))
             t0 = time.time()
             test = 'manager::checkpoint_vm_tests::%s::%s' % (module, name)
+            # Its own session, so a timeout kills the scenario's children with it.
+            proc = subprocess.Popen([binary, '--ignored', '--exact', test, '--test-threads=1',
+                                     '--nocapture'], cwd=os.path.dirname(binary),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    start_new_session=True)
             try:
-                proc = subprocess.run([binary, '--ignored', '--exact', test, '--test-threads=1',
-                                       '--nocapture'], cwd=os.path.dirname(binary),
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                      timeout=args.timeout)
-                output, code = proc.stdout, proc.returncode
-            except subprocess.TimeoutExpired as e:
-                output, code = (e.stdout or b'').decode('utf-8', 'replace') if isinstance(e.stdout, bytes) else (e.stdout or ''), 'timeout'
+                output, _ = proc.communicate(timeout=args.timeout)
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                output, _ = proc.communicate()
+                code = 'timeout'
             log.write('===== %s =====\n%s\n' % (name, output))
             log.flush()
             after = [] if name in NO_CHECK_AFTER else host_problems(baseline, snapshot(binary))

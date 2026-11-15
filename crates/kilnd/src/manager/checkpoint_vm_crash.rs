@@ -644,10 +644,14 @@ fn c6b_v13_helper_death_mid_restore_keeps_the_pin_until_absent() {
         let mut w = World::start(json!({})).await;
         let (src, cp, fork, pid, pending) = mid_restore(&w, "v13").await;
         w.kill_helper().await;
-        let first = pending.await.unwrap();
-        // The pin outlives the dead epoch until a fresh helper proves no reader.
+        // The pin outlives the dead epoch. The fork's supervisor waits for a helper to
+        // ask about its reader, so the fork answers only once a new one serves.
         assert_eq!(w.pin(&fork).as_deref(), Some(""));
         w.start_helper().await;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(180), pending)
+            .await
+            .expect("the fork never answered after the helper restart")
+            .unwrap();
         w.until("the old reader gone", 120, |_| !alive(pid)).await;
         w.until("the fork settled", 180, |w| w.sandbox_state(&fork) != "creating")
             .await;
