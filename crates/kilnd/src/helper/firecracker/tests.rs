@@ -1877,8 +1877,9 @@ async fn exit3_second_helper_is_refused_by_the_persistent_node_lock() {
     let first = fixture.helper_pid();
     // A second helper on this exact ledger, with its own listener.
     fixture.spawn_helper();
+    // The fixture writes start-error by creating it, then writing: wait for the text.
     wait_until("the second helper's lock failure", || {
-        fixture.root.join("start-error").exists()
+        std::fs::read_to_string(fixture.root.join("start-error")).is_ok_and(|r| !r.is_empty())
     })
     .await;
     let reason = std::fs::read_to_string(fixture.root.join("start-error")).unwrap();
