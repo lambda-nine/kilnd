@@ -13,7 +13,7 @@ use kilnd::runtime::Runtime;
 #[cfg(feature = "firecracker-test-deployment")]
 use kilnd::runtime::firecracker::FirecrackerRuntime;
 use kilnd::runtime::kiln::KilnRuntime;
-use kilnd::store::Store;
+use kilnd::store::{BusyCheckpoints, Store};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -261,6 +261,11 @@ enum Command {
         /// The account that will own the directory and run the daemon.
         #[arg(long)]
         account: String,
+        /// For the upgrade: refuse (exit 75, a `busy ID KIND` line per checkpoint on
+        /// stdout) if any checkpoint is capturing, deleting or pinned by a fork, checked in
+        /// the migration's own transaction, which a refusal leaves uncommitted.
+        #[arg(long)]
+        refuse_busy_checkpoints: bool,
     },
     /// Attaches to the helper once as this process, then exits. It passes only when run by
     /// the enrolled account, in the enrolled unit's cgroup, from the enrolled image.
@@ -323,9 +328,26 @@ fn main() -> ExitCode {
         }
     };
     let outcome = match args.command {
-        Some(Command::InitState { state_dir, account }) => init_state(&state_dir, &account)
-            .map(|instance| println!("{instance}"))
-            .with_context(|| format!("initialize {}", state_dir.display())),
+        Some(Command::InitState {
+            state_dir,
+            account,
+            refuse_busy_checkpoints,
+        }) => match init_state(&state_dir, &account, refuse_busy_checkpoints) {
+            Ok(instance) => {
+                println!("{instance}");
+                Ok(())
+            }
+            Err(e) => match e.downcast_ref::<BusyCheckpoints>() {
+                Some(BusyCheckpoints(busy)) => {
+                    for (id, kind) in busy {
+                        println!("busy {id} {kind}");
+                    }
+                    error!(state_dir = %state_dir.display(), "{e:#}");
+                    return ExitCode::from(BUSY_CHECKPOINTS_EXIT);
+                }
+                None => Err(e.context(format!("initialize {}", state_dir.display()))),
+            },
+        },
         Some(Command::CheckAttachment {
             state_dir,
             helper_socket,
@@ -523,9 +545,12 @@ async fn serve_with<R: Runtime>(
     result
 }
 
+/// `kilnd init-state --refuse-busy-checkpoints` found busy checkpoints (EX_TEMPFAIL).
+const BUSY_CHECKPOINTS_EXIT: u8 = 75;
+
 /// The one way an instance's identity comes to exist. Enrollment needs this ID before the
 /// unit may start, so it can't wait for the daemon's first start to generate one.
-fn init_state(state_dir: &Path, account: &str) -> Result<Id128> {
+fn init_state(state_dir: &Path, account: &str, refuse_busy: bool) -> Result<Id128> {
     if !state_dir.is_absolute() {
         bail!("--state-dir must be absolute");
     }
@@ -540,6 +565,10 @@ fn init_state(state_dir: &Path, account: &str) -> Result<Id128> {
         drop_privileges(uid, gid)?;
     } else if euid != uid {
         bail!("run this as root or as {account}");
+    }
+    if refuse_busy {
+        let (_, identity) = Store::open_refusing_busy_checkpoints(state_dir)?;
+        return Ok(identity.instance_id);
     }
     let store = Store::open(state_dir)?;
     Ok(store.identity()?.instance_id)
@@ -1558,14 +1587,23 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         let account = own_account_name();
-        let first = init_state(&state, &account).unwrap();
-        assert_eq!(init_state(&state, &account).unwrap(), first, "repeatable");
+        let first = init_state(&state, &account, false).unwrap();
+        assert_eq!(
+            init_state(&state, &account, false).unwrap(),
+            first,
+            "repeatable"
+        );
         assert_eq!(
             Store::open(&state).unwrap().identity().unwrap().instance_id,
             first
         );
         let other = temp.path().join("other");
-        assert_ne!(init_state(&other, &account).unwrap(), first);
+        assert_ne!(init_state(&other, &account, false).unwrap(), first);
+        // The upgrade's form prints the same ID for state with no busy checkpoint.
+        assert_eq!(init_state(&state, &account, true).unwrap(), first);
+        let fresh = temp.path().join("fresh");
+        let made = init_state(&fresh, &account, true).unwrap();
+        assert_eq!(init_state(&fresh, &account, false).unwrap(), made);
     }
 
     #[test]
@@ -1573,7 +1611,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         let refused = |dir: &Path, account: &str| {
-            let error = init_state(dir, account).unwrap_err().to_string();
+            let error = init_state(dir, account, false).unwrap_err().to_string();
             assert!(!temp.path().join("state").exists(), "{error}");
             error
         };
@@ -1598,7 +1636,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         let _daemon = Store::open(&state).unwrap();
-        init_state(&state, &own_account_name()).unwrap_err();
+        init_state(&state, &own_account_name(), false).unwrap_err();
+        init_state(&state, &own_account_name(), true).unwrap_err();
     }
 
     #[test]
@@ -1612,7 +1651,30 @@ mod tests {
             "kilnd-a",
         ])
         .unwrap();
-        assert!(matches!(args.command, Some(Command::InitState { .. })));
+        assert!(matches!(
+            args.command,
+            Some(Command::InitState {
+                refuse_busy_checkpoints: false,
+                ..
+            })
+        ));
+        let upgrade = Args::try_parse_from([
+            "kilnd",
+            "init-state",
+            "--state-dir",
+            "/var/lib/kilnd-a",
+            "--account",
+            "kilnd-a",
+            "--refuse-busy-checkpoints",
+        ])
+        .unwrap();
+        assert!(matches!(
+            upgrade.command,
+            Some(Command::InitState {
+                refuse_busy_checkpoints: true,
+                ..
+            })
+        ));
         assert_eq!(args.state_dir, PathBuf::from("/var/lib/kilnd"));
         assert!(Args::try_parse_from(["kilnd"]).unwrap().command.is_none());
         assert!(Args::try_parse_from(["kilnd", "init-state", "--account", "a"]).is_err());

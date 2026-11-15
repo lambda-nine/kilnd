@@ -1270,6 +1270,56 @@ pub struct DaemonIdentity {
     pub instance_id: Id128,
 }
 
+fn read_identity(conn: &Connection) -> Result<DaemonIdentity> {
+    let (database_uuid, instance_id): (String, String) = conn.query_row(
+        "SELECT database_uuid, instance_id FROM daemon_identity WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(DaemonIdentity {
+        database_uuid: Id128::parse(&database_uuid).map_err(anyhow::Error::msg)?,
+        instance_id: Id128::parse(&instance_id).map_err(anyhow::Error::msg)?,
+    })
+}
+
+/// A checkpoint an upgrade must not migrate over: capturing, deleting, or pinned by a fork
+/// still restoring from it. The same predicate as scripts/kilnd-maintenance.py's
+/// checkpoint-busy SQL; `maintenance_busy_query_matches_the_schema` runs both on one set of
+/// rows. Each row is (checkpoint ID, `capturing`, `deleting` or `fork pin`).
+pub const BUSY_CHECKPOINTS_SQL: &str = "SELECT c.id, CASE WHEN c.state IN ('capturing', 'deleting')
+    THEN c.state ELSE 'fork pin' END AS kind FROM checkpoints AS c
+    WHERE c.state IN ('capturing', 'deleting') OR EXISTS (
+        SELECT 1 FROM checkpoint_pins AS p
+        WHERE p.checkpoint_id = c.id AND p.released_at_ms IS NULL)
+    ORDER BY c.id";
+
+/// [`Store::open_refusing_busy_checkpoints`] refused: these (ID, kind) rows are busy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusyCheckpoints(pub Vec<(String, String)>);
+
+impl std::fmt::Display for BusyCheckpoints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} busy checkpoints:", self.0.len())?;
+        for (id, kind) in &self.0 {
+            write!(f, " {id} ({kind})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BusyCheckpoints {}
+
+fn refuse_busy_checkpoints(conn: &Connection) -> Result<()> {
+    let busy = conn
+        .prepare(BUSY_CHECKPOINTS_SQL)?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+    if busy.is_empty() {
+        return Ok(());
+    }
+    Err(BusyCheckpoints(busy).into())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BudgetExhausted {
     pub resource: &'static str,
@@ -1760,6 +1810,29 @@ impl Store {
     /// the final directory must be owned by the effective uid and exactly
     /// 0700. A process-lifetime lock is acquired before SQLite is opened.
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_checked(dir, false)
+    }
+
+    /// `kilnd init-state --refuse-busy-checkpoints`, for the upgrade: [`Store::open`], but a
+    /// busy checkpoint ([`BUSY_CHECKPOINTS_SQL`]) refuses with [`BusyCheckpoints`]. The check
+    /// runs inside the migration's one IMMEDIATE transaction, so a refusal leaves the old
+    /// schema, and a writer either committed before it or writes after the migration; then
+    /// again with the identity read, in an IMMEDIATE transaction of its own, which is all a
+    /// database already at this schema gets.
+    pub fn open_refusing_busy_checkpoints(dir: &Path) -> Result<(Self, DaemonIdentity)> {
+        let store = Self::open_checked(dir, true)?;
+        let identity = {
+            let mut conn = store.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            refuse_busy_checkpoints(&tx)?;
+            let identity = read_identity(&tx)?;
+            tx.commit()?;
+            identity
+        };
+        Ok((store, identity))
+    }
+
+    fn open_checked(dir: &Path, refuse_busy: bool) -> Result<Self> {
         let directory = prepare_directory(dir)?;
         let instance_lock = ExclusiveFileLock::acquire_at(
             &directory.file,
@@ -1807,6 +1880,7 @@ impl Store {
             conn,
             Some(instance_lock),
             Some(directory.file.try_clone()?),
+            refuse_busy,
         )?;
         validate_directory(
             &directory.file.metadata()?,
@@ -1848,13 +1922,14 @@ impl Store {
     }
 
     fn init(conn: Connection, instance_lock: Option<ExclusiveFileLock>) -> Result<Self> {
-        Self::init_with_directory(conn, instance_lock, None)
+        Self::init_with_directory(conn, instance_lock, None, false)
     }
 
     fn init_with_directory(
         conn: Connection,
         instance_lock: Option<ExclusiveFileLock>,
         state_directory: Option<File>,
+        refuse_busy: bool,
     ) -> Result<Self> {
         // Move both resources into their final drop order before any
         // fallible SQLite setup. This also makes initialization failures
@@ -1875,11 +1950,11 @@ impl Store {
             #[cfg(test)]
             fail_execution_read: std::sync::atomic::AtomicU32::new(0),
         };
-        store.initialize()?;
+        store.initialize(refuse_busy)?;
         Ok(store)
     }
 
-    fn initialize(&self) -> Result<()> {
+    fn initialize(&self, refuse_busy: bool) -> Result<()> {
         let mut conn = self.conn();
         register_receipt_validator(&conn)?;
         checkpoint::register_evidence_validator(&conn)?;
@@ -1918,7 +1993,13 @@ impl Store {
         }
         // Every older schema reaches 7 through its existing steps, then the one v8
         // step, all in one transaction: any failure leaves the old database intact.
-        let tx = conn.transaction()?;
+        // The upgrade's busy check takes the write lock first, so nothing commits between
+        // it and the migration's commit.
+        let tx = if refuse_busy {
+            conn.transaction_with_behavior(TransactionBehavior::Immediate)?
+        } else {
+            conn.transaction()?
+        };
         if version == 0 {
             tx.execute_batch(SCHEMA)?;
         }
@@ -2029,6 +2110,9 @@ impl Store {
         }
         tx.execute_batch(checkpoint::MIGRATE_V16)?;
         audit_accounting_full(&tx)?;
+        if refuse_busy {
+            refuse_busy_checkpoints(&tx)?;
+        }
         tx.commit()
             .with_context(|| format!("migrate schema v{version} to v{SCHEMA_VERSION}"))?;
         Ok(())
@@ -2054,15 +2138,7 @@ impl Store {
     }
 
     pub fn identity(&self) -> Result<DaemonIdentity> {
-        let (database_uuid, instance_id): (String, String) = self.conn().query_row(
-            "SELECT database_uuid, instance_id FROM daemon_identity WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        Ok(DaemonIdentity {
-            database_uuid: Id128::parse(&database_uuid).map_err(anyhow::Error::msg)?,
-            instance_id: Id128::parse(&instance_id).map_err(anyhow::Error::msg)?,
-        })
+        read_identity(&self.conn())
     }
 
     /// B7 RTC-14: the complete allocation token with the highest sequence among this

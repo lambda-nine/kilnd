@@ -6,6 +6,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Close the upgrade's quiescence race (C6a recheck 2 HIGH 1). `kilnd init-state` gains
+  `--refuse-busy-checkpoints`, which only the upgrade passes: it checks for busy
+  checkpoints inside the migration's own IMMEDIATE transaction (or, at the current schema,
+  one of its own) and exits 75 with nothing committed if it finds any, so the upgrade
+  rolls back instead of migrating over a row a late account job wrote. The process scan,
+  now a documented guard rather than a fence, also runs again before the images are
+  replaced and before the units start.
 - Fix the C6a recheck's maintenance findings (four HIGH). The upgrade's checkpoint check
   also covers every standard state directory (`/var/lib/kilnd`, `/var/lib/kilnd-<name>`)
   that no unit or enrollment names, and refuses one whose account is gone if it may hold

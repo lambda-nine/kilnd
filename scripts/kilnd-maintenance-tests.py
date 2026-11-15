@@ -416,7 +416,7 @@ class World:
         elif kind == 'migrated':
             seen = [0]
 
-            def counted(*_args):
+            def counted(*_args, **_kwargs):
                 seen[0] += 1
                 return seen[0] == int(number)
             after('init_state', counted)
@@ -485,6 +485,31 @@ class CheckpointWorld(World):
 
     def schema(self, unit):
         return self.as_account(None, 'schema', self.state[unit])['schema']
+
+    def run(self, argv, check=True):
+        """init-state's upgrade form refuses busy rows of the live state, by the script's own
+        predicate (the Rust store tests prove init-state's is the same), in a fresh process."""
+        if os.path.basename(argv[0]) != 'kilnd' or '--refuse-busy-checkpoints' not in argv:
+            return super().run(argv, check)
+        sql = self.m.ACCOUNT_CHILD.split('# BEGIN checkpoint-busy SQL')[1] \
+            .split('# END checkpoint-busy SQL')[0].strip()[len('sql = """'):-len('"""')]
+        state = argv[argv.index('--state-dir') + 1]
+        found = subprocess.run([sys.executable, '-I', '-c', """if 1:
+            import json, sqlite3, sys
+            db = sqlite3.connect(sys.argv[1])
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master")}
+            rows = db.execute(sys.argv[2]).fetchall() if 'checkpoints' in tables else []
+            print(json.dumps(rows))
+            """, state + '/kilnd.db', sql], capture_output=True, text=True, check=True)
+        busy = json.loads(found.stdout)
+        if not busy:
+            return super().run(argv, check)
+        self.calls.append(('run', *argv))
+        result = done(self.m.BUSY_EXIT, stdout=''.join('busy %s %s\n' % tuple(r) for r in busy),
+                      stderr='%d busy checkpoints' % len(busy))
+        if check:
+            raise RuntimeError(result.stderr)
+        return result
 
     def as_account(self, _account, op, state, *args, fds=()):
         # Run the real account code unprivileged; only the UID switch is faked.
@@ -1108,6 +1133,68 @@ class Checkpoints(Case):
         self.fake_process(4243, (), status=b'Name:\tkilnd\nGid:\t0\t0\t0\t0\n')
         self.upgrade(2)
         self.assertIn('4243/status has no Uid line', '\n'.join(self.messages))
+
+    def appears_after_the_last_snapshot(self, exits):
+        """Recheck 2 H1: once the last instance is copied, a job of its account starts and
+        commits a busy row; with exits, it is gone again before the next scan."""
+        state, real = self.w.state[INSTANCE], self.m.snapshot_state
+
+        def snapshot(account, where, destination):
+            report = real(account, where, destination)
+            if where == state:
+                self.fake_process(4242, (1000, 1000, 1000, 1000))
+                with closing(sqlite3.connect(state + '/kilnd.db')) as db, db:
+                    db.execute("INSERT INTO checkpoints VALUES ('cp-race', 'capturing')")
+                if exits:
+                    shutil.rmtree(self.m.PROC + '/4242')
+            return report
+        self.m.snapshot_state = snapshot
+        return state
+
+    def assert_race_row_kept(self, state):
+        with closing(sqlite3.connect(state + '/kilnd.db')) as db:
+            self.assertEqual(db.execute('SELECT id, state FROM checkpoints').fetchall(),
+                             [('cp-race', 'capturing')])
+
+    def test_process_started_after_the_scan_is_seen_before_replacing(self):
+        state = self.appears_after_the_last_snapshot(exits=False)
+        self.upgrade(2)
+        # Every fake account is UID 1000, so the first kept instance's scan is the one to see it.
+        self.assertIn('kilnd.service is stopped, but 1 processes started as kilnd.service '
+                      'during the upgrade: pids 4242; stop them and retry', '\n'.join(self.messages))
+        self.assertFalse([c for c in self.w.calls if c[:1] == ('run',) and 'init-state' in c])
+        self.assert_race_row_kept(state)
+
+    def test_busy_row_committed_after_the_last_scan_is_refused_by_init_state(self):
+        """No scan sees a job that has already exited: init-state's check in the migration's
+        own transaction is what refuses, and the upgrade rolls back over nothing."""
+        state = self.appears_after_the_last_snapshot(exits=True)
+        self.upgrade(1)
+        self.assertIn('the upgrade failed and was undone: kilnd@t1.service has 1 busy '
+                      'checkpoints, so its state was not upgraded: cp-race (capturing)',
+                      '\n'.join(self.messages))
+        self.assert_race_row_kept(state)
+        refused = [c for c in self.w.calls if c[:1] == ('run',) and 'init-state' in c]
+        self.assertTrue(refused and all('--refuse-busy-checkpoints' in c for c in refused))
+
+    def test_process_started_after_replacing_rolls_back_before_the_start(self):
+        real = self.m.init_state
+
+        def init_state(*args):
+            instance = real(*args)
+            if args[-1] == INSTANCE:
+                self.fake_process(4242, (1000, 1000, 1000, 1000))
+            return instance
+        self.m.init_state = init_state
+        self.upgrade(1)
+        self.assertIn('the upgrade failed and was undone: kilnd.service is stopped, but 1 '
+                      'processes started as kilnd.service during the upgrade: pids 4242',
+                      '\n'.join(self.messages))
+
+    def test_add_instance_keeps_the_plain_init_state(self):
+        self.assertEqual(self.m.init_state('kilnd', self.w.state['kilnd.service'], 'kilnd'),
+                         self.w.identity('kilnd.service'))
+        self.assertNotIn('--refuse-busy-checkpoints', self.w.calls[-1])
 
     def wal_only_busy_row(self):
         """The default instance's state in WAL mode, a busy row only in its WAL, its writer open."""

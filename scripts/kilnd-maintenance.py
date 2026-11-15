@@ -614,6 +614,8 @@ elif op == 'checkpoints':
             row = db.execute('SELECT instance_id FROM daemon_identity WHERE id = 1').fetchone()
             result['instance'] = row[0] if row else None
         if result['schema'] >= 15 and 'checkpoints' in tables:
+            # The early check. kilnd's BUSY_CHECKPOINTS_SQL, the same predicate (the store
+            # tests run both), decides inside init-state's migration transaction.
             # BEGIN checkpoint-busy SQL
             sql = """SELECT c.id, CASE WHEN c.state IN ('capturing', 'deleting')
                 THEN c.state ELSE 'fork pin' END AS kind FROM checkpoints AS c
@@ -744,8 +746,22 @@ def helper_rows(helper, policy):
     return json.loads(done.stdout)
 
 
-def init_state(kilnd, state, account):
-    done = run((kilnd, 'init-state', '--state-dir', state, '--account', account))
+BUSY_EXIT = 75  # kilnd init-state --refuse-busy-checkpoints found busy checkpoints
+
+
+def init_state(kilnd, state, account, unit=None):
+    """With unit, the upgrade's form: init-state refuses busy checkpoints itself, inside the
+    migration's transaction, which is what keeps the upgrade off a busy row; the scans are
+    only the early guard."""
+    argv = (kilnd, 'init-state', '--state-dir', state, '--account', account)
+    done = run(argv + ('--refuse-busy-checkpoints',) if unit else argv, check=not unit)
+    if unit and done.returncode == BUSY_EXIT:
+        busy = [line.split(' ', 2)[1:] for line in done.stdout.splitlines()
+                if line.startswith('busy ') and line.count(' ') >= 2]
+        raise RuntimeError('%s has %d busy checkpoints, so its state was not upgraded: %s'
+                           % (unit, len(busy), ', '.join('%s (%s)' % (i, k) for i, k in busy[:5])))
+    if unit and done.returncode != 0:
+        raise RuntimeError('%s failed: %s' % (' '.join(argv), done.stderr.strip()))
     instance = done.stdout.strip()
     if not re.fullmatch(r'[0-9a-f]{32}', instance):
         raise RuntimeError('init-state printed %r' % instance)
@@ -1062,6 +1078,9 @@ def upgrade_transaction(args, journal, window):
             continue
         # KillMode=process: a stopped unit doesn't prove that nothing of its account still runs,
         # and a surviving writer could change the state between the copy and the migration.
+        # A guard, not a fence: nothing stops the account starting a process after a scan, so
+        # it scans again before replacing and before starting, and init-state's own check is
+        # what keeps the migration off a busy row.
         pids = account_processes(entry.pw_uid)
         if pids:
             raise Refused('%s is stopped, but %d processes still run as %s: pids %s; stop them '
@@ -1121,6 +1140,7 @@ def upgrade_transaction(args, journal, window):
             kept = os.path.join(TXN_DIR, 'files', name)
             copy_durably(path, kept)
         journal['files'][path] = kept
+    require_quiet(journal, Refused)
     set_phase(journal, 'replacing')
 
     for image in IMAGES:
@@ -1148,11 +1168,12 @@ def upgrade_transaction(args, journal, window):
     # With every instance still down, the new image proves it can open each one's state.
     # Any schema upgrade happens here, before a client or a reconciliation can see it.
     for unit, kept in journal['instances'].items():
-        instance = init_state(installed_kilnd, kept['state'], kept['account'])
+        instance = init_state(installed_kilnd, kept['state'], kept['account'], unit)
         if unit in enrolled and enrolled[unit] != instance:
             raise RuntimeError('%s is enrolled as %s, but its state says %s'
                                % (unit, enrolled[unit], instance))
 
+    require_quiet(journal, RuntimeError)
     journal['started'] = True
     set_phase(journal, 'starting')
     errors = window.release(restored=False)
@@ -1161,6 +1182,20 @@ def upgrade_transaction(args, journal, window):
     settle(running)
     journal['restarted'] = running
     set_phase(journal, 'committed')
+
+
+def require_quiet(journal, error):
+    """Each kept instance's account scanned again: Refused before anything is replaced, a
+    RuntimeError that rolls back after."""
+    for unit, kept in sorted(journal['instances'].items()):
+        try:
+            pids = account_processes(pwd.getpwnam(kept['account']).pw_uid)
+        except (KeyError, Refused) as failure:
+            raise error('cannot check that %s is quiet: %s' % (unit, failure)) from None
+        if pids:
+            raise error('%s is stopped, but %d processes started as %s during the upgrade: pids '
+                        '%s; stop them and retry' % (unit, len(pids), kept['account'],
+                                                     ', '.join(map(str, pids[:10]))))
 
 
 def helper_rows_retrying(helper, policy):

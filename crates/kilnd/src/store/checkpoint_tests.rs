@@ -2803,4 +2803,121 @@ fn maintenance_busy_query_matches_the_schema() {
     actual.sort();
     expected.sort();
     assert_eq!(actual, expected);
+    // C6a recheck 2 HIGH 1: init-state's own predicate, which decides, agrees with the
+    // script's on the same rows, and so does its refusal.
+    let rust: Vec<(String, String)> = db
+        .prepare(BUSY_CHECKPOINTS_SQL)
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rust, expected, "ordered by ID, as the script's");
+    drop(db);
+    drop(store);
+    let refused = Store::open_refusing_busy_checkpoints(tmp.path())
+        .err()
+        .expect("busy checkpoints refuse");
+    assert_eq!(
+        refused.downcast_ref::<BusyCheckpoints>(),
+        Some(&BusyCheckpoints(expected))
+    );
+}
+
+/// C6a recheck 2 HIGH 1: the upgrade's `init-state --refuse-busy-checkpoints` refuses each
+/// busy kind on its own, accepts settled rows, and a refusal mid-migration commits nothing.
+#[test]
+fn upgrade_init_state_refuses_each_busy_kind_inside_the_migration() {
+    fn settled(store: &Store, src: &Sandbox) {
+        ready(store, src, 1000, 1 << 20);
+        remove(store, &ready(store, src, 1000, 1 << 20));
+        let idle = ready(store, src, 1000, 1 << 20);
+        let reader = dispatch();
+        let fork = fork_row(&idle, 1000);
+        store
+            .reserve_fork_sandbox(&fork, roomy(), None, &[], &reader)
+            .unwrap();
+        store
+            .release_checkpoint_pin(
+                &fork.id,
+                &evidence(
+                    &idle,
+                    &reader,
+                    Fact::ReaderEnded {
+                        copy: CopyOutcome::Complete,
+                    },
+                ),
+            )
+            .unwrap();
+    }
+    let user_version = |dir: &Path| -> i64 {
+        Connection::open(dir.join("kilnd.db"))
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    };
+    // Settled rows alone: the same identity as a plain open.
+    let tmp = private_dir();
+    let store = Store::open(tmp.path()).unwrap();
+    settled(&store, &source(&store, 1000));
+    let identity = store.identity().unwrap();
+    drop(store);
+    let (_, opened) = Store::open_refusing_busy_checkpoints(tmp.path()).unwrap();
+    assert_eq!(opened, identity);
+    for kind in ["capturing", "deleting", "fork pin"] {
+        let tmp = private_dir();
+        let store = Store::open(tmp.path()).unwrap();
+        let src = source(&store, 1000);
+        settled(&store, &src);
+        let busy = match kind {
+            "capturing" => inserted(reserve(&store, &new_checkpoint(&src, 1000, GIB))),
+            "deleting" => {
+                let c = ready(&store, &src, 1000, 1 << 20);
+                store
+                    .publish_checkpoint_delete_intent(c.id.as_str(), DeletionReason::Requested)
+                    .unwrap();
+                c
+            }
+            _ => {
+                let c = ready(&store, &src, 1000, 1 << 20);
+                store
+                    .reserve_fork_sandbox(&fork_row(&c, 1000), roomy(), None, &[], &dispatch())
+                    .unwrap();
+                c
+            }
+        };
+        let expected = BusyCheckpoints(vec![(busy.id.to_string(), kind.to_string())]);
+        drop(store);
+        let refused = |what: &str| {
+            let error = Store::open_refusing_busy_checkpoints(tmp.path())
+                .err()
+                .unwrap_or_else(|| panic!("{kind} {what}: not refused"));
+            assert_eq!(
+                error.downcast_ref::<BusyCheckpoints>(),
+                Some(&expected),
+                "{kind} {what}: {error:#}"
+            );
+        };
+        refused("at schema 16");
+        // The same row in a schema 15 database: the check is in the migration's
+        // transaction, so the refusal leaves schema 15 exactly as it was.
+        Connection::open(tmp.path().join("kilnd.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE checkpoint_barrier; PRAGMA user_version = 15;")
+            .unwrap();
+        refused("mid-migration");
+        assert_eq!(user_version(tmp.path()), 15, "{kind}");
+        let barrier: i64 = Connection::open(tmp.path().join("kilnd.db"))
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'checkpoint_barrier'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(barrier, 0, "{kind}: nothing of the migration committed");
+        // Without the flag, an open migrates it as it always has.
+        drop(Store::open(tmp.path()).unwrap());
+        assert_eq!(user_version(tmp.path()), 16, "{kind}");
+    }
 }

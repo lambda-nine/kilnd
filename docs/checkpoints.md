@@ -116,7 +116,19 @@ for every running instance as one transaction. With checkpoints it also:
 - **Requires the instance's account to be quiet.** The units stop with `KillMode=process`,
   so before each copy the upgrade refuses (exit 2) if any process still runs with the
   account's UID as its real, effective, saved or filesystem UID, or if `/proc` can't be
-  read.
+  read. It scans every migrated instance's account again just before replacing the images
+  (exit 2, nothing replaced) and just before starting the units (rolled back, exit 1).
+  These scans are a guard against what `KillMode=process` leaves, not a fence: nothing
+  stops an account starting a process after a scan.
+- **Never migrates over a busy checkpoint.** That invariant is enforced atomically by
+  `kilnd init-state --refuse-busy-checkpoints`, which only the upgrade passes. It applies
+  the same busy predicate inside the schema migration's own IMMEDIATE transaction (one
+  transaction for every step), or, at the current schema, in an IMMEDIATE transaction of
+  its own while it reads the instance ID, so a row committed before the check is seen
+  and one written after it can only be written after the migration committed. On a busy
+  row it commits nothing and exits 75 with a `busy <id> <kind>` line per checkpoint; the
+  upgrade then rolls back like any other failure after the replacement (exit 1). Without
+  the flag (`add-instance`, a daemon's own start) init-state is unchanged.
 - **Reads one coherent snapshot, not the live state.** The instance's own account takes one
   SQLite backup of its database, which reads the database and its WAL in one read
   transaction, so a checkpoint of the WAL during the copy can't hide a row; the snapshot is
@@ -159,6 +171,9 @@ The messages, each prefixed `kilnd-maintenance: `:
 | 2 | `refused, nothing changed: <state> holds kilnd state of schema 15 or later, but account <account> is gone, so it cannot be inspected safely; restore the account or move the directory aside, and retry` |
 | 2 | `refused, nothing changed: <unit> is stopped, but <n> processes still run as <account>: pids <pid>, …; stop them and retry` (at most ten PIDs) |
 | 2 | `refused, nothing changed: cannot list processes in /proc: <error>` |
+| 2 | `refused, nothing changed: <unit> is stopped, but <n> processes started as <account> during the upgrade: pids <pid>, …; stop them and retry` (the scan before replacing) |
+| 1 | `the upgrade failed and was undone: <unit> is stopped, but <n> processes started as <account> during the upgrade: pids <pid>, …; stop them and retry` (the scan before starting) |
+| 1 | `the upgrade failed and was undone: <unit> has <n> busy checkpoints, so its state was not upgraded: <id> (<kind>), …` (init-state's refusal; at most five IDs) |
 | 2 | `refused, nothing changed: <unit> is enrolled as <id>, but its state says <id>` |
 | 2 | `refused, nothing changed: <unit> is enrolled as <id>, but its state records no instance ID; start kilnd once and retry` |
 | 2 | `refused, nothing changed: <unit> has checkpoint state but records no instance ID; start kilnd once so it records one, then retry` |
