@@ -1623,3 +1623,7 @@ const FLAG_OFF_HEALTH: [&str; 2] = [
 
 #[path = "checkpoint_discovery_tests.rs"]
 mod discovery;
+
+// C6a: client fixtures and the harness contract goldens, over these helpers.
+#[path = "checkpoint_client_fixtures.rs"]
+mod clients;

@@ -1,0 +1,1065 @@
+{
+  "format": 1,
+  "notes": [
+    "Recorded against the fake backend, which has no files: steps pin call sequences, provenance, digests, typed refusals, keys and accounting, not workspace content.",
+    "Volatile values are placeholders by first appearance within each section: <sb-N>, <ex-N>, <cp-N> IDs, <sha-N> digests, <id-N> 128-bit IDs and <t-N> nonzero *_unix_ms times from the daemon's clock. Equal placeholders are equal values.",
+    "<wall> is a nonzero time the host clock stamped (sandbox and execution rows); its equalities are not pinned.",
+    "Messages are their Debug form. An error is its gRPC code, its kilnd-reason trailer and its message up to the first ':' after the token.",
+    "Flag-off Health is pinned byte for byte by flag_off_health_bytes_are_unchanged, not here.",
+    "Regenerate with KILND_BLESS_CHECKPOINT_CONTRACT=1 cargo test -p kilnd --lib harness_contract_goldens_match."
+  ],
+  "fixtures": {
+    "f1_rewind": [
+      {
+        "label": "the session's keyed create",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f1-rewind\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"\" }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "a retry of the create",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f1-rewind\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"\" }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "turn 1",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-1>\", argv: [\"echo\", \"turn 1\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-1>\", sandbox_id: \"<sb-1>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [116, 117, 114, 110, 32, 49, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-1>\", sandbox_id: \"<sb-1>\", argv: [\"echo\", \"turn 1\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [116, 117, 114, 110, 32, 49, 10], total_bytes: 7, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 7, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "capture after turn 1",
+        "rpc": "CheckpointSandbox",
+        "uid": 1000,
+        "request": "CheckpointSandboxRequest { sandbox_id: \"<sb-1>\", request_id: \"kiln-harness:f1-rewind/1\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), max_size_bytes: 0 }",
+        "response": "Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-5>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "capture while turn 2 runs",
+        "rpc": "CheckpointSandbox",
+        "uid": 1000,
+        "request": "CheckpointSandboxRequest { sandbox_id: \"<sb-1>\", request_id: \"kiln-harness:f1-rewind/2\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), max_size_bytes: 0 }",
+        "error": {
+          "code": "FailedPrecondition",
+          "reason": "checkpoint_busy",
+          "message": "checkpoint_busy:"
+        }
+      },
+      {
+        "label": "turn 2, held during the refused capture",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-1>\", argv: [\"echo\", \"turn 2\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-2>\", sandbox_id: \"<sb-1>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [116, 117, 114, 110, 32, 50, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-2>\", sandbox_id: \"<sb-1>\", argv: [\"echo\", \"turn 2\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [116, 117, 114, 110, 32, 50, 10], total_bytes: 7, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 7, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "the same capture after turn 2",
+        "rpc": "CheckpointSandbox",
+        "uid": 1000,
+        "request": "CheckpointSandboxRequest { sandbox_id: \"<sb-1>\", request_id: \"kiln-harness:f1-rewind/2\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), max_size_bytes: 0 }",
+        "response": "Checkpoint { id: \"<cp-2>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-3>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-5>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind/2\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "turn 3 (destructive)",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-1>\", argv: [\"exit\", \"1\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-3>\", sandbox_id: \"<sb-1>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-3>\", sandbox_id: \"<sb-1>\", argv: [\"exit\", \"1\"], state: Exited, exit_code: Some(1), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(1)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "delete the session's sandbox",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-1>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f1-rewind\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "the session's sandbox is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "fork turn 1",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f1-rewind-a\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-2>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind-a\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "turn 1's checkpoint, source gone",
+        "rpc": "GetCheckpoint",
+        "uid": 1000,
+        "request": "GetCheckpointRequest { id: \"<cp-1>\" }",
+        "response": "Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-5>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "turn 2 again, in the fork",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-2>\", argv: [\"echo\", \"turn 2b\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-4>\", sandbox_id: \"<sb-2>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [116, 117, 114, 110, 32, 50, 98, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-4>\", sandbox_id: \"<sb-2>\", argv: [\"echo\", \"turn 2b\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [116, 117, 114, 110, 32, 50, 98, 10], total_bytes: 8, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 8, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "capture the fork",
+        "rpc": "CheckpointSandbox",
+        "uid": 1000,
+        "request": "CheckpointSandboxRequest { sandbox_id: \"<sb-2>\", request_id: \"kiln-harness:f1-rewind-a/1\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), max_size_bytes: 0 }",
+        "response": "Checkpoint { id: \"<cp-3>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-2>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-4>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-5>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind-a/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "fork the fork's checkpoint (depth 2)",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f1-rewind-b\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-3>\" }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind-b\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-3>\", checkpoint_content_sha256: \"<sha-4>\" }"
+      },
+      {
+        "label": "a retry of the depth-2 fork",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f1-rewind-b\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-3>\" }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind-b\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-3>\", checkpoint_content_sha256: \"<sha-4>\" }"
+      },
+      {
+        "label": "turn 3 in the depth-2 fork",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-3>\", argv: [\"echo\", \"turn 3c\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-5>\", sandbox_id: \"<sb-3>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [116, 117, 114, 110, 32, 51, 99, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-5>\", sandbox_id: \"<sb-3>\", argv: [\"echo\", \"turn 3c\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [116, 117, 114, 110, 32, 51, 99, 10], total_bytes: 8, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 8, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "delete the depth-2 fork",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-3>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f1-rewind-b\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-3>\", checkpoint_content_sha256: \"<sha-4>\" }"
+      },
+      {
+        "label": "the depth-2 fork is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [Sandbox { id: \"<sb-2>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f1-rewind-a\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }], next_page_token: \"\" }"
+      },
+      {
+        "label": "release the depth-2 fork's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-3>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f1-rewind-b\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-3>\", checkpoint_content_sha256: \"<sha-4>\" }"
+      },
+      {
+        "label": "delete the first fork",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-2>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-2>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f1-rewind-a\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "the first fork is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release the first fork's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-2>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-2>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f1-rewind-a\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "delete turn 1 checkpoint",
+        "rpc": "DeleteCheckpoint",
+        "uid": 1000,
+        "request": "DeleteCheckpointRequest { id: \"<cp-1>\", release_request_id: false }",
+        "response": "Checkpoint { id: \"<cp-1>\", state: Deleted, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Requested, request_id: \"kiln-harness:f1-rewind/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "delete turn 2 checkpoint",
+        "rpc": "DeleteCheckpoint",
+        "uid": 1000,
+        "request": "DeleteCheckpointRequest { id: \"<cp-2>\", release_request_id: false }",
+        "response": "Checkpoint { id: \"<cp-2>\", state: Deleted, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-3>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Requested, request_id: \"kiln-harness:f1-rewind/2\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "delete the fork's checkpoint",
+        "rpc": "DeleteCheckpoint",
+        "uid": 1000,
+        "request": "DeleteCheckpointRequest { id: \"<cp-3>\", release_request_id: false }",
+        "response": "Checkpoint { id: \"<cp-3>\", state: Deleted, owner_uid: 1000, sandbox_id: \"<sb-2>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-4>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Requested, request_id: \"kiln-harness:f1-rewind-a/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      }
+    ],
+    "f2_best_of_four": [
+      {
+        "label": "baseline (CheckpointStats)",
+        "rpc": "Health",
+        "uid": 1000,
+        "request": "HealthRequest",
+        "response": "CheckpointStats { max_count: 128, current_count: 0, max_count_per_uid: 32, caller_count: 0, max_bytes: 8589934592, reserved_bytes: 0, max_bytes_per_uid: 4294967296, caller_reserved_bytes: 0, max_workers: 2, current_workers: 0, max_workers_per_uid: 1, caller_workers: 0, pending_deletes: 0, rejected_captures: 0, rejected_forks: 0, max_records: 32768, current_records: 0, max_records_per_uid: 4096, caller_records: 0, max_request_records: 32768, request_records: 0, max_request_records_per_uid: 4096, caller_request_records: 0, max_cleanup_workers: 2, current_cleanup_workers: 0, expired: 0 }"
+      },
+      {
+        "label": "the seed's keyed create",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-seed\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"\" }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "seed the workspace",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-1>\", argv: [\"echo\", \"seed\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-1>\", sandbox_id: \"<sb-1>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [115, 101, 101, 100, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-1>\", sandbox_id: \"<sb-1>\", argv: [\"echo\", \"seed\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [115, 101, 101, 100, 10], total_bytes: 5, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 5, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "capture the seed",
+        "rpc": "CheckpointSandbox",
+        "uid": 1000,
+        "request": "CheckpointSandboxRequest { sandbox_id: \"<sb-1>\", request_id: \"kiln-harness:f2-seed/1\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), max_size_bytes: 0 }",
+        "response": "Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-5>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f2-seed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "round 0: branch 1, refused",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-1\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "error": {
+          "code": "ResourceExhausted",
+          "reason": "checkpoint_workers",
+          "message": "checkpoint_workers:"
+        }
+      },
+      {
+        "label": "round 0: branch 2, refused",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-2\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "error": {
+          "code": "ResourceExhausted",
+          "reason": "checkpoint_workers",
+          "message": "checkpoint_workers:"
+        }
+      },
+      {
+        "label": "round 0: branch 3, refused",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-3\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "error": {
+          "code": "ResourceExhausted",
+          "reason": "checkpoint_workers",
+          "message": "checkpoint_workers:"
+        }
+      },
+      {
+        "label": "round 0: branch 0, admitted",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-0\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-2>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-0\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "round 1: branch 2, refused",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-2\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "error": {
+          "code": "ResourceExhausted",
+          "reason": "checkpoint_workers",
+          "message": "checkpoint_workers:"
+        }
+      },
+      {
+        "label": "round 1: branch 3, refused",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-3\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "error": {
+          "code": "ResourceExhausted",
+          "reason": "checkpoint_workers",
+          "message": "checkpoint_workers:"
+        }
+      },
+      {
+        "label": "round 1: branch 1, admitted",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-1\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "round 2: branch 3, refused",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-3\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "error": {
+          "code": "ResourceExhausted",
+          "reason": "checkpoint_workers",
+          "message": "checkpoint_workers:"
+        }
+      },
+      {
+        "label": "round 2: branch 2, admitted",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-2\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-4>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "round 3: branch 3, admitted",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f2-branch-3\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-5>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-5\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-3\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "branch 0's check",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-2>\", argv: [\"exit\", \"1\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-2>\", sandbox_id: \"<sb-2>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-2>\", sandbox_id: \"<sb-2>\", argv: [\"exit\", \"1\"], state: Exited, exit_code: Some(1), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(1)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "branch 1's check",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-3>\", argv: [\"exit\", \"1\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-3>\", sandbox_id: \"<sb-3>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-3>\", sandbox_id: \"<sb-3>\", argv: [\"exit\", \"1\"], state: Exited, exit_code: Some(1), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(1)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "branch 2's check",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-4>\", argv: [\"exit\", \"0\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-4>\", sandbox_id: \"<sb-4>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-4>\", sandbox_id: \"<sb-4>\", argv: [\"exit\", \"0\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "branch 3's check",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-5>\", argv: [\"exit\", \"1\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-5>\", sandbox_id: \"<sb-5>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-5>\", sandbox_id: \"<sb-5>\", argv: [\"exit\", \"1\"], state: Exited, exit_code: Some(1), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(1)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "delete branch 0",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-2>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-2>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-branch-0\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "branch 0 is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [Sandbox { id: \"<sb-5>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-5\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-3\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }, Sandbox { id: \"<sb-4>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }, Sandbox { id: \"<sb-3>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }, Sandbox { id: \"<sb-1>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }], next_page_token: \"\" }"
+      },
+      {
+        "label": "release branch 0's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-2>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-2>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-branch-0\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "delete branch 1",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-3>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-branch-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "branch 1 is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [Sandbox { id: \"<sb-5>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-5\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-3\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }, Sandbox { id: \"<sb-4>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }, Sandbox { id: \"<sb-1>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }], next_page_token: \"\" }"
+      },
+      {
+        "label": "release branch 1's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-3>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-branch-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "delete branch 3",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-5>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-5>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-5\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-branch-3\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "branch 3 is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [Sandbox { id: \"<sb-4>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }, Sandbox { id: \"<sb-1>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }], next_page_token: \"\" }"
+      },
+      {
+        "label": "release branch 3's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-5>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-5>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-5\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-branch-3\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "delete the seed's checkpoint",
+        "rpc": "DeleteCheckpoint",
+        "uid": 1000,
+        "request": "DeleteCheckpointRequest { id: \"<cp-1>\", release_request_id: false }",
+        "response": "Checkpoint { id: \"<cp-1>\", state: Deleted, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Requested, request_id: \"kiln-harness:f2-seed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "the kept branch, its checkpoint gone",
+        "rpc": "GetSandbox",
+        "uid": 1000,
+        "request": "GetSandboxRequest { id: \"<sb-4>\", execution_limit: 1 }",
+        "response": "GetSandboxResponse { sandbox: Some(Sandbox { id: \"<sb-4>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-branch-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }), recent_executions: [Execution { id: \"<ex-4>\", sandbox_id: \"<sb-4>\", argv: [\"exit\", \"0\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }] }"
+      },
+      {
+        "label": "the kept branch runs on",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-4>\", argv: [\"echo\", \"next\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-6>\", sandbox_id: \"<sb-4>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [110, 101, 120, 116, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-6>\", sandbox_id: \"<sb-4>\", argv: [\"echo\", \"next\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [110, 101, 120, 116, 10], total_bytes: 5, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 5, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "after (CheckpointStats)",
+        "rpc": "Health",
+        "uid": 1000,
+        "request": "HealthRequest",
+        "response": "CheckpointStats { max_count: 128, current_count: 0, max_count_per_uid: 32, caller_count: 0, max_bytes: 8589934592, reserved_bytes: 0, max_bytes_per_uid: 4294967296, caller_reserved_bytes: 0, max_workers: 2, current_workers: 0, max_workers_per_uid: 1, caller_workers: 0, pending_deletes: 0, rejected_captures: 0, rejected_forks: 6, max_records: 32768, current_records: 1, max_records_per_uid: 4096, caller_records: 1, max_request_records: 32768, request_records: 1, max_request_records_per_uid: 4096, caller_request_records: 1, max_cleanup_workers: 2, current_cleanup_workers: 0, expired: 0 }"
+      },
+      {
+        "label": "delete the kept branch",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-4>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-4>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-branch-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "the kept branch is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [Sandbox { id: \"<sb-1>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f2-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }], next_page_token: \"\" }"
+      },
+      {
+        "label": "release the kept branch's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-4>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-4>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-branch-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "delete the seed",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-1>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "the seed is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release the seed's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-1>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f2-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      }
+    ],
+    "f3_eval_reset": [
+      {
+        "label": "seed: keyed create",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f3-seed\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"\" }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f3-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "seed: seed the workspace",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-1>\", argv: [\"echo\", \"seed\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-1>\", sandbox_id: \"<sb-1>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [115, 101, 101, 100, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-1>\", sandbox_id: \"<sb-1>\", argv: [\"echo\", \"seed\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [115, 101, 101, 100, 10], total_bytes: 5, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 5, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "seed: capture with a lifetime",
+        "rpc": "CheckpointSandbox",
+        "uid": 1000,
+        "request": "CheckpointSandboxRequest { sandbox_id: \"<sb-1>\", request_id: \"kiln-harness:f3-seed/1\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), max_size_bytes: 0 }",
+        "response": "Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-5>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f3-seed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "delete the seed source",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-1>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f3-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "the seed source is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release the seed source's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-1>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f3-seed\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "run 1: fork",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:eval-1\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-2>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:eval-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 1: the eval",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-2>\", argv: [\"echo\", \"run 1\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-2>\", sandbox_id: \"<sb-2>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [114, 117, 110, 32, 49, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-2>\", sandbox_id: \"<sb-2>\", argv: [\"echo\", \"run 1\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [114, 117, 110, 32, 49, 10], total_bytes: 6, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 6, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "delete run 1",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-2>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-2>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 1 is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release run 1's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-2>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-2>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-2\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 1's released key, reused",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:eval-1\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:eval-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "delete the reused key's fork",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-3>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "the reused key's fork is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release the reused key's fork's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-3>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-3>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-3\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-1\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "before run 2",
+        "rpc": "ListCheckpoints",
+        "uid": 1000,
+        "request": "ListCheckpointsRequest { sandbox_id: \"\", page_size: 0, page_token: \"\" }",
+        "response": "ListCheckpointsResponse { checkpoints: [Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-5>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f3-seed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }], next_page_token: \"\" }"
+      },
+      {
+        "label": "run 2: fork",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:eval-2\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-4>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-6>, idle_expires_at_unix_ms: <t-7>, last_activity_at_unix_ms: <t-8>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:eval-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 2: the eval",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-4>\", argv: [\"echo\", \"run 2\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-3>\", sandbox_id: \"<sb-4>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [114, 117, 110, 32, 50, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-3>\", sandbox_id: \"<sb-4>\", argv: [\"echo\", \"run 2\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [114, 117, 110, 32, 50, 10], total_bytes: 6, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 6, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "delete run 2",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-4>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-4>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-8>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 2 is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release run 2's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-4>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-4>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-4\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-8>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-2\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "before run 3",
+        "rpc": "ListCheckpoints",
+        "uid": 1000,
+        "request": "ListCheckpointsRequest { sandbox_id: \"\", page_size: 0, page_token: \"\" }",
+        "response": "ListCheckpointsResponse { checkpoints: [Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-9>, last_activity_at_unix_ms: <t-8>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f3-seed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }], next_page_token: \"\" }"
+      },
+      {
+        "label": "run 3: fork",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:eval-3\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-5>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-5\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-10>, idle_expires_at_unix_ms: <t-11>, last_activity_at_unix_ms: <t-12>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:eval-3\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 3: the eval",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-5>\", argv: [\"echo\", \"run 3\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-4>\", sandbox_id: \"<sb-5>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [114, 117, 110, 32, 51, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-4>\", sandbox_id: \"<sb-5>\", argv: [\"echo\", \"run 3\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [114, 117, 110, 32, 51, 10], total_bytes: 6, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 6, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "delete run 3",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-5>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-5>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-5\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-12>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-3\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 3 is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release run 3's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-5>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-5>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-5\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-12>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-3\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "before run 4",
+        "rpc": "ListCheckpoints",
+        "uid": 1000,
+        "request": "ListCheckpointsRequest { sandbox_id: \"\", page_size: 0, page_token: \"\" }",
+        "response": "ListCheckpointsResponse { checkpoints: [Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-13>, last_activity_at_unix_ms: <t-12>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f3-seed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }], next_page_token: \"\" }"
+      },
+      {
+        "label": "run 4: fork",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:eval-4\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-6>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-6\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-14>, idle_expires_at_unix_ms: <t-15>, last_activity_at_unix_ms: <t-16>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:eval-4\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 4: the eval",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-6>\", argv: [\"echo\", \"run 4\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-5>\", sandbox_id: \"<sb-6>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [114, 117, 110, 32, 52, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-5>\", sandbox_id: \"<sb-6>\", argv: [\"echo\", \"run 4\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [114, 117, 110, 32, 52, 10], total_bytes: 6, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 6, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "delete run 4",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-6>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-6>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-6\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-16>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-4\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 4 is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release run 4's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-6>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-6>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-6\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-16>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-4\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "before run 5",
+        "rpc": "ListCheckpoints",
+        "uid": 1000,
+        "request": "ListCheckpointsRequest { sandbox_id: \"\", page_size: 0, page_token: \"\" }",
+        "response": "ListCheckpointsResponse { checkpoints: [Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-17>, last_activity_at_unix_ms: <t-16>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f3-seed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }], next_page_token: \"\" }"
+      },
+      {
+        "label": "run 5: fork",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:eval-5\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "response": "Sandbox { id: \"<sb-7>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-7\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-18>, idle_expires_at_unix_ms: <t-19>, last_activity_at_unix_ms: <t-20>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:eval-5\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 5: the eval",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-7>\", argv: [\"echo\", \"run 5\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-6>\", sandbox_id: \"<sb-7>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [114, 117, 110, 32, 53, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-6>\", sandbox_id: \"<sb-7>\", argv: [\"echo\", \"run 5\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [114, 117, 110, 32, 53, 10], total_bytes: 6, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 6, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "delete run 5",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-7>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-7>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-7\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-20>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-5\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "run 5 is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release run 5's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-7>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-7>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-7\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-20>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-5\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-1>\", checkpoint_content_sha256: \"<sha-1>\" }"
+      },
+      {
+        "label": "after the last run",
+        "rpc": "ListCheckpoints",
+        "uid": 1000,
+        "request": "ListCheckpointsRequest { sandbox_id: \"\", page_size: 0, page_token: \"\" }",
+        "response": "ListCheckpointsResponse { checkpoints: [Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-21>, last_activity_at_unix_ms: <t-20>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f3-seed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }], next_page_token: \"\" }"
+      },
+      {
+        "label": "past the lifetime: the next run's fork",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:eval-6\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "error": {
+          "code": "FailedPrecondition",
+          "reason": "checkpoint_expired",
+          "message": "checkpoint_expired:"
+        }
+      },
+      {
+        "label": "the expired checkpoint",
+        "rpc": "GetCheckpoint",
+        "uid": 1000,
+        "request": "GetCheckpointRequest { id: \"<cp-1>\" }",
+        "response": "Checkpoint { id: \"<cp-1>\", state: Deleted, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-20>, idle_paused: false }), failure_reason: \"\", deletion_reason: ExpiredLifetime, request_id: \"kiln-harness:f3-seed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "reseed: keyed create",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:f3-reseed\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"\" }",
+        "response": "Sandbox { id: \"<sb-8>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-8\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-22>, idle_expires_at_unix_ms: <t-23>, last_activity_at_unix_ms: <t-24>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:f3-reseed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "reseed: seed the workspace",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-8>\", argv: [\"echo\", \"reseed\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-7>\", sandbox_id: \"<sb-8>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [114, 101, 115, 101, 101, 100, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-7>\", sandbox_id: \"<sb-8>\", argv: [\"echo\", \"reseed\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [114, 101, 115, 101, 101, 100, 10], total_bytes: 7, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 7, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "reseed: capture with a lifetime",
+        "rpc": "CheckpointSandbox",
+        "uid": 1000,
+        "request": "CheckpointSandboxRequest { sandbox_id: \"<sb-8>\", request_id: \"kiln-harness:f3-reseed/1\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), max_size_bytes: 0 }",
+        "response": "Checkpoint { id: \"<cp-2>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-8>\", created_at_unix_ms: <t-24>, ready_at_unix_ms: <t-24>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-3>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), lifetime_expires_at_unix_ms: <t-25>, idle_expires_at_unix_ms: <t-26>, last_activity_at_unix_ms: <t-24>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"kiln-harness:f3-reseed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "delete the reseed source",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-8>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-8>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-8\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-24>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f3-reseed\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "the reseed source is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release the reseed source's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-8>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-8>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-8\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-24>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:f3-reseed\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "run 6: fork",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:eval-6\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-2>\" }",
+        "response": "Sandbox { id: \"<sb-9>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-9\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-22>, idle_expires_at_unix_ms: <t-23>, last_activity_at_unix_ms: <t-24>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:eval-6\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-2>\", checkpoint_content_sha256: \"<sha-3>\" }"
+      },
+      {
+        "label": "run 6: the eval",
+        "rpc": "ExecStream",
+        "uid": 1000,
+        "request": "ExecStreamRequest { exec: Some(ExecRequest { sandbox_id: \"<sb-9>\", argv: [\"echo\", \"run 6\"], stdin: [], timeout_ms: 0, cwd: \"\", env: [] }) }",
+        "response": [
+          "ExecStreamResponse { seq: 0, event: Some(Started(ExecStarted { execution_id: \"<ex-8>\", sandbox_id: \"<sb-9>\", started_at_unix_ms: <wall>, timeout_ms: 1800000 })) }",
+          "ExecStreamResponse { seq: 1, event: Some(Chunk(OutputChunk { stream: Stdout, offset: 0, data: [114, 117, 110, 32, 54, 10] })) }",
+          "ExecStreamResponse { seq: 2, event: Some(Finished(ExecFinished { execution: Some(Execution { id: \"<ex-8>\", sandbox_id: \"<sb-9>\", argv: [\"echo\", \"run 6\"], state: Exited, exit_code: Some(0), failure_reason: \"\", started_at_unix_ms: <wall>, finished_at_unix_ms: <wall>, timeout_ms: 1800000, stdin_bytes: 0, stdout: Some(Output { data: [114, 117, 110, 32, 54, 10], total_bytes: 6, truncated: false, total_bytes_known: true }), stderr: Some(Output { data: [], total_bytes: 0, truncated: false, total_bytes_known: true }), command_status: Some(CommandStatus { termination: Some(ExitCode(0)) }), runtime_error: None, sandbox_reusable: Some(true), cleanup_evidence: RuntimeDrained, cwd: \"\", env_names: [], env_sha256: \"\", cancel_reason: Unspecified, mode: Stream }), stdout: Some(LiveDelivery { delivered_bytes: 6, dropped_bytes: 0, dropped_bytes_known: true }), stderr: Some(LiveDelivery { delivered_bytes: 0, dropped_bytes: 0, dropped_bytes_known: true }) })) }"
+        ]
+      },
+      {
+        "label": "delete run 6",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-9>\", release_request_id: false }",
+        "response": "Sandbox { id: \"<sb-9>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-9\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-24>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-6\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"<cp-2>\", checkpoint_content_sha256: \"<sha-3>\" }"
+      },
+      {
+        "label": "run 6 is absent",
+        "rpc": "ListSandboxes",
+        "uid": 1000,
+        "request": "ListSandboxesRequest { include_deleted: false, page_size: None, page_token: \"\" }",
+        "response": "ListSandboxesResponse { sandboxes: [], next_page_token: \"\" }"
+      },
+      {
+        "label": "release run 6's key",
+        "rpc": "DeleteSandbox",
+        "uid": 1000,
+        "request": "DeleteSandboxRequest { id: \"<sb-9>\", release_request_id: true }",
+        "response": "Sandbox { id: \"<sb-9>\", state: Deleted, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-9\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: <wall>, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-24>, idle_paused: false }), deletion_reason: Requested, request_id: \"kiln-harness:eval-6\", default_env_names: [], default_env_sha256: \"\", request_id_released: true, from_checkpoint: \"<cp-2>\", checkpoint_content_sha256: \"<sha-3>\" }"
+      },
+      {
+        "label": "delete the re-seeded checkpoint",
+        "rpc": "DeleteCheckpoint",
+        "uid": 1000,
+        "request": "DeleteCheckpointRequest { id: \"<cp-2>\", release_request_id: false }",
+        "response": "Checkpoint { id: \"<cp-2>\", state: Deleted, owner_uid: 1000, sandbox_id: \"<sb-8>\", created_at_unix_ms: <t-24>, ready_at_unix_ms: <t-24>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-3>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 600000, idle_timeout_ms: 300000 }), lifetime_expires_at_unix_ms: 0, idle_expires_at_unix_ms: 0, last_activity_at_unix_ms: <t-24>, idle_paused: false }), failure_reason: \"\", deletion_reason: Requested, request_id: \"kiln-harness:f3-reseed/1\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      }
+    ]
+  },
+  "reasons": {
+    "table": [
+      {
+        "token": "backend_unsupported:workspace_checkpoint",
+        "code": "Unimplemented"
+      },
+      {
+        "token": "sandbox_unsupported:workspace_checkpoint",
+        "code": "FailedPrecondition"
+      },
+      {
+        "token": "checkpoint_busy",
+        "code": "FailedPrecondition"
+      },
+      {
+        "token": "checkpoint_not_ready",
+        "code": "FailedPrecondition"
+      },
+      {
+        "token": "checkpoint_expired",
+        "code": "FailedPrecondition"
+      },
+      {
+        "token": "checkpoint_layout_unsupported",
+        "code": "FailedPrecondition"
+      },
+      {
+        "token": "checkpoint_metadata_unsupported",
+        "code": "FailedPrecondition"
+      },
+      {
+        "token": "checkpoint_image_unavailable",
+        "code": "FailedPrecondition"
+      },
+      {
+        "token": "checkpoint_spec_mismatch",
+        "code": "InvalidArgument"
+      },
+      {
+        "token": "checkpoint_disk_too_small",
+        "code": "InvalidArgument"
+      },
+      {
+        "token": "checkpoint_expiry_required",
+        "code": "InvalidArgument"
+      },
+      {
+        "token": "checkpoint_quota",
+        "code": "ResourceExhausted"
+      },
+      {
+        "token": "checkpoint_size_limit",
+        "code": "ResourceExhausted"
+      },
+      {
+        "token": "checkpoint_workers",
+        "code": "ResourceExhausted"
+      },
+      {
+        "token": "checkpoint_corrupt",
+        "code": "DataLoss"
+      },
+      {
+        "token": "checkpoint_io",
+        "code": "Unavailable"
+      },
+      {
+        "token": "checkpoint_in_flight",
+        "code": "DeadlineExceeded"
+      }
+    ],
+    "firecracker": [
+      {
+        "label": "a source",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:fc\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"\" }",
+        "response": "Sandbox { id: \"<sb-1>\", state: Ready, spec: Some(SandboxSpec { image: \"alpine\", limits: Some(ResourceLimits { memory_bytes: 536870912, cpu_millis: 1000, pids: 128, disk_bytes: 1073741824 }), network: Some(NetworkPolicy { mode: None, allow: [] }), read_only_root: false, writable_paths: [], labels: {} }), backend: \"fake\", backend_id: \"f00d-1\", created_at_unix_ms: <wall>, updated_at_unix_ms: <wall>, deleted_at_unix_ms: 0, failure_reason: \"\", owner_uid: 1000, reservation: Some(ResourceReservation { memory_bytes: 536870912, disk_bytes: 1073741824, pids: 128, host_cpu_millis: 0, virtual_cpu_slots: 0, host_pids: 0 }), runtime_profile: \"fake\", runtime_artifact_digest: \"\", expiry: Some(ExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), lifetime_expires_at_unix_ms: <t-1>, idle_expires_at_unix_ms: <t-2>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), deletion_reason: Unspecified, request_id: \"kiln-harness:fc\", default_env_names: [], default_env_sha256: \"\", request_id_released: false, from_checkpoint: \"\", checkpoint_content_sha256: \"\" }"
+      },
+      {
+        "label": "its checkpoint",
+        "rpc": "CheckpointSandbox",
+        "uid": 1000,
+        "request": "CheckpointSandboxRequest { sandbox_id: \"<sb-1>\", request_id: \"\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), max_size_bytes: 0 }",
+        "response": "Checkpoint { id: \"<cp-1>\", state: Ready, owner_uid: 1000, sandbox_id: \"<sb-1>\", created_at_unix_ms: <t-3>, ready_at_unix_ms: <t-3>, size_bytes: 65536, logical_bytes: 4096, allocated_bytes: 8192, content_sha256: \"<sha-1>\", image: \"alpine\", image_content_sha256: \"<sha-2>\", read_only_root: false, writable_paths: [], excluded_paths: [\"/dev\", \"/dev/shm\", \"/etc/resolv.conf\", \"/proc\", \"/sys\"], scope: PersistentOverlay, expiry: Some(CheckpointExpiryStatus { effective: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), lifetime_expires_at_unix_ms: <t-4>, idle_expires_at_unix_ms: <t-5>, last_activity_at_unix_ms: <t-3>, idle_paused: false }), failure_reason: \"\", deletion_reason: Unspecified, request_id: \"\", request_id_released: false, format_version: 1, max_size_bytes: 1073741824 }"
+      },
+      {
+        "label": "capture on Firecracker",
+        "rpc": "CheckpointSandbox",
+        "uid": 1000,
+        "request": "CheckpointSandboxRequest { sandbox_id: \"<sb-1>\", request_id: \"\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 3600000, idle_timeout_ms: 600000 }), max_size_bytes: 0 }",
+        "error": {
+          "code": "Unimplemented",
+          "reason": "backend_unsupported:workspace_checkpoint",
+          "message": "backend_unsupported:workspace_checkpoint:"
+        }
+      },
+      {
+        "label": "fork on Firecracker",
+        "rpc": "CreateSandbox",
+        "uid": 1000,
+        "request": "CreateSandboxRequest { spec: None, request_id: \"kiln-harness:fc-fork\", expiry: Some(ExpiryPolicy { max_lifetime_ms: 7200000, idle_timeout_ms: 1800000 }), default_env: [], from_checkpoint: \"<cp-1>\" }",
+        "error": {
+          "code": "Unimplemented",
+          "reason": "backend_unsupported:workspace_checkpoint",
+          "message": "backend_unsupported:workspace_checkpoint:"
+        }
+      }
+    ]
+  },
+  "health": {
+    "features": [
+      "FEATURE_SANDBOX_EXPIRY",
+      "FEATURE_IDEMPOTENT_CREATE",
+      "FEATURE_EXEC_STREAM",
+      "FEATURE_TYPED_REASONS",
+      "FEATURE_REQUEST_ID_RELEASE",
+      "FEATURE_WORKSPACE_CHECKPOINT"
+    ],
+    "checkpoint": true,
+    "limits_checkpoint": "Some(CheckpointLimits { max_size_bytes: 1073741824, max_entries: 65536, max_manifest_bytes: 16777216, max_path_bytes: 4096, max_directory_depth: 128, max_link_target_bytes: 1023, max_xattrs_per_entry: 32, max_xattr_bytes_per_entry: 4096, default_lifetime_ms: 86400000, max_lifetime_ms: 604800000, default_idle_ms: 3600000, max_idle_ms: 86400000, min_lifetime_ms: 10000, min_idle_ms: 10000, operation_timeout_ms: 120000, helper_timeout_ceiling_ms: 300000, max_fork_depth: 0, worker_memory_bytes: 67108864, worker_max_fds: 256, request_retention_ms: 86400000 })",
+    "stats_empty": "Some(CheckpointStats { max_count: 128, current_count: 0, max_count_per_uid: 32, caller_count: 0, max_bytes: 8589934592, reserved_bytes: 0, max_bytes_per_uid: 4294967296, caller_reserved_bytes: 0, max_workers: 2, current_workers: 0, max_workers_per_uid: 1, caller_workers: 0, pending_deletes: 0, rejected_captures: 0, rejected_forks: 0, max_records: 32768, current_records: 0, max_records_per_uid: 4096, caller_records: 0, max_request_records: 32768, request_records: 0, max_request_records_per_uid: 4096, caller_request_records: 0, max_cleanup_workers: 2, current_cleanup_workers: 0, expired: 0 })",
+    "stats_one_ready": "Some(CheckpointStats { max_count: 128, current_count: 1, max_count_per_uid: 32, caller_count: 1, max_bytes: 8589934592, reserved_bytes: 65536, max_bytes_per_uid: 4294967296, caller_reserved_bytes: 65536, max_workers: 2, current_workers: 0, max_workers_per_uid: 1, caller_workers: 0, pending_deletes: 0, rejected_captures: 0, rejected_forks: 0, max_records: 32768, current_records: 1, max_records_per_uid: 4096, caller_records: 1, max_request_records: 32768, request_records: 0, max_request_records_per_uid: 4096, caller_request_records: 0, max_cleanup_workers: 2, current_cleanup_workers: 0, expired: 0 })"
+  }
+}
