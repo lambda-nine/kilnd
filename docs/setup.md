@@ -213,7 +213,10 @@ from its own copy in `/usr/local/libexec/kilnd`, and everything behind it waits:
 Any maintenance command exits with status 3 when something could not be put back, including a
 unit that would not start again. It keeps its record, and an upgrade its journal and stage, and
 `scripts/upgrade.sh --recover` tries again without stopping what did come back. The next
-maintenance command does the same first, and refuses to go on until that succeeds.
+maintenance command does the same first, and refuses to go on until that succeeds. A rollback
+that finds the checkpoint artifacts changed also exits 3 and keeps every unit down, the boot
+guard included, until `kilnd-maintenance.py accept-artifacts`; see
+[checkpoints.md](checkpoints.md#upgrade-and-rollback).
 
 Enrollment refuses an account another instance holds, root, the helper's own account and
 anything in the policy's VM identity ranges, and the helper refuses a ledger that breaks
@@ -236,8 +239,9 @@ scripts/upgrade.sh --recover        # finishes an upgrade killed partway
 2. It discovers every instance (`kilnd.service` and `kilnd@*`), records which are running,
    and stops them all, with activation unavailable as above.
 3. **Before replacing anything,** it refuses if the ledger can't be read or refreshed, if an
-   enrollment isn't a standard unit bound to its current account, or if it can't keep a copy of
-   a running instance's database.
+   enrollment isn't a standard unit bound to its current account, if it can't keep a copy of
+   a running instance's database, or if any configured or enrolled instance, running or not,
+   has a checkpoint in flight.
 4. It moves the old images aside by rename, keeping their inodes, installs the new images and
    units, and refreshes every enrollment's image in one ledger transaction. An instance's ID,
    account and unit can't change, and an instance that isn't running is refreshed too.

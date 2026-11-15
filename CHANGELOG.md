@@ -6,12 +6,22 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix the C6a adversarial review's maintenance findings (four HIGH). The upgrade's
+  checkpoint check now covers every configured or enrolled instance, stopped ones too; it
+  reads root's snapshot through a copy the instance's account can read but not change,
+  never the live database, and refuses a database identity other than the enrollment's.
+  The artifact inventory opens every registry component without following a link and
+  refuses one not private to root or on another filesystem; it compares names, types and
+  inodes only, and an absent instance directory is an empty one. A rollback that finds
+  the artifacts changed keeps its record and every unit down, through `recover`, other
+  commands and reboots, until `kilnd-maintenance.py accept-artifacts`.
 - Add milestone C6a of workspace checkpoints: acceptance groundwork. The feature stays
   off by default and testing only. `scripts/upgrade.sh` refuses (exit 2, nothing changed)
   while any checkpoint is capturing or deleting or a fork is still restoring from one, and
   records each instance's checkpoint artifact inventory beside its database snapshot; a
-  rollback whose artifacts no longer match still completes and exits 3, listing what was
-  added, missing or changed, with nothing left for `recover`. New `docs/checkpoints.md`
+  rollback whose artifacts no longer match restores everything but keeps kilnd stopped and
+  exits 3, listing what was added, missing or changed, until `kilnd-maintenance.py
+  accept-artifacts`. New `docs/checkpoints.md`
   covers states, cleanup, backup and restore, upgrade and rollback; a draft
   `docs/checkpoint-rollout-gate.md` lists the criteria for enabling the feature. Tests add
   rewind, best-of-four and eval-reset client fixtures through the API, harness contract

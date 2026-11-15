@@ -104,19 +104,32 @@ taken before the upgrade. `scripts/upgrade.sh` (`kilnd-maintenance.py upgrade`) 
 for every running instance as one transaction. With checkpoints it also:
 
 - **Refuses to start while a checkpoint is in flight** (exit 2, nothing changed): any
-  checkpoint `capturing` or `deleting`, or one with a fork still restoring from it. The
-  daemons were stopped to take the snapshot, so they are started again; let those
-  checkpoints settle (`kilndctl checkpoint ls`), then retry.
-- **Records the instance's artifact inventory** beside its database snapshot.
-- **Checks the inventory after a rollback.** Artifacts are immutable, so the snapshot plus
-  the artifacts on disk are a matching set unless the new daemon changed them before the
-  upgrade failed (it may have run and served requests). If they differ, the rollback still
-  finishes (binaries, unit files, enrollments and databases are back and the units
-  restarted) and the command exits 3, listing the artifacts added, missing or changed.
-  kilnd then keeps new disk work blocked, or quarantines the rows, as above. Nothing is
-  left for `recover` in this case: reconcile the listed artifacts as in "Cleaning up".
-  A rollback finished at boot only logs the difference; the first `recover` (or other
-  command) after it reports it the same way and exits 3, once.
+  checkpoint `capturing` or `deleting`, or one with a fork still restoring from it, in
+  **any** configured or enrolled instance, running or stopped. Only the running instances
+  are then snapshotted, migrated and started again. The daemons were stopped to take the
+  snapshot, so they are started again; let those checkpoints settle (`kilndctl checkpoint
+  ls`), then retry.
+- **Reads the snapshot, not the live state.** Root copies each instance's database, then
+  the instance's own account runs the query, unprivileged, on a copy of that snapshot that
+  only root can change. When the instance is enrolled, the snapshot's instance ID must be
+  the enrollment's (exit 2 otherwise), and that ID is what the journal records.
+- **Records the instance's artifact inventory** beside its database snapshot: the name,
+  type and inode of each entry at the top of `.checkpoints/<instance>/`. Root opens every
+  component from `/var/lib/kiln/runs` without following a link and refuses (exit 2) a
+  registry or instance directory that is a link, isn't root's alone (`0700`), or is on
+  another filesystem. An absent instance directory and an empty one are the same
+  inventory, and a changed modification time alone is not a difference.
+- **Checks the inventory after a rollback, and fails closed on a difference.** Artifacts
+  are immutable, so the snapshot plus the artifacts on disk are a matching set unless the
+  new daemon changed them before the upgrade failed (it may have run and served requests).
+  If they differ, the rollback still restores the binaries, unit files, enrollments and
+  databases, but **does not start kilnd again**: it keeps its record (the journal, with
+  the listing) and exits 3. While that record exists, `recover`, every other command and
+  the boot guard exit 3 with the listing, so every unit stays down, across reboots too.
+  Reconcile the listed artifacts as in "Cleaning up", then run
+  `sudo python3 -I scripts/kilnd-maintenance.py accept-artifacts`. It prints the listing,
+  clears the record and starts what was running. A journal from before inventories has
+  nothing to compare and recovers as before.
 
 The messages, each prefixed `kilnd-maintenance: `:
 
@@ -124,14 +137,15 @@ The messages, each prefixed `kilnd-maintenance: `:
 |---|---|
 | 2 | `refused, nothing changed: <unit> has <n> busy checkpoints: <id> (capturing), <id> (deleting), <id> (fork pin); start kilnd, let those checkpoints settle (kilndctl checkpoint ls), and retry` (at most five IDs) |
 | 2 | `refused, nothing changed: cannot inspect the checkpoints of <unit>: <error>` |
+| 2 | `refused, nothing changed: <unit> is enrolled as <id>, but its state says <id>` |
 | 2 | `refused, nothing changed: <unit> has an invalid checkpoint instance ID` |
 | 2 | `refused, nothing changed: cannot inventory the checkpoint artifacts of <unit>: <error>` |
-| 3 | `rolled back, but the checkpoint artifacts of <unit> changed during the window: added '<name>', missing '<name>', changed '<name>'; kilnd blocks new disk work or quarantines rows until they are reconciled; see docs/checkpoints.md` |
+| 3 | `rolled back, but the checkpoint artifacts of <unit> changed during the window: added '<name>', missing '<name>', changed '<name>'`, then `recovery required: kilnd stays stopped until the checkpoint artifacts are reconciled; then run kilnd-maintenance.py accept-artifacts (docs/checkpoints.md)` |
+| 2 | `refused, nothing changed: no checkpoint artifact difference is recorded` (from `accept-artifacts`) |
 
 A step of the rollback that cannot read the inventory logs `rollback: check the checkpoint
 artifacts of <unit>: <error>` and leaves the rollback incomplete (exit 3 with its record
-kept, as for any other step; `recover` retries it). `changed '<directory>'` means the
-instance's artifact directory appeared or vanished as a whole.
+kept, as for any other step; `recover` retries it).
 
 ## Disk
 
