@@ -6,6 +6,19 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Close the checkpoint acceptance gates (C6a recheck 1, two HIGH). `scripts/build.sh`
+  refuses, before cargo runs, a `.cargo/config` or `.cargo/config.toml` in the workspace
+  or a parent directory (other than `$CARGO_HOME`'s own), a `$CARGO_HOME` config with
+  `[env]`, a target runner or linker, or a `build` key it does not override, and any
+  `CARGO_TARGET_*_RUNNER`, `CARGO_TARGET_*_LINKER`, `CARGO_BUILD_*` or `CARGO_ENV_*`
+  variable, and passes a pass-through runner for every target; the workspace-config check
+  moved here from a test a runner could skip. A full-suite test runs the suite once with
+  its libtest output kept, and the ledger check requires every compiled test in that run
+  (`ok`, or `ignored` as listed), none filtered out, and every ledger test `ok`. The
+  checkpoint goldens are never written by the suite: only the ignored
+  `bless_checkpoint_contract` test does, run by name with
+  `KILND_BLESS_CHECKPOINT_CONTRACT=1`, which `build.sh` refuses outright. New
+  `scripts/build-config-regressions.sh`, run by the gate regressions.
 - `kilndctl run` calls a command finished only when the daemon's execution record shows
   it ran to its end (EXITED, or TIMED_OUT). A FAILED, CANCELED or INTERRUPTED record
   followed by a failed cleanup says "Exec reported FAILED (kilndctl exit 125), but

@@ -1500,12 +1500,9 @@ mod tests {
                 manifest.display()
             );
         }
-        for config in [".cargo/config", ".cargo/config.toml"] {
-            assert!(
-                !workspace.join(config).exists(),
-                "{config} could pass lint flags"
-            );
-        }
+        // A `.cargo/config` that could pass lint flags is refused by scripts/build.sh
+        // itself, before cargo runs, where a Cargo runner can't skip it (C6a recheck 1
+        // HIGH 5).
         let clippy = std::fs::read_to_string(workspace.join("clippy.toml")).unwrap();
         for path in [
             "libc::kill",

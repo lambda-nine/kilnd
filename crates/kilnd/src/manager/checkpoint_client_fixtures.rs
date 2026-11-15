@@ -1272,25 +1272,38 @@ fn golden_mismatch(golden: &J, file: &str) -> Option<String> {
     })
 }
 
-/// Compares `golden` with `tests/data/<name>`, or rewrites that file when blessing.
+/// Compares `golden` with `tests/data/<name>`. It never writes: only the ignored
+/// `bless_checkpoint_contract` does (C6a recheck 1 HIGH 6).
 #[track_caller]
 fn check_golden(name: &str, golden: &J) {
-    let path = data_path(name);
-    let blessing = bless_requested(
+    let file = std::fs::read_to_string(data_path(name)).unwrap_or_default();
+    if let Some(what) = golden_mismatch(golden, &file) {
+        panic!(
+            "tests/data/{name} differs from this run: {what}. If the change is intended, bless it ({BLESS_COMMAND}) and review the diff."
+        );
+    }
+}
+
+const BLESS_COMMAND: &str = "KILND_BLESS_CHECKPOINT_CONTRACT=1 cargo test --locked -p kilnd --lib bless_checkpoint_contract -- --ignored, locally; scripts/build.sh refuses the variable and CI refuses blessing";
+
+/// The one writer of the checkpoint goldens. It runs only when asked for twice: by name
+/// with `--ignored`, which scripts/build.sh never passes, and with
+/// `KILND_BLESS_CHECKPOINT_CONTRACT=1`, which it refuses, and never under CI:
+///
+/// ```text
+/// KILND_BLESS_CHECKPOINT_CONTRACT=1 cargo test --locked -p kilnd --lib bless_checkpoint_contract -- --ignored
+/// ```
+#[tokio::test]
+#[ignore = "rewrites the checkpoint goldens; run only to bless them"]
+async fn bless_checkpoint_contract() {
+    let asked = bless_requested(
         std::env::var_os(BLESS).as_deref(),
         std::env::var_os("CI").as_deref(),
     )
     .unwrap_or_else(|e| panic!("{e}"));
-    if blessing {
-        bless(&path, &golden.text());
-        return;
-    }
-    let file = std::fs::read_to_string(&path).unwrap_or_default();
-    if let Some(what) = golden_mismatch(golden, &file) {
-        panic!(
-            "tests/data/{name} differs from this run: {what}. If the change is intended, rerun with {BLESS}=1 (not under CI) and review the diff."
-        );
-    }
+    assert!(asked, "{BLESS}=1 is required to bless: {BLESS_COMMAND}");
+    bless(&data_path(CONTRACT), &contract(0).await.text());
+    bless(&data_path(wire::WIRE), &wire::wire().text());
 }
 
 #[test]
@@ -1443,7 +1456,7 @@ async fn contract(idle_shift_ms: i64) -> J {
         "<wall> is a nonzero time the host clock stamped (sandbox and execution rows); neither its value nor its equalities are pinned.",
         "Messages are their Debug form. An error is its gRPC code, its kilnd-reason trailer and its message up to the first ':' after the token.",
         "Flag-off Health is pinned byte for byte by flag_off_health_bytes_are_unchanged, and the checkpoint messages' protobuf encoding by checkpoint-wire.json, not here.",
-        "Regenerate with KILND_BLESS_CHECKPOINT_CONTRACT=1 scripts/build.sh default test -p kilnd --lib harness_contract_goldens_match (refused when CI is set).",
+        "Regenerate with KILND_BLESS_CHECKPOINT_CONTRACT=1 cargo test --locked -p kilnd --lib bless_checkpoint_contract -- --ignored, locally (scripts/build.sh refuses the variable; refused when CI is set).",
     ];
     obj([
         ("format", J::N(1)),

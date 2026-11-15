@@ -63,8 +63,10 @@
 #       scripts/build.sh: refused before cargo runs.
 #    b. The Clippy tail `-- --cfg 'feature="ambient-poc"'`: refused.
 #    c. The same cfg from a Cargo config file (`build.rustflags` and a
-#       `target.'cfg(all())'` table) and a config `rustc-wrapper`: build.sh's closed
-#       environment overrides them, and the feature's test is not compiled.
+#       `target.'cfg(all())'` table) and a config `rustc-wrapper`: in the workspace,
+#       build.sh refuses the file (C6a recheck 1 HIGH 5); as $CARGO_HOME's own config,
+#       build.sh's closed environment overrides them, and the feature's test is not
+#       compiled.
 #    d. A raw cargo build with that RUSTFLAGS: the workspace build scripts' backstop
 #       refuses the `--cfg`.
 # 9. Recheck 3 HIGH-2, the break-it reviewer's path-module PoC (path-module-sink.sh): its exact
@@ -92,6 +94,11 @@
 #    a. The toolchain compiles the nested path (a demo binary's file is truncated); the
 #       gate refuses on tests/hidden.rs's `set_len` and impl; clippy accepts the workspace.
 #    b. The same path three `cfg_attr`s deep: refused on tests/hidden.rs.
+# 12. C6a recheck 1 HIGH 5 and 6, scripts/build-config-regressions.sh: build.sh refuses a
+#    workspace or parent-directory Cargo config (the recheck's runner and [env] PoC
+#    among them, leaving the wire golden unchanged), a $CARGO_HOME config with a runner,
+#    linker, [env] or build key, the runner, linker, build and env variables, and the
+#    bless variable.
 #
 # Default toolchains: 1.88.0 and 1.99.0. It resolves fs-err and parking_lot from the
 # registry and vendors the locked crates (the network, or cargo's cache), so it is not
@@ -746,15 +753,25 @@ rustc-wrapper = "/nonexistent/rustc-wrapper"
 [target.'cfg(all())']
 rustflags = ["--cfg", "feature=\"ambient-poc\""]
 EOF
-    if sh scripts/build.sh "+$toolchain" default test -p kilnd --lib "$ambient_test" -- --exact \
+    # In the workspace, refused outright (C6a recheck 1 HIGH 5); as $CARGO_HOME's own
+    # config, which build.sh allows these keys in, overridden.
+    expect_build_refused "a workspace Cargo config file" \
+        "$(pwd -P)/.cargo/config.toml is a Cargo configuration file" \
+        sh scripts/build.sh "+$toolchain" default test -p kilnd --lib "$ambient_test" -- --exact
+    home=$scratch/cargo-home
+    mkdir -p "$home"
+    mv .cargo/config.toml "$home/config.toml"
+    rm -r .cargo
+    ln -s "${CARGO_HOME:-$HOME/.cargo}/registry" "$home/registry"
+    if CARGO_HOME=$home sh scripts/build.sh "+$toolchain" default test -p kilnd --lib "$ambient_test" -- --exact \
         >"$scratch/build.log" 2>&1 && grep -q '^running 0 tests' "$scratch/build.log" &&
         ! grep -q 'unreviewed_feature_entered_default_profile' "$scratch/build.log"; then
-        echo "build.sh's closed environment overrides the config: the feature's test is not compiled"
+        echo "build.sh's closed environment overrides \$CARGO_HOME's config: the feature's test is not compiled"
     else
         cat "$scratch/build.log" >&2
         fail "a Cargo config file reached build.sh's build"
     fi
-    rm -r .cargo
+    rm -r "$home"
 
     echo "-- a raw cargo build with that RUSTFLAGS:"
     if RUSTFLAGS='--cfg feature="ambient-poc"' cargo "+$toolchain" test --locked -q -p kilnd --lib \
@@ -955,6 +972,12 @@ for toolchain in $toolchains; do
     nested_cfgattr_wrapper '#[cfg_attr(all(), cfg_attr(not(windows), cfg_attr(any(unix, windows), path = "../tests/hidden.rs")))]'
     expect_refused "$toolchain" "$fixture" \
         "\`set_len\` in nested-module-wrapper@1.0.0 (nested-module-wrapper-1.0.0/tests/hidden.rs)"
+done
+
+# --- 12. the closed Cargo configuration (C6a recheck 1 HIGH 5 and 6) -----------------
+for toolchain in $toolchains; do
+    echo "== Rust $toolchain: scripts/build.sh's closed Cargo configuration =="
+    sh "$repo/scripts/build-config-regressions.sh" "$toolchain" || fail "the closed Cargo configuration"
 done
 
 if [ "$failed" -ne 0 ]; then

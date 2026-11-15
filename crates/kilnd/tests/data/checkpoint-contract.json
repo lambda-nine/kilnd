@@ -7,7 +7,7 @@
     "<wall> is a nonzero time the host clock stamped (sandbox and execution rows); neither its value nor its equalities are pinned.",
     "Messages are their Debug form. An error is its gRPC code, its kilnd-reason trailer and its message up to the first ':' after the token.",
     "Flag-off Health is pinned byte for byte by flag_off_health_bytes_are_unchanged, and the checkpoint messages' protobuf encoding by checkpoint-wire.json, not here.",
-    "Regenerate with KILND_BLESS_CHECKPOINT_CONTRACT=1 scripts/build.sh default test -p kilnd --lib harness_contract_goldens_match (refused when CI is set)."
+    "Regenerate with KILND_BLESS_CHECKPOINT_CONTRACT=1 cargo test --locked -p kilnd --lib bless_checkpoint_contract -- --ignored, locally (scripts/build.sh refuses the variable; refused when CI is set)."
   ],
   "fixtures": {
     "f1_rewind": [

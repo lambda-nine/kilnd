@@ -21,13 +21,32 @@ Each criterion is checkable: a test, a run with recorded conditions, or a docume
 | 10 | The node runs the kiln commit the gate was measured on, or a later one on which criteria 2–4 were rerun | `kiln --version` against the gate record | per node |
 
 Full-suite `scripts/build.sh PROFILE test` pins the ordered crash, case and finding IDs,
-then checks ledger test references against Cargo's compiled libtest registry after the
-suite passes. Mac references must be compiled and non-ignored in that profile. VM
-references must be compiled and ignored on Linux; elsewhere they may be absent but
-must be ignored if compiled. A filtered test run does not perform this registry gate.
-Names start with the test binary's crate name, followed by its libtest path; binary
-unit-test targets add `::bin` and doctests add `::doc` to distinguish them from a
-same-named library. Duplicate binary identities and unparsed listing lines fail closed.
+runs the suite once with libtest's per-test output kept, then checks the ledger's test
+references against that run and Cargo's compiled libtest registry. Every compiled test
+must appear in the run, `ok` or, if the registry lists it ignored, `ignored`; a test
+listed but not run, run but not listed, or filtered out fails, and every group's counts
+must match its lines. Mac references must have run `ok` in that profile. VM references
+must be compiled and ignored on Linux; elsewhere they may be absent but must be ignored
+if compiled. A filtered test run does not perform this gate. Names start with the test
+binary's crate name, followed by its libtest path; binary unit-test targets add `::bin`
+and doctests add `::doc` to distinguish them from a same-named library. Duplicate binary
+identities and unparsed listing or run lines fail closed.
+
+The run is only as honest as what runs it, so `build.sh` closes Cargo's configuration
+before cargo starts (C6a recheck 1): it refuses a `.cargo/config` or `.cargo/config.toml`
+in the workspace or any parent directory other than `$CARGO_HOME`'s own, a `$CARGO_HOME`
+config with an `[env]` table, a target runner or linker, or a `build` key it does not
+override, and any `CARGO_TARGET_*_RUNNER`, `CARGO_TARGET_*_LINKER`, `CARGO_BUILD_*` or
+`CARGO_ENV_*` variable, and it passes a pass-through runner for every target.
+`scripts/build-config-regressions.sh` holds it to that.
+
+The contract and wire goldens (`checkpoint-contract.json`, `checkpoint-wire.json`) are
+only ever compared by the suite. The one writer is the ignored test
+`bless_checkpoint_contract`, run locally, by name, with `--ignored` and
+`KILND_BLESS_CHECKPOINT_CONTRACT=1`, outside `build.sh` (its doc comment and the goldens'
+notes have the exact command). `build.sh` refuses that variable outright and never
+passes `--ignored`, and the test refuses while `CI` is set; review the golden diff it
+leaves.
 
 ## Gate record
 

@@ -31,9 +31,23 @@
 # clippy-driver and rustc: `--cfg`, response files) and for build and check; for test it
 # goes to the test harness, which compiles nothing.
 #
-# Full-suite test (no cargo arguments and no -- tail) also checks the checkpoint
-# ledger against compiled test registries, including ignored status, after the suite
-# passes. Filtered test invocations retain their ordinary cargo behavior.
+# A closed Cargo configuration too (C6a recheck 1 HIGH 5 and 6): a Cargo runner can list
+# a test without running it, and a config `[env]` reaches every test process. build.sh
+# refuses, before cargo runs, any `.cargo/config` or `.cargo/config.toml` in the
+# repository or a parent directory other than $CARGO_HOME's own; a $CARGO_HOME config
+# with an `[env]` table, a `target` key other than rustflags/rustdocflags, or a `build`
+# key other than those this file overrides (rustflags, rustdocflags, rustc and the two
+# wrappers); any CARGO_TARGET_*_RUNNER, CARGO_TARGET_*_LINKER, CARGO_BUILD_* or
+# CARGO_ENV_* variable, set at all; and KILND_BLESS_CHECKPOINT_CONTRACT, which only the
+# ignored bless_checkpoint_contract test, run locally by name, may use. It also
+# passes `--config target.TRIPLE.runner=["/bin/sh", "-c", 'exec "$0" "$@"']`, a
+# pass-through, for the host and every --target (Cargo refuses an empty runner).
+#
+# Full-suite test (no cargo arguments and no -- tail) runs the suite once with its
+# libtest output kept, then checks the checkpoint ledger against it and the compiled
+# test registries: every compiled test ran (`ok`, or `ignored` as the registry lists
+# it), none was filtered out, and every ledger test passed. Filtered test invocations
+# retain their ordinary cargo behavior.
 #
 # A profile enables only workspace features (member/feature) its member declares; a
 # dependency's feature is forwarded through one, checked in. Before `--`, it refuses
@@ -90,7 +104,52 @@ for name in $(awk 'BEGIN { for (name in ENVIRON) print name }'); do
             if [ -n "$(printenv "$name" || true)" ]; then
                 refuse "$name is set; build.sh runs cargo in a closed compiler environment, because compiler flags, wrappers and unstable switches can compile code (a feature cfg) no reviewed profile selects (dependency-gate.json, design section 7.1). Unset it"
             fi ;;
+        CARGO_TARGET_*_RUNNER | CARGO_TARGET_*_LINKER | CARGO_BUILD_* | CARGO_ENV_*)
+            refuse "$name is set; build.sh runs cargo in a closed configuration, because a runner or linker can report tests that never ran (C6a recheck 1 HIGH 5). Unset it" ;;
+        KILND_BLESS_CHECKPOINT_CONTRACT)
+            refuse "$name is set; build.sh never blesses goldens. Bless them locally with the ignored bless_checkpoint_contract test (docs/checkpoint-rollout-gate.md) and review the diff" ;;
     esac
+done
+
+# The closed Cargo configuration: no config file but $CARGO_HOME's own, which is checked.
+cargo_home=${CARGO_HOME:-${HOME:-/nonexistent}/.cargo}
+cargo_home=$(cd "$cargo_home" 2>/dev/null && pwd -P || echo "$cargo_home")
+dir=$(cd "$repo" && pwd -P)
+while :; do
+    if [ "$dir/.cargo" != "$cargo_home" ] && [ "${dir%/}/.cargo" != "$cargo_home" ]; then
+        for name in config config.toml; do
+            file=${dir%/}/.cargo/$name
+            if [ -e "$file" ] || [ -L "$file" ]; then
+                refuse "$file is a Cargo configuration file; build.sh runs cargo with none but \$CARGO_HOME's, because a config runner, [env] or build table can skip tests or bless goldens unseen (C6a recheck 1 HIGH 5). Remove it"
+            fi
+        done
+    fi
+    [ "$dir" = / ] && break
+    dir=$(dirname -- "$dir")
+done
+for name in config config.toml; do
+    [ -e "$cargo_home/$name" ] || continue
+    python3 -I -c '
+import sys
+path = sys.argv[1]
+def refuse(message):
+    sys.exit("scripts/build.sh: refused: %s %s; build.sh runs cargo in a closed configuration (C6a recheck 1 HIGH 5)" % (path, message))
+try:
+    import tomllib
+except ImportError:
+    refuse("cannot be checked without Python 3.11 (tomllib)")
+try:
+    config = tomllib.loads(open(path, encoding="utf-8").read())
+except (OSError, ValueError) as error:
+    refuse("is unreadable: %s" % error)
+overridden = {"rustflags", "rustdocflags", "rustc", "rustc-wrapper", "rustc-workspace-wrapper"}
+found = ["[env]"] if "env" in config else []
+found += ["build." + k for k in config.get("build", {}) if k not in overridden]
+found += ["target.%s.%s" % (t, k) for t, table in config.get("target", {}).items()
+          for k in (table if isinstance(table, dict) else {"": None}) if k not in ("rustflags", "rustdocflags")]
+if found:
+    refuse("sets " + ", ".join(found))
+' "$cargo_home/$name" || exit 2
 done
 
 targets=
@@ -160,7 +219,8 @@ for triple in $host $targets; do
     case $triple in
         *[!A-Za-z0-9_-]*) refuse "--target $triple is not a target triple" ;;
     esac
-    set -- --config "target.$triple.rustflags=[]" "$@"
+    set -- --config "target.$triple.rustflags=[]" \
+        --config "target.$triple.runner=[\"/bin/sh\", \"-c\", \"exec \\\"\$0\\\" \\\"\$@\\\"\"]" "$@"
 done
 if [ -n "$static" ]; then
     CARGO_ENCODED_RUSTFLAGS=-Ctarget-feature=+crt-static
@@ -181,16 +241,24 @@ fi
 
 cd "$repo"
 if [ -n "$full_suite" ]; then
-    cargo ${toolchain:+"$toolchain"} "$command" "$@"
+    cargo ${toolchain:+"$toolchain"} "$command" --no-run "$@"
     registry_dir=$(mktemp -d)
     trap 'rm -rf "$registry_dir"' EXIT
     trap 'exit 1' HUP INT TERM
+    # The one run, built above, its libtest lines kept for the ledger check.
+    {
+        status=0
+        cargo ${toolchain:+"$toolchain"} "$command" "$@" 2>&1 || status=$?
+        echo "$status" >"$registry_dir/status"
+    } | tee "$registry_dir/run"
+    status=$(cat "$registry_dir/status")
+    [ "$status" = 0 ] || exit "$status"
     # Merge streams at the producer so each Running header precedes its entries.
     cargo ${toolchain:+"$toolchain"} "$command" "$@" -- --list >"$registry_dir/all" 2>&1 || { cat "$registry_dir/all" >&2; exit 1; }
     cargo ${toolchain:+"$toolchain"} "$command" "$@" -- --list --ignored >"$registry_dir/ignored" 2>&1 || { cat "$registry_dir/ignored" >&2; exit 1; }
     python3 -I scripts/checkpoint-ledger.py --self-test
     python3 -I scripts/checkpoint-ledger.py crates/kilnd/tests/data/checkpoint-acceptance-matrix.json \
-        "$registry_dir/all" "$registry_dir/ignored" "$(uname -s)"
+        "$registry_dir/run" "$registry_dir/all" "$registry_dir/ignored" "$(uname -s)"
 else
     exec cargo ${toolchain:+"$toolchain"} "$command" "$@"
 fi

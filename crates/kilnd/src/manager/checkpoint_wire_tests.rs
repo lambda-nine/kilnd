@@ -15,7 +15,7 @@ use prost::Message;
 
 use super::*;
 
-const WIRE: &str = "checkpoint-wire.json";
+pub(super) const WIRE: &str = "checkpoint-wire.json";
 
 /// 2026-01-15T08:00:00Z, so times read as times; the offsets name their field numbers.
 const T: i64 = 1_768_464_000_000;
@@ -225,7 +225,7 @@ fn numbers(name: fn(i32) -> Option<&'static str>) -> J {
     )
 }
 
-fn wire() -> J {
+pub(super) fn wire() -> J {
     let messages: Vec<(&str, Vec<u8>)> = vec![
         ("Checkpoint", checkpoint().encode_to_vec()),
         (
@@ -289,7 +289,7 @@ fn wire() -> J {
                 [
                     "Encoded protobuf bytes (lowercase hex) of fixed checkpoint messages, each field a distinct nonzero value, so a renumbered, retyped or removed field changes them; and the checkpoint enums' numbers.",
                     "a_previous_client_reads_and_writes_every_checkpoint_field decodes the same messages with hand-written tags, as a client of the published v1 proto.",
-                    "Regenerate with KILND_BLESS_CHECKPOINT_CONTRACT=1 scripts/build.sh default test -p kilnd --lib checkpoint_wire_golden_matches (refused when CI is set). Within v1 only additions are compatible: review that no existing byte changed.",
+                    "Regenerate with KILND_BLESS_CHECKPOINT_CONTRACT=1 cargo test --locked -p kilnd --lib bless_checkpoint_contract -- --ignored, locally (scripts/build.sh refuses the variable; refused when CI is set). Within v1 only additions are compatible: review that no existing byte changed.",
                 ]
                 .iter()
                 .map(|n| J::S(n.to_string()))
