@@ -255,8 +255,16 @@ fn c6b_v4_copy_worker_death_fails_typed_and_removes_staging() {
         let w = World::start(json!({})).await;
         let (src, cp, pid, pending) = mid_copy(&w, "v4").await;
         kill_pid(pid);
+        // A keyed capture answers either a typed refusal or the row as it stands,
+        // already carrying its typed failure while its removal settles.
         let result = pending.await.unwrap();
-        let reason = refused(&result);
+        let reason = match result.get("ok") {
+            Some(row) => {
+                assert_ne!(row["state"], "CHECKPOINT_STATE_READY", "{result}");
+                row["failure_reason"].as_str().unwrap().to_string()
+            }
+            None => refused(&result),
+        };
         assert!(reason.starts_with("checkpoint_"), "untyped: {result}");
         settles_failed(&w, &cp, (0, 0)).await;
         source_usable(&w, &src, "one").await;

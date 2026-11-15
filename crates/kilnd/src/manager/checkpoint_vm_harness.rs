@@ -1216,7 +1216,7 @@ impl World {
 
     /// One column of a checkpoint row as text ("" if NULL or no row).
     pub(super) fn cp_col(&self, id: &str, column: &str) -> String {
-        assert!(column.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+        assert!(column.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
         self.db()
             .query_row(
                 &format!("SELECT coalesce(CAST({column} AS TEXT), '') FROM checkpoints WHERE id = ?1"),
@@ -1228,7 +1228,7 @@ impl World {
 
     /// One column of a sandbox row as text ("" if NULL or no row).
     pub(super) fn sb_col(&self, id: &str, column: &str) -> String {
-        assert!(column.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+        assert!(column.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
         self.db()
             .query_row(
                 &format!("SELECT coalesce(CAST({column} AS TEXT), '') FROM sandboxes WHERE id = ?1"),
