@@ -859,6 +859,97 @@ async fn quotas_admit_x_and_refuse_x_plus_one() {
     assert_eq!(f.reservation.unwrap().disk_bytes, S);
 }
 
+/// Design 6: caps lowered below what is already charged block only new captures. Existing
+/// checkpoints keep their charge and serve Get, List, Delete, forks and keyed retries.
+#[tokio::test]
+async fn lowered_budgets_block_new_captures_but_keep_what_is_charged() {
+    let (_tmp, dir, m, fake, clock) = persistent().await;
+    startup(&m).await;
+    let s = api(&m);
+    let src = api_source(&s, 1000).await;
+    let sized = |key: &str| {
+        let mut msg = capture_msg(&src.id);
+        msg.max_size_bytes = S;
+        msg.request_id = key.into();
+        msg
+    };
+    let capture = |msg: pb::CheckpointSandboxRequest| {
+        let s = s.clone();
+        async move {
+            s.checkpoint_sandbox(as_uid(msg, 1000))
+                .await
+                .map(|r| r.into_inner().checkpoint.unwrap())
+        }
+    };
+    let a = capture(sized("lowered-a")).await.unwrap();
+    let b = capture(sized("")).await.unwrap();
+    let mut keyed_fork = fork_msg(&a.id);
+    keyed_fork.request_id = "lowered-fork".into();
+    let fork = s
+        .create_sandbox(as_uid(keyed_fork.clone(), 1000))
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_eq!(charge(&m), (2, 2 * S));
+    drop(s);
+    let mut lowered = m.limits.clone();
+    let budgets = &mut lowered.checkpoints.as_mut().unwrap().budgets;
+    budgets.max_per_uid = 1;
+    budgets.max_bytes_per_uid = S;
+    let m = restart_with(m, &dir, &fake, &clock, lowered).await;
+    let s = api(&m);
+    assert!(!m.allocation_blocked(), "a lowered cap is not a barrier");
+    // Over both caps: nothing is evicted or released.
+    assert_eq!(charge(&m), (2, 2 * S));
+    for id in [&a.id, &b.id] {
+        assert_eq!(state(&api_get(&s, id, 1000).await.unwrap()), pb::CheckpointState::Ready);
+    }
+    assert_eq!(ids(&s, 1000, "").await.len(), 2);
+    // Keyed retries return their originals; a fork is not a checkpoint charge.
+    let mut retry = capture_msg(&src.id);
+    retry.max_size_bytes = S;
+    retry.request_id = "lowered-a".into();
+    let again = s
+        .checkpoint_sandbox(as_uid(retry, 1000))
+        .await
+        .unwrap()
+        .into_inner()
+        .checkpoint
+        .unwrap();
+    assert_eq!(again.id, a.id);
+    let same = s
+        .create_sandbox(as_uid(keyed_fork, 1000))
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_eq!(same.id, fork.id);
+    let f = api_fork(&s, &b.id, 1000).await.unwrap();
+    assert_eq!(sandbox_state(&f), pb::SandboxState::Ready);
+    // New captures are refused until the charge is back under both caps.
+    let mut fresh = capture_msg(&src.id);
+    fresh.max_size_bytes = S;
+    let e = s
+        .checkpoint_sandbox(as_uid(fresh.clone(), 1000))
+        .await
+        .unwrap_err();
+    refused(&e, Code::ResourceExhausted, "checkpoint_quota");
+    api_delete(&s, &b.id, 1000).await.unwrap();
+    assert_eq!(charge(&m), (1, S));
+    let e = s
+        .checkpoint_sandbox(as_uid(fresh.clone(), 1000))
+        .await
+        .unwrap_err();
+    refused(&e, Code::ResourceExhausted, "checkpoint_quota");
+    api_delete(&s, &a.id, 1000).await.unwrap();
+    assert_eq!(charge(&m), (0, 0));
+    s.checkpoint_sandbox(as_uid(fresh, 1000)).await.unwrap();
+    assert_eq!(charge(&m), (1, S));
+}
+
 // --- Cancellation and deadlines ------------------------------------------------------
 
 #[tokio::test]
