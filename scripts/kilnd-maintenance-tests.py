@@ -1781,6 +1781,36 @@ _os.fsync = _racing_fsync
             self.assertEqual([e['name'] for e in self.m.checkpoint_inventory(instance)], ['cp-a'],
                              path)
 
+    def test_inventory_refuses_when_the_mount_id_cannot_be_read(self):
+        """C6a recheck 4: with cp-a there, a missing or unreadable fdinfo entry, or one
+        without mnt_id, refuses instead of reading as an empty registry."""
+        instance = self.w.identity('kilnd.service')
+        os.mkdir(self.artifact_dir() + '/cp-a')
+        real = self.m.mount_id  # nested_subvolume replaces it
+        self.nested_subvolume(self.scratch + '/var/lib')
+        self.m.FDINFO = self.scratch + '/fdinfo'
+        os.mkdir(self.m.FDINFO)
+        self.m.mount_id = real  # the fd has no entry under FDINFO: FileNotFoundError
+        with self.assertRaises(FileNotFoundError):
+            self.m.checkpoint_inventory(instance)
+
+        def unreadable(_fd):
+            raise PermissionError('fdinfo is not readable')
+        self.m.mount_id = unreadable
+        with self.assertRaises(PermissionError):
+            self.m.checkpoint_inventory(instance)
+
+        def without_mnt_id(fd):
+            with open('%s/%d' % (self.m.FDINFO, fd), 'w') as file:
+                file.write('pos:\t0\n')
+            return real(fd)
+        self.m.mount_id = without_mnt_id
+        with self.assertRaisesRegex(OSError, 'has no mnt_id'):
+            self.m.checkpoint_inventory(instance)
+        self.upgrade(2)
+        self.assertIn('cannot inventory the checkpoint artifacts of kilnd.service',
+                      '\n'.join(self.messages))
+
     def test_inventory_refuses_a_device_change_that_is_not_a_nested_btrfs_subvolume(self):
         instance = self.w.identity('kilnd.service')
         self.artifact_dir()

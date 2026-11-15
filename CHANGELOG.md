@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Refuse a checkpoint inventory whose mount identity can't be read (C6a recheck 4). The
+  walk caught `FileNotFoundError` around all of it, so a missing `/proc/self/fdinfo` entry
+  for a nested Btrfs subvolume's descriptor read as an absent registry and an empty
+  inventory. Only an absent path component now means empty; any failure to read a
+  descriptor's `mnt_id` refuses.
 - Accept ordinary mount layouts below the registry's path (C6a recheck 3). The inventory
   walk allowed one mount point on the way and refused any other change of device, so a
   separately mounted `/var` with another filesystem lower down, or a Btrfs subvolume

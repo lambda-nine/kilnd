@@ -1346,42 +1346,45 @@ def checkpoint_inventory(instance):
     protected = len(components) - 2
     fds = [os.open('/', os.O_RDONLY | os.O_DIRECTORY)]
     try:
-        try:
-            anchor = os.fstat(fds[0])
-            if anchor.st_uid not in (0, REGISTRY_UID) or anchor.st_mode & 0o022:
-                raise OSError(errno.EPERM, "/ is not root's, or others can write it")
-            for index, component in enumerate(components):
-                fds.append(os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                   dir_fd=fds[-1]))
-                where = '/' + '/'.join(components[:index + 1])
-                meta, above = os.fstat(fds[-1]), os.fstat(fds[-2])
-                if index >= protected:
-                    if meta.st_uid != REGISTRY_UID or meta.st_mode & 0o077:
-                        raise OSError(errno.EPERM, '%s is not private to root' % component)
-                elif meta.st_uid not in (0, REGISTRY_UID) or meta.st_mode & 0o022:
-                    raise OSError(errno.EPERM, "%s is not root's, or others can write it" % where)
-                if where in mounts:
-                    device, root, subvolume = mounts[where][-1]
-                    whole = root == '/' and \
-                        device == '%d:%d' % (os.major(meta.st_dev), os.minor(meta.st_dev))
-                    # A Btrfs subvolume mounted by itself shows its subvol= path as its root,
-                    # and stat gives each subvolume a device of its own, not mountinfo's: it is
-                    # known instead by its root directory, inode 256 in every subvolume. A
-                    # root below the subvolume's is a bind mount of a subtree, as anywhere.
-                    whole = whole or (subvolume is not None and root == subvolume
-                                      and meta.st_ino == BTRFS_SUBVOLUME_ROOT)
-                    if index >= protected or not whole:
-                        raise OSError(errno.EXDEV, '%s is a mount point (bind mount?)' % where)
-                elif meta.st_dev != above.st_dev:
-                    # Not a mount point, so on its parent's mount: only a Btrfs subvolume
-                    # nested in its parent's has a device of its own there. The fds' mount IDs
-                    # prove the one mount, and mountinfo gives that mount's type.
-                    if index >= protected or meta.st_ino != BTRFS_SUBVOLUME_ROOT or \
-                            mount_id(fds[-1]) != mount_id(fds[-2]) or \
-                            types.get(mount_id(fds[-2])) != 'btrfs':
-                        raise OSError(errno.EXDEV, '%s is on another filesystem' % where)
-        except FileNotFoundError:
-            return []
+        anchor = os.fstat(fds[0])
+        if anchor.st_uid not in (0, REGISTRY_UID) or anchor.st_mode & 0o022:
+            raise OSError(errno.EPERM, "/ is not root's, or others can write it")
+        for index, component in enumerate(components):
+            # Only an absent component means an empty inventory. Every other failure, a
+            # missing fdinfo entry among them, refuses: the handler covers this open alone.
+            try:
+                fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                             dir_fd=fds[-1])
+            except FileNotFoundError:
+                return []
+            fds.append(fd)
+            where = '/' + '/'.join(components[:index + 1])
+            meta, above = os.fstat(fds[-1]), os.fstat(fds[-2])
+            if index >= protected:
+                if meta.st_uid != REGISTRY_UID or meta.st_mode & 0o077:
+                    raise OSError(errno.EPERM, '%s is not private to root' % component)
+            elif meta.st_uid not in (0, REGISTRY_UID) or meta.st_mode & 0o022:
+                raise OSError(errno.EPERM, "%s is not root's, or others can write it" % where)
+            if where in mounts:
+                device, root, subvolume = mounts[where][-1]
+                whole = root == '/' and \
+                    device == '%d:%d' % (os.major(meta.st_dev), os.minor(meta.st_dev))
+                # A Btrfs subvolume mounted by itself shows its subvol= path as its root,
+                # and stat gives each subvolume a device of its own, not mountinfo's: it is
+                # known instead by its root directory, inode 256 in every subvolume. A
+                # root below the subvolume's is a bind mount of a subtree, as anywhere.
+                whole = whole or (subvolume is not None and root == subvolume
+                                  and meta.st_ino == BTRFS_SUBVOLUME_ROOT)
+                if index >= protected or not whole:
+                    raise OSError(errno.EXDEV, '%s is a mount point (bind mount?)' % where)
+            elif meta.st_dev != above.st_dev:
+                # Not a mount point, so on its parent's mount: only a Btrfs subvolume
+                # nested in its parent's has a device of its own there. The fds' mount IDs
+                # prove the one mount, and mountinfo gives that mount's type.
+                if index >= protected or meta.st_ino != BTRFS_SUBVOLUME_ROOT or \
+                        mount_id(fds[-1]) != mount_id(fds[-2]) or \
+                        types.get(mount_id(fds[-2])) != 'btrfs':
+                    raise OSError(errno.EXDEV, '%s is on another filesystem' % where)
         with os.scandir(fds[-1]) as entries:
             return sorted(({'name': e.name, 'type': stat.S_IFMT(e.stat(follow_symlinks=False).st_mode),
                             'st_ino': e.inode()} for e in entries), key=lambda e: e['name'])
