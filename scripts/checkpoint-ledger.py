@@ -24,7 +24,8 @@ def registry(text, errors):
                 errors.append(f"duplicate binary name: {current}")
             binaries.add(current)
             count = 0
-        elif current is not None and re.fullmatch(PATH + r": test", line):
+        elif current is not None and (re.fullmatch(PATH + r": test", line) or (
+                current.endswith("::doc") and re.fullmatch(r"\S+\.rs - .+ \(line \d+\)(?: - [^:]+)?: test", line))):
             name = current + "::" + line[:-6]
             if name in tests:
                 errors.append(f"duplicate test: {name}")
@@ -65,6 +66,9 @@ def self_test():
     assert not check(ledger, "\x1b[1;32m" + present + "\x1b[0m", empty, True)  # CI color
     assert not check(ledger, present + empty.replace("src/lib.rs", "src/main.rs"),
                      empty + empty.replace("src/lib.rs", "src/main.rs"), True)
+    doc = "Doc-tests kilnd\nsrc/sys.rs - sys::f (line 9): test\nsrc/a.rs - g (line 2) - compile fail: test\n2 tests, 0 benchmarks\n"
+    assert not check(ledger, present + doc, empty + "Doc-tests kilnd\n0 tests, 0 benchmarks\n", True)
+    assert check(ledger, present.replace("a::b", "src/a.rs - g (line 2)"), empty, True)  # not a doctest binary
     for listing, ignored in [(empty, empty), (present, present),  # cfg-disabled, ignored
                              (present.replace("a::b", "a::renamed"), empty),
                              (present + empty, empty), (present + "garbage\n", empty)]:
