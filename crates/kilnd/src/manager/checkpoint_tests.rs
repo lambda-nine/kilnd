@@ -1572,3 +1572,6 @@ mod fork;
 
 #[path = "checkpoint_api_tests.rs"]
 mod api;
+
+#[path = "checkpoint_c6b_gap_tests.rs"]
+mod c6b_gaps;
