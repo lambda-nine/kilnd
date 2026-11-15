@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Pin the checkpoint wire contract's field numbers by hand (C6a recheck 1 HIGH). A table
+  of every field of every checkpoint message, `NodeResourceStats`, the checkpoint fields
+  of `RuntimeCapabilities`, `ApiLimits`, `AdmissionStats`, `Sandbox` and
+  `CreateSandboxRequest`, `Feature` 9 and the checkpoint enums (name, number, type,
+  label) is checked against `kilnd.proto` by a parser that refuses anything unexpected in
+  those blocks; nothing blesses it. The wire golden gains `NodeResourceStats`, its two
+  checkpoints differ in their booleans so swapped tags change the bytes, and the
+  previous client's expectations are literals covering limits, stats and node
+  resources too.
 - Close the checkpoint acceptance gates (C6a recheck 1, two HIGH). `scripts/build.sh`
   refuses, before cargo runs, a `.cargo/config` or `.cargo/config.toml` in the workspace
   or a parent directory (other than `$CARGO_HOME`'s own), a `$CARGO_HOME` config with

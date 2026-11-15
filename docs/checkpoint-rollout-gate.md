@@ -46,7 +46,9 @@ only ever compared by the suite. The one writer is the ignored test
 `KILND_BLESS_CHECKPOINT_CONTRACT=1`, outside `build.sh` (its doc comment and the goldens'
 notes have the exact command). `build.sh` refuses that variable outright and never
 passes `--ignored`, and the test refuses while `CI` is set; review the golden diff it
-leaves.
+leaves. The checkpoint messages' field numbers, types and labels, the checkpoint
+fields of shared messages and the checkpoint enums are also pinned by a table written by
+hand (`checkpoint_field_numbers_match_the_pinned_table`), which nothing blesses.
 
 ## Gate record
 
