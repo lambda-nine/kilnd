@@ -65,6 +65,7 @@ SETS = {
         'c6b_hostile_names_depth_and_counts_hold_their_limits',
         'c6b_hostile_sizes_sparse_and_inode_bombs_hold_their_limits',
         'c6b_hostile_protected_trees_and_sentinels_are_unchanged',
+        'c6b_hostile_artifact_and_process_attacks_are_refused_typed',
         'c6b_hostile_callers_two_uids_get_only_their_own',
     ]],
     'clients': [('clients', n) for n in [

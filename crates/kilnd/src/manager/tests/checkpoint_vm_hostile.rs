@@ -643,3 +643,115 @@ fn c6b_hostile_callers_two_uids_get_only_their_own() {
         w.finish().await;
     });
 }
+
+/// The shim pid `kiln ls` reports for a backend.
+fn shim_of(backend_id: &str) -> u32 {
+    let out = std::process::Command::new(kiln_bin()).arg("ls").output().unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.first() == Some(&backend_id)).then(|| f.get(2)?.parse().ok()).flatten()
+        })
+        .unwrap_or_else(|| panic!("no shim for {backend_id}"))
+}
+
+/// Attacks on the artifact and the processes around a capture (design 11.2 items 3
+/// and 4): a tampered manifest, a killed sandbox PID 1 mid-capture, a root `kiln exec`
+/// straight into the source, and writable paths over reserved ones.
+#[test]
+#[ignore = "root on the prepared VM: C6b hostile content"]
+fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
+    run(async {
+        let w = World::start(json!({})).await;
+        let mut seen = serde_json::Map::new();
+        // 1. A manifest edited on disk: the fork refuses it corrupt and the checkpoint is
+        // quarantined with its charge.
+        let src = w.source(0, "mkdir -p /root/w && printf one > /root/w/a").await;
+        let c = w.ok(json!({ "op": "capture", "id": src, "lifetime_ms": 3_600_000 })).await;
+        let cp = c["id"].as_str().unwrap().to_string();
+        let manifest = PathBuf::from(format!("{}/{}/{cp}/manifest.json", super::CPS, w.instance));
+        let mut text = std::fs::read(&manifest).unwrap();
+        let at = text.windows(4).position(|b| b == b"\"one").unwrap_or(text.len() / 2);
+        text[at + 1] ^= 0x01;
+        std::fs::write(&manifest, &text).unwrap();
+        let charged = w.charge();
+        let f = w.rpc(OWNER, json!({ "op": "create", "from_checkpoint": cp })).await;
+        let tampered = refused(&f);
+        assert_eq!(tampered, "checkpoint_corrupt", "{f}");
+        w.until("QUARANTINED", 60, |w| w.cp_state(&cp) == "quarantined").await;
+        assert_eq!(w.charge(), charged);
+        w.ok(json!({ "op": "delete_checkpoint", "id": cp })).await;
+        seen.insert("tampered_manifest".into(), json!({ "fork": tampered, "row": "quarantined" }));
+        // 2. The source's PID 1 killed mid-capture: a typed failure, nothing left.
+        let big = w.source(1 << 30, &format!("mkdir -p /root/w && {BIG}")).await;
+        let backend = w.ok(json!({ "op": "get", "id": big })).await["backend_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let pending = {
+            let (api, id) = (w.api.clone(), big.clone());
+            tokio::spawn(async move {
+                rpc(&api, OWNER, json!({ "op": "capture", "id": id, "request_id": "pid1", "lifetime_ms": 3_600_000 })).await
+            })
+        };
+        w.worker("capture", 60).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        kill_pid(shim_of(&backend));
+        let r = pending.await.unwrap();
+        let pid1 = match r.get("ok") {
+            Some(row) => row["failure_reason"].as_str().unwrap().to_string(),
+            None => refused(&r),
+        };
+        assert!(pid1.starts_with("checkpoint_"), "{r}");
+        w.until("settled", 120, |w| {
+            w.rows().iter().all(|(_, s)| s != "capturing" && s != "deleting")
+        })
+        .await;
+        assert_eq!(w.charge(), (0, 0));
+        seen.insert("pid1_killed_mid_capture".into(), json!(pid1));
+        // 3. Root's own `kiln exec` into the source makes a capture busy.
+        let backend = w.ok(json!({ "op": "get", "id": src })).await["backend_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut direct = std::process::Command::new(kiln_bin())
+            .args(["exec", &backend, "sleep", "4"])
+            .spawn()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        let busy = w.rpc(OWNER, json!({ "op": "capture", "id": src, "lifetime_ms": 3_600_000 })).await;
+        let direct_reason = busy
+            .get("error")
+            .map(|e| e["reason"].clone())
+            .unwrap_or_else(|| busy["ok"]["state"].clone());
+        assert!(direct.wait().unwrap().success());
+        if let Some(id) = busy["ok"]["id"].as_str() {
+            w.ok(json!({ "op": "delete_checkpoint", "id": id })).await;
+        }
+        seen.insert("direct_kiln_exec".into(), direct_reason);
+        // 4. Writable paths over reserved ones, at create (a source can't have them).
+        for path in ["/dev/shm/x", "/proc/x", "/sys/fs/cgroup/x"] {
+            let r = w
+                .rpc(OWNER, json!({ "op": "create", "read_only_root": true, "writable_paths": [path] }))
+                .await;
+            let outcome = match r.get("ok") {
+                Some(s) => {
+                    let id = s["id"].as_str().unwrap().to_string();
+                    let c = w.rpc(OWNER, json!({ "op": "capture", "id": id, "lifetime_ms": 3_600_000 })).await;
+                    let o = c.get("error").map(|e| e["reason"].clone()).unwrap_or(json!("captured"));
+                    if let Some(cp) = c["ok"]["id"].as_str() {
+                        w.ok(json!({ "op": "delete_checkpoint", "id": cp })).await;
+                    }
+                    w.ok(json!({ "op": "delete", "id": id })).await;
+                    json!({ "create": "ok", "capture": o })
+                }
+                None => json!({ "create": r["error"] }),
+            };
+            assert_ne!(outcome["capture"], "captured", "{path}: {outcome}");
+            seen.insert(format!("writable {path}"), outcome);
+        }
+        matrix("hostile artifact and process attacks", Value::Object(seen));
+        w.finish().await;
+    });
+}
