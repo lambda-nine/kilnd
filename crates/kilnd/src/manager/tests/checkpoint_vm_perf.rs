@@ -290,13 +290,37 @@ async fn cell(w: &World, csv: &mut Csv, phase: &str, mib: u64, entries: u64, run
             "stopped_early": stopped })
 }
 
+/// The grid's cells, or only those `KILND_C6B_PERF_CELLS` names (`MIB:ENTRIES,...`),
+/// and the runs per cell (`KILND_C6B_PERF_RUNS`, default 20).
+fn chosen_cells() -> (Vec<(u64, u64)>, usize) {
+    let all: Vec<(u64, u64)> = [10, 50, 100]
+        .into_iter()
+        .flat_map(|m| [100, 10_000, 50_000].map(|e| (m, e)))
+        .collect();
+    let cells = match std::env::var("KILND_C6B_PERF_CELLS") {
+        Ok(list) if !list.is_empty() => list
+            .split(',')
+            .map(|c| {
+                let (m, e) = c.split_once(':').unwrap();
+                (m.parse().unwrap(), e.parse().unwrap())
+            })
+            .collect(),
+        _ => all,
+    };
+    let runs = std::env::var("KILND_C6B_PERF_RUNS")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(20);
+    (cells, runs)
+}
+
 async fn warm(w: &World) -> Value {
-    let mut csv = Csv::new("perf-warm.csv", CAPTURE_HEADER);
+    let (cells_wanted, runs) = chosen_cells();
+    let name = format!("perf-warm-{}.csv", crate::model::now_ms() / 1000);
+    let mut csv = Csv::new(&name, CAPTURE_HEADER);
     let mut cells = Vec::new();
-    for mib in [10, 50, 100] {
-        for entries in [100, 10_000, 50_000] {
-            cells.push(cell(w, &mut csv, "warm", mib, entries, 20, false).await);
-        }
+    for (mib, entries) in cells_wanted {
+        cells.push(cell(w, &mut csv, "warm", mib, entries, runs, false).await);
     }
     Value::Array(cells)
 }
