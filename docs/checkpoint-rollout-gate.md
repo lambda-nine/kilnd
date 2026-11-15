@@ -9,7 +9,7 @@ Each criterion is checkable: a test, a run with recorded conditions, or a docume
 
 | # | Criterion | Evidence | Status |
 |---|---|---|---|
-| 1 | Every crash point of the design's recovery table, every required-test case and every adversarial-review finding of milestones C3–C5b is named in the acceptance ledger with a passing test, a planned VM scenario, or an explicit accepted disposition | `crates/kilnd/tests/data/checkpoint-acceptance-matrix.json`; `checkpoint_acceptance_matrix` tests in CI | C6a |
+| 1 | Every crash point of the design's recovery table, every required-test case and every adversarial-review finding of milestones C3–C5b is named in the acceptance ledger with a passing test, a planned VM scenario, or an explicit accepted disposition | `crates/kilnd/tests/data/checkpoint-acceptance-matrix.json`; `checkpoint_acceptance_matrix` tests and build.sh compiled-registry check in CI | C6a |
 | 2 | The VM crash matrix passes on the pinned kiln and kernel, with the host check clean before and after every scenario: real process death of the daemon, the root helper and kiln's copy and restore workers at each capture, removal and fork boundary; a reboot; a stale database backup; a corrupt artifact; a kill during the startup barrier | `scripts/checkpoint-crash-matrix.py` run log | *pending (C6b)* |
 | 3 | Hostile workspace content (links, special files, ACLs, file capabilities, xattrs, names, depth, entry count, sparse and inode-heavy trees, protected paths) is refused before allocation or round-trips exactly, through kilnd's capture and fork on the pinned kiln, with host and other users' sandboxes unchanged; hostile callers (two real uids) get only their own checkpoints and budgets | VM run log | *pending (C6b)* |
 | 4 | The rewind, best-of-N and eval-reset client fixtures pass on the fake runtime (CI) and on real kiln (VM), the latter checking workspace content byte for byte | `manager::checkpoint::tests::api::clients` in CI; VM run log | Mac: C6a; VM: *pending (C6b)* |
@@ -19,6 +19,15 @@ Each criterion is checkable: a test, a run with recorded conditions, or a docume
 | 8 | No HIGH or MEDIUM finding of the C6 adversarial reviews is open | review records | *pending* |
 | 9 | On the node itself, every discovery probe passes (Health lists `workspace_checkpoint`): helper group enabled, leases, format 1, generation-checked removal, XFS with project quotas on runs, trusted image registry, free space known; headroom configured | `kilndctl health` on the node | per node |
 | 10 | The node runs the kiln commit the gate was measured on, or a later one on which criteria 2–4 were rerun | `kiln --version` against the gate record | per node |
+
+Full-suite `scripts/build.sh PROFILE test` pins the ordered crash, case and finding IDs,
+then checks ledger test references against Cargo's compiled libtest registry after the
+suite passes. Mac references must be compiled and non-ignored in that profile. VM
+references must be compiled and ignored on Linux; elsewhere they may be absent but
+must be ignored if compiled. A filtered test run does not perform this registry gate.
+Names start with the test binary's crate name, followed by its libtest path; binary
+unit-test targets add `::bin` and doctests add `::doc` to distinguish them from a
+same-named library. Duplicate binary identities and unparsed listing lines fail closed.
 
 ## Gate record
 

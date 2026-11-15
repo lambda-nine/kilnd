@@ -15,6 +15,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   inodes only, and an absent instance directory is an empty one. A rollback that finds
   the artifacts changed keeps its record and every unit down, through `recover`, other
   commands and reboots, until `kilnd-maintenance.py accept-artifacts`.
+- Check the checkpoint acceptance ledger against the compiled tests (C6a adversarial
+  review, two HIGH). A full `scripts/build.sh PROFILE test` lists each profile's compiled
+  tests after the suite passes and refuses a ledger name that is missing or ignored
+  (VM names must be compiled and ignored on Linux); the source-text scan is gone. The
+  required case and finding IDs are pinned in order, so deleting or renaming one fails.
 - Pin the checkpoint messages' protobuf encoding (C6a adversarial review, two HIGH).
   `tests/data/checkpoint-wire.json` holds the wire bytes of every checkpoint message and of
   a fork's create request, and a previous client with its field numbers written by hand

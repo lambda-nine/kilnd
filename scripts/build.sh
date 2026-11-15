@@ -31,6 +31,10 @@
 # clippy-driver and rustc: `--cfg`, response files) and for build and check; for test it
 # goes to the test harness, which compiles nothing.
 #
+# Full-suite test (no cargo arguments and no -- tail) also checks the checkpoint
+# ledger against compiled test registries, including ignored status, after the suite
+# passes. Filtered test invocations retain their ordinary cargo behavior.
+#
 # A profile enables only workspace features (member/feature) its member declares; a
 # dependency's feature is forwarded through one, checked in. Before `--`, it refuses
 # every argument that would select features or another graph: --features and -F (and so
@@ -65,6 +69,10 @@ fi
 [ "$#" -ge 2 ] || usage
 profile=$1 command=$2
 shift 2
+full_suite=
+if [ "$command" = test ] && [ "$#" -eq 0 ]; then
+    full_suite=1
+fi
 case $command in
     build | test | clippy | check) ;;
     *) refuse "$command is not a supported command (build, test, clippy or check)" ;;
@@ -172,4 +180,17 @@ if [ "$command" = clippy ]; then
 fi
 
 cd "$repo"
-exec cargo ${toolchain:+"$toolchain"} "$command" "$@"
+if [ -n "$full_suite" ]; then
+    cargo ${toolchain:+"$toolchain"} "$command" "$@"
+    registry_dir=$(mktemp -d)
+    trap 'rm -rf "$registry_dir"' EXIT
+    trap 'exit 1' HUP INT TERM
+    # Merge streams at the producer so each Running header precedes its entries.
+    cargo ${toolchain:+"$toolchain"} "$command" "$@" -- --list >"$registry_dir/all" 2>&1 || { cat "$registry_dir/all" >&2; exit 1; }
+    cargo ${toolchain:+"$toolchain"} "$command" "$@" -- --list --ignored >"$registry_dir/ignored" 2>&1 || { cat "$registry_dir/ignored" >&2; exit 1; }
+    python3 -I scripts/checkpoint-ledger.py --self-test
+    python3 -I scripts/checkpoint-ledger.py crates/kilnd/tests/data/checkpoint-acceptance-matrix.json \
+        "$registry_dir/all" "$registry_dir/ignored" "$(uname -s)"
+else
+    exec cargo ${toolchain:+"$toolchain"} "$command" "$@"
+fi
