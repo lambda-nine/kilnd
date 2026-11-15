@@ -1,0 +1,1669 @@
+{
+  "format": 1,
+  "notes": [
+    "Checkpoint acceptance ledger: design crash rows, §11.2 cases and C3–C5b-2 review findings; the integration test checks referenced function names and coverage structure, not their execution or semantic sufficiency.",
+    "Planned VM slots are outstanding acceptance work; kiln-only tests are outside this tree. Unrated nonblocking observations are LOW, except the moderate VM coverage observation (MEDIUM); original reported severities are otherwise retained."
+  ],
+  "crash_points": [
+    {
+      "id": "before-c1",
+      "design": "Before C1",
+      "mac": [
+        "c0_refusals_allocate_nothing",
+        "a_waiter_departing_before_c1_allocates_nothing"
+      ],
+      "vm": null
+    },
+    {
+      "id": "after-c1-before-helper",
+      "design": "After C1, before helper",
+      "mac": [
+        "crash_after_c1_before_the_helper_settles_failed_with_no_recapture"
+      ],
+      "vm": "planned:C6b:V1"
+    },
+    {
+      "id": "mid-copy",
+      "design": "Mid-copy / partial marker",
+      "mac": [
+        "crash_mid_copy_reaps_the_worker_removes_staging_and_fails"
+      ],
+      "vm": "planned:C6b:V2/V3/V4"
+    },
+    {
+      "id": "c3-complete-c4-missing",
+      "design": "C3 complete, C4 missing",
+      "mac": [
+        "crash_between_complete_and_ready_discards_the_artifact"
+      ],
+      "vm": "planned:C6b:V5"
+    },
+    {
+      "id": "c4-committed-reply-lost",
+      "design": "C4 committed, RPC lost",
+      "mac": [
+        "crash_after_ready_keeps_it_and_a_key_retry_returns_it"
+      ],
+      "vm": "planned:C6b:V6"
+    },
+    {
+      "id": "fork-pin-not-dispatched",
+      "design": "Fork CREATING/pin committed, not dispatched",
+      "mac": [
+        "a_crash_after_the_pin_and_before_dispatch_retires_the_reader_and_keeps_the_pin"
+      ],
+      "vm": "planned:C6b:V9"
+    },
+    {
+      "id": "mid-restore",
+      "design": "Mid-restore, backend ID unknown",
+      "mac": [
+        "a_crash_mid_restore_blocks_until_the_orphaned_reader_settles",
+        "an_ambiguous_restore_stays_charged_and_its_pin_waits_for_absent"
+      ],
+      "vm": "planned:C6b:V10/V11/V13"
+    },
+    {
+      "id": "restored-ready-missing",
+      "design": "Restored backend published, READY missing",
+      "mac": [
+        "a_crash_after_the_copy_and_before_ready_compensates_the_exact_backend_at_startup",
+        "a_crash_between_each_settlement_write_and_the_pin_release_recovers"
+      ],
+      "vm": "planned:C6b:V12"
+    },
+    {
+      "id": "d1-interrupted",
+      "design": "D1 committed / deletion interrupted",
+      "mac": [
+        "crash_after_d1_or_after_d2_completes_the_removal",
+        "checkpoint_d1_keeps_the_interrupted_capture_source_held"
+      ],
+      "vm": "planned:C6b:V7"
+    },
+    {
+      "id": "d2-complete-d3-missing",
+      "design": "D2 complete, D3 missing",
+      "mac": [
+        "crash_after_d1_or_after_d2_completes_the_removal"
+      ],
+      "vm": "planned:C6b:V8"
+    },
+    {
+      "id": "ready-artifact-corrupt",
+      "design": "READY with missing/corrupt artifact",
+      "mac": [
+        "a_ready_row_with_a_missing_artifact_is_quarantined_until_deleted",
+        "authoritative_inspect_results_still_quarantine"
+      ],
+      "vm": "planned:C6b:V16"
+    },
+    {
+      "id": "unexplained-files",
+      "design": "Files with no matching DB row",
+      "mac": [
+        "unexplained_artifacts_or_an_incomplete_inventory_block_allocation",
+        "an_unexplained_tracked_operation_blocks_allocation"
+      ],
+      "vm": "planned:C6b:V15"
+    }
+  ],
+  "cases": [
+    {
+      "id": "11.2.1-round-trips",
+      "design": "§11.2 item 1: Round trips: lower/upper modifications and removals, directory replacement, whiteouts/opacity, rename, nested forks, uid/gid extrema, setuid/sticky modes, nanosecond mtime, non-UTF-8 names, internal hardlinks/symlinks, empty upper and zero-length files; logical manifests, real commands and independence",
+      "mac": [],
+      "vm": "planned:C6b:round-trips",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-acl",
+      "design": "§11.2 item 2: ACLs",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-file-capabilities",
+      "design": "§11.2 item 2: File capabilities",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-socket",
+      "design": "§11.2 item 2: Socket",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-fifo",
+      "design": "§11.2 item 2: FIFO",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-device",
+      "design": "§11.2 item 2: Device",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-unknown-xattrs",
+      "design": "§11.2 item 2: Unknown xattrs",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-redirect",
+      "design": "§11.2 item 2: Overlay redirect",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-metacopy",
+      "design": "§11.2 item 2: Overlay metacopy",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-index",
+      "design": "§11.2 item 2: Overlay index",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-protected-tree",
+      "design": "§11.2 item 2: Protected-tree edits",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-overlapping-writable-paths",
+      "design": "§11.2 item 2: Overlapping reserved writable paths",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.2-old-shims",
+      "design": "§11.2 item 2: Old shims",
+      "mac": [
+        "source_record_problems_refuse_before_any_reservation",
+        "a_disabled_helper_group_or_old_kiln_refuses_before_reserving"
+      ],
+      "vm": "planned:C6b:hostile-content"
+    },
+    {
+      "id": "11.2.2-wrong-image-generation",
+      "design": "§11.2 item 2: Wrong image generation",
+      "mac": [
+        "compatibility_refusals_allocate_nothing"
+      ],
+      "vm": [
+        "c5a2_vm_fork"
+      ]
+    },
+    {
+      "id": "11.2.2-incompatible-spec",
+      "design": "§11.2 item 2: Incompatible spec",
+      "mac": [
+        "compatibility_refusals_allocate_nothing"
+      ],
+      "vm": [
+        "c5a2_vm_fork"
+      ]
+    },
+    {
+      "id": "11.2.2-destination-disk",
+      "design": "§11.2 item 2: Too-small destination disk",
+      "mac": [
+        "compatibility_refusals_allocate_nothing"
+      ],
+      "vm": [
+        "c5a2_vm_fork"
+      ]
+    },
+    {
+      "id": "11.2.2-disabled-helper",
+      "design": "§11.2 item 2: Disabled helper",
+      "mac": [
+        "a_disabled_helper_group_or_old_kiln_refuses_before_reserving"
+      ],
+      "vm": [
+        "c5a_vm_engine"
+      ]
+    },
+    {
+      "id": "11.2.2-disabled-feature",
+      "design": "§11.2 item 2: Disabled feature",
+      "mac": [
+        "feature_off_with_rows_serves_get_list_delete_and_keyed_retries_only",
+        "feature_off_refuses_a_fork_without_a_store_query_and_create_is_unchanged"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.3-symlink-parents",
+      "design": "§11.2 item 3: Symlink every parent",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-absolute-link-targets",
+      "design": "§11.2 item 3: Absolute link targets",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-dot-dot-link-targets",
+      "design": "§11.2 item 3: Dot-dot link targets",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-hardlink-chains",
+      "design": "§11.2 item 3: Hardlink chains",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-hardlink-cycles",
+      "design": "§11.2 item 3: Hardlink cycles",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-hardlink-outside",
+      "design": "§11.2 item 3: Hardlinks outside the object",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-duplicate-paths",
+      "design": "§11.2 item 3: Duplicate paths",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-root-replacement",
+      "design": "§11.2 item 3: Root replacement",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-forged-type",
+      "design": "§11.2 item 3: Forged payload type",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-forged-size",
+      "design": "§11.2 item 3: Forged payload size",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-mount-crossing",
+      "design": "§11.2 item 3: Mount crossing",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-malformed-base64",
+      "design": "§11.2 item 3: Malformed base64",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-malformed-json",
+      "design": "§11.2 item 3: Malformed JSON",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-depth",
+      "design": "§11.2 item 3: Huge depth",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-count",
+      "design": "§11.2 item 3: Huge entry count",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-sparse",
+      "design": "§11.2 item 3: Giant sparse files",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-inode-bombs",
+      "design": "§11.2 item 3: Inode bombs",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-sentinels",
+      "design": "§11.2 item 3: Host sentinels and other users unchanged",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-fuzz-parsing",
+      "design": "§11.2 item 3: Fuzz parsing",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-fuzz-materialization",
+      "design": "§11.2 item 3: Fuzz materialization",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-arbitrary-device",
+      "design": "§11.2 item 3: Root accepts no arbitrary device number",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.3-external-fd",
+      "design": "§11.2 item 3: Root accepts no external FD",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.4-queued-exec",
+      "design": "§11.2 item 4: Capture against queued Exec",
+      "mac": [
+        "capture_and_exec_exclude_each_other"
+      ],
+      "vm": "planned:C6b:hostile-callers"
+    },
+    {
+      "id": "11.2.4-queued-exec-stream",
+      "design": "§11.2 item 4: Capture against queued ExecStream",
+      "mac": [],
+      "vm": "planned:C6b:hostile-callers",
+      "gap": "No direct checkpoint capture versus queued ExecStream regression identified; Exec coverage alone does not prove the stream gate."
+    },
+    {
+      "id": "11.2.4-direct-kiln-exec",
+      "design": "§11.2 item 4: Capture against direct kiln Exec",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.4-two-captures",
+      "design": "§11.2 item 4: Two captures",
+      "mac": [
+        "worker_permits_refuse_at_once_per_uid"
+      ],
+      "vm": [
+        "c5a_vm_engine"
+      ]
+    },
+    {
+      "id": "11.2.4-source-delete",
+      "design": "§11.2 item 4: Capture against source Delete",
+      "mac": [
+        "source_delete_cancels_the_capture_and_waits_for_its_reader"
+      ],
+      "vm": [
+        "c5a_vm_engine"
+      ]
+    },
+    {
+      "id": "11.2.4-source-idle-expiry",
+      "design": "§11.2 item 4: Capture against source idle expiry",
+      "mac": [
+        "source_lifetime_expiry_cancels_a_capture_and_idle_waits_for_it"
+      ],
+      "vm": "planned:C6b:hostile-callers"
+    },
+    {
+      "id": "11.2.4-source-lifetime-expiry",
+      "design": "§11.2 item 4: Capture against source lifetime expiry",
+      "mac": [
+        "source_lifetime_expiry_cancels_a_capture_and_idle_waits_for_it"
+      ],
+      "vm": [
+        "c5a_vm_engine"
+      ]
+    },
+    {
+      "id": "11.2.4-fork-delete",
+      "design": "§11.2 item 4: Fork against checkpoint Delete",
+      "mac": [
+        "checkpoint_delete_during_a_restore_fails_the_fork_and_reaches_absent",
+        "checkpoint_delete_after_the_copy_and_before_ready_compensates_the_fork"
+      ],
+      "vm": [
+        "c5a2_vm_fork"
+      ]
+    },
+    {
+      "id": "11.2.4-fork-get",
+      "design": "§11.2 item 4: Fork against checkpoint Get",
+      "mac": [
+        "a_pin_under_a_dead_epoch_pauses_idle_but_lifetime_still_reaches_absent"
+      ],
+      "vm": "planned:C6b:hostile-callers",
+      "gap": "Pin/Get retention is covered, but no direct concurrent fork-versus-Get winner regression identified."
+    },
+    {
+      "id": "11.2.4-fork-idle-expiry",
+      "design": "§11.2 item 4: Fork against checkpoint idle expiry",
+      "mac": [
+        "checkpoint_expiry_during_a_restore_waits_for_lifetime_and_fails_the_fork"
+      ],
+      "vm": [
+        "c5a2_vm_fork"
+      ]
+    },
+    {
+      "id": "11.2.4-fork-lifetime-expiry",
+      "design": "§11.2 item 4: Fork against checkpoint lifetime expiry",
+      "mac": [
+        "checkpoint_expiry_during_a_restore_waits_for_lifetime_and_fails_the_fork"
+      ],
+      "vm": [
+        "c5a2_vm_fork"
+      ]
+    },
+    {
+      "id": "11.2.4-fork-fan-out",
+      "design": "§11.2 item 4: Fork fan-out",
+      "mac": [
+        "concurrent_captures_and_forks_never_overspend_the_shared_disk"
+      ],
+      "vm": "planned:C6b:hostile-callers"
+    },
+    {
+      "id": "11.2.4-disconnect-helper",
+      "design": "§11.2 item 4: Disconnect helper",
+      "mac": [
+        "a_lost_or_pending_reply_follows_the_reader_to_its_record",
+        "removal_retries_busy_and_unavailable_until_absent_keeping_the_charge"
+      ],
+      "vm": "planned:C6b:hostile-callers"
+    },
+    {
+      "id": "11.2.4-downgrade-helper",
+      "design": "§11.2 item 4: Downgrade helper",
+      "mac": [
+        "an_older_helper_keeps_the_broad_removal_gate",
+        "discovery_advertises_after_its_probes_and_withdraws_on_each_failure"
+      ],
+      "vm": "planned:C6b:hostile-callers"
+    },
+    {
+      "id": "11.2.4-kill-worker",
+      "design": "§11.2 item 4: Kill worker",
+      "mac": [
+        "an_unkillable_worker_keeps_its_slot_and_blocks_absence"
+      ],
+      "vm": "planned:C6b:V4/V11"
+    },
+    {
+      "id": "11.2.4-kill-pid1",
+      "design": "§11.2 item 4: Kill PID 1",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true
+    },
+    {
+      "id": "11.2.4-output-queue",
+      "design": "§11.2 item 4: Fill output queue; Health and Delete retain progress",
+      "mac": [],
+      "vm": "planned:C6b:hostile-callers",
+      "gap": "No checkpoint-specific full output queue liveness regression identified."
+    },
+    {
+      "id": "11.2.4-control-queue",
+      "design": "§11.2 item 4: Fill control queue; Health and Delete retain progress",
+      "mac": [],
+      "vm": "planned:C6b:hostile-callers",
+      "gap": "No checkpoint-specific full control queue liveness regression identified."
+    },
+    {
+      "id": "11.2.4-deadline",
+      "design": "§11.2 item 4: Deadline; Health and Delete retain progress",
+      "mac": [
+        "a_hung_worker_is_killed_and_reaped_at_its_deadline",
+        "lanes_refuse_at_once_and_cleanup_never_waits_for_copying"
+      ],
+      "vm": "planned:C6b:hostile-callers"
+    },
+    {
+      "id": "11.2.4-shutdown",
+      "design": "§11.2 item 4: Shutdown; Health and Delete retain progress",
+      "mac": [
+        "shutdown_keeps_the_source_gated_until_the_capture_is_absent",
+        "source_delete_departed_waiter_and_shutdown_never_disturb_a_restore"
+      ],
+      "vm": "planned:C6b:hostile-callers"
+    },
+    {
+      "id": "11.2.5-uid-caps",
+      "design": "§11.2 item 5: Race Create, capture and forks at every uid cap",
+      "mac": [
+        "concurrent_captures_and_creates_never_overspend_any_cap_or_the_shared_disk",
+        "concurrent_captures_and_forks_never_overspend_the_shared_disk",
+        "quotas_admit_x_and_refuse_x_plus_one"
+      ],
+      "vm": "planned:C6b:accounting"
+    },
+    {
+      "id": "11.2.5-node-caps",
+      "design": "§11.2 item 5: Race Create, capture and forks at every node cap",
+      "mac": [
+        "concurrent_admissions_never_overspend_caps_or_the_shared_disk",
+        "quotas_admit_x_and_refuse_x_plus_one"
+      ],
+      "vm": "planned:C6b:accounting"
+    },
+    {
+      "id": "11.2.5-lowered-budgets",
+      "design": "§11.2 item 5: Lowered budgets",
+      "mac": [
+        "admission_enforces_every_cap_and_the_shared_disk_budget",
+        "lowered_budgets_block_new_captures_but_keep_what_is_charged"
+      ],
+      "vm": "planned:C6b:accounting"
+    },
+    {
+      "id": "11.2.5-sparse-physical",
+      "design": "§11.2 item 5: Logical versus physical sparse bytes",
+      "mac": [],
+      "vm": "planned:C6b:accounting",
+      "kiln": true
+    },
+    {
+      "id": "11.2.5-reflink-divergence",
+      "design": "§11.2 item 5: Reflink then full divergence",
+      "mac": [],
+      "vm": "planned:C6b:accounting",
+      "kiln": true
+    },
+    {
+      "id": "11.2.5-metadata-exhaustion",
+      "design": "§11.2 item 5: Metadata-only exhaustion",
+      "mac": [],
+      "vm": "planned:C6b:accounting",
+      "kiln": true
+    },
+    {
+      "id": "11.2.5-inode-exhaustion",
+      "design": "§11.2 item 5: Inode exhaustion",
+      "mac": [],
+      "vm": "planned:C6b:accounting",
+      "kiln": true
+    },
+    {
+      "id": "11.2.5-small-project-quota",
+      "design": "§11.2 item 5: Small project quota",
+      "mac": [],
+      "vm": "planned:C6b:accounting",
+      "kiln": true
+    },
+    {
+      "id": "11.2.5-enospc-fsync",
+      "design": "§11.2 item 5: ENOSPC at file fsync",
+      "mac": [],
+      "vm": "planned:C6b:accounting",
+      "kiln": true
+    },
+    {
+      "id": "11.2.5-enospc-rename",
+      "design": "§11.2 item 5: ENOSPC at rename",
+      "mac": [],
+      "vm": "planned:C6b:accounting",
+      "kiln": true
+    },
+    {
+      "id": "11.2.5-worker-fd-absence",
+      "design": "§11.2 item 5: Retain charge until workers, FDs and artifact are absent",
+      "mac": [
+        "removal_cancels_readers_and_waits_for_their_reap",
+        "an_unkillable_worker_keeps_its_slot_and_blocks_absence",
+        "a_failed_capture_stays_charged_r_until_its_absence_then_may_be_deleted"
+      ],
+      "vm": [
+        "c3_vm_checkpoint_group"
+      ]
+    },
+    {
+      "id": "11.2.5-sql-triggers",
+      "design": "§11.2 item 5: Ordinary SQL trigger tampering",
+      "mac": [
+        "sql_tampering_is_refused_by_the_triggers",
+        "the_triggers_bind_each_fact_to_its_dispatch_epoch_and_boot"
+      ],
+      "vm": null
+    },
+    {
+      "id": "11.2.5-membership-audit",
+      "design": "§11.2 item 5: Membership audits, including replacing/removing released rows",
+      "mac": [
+        "tampering_past_the_triggers_is_caught_and_never_frees_capacity",
+        "wrong_epoch_facts_past_the_triggers_are_caught_by_the_audits"
+      ],
+      "vm": null
+    },
+    {
+      "id": "11.2.6-capture-boundaries",
+      "design": "§11.2 item 6: Kill daemon/helper/worker at C0–C4",
+      "mac": [
+        "crash_after_c1_before_the_helper_settles_failed_with_no_recapture",
+        "crash_mid_copy_reaps_the_worker_removes_staging_and_fails",
+        "crash_between_complete_and_ready_discards_the_artifact",
+        "crash_after_ready_keeps_it_and_a_key_retry_returns_it"
+      ],
+      "vm": "planned:C6b:V1/V2/V3/V4/V5/V6"
+    },
+    {
+      "id": "11.2.6-delete-boundaries",
+      "design": "§11.2 item 6: Kill daemon/helper/worker at D1–D3",
+      "mac": [
+        "crash_after_d1_or_after_d2_completes_the_removal"
+      ],
+      "vm": "planned:C6b:V7/V8"
+    },
+    {
+      "id": "11.2.6-fork-pin-dispatch",
+      "design": "§11.2 item 6: Kill between fork pin commit and dispatch",
+      "mac": [
+        "a_crash_after_the_pin_and_before_dispatch_retires_the_reader_and_keeps_the_pin"
+      ],
+      "vm": "planned:C6b:V9"
+    },
+    {
+      "id": "11.2.6-restore-publication",
+      "design": "§11.2 item 6: Kill between complete restore copy and READY",
+      "mac": [
+        "a_crash_after_the_copy_and_before_ready_compensates_the_exact_backend_at_startup"
+      ],
+      "vm": "planned:C6b:V12"
+    },
+    {
+      "id": "11.2.6-reboot",
+      "design": "§11.2 item 6: Reboot with READY and partial artifacts",
+      "mac": [
+        "a_reboot_rebases_checkpoint_anchors_without_extending_lifetime"
+      ],
+      "vm": "planned:C6b:V14",
+      "gap": "Clock-rebase simulation exists; real reboot with both READY and partial artifacts remains planned."
+    },
+    {
+      "id": "11.2.6-mismatched-backups",
+      "design": "§11.2 item 6: Mismatched DB and artifact backups",
+      "mac": [
+        "unexplained_artifacts_or_an_incomplete_inventory_block_allocation"
+      ],
+      "vm": "planned:C6b:V15",
+      "gap": "Unknown-artifact admission refusal is covered; no real mismatched-backup restoration regression identified."
+    },
+    {
+      "id": "11.2.6-stale-helper-epochs",
+      "design": "§11.2 item 6: Stale helper epochs",
+      "mac": [
+        "epochs_and_retired_nonces_refuse_before_any_worker",
+        "a_crash_with_a_helper_restart_leaves_a_dead_epoch_pin_for_absent"
+      ],
+      "vm": "planned:C6b:V3/V13"
+    },
+    {
+      "id": "11.2.6-unknown-objects",
+      "design": "§11.2 item 6: Unknown objects",
+      "mac": [
+        "unexplained_artifacts_or_an_incomplete_inventory_block_allocation",
+        "an_unexplained_tracked_operation_blocks_allocation"
+      ],
+      "vm": "planned:C6b:V15"
+    },
+    {
+      "id": "11.2.6-barrier-interruption",
+      "design": "§11.2 item 6: Kill during the startup inventory barrier",
+      "mac": [
+        "a_crash_inside_the_pass_keeps_the_restart_reconciling",
+        "a_crash_after_the_blocking_verdict_cannot_lose_the_obligation"
+      ],
+      "vm": "planned:C6b:V17"
+    },
+    {
+      "id": "11.2.7-foreign-ids",
+      "design": "§11.2 item 7: Foreign IDs",
+      "mac": [
+        "foreign_ids_are_not_found_and_root_follows_the_design"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-foreign-filters",
+      "design": "§11.2 item 7: Foreign filters",
+      "mac": [
+        "list_pages_are_newest_first_filter_bound_and_bounded"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-root-on-behalf",
+      "design": "§11.2 item 7: Root-on-behalf capture",
+      "mac": [
+        "foreign_ids_are_not_found_and_root_follows_the_design"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-pagination-insert",
+      "design": "§11.2 item 7: Pagination under concurrent insert",
+      "mac": [
+        "list_pages_are_newest_first_filter_bound_and_bounded"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-pagination-delete",
+      "design": "§11.2 item 7: Pagination under concurrent delete",
+      "mac": [
+        "list_pages_are_newest_first_filter_bound_and_bounded"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-digest-v1",
+      "design": "§11.2 item 7: Digest v1 goldens",
+      "mac": [
+        "digest_goldens_are_stable"
+      ],
+      "vm": null
+    },
+    {
+      "id": "11.2.7-digest-v2",
+      "design": "§11.2 item 7: Digest v2 goldens",
+      "mac": [
+        "fork_digest_is_version_2_and_leaves_version_1_alone"
+      ],
+      "vm": null
+    },
+    {
+      "id": "11.2.7-key-reuse",
+      "design": "§11.2 item 7: Key reuse",
+      "mac": [
+        "capture_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "fork_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "keyed_captures_and_forks_retry_to_the_same_result_and_conflict_otherwise"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-key-conflict",
+      "design": "§11.2 item 7: Key conflict",
+      "mac": [
+        "capture_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "fork_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "keyed_captures_and_forks_retry_to_the_same_result_and_conflict_otherwise"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-key-release",
+      "design": "§11.2 item 7: Key release",
+      "mac": [
+        "capture_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "fork_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "keyed_captures_and_forks_retry_to_the_same_result_and_conflict_otherwise"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-retry-after-source-deletion",
+      "design": "§11.2 item 7: Retry after source deletion",
+      "mac": [
+        "capture_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "fork_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "keyed_captures_and_forks_retry_to_the_same_result_and_conflict_otherwise"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-retry-after-checkpoint-deletion",
+      "design": "§11.2 item 7: Retry after checkpoint deletion",
+      "mac": [
+        "capture_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "fork_keys_return_their_row_conflict_and_release_only_once_deleted",
+        "keyed_captures_and_forks_retry_to_the_same_result_and_conflict_otherwise"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-record-caps",
+      "design": "§11.2 item 7: Request record caps",
+      "mac": [
+        "quotas_admit_x_and_refuse_x_plus_one"
+      ],
+      "vm": null
+    },
+    {
+      "id": "11.2.7-wall-clock-jumps",
+      "design": "§11.2 item 7: Wall-clock jumps",
+      "mac": [
+        "a_reboot_rebases_checkpoint_anchors_without_extending_lifetime",
+        "lifetime_and_idle_expiry_take_the_same_removal_and_get_refreshes_only_idle"
+      ],
+      "vm": "planned:C6b:retention",
+      "gap": "Boot rebasing and normal expiry are covered, but no checkpoint-specific forward/backward wall-clock jump regression identified."
+    },
+    {
+      "id": "11.2.7-suspend",
+      "design": "§11.2 item 7: Suspend",
+      "mac": [],
+      "vm": "planned:C6b:retention",
+      "gap": "No checkpoint-specific suspend/resume regression identified."
+    },
+    {
+      "id": "11.2.7-reboot",
+      "design": "§11.2 item 7: Reboot retention",
+      "mac": [
+        "a_reboot_rebases_checkpoint_anchors_without_extending_lifetime",
+        "capture_keys_from_an_earlier_boot_age_out_after_restart"
+      ],
+      "vm": "planned:C6b:V14"
+    },
+    {
+      "id": "11.2.7-list-no-refresh",
+      "design": "§11.2 item 7: Listing never refreshes artifact retention",
+      "mac": [
+        "lifetime_and_idle_expiry_take_the_same_removal_and_get_refreshes_only_idle"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.7-get-bounded-refresh",
+      "design": "§11.2 item 7: Get refreshes idle only up to lifetime",
+      "mac": [
+        "lifetime_and_idle_expiry_take_the_same_removal_and_get_refreshes_only_idle",
+        "get_of_a_due_checkpoint_expires_it_and_never_resurrects_it"
+      ],
+      "vm": [
+        "c5b_vm_api"
+      ]
+    },
+    {
+      "id": "11.2.8-preallocation-refusal",
+      "design": "§11.2 item 8: Firecracker refusal before helper token/preflight, ledger, DB, reservations or runtime changes",
+      "mac": [
+        "firecracker_refuses_before_any_helper_call_allocation_or_row",
+        "firecracker_refuses_a_fork_before_prepare_and_any_effect",
+        "firecracker_refuses_capture_and_fork_before_any_allocation"
+      ],
+      "vm": null
+    },
+    {
+      "id": "11.2.8-legacy-behavior",
+      "design": "§11.2 item 8: No-checkpoint Create/Exec unchanged on both backends",
+      "mac": [
+        "off_by_default_nothing_changes_and_nothing_is_called",
+        "feature_off_refuses_a_fork_without_a_store_query_and_create_is_unchanged"
+      ],
+      "vm": "planned:C6b:legacy-backends",
+      "gap": "Feature-off kiln controls exist; a combined real-backend Create/Exec equivalence check on both kiln and Firecracker remains planned."
+    }
+  ],
+  "findings": [
+    {
+      "id": "C3-H1",
+      "review": "C3 adversarial review",
+      "severity": "HIGH",
+      "summary": "Removal could delete another generation and certify absence for the wrong generation.",
+      "mac": [
+        "h1_a_removal_of_another_generation_after_pruning_touches_nothing",
+        "h1_a_fresh_epoch_cannot_remove_another_generation",
+        "h1_an_older_kiln_fails_closed",
+        "the_absence_check_reads_generations_from_names",
+        "inventory_names_carry_their_generation"
+      ],
+      "vm": [
+        "c3_vm_generation_checked_removal"
+      ]
+    },
+    {
+      "id": "C3-M1",
+      "review": "C3 adversarial review",
+      "severity": "MEDIUM",
+      "summary": "Removal waited behind a full cleanup lane after changing artifact state.",
+      "mac": [
+        "m1_a_full_cleanup_lane_refuses_removal_without_changing_anything"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C3-r1-H1",
+      "review": "C3 adversarial review, recheck 1",
+      "severity": "HIGH",
+      "summary": "A remover could delete a replacement generation after checking a stale inode.",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true,
+      "gap": "Replacement-inode race regression belongs to kiln; no direct kilnd-tree test drives the pathname-rebinding interleaving."
+    },
+    {
+      "id": "C3-r1-L1",
+      "review": "C3 adversarial review, recheck 1",
+      "severity": "LOW",
+      "summary": "Unchecked removal stopped sweeping malformed staging/removing names.",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true,
+      "gap": "Malformed-name unchecked-removal regression belongs to kiln and is not checked by this ledger test."
+    },
+    {
+      "id": "C3-r1-L2",
+      "review": "C3 adversarial review, recheck 1",
+      "severity": "LOW",
+      "summary": "Cleanup permit was released immediately before state settlement.",
+      "mac": [
+        "m1_a_full_cleanup_lane_refuses_removal_without_changing_anything"
+      ],
+      "vm": null,
+      "gap": "The lane test covers immediate refusal, but no direct regression observes permit retention through settlement; a test hook is needed."
+    },
+    {
+      "id": "C3-r2-L1",
+      "review": "C3 adversarial review, recheck 2",
+      "severity": "LOW",
+      "summary": "A busy stale-generation removal could retain a tombstone that blocks the real generation.",
+      "mac": [
+        "l1_a_busy_stale_removal_does_not_block_the_real_generation"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C3-r2-L2",
+      "review": "C3 adversarial review, recheck 2",
+      "severity": "LOW",
+      "summary": "The universal directory-lock safety description overstated staging-failure cleanup.",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true,
+      "gap": "Kiln staging failure cleanup can unlink its unique name without its lock; no kilnd-tree regression or documentation guard pins the narrowed invariant."
+    },
+    {
+      "id": "C3-r2-L3",
+      "review": "C3 adversarial review, recheck 2",
+      "severity": "LOW",
+      "summary": "The stale-removal regression could pass on an unrelated busy refusal.",
+      "mac": [],
+      "vm": "planned:C6b:hostile-content",
+      "kiln": true,
+      "gap": "The kiln replacement-generation regression needs an assertion distinguishing pathname rebinding from unrelated lock contention; it is outside this tree."
+    },
+    {
+      "id": "C4-H1",
+      "review": "C4 adversarial review",
+      "severity": "HIGH",
+      "summary": "Stored evidence was not bound to the dispatched helper epoch and boot.",
+      "mac": [
+        "complete_evidence_from_another_helper_epoch_is_refused",
+        "absent_evidence_from_another_helper_epoch_is_refused",
+        "reader_evidence_from_another_helper_epoch_is_refused",
+        "the_triggers_bind_each_fact_to_its_dispatch_epoch_and_boot",
+        "wrong_epoch_facts_past_the_triggers_are_caught_by_the_audits"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-H1",
+      "review": "C5a adversarial review",
+      "severity": "HIGH",
+      "summary": "A departed Delete stranded a charged DELETING checkpoint.",
+      "mac": [
+        "a_departed_delete_leaves_a_supervisor_that_reaches_absent"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-H2",
+      "review": "C5a adversarial review",
+      "severity": "HIGH",
+      "summary": "Feature disablement stopped existing checkpoint maintenance.",
+      "mac": [
+        "feature_off_still_expires_existing_checkpoints",
+        "feature_off_resumes_a_pending_removal_then_admits"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-H3",
+      "review": "C5a adversarial review",
+      "severity": "HIGH",
+      "summary": "Capture request keys from a prior boot never aged out.",
+      "mac": [
+        "capture_keys_from_an_earlier_boot_age_out_after_restart"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-H4",
+      "review": "C5a adversarial review",
+      "severity": "HIGH",
+      "summary": "Feature disablement rejected a retry already covered by durable idempotency.",
+      "mac": [
+        "feature_off_answers_a_keyed_retry_from_its_durable_record"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-H5",
+      "review": "C5a adversarial review",
+      "severity": "HIGH",
+      "summary": "Transient Inspect I/O permanently quarantined intact content.",
+      "mac": [
+        "transient_inspect_io_keeps_ready_blocks_and_recovers",
+        "authoritative_inspect_results_still_quarantine"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-H6",
+      "review": "C5a adversarial review",
+      "severity": "HIGH",
+      "summary": "An incomplete inventory blocked Create until restart.",
+      "mac": [
+        "a_transient_incomplete_inventory_clears_without_restart",
+        "a_persistent_unexplained_artifact_stays_blocked_across_retries"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-H7",
+      "review": "C5a adversarial review",
+      "severity": "HIGH",
+      "summary": "Shutdown dropped the source hold before capture-worker absence.",
+      "mac": [
+        "shutdown_keeps_the_source_gated_until_the_capture_is_absent"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-H8",
+      "review": "C5a adversarial review",
+      "severity": "HIGH",
+      "summary": "Startup admission opened without accounting for all artifacts and operations.",
+      "mac": [
+        "failed_capabilities_block_allocation_even_with_an_empty_db",
+        "an_unexplained_tracked_operation_blocks_allocation",
+        "tracked_activity_that_does_not_match_its_row_blocks"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-M1",
+      "review": "C5a adversarial review",
+      "severity": "MEDIUM",
+      "summary": "Caller cancellation before C1 still created a charged checkpoint.",
+      "mac": [
+        "a_waiter_departing_before_c1_allocates_nothing",
+        "a_waiter_departing_after_c1_does_not_cancel"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r1-H1",
+      "review": "C5a adversarial review, recheck 1",
+      "severity": "HIGH",
+      "summary": "Feature-off settled history bypassed a failed-session barrier.",
+      "mac": [
+        "feature_off_settled_history_blocks_on_a_failed_session_until_inventory_is_clean",
+        "feature_off_settled_history_clears_once_the_helper_recovers"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r1-H2",
+      "review": "C5a adversarial review, recheck 1",
+      "severity": "HIGH",
+      "summary": "Pruning the last row left feature-off paths querying checkpoint storage.",
+      "mac": [
+        "pruning_the_last_row_restores_the_no_query_fast_path",
+        "feature_off_present_then_pruned_makes_no_store_query_on_request_paths"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r1-H3",
+      "review": "C5a adversarial review, recheck 1",
+      "severity": "HIGH",
+      "summary": "Startup removed a source before its interrupted capture worker.",
+      "mac": [
+        "restart_holds_a_deleting_source_until_its_capture_is_absent",
+        "restart_with_the_helper_unavailable_leaves_the_source_in_place",
+        "a_delete_after_restart_waits_for_the_interrupted_capture"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r2-H1",
+      "review": "C5a adversarial review, recheck 2",
+      "severity": "HIGH",
+      "summary": "Last-row pruning could clear a failed-session barrier without inventory.",
+      "mac": [
+        "pruning_after_a_failed_session_keeps_the_barrier_until_a_clean_inventory",
+        "startup_prune_keeps_the_barrier_retry_running"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r2-H2",
+      "review": "C5a adversarial review, recheck 2",
+      "severity": "HIGH",
+      "summary": "D1 dropped an interrupted capture source hold before ABSENT.",
+      "mac": [
+        "checkpoint_d1_keeps_the_interrupted_capture_source_held",
+        "a_delete_after_restart_waits_for_the_d1_capture",
+        "a_restart_after_the_d1_capture_is_absent_resumes_the_source_delete"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r2-M1",
+      "review": "C5a adversarial review, recheck 2",
+      "severity": "MEDIUM",
+      "summary": "A long grace bypassed the shutdown drain limit.",
+      "mac": [
+        "a_long_grace_still_ends_at_the_shutdown_drain_limit"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r3-H1",
+      "review": "C5a adversarial review, recheck 3",
+      "severity": "HIGH",
+      "summary": "Restart after last-row pruning forgot the inventory obligation.",
+      "mac": [
+        "a_restart_after_a_blocked_prune_still_reconciles"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r3-N1",
+      "review": "C5a adversarial review, recheck 3",
+      "severity": "LOW",
+      "summary": "Feature-off sandbox Delete while blocked lacked a direct coverage control.",
+      "mac": [
+        "a_sandbox_delete_while_blocked_without_rows_stays_fail_closed"
+      ],
+      "vm": null,
+      "classification": "observation"
+    },
+    {
+      "id": "C5a-r3-N2",
+      "review": "C5a adversarial review, recheck 3",
+      "severity": "LOW",
+      "summary": "An unsealed QUARANTINED store row is outside the source-hold predicate.",
+      "mac": [],
+      "vm": null,
+      "disposition": "accepted",
+      "reason": "Production quarantines only sealed READY rows; any future unsealed quarantine path must extend the source-hold rule.",
+      "classification": "observation"
+    },
+    {
+      "id": "C5a-r3-N3",
+      "review": "C5a adversarial review, recheck 3",
+      "severity": "LOW",
+      "summary": "A retained unsealed removal can hold its source until operator repair.",
+      "mac": [
+        "generation_mismatch_or_corrupt_keeps_the_charge_records_it_and_blocks_allocation"
+      ],
+      "vm": null,
+      "disposition": "accepted",
+      "reason": "Fail-closed source retention is required until authoritative ABSENT evidence.",
+      "classification": "observation"
+    },
+    {
+      "id": "C5a-r4-H1",
+      "review": "C5a adversarial review, recheck 4",
+      "severity": "HIGH",
+      "summary": "Feature-off restart forgot a rowless blocked barrier.",
+      "mac": [
+        "a_rowless_blocked_barrier_survives_restart_with_the_feature_off",
+        "a_marker_left_by_a_crash_keeps_the_restart_blocked"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r5-H1",
+      "review": "C5a adversarial review, recheck 5",
+      "severity": "HIGH",
+      "summary": "Crash before marker commit lost an already observed inventory obligation.",
+      "mac": [
+        "a_crash_after_the_blocking_verdict_cannot_lose_the_obligation",
+        "a_crash_inside_the_pass_keeps_the_restart_reconciling",
+        "the_retry_arms_before_each_pass"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r5-H2",
+      "review": "C5a adversarial review, recheck 5",
+      "severity": "HIGH",
+      "summary": "An unsupported backend cleared a rowless marker without inventory.",
+      "mac": [
+        "a_backend_without_checkpoints_cannot_clear_a_rowless_barrier",
+        "back_on_a_checkpoint_backend_a_clean_inventory_clears_the_marker"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r6-H1",
+      "review": "C5a adversarial review, recheck 6",
+      "severity": "HIGH",
+      "summary": "Restart admitted Create beside a failed capture with retained artifacts.",
+      "mac": [
+        "a_failed_capture_with_a_retained_artifact_keeps_the_restart_blocked",
+        "a_runtime_retained_verdict_survives_a_restart_with_or_without_its_marker",
+        "a_deleting_failed_capture_with_its_original_token_blocks"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r6-N1",
+      "review": "C5a adversarial review, recheck 6",
+      "severity": "LOW",
+      "summary": "The checkpoint retry could not clear its own shared admission latch after successful removal.",
+      "mac": [
+        "a_clean_retry_reopens_only_the_barriers_own_block"
+      ],
+      "vm": null,
+      "classification": "observation"
+    },
+    {
+      "id": "C5a-r7-H1",
+      "review": "C5a adversarial review, recheck 7",
+      "severity": "HIGH",
+      "summary": "A capture failure after a pass snapshot survived a stale clear.",
+      "mac": [
+        "a_capture_that_fails_after_the_pass_snapshot_must_not_clear",
+        "a_ready_row_deleted_after_the_pass_snapshot_must_not_clear",
+        "a_refused_clear_is_followed_by_a_clean_one"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r7-J1",
+      "review": "C5a adversarial review, recheck 7",
+      "severity": "LOW",
+      "summary": "A sealed quarantined row explains an inventory ID without validating replacement content.",
+      "mac": [
+        "authoritative_inspect_results_still_quarantine"
+      ],
+      "vm": null,
+      "disposition": "accepted",
+      "reason": "A sealed quarantine retains S and refuses forks; tracked bindings remain checked and Delete requires exact absence.",
+      "classification": "observation"
+    },
+    {
+      "id": "C5a-r7-J2",
+      "review": "C5a adversarial review, recheck 7",
+      "severity": "LOW",
+      "summary": "Release wakes can re-drive another retained row before its individual backoff.",
+      "mac": [
+        "removal_retries_busy_and_unavailable_until_absent_keeping_the_charge"
+      ],
+      "vm": null,
+      "disposition": "accepted",
+      "reason": "Allocation is blocked and finite release wakes bound the extra work; a retained verdict does not itself wake the retry.",
+      "gap": "No direct pacing regression pins the documented bound or distinguishes global release wakes from a per-row one-minute promise.",
+      "classification": "observation"
+    },
+    {
+      "id": "C5a-r7-VM-gap",
+      "review": "C5a adversarial review, recheck 7",
+      "severity": "MEDIUM",
+      "summary": "Orderly VM shutdown did not exercise blocked restart with retained real-helper artifacts.",
+      "mac": [
+        "a_failed_capture_with_a_retained_artifact_keeps_the_restart_blocked"
+      ],
+      "vm": "planned:C6b:V2/V3/V4/V17",
+      "gap": "The fake covers row and barrier logic; real process-crash residue and blocked restart have not been demonstrated by the existing VM engine test.",
+      "classification": "observation"
+    },
+    {
+      "id": "C5a-r8-H1",
+      "review": "C5a adversarial review, recheck 8",
+      "severity": "HIGH",
+      "summary": "A tracked capture failure after a clean clear did not globally re-arm allocation.",
+      "mac": [
+        "after_a_clean_clear_create_is_admitted_beside_a_tracked_failed_capture",
+        "after_a_clean_clear_create_is_admitted_beside_a_retrying_deleting_row"
+      ],
+      "vm": null,
+      "disposition": "accepted",
+      "reason": "The invariant ruling permits runtime overlap while cleanup is owned and charge retained; stale in-flight pass clears and ownership loss still block."
+    },
+    {
+      "id": "C5a-ruling-G1",
+      "review": "C5a adversarial review, invariant ruling",
+      "severity": "MEDIUM",
+      "summary": "A failed failure-record write lost capture cleanup tracking and left admission open.",
+      "mac": [
+        "a_failed_failure_write_arms_and_the_barrier_adopts_the_capture"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-ruling-G2",
+      "review": "C5a adversarial review, invariant ruling",
+      "severity": "LOW",
+      "summary": "Supervisor panic lacked an exit guard and could lose cleanup ownership.",
+      "mac": [
+        "a_panicking_supervisor_arms_the_barrier_and_leaves_no_entry"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a-r9-N1",
+      "review": "C5a adversarial review, recheck 9",
+      "severity": "LOW",
+      "summary": "Simultaneous supervisor exits would need atomic ownership checks in a multi-thread embedding.",
+      "mac": [
+        "of_two_supervisors_leaving_the_later_sees_the_earlier_gone_and_arms",
+        "supervisors_leaving_on_two_threads_always_arm_once_neither_owns_the_row"
+      ],
+      "vm": null,
+      "classification": "observation"
+    },
+    {
+      "id": "C5a2-H1",
+      "review": "C5a2 adversarial review",
+      "severity": "HIGH",
+      "summary": "Restart discarded final restore outcomes and stranded sandbox reservations.",
+      "mac": [
+        "a_crash_after_the_copy_and_before_ready_compensates_the_exact_backend_at_startup",
+        "a_crash_after_known_not_created_releases_the_reservation_at_startup",
+        "a_crash_between_each_settlement_write_and_the_pin_release_recovers"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-H2",
+      "review": "C5a2 adversarial review",
+      "severity": "HIGH",
+      "summary": "Fork admission allocated after the global barrier was raised.",
+      "mac": [
+        "allocation_barrier_raised_during_fork_preflight_blocks_reservation",
+        "allocation_barrier_raised_during_a_create_or_capture_preflight_blocks_it"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-H3",
+      "review": "C5a2 adversarial review",
+      "severity": "HIGH",
+      "summary": "Caller Exec argv impersonated a privileged checkpoint worker.",
+      "mac": [
+        "exec_argv_cannot_impersonate_a_checkpoint_worker",
+        "only_kiln_s_own_grammar_names_an_artifact",
+        "only_the_trusted_kiln_image_with_a_stable_start_is_evidence"
+      ],
+      "vm": [
+        "c5a2_vm_fork"
+      ]
+    },
+    {
+      "id": "C5a2-M1",
+      "review": "C5a2 adversarial review",
+      "severity": "MEDIUM",
+      "summary": "Durable fork failures lost their typed reason.",
+      "mac": [
+        "not_created_fails_definitely_and_releases_the_pin",
+        "stored_fork_failures_keep_the_returned_token"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-M2",
+      "review": "C5a2 adversarial review",
+      "severity": "MEDIUM",
+      "summary": "Restore-proven corruption left the checkpoint READY.",
+      "mac": [
+        "restore_detected_corruption_quarantines_the_checkpoint"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-r1-H1",
+      "review": "C5a2 adversarial review, recheck 1",
+      "severity": "HIGH",
+      "summary": "Checkpoint ABSENT discarded an orphan fork settlement handle.",
+      "mac": [
+        "checkpoint_absent_before_the_pass_still_settles_a_kept_fork",
+        "a_crash_at_each_step_after_absent_released_the_pin_recovers"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-r1-M1",
+      "review": "C5a2 adversarial review, recheck 1",
+      "severity": "MEDIUM",
+      "summary": "Dead-epoch startup retained an untyped keyed fork failure.",
+      "mac": [
+        "a_dead_epoch_fork_at_startup_keeps_its_token_for_a_keyed_retry"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-r1-M2",
+      "review": "C5a2 adversarial review, recheck 1",
+      "severity": "MEDIUM",
+      "summary": "An orphan path released a reservation while its recorded backend still ran.",
+      "mac": [
+        "an_orphan_with_a_recorded_backend_is_compensated_not_failed"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-r1-M3",
+      "review": "C5a2 adversarial review, recheck 1",
+      "severity": "MEDIUM",
+      "summary": "Settlement write failures were treated as a clean pass.",
+      "mac": [
+        "a_failed_settlement_write_keeps_allocation_blocked"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-r1-L1",
+      "review": "C5a2 adversarial review, recheck 1",
+      "severity": "LOW",
+      "summary": "Worker argv parser accepted command lines kiln refuses.",
+      "mac": [
+        "kiln_refused_command_lines_name_nothing"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-r2-M1",
+      "review": "C5a2 adversarial review, recheck 2",
+      "severity": "MEDIUM",
+      "summary": "Startup published a recorded fork that settlement deliberately kept blocked.",
+      "mac": [
+        "startup_does_not_promote_a_kept_recorded_backend_fork"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-r2-M2",
+      "review": "C5a2 adversarial review, recheck 2",
+      "severity": "MEDIUM",
+      "summary": "Fork publication compensation stored an untyped keyed failure.",
+      "mac": [
+        "failed_fork_publication_keeps_a_typed_failure_for_keyed_retry",
+        "a_failed_fork_backend_write_keeps_a_typed_failure_for_keyed_retry"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-r2-L1",
+      "review": "C5a2 adversarial review, recheck 2",
+      "severity": "LOW",
+      "summary": "Worker parser differed from kiln clap grammar at signed-zero, empty and non-UTF-8 edges.",
+      "mac": [
+        "kiln_s_clap_edges_and_capture_s_required_options"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5a2-r2-L2",
+      "review": "C5a2 adversarial review, recheck 2",
+      "severity": "LOW",
+      "summary": "Required capture options and CREATING-fork retention lacked direct mutation guards.",
+      "mac": [
+        "kiln_s_clap_edges_and_capture_s_required_options",
+        "retention_keeps_a_creating_fork_s_released_pin_and_checkpoint"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5b1-M1",
+      "review": "C5b1 adversarial review",
+      "severity": "MEDIUM",
+      "summary": "Canceled fork requests still crossed durable admission.",
+      "mac": [
+        "a_fork_canceled_before_admission_leaves_nothing",
+        "an_ordinary_create_still_completes_after_its_caller_departs"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5b1-M2",
+      "review": "C5b1 adversarial review",
+      "severity": "MEDIUM",
+      "summary": "Small list pages scanned all retained history.",
+      "mac": [
+        "every_list_shape_searches_its_index_at_retained_history_scale"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5b1-L1",
+      "review": "C5b1 adversarial review",
+      "severity": "LOW",
+      "summary": "CLI checkpoint listing failed under valid page caps below 100.",
+      "mac": [
+        "checkpoint_ls_finds_a_page_under_any_valid_cap",
+        "a_page_above_the_cap_is_refused_with_the_shared_message"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5b2-H1",
+      "review": "C5b2 adversarial review",
+      "severity": "HIGH",
+      "summary": "A reconnect let checkpoint Create bypass its feature check.",
+      "mac": [
+        "a_replaced_daemon_never_receives_a_checked_create",
+        "health_then_create_share_one_connection",
+        "a_create_that_ignored_the_checkpoint_fails_and_keeps_the_sandbox",
+        "a_connection_lost_after_create_was_sent_reports_an_unknown_outcome"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5b2-M1",
+      "review": "C5b2 adversarial review",
+      "severity": "MEDIUM",
+      "summary": "New-work storage probe failures also blocked Delete and cleanup.",
+      "mac": [
+        "a_delete_proceeds_while_a_new_work_probe_is_withdrawn",
+        "an_expiry_proceeds_while_a_new_work_probe_is_withdrawn",
+        "startup_cleanup_proceeds_while_a_new_work_probe_is_withdrawn",
+        "an_older_helper_keeps_the_broad_removal_gate",
+        "a_failed_storage_probe_keeps_removal_supported"
+      ],
+      "vm": [
+        "c5b2_vm_discovery"
+      ]
+    },
+    {
+      "id": "C5b2-L1",
+      "review": "C5b2 adversarial review",
+      "severity": "LOW",
+      "summary": "Health omitted an accounting-quarantined checkpoint charge.",
+      "mac": [
+        "wrong_epoch_facts_past_the_triggers_are_caught_by_the_audits"
+      ],
+      "vm": null
+    },
+    {
+      "id": "C5b2-r1-M1",
+      "review": "C5b2 adversarial review, recheck 1",
+      "severity": "MEDIUM",
+      "summary": "Run cleanup could report nothing sent after Exec reached the daemon.",
+      "mac": [
+        "run_keeps_an_unknown_exec_outcome_when_cleanup_finds_the_connection_lost",
+        "run_reports_exec_first_and_cleanup_second"
+      ],
+      "vm": null
+    }
+  ]
+}
