@@ -754,3 +754,5 @@ mod api;
 #[path = "checkpoint_vm_harness.rs"]
 mod harness;
 
+#[path = "checkpoint_vm_crash.rs"]
+mod crash;
