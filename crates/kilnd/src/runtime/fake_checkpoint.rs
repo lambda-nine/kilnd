@@ -60,8 +60,12 @@ pub enum FakeRestore {
 pub struct FakeCheckpoints {
     /// `kilnd-helper --enable-checkpoints`.
     pub enabled: bool,
-    /// The CLI grants leases and lists format 1.
+    /// The CLI grants leases and lists format 1, and the host passes the storage
+    /// probes.
     pub supported: bool,
+    /// The CLI lists format 1 and checks generations on removal (`false`: an older
+    /// helper, or a kiln without generation-checked removal).
+    pub removal_supported: bool,
     pub epoch: Id128,
     pub boot: Id128,
     /// Per source backend ID; absent means a capable `alpine` run.
@@ -138,6 +142,7 @@ impl Default for FakeCheckpoints {
         Self {
             enabled: true,
             supported: true,
+            removal_supported: true,
             epoch: Id128::random(),
             boot: Id128::random(),
             sources: BTreeMap::new(),
@@ -394,6 +399,7 @@ impl FakeRuntime {
                             cleanup_workers_busy: 0,
                             untracked_workers: 0,
                             storage: group.storage,
+                            removal_supported: group.removal_supported,
                         },
                     )));
                 }

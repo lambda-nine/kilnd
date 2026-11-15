@@ -162,6 +162,12 @@ pub struct CheckpointCapabilities {
     /// be read: capacity unknown.
     #[serde(default)]
     pub storage: Option<StorageFree>,
+    /// The installed kiln lists format 1 and checks generations on removal: what
+    /// removal and inventory need, whatever new work's storage probes found (C5b-2
+    /// adversarial review MEDIUM 1). Absent from an older helper, so false: the daemon
+    /// then removes only under `supported`, as before.
+    #[serde(default)]
+    pub removal_supported: bool,
 }
 
 /// `statvfs` `f_bavail * f_frsize` of kiln's runs filesystem and of the filesystem

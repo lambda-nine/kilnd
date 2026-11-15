@@ -647,21 +647,22 @@ impl<R: Runtime> Manager<R> {
         }
     }
 
-    /// The helper group's epoch and boot, from `capabilities`. A disabled group or a
-    /// kiln without leases refuses before anything is reserved.
+    /// The helper group's epoch and boot for maintenance, from `capabilities`. A
+    /// disabled group or a kiln without generation-checked removal refuses.
     pub(super) async fn checkpoint_session(&self) -> Result<Session> {
         self.checkpoint_session_with(&self.shutting_down.child_token())
             .await
     }
 
     /// As [`Self::checkpoint_session`], canceled by `cancel`. Maintenance (removal,
-    /// reconciliation) needs only the session; new work also needs the format and the
-    /// capacity checks (`capacity::new_work`).
+    /// reconciliation, fork settlement) needs only the session, under its own gate
+    /// (`capacity::maintenance_session`); new work also needs the format, the storage
+    /// probes and the capacity checks (`capacity::new_work`).
     async fn checkpoint_session_with(&self, cancel: &CancellationToken) -> Result<Session> {
         let caps = self
             .checkpoint_caps(Instant::now() + HELPER_QUICK_TIMEOUT, cancel)
             .await?;
-        capacity::session_of(&caps)
+        capacity::maintenance_session(&caps)
     }
 
     /// The source run's image identity, from its own records (C5a `source`). Only a

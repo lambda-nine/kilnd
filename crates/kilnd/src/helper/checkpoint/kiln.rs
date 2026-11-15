@@ -24,7 +24,18 @@ pub const FEATURE_CHECKPOINT_LEASE: u32 = 0x40;
 pub const WORKER_OUTPUT: usize = 1 << 20;
 
 pub type WorkerFuture = Pin<Box<dyn Future<Output = io::Result<Outcome>> + Send>>;
-pub type SupportFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+pub type SupportFuture = Pin<Box<dyn Future<Output = Support> + Send>>;
+
+/// What the installed kiln and host support (design 6.3 and 7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Support {
+    /// kiln lists format 1 and checks generations on removal: enough for removal and
+    /// inventory.
+    pub removal: bool,
+    /// New captures and restores: removal's checks, kiln's leases, XFS with project
+    /// quotas at runs and a trustworthy registry; or the first that failed.
+    pub new_work: Result<(), String>,
+}
 
 /// One live process's arguments, for the untracked-worker scan: only a process running
 /// the trusted kiln executable whose arguments read an artifact (see [`process_table`]).
@@ -69,7 +80,7 @@ pub trait Workers: Send + Sync + 'static {
     fn run(&self, args: KilnArgs, deadline: Instant, cancel: CancellationToken) -> WorkerFuture;
     /// Every live process's arguments. An error means no absence can be certified.
     fn processes(&self) -> io::Result<Vec<ProcessArgs>>;
-    /// Whether the installed CLI grants leases and lists the artifact namespace.
+    /// What the installed CLI and the host support ([`Support`]).
     fn support(&self, deadline: Instant, cancel: CancellationToken) -> SupportFuture;
     /// One of a run's own metadata records ([`read_run_record`]), never the image.
     fn run_record(&self, backend_id: &str, record: RunRecord) -> io::Result<RecordRead>;
@@ -127,6 +138,12 @@ impl KilnWorkers {
         self.runs = runs;
         self
     }
+
+    /// Another image registry root, for tests (only the trust probe reads it).
+    pub fn with_registry_root(mut self, registry: PathBuf) -> Self {
+        self.registry = registry;
+        self
+    }
 }
 
 impl Workers for KilnWorkers {
@@ -171,50 +188,60 @@ impl Workers for KilnWorkers {
             Ok(())
         };
         Box::pin(async move {
-            storage?;
             let core = kilnd_exec_core::runtime::kiln_direct::DirectKiln::new(&bin, &cgroup_root);
-            let caps = core
-                .capabilities(None, deadline, &cancel)
+            let leases = match core.capabilities(None, deadline, &cancel).await {
+                Ok(caps) if caps.features & FEATURE_CHECKPOINT_LEASE != 0 => Ok(()),
+                Ok(_) => Err("the installed kiln does not grant checkpoint leases".to_string()),
+                Err(e) => Err(format!("kiln capabilities: {e}")),
+            };
+            // Removal and inventory need only these two, never the storage probes or
+            // leases (C5b-2 adversarial review MEDIUM 1): a host that lost its project
+            // quota still removes what it holds.
+            let removal = async {
+                let out = process::run(
+                    &process::Request {
+                        tool: process::Tool::Kiln {
+                            bin: &bin,
+                            args: &KilnArgs::checkpoint_ls(),
+                        },
+                        stdin: b"",
+                        deadline,
+                        max_output: WORKER_OUTPUT,
+                    },
+                    &cancel,
+                )
                 .await
-                .map_err(|e| format!("kiln capabilities: {e}"))?;
-            if caps.features & FEATURE_CHECKPOINT_LEASE == 0 {
-                return Err("the installed kiln does not grant checkpoint leases".into());
+                .map_err(|e| format!("kiln checkpoint ls: {e}"))?;
+                let text = success_stdout(&out).ok_or("kiln checkpoint ls failed")?;
+                parse_inventory(text)?;
+                // Removal must be generation-checked: an older kiln would delete any
+                // generation published under the name.
+                let out = process::run(
+                    &process::Request {
+                        tool: process::Tool::Kiln {
+                            bin: &bin,
+                            args: &KilnArgs::checkpoint_rm_help(),
+                        },
+                        stdin: b"",
+                        deadline,
+                        max_output: WORKER_OUTPUT,
+                    },
+                    &cancel,
+                )
+                .await
+                .map_err(|e| format!("kiln checkpoint rm --help: {e}"))?;
+                match success_stdout(&out) {
+                    Some(help) if help.contains("--generation") => Ok(()),
+                    _ => Err(
+                        "the installed kiln's checkpoint rm does not check generations".to_string(),
+                    ),
+                }
             }
-            let out = process::run(
-                &process::Request {
-                    tool: process::Tool::Kiln {
-                        bin: &bin,
-                        args: &KilnArgs::checkpoint_ls(),
-                    },
-                    stdin: b"",
-                    deadline,
-                    max_output: WORKER_OUTPUT,
-                },
-                &cancel,
-            )
-            .await
-            .map_err(|e| format!("kiln checkpoint ls: {e}"))?;
-            let text = success_stdout(&out).ok_or("kiln checkpoint ls failed")?;
-            parse_inventory(text)?;
-            // Removal must be generation-checked: an older kiln would delete any
-            // generation published under the name.
-            let out = process::run(
-                &process::Request {
-                    tool: process::Tool::Kiln {
-                        bin: &bin,
-                        args: &KilnArgs::checkpoint_rm_help(),
-                    },
-                    stdin: b"",
-                    deadline,
-                    max_output: WORKER_OUTPUT,
-                },
-                &cancel,
-            )
-            .await
-            .map_err(|e| format!("kiln checkpoint rm --help: {e}"))?;
-            match success_stdout(&out) {
-                Some(help) if help.contains("--generation") => Ok(()),
-                _ => Err("the installed kiln's checkpoint rm does not check generations".into()),
+            .await;
+            Support {
+                removal: removal.is_ok(),
+                // The storage verdict first, as before.
+                new_work: storage.and(leases).and(removal),
             }
         })
     }

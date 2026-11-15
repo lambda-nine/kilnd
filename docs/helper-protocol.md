@@ -334,9 +334,20 @@ runs is not on a loop device). The daemon treats either as unknown capacity: Hea
 withdraws `FEATURE_WORKSPACE_CHECKPOINT` and new captures and forks are refused
 `UNAVAILABLE checkpoint_io`.
 
-**Mixed versions.** `storage` is optional on the wire (`#[serde(default)]`) and the group
-version is unchanged. A newer daemon reading an older helper's reply sees no `storage`:
-capacity unknown, so it fails closed as above. An older daemon (C5b-1) reading a newer
+**Removal support (C5b-2 round 1).** `removal_supported` is true when the CLI lists `kiln
+checkpoint ls` format 1 and checks generations on removal: all that `remove` and
+`inventory` need. It ignores the probes only new work needs (leases, XFS, project quotas,
+registry trust, `storage`), which the helper now runs independently of it, so a host that
+loses its project quota or registry trust still removes what it holds. The daemon removes,
+takes its inventory and settles interrupted forks while the group is enabled, its epoch
+is known and `removal_supported` is true; it admits new work only under `supported` and
+the capacity checks, as before.
+
+**Mixed versions.** `storage` and `removal_supported` are optional on the wire
+(`#[serde(default)]`) and the group version is unchanged. A newer daemon reading an older
+helper's reply sees no `storage`: capacity unknown, so it fails closed as above. It sees
+`removal_supported: false` too, and then removes only under `supported`, the gate it
+had before (never wider). An older daemon (C5b-1) reading a newer
 helper's reply refuses it (`deny_unknown_fields`), so its checkpoint calls fail and it
 captures and forks nothing; maintenance retries, as for an unreachable helper. The daemon
 and helper ship together and no release enables checkpoints, so this also fails closed.
@@ -350,7 +361,7 @@ before its future returns).
 
 | Operation | Budget | Lane | Does |
 | --- | --- | --- | --- |
-| `capabilities` | 5 s | recovery | Group version, this helper's epoch and boot ID, whether checkpoints are supported (below), limits, workers in use, untracked workers, and `storage` (below) |
+| `capabilities` | 5 s | recovery | Group version, this helper's epoch and boot ID, whether checkpoints are supported and whether removal is (below), limits, workers in use, untracked workers, and `storage` (below) |
 | `capture {binding}` | 300 s | copy | `kiln checkpoint capture` for `{target, operation nonce, source backend, R}`: `complete {evidence}`, `failed {reason, detail}` or `pending` |
 | `restore {target, content_sha256, reader, spec}` | 300 s | copy | `kiln checkpoint inspect` (same generation and content digest), then `kiln create --from-checkpoint`: `created`, `not_created` or `ambiguous`, each with the reader's evidence |
 | `inspect {target, verify, operation?}` | 30 s (300 s with `verify`) | cleanup (copy) | The namespace's view of the artifact, this epoch's activity on it, and an operation nonce's state |

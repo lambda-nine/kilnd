@@ -724,3 +724,150 @@ async fn concurrent_admissions_cannot_share_headroom() {
     free(&fake, h + S, h + S);
     capture_sized(&s, &a.id, S, 1000).await.unwrap();
 }
+
+// --- Removal while new work is withdrawn (C5b-2 round 1) ------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Removal {
+    Delete,
+    Expiry,
+    Startup,
+}
+
+/// C5b-2 adversarial review MEDIUM 1 (the review's PoC, extended). A failed new-work
+/// probe (runs not XFS, no project quota, an untrusted registry, free space unknown)
+/// withdraws the feature and refuses captures and forks, but removal keeps its own
+/// gate (the group, its epoch, a kiln that lists format 1 and checks generations): a
+/// Delete, an expiry and startup cleanup each reach DELETED with the charge released,
+/// while each probe is withdrawn in turn.
+async fn removal_while_withdrawn(how: Removal) {
+    type Break = fn(&mut FakeCheckpoints);
+    let probes: [(&str, Break); 4] = [
+        ("runs is not XFS", |g| {
+            g.supported = false;
+            g.unsupported_reason = "/var/lib/kiln/runs is not XFS (f_type 0x9123683e)";
+        }),
+        ("no project quota", |g| {
+            g.supported = false;
+            g.unsupported_reason = "/var/lib/kiln/runs is mounted without project quotas";
+        }),
+        ("an untrusted registry", |g| {
+            g.supported = false;
+            g.unsupported_reason = "kiln's image registry is writable by group or others";
+        }),
+        ("free space unknown", |g| g.storage = None),
+    ];
+    let (_tmp, dir, m, fake, clock) = persistent().await;
+    let mut m = restart_with(m, &dir, &fake, &clock, fresh_limits()).await;
+    let src = api_source(&api(&m), 1000).await;
+    let released =
+        |m: &M, id: &str| row(m, id).state == CheckpointState::Deleted && charge(m) == (0, 0);
+    for (what, broken) in probes {
+        let s = api(&m);
+        let c = api_capture(&s, &src.id, 1000).await.unwrap();
+        let removals = calls(&fake, "remove");
+        match how {
+            Removal::Delete => {
+                fake.checkpoints(broken);
+                refuses_new_work(&s, &fake, &src.id, &c.id, what).await;
+                let deleted = api_delete(&s, &c.id, 1000).await.unwrap();
+                assert_eq!(state(&deleted), pb::CheckpointState::Deleted, "{what}");
+                assert!(released(&m, &c.id), "{what}");
+            }
+            Removal::Expiry => {
+                fake.checkpoints(broken);
+                refuses_new_work(&s, &fake, &src.id, &c.id, what).await;
+                clock.advance(86_400 * SEC + SEC);
+                m.expire_checkpoints_due();
+                until("the expiry's release", || released(&m, &c.id)).await;
+            }
+            Removal::Startup => {
+                // A Delete the helper could not serve, resumed by the next start while
+                // the probe is withdrawn.
+                fake.checkpoints(|g| g.unavailable = true);
+                assert!(api_delete(&s, &c.id, 1000).await.is_err(), "{what}");
+                assert_eq!(row(&m, &c.id).state, CheckpointState::Deleting, "{what}");
+                assert!(charge(&m).1 > 0, "{what}: DELETING keeps its charge");
+                drop(s);
+                m.begin_shutdown();
+                m.drain_operations().await;
+                drop(m);
+                fake.checkpoints(|g| g.unavailable = false);
+                fake.checkpoints(broken);
+                m = on_disk(&dir, &fake, &clock, &fresh_limits());
+                startup(&m).await;
+                until("startup cleanup's release", || released(&m, &c.id)).await;
+            }
+        }
+        assert_eq!(calls(&fake, "remove"), removals + 1, "{what}: one Remove");
+        // New work is still refused, typed as before.
+        let s = api(&m);
+        assert!(!advertised(&health(&s, 1000).await), "{what}: advertised");
+        let (code, token) = if what == "free space unknown" {
+            (Code::Unavailable, "checkpoint_io")
+        } else {
+            (Code::FailedPrecondition, SANDBOX_UNSUPPORTED)
+        };
+        refused(
+            &api_capture(&s, &src.id, 1000).await.unwrap_err(),
+            code,
+            token,
+        );
+        fake.checkpoints(heal);
+    }
+}
+
+#[tokio::test]
+async fn a_delete_proceeds_while_a_new_work_probe_is_withdrawn() {
+    removal_while_withdrawn(Removal::Delete).await;
+}
+
+#[tokio::test]
+async fn an_expiry_proceeds_while_a_new_work_probe_is_withdrawn() {
+    removal_while_withdrawn(Removal::Expiry).await;
+}
+
+#[tokio::test]
+async fn startup_cleanup_proceeds_while_a_new_work_probe_is_withdrawn() {
+    removal_while_withdrawn(Removal::Startup).await;
+}
+
+/// The feature is withdrawn, and a capture and a fork are refused with nothing sent.
+async fn refuses_new_work(s: &Api, fake: &FakeRuntime, source: &str, ready: &str, what: &str) {
+    assert!(!advertised(&health(s, 1000).await), "{what}: advertised");
+    let captures = calls(fake, "capture");
+    assert!(
+        api_capture(s, source, 1000).await.is_err(),
+        "{what}: captured"
+    );
+    assert!(api_fork(s, ready, 1000).await.is_err(), "{what}: forked");
+    assert_eq!(calls(fake, "capture"), captures, "{what}");
+}
+
+/// An older helper does not send `removal_supported`: removal keeps the broad gate it
+/// had (fail closed). Delete records its intent, sends no Remove and keeps the charge;
+/// it completes once the probe passes again.
+#[tokio::test]
+async fn an_older_helper_keeps_the_broad_removal_gate() {
+    let (m, fake, _, s) = ready_engine().await;
+    let src = api_source(&s, 1000).await;
+    let checkpoint = api_capture(&s, &src.id, 1000).await.unwrap();
+    let charged = charge(&m);
+    let removals = calls(&fake, "remove");
+    fake.checkpoints(|g| {
+        g.removal_supported = false;
+        g.supported = false;
+        g.unsupported_reason = "/var/lib/kiln/runs is mounted without project quotas";
+    });
+    let error = api_delete(&s, &checkpoint.id, 1000).await.unwrap_err();
+    refused(&error, Code::FailedPrecondition, SANDBOX_UNSUPPORTED);
+    assert_eq!(calls(&fake, "remove"), removals, "Remove was never sent");
+    assert_eq!(charge(&m), charged, "the checkpoint remains charged");
+    assert_eq!(
+        state(&api_get(&s, &checkpoint.id, 1000).await.unwrap()),
+        pb::CheckpointState::Deleting
+    );
+    fake.checkpoints(heal);
+    until("the retried removal", || charge(&m) == (0, 0)).await;
+    assert_eq!(row(&m, &checkpoint.id).state, CheckpointState::Deleted);
+}

@@ -149,8 +149,13 @@ struct HelperProcess {
 }
 
 fn start_helper(socket: &std::path::Path) -> HelperProcess {
+    start_helper_with(socket, KilnWorkers::new(kiln_bin().into()))
+}
+
+/// A private helper with these workers (C5b-2 round 1: another registry root).
+fn start_helper_with(socket: &std::path::Path, workers: KilnWorkers) -> HelperProcess {
     let listener = tokio::net::UnixListener::bind(socket).unwrap();
-    let node = Node::new(Arc::new(KilnWorkers::new(kiln_bin().into()))).unwrap();
+    let node = Node::new(Arc::new(workers)).unwrap();
     let stop = CancellationToken::new();
     let task = tokio::spawn(crate::helper::serve_with_groups(
         listener,

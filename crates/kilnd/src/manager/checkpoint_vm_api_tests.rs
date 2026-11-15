@@ -477,6 +477,41 @@ async fn run_discovery() {
     let f3 = ok(&bin, &socket, OWNER, &["create", "--from-checkpoint", &cp]).await.trim().to_string();
     eprintln!("C5b-2 VM 5 PASS: withdrawn without the helper's group, re-advertised with it");
 
+    // 6. Removal while a new-work-only probe is withdrawn (C5b-2 adversarial review
+    // MEDIUM 1): the private helper restarted with its image registry root at a private
+    // directory writable by others, which fails registry trust. The feature is withdrawn
+    // and a capture refused, but `checkpoint rm` still removes, and its charge goes.
+    stop_helper(helper).await;
+    std::fs::remove_file(&helper_socket).ok();
+    let untrusted = tempfile::tempdir_in(tmp.path()).unwrap();
+    std::fs::set_permissions(untrusted.path(), std::os::unix::fs::PermissionsExt::from_mode(0o777))
+        .unwrap();
+    helper = start_helper_with(
+        &helper_socket,
+        KilnWorkers::new(kiln_bin().into()).with_registry_root(untrusted.path().into()),
+    );
+    let (code, h) = health_text(&p, OWNER).await;
+    assert_eq!(code, 0, "still serving: {h}");
+    assert!(!line(&h, "features:").contains("workspace_checkpoint"), "{h}");
+    assert!(line(&h, "detail:").contains("registry"), "{h}");
+    let (code, _, stderr) = ctl(&bin, &socket, OWNER, &["checkpoint", "create", &src]).await;
+    assert_eq!(code, 1);
+    assert!(stderr.contains("sandbox_unsupported:workspace_checkpoint"), "{stderr}");
+    let last = mine_cps.pop().unwrap();
+    let charged_before = charged(&m);
+    let out = ok(&bin, &socket, OWNER, &["checkpoint", "rm", &last]).await;
+    assert_eq!(out.trim(), format!("{last} deleted"));
+    assert_eq!(charged(&m).0, charged_before.0 - 1, "its charge was released");
+    let (_, h) = health_text(&p, OWNER).await;
+    assert!(line(&h, "checkpoints:").contains("node 4/128"), "{h}");
+    stop_helper(helper).await;
+    std::fs::remove_file(&helper_socket).ok();
+    drop(untrusted);
+    helper = start_helper(&helper_socket);
+    let (_, h) = health_text(&p, OWNER).await;
+    assert!(line(&h, "features:").contains("workspace_checkpoint"), "re-advertised: {h}");
+    eprintln!("C5b-2 VM 6a PASS: registry trust withdrawn; capture refused; {last} deleted");
+
     // 6. Delete: the checkpoint goes, the forks stay, the stats follow.
     for c in &mine_cps {
         let out = ok(&bin, &socket, OWNER, &["checkpoint", "rm", c]).await;

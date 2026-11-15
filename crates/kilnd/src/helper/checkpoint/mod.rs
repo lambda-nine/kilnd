@@ -1315,13 +1315,14 @@ impl Node {
             helper_epoch: Some(self.epoch),
             boot_id: Some(self.boot_id),
             format_version: crate::checkpoint::FORMAT_VERSION,
-            supported: support.is_ok(),
-            unsupported_reason: support.err(),
+            supported: support.new_work.is_ok(),
+            unsupported_reason: support.new_work.err(),
             limits: limits(),
             copy_workers_busy: busy(&self.copy, COPY_WORKERS),
             cleanup_workers_busy: busy(&self.cleanup, CLEANUP_WORKERS),
             untracked_workers: u32::try_from(untracked).unwrap_or(u32::MAX),
             storage: self.workers.storage(),
+            removal_supported: support.removal,
         }))
     }
 }
@@ -1377,6 +1378,7 @@ pub fn disabled(operation: &CheckpointOperation) -> CheckpointResponse {
                 cleanup_workers_busy: 0,
                 untracked_workers: 0,
                 storage: None,
+                removal_supported: false,
             }))
         }
         _ => error(

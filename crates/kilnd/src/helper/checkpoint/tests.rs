@@ -56,6 +56,8 @@ struct Fake {
     published: Mutex<HashMap<String, u64>>,
     /// The runs directory the real record reader reads; `None`: unreadable.
     runs: Mutex<Option<PathBuf>>,
+    /// What `support` answers; `None`: everything supported.
+    support: Mutex<Option<kiln::Support>>,
 }
 
 fn kind(argv: &[String]) -> &'static str {
@@ -269,7 +271,17 @@ impl kiln::Workers for Workers {
             .ok_or_else(|| io::Error::other("no process table"))
     }
     fn support(&self, _deadline: Instant, _cancel: CancellationToken) -> kiln::SupportFuture {
-        Box::pin(async { Ok(()) })
+        let support = self
+            .0
+            .support
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(kiln::Support {
+                removal: true,
+                new_work: Ok(()),
+            });
+        Box::pin(async move { support })
     }
     fn run_record(&self, backend_id: &str, record: RunRecord) -> io::Result<RecordRead> {
         self.0
@@ -2510,6 +2522,7 @@ fn capabilities_storage_is_optional_and_strict() {
         cleanup_workers_busy: 0,
         untracked_workers: 0,
         storage,
+        removal_supported: true,
     };
     let new = reply(Some(StorageFree {
         runs_free_bytes: 1 << 34,
@@ -2525,8 +2538,12 @@ fn capabilities_storage_is_optional_and_strict() {
     );
     let mut old: serde_json::Value = serde_json::to_value(reply(None)).unwrap();
     old.as_object_mut().unwrap().remove("storage");
+    old.as_object_mut().unwrap().remove("removal_supported");
     let parsed: CheckpointCapabilities = serde_json::from_value(old.clone()).unwrap();
     assert_eq!(parsed.storage, None);
+    // C5b-2 round 1: an older helper does not vouch for removal on its own.
+    assert!(!parsed.removal_supported);
+    assert!(text.contains(r#""removal_supported":true"#));
     old.as_object_mut()
         .unwrap()
         .insert("storagex".into(), serde_json::json!(1));
@@ -2538,7 +2555,10 @@ fn capabilities_storage_is_optional_and_strict() {
     assert!(serde_json::from_str::<CheckpointCapabilities>(&extra).is_err());
     // A disabled helper reports no capacity.
     match disabled(&CheckpointOperation::Capabilities) {
-        CheckpointResponse::Capabilities(caps) => assert_eq!(caps.storage, None),
+        CheckpointResponse::Capabilities(caps) => {
+            assert_eq!(caps.storage, None);
+            assert!(!caps.removal_supported);
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -2586,4 +2606,46 @@ fn a_restored_sandboxs_shim_session_is_not_a_worker() {
         named_artifact(&table[3]),
         Some((i.to_string(), c.to_string()))
     );
+}
+
+/// C5b-2 adversarial review MEDIUM 1, the helper's half: a failed new-work probe
+/// (XFS, project quota, registry trust, leases) clears `supported` with its reason but
+/// keeps `removal_supported`, which only kiln's format-1 listing and generation-checked
+/// removal decide; and a removal still proves absence then.
+#[tokio::test]
+async fn a_failed_storage_probe_keeps_removal_supported() {
+    let (node, fake) = setup();
+    let caps = |node: Arc<Node>| async move {
+        match call(&node, CheckpointOperation::Capabilities).await {
+            CheckpointResponse::Capabilities(caps) => caps,
+            other => panic!("{other:?}"),
+        }
+    };
+    let all = caps(node.clone()).await;
+    assert!(all.supported && all.removal_supported, "{all:?}");
+    for probe in [
+        "/var/lib/kiln/runs is not XFS",
+        "/var/lib/kiln/runs is mounted without project quotas",
+        "kiln's image registry is not a root-owned directory closed to group and others",
+        "the installed kiln does not grant checkpoint leases",
+    ] {
+        *fake.support.lock().unwrap() = Some(kiln::Support {
+            removal: true,
+            new_work: Err(probe.into()),
+        });
+        let c = caps(node.clone()).await;
+        assert!(!c.supported, "{probe}");
+        assert_eq!(c.unsupported_reason.as_deref(), Some(probe));
+        assert!(c.removal_supported, "{probe}: removal withdrawn");
+        assert!(matches!(
+            removed(&call(&node, remove(&other_target(), Id128::random())).await),
+            RemoveReply::Absent { .. }
+        ));
+    }
+    *fake.support.lock().unwrap() = Some(kiln::Support {
+        removal: false,
+        new_work: Err("the installed kiln's checkpoint rm does not check generations".into()),
+    });
+    let c = caps(node.clone()).await;
+    assert!(!c.supported && !c.removal_supported, "{c:?}");
 }

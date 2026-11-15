@@ -62,6 +62,21 @@ pub(super) fn session_of(caps: &CheckpointCapabilities) -> Result<Session> {
     }
 }
 
+/// The helper session for maintenance: removal, the barrier's inventory pass and
+/// interrupted-fork settlement, none of which starts new work (design 11: disablement
+/// is not permission to strand charged objects). It needs the group, its epoch and a
+/// kiln that lists format 1 and checks generations on removal, not new work's storage
+/// probes or leases (C5b-2 adversarial review MEDIUM 1). An older helper does not say
+/// (`removal_supported` false): then [`session_of`]'s broad gate, as before.
+pub(super) fn maintenance_session(caps: &CheckpointCapabilities) -> Result<Session> {
+    match (caps.helper_epoch, caps.boot_id) {
+        (Some(epoch), Some(boot)) if caps.enabled && caps.removal_supported => {
+            Ok(Session { epoch, boot })
+        }
+        _ => session_of(caps),
+    }
+}
+
 /// What a fresh Capabilities answer allows a new capture or fork, with the headroom
 /// sample it is checked against.
 pub(in crate::manager) struct Admission<'a> {
