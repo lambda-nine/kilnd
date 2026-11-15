@@ -42,7 +42,7 @@
 # with anything but registry credentials (token, credential-provider, secret-key and
 # secret-key-subject under [registry] and [registries.NAME]; C6a recheck 4), since Cargo
 # can merge those files as configuration; any CARGO_TARGET_*_RUNNER,
-# CARGO_TARGET_*_LINKER, CARGO_BUILD_*, CARGO_ENV_* or CARGO_ALIAS_*
+# CARGO_TARGET_*_LINKER, CARGO_BUILD_*, CARGO_ENV_*, CARGO_ALIAS_* or CARGO_PROFILE_*
 # variable, set at all; and KILND_BLESS_CHECKPOINT_CONTRACT, which only the ignored
 # bless_checkpoint_contract test, run locally by name, may use. Registry and source
 # replacement settings are inside the trusted toolchain, as cargo, rustc and the crates
@@ -155,6 +155,8 @@ for name in $(awk 'BEGIN { for (name in ENVIRON) print name }'); do
             fi ;;
         CARGO_TARGET_*_RUNNER | CARGO_TARGET_*_LINKER | CARGO_BUILD_* | CARGO_ENV_*)
             refuse "$name is set; build.sh runs cargo in a closed configuration, because a runner or linker can report tests that never ran (C6a recheck 1 HIGH 5). Unset it" ;;
+        CARGO_PROFILE_*)
+            refuse "$name is set; build.sh runs cargo in a closed configuration, because a profile variable changes how the reviewed code is compiled (debug-assertions, opt-level, overflow checks), as the refused [profile] table would. Unset it" ;;
         CARGO_ALIAS_*)
             refuse "$name is set; build.sh runs cargo in a closed configuration, because an alias can replace a command, clippy's lint gate included (C6a recheck 3). Unset it" ;;
         KILND_BLESS_CHECKPOINT_CONTRACT)

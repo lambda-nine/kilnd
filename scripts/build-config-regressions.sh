@@ -24,8 +24,8 @@
 #     before that).
 #  g. C6a recheck 4: a $CARGO_HOME credentials.toml, and separately a credentials, with a
 #     target runner, `[env]`, `include`, `[alias]`, a non-credential key in
-#     `[registries.NAME]` or a non-table `registry`. Credentials of tokens only get past
-#     the check (as in f).
+#     `[registries.NAME]` or a non-table `registry`; CARGO_PROFILE_DEV_DEBUG_ASSERTIONS set.
+#     Credentials of tokens only get past the check (as in f).
 # dependency-gate-regressions.sh runs it for each toolchain.
 set -eu
 toolchain=${1:-}
@@ -198,7 +198,7 @@ refused "a \$CARGO_HOME config of allowed keys only (past the config check)" "$a
     env CARGO_HOME="$include_home" sh scripts/build.sh ${toolchain:+"+$toolchain"} no-such-profile check
 [ "$(sha256 "$golden")" = "$golden_sha" ] || fail "the wire golden's SHA-256 changed"
 
-# g. The credentials files hold registry credentials only.
+# g. The credentials files hold registry credentials only, and no profile variables.
 credentials_home=$scratch/credentials-cargo-home
 mkdir "$credentials_home"
 ln -s "${CARGO_HOME:-$HOME/.cargo}/registry" "$credentials_home/registry"
@@ -216,6 +216,9 @@ for name in credentials.toml credentials; do
     done
     rm "$credentials_home/$name"
 done
+refused "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false" \
+    "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS is set; build.sh runs cargo in a closed configuration" \
+    env CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false sh scripts/build.sh ${toolchain:+"+$toolchain"} default test
 printf '[registry]\ntoken = "x"\n[registries.foo]\ntoken = "y"\n' >"$credentials_home/credentials.toml"
 if python3 -I -c 'import tomllib' 2>/dev/null; then
     allowed_message="no-such-profile is not a profile in dependency-gate.json"

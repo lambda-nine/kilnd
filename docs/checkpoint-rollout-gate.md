@@ -42,8 +42,8 @@ one needs Python 3.11's `tomllib`, and without it the config is refused unread),
 `$CARGO_HOME/credentials` or `credentials.toml`, which Cargo can merge as configuration, with
 anything but `token`, `credential-provider`, `secret-key` and `secret-key-subject` under
 `[registry]` and `[registries.NAME]` (C6a recheck 4, read the same way), and any
-`CARGO_TARGET_*_RUNNER`, `CARGO_TARGET_*_LINKER`, `CARGO_BUILD_*`, `CARGO_ENV_*` or
-`CARGO_ALIAS_*` variable, and it passes a pass-through runner for every
+`CARGO_TARGET_*_RUNNER`, `CARGO_TARGET_*_LINKER`, `CARGO_BUILD_*`, `CARGO_ENV_*`,
+`CARGO_ALIAS_*` or `CARGO_PROFILE_*` variable, and it passes a pass-through runner for every
 target. Registry and source replacement settings stay allowed: like the toolchain's own
 binaries and the crates they fetch, they are inside the trusted toolchain, not something
 `build.sh` proves. It
