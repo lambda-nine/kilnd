@@ -2545,7 +2545,11 @@ async fn b3_04_startup_that_cannot_journal_never_serves_and_leaves_no_workers() 
     fixture.fault("L.record_infrastructure.fail");
     fixture.spawn_helper();
     let error = fixture.root.join("start-error");
-    wait_until("startup gives up", || error.exists()).await;
+    // The fixture writes start-error by creating it, then writing: wait for the text.
+    wait_until("startup gives up", || {
+        std::fs::read_to_string(&error).is_ok_and(|reason| !reason.is_empty())
+    })
+    .await;
     let reason = std::fs::read_to_string(&error).unwrap();
     assert!(reason.contains("no journal row"), "{reason}");
     wait_until("the helper listens", || {
