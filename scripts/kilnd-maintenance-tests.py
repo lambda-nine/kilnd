@@ -1659,6 +1659,45 @@ _os.fsync = _racing_fsync
         self.assertIn('cannot inventory the checkpoint artifacts of kilnd.service',
                       '\n'.join(self.messages))
 
+    def test_a_btrfs_subvolume_with_a_comma_in_its_name_upgrades(self):
+        """Recheck 3 HIGH 2: Btrfs prints subvol= last and leaves commas in it literal."""
+        self.assertFalse(os.path.exists(self.m.CHECKPOINTS_ROOT))
+        self.btrfs_var(root='/@var,archive', subvol='/@var,archive')
+        self.upgrade()
+        self.assertEqual(self.w.images(), {i: 'new' for i in self.m.IMAGES})
+
+    def test_inventory_reads_the_whole_subvol_path_of_a_btrfs_mount(self):
+        instance = self.w.identity('kilnd.service')
+        os.mkdir(self.artifact_dir() + '/cp-a')
+        for root, subvol in (('/@var,archive', '/@var,archive'),
+                             ('/@a,subvol=/@b', '/@a,subvol=/@b'),
+                             ('/@a,b,,c', '/@a,b,,c'),
+                             ('/@my\\040var', '/@my\\040var'),
+                             ('/@tab\\011and\\134slash', '/@tab\\011and\\134slash'),
+                             ('/', '/')):
+            self.btrfs_var(root=root, subvol=subvol)
+            self.assertEqual([e['name'] for e in self.m.checkpoint_inventory(instance)], ['cp-a'],
+                             root)
+        # Only the superblock's options lack it: the mount options are read the same way.
+        var = self.scratch + '/var'
+        self.mounts('9 1 0:9999 /@x,y %s rw,subvol=/@x,y shared:1 - btrfs fake rw,ssd\n' % var)
+        self.assertEqual([e['name'] for e in self.m.checkpoint_inventory(instance)], ['cp-a'])
+
+    def test_inventory_refuses_a_btrfs_root_other_than_its_whole_subvol_path(self):
+        instance = self.w.identity('kilnd.service')
+        self.artifact_dir()
+        for root, subvol in (('/@b', '/@a,subvol=/@b'),
+                             ('/@a', '/@a,subvol=/@b'),
+                             ('/@var', '/@var,archive'),
+                             ('/@var,archive/sub', '/@var,archive'),
+                             ('/@var,archive,sub', '/@var,archive'),
+                             ('/@my\\040var/sub', '/@my\\040var'),
+                             ('/@my\\040var', '/@my\\040var/sub'),
+                             ('/@my\\040var', '/@my\\134040var')):
+            self.btrfs_var(root=root, subvol=subvol)
+            with self.assertRaisesRegex(OSError, 'var is a mount point', msg=root):
+                self.m.checkpoint_inventory(instance)
+
     def test_inventory_refuses_a_bind_mount_on_the_way(self):
         instance = self.w.identity('kilnd.service')
         self.artifact_dir()

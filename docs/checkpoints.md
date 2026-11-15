@@ -166,8 +166,11 @@ for every running instance as one transaction. With checkpoints it also:
   mountinfo root is its `subvol=` path (`/@var` for `/var` on a common layout), and `stat`
   gives each subvolume a device of its own rather than mountinfo's, so such a mount is
   accepted only when its type is `btrfs`, its root equals exactly the `subvol=` path in
-  its mount or superblock options, and the directory the walk opened is a subvolume root
-  (inode 256). A Btrfs mount rooted below its subvolume (`/@var/sub` with
+  its superblock options (or, if those have none, its mount options), and the directory
+  the walk opened is a subvolume root (inode 256). Btrfs prints `subvol=` after every
+  other option and escapes only space, tab, newline and backslash in it, so the path is
+  the decoded text from the first `subvol=` to the end of the field, commas included
+  (`subvol=/@var,archive` is the subvolume `/@var,archive`). A Btrfs mount rooted below its subvolume (`/@var/sub` with
   `subvol=/@var`), or any other filesystem with a root other than `/`, is a bind mount
   and refused. Any other change of filesystem on the way is refused, and so is a
   `/proc/self/mountinfo` the upgrade can't read or parse. An absent instance directory and an

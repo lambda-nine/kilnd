@@ -1295,10 +1295,16 @@ def discard_transaction():
 
 def mount_points():
     """Each mount point's stack of (major:minor, root, Btrfs subvolume or None), in mountinfo's
-    order, the top last. The subvolume is a btrfs mount's subvol= path, from its mount or its
-    superblock options."""
+    order, the top last. The subvolume is a btrfs mount's subvol= path, from its superblock
+    options or, without one there, its mount options. Btrfs prints subvol= after every other
+    option, none of which holds a name, and escapes only space, tab, newline and backslash
+    in it, so the path is all the text after the field's first subvol=, commas and all."""
     def decode(field):
         return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), field)
+
+    def subvol(options):
+        found = re.search(r'(?:^|,)subvol=', options)
+        return decode(options[found.end():]) if found else None
     mounts = {}
     with open(MOUNTINFO, 'rb') as file:
         lines = file.read().decode('utf-8', 'surrogateescape').splitlines()
@@ -1307,9 +1313,10 @@ def mount_points():
         end = fields.index('-', 6) if '-' in fields[6:] else len(fields)
         if len(fields) < end + 4 or not re.fullmatch(r'\d+:\d+', fields[2]):
             raise OSError(errno.EINVAL, 'cannot parse %s: %r' % (MOUNTINFO, line))
-        subvolumes = {decode(o[7:]) for o in (*fields[5].split(','), *fields[end + 3].split(','))
-                      if o.startswith('subvol=')}
-        subvolume = subvolumes.pop() if fields[end + 1] == 'btrfs' and len(subvolumes) == 1 else None
+        subvolume = None
+        if fields[end + 1] == 'btrfs':
+            subvolume = subvol(fields[end + 3])
+            subvolume = subvol(fields[5]) if subvolume is None else subvolume
         mounts.setdefault(decode(fields[4]), []).append((fields[2], decode(fields[3]), subvolume))
     return mounts
 

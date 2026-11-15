@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Read a Btrfs `subvol=` path whole (C6a recheck 3 HIGH 2). The mountinfo parser split
+  the options at every comma, so a subvolume with a comma in its name (`/@var,archive`)
+  looked like a bind mount and an empty flag-off node refused to upgrade. Btrfs prints
+  `subvol=` last with commas literal, so the path is now everything after the first
+  `subvol=` in the superblock options (or the mount options if those have none).
 - Keep stopped instances in the upgrade (C6a recheck 3 HIGH 1). A stopped instance was
   inspected once and forgotten, so an account job that made one of its checkpoints busy
   after that inspection and exited went unseen. The journal now keeps every inspected
