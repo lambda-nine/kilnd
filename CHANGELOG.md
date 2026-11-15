@@ -6,6 +6,18 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add milestone C6a of workspace checkpoints: acceptance groundwork. The feature stays
+  off by default and testing only. `scripts/upgrade.sh` refuses (exit 2, nothing changed)
+  while any checkpoint is capturing or deleting or a fork is still restoring from one, and
+  records each instance's checkpoint artifact inventory beside its database snapshot; a
+  rollback whose artifacts no longer match still completes and exits 3, listing what was
+  added, missing or changed, with nothing left for `recover`. New `docs/checkpoints.md`
+  covers states, cleanup, backup and restore, upgrade and rollback; a draft
+  `docs/checkpoint-rollout-gate.md` lists the criteria for enabling the feature. Tests add
+  rewind, best-of-four and eval-reset client fixtures through the API, harness contract
+  goldens (`KILND_BLESS_CHECKPOINT_CONTRACT=1` regenerates them), a ledger tying every
+  design crash point, acceptance case and review finding to its tests, a two-thread race
+  of supervisor exits, and lowered budgets over existing charges.
 - Fix `kilndctl run` reporting "nothing was sent" after Exec reached the daemon. When
   the connection was lost during Exec, the cleanup Delete's error replaced Exec's
   "outcome unknown". Exec's result or error now always comes first; a failed Delete

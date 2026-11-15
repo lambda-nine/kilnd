@@ -452,7 +452,10 @@ helper's checkpoint checks pass (see
 [architecture.md](architecture.md#checkpoint-discovery-and-capacity-milestone-c5b-2)),
 and every capture and create from a checkpoint must leave `--checkpoint-headroom-bytes`
 (default 1 GiB) free on kiln's runs filesystem and on its loop device's backing
-filesystem. The root helper must also run with its checkpoint group enabled.
+filesystem. The root helper must also run with its checkpoint group enabled. Operating a
+node with checkpoints (cleanup, backup, upgrade and rollback) is in
+[checkpoints.md](checkpoints.md); what must hold before the default changes is in
+[checkpoint-rollout-gate.md](checkpoint-rollout-gate.md).
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart. On a Firecracker node this is a transaction; see above.
