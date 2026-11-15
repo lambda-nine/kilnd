@@ -578,15 +578,44 @@ async fn run(cli: Cli) -> Result<u8> {
                 );
             }
             let result = exec(&mut client, sandbox.id.clone(), argv, &opts).await;
-            client
+            let cleanup = client
                 .delete_sandbox(pb::DeleteSandboxRequest {
-                    id: sandbox.id,
+                    id: sandbox.id.clone(),
                     release_request_id: false,
                 })
                 .await
-                .map_err(rpc)?;
-            result
+                .map(drop);
+            run_outcome(&sandbox.id, result, cleanup)
         }
+    }
+}
+
+/// `run`'s result once Exec and the cleanup Delete have both been tried. Exec's result
+/// or error comes first: a Delete failure can't replace it, since by then Exec may have
+/// reached the daemon and had effects, and a lost connection would make Delete's error
+/// say it was never sent. The Delete failure follows on a line of its own, naming the
+/// sandbox that may remain.
+fn run_outcome(
+    sandbox: &str,
+    exec: Result<u8>,
+    cleanup: Result<(), tonic::Status>,
+) -> Result<u8> {
+    let Err(status) = cleanup else {
+        return exec;
+    };
+    let why = if status.message().starts_with(LOST_UNSENT) {
+        "the connection to kilnd was lost before Delete was sent".to_string()
+    } else {
+        format!("Delete failed: {:#}", rpc(status))
+    };
+    let note = format!(
+        "kilndctl: cleanup: sandbox {sandbox} may remain ({why}); remove it with `kilndctl rm {sandbox}`"
+    );
+    match exec {
+        Err(e) => Err(anyhow::anyhow!("{e:#}\n{note}")),
+        Ok(code) => Err(anyhow::anyhow!(
+            "the command finished (kilndctl exit {code}), but cleanup failed\n{note}"
+        )),
     }
 }
 
@@ -2217,5 +2246,58 @@ mod tests {
             tonic::Status::deadline_exceeded("queued").code(),
             tonic::Code::DeadlineExceeded
         );
+    }
+
+    /// `run`'s precedence: Exec's result or error, never replaced by the cleanup
+    /// Delete's; a failed Delete is a second line naming the sandbox.
+    #[test]
+    fn run_reports_exec_first_and_cleanup_second() {
+        let sb = "sb-0123456789abcdef";
+        // Delete succeeded: Exec's result or error, untouched.
+        assert_eq!(run_outcome(sb, Ok(3), Ok(())).unwrap(), 3);
+        let e = run_outcome(sb, Err(anyhow::anyhow!("exec failed")), Ok(())).unwrap_err();
+        assert_eq!(format!("{e:#}"), "exec failed");
+
+        // Exec failed, then Delete was answered with an error: both, Exec's first.
+        let e = run_outcome(
+            sb,
+            Err(anyhow::anyhow!("unknown: {LOST_UNKNOWN} (x)")),
+            Err(tonic::Status::failed_precondition("sandbox is busy")),
+        )
+        .unwrap_err();
+        let e = format!("{e:#}");
+        let (primary, cleanup) = e.split_once('\n').unwrap();
+        assert_eq!(primary, format!("unknown: {LOST_UNKNOWN} (x)"));
+        assert_eq!(
+            cleanup,
+            format!(
+                "kilndctl: cleanup: sandbox {sb} may remain (Delete failed: \
+                 failedprecondition: sandbox is busy); remove it with `kilndctl rm {sb}`"
+            )
+        );
+
+        // Exec finished but Delete was never sent: still a failure, and never "nothing
+        // was sent", since Exec was.
+        let e = run_outcome(
+            sb,
+            Ok(0),
+            Err(tonic::Status::unavailable(format!("{LOST_UNSENT} (closed)"))),
+        )
+        .unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.starts_with("the command finished (kilndctl exit 0), but cleanup failed\n"),
+            "{e}"
+        );
+        assert!(e.contains("before Delete was sent") && e.contains(sb), "{e}");
+        assert!(!e.contains("nothing was sent"), "{e}");
+
+        // A Delete lost after it was sent: its own unknown outcome, on the second line.
+        let e = run_outcome(sb, Ok(0), Err(lost_unknown_status())).unwrap_err();
+        assert!(format!("{e:#}").contains(LOST_UNKNOWN), "{e:#}");
+    }
+
+    fn lost_unknown_status() -> tonic::Status {
+        tonic::Status::unknown(format!("{LOST_UNKNOWN} (connection closed)"))
     }
 }

@@ -6,6 +6,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Fix `kilndctl run` reporting "nothing was sent" after Exec reached the daemon. When
+  the connection was lost during Exec, the cleanup Delete's error replaced Exec's
+  "outcome unknown". Exec's result or error now always comes first; a failed Delete
+  follows on its own line, naming the sandbox that may remain.
 - Fix three findings of the C5b-2 adversarial review (one HIGH, one MEDIUM, one LOW).
   `kilndctl` uses one connection per command and never reconnects, so a feature check
   always covers the request that needs it; a lost connection fails the command, saying

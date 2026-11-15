@@ -24,6 +24,8 @@ struct Daemon {
     stop_after_health: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     /// Create drops the connection without answering: the request was sent.
     drop_in_create: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Exec drops the connection without answering: the request was sent.
+    drop_in_exec: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     seen: mpsc::UnboundedSender<Seen>,
 }
 
@@ -111,6 +113,12 @@ impl pb::kilnd_service_server::KilndService for Daemon {
         unused()
     }
     async fn exec(&self, _: tonic::Request<pb::ExecRequest>) -> Reply<pb::ExecResponse> {
+        let _ = self.seen.send((self.generation, "exec", String::new()));
+        let drop_now = self.drop_in_exec.lock().unwrap().take();
+        if let Some(drop_now) = drop_now {
+            let _ = drop_now.send(());
+            std::future::pending::<()>().await;
+        }
         unused()
     }
     async fn get_execution(
@@ -253,6 +261,7 @@ fn daemon(generation: usize, seen: &mpsc::UnboundedSender<Seen>) -> Daemon {
         honors_checkpoint: true,
         stop_after_health: Arc::default(),
         drop_in_create: Arc::default(),
+        drop_in_exec: Arc::default(),
         seen: seen.clone(),
     }
 }
@@ -391,4 +400,59 @@ async fn a_connection_lost_after_create_was_sent_reports_an_unknown_outcome() {
         "{seen:?}"
     );
     assert_eq!(socket.accepted(), 1);
+}
+
+/// `run` with the daemon gone once Exec arrived (C5b-2 recheck MEDIUM): Exec's outcome
+/// is unknown and stays the reported error. The cleanup Delete finds the connection
+/// closed; its failure follows on a line of its own, naming the sandbox, and nothing
+/// claims the command was never sent.
+#[tokio::test]
+async fn run_keeps_an_unknown_exec_outcome_when_cleanup_finds_the_connection_lost() {
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+    let mut socket = Socket::serve(|seen| {
+        let first = Daemon {
+            drop_in_exec: Arc::new(Mutex::new(Some(dropped_tx))),
+            ..daemon(1, &seen)
+        };
+        vec![
+            (first, oneshot::channel().1),
+            (daemon(2, &seen), oneshot::channel().1),
+        ]
+    });
+    let cli = Cli::try_parse_from([
+        "kilndctl",
+        "--socket",
+        socket.path.to_str().unwrap(),
+        "run",
+        "--",
+        "/bin/true",
+    ])
+    .unwrap();
+    // Once Exec arrives, model a daemon exit that closes the connection.
+    let acceptor = std::mem::replace(&mut socket.acceptor, tokio::spawn(async {}));
+    let killer = tokio::spawn(async move {
+        let _ = dropped_rx.await;
+        acceptor.abort();
+    });
+    let error = tokio::time::timeout(Duration::from_secs(5), run(cli))
+        .await
+        .expect("run finished")
+        .unwrap_err();
+    let error = format!("{error:#}");
+    killer.await.unwrap();
+    let seen = socket.seen();
+    assert_eq!(
+        seen,
+        vec![(1, "create", String::new()), (1, "exec", String::new())]
+    );
+    assert_eq!(socket.accepted(), 1, "kilndctl dialed again");
+    assert!(!error.contains("nothing was sent"), "{error}");
+    let (primary, cleanup) = error.split_once('\n').expect("a cleanup line");
+    assert!(primary.contains(LOST_UNKNOWN), "{error}");
+    assert!(
+        cleanup.contains("sb-0000000000000001")
+            && cleanup.contains("before Delete was sent")
+            && cleanup.contains("kilndctl rm sb-0000000000000001"),
+        "{error}"
+    );
 }

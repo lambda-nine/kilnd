@@ -485,7 +485,9 @@ HIGH 1): a feature check answers only for the daemon that asked it, and a reconn
 channel would carry the gated request to a replacement, perhaps an older daemon that
 ignores the field. A connection lost before a request was handed to it fails the command
 with `connection to kilnd was lost; nothing was sent`; one lost after it, with `outcome
-unknown`. Nothing is retried.
+unknown`. Nothing is retried. `run` reports Exec's result or error first and never lets
+its cleanup Delete replace it: a failed Delete follows on a second line naming the
+sandbox that may remain.
 
 Refusals defined by the additions, and the existing "is X, not ready" refusals of
 Exec and RenewSandbox, carry a `kilnd-reason: <token>` metadata entry, and their
