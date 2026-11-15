@@ -828,6 +828,59 @@ async fn an_ambiguous_restore_stays_charged_and_its_pin_waits_for_absent() {
     assert_eq!(charge(&m), (0, 0));
 }
 
+/// C6b V16: kiln's shim checks object digests after allocation, so a corrupt
+/// artifact comes back as an ambiguous restore. Its corrupt verdict still quarantines
+/// the checkpoint (design 10): the next fork is refused before admission, the charge
+/// stays, and the owner's Delete releases it.
+#[tokio::test]
+async fn an_ambiguous_corrupt_restore_quarantines_the_checkpoint_and_keeps_its_charge() {
+    let (m, fake, _) = engine();
+    let (_, c) = ready(&m, 1000).await;
+    let charged = charge(&m);
+    script(&fake, &[FakeRestore::Ambiguous(Reason::Corrupt)]);
+    let e = fork(&m, &c, 1000).await.unwrap_err();
+    assert_eq!(reason(&e), Some("checkpoint_corrupt"), "{e:?}");
+    let f = forks_of(&m, &c).pop().unwrap();
+    assert_eq!(f.state, SandboxState::Failed);
+    assert_eq!(f.create_certainty, CreateCertainty::AllocationAmbiguous);
+    let q = row(&m, c.id.as_str());
+    assert_eq!(q.state, CheckpointState::Quarantined, "{q:?}");
+    assert_eq!(q.failure.unwrap().token, "checkpoint_corrupt");
+    assert_eq!(charge(&m), charged, "the charge stays while quarantined");
+    assert!(pin_of(&m, &f.id).unwrap().released_at_ms.is_none());
+    // Refused before admission: no row, reservation or restore.
+    let (forks, resources) = (forks_of(&m, &c).len(), m.store_resources_for_test());
+    let restores = fake.checkpoints(|g| g.calls.iter().filter(|op| op.starts_with("restore ")).count());
+    let e = fork(&m, &c, 1000).await.unwrap_err();
+    assert_eq!(reason(&e), Some("checkpoint_corrupt"), "{e:?}");
+    assert_eq!(forks_of(&m, &c).len(), forks);
+    assert_eq!(m.store_resources_for_test(), resources);
+    assert_eq!(
+        fake.checkpoints(|g| g.calls.iter().filter(|op| op.starts_with("restore ")).count()),
+        restores
+    );
+    let d = m
+        .delete_checkpoint(c.id.as_str(), 1000, false)
+        .await
+        .unwrap();
+    assert_eq!(d.state, CheckpointState::Deleted);
+    assert_eq!(
+        pin_of(&m, &f.id).unwrap().released_by.as_deref(),
+        Some("absent")
+    );
+    assert_eq!(charge(&m), (0, 0));
+}
+
+/// Any other ambiguous reason leaves the checkpoint READY (C6b V16's control).
+#[tokio::test]
+async fn an_ambiguous_io_restore_leaves_the_checkpoint_ready() {
+    let (m, fake, _) = engine();
+    let (_, c) = ready(&m, 1000).await;
+    script(&fake, &[FakeRestore::Ambiguous(Reason::Io)]);
+    fork(&m, &c, 1000).await.unwrap_err();
+    assert_eq!(row(&m, c.id.as_str()).state, CheckpointState::Ready);
+}
+
 #[tokio::test]
 async fn a_typed_helper_refusal_fails_definitely_and_delete_still_reaches_absent() {
     let (m, fake, _) = engine();

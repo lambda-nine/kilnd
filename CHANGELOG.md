@@ -6,6 +6,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Quarantine a checkpoint whose restore proves it corrupt after allocating (C6b V16).
+  kiln's shim checks each object's digest after the new sandbox is allocated, so a
+  corrupted artifact came back as an ambiguous restore, and only a restore that
+  allocated nothing quarantined. The fork failed `checkpoint_corrupt` but the
+  checkpoint stayed `ready`, so every later fork was admitted, allocated and failed the
+  same way. A corrupt verdict now quarantines the checkpoint whichever way the restore
+  ended, charge kept, and the next fork is refused before admission.
 - Refuse `CARGO_PROFILE_*` variables in `build.sh`, the environment's form of the
   already refused `[profile]` table, so a reviewed build's debug assertions, optimization
   and overflow checks are the workspace's own.

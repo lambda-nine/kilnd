@@ -353,7 +353,13 @@ impl<R: Runtime> Manager<R> {
                 // The reader was reaped, but kiln may have allocated: a legacy ambiguous
                 // create, charged; READER_ENDED `unknown` never releases the pin.
                 restoring.settled = true;
-                (reason_of(CheckpointReason::from_helper(reason)), detail)
+                let reason = reason_of(CheckpointReason::from_helper(reason));
+                if let Err(e) =
+                    self.quarantine_if_corrupt(&plan.checkpoint, &sandbox.id, reason, &detail)
+                {
+                    warn!(checkpoint = %checkpoint, error = %format!("{e:#}"), "could not quarantine a checkpoint a restore found corrupt");
+                }
+                (reason, detail)
             }
             Restored::Unproven(detail) => {
                 restoring.settled = true;
@@ -385,6 +391,22 @@ impl<R: Runtime> Manager<R> {
         reason: CheckpointReason,
         detail: &str,
     ) -> Result<()> {
+        self.quarantine_if_corrupt(c, sandbox, reason, detail)?;
+        self.store
+            .fail_create_definitely(sandbox, &fork_failure(reason, detail))?;
+        Ok(())
+    }
+
+    /// A restore's corrupt verdict quarantines the checkpoint, charge kept, so no new
+    /// fork is admitted (design 10's READY-with-corrupt-artifact row), whether or not
+    /// the restore allocated: kiln's shim checks digests after allocation (C6b V16).
+    fn quarantine_if_corrupt(
+        &self,
+        c: &Checkpoint,
+        sandbox: &str,
+        reason: CheckpointReason,
+        detail: &str,
+    ) -> Result<()> {
         if reason == CheckpointReason::Corrupt
             && self.db().record_checkpoint_failure_token(
                 c.id.as_str(),
@@ -395,8 +417,6 @@ impl<R: Runtime> Manager<R> {
         {
             warn!(checkpoint = %c.id, sandbox, "a restore proved the checkpoint corrupt; quarantined, charge kept");
         }
-        self.store
-            .fail_create_definitely(sandbox, &fork_failure(reason, detail))?;
         Ok(())
     }
 
@@ -833,6 +853,9 @@ impl<R: Runtime> Manager<R> {
             }
             Restored::Final(RestoreReply::Ambiguous { reason, detail, .. }) => {
                 let reason = CheckpointReason::from_helper(reason);
+                if let Err(e) = self.quarantine_if_corrupt(c, id, reason, &detail) {
+                    warn!(checkpoint = %c.id, error = %format!("{e:#}"), "could not quarantine a checkpoint a restore found corrupt");
+                }
                 return self
                     .fail_orphaned_fork(id, reason, &detail)
                     .await
