@@ -22,6 +22,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   fixture clock's times as exact offsets (`<clock+N>`) and checks each published deadline
   against its policy. `KILND_BLESS_CHECKPOINT_CONTRACT=1` refuses to bless while `CI` is
   set.
+- `kilndctl run` no longer calls a deadline it mapped to exit 124 a finished command when
+  cleanup then fails: it says "Exec returned kilndctl exit 124, but cleanup failed", and
+  keeps "the command finished" for an exit the daemon's execution record confirmed.
 - Add milestone C6a of workspace checkpoints: acceptance groundwork. The feature stays
   off by default and testing only. `scripts/upgrade.sh` refuses (exit 2, nothing changed)
   while any checkpoint is capturing or deleting or a fork is still restoring from one, and

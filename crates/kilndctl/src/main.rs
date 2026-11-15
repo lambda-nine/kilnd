@@ -469,7 +469,9 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
-        Command::Exec { opts, id, argv } => exec(&mut client, id, argv, &opts).await,
+        Command::Exec { opts, id, argv } => {
+            exec(&mut client, id, argv, &opts).await.map(ExecExit::code)
+        }
         Command::Execution { id } => {
             let e = client
                 .get_execution(pb::GetExecutionRequest { id })
@@ -597,11 +599,11 @@ async fn run(cli: Cli) -> Result<u8> {
 /// sandbox that may remain.
 fn run_outcome(
     sandbox: &str,
-    exec: Result<u8>,
+    exec: Result<ExecExit>,
     cleanup: Result<(), tonic::Status>,
 ) -> Result<u8> {
     let Err(status) = cleanup else {
-        return exec;
+        return exec.map(ExecExit::code);
     };
     let why = if status.message().starts_with(LOST_UNSENT) {
         "the connection to kilnd was lost before Delete was sent".to_string()
@@ -613,9 +615,29 @@ fn run_outcome(
     );
     match exec {
         Err(e) => Err(anyhow::anyhow!("{e:#}\n{note}")),
-        Ok(code) => Err(anyhow::anyhow!(
+        Ok(ExecExit::Finished(code)) => Err(anyhow::anyhow!(
             "the command finished (kilndctl exit {code}), but cleanup failed\n{note}"
         )),
+        Ok(ExecExit::Mapped(code)) => Err(anyhow::anyhow!(
+            "Exec returned kilndctl exit {code}, but cleanup failed\n{note}"
+        )),
+    }
+}
+
+/// Exec's exit code: `Finished` from the daemon's execution record, `Mapped` from a
+/// status kilndctl turned into a code (a deadline is 124), which may have come before
+/// any execution started.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ExecExit {
+    Finished(u8),
+    Mapped(u8),
+}
+
+impl ExecExit {
+    fn code(self) -> u8 {
+        match self {
+            Self::Finished(code) | Self::Mapped(code) => code,
+        }
     }
 }
 
@@ -1148,7 +1170,12 @@ fn check_feature(health: &pb::HealthResponse, feature: pb::Feature, what: &str) 
     Ok(())
 }
 
-async fn exec(client: &mut Client, id: String, argv: Vec<String>, opts: &ExecOpts) -> Result<u8> {
+async fn exec(
+    client: &mut Client,
+    id: String,
+    argv: Vec<String>,
+    opts: &ExecOpts,
+) -> Result<ExecExit> {
     let mut stdin = Vec::new();
     if opts.stdin {
         std::io::stdin()
@@ -1191,7 +1218,7 @@ async fn exec(client: &mut Client, id: String, argv: Vec<String>, opts: &ExecOpt
         Ok(response) => response,
         Err(status) if status.code() == tonic::Code::DeadlineExceeded => {
             eprintln!("kilndctl: deadline_exceeded: {}", status.message());
-            return Ok(EXIT_TIMED_OUT);
+            return Ok(ExecExit::Mapped(EXIT_TIMED_OUT));
         }
         Err(status) => return Err(rpc(status)),
     };
@@ -1204,7 +1231,7 @@ async fn exec(client: &mut Client, id: String, argv: Vec<String>, opts: &ExecOpt
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     )?;
-    Ok(report_execution(&e, opts))
+    Ok(ExecExit::Finished(report_execution(&e, opts)))
 }
 
 /// `exec --stream`: live bytes as they come, gaps on stderr, then the same report and
@@ -1213,7 +1240,7 @@ async fn exec_streamed(
     client: &mut Client,
     request: pb::ExecRequest,
     opts: &ExecOpts,
-) -> Result<u8> {
+) -> Result<ExecExit> {
     use pb::exec_stream_response::Event;
     let response = client
         .exec_stream(pb::ExecStreamRequest {
@@ -1224,7 +1251,7 @@ async fn exec_streamed(
         Ok(response) => response.into_inner(),
         Err(status) if status.code() == tonic::Code::DeadlineExceeded => {
             eprintln!("kilndctl: deadline_exceeded: {}", status.message());
-            return Ok(EXIT_TIMED_OUT);
+            return Ok(ExecExit::Mapped(EXIT_TIMED_OUT));
         }
         Err(status) => return Err(rpc(status)),
     };
@@ -1294,7 +1321,7 @@ async fn exec_streamed(
                     &mut std::io::sink(),
                     &mut std::io::stderr().lock(),
                 )?;
-                return Ok(report_execution(&e, opts));
+                return Ok(ExecExit::Finished(report_execution(&e, opts)));
             }
         }
     }
@@ -2254,7 +2281,14 @@ mod tests {
     fn run_reports_exec_first_and_cleanup_second() {
         let sb = "sb-0123456789abcdef";
         // Delete succeeded: Exec's result or error, untouched.
-        assert_eq!(run_outcome(sb, Ok(3), Ok(())).unwrap(), 3);
+        assert_eq!(
+            run_outcome(sb, Ok(ExecExit::Finished(3)), Ok(())).unwrap(),
+            3
+        );
+        assert_eq!(
+            run_outcome(sb, Ok(ExecExit::Mapped(EXIT_TIMED_OUT)), Ok(())).unwrap(),
+            EXIT_TIMED_OUT
+        );
         let e = run_outcome(sb, Err(anyhow::anyhow!("exec failed")), Ok(())).unwrap_err();
         assert_eq!(format!("{e:#}"), "exec failed");
 
@@ -2280,7 +2314,7 @@ mod tests {
         // was sent", since Exec was.
         let e = run_outcome(
             sb,
-            Ok(0),
+            Ok(ExecExit::Finished(0)),
             Err(tonic::Status::unavailable(format!("{LOST_UNSENT} (closed)"))),
         )
         .unwrap_err();
@@ -2293,8 +2327,42 @@ mod tests {
         assert!(!e.contains("nothing was sent"), "{e}");
 
         // A Delete lost after it was sent: its own unknown outcome, on the second line.
-        let e = run_outcome(sb, Ok(0), Err(lost_unknown_status())).unwrap_err();
+        let e =
+            run_outcome(sb, Ok(ExecExit::Finished(0)), Err(lost_unknown_status())).unwrap_err();
         assert!(format!("{e:#}").contains(LOST_UNKNOWN), "{e:#}");
+    }
+
+    /// A deadline mapped to 124 may be the daemon refusing before any execution started,
+    /// so a failed cleanup after it never calls the command finished.
+    #[test]
+    fn run_never_calls_a_mapped_deadline_a_finished_command() {
+        let sb = "sb-0123456789abcdef";
+        let e = run_outcome(
+            sb,
+            Ok(ExecExit::Mapped(EXIT_TIMED_OUT)),
+            Err(tonic::Status::failed_precondition("sandbox is busy")),
+        )
+        .unwrap_err();
+        let e = format!("{e:#}");
+        let (primary, cleanup) = e.split_once('\n').unwrap();
+        assert_eq!(
+            primary,
+            "Exec returned kilndctl exit 124, but cleanup failed"
+        );
+        assert!(cleanup.starts_with(&format!("kilndctl: cleanup: sandbox {sb} may remain")));
+        assert!(!e.contains("finished"), "{e}");
+        // A 124 the daemon's execution record confirmed (a timed-out command) did finish.
+        let e = run_outcome(
+            sb,
+            Ok(ExecExit::Finished(EXIT_TIMED_OUT)),
+            Err(tonic::Status::failed_precondition("sandbox is busy")),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e:#}")
+                .starts_with("the command finished (kilndctl exit 124), but cleanup failed\n"),
+            "{e:#}"
+        );
     }
 
     fn lost_unknown_status() -> tonic::Status {
