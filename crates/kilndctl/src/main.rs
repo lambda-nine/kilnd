@@ -6,12 +6,13 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use hyper_util::rt::TokioIo;
+use hyper::client::conn::http2;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use kilnd_api::v1 as pb;
 use pb::kilnd_service_client::KilndServiceClient;
 use tokio::net::UnixStream;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
+use tonic::codegen::http;
+use tonic::transport::Uri;
 
 /// Exit code when kilnd or the sandbox couldn't run the command, as with
 /// `kiln exec` and `docker exec`.
@@ -600,21 +601,86 @@ fn list_request(include_deleted: bool, page_token: String) -> pb::ListSandboxesR
     }
 }
 
-async fn connect(path: PathBuf) -> Result<KilndServiceClient<Channel>> {
-    let shown = path.display().to_string();
-    // The URI is required by the API but unused: every connection goes to
-    // the socket.
-    let channel = Endpoint::try_from("http://kilnd.invalid")?
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = path.clone();
-            async move { Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(path).await?)) }
-        }))
-        .await
-        .with_context(|| format!("connect to {shown}"))?;
-    Ok(KilndServiceClient::new(channel).max_decoding_message_size(64 << 20))
+/// kilndctl's client: every request of one command on one connection.
+type Client = KilndServiceClient<OneConnection>;
+
+/// A request the lost connection never carried.
+const LOST_UNSENT: &str = "connection to kilnd was lost; nothing was sent";
+/// A request the lost connection carried, whose answer never came.
+const LOST_UNKNOWN: &str =
+    "connection to kilnd was lost after the request was sent; outcome unknown";
+
+/// The one HTTP/2 connection a command uses (C5b-2 adversarial review HIGH 1). A
+/// feature check answers for the daemon on the connection that asked it, so a request
+/// that needs the feature must ride that connection: tonic's `Channel` would dial
+/// again after the daemon is replaced, perhaps by an older one that ignores the field.
+/// This one never dials again. A lost connection fails each later request, saying
+/// whether it was written.
+#[derive(Clone)]
+struct OneConnection(http2::SendRequest<tonic::body::Body>);
+
+type ReplyBody =
+    http_body_util::combinators::MapErr<hyper::body::Incoming, fn(hyper::Error) -> tonic::Status>;
+
+impl tower::Service<http::Request<tonic::body::Body>> for OneConnection {
+    type Response = http::Response<ReplyBody>;
+    type Error = tonic::Status;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, tonic::Status>> + Send>,
+    >;
+
+    /// HTTP/2 multiplexes; a closed connection is found when the request is handed to
+    /// it, which says whether it was taken.
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), tonic::Status>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        let reply = self.0.try_send_request(request);
+        Box::pin(async move {
+            match reply.await {
+                Ok(reply) => Ok(
+                    reply.map(|body| http_body_util::BodyExt::map_err(body, lost as fn(_) -> _))
+                ),
+                Err(e) if e.message().is_some() => Err(tonic::Status::unavailable(format!(
+                    "{LOST_UNSENT} ({})",
+                    e.error()
+                ))),
+                Err(e) => Err(lost(e.into_error())),
+            }
+        })
+    }
 }
 
-async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Result<pb::Sandbox> {
+/// The connection failed once the request had been handed to it.
+fn lost(e: hyper::Error) -> tonic::Status {
+    tonic::Status::unknown(format!("{LOST_UNKNOWN} ({e})"))
+}
+
+async fn connect(path: PathBuf) -> Result<Client> {
+    let shown = path.display().to_string();
+    let stream = UnixStream::connect(&path)
+        .await
+        .with_context(|| format!("connect to {shown}"))?;
+    let (send, connection) = http2::Builder::new(TokioExecutor::new())
+        .timer(TokioTimer::new())
+        .handshake(TokioIo::new(stream))
+        .await
+        .with_context(|| format!("connect to {shown}"))?;
+    // Ends with the connection; nothing dials again.
+    tokio::spawn(connection);
+    // The URI is required by the API but unused: the connection is the socket.
+    Ok(KilndServiceClient::with_origin(
+        OneConnection(send),
+        Uri::from_static("http://kilnd.invalid"),
+    )
+    .max_decoding_message_size(64 << 20))
+}
+
+async fn create(client: &mut Client, a: CreateArgs) -> Result<pb::Sandbox> {
     let labels = a
         .label
         .iter()
@@ -697,19 +763,30 @@ async fn create(client: &mut KilndServiceClient<Channel>, a: CreateArgs) -> Resu
         writable_paths: a.writable,
         labels,
     };
-    client
+    let sandbox = client
         .create_sandbox(pb::CreateSandboxRequest {
             default_env,
             spec: Some(spec),
             expiry,
             request_id,
-            from_checkpoint,
+            from_checkpoint: from_checkpoint.clone(),
         })
         .await
         .map_err(rpc)?
         .into_inner()
         .sandbox
-        .context("response has no sandbox")
+        .context("response has no sandbox")?;
+    // Defence in depth: the sandbox must say it was restored from the checkpoint asked
+    // for. Nothing is deleted on the caller's behalf.
+    if sandbox.from_checkpoint != from_checkpoint {
+        bail!(
+            "warning: kilnd created sandbox {} but ignored --from-checkpoint {from_checkpoint} (the sandbox reports {:?}); it was not deleted: remove it with `kilndctl rm {}`",
+            sandbox.id,
+            sandbox.from_checkpoint,
+            sandbox.id
+        );
+    }
+    Ok(sandbox)
 }
 
 /// The capture request `checkpoint create` sends.
@@ -735,7 +812,7 @@ fn capture_request(
 
 /// `kilndctl checkpoint ...`. The checkpoint RPCs need no feature check before they are
 /// sent: a kilnd without them answers UNIMPLEMENTED, and no field is silently dropped.
-async fn checkpoint(client: &mut KilndServiceClient<Channel>, command: CheckpointCommand) -> Result<u8> {
+async fn checkpoint(client: &mut Client, command: CheckpointCommand) -> Result<u8> {
     match command {
         CheckpointCommand::Create {
             sandbox,
@@ -1009,11 +1086,7 @@ fn checkpoint_state(v: i32) -> String {
 
 /// Design section 1: a client uses a feature only from a fresh SERVING Health
 /// response that advertises it. Asked right before the request that needs it.
-async fn require_feature(
-    client: &mut KilndServiceClient<Channel>,
-    feature: pb::Feature,
-    what: &str,
-) -> Result<()> {
+async fn require_feature(client: &mut Client, feature: pb::Feature, what: &str) -> Result<()> {
     let health = client
         .health(pb::HealthRequest {})
         .await
@@ -1046,12 +1119,7 @@ fn check_feature(health: &pb::HealthResponse, feature: pb::Feature, what: &str) 
     Ok(())
 }
 
-async fn exec(
-    client: &mut KilndServiceClient<Channel>,
-    id: String,
-    argv: Vec<String>,
-    opts: &ExecOpts,
-) -> Result<u8> {
+async fn exec(client: &mut Client, id: String, argv: Vec<String>, opts: &ExecOpts) -> Result<u8> {
     let mut stdin = Vec::new();
     if opts.stdin {
         std::io::stdin()
@@ -1113,7 +1181,7 @@ async fn exec(
 /// `exec --stream`: live bytes as they come, gaps on stderr, then the same report and
 /// exit code as a unary Exec. The final retained output is not printed again.
 async fn exec_streamed(
-    client: &mut KilndServiceClient<Channel>,
+    client: &mut Client,
     request: pb::ExecRequest,
     opts: &ExecOpts,
 ) -> Result<u8> {
@@ -1685,6 +1753,9 @@ fn time(ms: i64) -> String {
         rem % 60
     )
 }
+
+#[cfg(test)]
+mod transport_tests;
 
 #[cfg(test)]
 mod tests {
