@@ -672,6 +672,113 @@ class Checkpoints(Case):
         self.assertFalse(self.w.load_units()[INSTANCE])
         self.assertEqual(self.w.images(), {i: 'new' for i in self.m.IMAGES})
 
+    def upgrade_with_stopped(self, *units):
+        """An upgrade with units stopped; its exit code, with the window and transaction gone
+        and the stopped units still stopped whatever it ended with."""
+        units_now = self.w.load_units()
+        units_now.update({unit: False for unit in units})
+        self.w.save_units(units_now)
+        code = self.command('upgrade', '--bin-dir', self.w.new, '--deploy-dir', self.w.deploy)
+        for path in (self.m.WINDOW_RECORD, self.m.TXN_DIR, self.m.STAGE):
+            self.assertFalse(os.path.exists(path), path + ' remains')
+        for unit in units:
+            self.assertFalse(self.w.load_units()[unit], unit + ' still stopped')
+        return code
+
+    def assert_stopped_rolled_back(self, state, before, what):
+        """Rolled back over the stopped instance's state without touching it."""
+        self.assertEqual(self.w.images(), {i: 'old' for i in self.m.IMAGES}, what)
+        self.assertEqual(self.w.load_rows(), self.before_rows, what)
+        with open(state + '/kilnd.db', 'rb') as file:
+            self.assertEqual(file.read(), before, what + ': the stopped state is untouched')
+
+    def test_a_stopped_instance_busy_after_its_inspection_rolls_back(self):
+        """Recheck 3 HIGH 1: a short-lived account job commits a busy row in a stopped
+        instance after its first inspection and exits before any rescan. The last inspection,
+        with the new images in place, sees it and the upgrade rolls back."""
+        state, real, committed = self.w.state[INSTANCE], self.m.snapshot_state, []
+
+        def snapshot(account, where, destination):
+            report = real(account, where, destination)
+            if where == state and not committed:
+                with closing(sqlite3.connect(state + '/kilnd.db')) as db, db:
+                    db.execute("INSERT INTO checkpoints VALUES ('cp-stopped-race', 'capturing')")
+                with open(state + '/kilnd.db', 'rb') as file:
+                    committed.append(file.read())
+            return report
+        self.m.snapshot_state = snapshot
+        self.assertEqual(self.upgrade_with_stopped(INSTANCE), 1)
+        self.assertIn('the upgrade failed and was undone: %s has 1 busy checkpoints: '
+                      'cp-stopped-race (capturing)' % INSTANCE, '\n'.join(self.messages))
+        self.assert_stopped_rolled_back(state, committed[0], 'the race')
+        with closing(sqlite3.connect(state + '/kilnd.db')) as db:
+            self.assertEqual(db.execute('SELECT id, state FROM checkpoints').fetchall(),
+                             [('cp-stopped-race', 'capturing')])
+        self.assertTrue(self.w.load_units()['kilnd.service'], 'what ran runs again')
+        self.assertEqual(self.w.schema('kilnd.service'), 16)
+
+    def test_a_stopped_instance_whose_identity_changes_rolls_back(self):
+        state, real, swapped = self.w.state[INSTANCE], self.m.snapshot_state, []
+
+        def snapshot(account, where, destination):
+            report = real(account, where, destination)
+            if where == state and not swapped:
+                with closing(sqlite3.connect(state + '/kilnd.db')) as db, db:
+                    db.execute("UPDATE daemon_identity SET instance_id = ?", ('f' * 32,))
+                swapped.append(True)
+            return report
+        self.m.snapshot_state = snapshot
+        self.assertEqual(self.upgrade_with_stopped(INSTANCE), 1)
+        self.assertIn('the upgrade failed and was undone: %s is enrolled as %s, but its state '
+                      'says %s' % (INSTANCE, self.w.identity(INSTANCE), 'f' * 32),
+                      '\n'.join(self.messages))
+        self.assertEqual(self.w.images(), {i: 'old' for i in self.m.IMAGES})
+
+    def stopped_account_process(self, after_phase):
+        """Both instances stopped, so only the stopped instances' rescans can see a process
+        their account starts once after_phase is journaled."""
+        real_phase = self.m.set_phase
+
+        def phase(journal, name):
+            real_phase(journal, name)
+            if name == after_phase:
+                self.fake_process(4242, (1000, 1000, 1000, 1000))
+        self.m.set_phase = phase
+
+    def test_a_stopped_account_process_alive_at_the_first_rescan_refuses(self):
+        real = self.m.snapshot_state
+
+        def snapshot(account, where, destination):
+            report = real(account, where, destination)
+            if where == self.w.state[INSTANCE]:
+                self.fake_process(4242, (1000, 1000, 1000, 1000))
+            return report
+        self.m.snapshot_state = snapshot
+        self.assertEqual(self.upgrade_with_stopped('kilnd.service', INSTANCE), 2)
+        self.assertIn('refused, nothing changed: kilnd.service is stopped, but 1 processes started '
+                      'as kilnd.service during the upgrade: pids 4242', '\n'.join(self.messages))
+        self.assertEqual(self.w.images(), {i: 'old' for i in self.m.IMAGES})
+
+    def test_a_stopped_account_process_alive_at_the_last_rescan_rolls_back(self):
+        before = {}
+        for unit, state in self.w.state.items():
+            with open(state + '/kilnd.db', 'rb') as file:
+                before[unit] = file.read()
+        self.stopped_account_process('refreshed')
+        self.assertEqual(self.upgrade_with_stopped('kilnd.service', INSTANCE), 1)
+        self.assertIn('the upgrade failed and was undone: kilnd.service is stopped, but 1 '
+                      'processes started as kilnd.service during the upgrade: pids 4242',
+                      '\n'.join(self.messages))
+        for unit, state in self.w.state.items():
+            self.assert_stopped_rolled_back(state, before[unit], unit)
+
+    def test_quiet_reads_a_journal_from_before_stopped_instances_were_kept(self):
+        self.m.require_quiet({'instances': {}}, RuntimeError)
+        self.fake_process(4242, (1000, 1000, 1000, 1000))
+        with self.assertRaisesRegex(RuntimeError, 'pids 4242'):
+            self.m.require_quiet({'instances': {}, 'inspected': {INSTANCE: {'account': 'x'}}},
+                                 RuntimeError)
+
     def make_db(self, path, identity, busy=None):
         with closing(sqlite3.connect(path)) as db, db:
             db.executescript("""

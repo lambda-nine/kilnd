@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Keep stopped instances in the upgrade (C6a recheck 3 HIGH 1). A stopped instance was
+  inspected once and forgotten, so an account job that made one of its checkpoints busy
+  after that inspection and exited went unseen. The journal now keeps every inspected
+  stopped instance, both account rescans cover it, and with the new images installed,
+  just before the units start, a fresh snapshot of it is inspected again; a busy row or a
+  changed ID rolls the upgrade back. Its state is still never migrated or restored.
 - Accept a Btrfs subvolume on the registry's path (C6a recheck 2 HIGH 4). The inventory's
   mount check took a separately mounted subvolume (`/var` rooted at `/@var`) for a bind
   mount and refused even an empty flag-off node. A `btrfs` mount whose root is exactly its

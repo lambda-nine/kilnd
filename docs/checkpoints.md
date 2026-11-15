@@ -116,8 +116,9 @@ for every running instance as one transaction. With checkpoints it also:
 - **Requires the instance's account to be quiet.** The units stop with `KillMode=process`,
   so before each copy the upgrade refuses (exit 2) if any process still runs with the
   account's UID as its real, effective, saved or filesystem UID, or if `/proc` can't be
-  read. It scans every migrated instance's account again just before replacing the images
-  (exit 2, nothing replaced) and just before starting the units (rolled back, exit 1).
+  read. It scans every inspected instance's account again, running or stopped, just before
+  replacing the images (exit 2, nothing replaced) and just before starting the units (rolled
+  back, exit 1).
   These scans are a guard against what `KillMode=process` leaves, not a fence: nothing
   stops an account starting a process after a scan.
 - **Never migrates over a busy checkpoint.** That invariant is enforced atomically by
@@ -128,7 +129,14 @@ for every running instance as one transaction. With checkpoints it also:
   and one written after it can only be written after the migration committed. On a busy
   row it commits nothing and exits 75 with a `busy <id> <kind>` line per checkpoint; the
   upgrade then rolls back like any other failure after the replacement (exit 1). Without
-  the flag (`add-instance`, a daemon's own start) init-state is unchanged.
+  the flag (`add-instance`, a daemon's own start) init-state is unchanged. A stopped
+  instance isn't migrated, so the upgrade keeps it in its journal and, with the new images
+  installed and just before starting the units, takes a fresh snapshot and inspects it
+  again: a busy row, or an ID other than its enrollment's, rolls the upgrade back (exit 1).
+  That last inspection is the decisive check for a stopped instance. A write after it is
+  the same as a write to a stopped instance at any time after an upgrade: ordinary state
+  the new image will open, not state the upgrade upgraded over. A stopped instance's state
+  is never restored, because the upgrade never changed it.
 - **Reads one coherent snapshot, not the live state.** The instance's own account takes one
   SQLite backup of its database, which reads the database and its WAL in one read
   transaction, so a checkpoint of the WAL during the copy can't hide a row; the snapshot is
@@ -189,6 +197,8 @@ The messages, each prefixed `kilnd-maintenance: `:
 | 2 | `refused, nothing changed: <unit> is stopped, but <n> processes started as <account> during the upgrade: pids <pid>, …; stop them and retry` (the scan before replacing) |
 | 1 | `the upgrade failed and was undone: <unit> is stopped, but <n> processes started as <account> during the upgrade: pids <pid>, …; stop them and retry` (the scan before starting) |
 | 1 | `the upgrade failed and was undone: <unit> has <n> busy checkpoints, so its state was not upgraded: <id> (<kind>), …` (init-state's refusal; at most five IDs) |
+| 1 | `the upgrade failed and was undone: <unit> has <n> busy checkpoints: <id> (<kind>), …; start kilnd, let those checkpoints settle (kilndctl checkpoint ls), and retry` (a stopped instance's last inspection; at most five IDs) |
+| 1 | `the upgrade failed and was undone: <unit> is enrolled as <id>, but its state says <id>` (a stopped instance's last inspection) |
 | 2 | `refused, nothing changed: <unit> is enrolled as <id>, but its state says <id>` |
 | 2 | `refused, nothing changed: <unit> is enrolled as <id>, but its state records no instance ID; start kilnd once and retry` |
 | 2 | `refused, nothing changed: <unit> has checkpoint state but records no instance ID; start kilnd once so it records one, then retry` |

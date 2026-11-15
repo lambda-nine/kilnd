@@ -998,6 +998,7 @@ def cmd_upgrade(args):
             'had_image': {i: os.path.exists(os.path.join(BIN, i)) for i in IMAGES},
             'files': {},
             'instances': {},
+            'inspected': {},
             'rows': None,
         }
         write_json(JOURNAL, journal)
@@ -1087,33 +1088,20 @@ def upgrade_transaction(args, journal, window):
         # KillMode=process: a stopped unit doesn't prove that nothing of its account still runs,
         # and a surviving writer could change the state between the copy and the migration.
         # A guard, not a fence: nothing stops the account starting a process after a scan, so
-        # it scans again before replacing and before starting, and init-state's own check is
-        # what keeps the migration off a busy row.
+        # it scans again before replacing and before starting, and what keeps the upgrade off
+        # a busy row is init-state's own check for a running instance and a last inspection,
+        # with the new images in place, for a stopped one.
         pids = account_processes(entry.pw_uid)
         if pids:
             raise Refused('%s is stopped, but %d processes still run as %s: pids %s; stop them '
                           'and retry' % (unit, len(pids), account, ', '.join(map(str, pids[:10]))))
         destination = os.path.join(TXN_DIR, 'state' if unit in running else 'inspected', unit)
-        os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
-        try:
-            snapshot_state(account, state, destination)
-        except (OSError, RuntimeError) as error:
-            raise Refused('cannot keep a copy of %s: %s' % (state, error)) from None
-        try:
-            checkpoints = inspect_snapshot(account, destination)
-        except (OSError, RuntimeError) as error:
-            raise Refused('cannot inspect the checkpoints of %s: %s' % (unit, error)) from None
-        if checkpoints['busy']:
-            busy = checkpoints['busy']
-            raise Refused('%s has %d busy checkpoints: %s; start kilnd, let those checkpoints '
-                          'settle (kilndctl checkpoint ls), and retry'
-                          % (unit, len(busy), ', '.join('%s (%s)' % (c['id'], c['kind'])
-                                                       for c in busy[:5])))
+        checkpoints = inspect_instance(unit, state, account, destination, enrolled, Refused)
         identity, expected = checkpoints['instance'], enrolled.get(unit)
-        if identity is not None and expected is not None and identity != expected:
-            raise Refused('%s is enrolled as %s, but its state says %s'
-                          % (unit, expected, identity))
         if unit not in running:
+            # Kept, so that both rescans cover its account and it is inspected again last.
+            journal.setdefault('inspected', {})[unit] = {'state': state, 'account': account,
+                                                         'snapshot': destination}
             continue
         # The identity comes from the snapshot or the enrollment, never from the live state.
         checkpointed = (checkpoints['schema'] or 0) >= 15 and checkpoints.get('has_checkpoints')
@@ -1138,8 +1126,9 @@ def upgrade_transaction(args, journal, window):
         journal['instances'][unit] = kept
     os.mkdir(TXN_DIR + '/files', 0o700)
     fsync_dir(TXN_DIR)
-    if os.path.isdir(os.path.join(TXN_DIR, 'state')):
-        fsync_dir(os.path.join(TXN_DIR, 'state'))
+    for kept in ('state', 'inspected'):
+        if os.path.isdir(os.path.join(TXN_DIR, kept)):
+            fsync_dir(os.path.join(TXN_DIR, kept))
     for name, path in MANAGED_FILES.items():
         if not os.path.exists(os.path.join(args.deploy_dir, name)):
             raise Refused('%s is missing %s' % (args.deploy_dir, name))
@@ -1182,6 +1171,14 @@ def upgrade_transaction(args, journal, window):
                                % (unit, enrolled[unit], instance))
 
     require_quiet(journal, RuntimeError)
+    # A stopped instance is not migrated, so nothing like init-state's check guards it. This
+    # inspection, made with the new images installed, is the decisive one: a write after it is
+    # the same as a write to a stopped instance at any time after an upgrade, ordinary state
+    # the new image will open, not state the upgrade upgraded over. Its snapshot is the
+    # transaction's, and a stopped instance's state is never restored: nothing changed it.
+    for unit, kept in sorted(journal.get('inspected', {}).items()):
+        inspect_instance(unit, kept['state'], kept['account'], os.path.join(TXN_DIR, 'final', unit),
+                         enrolled, RuntimeError)
     journal['started'] = True
     set_phase(journal, 'starting')
     errors = window.release(restored=False)
@@ -1192,10 +1189,36 @@ def upgrade_transaction(args, journal, window):
     set_phase(journal, 'committed')
 
 
-def require_quiet(journal, error):
-    """Each kept instance's account scanned again: Refused before anything is replaced, a
+def inspect_instance(unit, state, account, destination, enrolled, error):
+    """A snapshot of the instance's state and its checkpoints, refused with error if any is
+    busy or the state's ID is not its enrollment's: Refused before anything is replaced, a
     RuntimeError that rolls back after."""
-    for unit, kept in sorted(journal['instances'].items()):
+    os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
+    try:
+        snapshot_state(account, state, destination)
+    except (OSError, RuntimeError) as failure:
+        raise error('cannot keep a copy of %s: %s' % (state, failure)) from None
+    try:
+        checkpoints = inspect_snapshot(account, destination)
+    except (OSError, RuntimeError, KeyError) as failure:
+        raise error('cannot inspect the checkpoints of %s: %s' % (unit, failure)) from None
+    busy = checkpoints['busy']
+    if busy:
+        raise error('%s has %d busy checkpoints: %s; start kilnd, let those checkpoints settle '
+                    '(kilndctl checkpoint ls), and retry'
+                    % (unit, len(busy), ', '.join('%s (%s)' % (c['id'], c['kind']) for c in busy[:5])))
+    identity, expected = checkpoints['instance'], enrolled.get(unit)
+    if identity is not None and expected is not None and identity != expected:
+        raise error('%s is enrolled as %s, but its state says %s' % (unit, expected, identity))
+    return checkpoints
+
+
+def require_quiet(journal, error):
+    """Each kept instance's account, running or stopped, scanned again: Refused before anything
+    is replaced, a RuntimeError that rolls back after. A journal from before stopped instances
+    were kept has none."""
+    kept_units = {**journal.get('inspected', {}), **journal['instances']}
+    for unit, kept in sorted(kept_units.items()):
         try:
             pids = account_processes(pwd.getpwnam(kept['account']).pw_uid)
         except (KeyError, Refused) as failure:
