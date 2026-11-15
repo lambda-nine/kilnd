@@ -127,7 +127,7 @@ probes' own statvfs and checks.
 ## Workload survey (design 13.1), limited scope
 
 How often harness workloads use ACLs, special files or more than 1 GiB was surveyed read
-only over the kiln-harness repository's `evals/` seed trees (29 tasks, 371 entries, 1.3 MiB):
+only over the kiln-harness repository's `evals/` seed trees (26 tasks, 371 entries, 1.3 MiB):
 no ACL or other xattr, no FIFO, socket or device node, no symlink, no setuid file, no file
 over 58 KiB, at most 7 levels deep. No retained live-eval workspaces were found to survey.
 This says nothing about real agent workspaces, which may clone repositories, install
