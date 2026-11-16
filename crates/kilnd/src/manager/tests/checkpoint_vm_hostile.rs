@@ -831,7 +831,11 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
         // 3. Root's own `kiln exec` into the source makes a capture busy (C6b review
         // HIGH 4: required, not recorded). The direct Exec reports it started, then waits
         // on its stdin, which is released only after Capture has answered, so it is
-        // running at the admission instant; a READY capture fails the test.
+        // running at the admission instant; a READY capture fails the test. kilnd's gate
+        // sees only its own executions, so it admits the capture (row, charge, dispatch)
+        // and kiln's checkpoint lease refuses it (the design: "manager locking alone
+        // cannot exclude a direct root CLI execution"). The row must fail as busy and
+        // release its charge, with no artifact left.
         let backend = w.ok(json!({ "op": "get", "id": src })).await["backend_id"]
             .as_str()
             .unwrap()
@@ -858,10 +862,38 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
         assert!(direct.try_wait().unwrap().is_none(), "the direct exec ended before Capture answered");
         assert_eq!(busy["error"]["code"], "FailedPrecondition", "{busy}");
         assert_eq!(busy["error"]["reason"], "checkpoint_busy", "{busy}");
-        assert_eq!(w.rows(), rows, "a busy capture made a checkpoint row");
-        assert_eq!(w.charge(), charge, "a busy capture charged");
-        assert_eq!(w.artifacts(), artifacts, "a busy capture left an artifact");
-        assert!(w.relay.requests_since(mark, "checkpoint.capture").is_empty(), "a busy capture was dispatched");
+        let added: Vec<String> = w
+            .rows()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| !rows.iter().any(|(old, _)| old == id))
+            .collect();
+        assert_eq!(added.len(), 1, "the busy capture's rows: {added:?}");
+        let refused_cp = added[0].clone();
+        // Settled within 30 s: FAILED as busy, its charge released on ABSENT evidence
+        // and no artifact entry left; otherwise fail with what the row holds.
+        let settled = |w: &World| {
+            w.cp_state(&refused_cp) == "failed"
+                && w.charge() == charge
+                && w.artifacts() == artifacts
+        };
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !settled(&w) && std::time::Instant::now() < end {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            settled(&w),
+            "the busy capture {refused_cp} did not settle in 30 s: state {} token {:?} charge {:?} (before {charge:?}) artifacts {:?} (before {artifacts:?})",
+            w.cp_state(&refused_cp),
+            w.cp_col(&refused_cp, "failure_token"),
+            w.charge(),
+            w.artifacts()
+        );
+        assert_eq!(w.cp_col(&refused_cp, "failure_token"), "checkpoint_busy");
+        assert!(w.evidence(&refused_cp, "absent") >= 1, "the busy capture was released without ABSENT");
+        assert!(!w.cp_col(&refused_cp, "release_evidence_id").is_empty(), "no release evidence on the row");
+        assert_eq!(w.relay.requests_since(mark, "checkpoint.capture").len(), 1, "busy capture dispatches");
+        assert_eq!(w.sandbox_state(&src), "ready", "the source after a busy capture");
         let mut stdin = direct.stdin.take().unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut stdin, b"go\n").await.unwrap();
         drop(stdin);
@@ -872,7 +904,8 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
         seen.insert(
             "direct_kiln_exec".into(),
             json!({ "code": busy["error"]["code"], "reason": busy["error"]["reason"],
-                    "exec_running_at_admission": true, "rows_charge_artifacts_unchanged": true }),
+                    "exec_running_at_admission": true, "row": "failed checkpoint_busy",
+                    "charge_artifacts_unchanged": true }),
         );
         // 4. Writable paths over reserved ones, at create (a source can't have them).
         // kiln may refuse such a path only after allocating, leaving a stale run kilnd
