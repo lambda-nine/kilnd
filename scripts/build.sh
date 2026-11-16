@@ -224,9 +224,12 @@ try:
     credentials = tomllib.loads(open(path, encoding="utf-8").read())
 except (OSError, ValueError) as error:
     refuse("is unreadable: %s" % error)
-# Registry credentials only: [registry] and each [registries.NAME] hold nothing but these.
+# Registry credentials only: [registry] and each [registries.NAME] hold nothing but these,
+# and a top-level token string is the legacy Cargo form of [registry] token.
 keys = {"token", "credential-provider", "secret-key", "secret-key-subject"}
-found = sorted(k for k in credentials if k not in ("registry", "registries"))
+found = sorted(k for k in credentials if k not in ("registry", "registries", "token"))
+if "token" in credentials and not isinstance(credentials["token"], str):
+    found.append("token")
 def check(where, table):
     if not isinstance(table, dict):
         found.append(where)
@@ -240,8 +243,8 @@ if isinstance(registries, dict):
 else:
     found.append("registries")
 if found:
-    refuse("sets %s; a credentials file may hold only registry.KEY and registries.NAME.KEY for %s"
-           % (", ".join(found), ", ".join(sorted(keys))))
+    refuse("sets %s; a credentials file may hold only a top-level token string, and registry.KEY "
+           "and registries.NAME.KEY for %s" % (", ".join(found), ", ".join(sorted(keys))))
 ' "$cargo_home/$name" || exit 2
 done
 

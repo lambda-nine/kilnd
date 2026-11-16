@@ -25,7 +25,9 @@
 #  g. C6a recheck 4: a $CARGO_HOME credentials.toml, and separately a credentials, with a
 #     target runner, `[env]`, `include`, `[alias]`, a non-credential key in
 #     `[registries.NAME]` or a non-table `registry`; CARGO_PROFILE_DEV_DEBUG_ASSERTIONS set.
-#     Credentials of tokens only get past the check (as in f).
+#     Credentials of tokens only get past the check (as in f). C6b review HIGH 1: Cargo's
+#     legacy top-level `token = "..."` gets past it too, in either file; beside a target
+#     runner, `[env]`, `include`, `[alias]` or `[profile]`, or as a non-string, it is refused.
 # dependency-gate-regressions.sh runs it for each toolchain.
 set -eu
 toolchain=${1:-}
@@ -214,6 +216,30 @@ for name in credentials.toml credentials; do
             "$credentials_dir/$name " env CARGO_HOME="$credentials_home" sh scripts/build.sh \
             ${toolchain:+"+$toolchain"} default check
     done
+    rm "$credentials_home/$name"
+done
+# Cargo's legacy top-level token string is allowed (C6b review HIGH 1); with anything else
+# beside it, or as a non-string, it is refused.
+for name in credentials.toml credentials; do
+    for body in "token = \"x\"\n[target.$host]\nrunner = \"$scratch/runner.sh\"" \
+        'token = "x"\n[env]\nKILND_BLESS_CHECKPOINT_CONTRACT = "1"' \
+        'token = "x"\ninclude = ["bless.toml"]' 'token = "x"\n[alias]\nclippy = "test --no-run"' \
+        'token = "x"\n[profile.dev]\ndebug-assertions = false' 'token = 1' \
+        'token = ["x"]' 'token = { value = "x" }'; do
+        printf "$body\n" >"$credentials_home/$name"
+        refused "a \$CARGO_HOME $name with $(tr '\n' ' ' <"$credentials_home/$name")" \
+            "$credentials_dir/$name " env CARGO_HOME="$credentials_home" sh scripts/build.sh \
+            ${toolchain:+"+$toolchain"} default check
+    done
+    printf 'token = "x"\n' >"$credentials_home/$name"
+    if python3 -I -c 'import tomllib' 2>/dev/null; then
+        allowed_message="no-such-profile is not a profile in dependency-gate.json"
+    else
+        allowed_message="$credentials_dir/$name cannot be checked without Python 3.11"
+    fi
+    refused "a \$CARGO_HOME $name of a legacy top-level token only (past the credentials check)" \
+        "$allowed_message" env CARGO_HOME="$credentials_home" sh scripts/build.sh \
+        ${toolchain:+"+$toolchain"} no-such-profile check
     rm "$credentials_home/$name"
 done
 refused "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false" \

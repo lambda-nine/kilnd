@@ -26,6 +26,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 - Refuse `CARGO_PROFILE_*` variables in `build.sh`, the environment's form of the
   already refused `[profile]` table, so a reviewed build's debug assertions, optimization
   and overflow checks are the workspace's own.
+- Accept Cargo's legacy top-level `token = "..."` in `$CARGO_HOME/credentials` and
+  `credentials.toml` again (C6b review). The C6a recheck allowlist knew only the
+  `[registry]` table form, so an existing legacy credentials file stopped every
+  `build.sh` run. A top-level `token` string is allowed; any other top-level key, or a
+  non-string `token`, is still refused.
 - Check `$CARGO_HOME`'s credentials files too (C6a recheck 4). Cargo 1.88 can merge
   `credentials` or `credentials.toml` as general configuration during an authenticated
   registry lookup, so a `[target]` runner there reached the bless writer. `build.sh` now
