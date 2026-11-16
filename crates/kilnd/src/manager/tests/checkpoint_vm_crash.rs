@@ -460,6 +460,8 @@ fn c6b_v9_pin_committed_not_dispatched_retires_the_reader_and_releases_on_absent
         let pending = fork_bg(&w, &cp, "v9-fork", 0);
         w.relay.held("checkpoint.restore", 60).await;
         let fork = pinned_fork(&w, &cp).await;
+        // Retired without a dispatch: its reservation stays ambiguous.
+        w.expect_ambiguous(&fork);
         assert_eq!(w.pin(&fork).as_deref(), Some(""), "a live pin");
         w.kill_daemon().await;
         let _ = pending.await;
@@ -571,6 +573,8 @@ fn c6b_v11_restore_worker_death_fails_the_fork_and_keeps_the_checkpoint() {
     run(async {
         let w = World::start(json!({})).await;
         let (src, cp, fork, pid, pending) = mid_restore(&w, "v11").await;
+        // The killed restore reported no backend ID: its reservation stays ambiguous.
+        w.expect_ambiguous(&fork);
         kill_pid(pid);
         // A keyed fork answers the FAILED sandbox with its typed reason, or refuses.
         let result = pending.await.unwrap();
@@ -680,6 +684,8 @@ fn c6b_v13_helper_death_mid_restore_keeps_the_pin_until_absent() {
     run(async {
         let mut w = World::start(json!({})).await;
         let (src, cp, fork, pid, pending) = mid_restore(&w, "v13").await;
+        // The killed restore reported no backend ID: its reservation stays ambiguous.
+        w.expect_ambiguous(&fork);
         w.kill_helper().await;
         // The pin outlives the dead epoch. The fork's supervisor waits for a helper to
         // ask about its reader, so the fork answers only once a new one serves.
@@ -822,9 +828,20 @@ fn c6b_v16_corrupt_payload_quarantines_and_delete_releases() {
         let cp = ready(&w, &src, "v16").await;
         let charged = w.charge();
         let flipped = flip_payload_byte(&w, &cp, 1 << 20);
+        let rows_before: Vec<String> = w.host_state().sandboxes.into_iter().map(|r| r.id).collect();
         let fork = w
             .rpc(OWNER, json!({ "op": "create", "from_checkpoint": cp }))
             .await;
+        // The refused fork's row: FAILED in setup with no backend ID, so ambiguous.
+        let new_rows: Vec<String> = w
+            .host_state()
+            .sandboxes
+            .into_iter()
+            .map(|r| r.id)
+            .filter(|id| !rows_before.contains(id))
+            .collect();
+        assert_eq!(new_rows.len(), 1, "the corrupt fork's rows: {new_rows:?}");
+        w.expect_ambiguous(&new_rows[0]);
         eprintln!(
             "C6B V16 fork of the corrupted checkpoint: {fork}; row {} {}",
             w.cp_state(&cp),

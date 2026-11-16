@@ -1112,6 +1112,9 @@ pub(super) struct World {
     pub(super) relay: Relay,
     pub(super) instance: String,
     pub(super) daemon_args: Value,
+    /// The sandboxes the scenario declared will end FAILED with an ambiguous
+    /// reservation ([`World::expect_ambiguous`]); [`World::finish`] requires exactly these.
+    expected_ambiguous: Mutex<Vec<String>>,
 }
 
 impl World {
@@ -1161,6 +1164,7 @@ impl World {
             relay,
             instance: String::new(),
             daemon_args,
+            expected_ambiguous: Mutex::new(Vec::new()),
         }
     }
 
@@ -1523,6 +1527,13 @@ impl World {
     /// through the API as its owner, each answer checked, and requires nothing left
     /// ([`residue_after_cleanup`]) before stopping the daemon and the helper. The
     /// scene's root cleanup is a fallback only: needed after this, it fails the test.
+    /// Declares that sandbox `id` ends FAILED with an ambiguous reservation, which
+    /// kilnd keeps charged and refuses to delete; [`World::finish`] fails on any such
+    /// sandbox not declared, and on a declared one that is not.
+    pub(super) fn expect_ambiguous(&self, id: &str) {
+        self.expected_ambiguous.lock().unwrap().push(id.to_string());
+    }
+
     pub(super) async fn finish(mut self) {
         // A kiln child a scenario orphaned holds its artifact until it exits.
         self.until("no process naming the artifacts", 180, |w| w.workers().is_empty())
@@ -1536,7 +1547,9 @@ impl World {
         })
         .await;
         let before = self.host_state();
+        let declared = self.expected_ambiguous.lock().unwrap().clone();
         assert_clean(&residue_before_cleanup(&before), "before cleanup", &before);
+        assert_clean(&ambiguity_mismatch(&before, &declared), "before cleanup", &before);
         for (id, state, owner) in &before.checkpoints {
             if matches!(state.as_str(), "ready" | "quarantined") {
                 let d = self.rpc(*owner, json!({ "op": "delete_checkpoint", "id": id })).await;
@@ -1551,7 +1564,12 @@ impl World {
         }
         for row in before.sandboxes.iter().filter(|s| s.state != "deleted") {
             let d = self.rpc(row.owner_uid, json!({ "op": "delete", "id": row.id })).await;
-            assert_eq!(ok(&d)["state"], "SANDBOX_STATE_DELETED", "Delete of {}: {d}", row.id);
+            if declared.contains(&row.id) {
+                // kilnd keeps an ambiguous reservation charged: Delete must refuse it.
+                assert!(refuses_ambiguous_release(&d, &row.id), "Delete of {}: {d}", row.id);
+            } else {
+                assert_eq!(ok(&d)["state"], "SANDBOX_STATE_DELETED", "Delete of {}: {d}", row.id);
+            }
         }
         self.until("every checkpoint settled", 120, |w| {
             w.rows()
@@ -1561,7 +1579,7 @@ impl World {
         .await;
         assert_eq!(self.charge(), (0, 0), "charge left: {:?}", self.rows());
         let after = self.host_state();
-        assert_clean(&residue_after_cleanup(&after), "after cleanup", &after);
+        assert_clean(&residue_after_cleanup(&after, &declared), "after cleanup", &after);
         self.stop_daemon().await;
         if let Some(helper) = self.helper.take() {
             let status = helper.stop(60).await;
@@ -1652,14 +1670,14 @@ pub(super) fn residue_before_cleanup(s: &HostState) -> Vec<String> {
 
 /// Every way the state after the API's deletes is not empty: any run, any artifact
 /// entry, a sandbox not deleted, a checkpoint neither deleted nor failed.
-pub(super) fn residue_after_cleanup(s: &HostState) -> Vec<String> {
+pub(super) fn residue_after_cleanup(s: &HostState, declared: &[String]) -> Vec<String> {
     let mut found: Vec<String> = s.runs.iter().map(|r| format!("run {r} left")).collect();
     found.extend(s.listed.iter().map(|r| format!("kiln ls lists {r}")));
     found.extend(s.artifacts.iter().map(|a| format!("artifact entry {a} left")));
     found.extend(
         s.sandboxes
             .iter()
-            .filter(|r| r.state != "deleted")
+            .filter(|r| r.state != "deleted" && !(ambiguous_reservation(r) && declared.contains(&r.id)))
             .map(|r| format!("sandbox {} is {}", r.id, r.state)),
     );
     found.extend(
@@ -1669,6 +1687,43 @@ pub(super) fn residue_after_cleanup(s: &HostState) -> Vec<String> {
             .map(|(id, st, _)| format!("checkpoint {id} is {st}")),
     );
     found
+}
+
+/// A FAILED sandbox whose reservation is ambiguous: no backend ID was reported and
+/// nothing proved its backend gone. kilnd keeps it charged and refuses its Delete,
+/// since the backend listing cannot prove an unpublished resource absent, so it is
+/// the one non-deleted sandbox the state after cleanup may hold, once declared.
+pub(super) fn ambiguous_reservation(r: &SandboxRow) -> bool {
+    r.state == "failed" && !r.released && r.backend_id.is_none()
+}
+
+/// Every way the ambiguous reservations differ from the declared IDs, in both
+/// directions: an ambiguous sandbox not declared, a declared one not ambiguous.
+pub(super) fn ambiguity_mismatch(s: &HostState, declared: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = s
+        .sandboxes
+        .iter()
+        .filter(|r| ambiguous_reservation(r) && !declared.contains(&r.id))
+        .map(|r| format!("sandbox {} has an undeclared ambiguous reservation", r.id))
+        .collect();
+    found.extend(
+        declared
+            .iter()
+            .filter(|id| !s.sandboxes.iter().any(|r| &r.id == *id && ambiguous_reservation(r)))
+            .map(|id| format!("declared ambiguous sandbox {id} is not")),
+    );
+    found
+}
+
+/// Whether a Delete answer is exactly kilnd's refusal to release sandbox `id`'s
+/// ambiguous reservation.
+pub(super) fn refuses_ambiguous_release(answer: &Value, id: &str) -> bool {
+    let prefix = format!("cannot release the ambiguous reservation for failed sandbox {id}: ");
+    answer.get("ok").is_none()
+        && answer["error"]["code"] == "FailedPrecondition"
+        && answer["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with(&prefix))
 }
 
 #[track_caller]
@@ -1786,13 +1841,98 @@ mod finish_tests {
             checkpoints: vec![("cp-1".into(), "deleted".into(), OWNER)],
             ..HostState::default()
         };
-        assert_eq!(residue_after_cleanup(&empty), Vec::<String>::new());
+        assert_eq!(residue_after_cleanup(&empty, &[]), Vec::<String>::new());
         let mut s = empty.clone();
         s.runs.push("run-a".into());
-        assert_eq!(residue_after_cleanup(&s), vec!["run run-a left".to_string()]);
+        assert_eq!(residue_after_cleanup(&s, &[]), vec!["run run-a left".to_string()]);
         let mut s = empty;
         s.artifacts.push(".removing-cp-1-1-2-3".into());
-        assert_eq!(residue_after_cleanup(&s).len(), 1);
+        assert_eq!(residue_after_cleanup(&s, &[]).len(), 1);
+    }
+
+    #[test]
+    fn only_a_declared_ambiguous_reservation_may_stay_after_cleanup() {
+        let declared = ["sb-r".to_string()];
+        let with = |row: SandboxRow| {
+            residue_after_cleanup(
+                &HostState {
+                    sandboxes: vec![row],
+                    ..HostState::default()
+                },
+                &declared,
+            )
+        };
+        assert_eq!(with(sandbox("sb-r", "failed", None, false)), Vec::<String>::new());
+        // Undeclared, the same ambiguous row is residue.
+        let undeclared = HostState {
+            sandboxes: vec![sandbox("sb-u", "failed", None, false)],
+            ..HostState::default()
+        };
+        assert_eq!(residue_after_cleanup(&undeclared, &declared).len(), 1);
+        for row in [
+            sandbox("sb-r", "failed", Some("run-r"), false),
+            sandbox("sb-r", "failed", Some("run-r"), true),
+            sandbox("sb-r", "failed", None, true),
+            sandbox("sb-r", "ready", None, false),
+            sandbox("sb-r", "ready", Some("run-r"), false),
+        ] {
+            assert_eq!(with(row.clone()).len(), 1, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn the_declared_ambiguous_set_must_match_exactly() {
+        let state = |rows: Vec<SandboxRow>| HostState {
+            sandboxes: rows,
+            ..HostState::default()
+        };
+        let declared = ["sb-r".to_string()];
+        let exact = state(vec![sandbox("sb-r", "failed", None, false), sandbox("sb-d", "deleted", None, true)]);
+        assert_eq!(ambiguity_mismatch(&exact, &declared), Vec::<String>::new());
+        // An undeclared ambiguous row fails it.
+        let extra = state(vec![sandbox("sb-r", "failed", None, false), sandbox("sb-u", "failed", None, false)]);
+        assert_eq!(
+            ambiguity_mismatch(&extra, &declared),
+            vec!["sandbox sb-u has an undeclared ambiguous reservation".to_string()]
+        );
+        assert_eq!(ambiguity_mismatch(&extra, &[]).len(), 2);
+        // A declared row that is missing, or not ambiguous, fails it.
+        assert_eq!(
+            ambiguity_mismatch(&state(vec![]), &declared),
+            vec!["declared ambiguous sandbox sb-r is not".to_string()]
+        );
+        for row in [
+            sandbox("sb-r", "failed", Some("run-r"), false),
+            sandbox("sb-r", "failed", None, true),
+            sandbox("sb-r", "deleted", None, true),
+        ] {
+            assert_eq!(ambiguity_mismatch(&state(vec![row.clone()]), &declared).len(), 1, "{row:?}");
+        }
+        // Through `assert_clean`, as `finish` uses it, both fail.
+        for (s, id) in [(extra, "sb-u"), (state(vec![]), "sb-r")] {
+            let failed = std::panic::catch_unwind(|| {
+                assert_clean(&ambiguity_mismatch(&s, &declared), "before cleanup", &s)
+            })
+            .expect_err("finish passed with a mismatched ambiguous set");
+            let message = failed.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(message.contains("residue before cleanup") && message.contains(id), "{message}");
+        }
+    }
+
+    #[test]
+    fn finish_requires_the_exact_ambiguous_release_refusal() {
+        let refusal = |code: &str, id: &str| {
+            json!({ "error": { "code": code, "reason": "", "message": format!(
+                "cannot release the ambiguous reservation for failed sandbox {id}: no backend ID was reported"
+            ) } })
+        };
+        assert!(refuses_ambiguous_release(&refusal("FailedPrecondition", "sb-r"), "sb-r"));
+        assert!(!refuses_ambiguous_release(&refusal("FailedPrecondition", "sb-x"), "sb-r"));
+        assert!(!refuses_ambiguous_release(&refusal("Internal", "sb-r"), "sb-r"));
+        let other = json!({ "error": { "code": "FailedPrecondition", "reason": "", "message": "busy" } });
+        assert!(!refuses_ambiguous_release(&other, "sb-r"));
+        let deleted = json!({ "ok": { "state": "SANDBOX_STATE_DELETED" } });
+        assert!(!refuses_ambiguous_release(&deleted, "sb-r"));
     }
 }
 
