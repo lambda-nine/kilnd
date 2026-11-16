@@ -54,15 +54,11 @@ fn no_plant() -> Plant {
     Box::new(|_, _| {})
 }
 
-/// The tree a comparison covers: `/root/w`, and for a read-only root `/workspace`.
-const LISTING: &str = "for p in /root/w /workspace; do [ -e \"$p\" ] || [ -L \"$p\" ] || continue; \
-    find \"$p\" -xdev | LC_ALL=C sort | while IFS= read -r f; do \
-      t=$(stat -c '%F' \"$f\"); \
-      if [ \"$t\" = directory ]; then stat -c '%n|%F|%a|%u|%g' \"$f\"; \
-      else stat -c '%n|%F|%a|%u|%g|%s|%h|%y' \"$f\"; fi; \
-      [ -L \"$f\" ] && printf 'link %s\\n' \"$(readlink \"$f\")\"; \
-      if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then sha256sum < \"$f\"; fi; \
-    done; done; true";
+/// The tree a comparison covers: `/root/w`, and for a read-only root `/workspace`
+/// ([`listing_script`]: every name byte, directory mtimes included).
+fn listing() -> String {
+    listing_script(&["/root/w", "/workspace"])
+}
 
 /// A command whose output the fork must reproduce.
 const BEHAVIOR: &str = "cd /root/w 2>/dev/null && (ls -la; for f in *; do [ -f \"$f\" ] && head -c 64 \"$f\"; echo; done) 2>&1 | sed 's/ [A-Z][a-z][a-z] [ 0-9][0-9] [0-9:]* / /'";
@@ -76,7 +72,7 @@ struct Case {
     plant: Plant,
     expect: Expect,
     disk_bytes: u64,
-    listing: &'static str,
+    listing: String,
     fork_check: Option<ForkCheck>,
 }
 
@@ -87,7 +83,7 @@ fn case(name: &'static str, inside: &str, expect: Expect) -> Case {
         plant: no_plant(),
         expect,
         disk_bytes: 0,
-        listing: LISTING,
+        listing: listing(),
         fork_check: None,
     }
 }
@@ -96,7 +92,7 @@ fn case(name: &'static str, inside: &str, expect: Expect) -> Case {
 const COUNT_LISTING: &str = "find /root/w -xdev | wc -l; find /root/w -xdev | LC_ALL=C sort | sha256sum";
 
 fn many(mut c: Case) -> Case {
-    c.listing = COUNT_LISTING;
+    c.listing = COUNT_LISTING.into();
     c
 }
 
@@ -263,8 +259,10 @@ async fn check(w: &World, by: &Bystanders, c: Case) -> Value {
     }
     (c.plant)(&upper, owner);
     let before = w.charge();
-    let listing = w.sh(&src, c.listing).await["stdout"].clone();
-    let behavior = w.ok(json!({ "op": "exec", "id": src, "script": BEHAVIOR })).await["stdout"].clone();
+    // The exact bytes of both (C6b review HIGH 3): two different invalid names must
+    // never compare equal.
+    let listing = w.sh(&src, &c.listing).await;
+    let behavior = w.ok(json!({ "op": "exec", "id": src, "script": BEHAVIOR })).await;
     let r = w
         .rpc(
             OWNER,
@@ -302,10 +300,11 @@ async fn check(w: &World, by: &Bystanders, c: Case) -> Value {
             .ok(json!({ "op": "create", "from_checkpoint": cp, "disk_bytes": c.disk_bytes }))
             .await;
         let fid = f["id"].as_str().unwrap().to_string();
-        let fork_listing = w.sh(&fid, c.listing).await["stdout"].clone();
-        let fork_behavior = w.ok(json!({ "op": "exec", "id": fid, "script": BEHAVIOR })).await["stdout"].clone();
-        assert_eq!(fork_listing, listing, "{}: the fork's tree differs", c.name);
-        assert_eq!(fork_behavior, behavior, "{}: the fork behaves differently", c.name);
+        let fork_listing = w.sh(&fid, &c.listing).await;
+        let fork_behavior = w.ok(json!({ "op": "exec", "id": fid, "script": BEHAVIOR })).await;
+        if let Err(e) = same_tree(&[listing.clone(), behavior.clone()], &[fork_listing, fork_behavior]) {
+            panic!("{}: {e}", c.name);
+        }
         let checked = match c.fork_check {
             Some(check) => {
                 let (fork_upper, _) = locate(w, &fid, f["backend_id"].as_str().unwrap()).await;
@@ -317,7 +316,8 @@ async fn check(w: &World, by: &Bystanders, c: Case) -> Value {
         let d = w.ok(json!({ "op": "delete_checkpoint", "id": cp })).await;
         assert_eq!(d["state"], "CHECKPOINT_STATE_DELETED", "{d}");
         json!({ "round_trip": true, "size_bytes": r["ok"]["size_bytes"],
-                "entries": w.cp_col(&cp, "entry_count"), "fork_upper": checked })
+                "entries": w.cp_col(&cp, "entry_count"), "fork_upper": checked,
+                "listing_bytes": output_bytes(&listing).len() })
     };
     match c.expect {
         Expect::RoundTrip => assert!(outcome.get("round_trip").is_some(), "{}: {outcome}", c.name),

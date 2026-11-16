@@ -310,6 +310,93 @@ pub(super) fn sandbox_json(s: &pb::Sandbox) -> Value {
     })
 }
 
+/// An execution as JSON. `stdout` and `stderr` are lossy text for messages and simple
+/// comparisons; `stdout_hex` and `stderr_hex` carry the exact bytes (C6b review HIGH 3),
+/// which every fidelity comparison uses ([`output_bytes`]).
+pub(super) fn exec_json(
+    state: &str,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+    failure_reason: &str,
+) -> Value {
+    json!({
+        "state": state,
+        "exit_code": exit_code,
+        "stdout": String::from_utf8_lossy(stdout),
+        "stderr": String::from_utf8_lossy(stderr),
+        "stdout_hex": hex(stdout),
+        "stderr_hex": hex(stderr),
+        "failure_reason": failure_reason,
+    })
+}
+
+pub(super) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    assert!(text.len().is_multiple_of(2), "odd hex length");
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex digits"))
+        .collect()
+}
+
+/// An execution's exact stdout bytes.
+#[track_caller]
+pub(super) fn output_bytes(exec: &Value) -> Vec<u8> {
+    unhex(
+        exec["stdout_hex"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no stdout_hex in {exec}")),
+    )
+}
+
+/// The tree a fidelity comparison covers, as one line per entry, every byte of every
+/// name kept: type, mode, owner, group, link count and nanosecond mtime of every entry,
+/// directories included; the size of every entry but a directory (a directory's size
+/// is its filesystem's layout, not its content); a symlink's target and a regular
+/// file's SHA-256. Paths that do not exist print nothing.
+pub(super) fn listing_script(paths: &[&str]) -> String {
+    let quoted: Vec<String> = paths.iter().map(|p| format!("'{p}'")).collect();
+    format!(
+        "for p in {}; do [ -e \"$p\" ] || [ -L \"$p\" ] || continue; \
+         find \"$p\" -xdev | LC_ALL=C sort | while IFS= read -r f; do \
+           if [ -d \"$f\" ] && [ ! -L \"$f\" ]; then stat -c '%n|%F|%a|%u|%g|%h|%y' \"$f\"; \
+           else stat -c '%n|%F|%a|%u|%g|%s|%h|%y' \"$f\"; fi; \
+           [ -L \"$f\" ] && printf 'link %s\\n' \"$(readlink \"$f\")\"; \
+           if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then sha256sum < \"$f\"; fi; \
+         done; done; true",
+        quoted.join(" ")
+    )
+}
+
+/// The fidelity oracle: the fork's listing and behaviour are the source's, byte for
+/// byte. The error names the first differing line, escaped.
+pub(super) fn same_tree(source: &[Value; 2], fork: &[Value; 2]) -> Result<(), String> {
+    for (what, a, b) in [
+        ("tree", &source[0], &fork[0]),
+        ("behaviour", &source[1], &fork[1]),
+    ] {
+        let (a, b) = (output_bytes(a), output_bytes(b));
+        if a != b {
+            let (la, lb): (Vec<&[u8]>, Vec<&[u8]>) =
+                (a.split(|c| *c == b'\n').collect(), b.split(|c| *c == b'\n').collect());
+            let at = (0..la.len().max(lb.len()))
+                .find(|i| la.get(*i) != lb.get(*i))
+                .unwrap_or(0);
+            let show = |l: Option<&&[u8]>| l.map(|l| l.escape_ascii().to_string()).unwrap_or_default();
+            return Err(format!(
+                "the fork's {what} differs at line {at}: source {:?}, fork {:?}",
+                show(la.get(at)),
+                show(lb.get(at))
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn expiry(op: &Value, lifetime: &str, idle: &str) -> Option<pb::ExpiryPolicy> {
     let (l, i) = (op[lifetime].as_u64(), op[idle].as_u64());
     (l.is_some() || i.is_some()).then(|| pb::ExpiryPolicy {
@@ -398,13 +485,13 @@ async fn perform(client: &mut Client, op: &Value) -> Result<Value, tonic::Status
                 .await?
                 .into_inner();
             let e = r.execution.unwrap();
-            json!({
-                "state": pb::ExecutionState::try_from(e.state).map(|s| s.as_str_name()).unwrap_or("?"),
-                "exit_code": e.exit_code,
-                "stdout": String::from_utf8_lossy(&e.stdout.map(|o| o.data).unwrap_or_default()),
-                "stderr": String::from_utf8_lossy(&e.stderr.map(|o| o.data).unwrap_or_default()),
-                "failure_reason": e.failure_reason,
-            })
+            exec_json(
+                pb::ExecutionState::try_from(e.state).map(|s| s.as_str_name()).unwrap_or("?"),
+                e.exit_code,
+                &e.stdout.map(|o| o.data).unwrap_or_default(),
+                &e.stderr.map(|o| o.data).unwrap_or_default(),
+                &e.failure_reason,
+            )
         }
         "exec_stream" => {
             use tokio_stream::StreamExt;
@@ -1667,5 +1754,93 @@ mod relay_tests {
         let requests = fake.await.unwrap();
         assert_eq!(requests.len(), 2, "the held request was forwarded: {requests:?}");
         let _ = uid();
+    }
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    //! The fidelity oracle's own negative tests, on any host (C6b review HIGH 3): it
+    //! sees one swapped invalid filename byte and one directory mtime.
+    use super::*;
+
+    fn exec(stdout: &[u8]) -> Value {
+        exec_json("EXECUTION_STATE_SUCCEEDED", Some(0), stdout, b"", "")
+    }
+
+    #[test]
+    fn the_fidelity_oracle_sees_swapped_invalid_filename_bytes() {
+        let a = exec(b"/root/w/n\xff\xfe|regular file|644|0|0|1|1|2026-11-15 12:00:00.000000001 +0000\n");
+        let b = exec(b"/root/w/n\xfe\xff|regular file|644|0|0|1|1|2026-11-15 12:00:00.000000001 +0000\n");
+        // The lossy text, all the old oracle compared, cannot tell them apart.
+        assert_eq!(a["stdout"], b["stdout"]);
+        let behaviour = exec(b"same\n");
+        let e = same_tree(&[a.clone(), behaviour.clone()], &[b, behaviour.clone()]).unwrap_err();
+        assert!(e.contains("tree differs at line 0") && e.contains("xff") && e.contains("xfe"), "{e}");
+        same_tree(&[a.clone(), behaviour.clone()], &[a.clone(), behaviour]).unwrap();
+        // And the behaviour output too.
+        let e = same_tree(&[a.clone(), exec(b"n\xff\xfe\n")], &[a, exec(b"n\xfe\xff\n")]).unwrap_err();
+        assert!(e.contains("behaviour differs"), "{e}");
+    }
+
+    #[test]
+    fn the_fidelity_oracle_sees_one_directory_mtime() {
+        let tree = |mtime: &str| {
+            exec(format!(
+                "/root/w|directory|755|0|0|3|{mtime}\n/root/w/d|directory|755|0|0|2|2026-11-15 12:00:00.000000000 +0000\n"
+            ).as_bytes())
+        };
+        let behaviour = exec(b"");
+        let e = same_tree(
+            &[tree("2026-11-15 12:00:00.000000001 +0000"), behaviour.clone()],
+            &[tree("2026-11-15 12:00:00.000000002 +0000"), behaviour.clone()],
+        )
+        .unwrap_err();
+        assert!(e.contains("line 0"), "{e}");
+        // The listing prints a directory's mtime (and every entry's link count).
+        let script = listing_script(&["/root/w"]);
+        assert!(script.contains("stat -c '%n|%F|%a|%u|%g|%h|%y'"), "{script}");
+    }
+
+    /// The listing itself, run for real where GNU stat is the system's (Linux): one
+    /// swapped invalid name byte and one directory mtime change its bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_listing_records_name_bytes_and_directory_mtimes() {
+        use std::os::unix::ffi::OsStrExt;
+        let run = |root: &Path| -> Vec<u8> {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &listing_script(&[root.to_str().unwrap()])])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            out.stdout
+                .split(|c| *c == b'\n')
+                .map(|l| l.strip_prefix(root.as_os_str().as_bytes()).unwrap_or(l).to_vec())
+                .collect::<Vec<_>>()
+                .join(&b'\n')
+        };
+        let tree = |name: &[u8]| {
+            let t = tempfile::tempdir().unwrap();
+            let dir = t.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join(std::ffi::OsStr::from_bytes(name)), b"a").unwrap();
+            let pin = |p: &Path| {
+                let f = std::fs::File::open(p).unwrap();
+                f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000)).unwrap();
+            };
+            pin(&dir.join(std::ffi::OsStr::from_bytes(name)));
+            pin(&dir);
+            pin(t.path());
+            t
+        };
+        let (a, b) = (tree(b"n\xff\xfe"), tree(b"n\xfe\xff"));
+        assert_ne!(run(a.path()), run(b.path()), "swapped invalid bytes");
+        let c = tree(b"n\xff\xfe");
+        assert_eq!(run(a.path()), run(c.path()), "the same tree");
+        std::fs::File::open(c.path().join("d"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_001))
+            .unwrap();
+        assert_ne!(run(a.path()), run(c.path()), "one directory mtime");
     }
 }
