@@ -6,6 +6,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Record the passing C6b fix-round-1 crash, reboot, hostile and client VM reruns
+  in the rollout gate. Its adversarial recheck remains pending; workspace
+  checkpoints stay off by default and for testing only.
+
 - Checkpoint acceptance on real kiln (C6b). A VM harness runs the daemon and the root
   helper as SIGKILLable children of the test binary, with a test-only relay between them
   that holds a named helper operation or its reply, and
