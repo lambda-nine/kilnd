@@ -1957,6 +1957,27 @@ async fn failed_delete_stays_deleting_and_can_be_retried() {
 }
 
 #[tokio::test]
+async fn failed_delete_retried_after_the_backend_is_gone_is_deleted_and_released() {
+    // A sandbox whose backend can't be proven gone (a dead shim) stays DELETING and
+    // charged; once root collects the backend out of band, the retry's removal finds
+    // it absent, and that NotFound is the legacy release: DELETED, reservation freed.
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let reserved = || async { m.health().await.unwrap().node_resources.reserved.sandboxes };
+    assert_eq!(reserved().await, 1);
+    fake.state().fail_remove = true;
+    assert!(matches!(m.delete(&s.id).await, Err(Error::Backend(_))));
+    let stuck = m.get(&s.id, 0).unwrap().0;
+    assert_eq!(stuck.state, SandboxState::Deleting);
+    assert_eq!(reserved().await, 1);
+    fake.state().sandboxes.clear();
+    let attempts = fake.state().remove_attempts.len();
+    assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
+    assert_eq!(fake.state().remove_attempts.len(), attempts + 1);
+    assert_eq!(reserved().await, 0);
+}
+
+#[tokio::test]
 async fn shutdown_refuses_new_work_and_cancels_executions() {
     let (m, _) = manager();
     let s = m.create(CreateRequest::default()).await.unwrap();

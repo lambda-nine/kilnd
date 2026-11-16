@@ -802,6 +802,7 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
         w.ok(json!({ "op": "delete_checkpoint", "id": cp })).await;
         seen.insert("tampered_manifest".into(), json!({ "fork": tampered, "row": "quarantined" }));
         // 2. The source's PID 1 killed mid-capture: a typed failure, nothing left.
+        let charge_before = w.charge();
         let big = w.source(1 << 30, &format!("mkdir -p /root/w && {BIG}")).await;
         let backend = w.ok(json!({ "op": "get", "id": big })).await["backend_id"]
             .as_str()
@@ -828,6 +829,43 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
         .await;
         assert_eq!(w.charge(), (0, 0));
         seen.insert("pid1_killed_mid_capture".into(), json!(pid1));
+        // The killed shim leaves the source's run stale, and kilnd cannot prove that
+        // backend gone (its probe of the dead PID 1 fails), so Delete refuses and the
+        // row stays DELETING, charged: a recorded pre-existing kilnd Delete gap
+        // (MEDIUM), outside the checkpoint gate. Root's `kiln gc` of exactly that run
+        // removes it; a second Delete then finds the backend absent and answers DELETED.
+        let row_of = |w: &World| {
+            w.host_state().sandboxes.into_iter().find(|r| r.id == big).unwrap()
+        };
+        let d = w.rpc(OWNER, json!({ "op": "delete", "id": big })).await;
+        let refusal = d["error"]["message"].as_str().unwrap_or_default().to_string();
+        assert!(
+            d.get("ok").is_none()
+                && d["error"]["code"] == "Internal"
+                && refusal.starts_with(&format!(
+                    "delete sandbox {big}: kiln rm {backend} did not prove absence: "
+                )),
+            "Delete of the dead-shim source: {d}"
+        );
+        let stuck = row_of(&w);
+        assert!(
+            stuck.state == "deleting"
+                && !stuck.released
+                && stuck.backend_id.as_deref() == Some(backend.as_str()),
+            "the dead-shim source after the refused Delete: {stuck:?}"
+        );
+        let collected = collect_expected_stale_runs(std::slice::from_ref(&backend)).await;
+        assert_eq!(collected, vec![backend.clone()], "the dead-shim source's run");
+        let d = w.ok(json!({ "op": "delete", "id": big })).await;
+        assert_eq!(d["state"], "SANDBOX_STATE_DELETED", "{d}");
+        let gone = row_of(&w);
+        assert!(gone.state == "deleted" && gone.released, "{gone:?}");
+        assert_eq!(w.charge(), charge_before);
+        seen.insert(
+            "dead_shim_delete".into(),
+            json!({ "first": format!("refused Internal: {refusal}"), "row": "deleting, charged",
+                    "gc": collected, "second": "deleted, released" }),
+        );
         // 3. Root's own `kiln exec` into the source makes a capture busy (C6b review
         // HIGH 4: required, not recorded). The direct Exec reports it started, then waits
         // on its stdin, which is released only after Capture has answered, so it is
