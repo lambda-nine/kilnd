@@ -40,6 +40,10 @@ struct Scene {
     registry_existed: bool,
     checkpoints_existed: bool,
     instance: Option<String>,
+    /// C6b's scenarios (C6b review HIGH 6): their own `World::finish` proves nothing is
+    /// left, so root's removal of runs and artifacts here is a fallback only, and a
+    /// passing test that needs it fails. C5a's tests keep the plain cleanup.
+    fallback_only: bool,
 }
 
 impl Scene {
@@ -58,6 +62,7 @@ impl Scene {
             registry_existed: std::path::Path::new(REGISTRY).exists(),
             checkpoints_existed: std::path::Path::new(CPS).exists(),
             instance: None,
+            fallback_only: false,
         };
         let copied = Command::new("cp")
             .args([
@@ -99,15 +104,52 @@ impl Scene {
     }
 }
 
+impl Scene {
+    /// What root's cleanup would remove: every run, and this instance's listed
+    /// checkpoints and artifact entries.
+    fn residue(&self) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(RUNS)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n != ".checkpoints")
+                    .map(|n| format!("run {n}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(instance) = &self.instance {
+            found.extend(self.listed().into_iter().map(|l| format!("listed {l}")));
+            if let Ok(d) = std::fs::read_dir(format!("{CPS}/{instance}")) {
+                found.extend(
+                    d.filter_map(Result::ok)
+                        .map(|e| format!("artifact {}", e.file_name().to_string_lossy())),
+                );
+            }
+        }
+        found
+    }
+}
+
+/// Whether a scene's drop fails its test: a fallback-only scene on a passing path
+/// that still found residue to remove (C6b review HIGH 6).
+fn fallback_failure(fallback_only: bool, passing: bool, residue: &[String]) -> Option<String> {
+    (fallback_only && passing && !residue.is_empty())
+        .then(|| format!("fallback cleanup was needed on a passing path: {residue:?}"))
+}
+
 impl Drop for Scene {
     fn drop(&mut self) {
+        let residue = self.residue();
         // Anything a failed run left: its sandboxes are this test's only ones.
-        if let Ok(entries) = std::fs::read_dir(RUNS) {
-            for e in entries.filter_map(Result::ok) {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name != ".checkpoints" {
-                    let _ = kiln(&["rm", &name]);
-                }
+        let runs = if residue.is_empty() {
+            None
+        } else {
+            std::fs::read_dir(RUNS).ok()
+        };
+        for e in runs.into_iter().flatten().filter_map(Result::ok) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name != ".checkpoints" {
+                let _ = kiln(&["rm", &name]);
             }
         }
         if let Some(instance) = &self.instance {
@@ -139,7 +181,21 @@ impl Drop for Scene {
             let _ = std::fs::remove_dir(REGISTRY);
         }
         eprintln!("C5a VM: cleaned up image {}", self.image);
+        if let Some(failure) = fallback_failure(self.fallback_only, !std::thread::panicking(), &residue) {
+            eprintln!("C6B FALLBACK CLEANUP: {failure}");
+            panic!("{failure}");
+        }
     }
+}
+
+#[test]
+fn a_fallback_only_scene_fails_a_passing_test_that_needed_its_cleanup() {
+    let residue = vec!["run 18e8-1".to_string()];
+    assert!(fallback_failure(true, true, &residue).is_some());
+    assert!(fallback_failure(true, true, &[]).is_none());
+    // A failing test's cleanup is what the fallback is for; C5a's scenes keep theirs.
+    assert!(fallback_failure(true, false, &residue).is_none());
+    assert!(fallback_failure(false, true, &residue).is_none());
 }
 
 struct HelperProcess {

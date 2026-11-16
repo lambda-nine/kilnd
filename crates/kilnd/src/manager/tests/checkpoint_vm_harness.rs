@@ -1130,7 +1130,8 @@ impl World {
     }
 
     async fn start_at(dir: PathBuf, tmp: Option<tempfile::TempDir>, daemon_args: Value) -> Self {
-        let scene = Scene::new();
+        let mut scene = Scene::new();
+        scene.fallback_only = true;
         let mut world = Self::assemble(scene, dir, tmp, daemon_args);
         std::fs::create_dir(&world.state).unwrap();
         set_mode(&world.state, 0o700);
@@ -1171,6 +1172,7 @@ impl World {
             registry_existed: arm["registry_existed"].as_bool().unwrap(),
             checkpoints_existed: arm["checkpoints_existed"].as_bool().unwrap(),
             instance: Some(arm["instance"].as_str().unwrap().into()),
+            fallback_only: true,
         };
         let mut world = Self::assemble(scene, dir.to_path_buf(), None, json!({}));
         world.instance = arm["instance"].as_str().unwrap().into();
@@ -1188,6 +1190,7 @@ impl World {
                 registry_existed: true,
                 checkpoints_existed: true,
                 instance: None,
+                fallback_only: false,
             },
         );
         std::mem::forget(scene);
@@ -1472,8 +1475,54 @@ impl World {
         names
     }
 
-    /// Deletes every live sandbox and checkpoint through the API, stops the daemon and
-    /// the helper, and leaves the scene to clean up the rest.
+    /// What [`Self::finish`] checks: the kiln runs, the daemon's rows and the instance's
+    /// artifact entries, read without changing anything.
+    pub(super) fn host_state(&self) -> HostState {
+        let db = self.db();
+        let mut q = db
+            .prepare(
+                "SELECT id, state, backend_id, owner_uid, \
+                 legacy_release IS NOT NULL OR release_evidence_id IS NOT NULL \
+                 FROM sandboxes ORDER BY list_seq",
+            )
+            .unwrap();
+        let sandboxes = q
+            .query_map([], |r| {
+                Ok(SandboxRow {
+                    id: r.get(0)?,
+                    state: r.get(1)?,
+                    backend_id: r.get(2)?,
+                    owner_uid: r.get::<_, i64>(3)? as u32,
+                    released: r.get(4)?,
+                })
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut q = db
+            .prepare("SELECT id, state, owner_uid FROM checkpoints ORDER BY creation_seq")
+            .unwrap();
+        let checkpoints = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u32)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        HostState {
+            runs: run_dirs(),
+            listed: kiln_listed(),
+            sandboxes,
+            checkpoints,
+            artifacts: self.artifacts(),
+        }
+    }
+
+    /// Ends a scenario that passed (C6b review HIGH 6). Before any cleanup it requires
+    /// the exact expected state ([`residue_before_cleanup`]): every kiln run a live
+    /// sandbox's backend, every READY sandbox's backend a run, and no artifact entry
+    /// but each live checkpoint's own. Then it deletes every checkpoint and sandbox
+    /// through the API as its owner, each answer checked, and requires nothing left
+    /// ([`residue_after_cleanup`]) before stopping the daemon and the helper. The
+    /// scene's root cleanup is a fallback only: needed after this, it fails the test.
     pub(super) async fn finish(mut self) {
         // A kiln child a scenario orphaned holds its artifact until it exits.
         self.until("no process naming the artifacts", 180, |w| w.workers().is_empty())
@@ -1482,25 +1531,27 @@ impl World {
             self.relay.clear_rules();
             self.start_daemon().await;
         }
-        for (id, state) in self.rows() {
-            if matches!(state.as_str(), "ready" | "quarantined" | "capturing" | "deleting") {
-                let _ = self
-                    .rpc(OWNER, json!({ "op": "delete_checkpoint", "id": id }))
-                    .await;
+        self.until("no checkpoint capturing or deleting", 120, |w| {
+            w.rows().iter().all(|(_, s)| s != "capturing" && s != "deleting")
+        })
+        .await;
+        let before = self.host_state();
+        assert_clean(&residue_before_cleanup(&before), "before cleanup", &before);
+        for (id, state, owner) in &before.checkpoints {
+            if matches!(state.as_str(), "ready" | "quarantined") {
+                let d = self.rpc(*owner, json!({ "op": "delete_checkpoint", "id": id })).await;
+                assert!(
+                    matches!(
+                        ok(&d)["state"].as_str(),
+                        Some("CHECKPOINT_STATE_DELETED" | "CHECKPOINT_STATE_DELETING")
+                    ),
+                    "Delete of {id}: {d}"
+                );
             }
         }
-        let sandboxes: Vec<String> = {
-            let db = self.db();
-            let mut q = db
-                .prepare("SELECT id FROM sandboxes WHERE state NOT IN ('deleted')")
-                .unwrap();
-            q.query_map([], |r| r.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        };
-        for id in sandboxes {
-            let _ = self.rpc(OWNER, json!({ "op": "delete", "id": id })).await;
+        for row in before.sandboxes.iter().filter(|s| s.state != "deleted") {
+            let d = self.rpc(row.owner_uid, json!({ "op": "delete", "id": row.id })).await;
+            assert_eq!(ok(&d)["state"], "SANDBOX_STATE_DELETED", "Delete of {}: {d}", row.id);
         }
         self.until("every checkpoint settled", 120, |w| {
             w.rows()
@@ -1509,18 +1560,239 @@ impl World {
         })
         .await;
         assert_eq!(self.charge(), (0, 0), "charge left: {:?}", self.rows());
+        let after = self.host_state();
+        assert_clean(&residue_after_cleanup(&after), "after cleanup", &after);
         self.stop_daemon().await;
         if let Some(helper) = self.helper.take() {
             let status = helper.stop(60).await;
             assert!(status.success(), "helper stopped with {status}");
         }
         assert!(self.workers().is_empty(), "{:?}", self.workers());
-        assert!(
-            self.artifacts().iter().all(|n| !n.starts_with("cp-")),
-            "artifacts left: {:?}",
-            self.artifacts()
-        );
+        assert_eq!(self.artifacts(), Vec::<String>::new(), "artifacts left");
         drop(self);
+    }
+}
+
+/// One sandbox row as [`World::finish`] reads it.
+#[derive(Clone, Debug)]
+pub(super) struct SandboxRow {
+    pub(super) id: String,
+    pub(super) state: String,
+    pub(super) backend_id: Option<String>,
+    pub(super) owner_uid: u32,
+    /// Its backend is proven gone (compensated, deleted or never created, or ABSENT
+    /// evidence recorded).
+    pub(super) released: bool,
+}
+
+/// The state [`World::finish`] judges.
+#[derive(Clone, Debug, Default)]
+pub(super) struct HostState {
+    /// Run directories under the runs root, `.checkpoints` aside.
+    pub(super) runs: Vec<String>,
+    /// The IDs `kiln ls` lists.
+    pub(super) listed: Vec<String>,
+    pub(super) sandboxes: Vec<SandboxRow>,
+    /// (id, state, owner uid).
+    pub(super) checkpoints: Vec<(String, String, u32)>,
+    /// The daemon instance's artifact directory entries.
+    pub(super) artifacts: Vec<String>,
+}
+
+/// Every way the state before cleanup differs from the expected one: a run (in the
+/// runs root or `kiln ls`) that no live, unreleased sandbox names; a READY sandbox
+/// without its run; an artifact entry that is not a READY or QUARANTINED
+/// checkpoint's completed artifact (staging, tombstones, a settled checkpoint's); a
+/// live checkpoint without its artifact; a checkpoint still capturing or deleting.
+pub(super) fn residue_before_cleanup(s: &HostState) -> Vec<String> {
+    let mut found = Vec::new();
+    let named: Vec<&str> = s
+        .sandboxes
+        .iter()
+        .filter(|r| r.state != "deleted" && !r.released)
+        .filter_map(|r| r.backend_id.as_deref())
+        .collect();
+    let mut runs: Vec<&String> = s.runs.iter().chain(&s.listed).collect();
+    runs.sort();
+    runs.dedup();
+    for run in runs {
+        if !named.contains(&run.as_str()) {
+            found.push(format!("run {run} is no live sandbox's backend"));
+        }
+    }
+    for r in s.sandboxes.iter().filter(|r| r.state == "ready") {
+        match r.backend_id.as_deref() {
+            Some(b) if s.runs.iter().any(|x| x == b) && s.listed.iter().any(|x| x == b) => {}
+            b => found.push(format!("READY sandbox {} has no run (backend {b:?})", r.id)),
+        }
+    }
+    let live: Vec<&str> = s
+        .checkpoints
+        .iter()
+        .filter(|(_, st, _)| matches!(st.as_str(), "ready" | "quarantined"))
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    for name in &s.artifacts {
+        if !live.contains(&name.as_str()) {
+            found.push(format!("artifact entry {name} is no live checkpoint's"));
+        }
+    }
+    for id in &live {
+        if !s.artifacts.iter().any(|a| a == id) {
+            found.push(format!("live checkpoint {id} has no artifact"));
+        }
+    }
+    for (id, st, _) in &s.checkpoints {
+        if matches!(st.as_str(), "capturing" | "deleting") {
+            found.push(format!("checkpoint {id} still {st}"));
+        }
+    }
+    found
+}
+
+/// Every way the state after the API's deletes is not empty: any run, any artifact
+/// entry, a sandbox not deleted, a checkpoint neither deleted nor failed.
+pub(super) fn residue_after_cleanup(s: &HostState) -> Vec<String> {
+    let mut found: Vec<String> = s.runs.iter().map(|r| format!("run {r} left")).collect();
+    found.extend(s.listed.iter().map(|r| format!("kiln ls lists {r}")));
+    found.extend(s.artifacts.iter().map(|a| format!("artifact entry {a} left")));
+    found.extend(
+        s.sandboxes
+            .iter()
+            .filter(|r| r.state != "deleted")
+            .map(|r| format!("sandbox {} is {}", r.id, r.state)),
+    );
+    found.extend(
+        s.checkpoints
+            .iter()
+            .filter(|(_, st, _)| !matches!(st.as_str(), "deleted" | "failed"))
+            .map(|(id, st, _)| format!("checkpoint {id} is {st}")),
+    );
+    found
+}
+
+#[track_caller]
+pub(super) fn assert_clean(residue: &[String], when: &str, state: &HostState) {
+    assert!(residue.is_empty(), "residue {when}: {residue:?} in {state:?}");
+}
+
+/// The run directories under the runs root, `.checkpoints` aside, sorted.
+pub(super) fn run_dirs() -> Vec<String> {
+    let mut runs: Vec<String> = std::fs::read_dir(super::RUNS)
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n != ".checkpoints")
+                .collect()
+        })
+        .unwrap_or_default();
+    runs.sort();
+    runs
+}
+
+/// The IDs `kiln ls` lists, sorted.
+pub(super) fn kiln_listed() -> Vec<String> {
+    let out = std::process::Command::new(kiln_bin()).arg("ls").output().unwrap();
+    assert!(out.status.success(), "kiln ls: {out:?}");
+    let mut ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[cfg(test)]
+mod finish_tests {
+    //! `World::finish`'s residue checks on any host (C6b review HIGH 6): an injected
+    //! run, a staging or tombstone entry, a settled checkpoint's artifact or a READY
+    //! sandbox without its run fails it.
+    use super::*;
+
+    fn sandbox(id: &str, state: &str, backend: Option<&str>, released: bool) -> SandboxRow {
+        SandboxRow {
+            id: id.into(),
+            state: state.into(),
+            backend_id: backend.map(str::to_string),
+            owner_uid: OWNER,
+            released,
+        }
+    }
+
+    /// A clean state: one READY sandbox and its run, a FAILED fork whose backend was
+    /// compensated, one READY checkpoint and its artifact, a settled one.
+    fn clean() -> HostState {
+        HostState {
+            runs: vec!["run-a".into()],
+            listed: vec!["run-a".into()],
+            sandboxes: vec![
+                sandbox("sb-a", "ready", Some("run-a"), false),
+                sandbox("sb-f", "failed", Some("run-f"), true),
+                sandbox("sb-d", "deleted", Some("run-d"), true),
+            ],
+            checkpoints: vec![
+                ("cp-1".into(), "ready".into(), OWNER),
+                ("cp-2".into(), "deleted".into(), OWNER),
+            ],
+            artifacts: vec!["cp-1".into()],
+        }
+    }
+
+    #[test]
+    fn finish_refuses_any_residue_before_cleanup() {
+        assert_eq!(residue_before_cleanup(&clean()), Vec::<String>::new());
+        let with = |f: &dyn Fn(&mut HostState)| {
+            let mut s = clean();
+            f(&mut s);
+            residue_before_cleanup(&s)
+        };
+        // An injected extra run, in the runs root or only in `kiln ls`.
+        assert_eq!(with(&|s| s.runs.push("run-x".into())).len(), 1);
+        assert_eq!(with(&|s| s.listed.push("run-x".into())).len(), 1);
+        // A run of a deleted or compensated sandbox.
+        assert_eq!(with(&|s| s.runs.push("run-d".into())).len(), 1);
+        assert_eq!(with(&|s| s.runs.push("run-f".into())).len(), 1);
+        // A READY sandbox without its run.
+        assert_eq!(with(&|s| s.runs.clear()).len(), 1);
+        // Staging, tombstones and a settled checkpoint's artifact.
+        for name in [".staging-cp-1-1-00ff", ".removing-cp-1-1-2-3", "cp-2"] {
+            assert_eq!(with(&|s| s.artifacts.push(name.into())).len(), 1, "{name}");
+        }
+        // A live checkpoint without its artifact, and an unsettled one.
+        assert_eq!(with(&|s| s.artifacts.clear()).len(), 1);
+        assert_eq!(with(&|s| s.checkpoints[1].1 = "deleting".into()).len(), 1);
+    }
+
+    #[test]
+    fn an_injected_run_makes_finish_fail() {
+        let mut s = clean();
+        s.runs.push("run-x".into());
+        let failed = std::panic::catch_unwind(|| {
+            assert_clean(&residue_before_cleanup(&s), "before cleanup", &s)
+        })
+        .expect_err("finish passed with an injected run");
+        let message = failed
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("residue before cleanup") && message.contains("run-x"), "{message}");
+    }
+
+    #[test]
+    fn finish_requires_nothing_left_after_cleanup() {
+        let empty = HostState {
+            sandboxes: vec![sandbox("sb-a", "deleted", Some("run-a"), true)],
+            checkpoints: vec![("cp-1".into(), "deleted".into(), OWNER)],
+            ..HostState::default()
+        };
+        assert_eq!(residue_after_cleanup(&empty), Vec::<String>::new());
+        let mut s = empty.clone();
+        s.runs.push("run-a".into());
+        assert_eq!(residue_after_cleanup(&s), vec!["run run-a left".to_string()]);
+        let mut s = empty;
+        s.artifacts.push(".removing-cp-1-1-2-3".into());
+        assert_eq!(residue_after_cleanup(&s).len(), 1);
     }
 }
 

@@ -626,12 +626,24 @@ fn c6b_v12_restored_without_ready_is_compensated_never_promoted() {
     run(async {
         let mut w = World::start(json!({})).await;
         let src = w.source(0, SMALL).await;
+        let src_backend = w.ok(json!({ "op": "get", "id": src })).await["backend_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let cp = ready(&w, &src, "v12").await;
+        assert_eq!(run_dirs(), vec![src_backend.clone()], "runs before the fork");
         w.relay.add(hold(Phase::Reply, "checkpoint.restored", None));
         let pending = fork_bg(&w, &cp, "v12-fork", 0);
         let reply = w.relay.held("checkpoint.restored", 120).await;
         let fork = pinned_fork(&w, &cp).await;
-        let runs_before = kiln_runs();
+        // C6b review HIGH 6: the runs at the kill are exactly the source's and the one
+        // backend the restore published; after compensation only the source's is left.
+        let runs_before = run_dirs();
+        let restored: Vec<String> = runs_before.iter().filter(|r| **r != src_backend).cloned().collect();
+        assert_eq!(restored.len(), 1, "runs at the kill: {runs_before:?}");
+        assert!(runs_before.contains(&src_backend), "runs at the kill: {runs_before:?}");
+        let restored = restored[0].clone();
+        assert!(reply.contains(&restored), "the held Restored reply names another backend: {reply}");
         w.kill_daemon().await;
         let _ = pending.await;
         let reconciled = w.start_daemon().await;
@@ -643,13 +655,17 @@ fn c6b_v12_restored_without_ready_is_compensated_never_promoted() {
             w.pin(&fork).is_some_and(|p| !p.is_empty())
         })
         .await;
-        let runs_after = kiln_runs();
+        let runs_after = run_dirs();
+        assert_eq!(runs_after, vec![src_backend.clone()], "the restored backend {restored} was not compensated");
+        let recorded = w.sb_col(&fork, "backend_id");
+        assert!(recorded.is_empty() || recorded == restored, "the fork names {recorded}, not {restored}");
         assert_eq!(w.cp_state(&cp), "ready");
         source_usable(&w, &src, "one").await;
         matrix(
             "V12 restore published, READY missing",
             json!({ "fork_state": w.sandbox_state(&fork), "pin_released_by": w.pin(&fork),
-                    "kiln_runs_at_kill": runs_before.len(), "kiln_runs_after": runs_after.len(),
+                    "kiln_runs_at_kill": runs_before, "kiln_runs_after": runs_after,
+                    "restored_backend": restored, "fork_backend_id": recorded,
                     "restored_reply_bytes": reply.len(), "reconciled": reconciled }),
         );
         w.finish().await;
@@ -720,16 +736,6 @@ fn c6b_v13_helper_death_mid_restore_keeps_the_pin_until_absent() {
         );
         w.finish().await;
     });
-}
-
-/// The kiln runs on the node (directory names under runs, `.checkpoints` aside).
-fn kiln_runs() -> Vec<String> {
-    std::fs::read_dir(super::RUNS)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n != ".checkpoints")
-        .collect()
 }
 
 // ---------------------------------------------------------------------------------

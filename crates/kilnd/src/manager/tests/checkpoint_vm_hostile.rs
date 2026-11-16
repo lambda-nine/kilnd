@@ -717,21 +717,38 @@ fn kiln_ids() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Root's `kiln gc` of the stale runs that appeared since `before`; their IDs.
-fn gc_new_stale_runs(before: &[(String, String)]) -> Vec<String> {
-    // The failed shim takes a moment to be seen as stale.
-    let mut stale = Vec::new();
-    for _ in 0..50 {
-        let new: Vec<(String, String)> = kiln_ids()
-            .into_iter()
-            .filter(|(id, _)| !before.iter().any(|(b, _)| b == id))
-            .collect();
-        stale = new.iter().filter(|(_, s)| s == "stale").map(|(id, _)| id.clone()).collect();
-        if new.iter().all(|(_, s)| s == "stale") {
-            break;
+/// The backend IDs of the daemon's sandboxes that are not deleted, sorted.
+fn live_backends(w: &World) -> Vec<String> {
+    backends(w, "WHERE state != 'deleted' AND backend_id IS NOT NULL")
+}
+
+/// Every backend ID a sandbox row of the daemon names.
+fn all_backends(w: &World) -> Vec<String> {
+    backends(w, "WHERE backend_id IS NOT NULL")
+}
+
+fn backends(w: &World, filter: &str) -> Vec<String> {
+    let db = w.db();
+    let mut q = db
+        .prepare(&format!("SELECT backend_id FROM sandboxes {filter} ORDER BY backend_id"))
+        .unwrap();
+    q.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+}
+
+/// The deliberately stale runs of a failed create, exactly these: each is listed
+/// stale by kiln (or already removed by it) within 60 s, then root's `kiln gc` of
+/// exactly those IDs removes them. Their IDs, as collected.
+async fn collect_expected_stale_runs(expected: &[String]) -> Vec<String> {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let stale = loop {
+        let listed = kiln_ids();
+        let present: Vec<&String> = expected.iter().filter(|r| run_dirs().contains(r)).collect();
+        if present.iter().all(|r| listed.iter().any(|(id, st)| id == *r && st == "stale")) {
+            break present.into_iter().cloned().collect::<Vec<_>>();
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+        assert!(std::time::Instant::now() < end, "never stale: {present:?} in {listed:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
     if !stale.is_empty() {
         let out = std::process::Command::new(kiln_bin())
             .arg("gc")
@@ -740,6 +757,8 @@ fn gc_new_stale_runs(before: &[(String, String)]) -> Vec<String> {
             .unwrap();
         assert!(out.status.success(), "{out:?}");
     }
+    let left: Vec<String> = run_dirs().into_iter().filter(|r| expected.contains(r)).collect();
+    assert!(left.is_empty(), "kiln gc left {left:?}");
     stale
 }
 
@@ -763,7 +782,6 @@ fn shim_of(backend_id: &str) -> u32 {
 fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
     run(async {
         let w = World::start(json!({})).await;
-        let at_start = kiln_ids();
         let mut seen = serde_json::Map::new();
         // 1. A manifest edited on disk: the fork refuses it corrupt and the checkpoint is
         // quarantined with its charge.
@@ -857,48 +875,50 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
                     "exec_running_at_admission": true, "rows_charge_artifacts_unchanged": true }),
         );
         // 4. Writable paths over reserved ones, at create (a source can't have them).
+        // kiln may refuse such a path only after allocating, leaving a stale run kilnd
+        // cannot name (a recorded LOW). Each create is checked alone: the run
+        // directories that appeared while it ran are its own, each must turn stale and
+        // be named by no sandbox, and root's `kiln gc` removes exactly those (C6b review
+        // HIGH 6: nothing else is ever collected).
         for path in ["/dev/shm/x", "/proc/x", "/sys/fs/cgroup/x"] {
-            let runs_before = kiln_ids();
+            let runs_before = run_dirs();
+            let live = live_backends(&w);
+            assert!(
+                runs_before.iter().all(|r| live.contains(r)),
+                "{path}: a run no live sandbox names before the create: {runs_before:?}, {live:?}"
+            );
             let r = w
                 .rpc(OWNER, json!({ "op": "create", "read_only_root": true, "writable_paths": [path] }))
                 .await;
-            // kiln may refuse such a path only after allocating, leaving a stale run that
-            // kilnd cannot name: root's `kiln gc` of exactly the new stale IDs removes it.
-            let stale = gc_new_stale_runs(&runs_before);
+            let new_runs: Vec<String> = run_dirs().into_iter().filter(|r| !runs_before.contains(r)).collect();
             let outcome = match r.get("ok") {
                 Some(s) => {
                     let id = s["id"].as_str().unwrap().to_string();
+                    assert_eq!(new_runs, vec![s["backend_id"].as_str().unwrap().to_string()], "{path}: {s}");
                     let c = w.rpc(OWNER, json!({ "op": "capture", "id": id, "lifetime_ms": 3_600_000 })).await;
                     let o = c.get("error").map(|e| e["reason"].clone()).unwrap_or(json!("captured"));
                     if let Some(cp) = c["ok"]["id"].as_str() {
                         w.ok(json!({ "op": "delete_checkpoint", "id": cp })).await;
                     }
-                    w.ok(json!({ "op": "delete", "id": id })).await;
+                    let d = w.ok(json!({ "op": "delete", "id": id })).await;
+                    assert_eq!(d["state"], "SANDBOX_STATE_DELETED", "{d}");
                     json!({ "create": "ok", "capture": o })
                 }
-                None => json!({ "create": r["error"], "stale_runs_gc": stale }),
+                None => {
+                    assert!(new_runs.len() <= 1, "{path}: one create made runs {new_runs:?}");
+                    let named = all_backends(&w);
+                    assert!(
+                        new_runs.iter().all(|r| !named.contains(r)),
+                        "{path}: a failed create's run is a sandbox's backend: {new_runs:?}"
+                    );
+                    let collected = collect_expected_stale_runs(&new_runs).await;
+                    json!({ "create": r["error"], "stale_runs": collected })
+                }
             };
             assert_ne!(outcome["capture"], "captured", "{path}: {outcome}");
+            assert_eq!(run_dirs(), runs_before, "{path}: runs left after the case");
             seen.insert(format!("writable {path}"), outcome);
         }
-        // The failed creates' shims may be seen as stale only later: collect every stale
-        // run that appeared during the test, waiting up to 20 s for them.
-        let mut collected = Vec::new();
-        for _ in 0..100 {
-            let stale: Vec<String> = kiln_ids()
-                .into_iter()
-                .filter(|(id, st)| st == "stale" && !at_start.iter().any(|(b, _)| b == id))
-                .map(|(id, _)| id)
-                .collect();
-            if !stale.is_empty() {
-                collected.extend(gc_new_stale_runs(&at_start));
-            }
-            if collected.len() >= 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        seen.insert("stale_runs_collected".into(), json!(collected));
         matrix("hostile artifact and process attacks", Value::Object(seen));
         w.finish().await;
     });
