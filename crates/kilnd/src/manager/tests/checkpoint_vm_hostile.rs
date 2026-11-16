@@ -810,26 +810,52 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
         .await;
         assert_eq!(w.charge(), (0, 0));
         seen.insert("pid1_killed_mid_capture".into(), json!(pid1));
-        // 3. Root's own `kiln exec` into the source makes a capture busy.
+        // 3. Root's own `kiln exec` into the source makes a capture busy (C6b review
+        // HIGH 4: required, not recorded). The direct Exec reports it started, then waits
+        // on its stdin, which is released only after Capture has answered, so it is
+        // running at the admission instant; a READY capture fails the test.
         let backend = w.ok(json!({ "op": "get", "id": src })).await["backend_id"]
             .as_str()
             .unwrap()
             .to_string();
-        let mut direct = std::process::Command::new(kiln_bin())
-            .args(["exec", &backend, "sleep", "4"])
+        let mut direct = tokio::process::Command::new(kiln_bin())
+            .args(["exec", &backend, "sh", "-c", "echo started; read line; echo released"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        let mut out = tokio::io::BufReader::new(direct.stdout.take().unwrap());
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::io::AsyncBufReadExt::read_line(&mut out, &mut line),
+        )
+        .await
+        .expect("the direct exec never started")
+        .unwrap();
+        assert_eq!(line, "started\n");
+        let (rows, charge, artifacts) = (w.rows(), w.charge(), w.artifacts());
+        let mark = w.relay.mark();
         let busy = w.rpc(OWNER, json!({ "op": "capture", "id": src, "lifetime_ms": 3_600_000 })).await;
-        let direct_reason = busy
-            .get("error")
-            .map(|e| e["reason"].clone())
-            .unwrap_or_else(|| busy["ok"]["state"].clone());
-        assert!(direct.wait().unwrap().success());
-        if let Some(id) = busy["ok"]["id"].as_str() {
-            w.ok(json!({ "op": "delete_checkpoint", "id": id })).await;
-        }
-        seen.insert("direct_kiln_exec".into(), direct_reason);
+        assert!(direct.try_wait().unwrap().is_none(), "the direct exec ended before Capture answered");
+        assert_eq!(busy["error"]["code"], "FailedPrecondition", "{busy}");
+        assert_eq!(busy["error"]["reason"], "checkpoint_busy", "{busy}");
+        assert_eq!(w.rows(), rows, "a busy capture made a checkpoint row");
+        assert_eq!(w.charge(), charge, "a busy capture charged");
+        assert_eq!(w.artifacts(), artifacts, "a busy capture left an artifact");
+        assert!(w.relay.requests_since(mark, "checkpoint.capture").is_empty(), "a busy capture was dispatched");
+        let mut stdin = direct.stdin.take().unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stdin, b"go\n").await.unwrap();
+        drop(stdin);
+        let mut rest = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut out, &mut rest).await.unwrap();
+        assert!(direct.wait().await.unwrap().success());
+        assert_eq!(rest, "released\n");
+        seen.insert(
+            "direct_kiln_exec".into(),
+            json!({ "code": busy["error"]["code"], "reason": busy["error"]["reason"],
+                    "exec_running_at_admission": true, "rows_charge_artifacts_unchanged": true }),
+        );
         // 4. Writable paths over reserved ones, at create (a source can't have them).
         for path in ["/dev/shm/x", "/proc/x", "/sys/fs/cgroup/x"] {
             let runs_before = kiln_ids();
