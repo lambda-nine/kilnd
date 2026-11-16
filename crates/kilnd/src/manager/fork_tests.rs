@@ -881,6 +881,83 @@ async fn an_ambiguous_io_restore_leaves_the_checkpoint_ready() {
     assert_eq!(row(&m, c.id.as_str()).state, CheckpointState::Ready);
 }
 
+/// C6b V16 on restart (C6b review): a fork orphaned by a dead daemon whose reader
+/// later answers ambiguous with a corrupt verdict quarantines the checkpoint when the
+/// restart settles it, with the checkpoint feature on or off; any other verdict leaves
+/// it READY. Either way the fork keeps its row, its ambiguous charge and its live pin,
+/// a keyed retry answers that FAILED fork without a new restore, and the owner's Delete
+/// releases the pin by ABSENT.
+#[tokio::test]
+async fn a_restart_settling_an_ambiguous_corrupt_restore_quarantines_the_checkpoint() {
+    for verdict in [Reason::Corrupt, Reason::Io] {
+        for off in [false, true] {
+            let (_tmp, dir, m, fake, clock) = on_disk_engine().await;
+            let (s, c) = ready(&m, 1000).await;
+            let req = fork_req(&c);
+            let key = fork_key("v16-restart", &req);
+            let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
+            let (f, reader) = committed_keyed_fork(&m, &c, &s, epoch, boot, Some(&key));
+            script(&fake, &[FakeRestore::Ambiguous(verdict)]);
+            orphan_restore(&fake, &c, &f, &reader).await.unwrap();
+            let resources = m.store_resources_for_test();
+            let cp_charge = charge(&m);
+            let mut limits = m.limits.clone();
+            if off {
+                limits.checkpoints = None;
+            }
+            m.begin_shutdown();
+            m.drain_operations().await;
+            drop(m);
+            let m = on_disk(&dir, &fake, &clock, &limits);
+            m.reconcile().await.unwrap();
+            m.start_checkpoints().unwrap();
+            let expected = if verdict == Reason::Corrupt {
+                CheckpointState::Quarantined
+            } else {
+                CheckpointState::Ready
+            };
+            assert_eq!(row(&m, c.id.as_str()).state, expected, "{verdict:?}, off={off}");
+            assert_eq!(charge(&m), cp_charge);
+            assert_eq!(m.store_resources_for_test(), resources);
+            assert_eq!(
+                m.load(&f.id).unwrap().create_certainty,
+                CreateCertainty::AllocationAmbiguous
+            );
+            assert!(pin_of(&m, &f.id).unwrap().released_at_ms.is_none());
+            let restores_before = calls(&fake, "restore");
+            let retried = m
+                .create_keyed(Ok(req.clone()), 1000, key.clone(), None)
+                .await
+                .unwrap();
+            assert_eq!(retried.id, f.id);
+            assert_eq!(retried.state, SandboxState::Failed);
+            assert!(retried
+                .failure_reason
+                .as_deref()
+                .unwrap()
+                .starts_with(verdict.token()));
+            assert_eq!(calls(&fake, "restore"), restores_before);
+            if !off && verdict == Reason::Corrupt {
+                let e = fork(&m, &c, 1000).await.unwrap_err();
+                assert_eq!(reason(&e), Some("checkpoint_corrupt"));
+                assert_eq!(m.store_resources_for_test(), resources);
+            }
+            assert!(matches!(
+                m.delete_checkpoint(c.id.as_str(), 2000, false).await,
+                Err(Error::NotFound(_))
+            ));
+            m.delete_checkpoint(c.id.as_str(), 1000, false).await.unwrap();
+            assert_eq!(row(&m, c.id.as_str()).state, CheckpointState::Deleted);
+            assert_eq!(
+                pin_of(&m, &f.id).unwrap().released_by.as_deref(),
+                Some("absent")
+            );
+            assert_eq!(charge(&m), (0, 0));
+            assert!(m.load(&f.id).unwrap().is_charged());
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_typed_helper_refusal_fails_definitely_and_delete_still_reaches_absent() {
     let (m, fake, _) = engine();
