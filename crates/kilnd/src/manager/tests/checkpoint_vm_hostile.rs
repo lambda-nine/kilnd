@@ -920,6 +920,7 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
                 runs_before.iter().all(|r| live.contains(r)),
                 "{path}: a run no live sandbox names before the create: {runs_before:?}, {live:?}"
             );
+            let rows_before: Vec<String> = w.host_state().sandboxes.into_iter().map(|r| r.id).collect();
             let r = w
                 .rpc(OWNER, json!({ "op": "create", "read_only_root": true, "writable_paths": [path] }))
                 .await;
@@ -945,7 +946,30 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
                         "{path}: a failed create's run is a sandbox's backend: {new_runs:?}"
                     );
                     let collected = collect_expected_stale_runs(&new_runs).await;
-                    json!({ "create": r["error"], "stale_runs": collected })
+                    // kiln failed the create with no backend ID reported, so kilnd keeps
+                    // the row FAILED with its reservation charged and refuses to delete
+                    // it (an ambiguous reservation): exactly one new row, the one the
+                    // error names, declared for `finish`.
+                    let new_rows: Vec<SandboxRow> = w
+                        .host_state()
+                        .sandboxes
+                        .into_iter()
+                        .filter(|row| !rows_before.contains(&row.id))
+                        .collect();
+                    assert_eq!(new_rows.len(), 1, "{path}: the refused create's rows: {new_rows:?}");
+                    let row = &new_rows[0];
+                    assert!(
+                        row.state == "failed" && !row.released && row.backend_id.is_none(),
+                        "{path}: the refused create's row is not an ambiguous reservation: {row:?}"
+                    );
+                    let message = r["error"]["message"].as_str().unwrap_or_default();
+                    assert!(
+                        message.starts_with(&format!("create sandbox {}: ", row.id)),
+                        "{path}: the refusal names another sandbox than {}: {r}",
+                        row.id
+                    );
+                    w.expect_ambiguous(&row.id);
+                    json!({ "create": r["error"], "stale_runs": collected, "ambiguous": row.id })
                 }
             };
             assert_ne!(outcome["capture"], "captured", "{path}: {outcome}");

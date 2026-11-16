@@ -291,7 +291,8 @@
       "vm": [
         "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
       ],
-      "kiln": true
+      "kiln": true,
+      "vm_note": "A recorded LOW, declared, not fixed: kiln refuses /proc/x and /sys/fs/cgroup/x only after kilnd has admitted the create, with no backend ID reported, so kilnd keeps each row FAILED with its reservation charged (an ambiguous reservation) and Delete refuses it. Production does not declare these rows; the VM scenario requires exactly one such row per refused create, the one the error names, and declares it for its end-of-scenario check. /dev/shm/x is created and its capture refused."
     },
     {
       "id": "11.2.2-old-shims",
