@@ -138,15 +138,61 @@
   "cases": [
     {
       "id": "11.2.1-round-trips",
-      "design": "§11.2 item 1: Round trips: lower/upper modifications and removals, directory replacement, whiteouts/opacity, rename, nested forks, uid/gid extrema, setuid/sticky modes, nanosecond mtime, non-UTF-8 names, internal hardlinks/symlinks, empty upper and zero-length files; logical manifests, real commands and independence",
+      "design": "§11.2 item 1: Round trips: upper modifications, a lower file modified and renamed, nested forks, setuid/sticky modes, nanosecond file and directory mtimes, non-UTF-8 names (compared byte for byte), internal hardlinks/symlinks, zero-length files and empty directories, user xattrs; real commands and independence from the deleted source. The cases below each have their own row; C6b review HIGH 2 split them out of this one.",
       "mac": [],
       "vm": [
         "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip",
         "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_special_files_and_metadata_are_refused_before_allocation",
         "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_names_depth_and_counts_hold_their_limits",
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_sizes_sparse_and_inode_bombs_hold_their_limits",
         "kilnd::manager::checkpoint_vm_tests::clients::c6b_f1_rewind_on_real_kiln"
       ],
       "kiln": true
+    },
+    {
+      "id": "11.2.1-lower-removal",
+      "design": "§11.2 item 1: A lower (image) file removed in the source: the fork has it removed too (a whiteout round trip)",
+      "mac": [],
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_names_depth_and_counts_hold_their_limits"
+      ],
+      "kiln": true
+    },
+    {
+      "id": "11.2.1-directory-replacement",
+      "design": "§11.2 item 1: Directory replacement: a lower file replaced by a directory and a lower directory by a file",
+      "mac": [],
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_names_depth_and_counts_hold_their_limits"
+      ],
+      "kiln": true
+    },
+    {
+      "id": "11.2.1-whiteout-opacity",
+      "design": "§11.2 item 1: Whiteouts and opacity: a lower directory removed and recreated, its lower entries hidden in the fork. The opaque-scaffold case of the protected-trees test is a refusal and is not counted here.",
+      "mac": [],
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_names_depth_and_counts_hold_their_limits"
+      ],
+      "kiln": true
+    },
+    {
+      "id": "11.2.1-uid-gid-extrema",
+      "design": "§11.2 item 1: uid/gid extrema: files owned by ID 0 and by the highest uid and gid in the sandbox's ID map",
+      "mac": [],
+      "vm": [
+        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_names_depth_and_counts_hold_their_limits"
+      ],
+      "kiln": true,
+      "gap": "kiln (repository kiln, crate kiln, commit 8735907): IDs past the map are refused by checkpoint::manifest::tests::hostile_structure_is_refused (uid 65536); no kilnd test constructs an unmapped ID."
+    },
+    {
+      "id": "11.2.1-empty-upper",
+      "design": "§11.2 item 1: An empty upper",
+      "mac": [],
+      "vm": null,
+      "kiln": true,
+      "gap": "kiln (repository kiln, crate kiln, commit 8735907): checkpoint::capture::tests::empty_upper_and_refusals_leave_no_staging captures an empty upper (one entry, no objects) but does not restore it; no kilnd test (every kilnd VM source writes at least its workspace directory)."
     },
     {
       "id": "11.2.2-acl",
@@ -347,10 +393,9 @@
       "id": "11.2.3-hardlink-cycles",
       "design": "§11.2 item 3: Hardlink cycles",
       "mac": [],
-      "vm": [
-        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
-      ],
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "kiln (repository kiln, crate kiln, commit 8735907): checkpoint::manifest::tests::hostile_structure_is_refused points a hardlink entry at itself, at an earlier directory and at a later symlink; a hardlink must name an earlier file entry, so no cycle can be encoded. A filesystem cannot make a hardlink cycle, so no kilnd test constructs one."
     },
     {
       "id": "11.2.3-hardlink-outside",
@@ -365,10 +410,9 @@
       "id": "11.2.3-duplicate-paths",
       "design": "§11.2 item 3: Duplicate paths",
       "mac": [],
-      "vm": [
-        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_links_and_roots_are_refused_or_round_trip"
-      ],
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "kiln (repository kiln, crate kiln, commit 8735907): checkpoint::manifest::tests::hostile_structure_is_refused inserts a duplicate entry and requires the out-of-order-or-duplicate refusal. A filesystem cannot hold two entries of one path, so no kilnd test constructs one."
     },
     {
       "id": "11.2.3-root-replacement",
@@ -384,19 +428,17 @@
       "id": "11.2.3-forged-type",
       "design": "§11.2 item 3: Forged payload type",
       "mac": [],
-      "vm": [
-        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
-      ],
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "kiln (repository kiln, crate kiln, commit 8735907): checkpoint::manifest::tests::hostile_bytes_are_refused changes a whiteout entry's type to chardev and injects an illegal rdev, decoding directly. No kilnd test: the artifact attack in c6b_hostile_artifact_and_process_attacks_are_refused_typed edits the manifest without resealing it, so kiln refuses its digest before decoding."
     },
     {
       "id": "11.2.3-forged-size",
       "design": "§11.2 item 3: Forged payload size",
       "mac": [],
-      "vm": [
-        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
-      ],
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "kiln (repository kiln, crate kiln, commit 8735907): checkpoint::capture::tests::tampered_artifacts_are_corrupt_and_never_restored lengthens an object past the size its manifest declares and requires a corrupt refusal with nothing restored. No test forges the declared size in a resealed manifest; no kilnd test."
     },
     {
       "id": "11.2.3-mount-crossing",
@@ -410,19 +452,17 @@
       "id": "11.2.3-malformed-base64",
       "design": "§11.2 item 3: Malformed base64",
       "mac": [],
-      "vm": [
-        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
-      ],
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "kiln (repository kiln, crate kiln, commit 8735907): checkpoint::manifest::tests::hostile_bytes_are_refused pads a path's base64; cjson::tests::base64_is_rfc4648_and_strict covers padding, alphabet, length and non-canonical bits. No kilnd test (as for forged-type, the kilnd artifact attack never reaches the decoder)."
     },
     {
       "id": "11.2.3-malformed-json",
       "design": "§11.2 item 3: Malformed JSON",
       "mac": [],
-      "vm": [
-        "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
-      ],
-      "kiln": true
+      "vm": null,
+      "kiln": true,
+      "gap": "kiln (repository kiln, crate kiln, commit 8735907): checkpoint::manifest::tests::hostile_bytes_are_refused adds a trailing comma and an extra brace and rejects non-canonical spacing, key order, extra keys and a trailing newline. No kilnd test (as for forged-type)."
     },
     {
       "id": "11.2.3-depth",

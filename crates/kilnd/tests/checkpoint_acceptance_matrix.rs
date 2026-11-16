@@ -21,8 +21,13 @@ const CRASH_IDS: [&str; 12] = [
     "unexplained-files",
 ];
 
-const CASE_IDS: [&str; 102] = [
+const CASE_IDS: [&str; 107] = [
     "11.2.1-round-trips",
+    "11.2.1-lower-removal",
+    "11.2.1-directory-replacement",
+    "11.2.1-whiteout-opacity",
+    "11.2.1-uid-gid-extrema",
+    "11.2.1-empty-upper",
     "11.2.2-acl",
     "11.2.2-file-capabilities",
     "11.2.2-socket",

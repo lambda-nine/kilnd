@@ -479,6 +479,7 @@ fn c6b_hostile_names_depth_and_counts_hold_their_limits() {
         let cases = case_results(
         vec![
             case("non-utf8-names", "printf a > \"/root/w/$(printf 'n\\377\\376')\" && mkdir \"/root/w/$(printf 'd\\200')\"", RoundTrip),
+            image_changes_and_id_extremes(),
             case("name-255", &format!("printf a > /root/w/{}", "n".repeat(255)), RoundTrip),
             case("depth-126", &chain(124), RoundTrip),
             case("depth-128", &chain(126), Either),
@@ -487,6 +488,42 @@ fn c6b_hostile_names_depth_and_counts_hold_their_limits() {
         let limit = entry_limit().await;
         matrix("hostile names, depth and counts", json!({ "cases": cases, "entry_limit": limit }));
     });
+}
+
+/// Changes to the image's own files and owners at the ends of the sandbox's ID map
+/// (C6b review HIGH 2: each is its own ledger row now): a lower file modified (copied
+/// up), a lower file removed (a whiteout), a lower file renamed into the workspace, a lower file replaced by a
+/// directory and a lower directory by a file, a lower directory removed and recreated
+/// (opaque, its lower entries hidden), and files owned by ID 0 and by the highest
+/// mapped uid and gid. The listing covers each changed path, so a lost whiteout or
+/// opacity shows as an extra line in the fork.
+fn image_changes_and_id_extremes() -> Case {
+    let inside = "set -e; \
+        for f in /etc/motd /etc/issue /etc/shells; do test -f $f; done; \
+        test -d /etc/apk/keys; test -d /etc/profile.d; test -n \"$(ls /etc/profile.d)\"; \
+        test -f /etc/profile; printf '\\n# c6b\\n' >> /etc/profile; \
+        rm /etc/motd; \
+        mv /etc/issue /root/w/issue-moved; \
+        rm /etc/shells; mkdir /etc/shells; printf d > /etc/shells/inner; \
+        rm -rf /etc/apk/keys; printf f > /etc/apk/keys; \
+        rm -rf /etc/profile.d; mkdir /etc/profile.d; printf o > /etc/profile.d/only; \
+        u=$(awk '{ print $1 + $3 - 1 }' /proc/self/uid_map | sort -n | tail -n 1); \
+        g=$(awk '{ print $1 + $3 - 1 }' /proc/self/gid_map | sort -n | tail -n 1); \
+        printf z > /root/w/id-low; chown 0:0 /root/w/id-low; \
+        printf m > /root/w/id-high; chown $u:$g /root/w/id-high; \
+        test \"$(stat -c %u:%g /root/w/id-high)\" = \"$u:$g\"; \
+        test ! -e /etc/motd; test \"$(ls /etc/profile.d)\" = only";
+    let mut c = case("image-changes-and-id-extremes", inside, Expect::RoundTrip);
+    c.listing = listing_script(&[
+        "/root/w",
+        "/etc/profile",
+        "/etc/motd",
+        "/etc/issue",
+        "/etc/shells",
+        "/etc/apk",
+        "/etc/profile.d",
+    ]);
+    c
 }
 
 /// The 65,536-entry bound exactly: a capture of a known tree gives the entries a fresh
