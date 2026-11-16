@@ -77,8 +77,8 @@ slowest run or close to it.
 
 | Case | Runs | Capture p50 / p95 ms | Fork p50 ms | Charged S | Physical |
 |---|---|---|---|---|---|
-| One 960 MiB sparse file (3 bytes written at its end) | 10 | 2,522 / 2,529 | 5,027 | 960 MiB | 16 KiB |
-| 50,000 empty files, one user xattr each | 10 | 16,500 / 16,650 | 1,352 | 793 MiB | 13.3 MiB |
+| One 960 MiB sparse file (3 bytes written at its end) | 10 | 2,522 / 2,529 | 5,010 | 960 MiB | 16 KiB |
+| 50,000 empty files, one user xattr each | 10 | 16,500 / 16,650 | 1,338 | 793 MiB | 13.3 MiB |
 
 - **Sparse files are charged by logical size.** Holes stay holes in the artifact and the
   fork (the fork's upper used 4 KiB), but they count as zeros in the digest and in the
@@ -91,7 +91,8 @@ Two workers at once, 50 MiB × 10,000, two uids, 20 runs each:
 | Measure | p50 / p95 ms |
 |---|---|
 | One capture alone | 5,856 / 5,963 |
-| Two captures at once (each) | 7,728 / 8,078 |
+| Two captures at once: the first uid's | 7,729 / 8,079 |
+| Two captures at once: the second uid's | 7,727 / 8,077 |
 | A capture with a fork at once: the capture | 6,558 / 6,674 |
 | A capture with a fork at once: the fork | 1,833 / 1,876 |
 
@@ -127,9 +128,15 @@ probes' own statvfs and checks.
 ## Workload survey (design 13.1), limited scope
 
 How often harness workloads use ACLs, special files or more than 1 GiB was surveyed read
-only over the kiln-harness repository's `evals/` seed trees (26 tasks, 371 entries, 1.3 MiB):
-no ACL or other xattr, no FIFO, socket or device node, no symlink, no setuid file, no file
-over 58 KiB, at most 7 levels deep. No retained live-eval workspaces were found to survey.
+only over the kiln-harness repository's `evals/` directory at commit `1b91be5`. It holds 26
+tasks, 25 of them with a seed directory (`seed/`, the files written into the workspace before
+a session). The 25 seeds together hold 211 entries (158 files): 268,064 bytes logical (the
+files' sizes) and 835,584 bytes allocated (on disk, as checked out on APFS). The whole
+`evals/` tree, which adds each task's metadata, prompt, check and reference solution, holds
+371 entries: 502,222 bytes logical and 1,392,640 allocated. Across the whole tree: no ACL or
+other xattr, no FIFO, socket or device node, no symlink, no setuid file, no file over 58 KiB,
+and no seed path more than 3 levels below its seed directory. No retained live-eval
+workspaces were found to survey.
 This says nothing about real agent workspaces, which may clone repositories, install
 dependencies and build; it says only that the shipped eval seeds sit far inside every
 checkpoint limit.

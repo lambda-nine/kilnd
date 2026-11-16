@@ -23,6 +23,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   checkpoint stayed `ready`, so every later fork was admitted, allocated and failed the
   same way. A corrupt verdict now quarantines the checkpoint whichever way the restore
   ended, charge kept, and the next fork is refused before admission.
+- Hold the checkpoint VM acceptance oracles to what the ledger and rollout gate claim
+  (C6b review, test-only): exec output carried losslessly so non-UTF-8 names compare
+  byte for byte, directory mtimes included; the direct-`kiln exec` busy refusal and the
+  pin's release only by ABSENT required rather than recorded; every scenario's end
+  checked for unexpected runs and artifacts before any cleanup, with root cleanup a
+  fallback that fails a passing scenario; ledger rows that named tests which never
+  construct their case now record the kiln test that does, or the gap; and a regression
+  for the C6b V16 quarantine on restart.
 - Refuse `CARGO_PROFILE_*` variables in `build.sh`, the environment's form of the
   already refused `[profile]` table, so a reviewed build's debug assertions, optimization
   and overflow checks are the workspace's own.
