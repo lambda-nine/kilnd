@@ -451,16 +451,61 @@ rows are unchanged and older binaries refuse schema 16. Rollback is the same dat
 backup restore.
 
 `--enable-workspace-checkpoints` (default off) serves the checkpoint RPCs and creates from
-a checkpoint. **Use it only in tests and explicit staging for now:** the acceptance and
-rollout gate is still to come. Health lists `workspace_checkpoint` only while the root
-helper's checkpoint checks pass (see
+a checkpoint. **It is off by default and a supported opt-in** on a node that passes the
+rollout gate's per-node criteria 9 and 10
+([checkpoint-rollout-gate.md](checkpoint-rollout-gate.md)). Health lists
+`workspace_checkpoint` only while the root helper's checkpoint checks pass (see
 [architecture.md](architecture.md#checkpoint-discovery-and-capacity-milestone-c5b-2)),
 and every capture and create from a checkpoint must leave `--checkpoint-headroom-bytes`
 (default 1 GiB) free on kiln's runs filesystem and on its loop device's backing
-filesystem. The root helper must also run with its checkpoint group enabled. Operating a
-node with checkpoints (cleanup, backup, upgrade and rollback) is in
-[checkpoints.md](checkpoints.md); what must hold before the default changes is in
-[checkpoint-rollout-gate.md](checkpoint-rollout-gate.md).
+filesystem. Operating a node with checkpoints (cleanup, backup, upgrade and rollback) is
+in [checkpoints.md](checkpoints.md).
+
+To opt a node in:
+
+1. **Check criterion 10.** `kiln --version` must report commit `8735907`, the kiln the
+   gate was measured on, or a later commit on which gate criteria 2-4 were rerun. Any
+   other kiln: the node is not eligible; leave the flag off.
+2. **Start both daemons with checkpoints on:** kilnd with `--enable-workspace-checkpoints`
+   (and `--checkpoint-headroom-bytes` if 1 GiB is not right for the node), and the root
+   helper with `kilnd-helper --enable-checkpoints`. With kilnd's flag alone, Health does
+   not list the feature and new captures and forks are refused (step 3).
+3. **Check criterion 9.** `kilndctl health` must list `workspace_checkpoint` under
+   `features` and print a `checkpoint limits:` line. If it does not, the node is not
+   eligible as it stands. kilnd still starts and Health stays SERVING, without the
+   feature, with `workspace checkpoints withdrawn: <why>` in its `detail` and no limits
+   line. Every new capture and create from a checkpoint asks the helper again (never the
+   cached Health answer) and is refused with a typed reason: `UNIMPLEMENTED
+   backend_unsupported:workspace_checkpoint` while the helper's group is disabled,
+   `FAILED_PRECONDITION sandbox_unsupported:workspace_checkpoint` when the installed kiln
+   or host fails a check (leases, format 1, generation-checked removal, XFS with project
+   quotas, trusted image registry) or the helper writes another checkpoint format, and
+   `UNAVAILABLE checkpoint_io` when the helper cannot be reached or free space on runs or
+   its loop backing is unknown. Get, List and Delete stay served. A later probe that
+   passes lists the feature again. A Firecracker node never lists it and refuses captures
+   and forks `backend_unsupported`. `kilndctl create --from-checkpoint` itself refuses
+   unless Health is SERVING and lists the feature.
+4. **To turn it back off,** restart kilnd without `--enable-workspace-checkpoints`;
+   nothing is deleted. With no checkpoint state on disk, every checkpoint RPC is refused
+   `UNIMPLEMENTED backend_unsupported:workspace_checkpoint`. With any row, capture key or
+   barrier marker present, kilnd keeps serving Get, List and Delete, answers keyed capture
+   retries from their records, keeps running expiry, removal and startup reconciliation,
+   and keeps reporting Health's checkpoint stats (without the limits line); only new
+   captures and forks are refused `backend_unsupported`. Charges stay counted until each
+   artifact's removal is proved. Leave the helper's group on until the checkpoints have
+   expired or been deleted: without it removal cannot run and the rows stay DELETING and
+   charged ([checkpoints.md](checkpoints.md#turning-it-on-and-off)).
+
+Known limits, measured on one test machine
+([checkpoint-performance.md](checkpoint-performance.md); no latency is promised):
+
+- **The per-checkpoint cap is in effect an entry cap.** Each file is charged a 16 KiB
+  allowance toward the 1 GiB per-checkpoint cap whatever its real size, so a checkpoint
+  holds roughly 60,000 small files at most (50,000 entries were charged 987 MiB against
+  208 MiB of physical use).
+- **Large captures take tens of seconds.** A 50,000-file capture took about 28 s warm and
+  37 s (p50) cold, against kilnd's 120 s checkpoint operation timeout. `kilndctl` sets no
+  gRPC deadline of its own; a client that sets one must allow for this.
 
 - **Upgrade:** rerun `scripts/install.sh`. Sandboxes keep running across the
   restart. On a Firecracker node this is a transaction; see above.

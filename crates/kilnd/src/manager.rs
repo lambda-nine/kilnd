@@ -111,8 +111,9 @@ pub struct Limits {
     /// `--exec-stream-buffer-bytes` and `--exec-stream-chunk-bytes`.
     pub exec_stream: crate::exec_stream::StreamBuffer,
     /// Workspace checkpoints (milestone C5a): `None`, the default, is the feature off.
-    /// `--enable-workspace-checkpoints` sets the design's limits (testing only until the
-    /// C6 rollout gate; discovery and the headroom check are `manager/capacity.rs`).
+    /// `--enable-workspace-checkpoints` sets the design's limits (off by default; a
+    /// supported opt-in on a node that passes the rollout gate's per-node criteria;
+    /// discovery and the headroom check are `manager/capacity.rs`).
     pub checkpoints: Option<CheckpointLimits>,
 }
 

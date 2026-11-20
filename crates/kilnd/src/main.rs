@@ -212,13 +212,13 @@ struct Args {
     /// The most data one ExecStream OutputChunk carries, in bytes (1 to 65536).
     #[arg(long, default_value_t = 32 * 1024)]
     exec_stream_chunk_bytes: usize,
-    /// For testing only: serve the workspace checkpoint RPCs and creates from a
-    /// checkpoint, with the design's limits (1 GiB per checkpoint; 32 checkpoints and
-    /// 4 GiB per uid; 128 and 8 GiB per node; 24 h lifetime and 1 h idle by default, at
-    /// most 7 days; two capture/restore workers, one per uid). Health lists
-    /// workspace_checkpoint only while the root helper's checkpoint checks pass. The
-    /// acceptance and rollout gate is still to come, so leave this off outside tests
-    /// and explicit staging.
+    /// Serve the workspace checkpoint RPCs and creates from a checkpoint. Off by
+    /// default; a supported opt-in on a node that passes rollout-gate criteria 9 and 10
+    /// (docs/checkpoint-rollout-gate.md). Uses the design's limits (1 GiB per
+    /// checkpoint; 32 checkpoints and 4 GiB per uid; 128 and 8 GiB per node; 24 h
+    /// lifetime and 1 h idle by default, at most 7 days; two capture/restore workers,
+    /// one per uid). Health lists workspace_checkpoint only while the root helper's
+    /// checkpoint checks pass.
     #[arg(long)]
     enable_workspace_checkpoints: bool,
     /// With --enable-workspace-checkpoints: free space, in bytes, every capture and

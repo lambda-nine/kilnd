@@ -1669,8 +1669,8 @@ maps each to its status without reshaping.
 `--enable-workspace-checkpoints` (default off) sets `Limits.checkpoints` to the design's
 limits: 1 GiB per checkpoint; 32 checkpoints and 4 GiB per uid; 128 and 8 GiB per node;
 24 h lifetime and 1 h idle by default, at most 7 days and 24 h; two capture/restore workers
-and one per uid. **It is for testing and explicit staging only;** C6 is the gate for
-switching it on. Discovery, Health's checkpoint stats and limits and the headroom check
+and one per uid. **It is off by default and a supported opt-in** on a node that passes
+the rollout gate's per-node criteria 9 and 10 ([checkpoint-rollout-gate.md](checkpoint-rollout-gate.md)). Discovery, Health's checkpoint stats and limits and the headroom check
 are C5b-2's (next section).
 
 **RPCs.** `service/checkpoint.rs` maps the four RPCs onto the C5a engine, which owns
@@ -1840,7 +1840,7 @@ units, rounded up) equals the charge exactly.
 | ExecStream live queue / chunk (queue at least two chunks with their overhead and idle deque slots, 65,984 bytes for 32 KiB chunks; chunk at most 64 KiB) | 256 KiB / 32 KiB | `--exec-stream-buffer-bytes`, `--exec-stream-chunk-bytes` |
 | Helper live message | 16 KiB data | (code) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
-| Workspace checkpoints (testing only until C6): 1 GiB each; 32 / 4 GiB per uid; 128 / 8 GiB per node; 24 h / 1 h default lifetime / idle, at most 7 d / 24 h; 2 workers, 1 per uid | off | `--enable-workspace-checkpoints` |
+| Workspace checkpoints (off by default; supported opt-in, see checkpoint-rollout-gate.md): 1 GiB each; 32 / 4 GiB per uid; 128 / 8 GiB per node; 24 h / 1 h default lifetime / idle, at most 7 d / 24 h; 2 workers, 1 per uid | off | `--enable-workspace-checkpoints` |
 
 Startup validates limits before opening state or binding: required counts,
 bytes and times are nonzero (the per-sandbox queue may be zero), semaphore and

@@ -2,7 +2,8 @@
 
 **These are measurements of one test machine under the conditions below, not a promise.**
 kilnd makes no latency commitment for capture or fork (checkpoint design, decision 1). The
-feature stays off by default and is for testing only.
+feature stays off by default and is a supported opt-in on a node that passes the
+[rollout gate](checkpoint-rollout-gate.md)'s criteria 9 and 10.
 
 ## Conditions
 

@@ -3,9 +3,9 @@
 //! expiry and failed captures, checkpoint expiry and its cross-boot rebase, and startup
 //! reconciliation. It drives C3's helper group through `Runtime::checkpoint` and C4's
 //! store. The checkpoint RPCs (`service/checkpoint.rs`, C5b-1) reach it; it is off
-//! unless `Limits::checkpoints` is set (`--enable-workspace-checkpoints`, testing only
-//! until the C6 rollout gate). Discovery, headroom and Health's stats are `capacity.rs`
-//! (C5b-2).
+//! unless `Limits::checkpoints` is set (`--enable-workspace-checkpoints`, a supported
+//! opt-in per the rollout gate). Discovery, headroom and Health's stats are
+//! `capacity.rs` (C5b-2).
 //!
 //! Lock order (design 8.3): a capture takes the source's exec mutex (try-lock), then the
 //! short admission gate, then short store transactions; nothing awaits under the gate,

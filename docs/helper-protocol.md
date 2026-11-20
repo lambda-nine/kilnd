@@ -316,7 +316,7 @@ and the whole frame must be strict JSON as for Firecracker. Only the `kilnd` acc
 use it. **It is off by default:** without `kilnd-helper --enable-checkpoints`,
 `capabilities` answers `enabled: false` and every other operation `disabled`. The daemon's
 engine (milestone C5a) calls it only when `Limits::checkpoints` is set
-(`kilnd --enable-workspace-checkpoints`, testing only), and only on a kiln backend.
+(`kilnd --enable-workspace-checkpoints`, off by default, supported opt-in), and only on a kiln backend.
 
 **Support and capacity (C5b-2).** `supported` is true only when the CLI grants leases
 (bit `0x40`), lists `kiln checkpoint ls` format 1 and checks generations on removal, kiln's

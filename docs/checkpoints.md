@@ -2,8 +2,9 @@
 
 Workspace checkpoints capture a sandbox's writes over its image and create new sandboxes
 from them (design in [architecture.md](architecture.md#workspace-checkpoint-api-milestone-c5b-1)).
-**They are for tests and explicit staging only** until the rollout gate
-([checkpoint-rollout-gate.md](checkpoint-rollout-gate.md)) passes and the default is decided.
+**They are off by default and a supported opt-in** on a node that passes the rollout
+gate's per-node criteria 9 and 10 ([checkpoint-rollout-gate.md](checkpoint-rollout-gate.md));
+[setup.md](setup.md) has the opt-in steps.
 This page is what an operator needs once checkpoints exist on a node: turning the feature on
 and off, cleaning up, backing up, upgrading and rolling back.
 

@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Document workspace checkpoints as a supported opt-in. With rollout-gate criteria 1-8
+  met, `--enable-workspace-checkpoints` is no longer described as testing only: it is
+  supported on a node that passes the gate's per-node criteria 9 (Health lists
+  `workspace_checkpoint`) and 10 (the gated kiln commit, or a later one with criteria
+  2-4 rerun). `docs/setup.md` has the opt-in steps, how to turn it back off and the
+  measured limits. The feature stays off by default; no behaviour, flag, limit, API or
+  schema changes.
+
 - Delete a sandbox whose kiln shim died. When a shim crashed or was killed out of
   band, kiln lists its run `stale` and kilnd's removal could not prove the backend
   gone, so Delete answered Internal and left the sandbox DELETING and charged until

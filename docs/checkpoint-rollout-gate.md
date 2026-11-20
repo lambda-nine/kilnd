@@ -1,8 +1,10 @@
 # Workspace checkpoint rollout gate
 
-**Status: criteria 1-8 met (milestone C6b); 9 and 10 are checked per node.** The criteria were fixed in C6a. Until every criterion holds, and the default is
-decided, `--enable-workspace-checkpoints` stays off by default and documented as testing
-only. Passing the gate does not by itself turn the feature on anywhere.
+**Status: criteria 1-8 met (milestone C6b); 9 and 10 are checked per node. Default
+decided 2026-11-20: off by default, a supported opt-in on a node that passes 9 and 10.**
+The criteria were fixed in C6a. Passing the gate does not by itself turn the feature on
+anywhere: an operator enables `--enable-workspace-checkpoints` on a node after checking
+criteria 9 and 10 there ([setup.md](setup.md) has the steps).
 
 Each criterion is checkable: a test, a run with recorded conditions, or a document.
 
@@ -97,5 +99,6 @@ Fix round 2 reran the crash (16 of 16), hostile (7 of 7, two uids included) and
 client (4 of 4) sets at `5252bbf`, on kiln `8735907` and kernel
 `6.8.0-149-generic`, with both VM gates passed and both project-quota reports
 restored byte for byte (2026-11-20). Criteria 1-8 are met; 9 and 10 are checked
-per node. The feature remains off by default and for testing only until the
-default is decided.
+per node. On 2026-11-20 the default was decided: workspace checkpoints are **off by
+default and a supported opt-in** on a node that passes criteria 9 and 10. An operator
+enables them with `--enable-workspace-checkpoints` after checking both on that node.
