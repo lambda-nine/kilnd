@@ -234,9 +234,10 @@ freeing it. The group is disabled unless root starts the helper with
 `image` and `layout` records, through no-follow opens checked on the open descriptor
 (regular, owned by the helper, no group or other bits, at most 4 KiB, strict text); a
 symlink or anything unexpected is a typed refusal, and it never opens the image. The
-daemon's engine (C5a) admits new captures only when `Limits::checkpoints` is set, which no
-flag does before milestone C5b; with it off it still uses the group to expire, remove and
-reconcile checkpoints that already exist, and calls nothing when none do.
+daemon's engine (C5a) admits new captures and forks only when `Limits::checkpoints` is set
+(`--enable-workspace-checkpoints`, off by default); with it off it still uses the group to
+expire, remove and reconcile checkpoint state that already exists (rows, capture records or
+the barrier marker), and calls nothing when there is none.
 
 The daemon's checkpoint store (schema 15, milestone C4) keeps each checkpoint charged
 until it stores ABSENT evidence of its own recorded removal, in the same node disk

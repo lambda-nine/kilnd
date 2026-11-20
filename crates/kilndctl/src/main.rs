@@ -79,8 +79,9 @@ enum Command {
     /// Record activity on a ready sandbox, restarting its idle timeout.
     Renew { id: String },
     /// Workspace checkpoints: capture a sandbox's files, show, list and delete them.
-    /// Needs a kilnd started with --enable-workspace-checkpoints on a node whose Health
-    /// lists workspace_checkpoint.
+    /// Creating one needs a kilnd started with --enable-workspace-checkpoints whose
+    /// Health lists workspace_checkpoint; show, list and delete stay available while
+    /// kilnd maintains existing checkpoints, also with the feature withdrawn or off.
     #[command(subcommand)]
     Checkpoint(CheckpointCommand),
     /// Create a sandbox, run one command in it, and delete it.

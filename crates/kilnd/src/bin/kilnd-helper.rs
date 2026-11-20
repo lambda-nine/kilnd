@@ -24,9 +24,10 @@ struct Args {
     /// or partial ledger is refused; nothing else ever creates one.
     #[arg(long, requires = "firecracker_policy")]
     firecracker_init_ledger: bool,
-    /// Serve the workspace checkpoint group (design section 4.3). Off by default: until
-    /// the feature's acceptance milestone nothing in kilnd uses it, and without this
-    /// flag the group answers Disabled.
+    /// Serve the workspace checkpoint group (design section 4.3). Off by default.
+    /// Required for kilnd's supported checkpoint opt-in and for maintaining existing
+    /// checkpoint state (expiry, removal, reconciliation), also after kilnd's flag is
+    /// off; without it the group answers Disabled.
     #[arg(long)]
     enable_checkpoints: bool,
     #[command(subcommand)]

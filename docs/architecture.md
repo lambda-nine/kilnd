@@ -1744,7 +1744,11 @@ while that answer passes every probe:
 A failed check, a helper error or a probe that misses the deadline withdraws only these
 three (Health stays SERVING, with `workspace checkpoints withdrawn: <why>` in `detail`);
 a failed backend probe withdraws every dynamic feature as before. The next probe that
-passes advertises them again. Firecracker has no checkpoint group, is never probed and
+passes advertises them again. That is the behaviour after a clean startup
+reconciliation: a startup reconciliation that cannot get a maintenance session (helper
+group disabled or unreachable, or a kiln without format 1 and generation-checked removal)
+leaves the checkpoint barrier blocked, Health DEGRADED and all new allocation refused
+until a retry completes cleanly. Firecracker has no checkpoint group, is never probed and
 never advertises. New captures and forks never read the cached bit: each asks the helper
 afresh and applies the same checks, so a withdrawn feature refuses new work at once, and
 a daemon that has not probed yet still admits. With the flag off nothing is probed or

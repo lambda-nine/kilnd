@@ -21,21 +21,49 @@ Two switches, both off by default:
 - `kilnd-helper --enable-checkpoints` serves the root helper's checkpoint group. Without it
   the group answers Disabled and kilnd advertises nothing.
 
+**Turn the helper's group on first.** kilnd's flag makes every kilnd startup reconcile
+checkpoints, which needs the helper's group and a kiln that lists format 1 and checks
+generations on removal. Start the helper with `--enable-checkpoints`, check that it is
+running without a `kilnd-helper: checkpoint group disabled` line in its journal, and only
+then restart kilnd with its flag. If kilnd starts without them, the checkpoint barrier
+stays set: Health is DEGRADED, every new sandbox create is refused, and captures and forks
+get the allocation barrier's `FAILED_PRECONDITION` refusal, until the helper and a
+compatible kiln are back and a reconciliation completes cleanly.
+
 `kilndctl health` lists `workspace_checkpoint` only while every probe passes: the helper's
 group is enabled, kiln grants leases, lists checkpoint format 1 and checks generations on
 removal, runs is XFS with project quotas, kiln's image registry is trusted, and free space
-on runs and its backing is known. When a probe fails, Health stays SERVING with
-`workspace checkpoints withdrawn: <why>` in its detail, and new captures and forks are
-refused with a typed reason until a later probe passes. Firecracker never lists the feature.
+on runs and its backing is known. After a clean startup, when a later probe fails, Health
+stays SERVING with `workspace checkpoints withdrawn: <why>` in its detail, and new captures
+and forks are refused with a typed reason until a later probe passes. Firecracker never
+lists the feature.
 
 **Turning it off keeps what exists.** With the flag off and checkpoint state on disk (any
 row, capture key or barrier marker), kilnd still serves Get, List and Delete, answers
 keyed retries from their records, runs expiry and removal, and reconciles at startup. Only
 new captures and forks are refused (`UNIMPLEMENTED backend_unsupported:workspace_checkpoint`).
-Charges stay counted until each artifact's removal is proved. Turning the helper's group off
-instead makes removal impossible: the rows stay DELETING and charged, and kilnd retries.
-Turn kilnd's flag off first, let the checkpoints expire or delete them, and only then turn
-off the helper's group.
+Charges stay counted until each artifact's removal is proved.
+
+**The helper's group goes off last, after all checkpoint state is gone,** not just the
+live checkpoints. Turn kilnd's flag off first, let the checkpoints expire or delete them,
+and keep the helper's group on and a kiln that lists format 1 and checks generations on
+removal installed until, with the flag off, `kilndctl health` no longer prints the
+`checkpoints:` block. kilnd prints those statistics, flag off, exactly while a checkpoint
+row, capture record or barrier marker exists or the barrier is blocked. A deleted or failed
+checkpoint's history row stays until it is older than `--deleted-sandbox-max-age-secs`
+(default 7 days, at least one day) and its capture record is gone; a capture record stays
+for at least `--create-request-retention-secs` (default one day, counted again from a host
+reboot); a quarantined checkpoint stays until it is deleted; and nothing is pruned while the
+barrier is blocked. Once the last of them may go, the next prune (every
+`--prune-interval-secs`, default 60) removes it and the block disappears.
+
+Turning the helper's group off, or installing an older kiln, while any of that remains
+makes removal impossible (rows stay DELETING and charged, and kilnd retries) and, at the
+next kilnd start, leaves the barrier set: Health is DEGRADED and every new sandbox create
+is refused, even when no checkpoint is visible. One DELETED history row is enough
+(the test `manager::checkpoint::tests::fix::feature_off_settled_history_blocks_on_a_failed_session_until_inventory_is_clean`). To
+recover, reinstall a compatible kiln, restart the helper with `--enable-checkpoints` and
+leave both up; kilnd's retry clears the barrier once a reconciliation completes cleanly.
 
 ## What the states mean
 

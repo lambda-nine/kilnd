@@ -315,8 +315,12 @@ reply is byte-identical, an older helper closes the connection on the unknown va
 and the whole frame must be strict JSON as for Firecracker. Only the `kilnd` account may
 use it. **It is off by default:** without `kilnd-helper --enable-checkpoints`,
 `capabilities` answers `enabled: false` and every other operation `disabled`. The daemon's
-engine (milestone C5a) calls it only when `Limits::checkpoints` is set
-(`kilnd --enable-workspace-checkpoints`, off by default, supported opt-in), and only on a kiln backend.
+engine (milestone C5a) calls it only on a kiln backend. Only new captures and forks need
+`Limits::checkpoints` (`kilnd --enable-workspace-checkpoints`, off by default, supported
+opt-in). Maintenance of durable checkpoint state continues with the flag off: removal
+(Delete and expiry), the barrier's reconciliation and interrupted-fork settlement call the
+group whenever checkpoints are maintained (`maintained()`: the flag is set, any checkpoint
+row, capture record or barrier marker exists, or the barrier is blocked).
 
 **Support and capacity (C5b-2).** `supported` is true only when the CLI grants leases
 (bit `0x40`), lists `kiln checkpoint ls` format 1 and checks generations on removal, kiln's
