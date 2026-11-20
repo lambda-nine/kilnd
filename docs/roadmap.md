@@ -18,18 +18,20 @@ in the products that consume the harness.
 The root surface and remaining trusted code are described in the
 [helper protocol](helper-protocol.md) and [threat model](threat-model.md).
 
-## 1. Control-plane features (next)
+## 1. Control-plane features
 
-- **Streaming exec:** a server-streaming `ExecStream` for long commands and
+- [x] **Streaming exec:** a server-streaming `ExecStream` for long commands and
   live output, alongside the bounded unary `Exec` (API additions M4; kiln backend,
   Linux helper; Firecracker needs broker live frames).
-- **Idempotent create:** a client request ID so a retried `CreateSandbox`
+- [x] **Idempotent create:** a client request ID so a retried `CreateSandbox`
   doesn't make a second sandbox.
-- **Exec options:** working directory and environment. These need kiln
-  support first.
-- **Sandbox TTLs:** delete idle sandboxes after a limit, so a crashed client
+- [x] **Exec options:** working directory and environment (with a kiln that has exec
+  options).
+- [x] **Sandbox TTLs:** delete idle sandboxes after a limit, so a crashed client
   can't hold capacity forever.
-- **Metrics:** request and execution counters and latencies next to kiln's
+- [x] **Workspace checkpoints:** capture a sandbox's workspace and create new sandboxes
+  from it; off by default and a supported opt-in ([checkpoints.md](checkpoints.md)).
+- [ ] **Metrics:** request and execution counters and latencies next to kiln's
   `/metrics`.
 
 ## 2. Sandbox pool

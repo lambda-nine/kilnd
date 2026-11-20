@@ -9,6 +9,7 @@ the shared contract at that boundary; invalid API values return gRPC
 |---|---|
 | Sandbox ID | `sb-` followed by exactly 16 lowercase hexadecimal digits |
 | Execution ID | `ex-` followed by exactly 16 lowercase hexadecimal digits |
+| Checkpoint ID | `cp-` followed by exactly 32 lowercase hexadecimal digits |
 | Image | Empty selects the daemon default; effective names are 1–128 ASCII bytes: letters, digits, `-`, `_`, or `.`; the first byte is not `-` or `.` |
 | Allowlist | At most 64 entries, each at most 260 ASCII bytes: `HOST[:PORT]` or `IPv4[/PREFIX][:PORT]` |
 | Writable paths | Only with a read-only root; at most 16 absolute UTF-8 paths of at most 1024 bytes |
@@ -17,6 +18,8 @@ the shared contract at that boundary; invalid API values return gRPC
 | Exec `cwd` | Empty (`/`, as before) or an absolute UTF-8 path starting with `/`, at most 4,096 bytes (`--max-exec-cwd-bytes` may lower it), without NUL; not normalized |
 | Exec `env`, create `default_env` | At most 64 entries; names 1–128 bytes matching `[A-Za-z_][A-Za-z0-9_]*`, each given once; values UTF-8 without NUL, at most 4,096 bytes; `len(name) + len(value) + 2` totals at most 32,768. The same bounds hold for the merge of default env and an Exec's env; flags may lower each. Errors name an entry by position, never by its contents |
 | Create `request_id` | Empty (an unkeyed create) or 1–64 bytes, each printable ASCII without space (`0x21`–`0x7e`); checked before any lookup. The rest of a keyed create is validated after its request record lookup, so an accepted key is answered even if a node limit changed since |
+| CheckpointSandbox `request_id` | The Create `request_id` grammar, in a namespace of its own per uid |
+| Create `from_checkpoint` | Empty (an ordinary create) or a checkpoint ID; needs `FEATURE_WORKSPACE_CHECKPOINT`, and the create's spec must match the checkpoint's ([checkpoints.md](checkpoints.md)) |
 
 Hostnames use ASCII labels of 1–63 bytes, begin and end with an alphanumeric
 byte, and contain only alphanumeric bytes or interior hyphens. They have at
