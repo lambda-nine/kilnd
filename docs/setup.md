@@ -102,6 +102,8 @@ sudo kilndctl ls --all
 ```sh
 scripts/build.sh default test
 scripts/build.sh default clippy --all-targets
+scripts/build.sh firecracker-test-deployment test
+scripts/build.sh firecracker-test-deployment clippy --all-targets
 scripts/integration-test.sh          # dedicated admission stress, root + real kiln, FD-exec properties
 scripts/daemon-singleton-regressions.sh # duplicate starts preserve active work
 scripts/state-path-regressions.sh    # ownership, mode, type, link and symlink defenses
@@ -112,6 +114,8 @@ sudo python3 -I scripts/deployment-regressions.py --bin-a DIR --bin-b DIR
 # recovery from a reboot at each step, or from a failed restore, with systemd faked; runs anywhere
 python3 -I scripts/kilnd-maintenance-tests.py
 scripts/smoke.sh                     # through the installed service
+scripts/expiry-regressions.sh        # real idle and lifetime expiry, grace, renew and restart
+scripts/idempotent-create-regressions.sh # keyed retries, release and a kill mid-create
 ```
 
 The smoke test restarts and kills kilnd, so don't run it on a node with
@@ -120,23 +124,32 @@ sandboxes you care about.
 ### Firecracker B4 regressions (real VMs, test approval only)
 
 These launch real Firecracker microVMs in the VM under the shared VM lock. They need
-nested KVM, the release Firecracker v1.17.0 binary and a kiln-guest bundle's `Image` and
-`rootfs.squashfs` (the schema-1 guest, which listens for nothing, so a boot ends at
-BOOTING). Production is untouched: the catalog is approved only by a `cfg(test)` gate.
+nested KVM, the release Firecracker v1.17.0 binary and a kiln-guest bundle with `Image`,
+`rootfs.squashfs` and `kilnd-guest-broker`: since B5 the production bundle (default
+`$HOME/kiln-guest-build/bundle-a`), whose broker answers the host, so a boot reaches READY
+(the earlier schema-1 guest listens for nothing, so its boot ends at BOOTING). Production
+is untouched: the catalog is approved only by a `cfg(test)` gate.
 
 ```sh
 # Once: the patched jailer and a static mkfs.xfs, both SHA-256 pinned (no sudo).
 scripts/build-phase1b-tools.sh --out "$HOME/b4-build/out"
 # The privileged suite; B4_TOOLS, B4_VMM and B4_GUEST override the inputs.
 scripts/b4-vm-tests.sh                 # every b4_linux_root test, or pass a name filter
+scripts/b4-vm-tests.sh b5_linux_root   # B5's broker and console tests; two need B5's test
+                                       # guests from scripts/b5-test-guest.sh
+B6_EVIDENCE=$HOME/b6-evidence scripts/b4-vm-tests.sh b6_linux_root # a whole session
+                                       # through kilnd and kilndctl (deploy/firecracker-test/)
 ```
 
 `b4-vm-tests.sh` builds the library tests statically (`crt-static`), because that binary
 is installed in the protected store as the helper image and the contract approves static
 ELFs only. It installs under `/opt/kilnd`, uses `/var/lib/kilnd-helper/{jails,work}` and
 `/sys/fs/cgroup/kilnd-firecracker`, and its `scripts/b4-vm-cleanup.py` removes all of it
-and fails if any owned VMM, loop device, mount, cgroup or file is left. Its output is
-under `CARGO_TARGET_DIR` (default `~/.cache/kilnd-target-static`).
+and fails if any owned VMM, loop device, mount, cgroup or file is left. It first builds
+`kilnd` (with the `firecracker-test-deployment` feature) and `kilndctl` as ordinary
+release binaries for B6's session test, under `B6_TARGET_DIR` (default
+`~/.cache/kilnd-target-b6`); the static test binary goes under `B4_TARGET_DIR` (default
+`~/.cache/kilnd-target-static`), and an ambient `CARGO_TARGET_DIR` is ignored.
 
 ## Firecracker group (disabled by default)
 
@@ -317,7 +330,7 @@ proving every resource absent.
 **Selecting Firecracker for a database that holds kiln rows.** Historical kiln rows do not
 drain under `--backend firecracker`: their Delete is refused before any helper call and the
 row stays DELETING and charged, and Health names the count. Before switching, run the
-database with `--backend kiln` and delete every kiln row until `kilndctl list` shows none
+database with `--backend kiln` and delete every kiln row until `kilndctl ls` shows none
 charged. Each further Firecracker instance has a fresh database, so this arises only for
 the default instance.
 
@@ -404,7 +417,7 @@ bounded `next_page_token` until empty, keeping `include_deleted` and the calling
 uid unchanged. Tokens do not survive the schema 7 upgrade: restart the listing.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
-bounds. Every older schema upgrades in order through v9. Schema 5 introduced
+bounds. Every older schema upgrades in order through the current one (16). Schema 5 introduced
 typed termination and runtime diagnostics together with output, terminal state,
 truncation facts and whether each byte total is exact, plus each sandbox's
 create certainty. Historical records retain unknown typed values and unknown
