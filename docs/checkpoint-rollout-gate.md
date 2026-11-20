@@ -1,7 +1,6 @@
 # Workspace checkpoint rollout gate
 
-**Status: evidence filled in (milestone C6b); criterion 8 waits for C6b's adversarial
-review.** The criteria were fixed in C6a. Until every criterion holds, and the default is
+**Status: criteria 1-8 met (milestone C6b); 9 and 10 are checked per node.** The criteria were fixed in C6a. Until every criterion holds, and the default is
 decided, `--enable-workspace-checkpoints` stays off by default and documented as testing
 only. Passing the gate does not by itself turn the feature on anywhere.
 
@@ -16,7 +15,7 @@ Each criterion is checkable: a test, a run with recorded conditions, or a docume
 | 5 | The harness contract goldens are unchanged: fixture request and response shapes, every typed refusal's code and `kilnd-reason` token, and Health with the flag on; flag-off Health bytes unchanged | `crates/kilnd/tests/data/checkpoint-contract.json`; `flag_off_health_bytes_are_unchanged` | C6a |
 | 6 | A performance report is published with its conditions (hardware, kernel, kiln, filesystem and backing, cache state, concurrency, runs per cell, p50 and p95). No latency is promised | [checkpoint-performance.md](checkpoint-performance.md) | **Met** (one warm cell at n=8, labeled). Open tuning questions it raises, not changed: the per-entry allowance makes the 1 GiB cap an entry cap of about 60,000; a 50,000-entry capture takes about 28 s warm, inside the 120 s operation timeout |
 | 7 | Operator documentation covers enabling and disabling, cleanup, backup, upgrade and rollback with checkpoints present; the maintenance upgrade refuses while a checkpoint is in flight and checks the artifact inventory on rollback, with tests | [checkpoints.md](checkpoints.md); `scripts/kilnd-maintenance-tests.py`; `maintenance_busy_query_matches_the_schema` | C6a |
-| 8 | No HIGH or MEDIUM finding of the C6 adversarial reviews is open | review records | *pending: C6b's adversarial review* |
+| 8 | No HIGH or MEDIUM finding of the C6 adversarial reviews is open | review records | **Met.** C6a's two MEDIUMs were fixed at the start of C6b. The C6b review's six HIGHs and two LOWs were fixed in fix round 1; its recheck's HIGH (the tree listing lost names containing a newline), two MEDIUMs and two LOWs were fixed in fix round 2 (`5252bbf`), and the second recheck found nothing (2026-11-20). The dead-shim Delete gap found along the way is a pre-existing kilnd MEDIUM outside the checkpoint feature, recorded for the first kilnd change after C6 |
 | 9 | On the node itself, every discovery probe passes (Health lists `workspace_checkpoint`): helper group enabled, leases, format 1, generation-checked removal, XFS with project quotas on runs, trusted image registry, free space known; headroom configured | `kilndctl health` on the node | per node |
 | 10 | The node runs the kiln commit the gate was measured on, or a later one on which criteria 2–4 were rerun | `kiln --version` against the gate record | per node |
 
@@ -92,5 +91,9 @@ the reservation. This pre-existing MEDIUM is outside the checkpoint gate and is
 not fixed here. The case checks this explicit recovery sequence; root cleanup
 remains a failing fallback for any undeclared residue.
 
-Criterion 8 still awaits the C6b recheck. The feature remains off by default and
-for testing only.
+Fix round 2 reran the crash (16 of 16), hostile (7 of 7, two uids included) and
+client (4 of 4) sets at `5252bbf`, on kiln `8735907` and kernel
+`6.8.0-149-generic`, with both VM gates passed and both project-quota reports
+restored byte for byte (2026-11-20). Criteria 1-8 are met; 9 and 10 are checked
+per node. The feature remains off by default and for testing only until the
+default is decided.
