@@ -53,7 +53,8 @@ code, the test suite and `CHANGELOG.md`.
 
 - **gRPC API `kilnd.v1`** ([proto/kilnd/v1/kilnd.proto](proto/kilnd/v1/kilnd.proto)):
   `Health`, `CreateSandbox`, `GetSandbox`, `ListSandboxes`, `DeleteSandbox`,
-  `Exec`, `GetExecution` and `RenewSandbox`. Nothing in it is kiln-specific, so a
+  `Exec`, `ExecStream`, `GetExecution` and `RenewSandbox`, and for workspace checkpoints
+  `CheckpointSandbox`, `GetCheckpoint`, `ListCheckpoints` and `DeleteCheckpoint`. Nothing in it is kiln-specific, so a
   microVM backend can implement the same API. Optional parts are discovered from
   `Health.runtime_capabilities.features` (an older daemon lists none and ignores
   fields it doesn't know), refusals carry a machine-readable `kilnd-reason` trailer,
@@ -69,7 +70,10 @@ code, the test suite and `CHANGELOG.md`.
   ([docs/architecture.md](docs/architecture.md#exec-cwd-and-env)). `ExecStream` is
   Exec with live output: lossy chunks with exact offsets and reported gaps, then the
   stored execution, without ever slowing the command
-  ([docs/architecture.md](docs/architecture.md#execstream)).
+  ([docs/architecture.md](docs/architecture.md#execstream)). A workspace checkpoint
+  captures a sandbox's writes over its image, and a create with `from_checkpoint` forks a new
+  sandbox from it; checkpoints are off by default and a supported opt-in on a node that
+  passes their rollout gate ([docs/checkpoints.md](docs/checkpoints.md)).
 - **Runtime adapter trait** ([crates/kilnd/src/runtime/mod.rs](crates/kilnd/src/runtime/mod.rs)).
   The kiln implementation calls a private root helper, which runs the installed `kiln` CLI with argument vectors
   (never a shell), a cleared environment, timeouts and bounded output. kiln's
@@ -245,10 +249,13 @@ you created, so one made with `sudo` above stays visible only to root.
 ```sh
 scripts/build.sh default test
 scripts/build.sh default clippy --all-targets
+scripts/build.sh firecracker-test-deployment test
+scripts/build.sh firecracker-test-deployment clippy --all-targets
 git diff --check
+python3 -I scripts/kilnd-maintenance-tests.py
 ```
 
-CI runs these with Rust 1.88 on Ubuntu 24.04. The privileged checks run by
+CI runs these with Rust 1.88 (the MSRV) on Ubuntu 24.04, and clippy again with 1.99. The privileged checks run by
 hand in the VM after `scripts/install.sh`:
 
 ```sh
@@ -282,8 +289,9 @@ Copyright 2026 Stephen Estrada. Licensed under the
 
 The API socket is `kilnd:kilnd 0660` in `/run/kilnd` (0750); state stays
 private to `kilnd` (0700 directory, 0600 DB/sidecars). `--helper-socket` defaults
-to `/run/kilnd-helper/helper.sock`, `root:kilnd 0660` in a root-owned 0750
-directory. Only the service UID passes the helper's peer check, including
+to `/run/kilnd-helper/helper.sock`, `root:kilnd-helper 0660` in a
+`root:kilnd-helper` 0750 directory; `scripts/install.sh` adds the `kilnd` account to the
+`kilnd-helper` group. Only the service UID passes the helper's peer check, including
 rejecting root and ordinary API group members. `kilnd` refuses to run as root.
 The helper checks the daemon's typed request again, uses fixed argv and a
 cleared environment, and owns the existing CLI cleanup barriers. The daemon
