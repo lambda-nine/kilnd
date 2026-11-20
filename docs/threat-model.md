@@ -85,7 +85,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   resurrect `DELETING`. A backend side effect whose caller is interrupted is
   reconciled by retry, treating an already-absent backend as success.
   Startup garbage collection receives only stale backend IDs recorded in
-  kilnd's own rows; unmanaged live and stale sandboxes are retained. Restart
+  kilnd's own rows; unmanaged live and stale sandboxes are retained. A removal
+  that cannot prove its own row's backend gone collects it only when a complete
+  listing shows exactly that one ID stale, and only that ID. Restart
   execution interruption is likewise joined through each sandbox and limited
   to the active backend.
 - **Typed reservation release.** Schema 8 records release explicitly. Legacy rows

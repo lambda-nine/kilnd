@@ -25,7 +25,7 @@ use crate::model::{
 use crate::runtime::{
     AbsenceReceipt, AccountingAuthority, AllocationObservation, BackendRecord, BackendStatus,
     CreateContext, CreateFailure, CreatedSandbox, EvidenceRegime, ExecFinish, ExecOutcome,
-    PrepareContext, RemoveTarget,
+    LegacyAbsence, LegacyProof, PrepareContext, RemoveTarget,
     ExecSpec, ExecutionContext, FencedAbsence, MAX_BACKEND_PLAN_BYTES, NodeTotals, PreparedCreate,
     Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt,
 };
@@ -1719,7 +1719,80 @@ impl<R: Runtime> Manager<R> {
 
     /// Legacy kiln's existing release standard: its strict removal, or its NotFound
     /// from the same probe. It releases only through the row's explicit legacy tag.
+    ///
+    /// One more proof, for a backend whose supervisor died out of band: when the strict
+    /// removal fails as a backend error and a complete inventory lists exactly this ID,
+    /// once, as `Stale`, a scoped collection of exactly this ID must return exactly its
+    /// own receipt and a second strict removal must then succeed or find it absent. Any
+    /// other inventory or a failed step keeps the honest unknown (the first error).
     async fn remove_legacy(&self, backend_id: &str) -> std::result::Result<(), RuntimeError> {
+        match self.remove_legacy_strict(backend_id).await {
+            Err(RuntimeError::Backend(first)) => self.collect_stale_legacy(backend_id, first).await,
+            result => result,
+        }
+    }
+
+    /// The scoped stale collection behind [`Self::remove_legacy`]. Every call is bounded
+    /// by its own deadline; nothing here waits forever.
+    async fn collect_stale_legacy(
+        &self,
+        backend_id: &str,
+        first: String,
+    ) -> std::result::Result<(), RuntimeError> {
+        let cancel = CancellationToken::new();
+        let Ok(inventory) = self
+            .runtime
+            .list(Instant::now() + LIST_TIMEOUT, &cancel)
+            .await
+        else {
+            return Err(RuntimeError::Backend(first));
+        };
+        let mut entries = inventory.records.iter().filter(|r| r.id == backend_id);
+        let listed_stale = inventory.complete
+            && matches!(
+                (entries.next(), entries.next()),
+                (Some(record), None)
+                    if record.status == BackendStatus::Stale && record.allocation_id.is_none()
+            );
+        if !listed_stale {
+            return Err(RuntimeError::Backend(first));
+        }
+        let receipts = self
+            .runtime
+            .gc(
+                &[RemoveTarget::Legacy { backend_id }],
+                Instant::now() + LIST_TIMEOUT,
+                &cancel,
+            )
+            .await
+            .map_err(|e| {
+                RuntimeError::Backend(format!("{first}; stale collection failed: {e}"))
+            })?;
+        let own = matches!(
+            receipts.as_slice(),
+            [AbsenceReceipt::Legacy(LegacyAbsence { backend_id: id, proof: LegacyProof::ScopedGc })]
+                if id == backend_id
+        );
+        if !own {
+            return Err(RuntimeError::Backend(format!(
+                "{first}; stale collection of {backend_id} returned {} receipt(s), not exactly its own",
+                receipts.len()
+            )));
+        }
+        self.remove_legacy_strict(backend_id).await.map_err(|e| {
+            RuntimeError::Backend(format!(
+                "{first}; removal after stale collection did not prove absence: {e}"
+            ))
+        })?;
+        info!(backend_id = %backend_id, "backend listed stale (its supervisor died) was collected by ID and proved absent");
+        Ok(())
+    }
+
+    /// One strict removal: its own receipt or NotFound is absence; anything else is not.
+    async fn remove_legacy_strict(
+        &self,
+        backend_id: &str,
+    ) -> std::result::Result<(), RuntimeError> {
         match self
             .runtime
             .remove(

@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Delete a sandbox whose kiln shim died. When a shim crashed or was killed out of
+  band, kiln lists its run `stale` and kilnd's removal could not prove the backend
+  gone, so Delete answered Internal and left the sandbox DELETING and charged until
+  root ran `kiln gc` by hand. Delete, expiry and create cleanup now collect exactly
+  that run with a scoped `kiln gc` when kiln lists it once as stale, then prove it
+  absent and release the reservation. Every other failure still keeps the sandbox
+  DELETING and charged.
+
 - Record the passing C6b fix-round-1 crash, reboot, hostile and client VM reruns
   in the rollout gate. Its adversarial recheck remains pending; workspace
   checkpoints stay off by default and for testing only.

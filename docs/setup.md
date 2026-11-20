@@ -507,7 +507,9 @@ node with checkpoints (cleanup, backup, upgrade and rollback) is in
 - **Logs:** `--log-format json` in the unit; `KILND_LOG=debug` for more.
 - **Stray kiln sandboxes** kilnd didn't create are logged at startup as
   unmanaged and left alone. Remove live ones with `sudo kiln rm ID`; remove
-  stale ones explicitly with `sudo kiln gc ID`.
+  stale ones explicitly with `sudo kiln gc ID`. A kilnd sandbox whose kiln shim
+  died (kiln lists its run `stale`) needs no root step: Delete collects exactly
+  that run by ID and proves it absent.
 - **Reservation boundary:** budgets cover promises made through kilnd. Trusted
   root or direct `kiln` use can bypass them and must be included in deployment
   headroom and operator accounting.

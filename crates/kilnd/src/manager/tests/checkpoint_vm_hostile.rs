@@ -835,42 +835,39 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
         .await;
         assert_eq!(w.charge(), (0, 0));
         seen.insert("pid1_killed_mid_capture".into(), json!(pid1));
-        // The killed shim leaves the source's run stale, and kilnd cannot prove that
-        // backend gone (its probe of the dead PID 1 fails), so Delete refuses and the
-        // row stays DELETING, charged: a recorded pre-existing kilnd Delete gap
-        // (MEDIUM), outside the checkpoint gate. Root's `kiln gc` of exactly that run
-        // removes it; a second Delete then finds the backend absent and answers DELETED.
+        // The killed shim leaves the source's run stale. kilnd's strict removal cannot
+        // prove that backend gone (its probe of the dead PID 1 fails), so Delete reads
+        // kiln's listing: exactly this run, listed once and stale, is collected by ID and
+        // then proved absent. One Delete answers DELETED and releases the reservation,
+        // and the run is gone, with no root `kiln gc` anywhere in the scene.
         let row_of = |w: &World| {
             w.host_state().sandboxes.into_iter().find(|r| r.id == big).unwrap()
         };
-        let d = w.rpc(OWNER, json!({ "op": "delete", "id": big })).await;
-        let refusal = d["error"]["message"].as_str().unwrap_or_default().to_string();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !kiln_ids().iter().any(|(id, st)| *id == backend && st == "stale") {
+            assert!(std::time::Instant::now() < end, "never stale: {:?}", kiln_ids());
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        // The row is still live and charged; kilnd never saw the shim die.
+        let before = row_of(&w);
         assert!(
-            d.get("ok").is_none()
-                && d["error"]["code"] == "Internal"
-                && refusal.starts_with(&format!(
-                    "delete sandbox {big}: kiln rm {backend} did not prove absence: "
-                )),
-            "Delete of the dead-shim source: {d}"
+            before.state != "deleting" && before.state != "deleted" && !before.released,
+            "the dead-shim source before its Delete: {before:?}"
         );
-        let stuck = row_of(&w);
-        assert!(
-            stuck.state == "deleting"
-                && !stuck.released
-                && stuck.backend_id.as_deref() == Some(backend.as_str()),
-            "the dead-shim source after the refused Delete: {stuck:?}"
-        );
-        let collected = collect_expected_stale_runs(std::slice::from_ref(&backend)).await;
-        assert_eq!(collected, vec![backend.clone()], "the dead-shim source's run");
         let d = w.ok(json!({ "op": "delete", "id": big })).await;
-        assert_eq!(d["state"], "SANDBOX_STATE_DELETED", "{d}");
+        assert_eq!(d["state"], "SANDBOX_STATE_DELETED", "Delete of the dead-shim source: {d}");
         let gone = row_of(&w);
         assert!(gone.state == "deleted" && gone.released, "{gone:?}");
         assert_eq!(w.charge(), charge_before);
+        assert!(
+            !kiln_ids().iter().any(|(id, _)| *id == backend) && !run_dirs().contains(&backend),
+            "kiln still lists or keeps the dead-shim run {backend}: {:?}",
+            kiln_ids()
+        );
         seen.insert(
             "dead_shim_delete".into(),
-            json!({ "first": format!("refused Internal: {refusal}"), "row": "deleting, charged",
-                    "gc": collected, "second": "deleted, released" }),
+            json!({ "row_before": before.state, "listed": "stale",
+                    "delete": "deleted, released", "root_gc": false, "run": "gone" }),
         );
         // 3. Root's own `kiln exec` into the source makes a capture busy (C6b review
         // HIGH 4: required, not recorded). The direct Exec reports it started, then waits

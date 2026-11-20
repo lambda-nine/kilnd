@@ -704,7 +704,7 @@
         "kilnd::manager::checkpoint_vm_tests::hostile::c6b_hostile_artifact_and_process_attacks_are_refused_typed"
       ],
       "kiln": true,
-      "vm_note": "A recorded pre-existing kilnd Delete gap (MEDIUM), outside the checkpoint gate, not fixed: a sandbox whose shim dies out of band stays READY with its quota and slot, and kilnd cannot delete it, since its probe of the dead PID 1 cannot prove the backend gone; Delete answers Internal and leaves the row DELETING and charged until root runs kiln gc on its run. The VM scenario requires that refusal, collects exactly that run with kiln gc, then requires a second Delete to answer DELETED and release the reservation (on the Mac: kilnd::manager::tests::failed_delete_retried_after_the_backend_is_gone_is_deleted_and_released)."
+      "vm_note": "A sandbox whose shim dies out of band keeps its row and charge, and kilnd's strict removal cannot prove the backend gone, since its probe of the dead PID 1 fails. When kiln lists exactly that run once as stale, Delete collects it by ID and proves it absent. The VM scenario kills the shim, waits for kiln to list the run stale, then requires one Delete to answer DELETED, release the reservation and leave no run, with no root kiln gc (on the Mac: kilnd::manager::tests::delete_collects_a_backend_listed_stale_and_releases_it and kilnd::manager::tests::delete_never_collects_a_backend_listed_running)."
     },
     {
       "id": "11.2.4-output-queue",

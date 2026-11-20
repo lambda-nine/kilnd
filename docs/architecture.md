@@ -55,7 +55,7 @@ The helper maps these operations to fixed argv:
 |-------|------|
 | create | `kiln create --require-exec-protocol=1 --image=… --memory=… --cpus=… --pids=… --disk=… --net=…/--allow=… [--read-only --writable=…]`; stdout is the ID, exit 124 means a failure known before allocation |
 | exec | `kiln exec --protocol=1 --status-fd=N --stdin-fd=I --stdout-fd=O --stderr-fd=E ID -- ARGV…`; private status and workload streams |
-| delete | `kiln rm ID` |
+| delete | `kiln rm ID`; if that cannot prove absence and `kiln ls` lists exactly that ID once as stale, scoped `kiln gc ID`, then `kiln rm ID` again |
 | reconcile | `kiln ls`, scoped `kiln gc ID...`, then `kiln ls` again |
 | health | `kiln capabilities --protocol=1` |
 
@@ -321,6 +321,14 @@ Reservations on a legacy row follow ownership evidence:
   reload, including after waiting behind the create compensator's lock.
 - `DELETED` releases. A failed or interrupted delete remains `DELETING` and
   cannot return capacity early.
+- A legacy removal (Delete, expiry, create compensation and startup's retry of a
+  `DELETING` row) has one more proof for a backend whose kiln shim died out of
+  band. The dead shim answers no probe, so `rm` cannot prove absence. If, and only
+  if, a complete `kiln ls` then lists exactly that ID once as `stale`, kilnd runs a
+  scoped `kiln gc` of that one ID, requires exactly that ID's receipt, and requires
+  a second `rm` to succeed or find it absent. A running, absent, duplicated or
+  unlistable backend, or any failed step, keeps the original error and the row
+  `DELETING` and charged.
 
 The kiln adapter claims `definitely_not_created` in exactly two cases, and never
 from diagnostics text:

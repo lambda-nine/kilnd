@@ -1977,6 +1977,195 @@ async fn failed_delete_retried_after_the_backend_is_gone_is_deleted_and_released
     assert_eq!(reserved().await, 0);
 }
 
+/// A READY sandbox whose backend's supervisor died: kiln lists it stale, and its
+/// strict removal fails as a backend error (the dead shim answers no probe).
+async fn dead_shim_sandbox() -> (Arc<Manager<FakeRuntime>>, FakeRuntime, Sandbox, String) {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let backend = s.backend_id.clone().unwrap();
+    let mut state = fake.state();
+    state.sandboxes.insert(backend.clone(), BackendStatus::Stale);
+    state.fail_remove = true;
+    drop(state);
+    (m, fake, s, backend)
+}
+
+async fn reserved_sandboxes(m: &Arc<Manager<FakeRuntime>>) -> u64 {
+    m.health().await.unwrap().node_resources.reserved.sandboxes
+}
+
+/// The refusal every unproven case keeps: Internal-class backend error, the row
+/// DELETING with the failure recorded, and the reservation still charged.
+async fn assert_refused_and_charged(m: &Arc<Manager<FakeRuntime>>, id: &str) -> String {
+    let error = m.delete(id).await.unwrap_err();
+    let Error::Backend(message) = &error else {
+        panic!("Delete of an unproven backend answered {error:?}");
+    };
+    assert!(message.starts_with(&format!("delete sandbox {id}: ")), "{message}");
+    let row = m.get(id, 0).unwrap().0;
+    assert_eq!(row.state, SandboxState::Deleting);
+    assert!(row.is_charged(), "an unproven removal released the reservation");
+    assert!(row.failure_reason.unwrap().contains("delete failed"));
+    assert_eq!(reserved_sandboxes(m).await, 1);
+    message.clone()
+}
+
+fn assert_deleted_and_released(m: &Arc<Manager<FakeRuntime>>, id: &str) {
+    let row = m.get(id, 0).unwrap().0;
+    assert_eq!(row.state, SandboxState::Deleted);
+    assert_eq!(
+        row.accounting.release,
+        crate::model::ReservationRelease::Legacy(crate::model::LegacyRelease::Deleted)
+    );
+}
+
+#[tokio::test]
+async fn delete_collects_a_backend_listed_stale_and_releases_it() {
+    let (m, fake, s, backend) = dead_shim_sandbox().await;
+    assert_eq!(reserved_sandboxes(&m).await, 1);
+    assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
+    assert_deleted_and_released(&m, &s.id);
+    assert_eq!(reserved_sandboxes(&m).await, 0);
+    let state = fake.state();
+    assert_eq!(state.gc_requests, vec![vec![backend.clone()]]);
+    assert!(!state.sandboxes.contains_key(&backend));
+    // The first strict removal failed; the second found the collected run absent.
+    assert_eq!(state.remove_attempts, vec![backend.clone(), backend]);
+}
+
+#[tokio::test]
+async fn delete_never_collects_a_backend_listed_running() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    fake.state().fail_remove = true;
+    let message = assert_refused_and_charged(&m, &s.id).await;
+    assert!(message.ends_with("fake remove failed"), "{message}");
+    let state = fake.state();
+    assert!(state.gc_requests.is_empty(), "gc ran on a running backend");
+    assert_eq!(state.gc_runs, 0);
+    assert_eq!(
+        state.sandboxes.get(s.backend_id.as_ref().unwrap()),
+        Some(&BackendStatus::Running)
+    );
+}
+
+#[tokio::test]
+async fn delete_keeps_the_honest_unknown_without_one_stale_listing() {
+    // Absent from a complete listing, listed twice, or no listing at all: none of
+    // them proves this backend's supervisor dead, so nothing is collected.
+    for case in ["absent", "twice", "list fails"] {
+        let (m, fake, s, backend) = dead_shim_sandbox().await;
+        match case {
+            "absent" => fake.state().hidden_from_list.push(backend.clone()),
+            "twice" => fake.state().listed_twice.push(backend.clone()),
+            _ => fake.state().fail_list = true,
+        }
+        let message = assert_refused_and_charged(&m, &s.id).await;
+        assert!(message.ends_with("fake remove failed"), "{case}: {message}");
+        let state = fake.state();
+        assert!(state.gc_requests.is_empty(), "{case}: gc ran");
+        assert_eq!(state.sandboxes.get(&backend), Some(&BackendStatus::Stale), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn delete_refuses_when_the_stale_collection_misbehaves() {
+    use crate::runtime::fake::FakeGcScript;
+    let cases: Vec<(&str, FakeGcScript)> = vec![
+        ("no receipt", FakeGcScript::Report(vec![])),
+        ("another ID", FakeGcScript::Report(vec!["f00d-elsewhere".into()])),
+        ("two receipts", FakeGcScript::Report(vec![String::new(), String::new()])),
+        ("error", FakeGcScript::Fail),
+    ];
+    for (case, script) in cases {
+        let (m, fake, s, backend) = dead_shim_sandbox().await;
+        let script = match script {
+            FakeGcScript::Report(ids) if ids.len() == 2 => {
+                FakeGcScript::Report(vec![backend.clone(), backend.clone()])
+            }
+            other => other,
+        };
+        fake.state().gc_script = Some(script);
+        let message = assert_refused_and_charged(&m, &s.id).await;
+        let expected = if case == "error" {
+            "stale collection failed: fake gc failed".to_string()
+        } else {
+            format!("stale collection of {backend} returned")
+        };
+        assert!(message.contains(&expected), "{case}: {message}");
+        let state = fake.state();
+        assert_eq!(state.gc_requests, vec![vec![backend.clone()]], "{case}");
+        // No second removal follows a collection that proved nothing.
+        assert_eq!(state.remove_attempts, vec![backend.clone()], "{case}");
+    }
+}
+
+#[tokio::test]
+async fn delete_refuses_when_the_removal_after_collection_proves_nothing() {
+    use crate::runtime::fake::FakeGcScript;
+    let (m, fake, s, backend) = dead_shim_sandbox().await;
+    // The collection claims exactly this ID, but the run stays and removal still fails.
+    fake.state().gc_script = Some(FakeGcScript::Report(vec![backend.clone()]));
+    let message = assert_refused_and_charged(&m, &s.id).await;
+    assert!(
+        message.contains("removal after stale collection did not prove absence: fake remove failed"),
+        "{message}"
+    );
+    let state = fake.state();
+    assert_eq!(state.gc_requests, vec![vec![backend.clone()]]);
+    assert_eq!(state.remove_attempts, vec![backend.clone(), backend]);
+}
+
+#[tokio::test]
+async fn deleting_row_whose_backend_went_stale_later_is_deleted_on_retry() {
+    let (m, fake) = manager();
+    let s = m.create(CreateRequest::default()).await.unwrap();
+    let backend = s.backend_id.clone().unwrap();
+    fake.state().fail_remove = true;
+    assert_refused_and_charged(&m, &s.id).await;
+    assert!(fake.state().gc_requests.is_empty());
+    fake.state()
+        .sandboxes
+        .insert(backend.clone(), BackendStatus::Stale);
+    assert_eq!(m.delete(&s.id).await.unwrap().state, SandboxState::Deleted);
+    assert_deleted_and_released(&m, &s.id);
+    assert_eq!(reserved_sandboxes(&m).await, 0);
+    assert_eq!(fake.state().gc_requests, vec![vec![backend]]);
+}
+
+#[tokio::test]
+async fn create_compensation_collects_a_backend_that_went_stale() {
+    // Create compensation shares the legacy removal: a backend whose supervisor died
+    // before READY was recorded is collected by ID, and the create fails released.
+    let (m, fake) = manager();
+    m.store.reject_ready_updates().unwrap();
+    let gate = FakeGate::default();
+    fake.state().create_after_allocation = Some(gate.clone());
+    fake.state().fail_remove = true;
+    let create = tokio::spawn({
+        let m = m.clone();
+        async move { m.create(CreateRequest::default()).await }
+    });
+    gate.entered().await;
+    let backend = {
+        let mut state = fake.state();
+        let backend = state.sandboxes.keys().next().unwrap().clone();
+        state.sandboxes.insert(backend.clone(), BackendStatus::Stale);
+        backend
+    };
+    gate.release();
+    assert!(create.await.unwrap().is_err());
+    let row = m.list(true).unwrap().remove(0);
+    assert_eq!(row.state, SandboxState::Failed, "{:?}", row.failure_reason);
+    assert_eq!(row.backend_id.as_deref(), Some(backend.as_str()));
+    assert_eq!(
+        row.accounting.release,
+        crate::model::ReservationRelease::Legacy(crate::model::LegacyRelease::Compensated)
+    );
+    assert_eq!(reserved_sandboxes(&m).await, 0);
+    assert_eq!(fake.state().gc_requests, vec![vec![backend]]);
+}
+
 #[tokio::test]
 async fn shutdown_refuses_new_work_and_cancels_executions() {
     let (m, _) = manager();

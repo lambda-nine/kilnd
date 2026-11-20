@@ -146,6 +146,15 @@ pub enum FakeForgery {
     EmptyBoot,
 }
 
+/// What a scripted legacy `gc` answers instead of collecting stale entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FakeGcScript {
+    /// Fails with a backend error and changes nothing.
+    Fail,
+    /// Reports these IDs collected (scoped-gc receipts) and changes nothing.
+    Report(Vec<String>),
+}
+
 /// Fault switches for the fenced mode. Everything is explicit and deterministic;
 /// the defaults model a healthy helper.
 #[derive(Default)]
@@ -256,6 +265,12 @@ pub struct FakeState {
     pub remove_after_delete: Option<FakeGate>,
     /// When set, `list` and `version` fail, like a missing kiln binary.
     pub unavailable: bool,
+    /// When set, only `list` fails.
+    pub fail_list: bool,
+    /// Backend IDs `list` reports twice.
+    pub listed_twice: Vec<String>,
+    /// When set, a legacy `gc` records its scope, then answers this instead.
+    pub gc_script: Option<FakeGcScript>,
     /// Backend IDs deliberately omitted from `list` while direct validation
     /// still observes them. Reconciliation tests use this to model an
     /// incomplete but otherwise successful backend listing.
@@ -311,6 +326,9 @@ impl Default for FakeState {
             remove_before_delete: None,
             remove_after_delete: None,
             unavailable: false,
+            fail_list: false,
+            listed_twice: Vec::new(),
+            gc_script: None,
             hidden_from_list: Vec::new(),
             incompatible_sandboxes: Vec::new(),
             proven_features: Ok(Vec::new()),
@@ -1534,11 +1552,18 @@ impl Runtime for FakeRuntime {
         if s.unavailable {
             return Err(RuntimeError::Backend("fake backend unavailable".into()));
         }
+        if s.fail_list {
+            return Err(RuntimeError::Backend("fake list failed".into()));
+        }
         Ok(BackendInventory {
             records: s
                 .sandboxes
                 .iter()
                 .filter(|(id, _)| !s.hidden_from_list.iter().any(|hidden| hidden == *id))
+                .flat_map(|entry| {
+                    let twice = s.listed_twice.iter().any(|id| id == entry.0);
+                    std::iter::repeat_n(entry, if twice { 2 } else { 1 })
+                })
                 .map(|(id, status)| BackendRecord {
                     id: id.clone(),
                     status: *status,
@@ -1602,6 +1627,23 @@ impl Runtime for FakeRuntime {
                 receipts.push(AbsenceReceipt::Fenced(receipt));
             }
             return Ok(receipts);
+        }
+        match s.gc_script.clone() {
+            Some(FakeGcScript::Fail) => {
+                return Err(RuntimeError::Backend("fake gc failed".into()));
+            }
+            Some(FakeGcScript::Report(reported)) => {
+                return Ok(reported
+                    .into_iter()
+                    .map(|backend_id| {
+                        AbsenceReceipt::Legacy(LegacyAbsence {
+                            backend_id,
+                            proof: LegacyProof::ScopedGc,
+                        })
+                    })
+                    .collect());
+            }
+            None => {}
         }
         let stale: Vec<String> = s
             .sandboxes
