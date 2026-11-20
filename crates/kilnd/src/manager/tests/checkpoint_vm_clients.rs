@@ -19,14 +19,6 @@ fn run<F: std::future::Future<Output = ()>>(f: F) {
 
 const MIN: u64 = 60_000;
 
-/// Every entry under `/root/repo`: type, mode, owner, size, link count, link target,
-/// file digest and mtime (directories without their mtime).
-const TREE: &str = "cd /root && find repo | LC_ALL=C sort | while IFS= read -r f; do \
-    if [ -d \"$f\" ] && [ ! -L \"$f\" ]; then stat -c '%n|%F|%a|%u|%g' \"$f\"; \
-    else stat -c '%n|%F|%a|%u|%g|%s|%h|%y' \"$f\"; fi; \
-    [ -L \"$f\" ] && printf 'link %s\\n' \"$(readlink \"$f\")\"; \
-    if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then sha256sum < \"$f\"; fi; done; true";
-
 fn keyed_create(key: &str) -> Value {
     json!({ "op": "create", "request_id": key, "lifetime_ms": 120 * MIN, "idle_ms": 30 * MIN })
 }
@@ -48,8 +40,9 @@ async fn turn(w: &World, id: &str, script: &str) -> i64 {
     r["exit_code"].as_i64().unwrap_or(-1)
 }
 
-async fn tree(w: &World, id: &str) -> String {
-    w.sh(id, TREE).await["stdout"].as_str().unwrap().to_string()
+async fn tree(w: &World, id: &str) -> Vec<Vec<u8>> {
+    let exec = w.sh(id, &listing_script(&["/root/repo"])).await;
+    tree_records(&exec).unwrap_or_else(|e| panic!("listing {id}: {e}"))
 }
 
 /// The harness's cleanup: Delete, then Delete again with `release_request_id` once
@@ -155,7 +148,7 @@ fn c6b_f1_rewind_on_real_kiln() {
             json!({ "busy_while_a_turn_runs": "checkpoint_busy", "digest_stable": true,
                     "rewound_byte_for_byte": true, "depth2_byte_for_byte": true,
                     "keyed_fork_retry": "same sandbox", "git_in_image": git,
-                    "turn1_entries": turn1.lines().count() }),
+                    "turn1_entries": turn1.len() }),
         );
         w.finish().await;
     });

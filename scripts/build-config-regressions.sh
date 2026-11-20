@@ -218,8 +218,8 @@ for name in credentials.toml credentials; do
     done
     rm "$credentials_home/$name"
 done
-# Cargo's legacy top-level token string is allowed (C6b review HIGH 1); with anything else
-# beside it, or as a non-string, it is refused.
+# Cargo's legacy root token string is accepted alongside valid registry and registries
+# credential tables. Every other top-level key and a non-string token are refused.
 for name in credentials.toml credentials; do
     for body in "token = \"x\"\n[target.$host]\nrunner = \"$scratch/runner.sh\"" \
         'token = "x"\n[env]\nKILND_BLESS_CHECKPOINT_CONTRACT = "1"' \

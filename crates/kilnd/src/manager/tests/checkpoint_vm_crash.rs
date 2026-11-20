@@ -477,16 +477,15 @@ fn c6b_v9_pin_committed_not_dispatched_retires_the_reader_and_releases_on_absent
         assert_eq!(w.cp_state(&cp), "ready");
         let again = still_forkable(&w, &cp, "one", 0).await;
         source_usable(&w, &src, "one").await;
-        let d = w.ok(json!({ "op": "delete_checkpoint", "id": cp })).await;
-        assert_eq!(d["state"], "CHECKPOINT_STATE_DELETED", "{d}");
-        let released_by = w.pin(&fork).unwrap();
-        assert_eq!(released_by, "absent");
-        assert_eq!(w.charge(), (0, 0));
+        live_pin(&w, &fork, &cp, "immediately before the owner's Delete");
+        let released_by = delete_releases_by_absent(&w, &cp, &fork).await;
+        let deletion_reason = w.cp_col(&cp, "deletion_reason");
+        assert_eq!(deletion_reason, "requested");
         matrix(
             "V9 pin committed, not dispatched",
             json!({ "fork_state": w.sandbox_state(&fork), "restores_after_restart": 0,
                     "pin_after_restart": "live, nothing blocked", "checkpoint": "ready",
-                    "forked_again": again, "pin_released_by": released_by,
+                    "forked_again": again, "pin_released_by": released_by, "deletion_reason": deletion_reason,
                     "reconciled": reconciled }),
         );
         w.finish().await;

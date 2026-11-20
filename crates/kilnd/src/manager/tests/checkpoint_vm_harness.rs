@@ -353,46 +353,115 @@ pub(super) fn output_bytes(exec: &Value) -> Vec<u8> {
     )
 }
 
-/// The tree a fidelity comparison covers, as one line per entry, every byte of every
-/// name kept: type, mode, owner, group, link count and nanosecond mtime of every entry,
-/// directories included; the size of every entry but a directory (a directory's size
-/// is its filesystem's layout, not its content); a symlink's target and a regular
-/// file's SHA-256. Paths that do not exist print nothing.
+/// One NUL-terminated record per entry, with a hex name, stat metadata, and a
+/// hex symlink target or file digest where applicable. Directory size is omitted
+/// because it depends on the filesystem layout. Missing paths print nothing.
 pub(super) fn listing_script(paths: &[&str]) -> String {
-    let quoted: Vec<String> = paths.iter().map(|p| format!("'{p}'")).collect();
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let paths = paths.iter().map(|p| quote(p)).collect::<Vec<_>>().join(" ");
+    // The marker lets the consumer check readlink succeeded even in shells without
+    // pipefail. It cannot be part of the target, and encoding before substitution
+    // preserves any trailing newlines in the target.
+    let entry = r#"
+        hex_bytes() {
+            bytes=$(od -An -v -tx1) || return 1
+            printf '%s' "$bytes" | tr -d ' \n'
+        }
+        for f do
+            name=$(printf '%s' "$f" | hex_bytes) || exit 1
+            if [ -d "$f" ] && [ ! -L "$f" ]; then
+                metadata=$(stat -c '%F|%a|%u|%g|%h|%y' "$f") || exit 1
+            else
+                metadata=$(stat -c '%F|%a|%u|%g|%s|%h|%y' "$f") || exit 1
+            fi
+            printf '%s|%s' "$name" "$metadata" || exit 1
+            if [ -L "$f" ]; then
+                target=$({ readlink "$f" && printf '\000'; } | hex_bytes) || exit 1
+                case "$target" in
+                    *00) printf '|link=%s' "${target%00}" || exit 1 ;;
+                    *) exit 1 ;;
+                esac
+            elif [ -f "$f" ]; then
+                digest=$(sha256sum < "$f") || exit 1
+                printf '|sha256=%s' "${digest%% *}" || exit 1
+            fi
+            printf '\000' || exit 1
+        done
+    "#;
     format!(
-        "for p in {}; do [ -e \"$p\" ] || [ -L \"$p\" ] || continue; \
-         find \"$p\" -xdev | LC_ALL=C sort | while IFS= read -r f; do \
-           if [ -d \"$f\" ] && [ ! -L \"$f\" ]; then stat -c '%n|%F|%a|%u|%g|%h|%y' \"$f\"; \
-           else stat -c '%n|%F|%a|%u|%g|%s|%h|%y' \"$f\"; fi; \
-           [ -L \"$f\" ] && printf 'link %s\\n' \"$(readlink \"$f\")\"; \
-           if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then sha256sum < \"$f\"; fi; \
-         done; done; true",
-        quoted.join(" ")
+        "export LC_ALL=C; for p in {paths}; do [ -e \"$p\" ] || [ -L \"$p\" ] || continue; \
+         find \"$p\" -xdev -exec sh -c {} sh {{}} + || exit 1; done",
+        quote(entry)
     )
 }
 
-/// The fidelity oracle: the fork's listing and behaviour are the source's, byte for
-/// byte. The error names the first differing line, escaped.
+pub(super) fn tree_records(exec: &Value) -> Result<Vec<Vec<u8>>, String> {
+    if exec["exit_code"] != 0 || exec["stderr_hex"].as_str() != Some("") {
+        return Err(format!(
+            "listing exit {}, stderr hex {}",
+            exec["exit_code"], exec["stderr_hex"]
+        ));
+    }
+    let stdout = exec["stdout_hex"].as_str().ok_or("listing missing stdout_hex")?;
+    if !stdout.len().is_multiple_of(2) || !stdout.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("listing has invalid stdout_hex".into());
+    }
+    let bytes = unhex(stdout);
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = bytes.strip_suffix(b"\0").ok_or("listing missing final NUL")?;
+    let mut records: Vec<Vec<u8>> = bytes.split(|&b| b == 0).map(<[u8]>::to_vec).collect();
+    records.sort_unstable();
+    Ok(records)
+}
+
+/// The fidelity oracle compares tree records and execution output byte for byte.
 pub(super) fn same_tree(source: &[Value; 2], fork: &[Value; 2]) -> Result<(), String> {
-    for (what, a, b) in [
-        ("tree", &source[0], &fork[0]),
-        ("behaviour", &source[1], &fork[1]),
-    ] {
-        let (a, b) = (output_bytes(a), output_bytes(b));
-        if a != b {
-            let (la, lb): (Vec<&[u8]>, Vec<&[u8]>) =
-                (a.split(|c| *c == b'\n').collect(), b.split(|c| *c == b'\n').collect());
-            let at = (0..la.len().max(lb.len()))
-                .find(|i| la.get(*i) != lb.get(*i))
-                .unwrap_or(0);
-            let show = |l: Option<&&[u8]>| l.map(|l| l.escape_ascii().to_string()).unwrap_or_default();
-            return Err(format!(
-                "the fork's {what} differs at line {at}: source {:?}, fork {:?}",
-                show(la.get(at)),
-                show(lb.get(at))
-            ));
-        }
+    let a = tree_records(&source[0]).map_err(|e| format!("source tree: {e}"))?;
+    let b = tree_records(&fork[0]).map_err(|e| format!("fork tree: {e}"))?;
+    if let Some(at) = (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i)) {
+        let show = |record: Option<&Vec<u8>>| {
+            let Some(record) = record else {
+                return "<missing>".to_string();
+            };
+            let name = record.split(|&b| b == b'|').next().unwrap_or_default();
+            let escaped = record.escape_ascii();
+            if name.len().is_multiple_of(2) && name.iter().all(u8::is_ascii_hexdigit) {
+                let decoded = unhex(std::str::from_utf8(name).unwrap());
+                format!("{escaped} (name: {})", decoded.escape_ascii())
+            } else {
+                escaped.to_string()
+            }
+        };
+        return Err(format!(
+            "the fork's tree differs at record {at}: source {}, fork {}",
+            show(a.get(at)),
+            show(b.get(at))
+        ));
+    }
+    let (source, fork) = (&source[1], &fork[1]);
+    if source["exit_code"] != fork["exit_code"] {
+        return Err(format!(
+            "the fork's behaviour differs in exit status: source {}, fork {}",
+            source["exit_code"], fork["exit_code"]
+        ));
+    }
+    let (a, b) = (output_bytes(source), output_bytes(fork));
+    if a != b {
+        let a: Vec<_> = a.split(|&c| c == b'\n').collect();
+        let b: Vec<_> = b.split(|&c| c == b'\n').collect();
+        let at = (0..a.len().max(b.len()))
+            .find(|&i| a.get(i) != b.get(i))
+            .expect("different stdout has a differing line");
+        let show = |line: Option<&&[u8]>| {
+            line.map_or_else(|| "<missing>".to_string(), |line| line.escape_ascii().to_string())
+        };
+        return Err(format!(
+            "the fork's behaviour differs at line {at}: source {}, fork {}",
+            show(a.get(at)),
+            show(b.get(at))
+        ));
     }
     Ok(())
 }
@@ -1579,7 +1648,7 @@ impl World {
         .await;
         assert_eq!(self.charge(), (0, 0), "charge left: {:?}", self.rows());
         let after = self.host_state();
-        assert_clean(&residue_after_cleanup(&after, &declared), "after cleanup", &after);
+        assert_after_cleanup(&after, &declared);
         self.stop_daemon().await;
         if let Some(helper) = self.helper.take() {
             let status = helper.stop(60).await;
@@ -1687,6 +1756,12 @@ pub(super) fn residue_after_cleanup(s: &HostState, declared: &[String]) -> Vec<S
             .map(|(id, st, _)| format!("checkpoint {id} is {st}")),
     );
     found
+}
+
+#[track_caller]
+fn assert_after_cleanup(after: &HostState, declared: &[String]) {
+    assert_clean(&residue_after_cleanup(after, declared), "after cleanup", after);
+    assert_clean(&ambiguity_mismatch(after, declared), "after cleanup", after);
 }
 
 /// A FAILED sandbox whose reservation is ambiguous: no backend ID was reported and
@@ -1917,6 +1992,35 @@ mod finish_tests {
             let message = failed.downcast_ref::<String>().cloned().unwrap_or_default();
             assert!(message.contains("residue before cleanup") && message.contains(id), "{message}");
         }
+    }
+
+    #[test]
+    fn finish_refuses_a_missing_declared_reservation_after_cleanup() {
+        let after = HostState::default();
+        let failed = std::panic::catch_unwind(|| assert_after_cleanup(&after, &["sb-r".into()]))
+            .expect_err("finish passed with a missing declared reservation");
+        let message = failed.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            message.contains("residue after cleanup")
+                && message.contains("declared ambiguous sandbox sb-r is not"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn finish_refuses_a_deleted_and_released_declared_reservation_after_cleanup() {
+        let after = HostState {
+            sandboxes: vec![sandbox("sb-r", "deleted", None, true)],
+            ..HostState::default()
+        };
+        let failed = std::panic::catch_unwind(|| assert_after_cleanup(&after, &["sb-r".into()]))
+            .expect_err("finish passed with a deleted and released declared reservation");
+        let message = failed.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            message.contains("residue after cleanup")
+                && message.contains("declared ambiguous sandbox sb-r is not"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -2180,79 +2284,170 @@ mod oracle_tests {
     }
 
     #[test]
+    fn tree_records_refuses_failed_or_incomplete_output() {
+        let mut failure = exec(b"61|a\0");
+        failure["exit_code"] = json!(1);
+        assert!(tree_records(&failure).is_err());
+        failure["exit_code"] = json!(0);
+        failure["stderr_hex"] = json!("6572726f72");
+        assert!(tree_records(&failure).is_err());
+        assert!(tree_records(&exec(b"61|a")).is_err());
+        assert_eq!(tree_records(&exec(b"")).unwrap(), Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn tree_records_compares_independently_of_listing_order() {
+        let sorted = tree_records(&exec(b"61|a\x0062|b\0")).unwrap();
+        assert_eq!(sorted, vec![b"61|a".to_vec(), b"62|b".to_vec()]);
+        assert_eq!(tree_records(&exec(b"62|b\x0061|a\0")).unwrap(), sorted);
+    }
+
+    #[test]
     fn the_fidelity_oracle_sees_swapped_invalid_filename_bytes() {
-        let a = exec(b"/root/w/n\xff\xfe|regular file|644|0|0|1|1|2026-11-15 12:00:00.000000001 +0000\n");
-        let b = exec(b"/root/w/n\xfe\xff|regular file|644|0|0|1|1|2026-11-15 12:00:00.000000001 +0000\n");
-        // The lossy text, all the old oracle compared, cannot tell them apart.
-        assert_eq!(a["stdout"], b["stdout"]);
+        let a = exec(b"6efffe|regular file|644|0|0|1|1|2026-11-15 12:00:00.000000001 +0000\0");
+        let b = exec(b"6efeff|regular file|644|0|0|1|1|2026-11-15 12:00:00.000000001 +0000\0");
         let behaviour = exec(b"same\n");
         let e = same_tree(&[a.clone(), behaviour.clone()], &[b, behaviour.clone()]).unwrap_err();
-        assert!(e.contains("tree differs at line 0") && e.contains("xff") && e.contains("xfe"), "{e}");
-        same_tree(&[a.clone(), behaviour.clone()], &[a.clone(), behaviour]).unwrap();
-        // And the behaviour output too.
-        let e = same_tree(&[a.clone(), exec(b"n\xff\xfe\n")], &[a, exec(b"n\xfe\xff\n")]).unwrap_err();
+        assert!(e.contains("tree differs at record 0") && e.contains("xff") && e.contains("xfe"), "{e}");
+        same_tree(&[a.clone(), behaviour.clone()], &[a.clone(), behaviour.clone()]).unwrap();
+        // Lossy output text also cannot distinguish these behaviour results.
+        let (x, y) = (exec(b"n\xff\xfe\n"), exec(b"n\xfe\xff\n"));
+        assert_eq!(x["stdout"], y["stdout"]);
+        let e = same_tree(&[a.clone(), x], &[a.clone(), y]).unwrap_err();
         assert!(e.contains("behaviour differs"), "{e}");
+        let mut other_status = behaviour.clone();
+        other_status["exit_code"] = json!(1);
+        let e = same_tree(&[a.clone(), behaviour], &[a, other_status]).unwrap_err();
+        assert!(e.contains("behaviour differs in exit status"), "{e}");
     }
 
     #[test]
     fn the_fidelity_oracle_sees_one_directory_mtime() {
-        let tree = |mtime: &str| {
-            exec(format!(
-                "/root/w|directory|755|0|0|3|{mtime}\n/root/w/d|directory|755|0|0|2|2026-11-15 12:00:00.000000000 +0000\n"
-            ).as_bytes())
+        let tree = |nanos: u8| {
+            exec(format!("64|directory|755|0|0|2|2026-11-15 12:00:00.00000000{nanos} +0000\0").as_bytes())
         };
-        let behaviour = exec(b"");
-        let e = same_tree(
-            &[tree("2026-11-15 12:00:00.000000001 +0000"), behaviour.clone()],
-            &[tree("2026-11-15 12:00:00.000000002 +0000"), behaviour.clone()],
-        )
-        .unwrap_err();
-        assert!(e.contains("line 0"), "{e}");
-        // The listing prints a directory's mtime (and every entry's link count).
-        let script = listing_script(&["/root/w"]);
-        assert!(script.contains("stat -c '%n|%F|%a|%u|%g|%h|%y'"), "{script}");
+        let e = same_tree(&[tree(1), exec(b"")], &[tree(2), exec(b"")]).unwrap_err();
+        assert!(e.contains("tree differs at record 0") && e.contains("name: d)"), "{e}");
     }
 
-    /// The listing itself, run for real where GNU stat is the system's (Linux): one
-    /// swapped invalid name byte and one directory mtime change its bytes.
+    #[cfg(target_os = "linux")]
+    fn list(root: &Path) -> Value {
+        let out = std::process::Command::new("sh")
+            .current_dir(root)
+            .args(["-c", &listing_script(&["d"])])
+            .output()
+            .unwrap();
+        exec_json("", out.status.code(), &out.stdout, &out.stderr, "")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pin_mtime(path: &Path, seconds: u64) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture(entries: &[(&[u8], &[u8])]) -> tempfile::TempDir {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("d/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        for (name, contents) in entries {
+            let path = nested.join(std::ffi::OsStr::from_bytes(name));
+            std::fs::write(&path, contents).unwrap();
+            pin_mtime(&path, 1_700_000_000);
+        }
+        pin_mtime(&nested, 1_700_000_000);
+        pin_mtime(&dir.path().join("d"), 1_700_000_000);
+        dir
+    }
+
+    #[cfg(target_os = "linux")]
+    fn compare_listings(a: &Path, b: &Path) -> Result<(), String> {
+        let (a, b) = (list(a), list(b));
+        tree_records(&a).unwrap();
+        tree_records(&b).unwrap();
+        same_tree(&[a, exec(b"")], &[b, exec(b"")])
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn the_listing_records_name_bytes_and_directory_mtimes() {
-        use std::os::unix::ffi::OsStrExt;
-        let run = |root: &Path| -> Vec<u8> {
-            let out = std::process::Command::new("sh")
-                .args(["-c", &listing_script(&[root.to_str().unwrap()])])
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "{out:?}");
-            out.stdout
-                .split(|c| *c == b'\n')
-                .map(|l| l.strip_prefix(root.as_os_str().as_bytes()).unwrap_or(l).to_vec())
-                .collect::<Vec<_>>()
-                .join(&b'\n')
-        };
-        let tree = |name: &[u8]| {
-            let t = tempfile::tempdir().unwrap();
-            let dir = t.path().join("d");
-            std::fs::create_dir(&dir).unwrap();
-            std::fs::write(dir.join(std::ffi::OsStr::from_bytes(name)), b"a").unwrap();
-            let pin = |p: &Path| {
-                let f = std::fs::File::open(p).unwrap();
-                f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000)).unwrap();
-            };
-            pin(&dir.join(std::ffi::OsStr::from_bytes(name)));
-            pin(&dir);
-            pin(t.path());
+        let a = fixture(&[(b"n\xff\xfe", b"a")]);
+        let b = fixture(&[(b"n\xfe\xff", b"a")]);
+        let e = compare_listings(a.path(), b.path()).unwrap_err();
+        assert!(e.contains("n\\xff\\xfe") && e.contains("n\\xfe\\xff"), "{e}");
+
+        let c = fixture(&[(b"n\xff\xfe", b"a")]);
+        compare_listings(a.path(), c.path()).unwrap();
+        pin_mtime(&c.path().join("d/nested"), 1_700_000_001);
+        assert!(compare_listings(a.path(), c.path()).unwrap_err().contains("name: d/nested)"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_listing_distinguishes_nested_names_with_newlines() {
+        let a = fixture(&[(b"quarter\nred", b"first")]);
+        let b = fixture(&[(b"quarter\nblue", b"other")]);
+        let e = compare_listings(a.path(), b.path()).unwrap_err();
+        assert!(e.contains("quarter\\nred") && e.contains("quarter\\nblue"), "{e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_listing_distinguishes_a_trailing_newline_in_a_name() {
+        let a = fixture(&[(b"quarter\n", b"same")]);
+        let b = fixture(&[(b"quarter", b"same")]);
+        let e = compare_listings(a.path(), b.path()).unwrap_err();
+        assert!(e.contains("quarter\\n)") && e.contains("quarter)"), "{e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_listing_distinguishes_a_pipe_in_a_name_from_a_sibling_separator() {
+        let a = fixture(&[(b"quarter|red", b"same")]);
+        let b = fixture(&[(b"quarter", b"same"), (b"red", b"same")]);
+        let e = compare_listings(a.path(), b.path()).unwrap_err();
+        assert!(e.contains("quarter|red)") && e.contains("quarter)"), "{e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_listing_distinguishes_a_trailing_newline_in_a_link_target() {
+        let tree = |target: &str| {
+            let t = fixture(&[]);
+            let nested = t.path().join("d/nested");
+            let link = nested.join("link");
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            assert!(
+                std::process::Command::new("touch")
+                    .args(["-h", "-d", "@1700000000"])
+                    .arg(&link)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            pin_mtime(&nested, 1_700_000_000);
             t
         };
-        let (a, b) = (tree(b"n\xff\xfe"), tree(b"n\xfe\xff"));
-        assert_ne!(run(a.path()), run(b.path()), "swapped invalid bytes");
-        let c = tree(b"n\xff\xfe");
-        assert_eq!(run(a.path()), run(c.path()), "the same tree");
-        std::fs::File::open(c.path().join("d"))
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_001))
-            .unwrap();
-        assert_ne!(run(a.path()), run(c.path()), "one directory mtime");
+        let (a, b) = (tree("target\n"), tree("target"));
+        let e = compare_listings(a.path(), b.path()).unwrap_err();
+        assert!(e.contains("|link=7461726765740a0a ") && e.contains("|link=7461726765740a "), "{e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_listing_fails_on_an_unreadable_file() {
+        // SAFETY: no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let t = fixture(&[(b"unreadable", b"a")]);
+        set_mode(&t.path().join("d/nested/unreadable"), 0);
+        let exec = list(t.path());
+        assert_ne!(exec["exit_code"], 0, "{exec}");
+        assert!(tree_records(&exec).is_err());
     }
 }

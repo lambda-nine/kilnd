@@ -41,8 +41,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 - Accept Cargo's legacy top-level `token = "..."` in `$CARGO_HOME/credentials` and
   `credentials.toml` again (C6b review). The C6a recheck allowlist knew only the
   `[registry]` table form, so an existing legacy credentials file stopped every
-  `build.sh` run. A top-level `token` string is allowed; any other top-level key, or a
-  non-string `token`, is still refused.
+  `build.sh` run. A legacy root `token` string is accepted alongside valid `registry` and
+  `registries` credential tables. Every other top-level key and a non-string
+  `token` are refused.
 - Check `$CARGO_HOME`'s credentials files too (C6a recheck 4). Cargo 1.88 can merge
   `credentials` or `credentials.toml` as general configuration during an authenticated
   registry lookup, so a `[target]` runner there reached the bless writer. `build.sh` now

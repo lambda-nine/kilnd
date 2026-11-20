@@ -88,8 +88,14 @@ fn case(name: &'static str, inside: &str, expect: Expect) -> Case {
     }
 }
 
-/// A cheap comparison for trees of many entries: the count and the sorted names.
-const COUNT_LISTING: &str = "find /root/w -xdev | wc -l; find /root/w -xdev | LC_ALL=C sort | sha256sum";
+/// A compact summary for the inode-bomb fixture, whose names are generated numbers.
+const COUNT_LISTING: &str = r#"
+    names=$(find /root/w -xdev) || exit 1
+    count=$(printf '%s\n' "$names" | wc -l) || exit 1
+    sorted=$(printf '%s\n' "$names" | LC_ALL=C sort) || exit 1
+    digest=$(printf '%s\n' "$sorted" | sha256sum) || exit 1
+    printf '%s|%s\000' "$count" "${digest%% *}"
+"#;
 
 fn many(mut c: Case) -> Case {
     c.listing = COUNT_LISTING.into();
