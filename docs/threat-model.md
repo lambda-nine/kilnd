@@ -24,8 +24,9 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   the path only when its device and inode still match this instance. Each
   connection's uid, gid and pid are logged from `SO_PEERCRED`.
 - **Per-caller ownership.** Create records the connection's kernel-reported uid
-  as the sandbox's immutable owner. Get, Exec, RenewSandbox, Delete, GetExecution and List
-  authorize that uid before backend execution, Exec admission or stored-output reads,
+  as the sandbox's immutable owner, and a capture as the checkpoint's. Get, Exec,
+  ExecStream, RenewSandbox, Delete, GetExecution, List and the checkpoint RPCs (and a
+  create from a checkpoint) authorize that uid before backend execution, Exec admission or stored-output reads,
   and List filters in SQLite before limits and continuation. Only the owner and
   root (uid 0) pass; a foreign ID is `NOT_FOUND`, the same as a missing one, and
   page tokens are bound to the uid. A connection whose credentials cannot be read
@@ -105,7 +106,7 @@ file says what it protects, what it trusts, and what it doesn't try to do.
   startup checks before open and after SQLite setup. For Firecracker, the root-owned
   kilnd-helper node ledger (B3/B4) is authoritative even against a compromised
   kilnd user; it never frees capacity or host resources without its own ABSENT
-  receipt, whatever the daemon DB says. B2 has no implemented node ledger yet.
+  receipt, whatever the daemon DB says.
   Every trusted accounting read independently decodes referenced FencedAbsence
   receipts in Rust and matches their complete binding and generation: those of the
   live rows each time, and all of them whenever another connection has committed
@@ -309,8 +310,10 @@ sandbox compromises the host.
   device with discard disabled, a bounded private tmpfs jail with read-only artifact binds,
   the patched jailer (`deploy/firecracker/`) executed by retained descriptor with a
   verified zero capability set, Stop, Remove, scoped Gc and the real absence observation.
-  Production still serves no profile: the manifest gate refuses every catalog until B7, the
-  manager does not consume the helper's READY until B6, and `main.rs` selects kiln only.
+  Production still serves no profile: the manifest gate refuses every catalog until B7. Since
+  B6 the manager consumes the helper's READY, but `main.rs` selects Firecracker only in a
+  `firecracker-test-deployment` feature build, as the isolated test deployment
+  (`deploy/firecracker-test/`); a default build selects kiln only.
   B5's broker relay and console drainer run outside H, in their own cgroup leaves, without
   capabilities, under the relay or VMM credentials; every guest byte is parsed there, under
   cumulative frame, byte and time budgets, and a breach of either retires the VM. The B4 root tests
@@ -454,7 +457,8 @@ sandbox compromises the host.
 - **The service account is trusted.** kilnd refuses root and runs with no
   capabilities. Its request/SQLite bugs do not directly execute in a root
   process. Root is reachable only through the [typed helper surface](helper-protocol.md):
-  six kiln verbs, bounded frames and helper-created descriptor-only stdio, independent
+  seven kiln verbs plus the Firecracker and checkpoint groups (each disabled unless root
+  starts the helper with it), bounded frames and helper-created descriptor-only stdio, independent
   validation, no shell, fixed executable/argv and a cleared environment. The
   helper socket is root-owned and checks the exact service UID for kiln; sandbox UIDs,
   root and ordinary group members are rejected before parsing, and an account root enrolled
