@@ -42,6 +42,18 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   socket in a fresh temporary directory now make it 0700, so a umask of 0002 no longer has
   the ancestor checks refuse it. No behaviour changes.
 
+- Bring the docs in step with the code. The README lists ExecStream and the four
+  checkpoint RPCs, every check `CLAUDE.md` asks for, and the helper socket's
+  `kilnd-helper` group; architecture, the helper protocol and the threat model describe B6
+  (the manager consumes READY; `--backend firecracker` only in a
+  `firecracker-test-deployment` build), the helper's `checkpoint` group, seven kiln verbs,
+  `WORKSPACE_CHECKPOINT` in the dynamic feature set and checkpoint ownership; the limits
+  table gains every daemon flag it lacked; setup has the feature-profile checks, the expiry
+  and idempotent-create regressions, the B5 and B6 VM suites and their target
+  directories, `kilndctl ls` in place of a nonexistent `kilndctl list`, and the current schema (16); the
+  roadmap marks the landed control-plane features; and the validation contract adds
+  checkpoint IDs, the capture `request_id` and `from_checkpoint`. No behaviour changes.
+
 - Document workspace checkpoints as a supported opt-in. With rollout-gate criteria 1-8
   met, `--enable-workspace-checkpoints` is no longer described as testing only: it is
   supported on a node that passes the gate's per-node criteria 9 (Health lists
