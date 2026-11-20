@@ -10,9 +10,10 @@ root enrolled for a Firecracker instance, and only the `kilnd` account gets kiln
 It rejects root connections. Group membership alone grants no helper access. The daemon verifies that its helper peer is root.
 
 The helper accepts a private v3 typed request enum. Its outer `operation` enum
-has `kiln` and `firecracker` variants, each separately validated. The Firecracker
-group is described [below](#firecracker-group-schema-1); it is disabled by default
-and cannot launch anything in this build. No request chooses an executable,
+has `kiln`, `firecracker` and `checkpoint` variants, each separately validated. The
+[Firecracker group](#firecracker-group-schema-2) and the
+[checkpoint group](#checkpoint-group-1) are described below. The Firecracker group is
+disabled by default and the production helper cannot launch anything with it. No request chooses an executable,
 host path, environment, arbitrary kiln flags, or shell text. The root-owned
 helper command line fixes the kiln executable. Its canonical file and every
 ancestor must be root-owned and not group/other writable.

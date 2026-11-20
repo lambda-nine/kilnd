@@ -153,15 +153,19 @@ Runtime::exec returns this evidence directly; non-exec methods retain Results.
 An allocation-token backend also needs preflight, recovery by exact token and
 receipts bound to its identity. `FakeRuntime`'s `Fenced` mode exercises that contract
 for the manager. `FirecrackerRuntime` is the unprivileged typed client for the helper's
-Firecracker group: it reconstructs and verifies each prepared plan, and its create can
-end only in a matching fence or a charged ambiguous failure: the helper's READY (B5) is not
-yet wired into the manager, which is B6's work. `main.rs` still selects kiln only, and B7
-alone may change that. The helper's side is the [root node ledger](#firecracker-node-authority).
+Firecracker group: it reconstructs and verifies each prepared plan, and since B6 its create
+follows Inspect until the helper journals READY, publishing the session only from that
+READY answer; anything else is a charged failure the manager settles by exact token.
+`main.rs` selects it only in a build with the non-default `firecracker-test-deployment`
+feature, for `--backend firecracker --firecracker-test-deployment FILE`
+([test deployment](../deploy/firecracker-test/README.md)); a default build selects kiln
+only, and the production helper's manifest gate still refuses every profile until B7.
+The helper's side is the [root node ledger](#firecracker-node-authority).
 
 ### Firecracker node authority
 
 `helper/firecracker` holds approved plans, the root ledger and the fixed worker
-processes ([protocol](helper-protocol.md#firecracker-group-schema-1),
+processes ([protocol](helper-protocol.md#firecracker-group-schema-2),
 [design](design/phase1b-firecracker.md#b3-implementation-notes-october-31-2026)). With
 no `--firecracker-policy` the group answers Disabled. With one, a node ledger and
 fixed workers run, and the production manifest gate still refuses every profile, so
@@ -478,7 +482,10 @@ successful probe and cleared by any failed or timed-out one, so it fails closed.
 kiln backend proves `EXEC_CWD`, `EXEC_ENV` and `SANDBOX_DEFAULT_ENV` together when the
 helper's `features` probe finds the installed CLI's bit `0x20` and a host whose memfds
 kiln accepts, and `EXEC_STREAM` when the helper reports it can carry live output
-(`exec_stream` in the same probe; Linux only); Firecracker proves none. The create-time and
+(`exec_stream` in the same probe; Linux only); Firecracker proves none. With
+`--enable-workspace-checkpoints`, the same probe adds `WORKSPACE_CHECKPOINT` only while the
+helper's checkpoint group passes every check
+([Checkpoint discovery](#checkpoint-discovery-and-capacity-milestone-c5b-2)). The create-time and
 Exec-time gates read the same set Health publishes, so Health never lists an option
 the daemon would refuse. An older
 daemon lists no features and ignores unknown request fields, so a client sets a
@@ -519,7 +526,10 @@ is `INVALID_ARGUMENT invalid_grpc_timeout` before dispatch, on every RPC.
 (`FAILED_PRECONDITION`, like `sandbox_not_ready`) means the conditional execution
 insert saw the sandbox leave `READY` and a reload found it `READY` again: nothing ran,
 retry. ExecStream adds `backend_unsupported:exec_stream` (`UNIMPLEMENTED`) and
-`exec_stream_limit` (`RESOURCE_EXHAUSTED`).
+`exec_stream_limit` (`RESOURCE_EXHAUSTED`). Workspace checkpoints add the
+`checkpoint_*` tokens and the `workspace_checkpoint` feature's
+`backend_unsupported:`/`sandbox_unsupported:` pair, listed with their codes in the
+[checkpoint API's refusals](#workspace-checkpoint-api-milestone-c5b-1).
 
 ## Sandbox expiry
 
@@ -1269,10 +1279,9 @@ exits with the command's code; `kilndctl execution` shows the mode.
 
 Milestone C4 of the workspace checkpoint design reserves schema 15 for the whole
 feature: every table and column C5's RPCs and C6's acceptance need exists now, so no
-later milestone reshapes a migrated row. **The feature stays off:** no RPC, Health
-field, `kilndctl` command or feature bit reaches these tables yet, and an empty
-`checkpoints` table adds exactly zero to every total. The store API in
-`crates/kilnd/src/store/checkpoint.rs` is what C5 will call.
+later milestone reshapes a migrated row. An empty `checkpoints` table adds exactly zero
+to every total, so a node that never enables checkpoints is unaffected. The store API in
+`crates/kilnd/src/store/checkpoint.rs` is what the C5 engine calls.
 
 **Tables.**
 
@@ -1381,9 +1390,8 @@ schema 15 row is unchanged; the table starts empty. Older binaries refuse schema
 
 `crates/kilnd/src/manager/checkpoint.rs` drives C3's helper group and C4's store:
 supervised capture, the D1-D3 removal, checkpoint expiry and startup reconciliation.
-**It is off unless `Limits::checkpoints` is set**, which only Rust callers and tests do:
-there is no flag, RPC, `kilndctl` command, Health field or feature bit yet (C5b). The
-switch gates only new work: an unkeyed capture, or a keyed one whose key has no record.
+**It is off unless `Limits::checkpoints` is set**, which `--enable-workspace-checkpoints`
+does ([C5b-1](#workspace-checkpoint-api-milestone-c5b-1)). The switch gates only new work: an unkeyed capture, or a keyed one whose key has no record.
 Checkpoints that already exist are maintained with it off (design 11.1): when startup's
 one existence check finds any row, capture key or barrier marker, expiry, removal, the cross-boot rebase
 of anchors and keys, and reconciliation all run, and a key with a record is answered from
@@ -1540,8 +1548,8 @@ and clears only the barrier's block after a clean pass, with no restart. Delete,
 List and removals stay available meanwhile.
 
 **Fork** (`crates/kilnd/src/manager/fork.rs`, design 4.2, 7.2, 8.2, 10 and 11.1). A
-create whose `CreateRequest.from_checkpoint` names a checkpoint (Rust only; no proto
-field yet) is an ordinary create in every respect but two: its admitting transaction is
+create whose `CreateRequest.from_checkpoint` names a checkpoint (on the wire,
+`CreateSandboxRequest.from_checkpoint`, C5b-1) is an ordinary create in every respect but two: its admitting transaction is
 `reserve_fork_sandbox`, and its backend is made by the helper's `Restore` (kiln's `create
 --from-checkpoint`) instead of `Runtime::create`. An empty or absent field is the legacy
 create, unchanged, with no checkpoint query. After the spec's defaults are resolved and
@@ -1818,7 +1826,10 @@ units, rounded up) equals the charge exactly.
 | stdin / argv per exec | 1 MiB / 256 KiB | (code) |
 | argc per exec | 4096 | (code) |
 | Admitted connections | 64 | `--max-connections` |
+| Connections held back for Health, Get and Delete (one per uid) / general connections per uid | 4 / 32 | `--reserved-connections`, `--max-connections-per-uid` |
+| HTTP/2 client preface deadline | 5 s | `--connection-preface-timeout-ms` |
 | Ordinary RPC / Health handlers | 64 / 4 | `--max-concurrent-rpcs`, `--max-concurrent-health` |
+| Ordinary RPC handlers per uid / reserved cleanup handlers once ordinary RPCs are full (one per uid) | 32 / 4 | `--max-concurrent-rpcs-per-uid`, `--max-concurrent-cleanup` |
 | Global Exec admissions | 32 | `--max-concurrent-execs` |
 | Queued Exec per sandbox | 8, plus one running | `--max-queued-execs-per-sandbox` |
 | Aggregate admitted Exec stdin | 16 MiB | `--max-queued-exec-stdin-bytes` |
@@ -1827,6 +1838,9 @@ units, rounded up) equals the charge exactly.
 | Maximum List page / response | 200 items / 1 MiB | `--max-list-page-size`, `--max-list-response-bytes` |
 | Health probe timeout | 2 s | `--health-probe-timeout-secs` |
 | Health success / failure cache | 5 s / 1 s | `--health-success-cache-secs`, `--health-failure-cache-secs` |
+| Grace for running requests on SIGTERM before executions are canceled | 30 s | `--shutdown-grace-secs` |
+| Log format | `text` (or `json`) | `--log-format` |
+| Backend | `kiln`; `firecracker` only in a `firecracker-test-deployment` feature build, with its test deployment file | `--backend`, `--firecracker-test-deployment` |
 | Sandbox defaults | alpine, 512 MiB, 1 CPU, 128 pids, 1 GiB disk, no network | (code) |
 | Maximum sandbox lifetime / idle timeout a create may ask for (0: no cap) | 7 d / 24 h | `--max-sandbox-lifetime-secs`, `--max-sandbox-idle-secs` |
 | Lifetime / idle for a zero field of a present expiry policy (0: never; never applies without a policy) | 0 / 0 | `--default-sandbox-lifetime-secs`, `--default-sandbox-idle-secs` |
@@ -1849,6 +1863,7 @@ units, rounded up) equals the charge exactly.
 | Helper live message | 16 KiB data | (code) |
 | Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
 | Workspace checkpoints (off by default; supported opt-in, see checkpoint-rollout-gate.md): 1 GiB each; 32 / 4 GiB per uid; 128 / 8 GiB per node; 24 h / 1 h default lifetime / idle, at most 7 d / 24 h; 2 workers, 1 per uid | off | `--enable-workspace-checkpoints` |
+| Free space every capture and fork must leave on kiln's runs filesystem and its loop backing | 1 GiB | `--checkpoint-headroom-bytes` |
 
 Startup validates limits before opening state or binding: required counts,
 bytes and times are nonzero (the per-sandbox queue may be zero), semaphore and
