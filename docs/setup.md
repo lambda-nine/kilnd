@@ -463,28 +463,54 @@ in [checkpoints.md](checkpoints.md).
 
 To opt a node in:
 
-1. **Check criterion 10.** `kiln --version` must end in exactly
-   `(git 87359079834c, clean)`: commit `8735907`, the kiln the gate was measured on, built
-   with none of its runtime build inputs changed (at that commit the whole line is
-   `kiln 0.1.0 (git 87359079834c, clean)`). `dirty` means the binary is not the one the
-   gate measured, and `(git unknown)` or any other form names no commit; either way the
-   node is not eligible. A later commit qualifies only if it reports `clean` and a gate
-   record shows criteria 2-4 rerun on that exact commit. The string is what kiln's build
-   recorded (a build outside a git checkout takes it from `KILN_BUILD_COMMIT` unchecked),
-   so install a kiln built from a checkout of the commit. Any other kiln: leave the flag
-   off.
-2. **Start the helper with checkpoints on, and check it, before kilnd.** Restart the root
-   helper with `kilnd-helper --enable-checkpoints` and check that it is running and its
-   journal has no `kilnd-helper: checkpoint group disabled` line. Only then restart kilnd
+1. **Check criterion 10 on the kiln the helper runs:** the helper's `--kiln` path,
+   `/usr/local/bin/kiln` unless its command line (step 2) names another. All three must
+   hold:
+   - **(a)** That binary's `--version` (`/usr/local/bin/kiln --version` by default)
+     prints exactly `kiln 0.1.0 (git 87359079834c, clean)`: commit `8735907`, the kiln
+     the gate was measured on. `dirty`, `(git unknown)` or any other form fails.
+   - **(b)** That binary was built from a clean checkout of exactly that commit with
+     `KILN_BUILD_COMMIT` unset, as kiln's `RELEASING.md` at that commit describes:
+     section 1's `git status --porcelain` prints nothing, and section 4 runs the locked
+     release build under `env -u KILN_BUILD_COMMIT`.
+   - **(c)** A build record proves (b): the commit (`git rev-parse HEAD`), the empty
+     `git status --porcelain`, the unset `KILN_BUILD_COMMIT` and the built binary's
+     sha256. The installed binary's `sha256sum` must equal the recorded one.
+
+   The version line alone proves nothing. kiln's build script takes `KILN_BUILD_COMMIT`
+   first in every build, inside a git checkout or not, and for any value of at least 12
+   hex digits not ending in `-dirty` reports that commit and `clean` without looking at
+   the source (kiln `runtime/build.rs:24-42` at `8735907`). Any source built with it set
+   can print the gated line. A later commit qualifies only if (a) to (c) hold for it, with
+   `(git <its first 12 digits>, clean)`, and a gate record shows criteria 2-4 rerun on
+   that exact commit with a binary built and recorded the same way. Any other kiln: leave
+   the flag off.
+2. **Start the helper with checkpoints on, and check it, before kilnd.** Add
+   `--enable-checkpoints` to the helper's `ExecStart` (the shipped
+   `deploy/kilnd-helper.service` runs `/usr/local/bin/kilnd-helper` with no flags), run
+   `systemctl daemon-reload` and restart `kilnd-helper`. Then check the running process,
+   not the unit file: `systemctl show -p MainPID --value kilnd-helper` gives its PID,
+   and `tr '\0' ' ' < /proc/<pid>/cmdline` must contain `--enable-checkpoints` (and no
+   `--kiln` other than the binary checked in step 1). `systemctl show -p ExecStart
+   kilnd-helper` shows what the loaded unit runs, which a missed restart leaves different
+   from the running process. Then check that the helper's journal since that restart
+   (`journalctl -u kilnd-helper --since "<restart time>"`) has no
+   `kilnd-helper: checkpoint group disabled` line. The helper prints that line only when
+   it was given the flag and the group failed to start; started without the flag, it
+   leaves the group off silently, so the journal alone does not show a missed
+   `daemon-reload`, a wrong drop-in or the wrong unit. Only then restart kilnd
    with `--enable-workspace-checkpoints` (and `--checkpoint-headroom-bytes` if 1 GiB is
    not right for the node). The flag makes every kilnd startup reconcile checkpoints, and
    reconciliation needs the helper's checkpoint group and a kiln that lists format 1 and
-   checks generations on removal. If either is missing when kilnd starts, the checkpoint
-   barrier stays set: Health is DEGRADED, every new sandbox create is refused, and
-   captures and forks get the allocation barrier's `FAILED_PRECONDITION` refusal (not one
-   of the typed checkpoint reasons below). kilnd retries on its own; the barrier clears
-   once the helper's group and a compatible kiln are back and a reconciliation completes
-   cleanly.
+   checks generations on removal. If the helper answers ordinary kiln operations but
+   cannot give kilnd a checkpoint maintenance session (its group off, or a kiln without
+   format 1 or generation-checked removal) when kilnd starts, the checkpoint barrier
+   stays set: Health is DEGRADED, every new sandbox create is refused, and captures and
+   forks get the allocation barrier's `FAILED_PRECONDITION` refusal (not one of the typed
+   checkpoint reasons below). kilnd retries on its own; the barrier clears once the
+   helper's group and a compatible kiln are back and a reconciliation completes cleanly.
+   If the helper cannot be reached at all, kilnd's startup reconciliation fails before
+   it serves anything, and kilnd exits with a `startup reconciliation` error.
 3. **Check criterion 9.** `kilndctl health` must report SERVING, list
    `workspace_checkpoint` under `features` and print a `checkpoint limits:` line. If it
    is SERVING without the feature, the node is not eligible as it stands. This is also
@@ -500,30 +526,59 @@ To opt a node in:
    on runs or its loop backing is unknown. Get, List and Delete stay served. A later probe
    that passes lists the feature again. A Firecracker node never lists it and refuses
    captures and forks `backend_unsupported`. `kilndctl create --from-checkpoint` itself
-   refuses unless Health is SERVING and lists the feature. If Health is DEGRADED instead,
-   startup reconciliation could not finish (step 2).
+   refuses unless Health is SERVING and lists the feature. DEGRADED alone does not say
+   why (a failed backend probe, retrying finalization writes, degraded accounting,
+   over-budget reservations and other allocation blocks also cause it; its `detail` names
+   them). If Health is DEGRADED and kilnd's journal (`journalctl -u kilnd`) has
+   `checkpoint reconciliation could not reach the helper; allocation blocked`, startup
+   reconciliation could not get a checkpoint session from the helper (step 2; the
+   warning reads the same when the helper answers but its group is off or kiln fails the
+   removal checks), and kilnd's retry logs it again on each pass that fails that way.
 4. **To turn it back off,** restart kilnd without `--enable-workspace-checkpoints`;
    nothing is deleted. With no checkpoint state on disk, every checkpoint RPC is refused
    `UNIMPLEMENTED backend_unsupported:workspace_checkpoint`. With any row, capture key or
    barrier marker present, kilnd keeps serving Get, List and Delete, answers keyed capture
    retries from their records, keeps running expiry, removal and startup reconciliation,
-   and keeps reporting Health's checkpoint stats (without the limits line); only new
-   captures and forks are refused `backend_unsupported`. Charges stay counted until each
-   artifact's removal is proved.
+   and keeps reporting Health's checkpoint stats when it can read them (without the
+   limits line); only new captures and forks are refused `backend_unsupported`. Charges
+   stay counted until each artifact's removal is proved.
 
    **Keep the helper's checkpoint group on, and a kiln that lists format 1 and checks
    generations on removal installed, until no checkpoint state is left at all,** not just
    no live checkpoints. A deleted or failed checkpoint stays as a history row, and a keyed
-   capture's request record stays, after its artifact is gone: a record for at least
-   `--create-request-retention-secs` (default one day, counted again from a host reboot),
-   and the row until it is older than `--deleted-sandbox-max-age-secs` (default 7 days, at
-   least one day) and its record is gone. A quarantined checkpoint stays until it is
-   deleted, and nothing is pruned while the barrier is blocked. **The exit condition:**
-   with kilnd's flag off, `kilndctl health` no longer prints the `checkpoints:` block.
-   kilnd reports those statistics, flag off, exactly while any checkpoint row, capture
-   record or barrier marker exists or the barrier is blocked; once the last of them may
-   go, the next prune (every `--prune-interval-secs`, default 60) removes it and the block
-   disappears. Only then turn off the helper's group or install an older kiln.
+   capture's request record stays, after its artifact is gone: a record is automatically
+   retained for at least `--create-request-retention-secs` (default one day, counted again
+   from a host reboot) unless released early with
+   `kilndctl checkpoint rm --release-request-id`, and the row until it is older than
+   `--deleted-sandbox-max-age-secs` (default 7 days, at least one day) and its record is
+   gone. A quarantined checkpoint stays until it is deleted, and no checkpoint row or
+   capture key is pruned while the checkpoint barrier is blocked. Once the last of them
+   may go, the next prune (every `--prune-interval-secs`, default 60) removes it.
+
+   **The exit condition** is kilnd's own checkpoint gate. With kilnd's flag off, ask the
+   kilnd instance being turned off (`--socket`, default `/run/kilnd/kilnd.sock`):
+
+   ```sh
+   sudo kilndctl checkpoint ls --page-size 1
+   ```
+
+   It is done only when that is refused with gRPC `UNIMPLEMENTED` and reason
+   `backend_unsupported:workspace_checkpoint`: kilndctl prints the list's header line,
+   then exits 1 with this on standard error:
+
+   ```text
+   kilndctl: unimplemented: backend_unsupported:workspace_checkpoint: workspace checkpoints are not enabled
+   ```
+
+   kilnd checks that gate before reading any row, and refuses this way only while it
+   maintains no checkpoint state: flag off, no checkpoint row, capture key or barrier
+   marker, and the barrier not blocked. Anything else is not done: a list that succeeds,
+   even an empty one, means kilnd still maintains checkpoint state, and any other error
+   tells nothing. Keep the helper's group and kiln as they are and check again later.
+   Health's `checkpoints:` block is informational only: kilnd leaves it out when reading
+   the statistics fails (logging `read checkpoint counts`), so its absence proves
+   nothing. Only after that refusal turn off the helper's group or install an older
+   kiln.
 
    If the helper's group goes off, or an older kiln goes in, while any of that remains,
    removal cannot run (rows stay DELETING and charged), and the next kilnd start must

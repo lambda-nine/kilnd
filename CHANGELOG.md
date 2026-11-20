@@ -9,12 +9,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 - Document workspace checkpoints as a supported opt-in. With rollout-gate criteria 1-8
   met, `--enable-workspace-checkpoints` is no longer described as testing only: it is
   supported on a node that passes the gate's per-node criteria 9 (Health lists
-  `workspace_checkpoint`) and 10 (`kiln --version` reports a clean build of the gated
-  kiln commit, or of a later one with criteria 2-4 rerun on it). `docs/setup.md` has the
-  opt-in steps (the helper's checkpoint group first, then kilnd's flag), how to turn it
-  back off (the helper's group and a compatible kiln stay until `kilndctl health` shows
-  no checkpoint state, or the next kilnd start blocks new sandboxes), and the measured
-  limits. The feature stays off by default; no behaviour, flag, limit, API or schema
+  `workspace_checkpoint`) and 10 (the helper's kiln is a clean build of the gated kiln
+  commit, or of a later one with criteria 2-4 rerun on it, built with
+  `KILN_BUILD_COMMIT` unset and proved by a build record whose sha256 matches the
+  installed binary; the version line alone is not proof). `docs/setup.md` has the opt-in
+  steps (the helper's checkpoint group first, checked on the running process's command
+  line, then kilnd's flag), how to turn it back off (the helper's group and a compatible
+  kiln stay until, with kilnd's flag off, `kilndctl checkpoint ls` is refused
+  `UNIMPLEMENTED backend_unsupported:workspace_checkpoint`, or the next kilnd start
+  blocks new sandboxes; Health's `checkpoints:` block is not the check), and the
+  measured limits. The feature stays off by default; no behaviour, flag, limit, API or schema
   changes.
 
 - Delete a sandbox whose kiln shim died. When a shim crashed or was killed out of

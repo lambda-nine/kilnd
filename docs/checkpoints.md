@@ -23,12 +23,21 @@ Two switches, both off by default:
 
 **Turn the helper's group on first.** kilnd's flag makes every kilnd startup reconcile
 checkpoints, which needs the helper's group and a kiln that lists format 1 and checks
-generations on removal. Start the helper with `--enable-checkpoints`, check that it is
-running without a `kilnd-helper: checkpoint group disabled` line in its journal, and only
-then restart kilnd with its flag. If kilnd starts without them, the checkpoint barrier
-stays set: Health is DEGRADED, every new sandbox create is refused, and captures and forks
-get the allocation barrier's `FAILED_PRECONDITION` refusal, until the helper and a
-compatible kiln are back and a reconciliation completes cleanly.
+generations on removal. Add `--enable-checkpoints` to the helper's `ExecStart` (the shipped
+unit has no flags), run `systemctl daemon-reload` and restart `kilnd-helper`. Then check
+the running process: `tr '\0' ' ' < /proc/<pid>/cmdline`, with the PID from
+`systemctl show -p MainPID --value kilnd-helper`, must contain `--enable-checkpoints`, and
+its journal since that restart (`journalctl -u kilnd-helper --since "<restart time>"`)
+must have no `kilnd-helper: checkpoint group disabled` line. The journal alone is not
+enough: the helper prints that line only when the flag was given and the group failed to
+start, and without the flag it leaves the group off silently. Only then restart kilnd with
+its flag. If kilnd starts while the helper answers ordinary kiln operations but cannot
+give it a checkpoint maintenance session, the checkpoint barrier stays set: Health is
+DEGRADED, every new sandbox create is refused, kilnd's journal has `checkpoint
+reconciliation could not reach the helper; allocation blocked`, and captures and forks get
+the allocation barrier's `FAILED_PRECONDITION` refusal, until the helper's group and a
+compatible kiln are back and a reconciliation completes cleanly. If the helper cannot be
+reached at all, kilnd's startup reconciliation fails and kilnd exits before serving.
 
 `kilndctl health` lists `workspace_checkpoint` only while every probe passes: the helper's
 group is enabled, kiln grants leases, lists checkpoint format 1 and checks generations on
@@ -47,15 +56,24 @@ Charges stay counted until each artifact's removal is proved.
 **The helper's group goes off last, after all checkpoint state is gone,** not just the
 live checkpoints. Turn kilnd's flag off first, let the checkpoints expire or delete them,
 and keep the helper's group on and a kiln that lists format 1 and checks generations on
-removal installed until, with the flag off, `kilndctl health` no longer prints the
-`checkpoints:` block. kilnd prints those statistics, flag off, exactly while a checkpoint
-row, capture record or barrier marker exists or the barrier is blocked. A deleted or failed
-checkpoint's history row stays until it is older than `--deleted-sandbox-max-age-secs`
-(default 7 days, at least one day) and its capture record is gone; a capture record stays
-for at least `--create-request-retention-secs` (default one day, counted again from a host
-reboot); a quarantined checkpoint stays until it is deleted; and nothing is pruned while the
-barrier is blocked. Once the last of them may go, the next prune (every
-`--prune-interval-secs`, default 60) removes it and the block disappears.
+removal installed until, with the flag off, `kilndctl checkpoint ls --page-size 1` against
+that kilnd is refused with gRPC `UNIMPLEMENTED` and reason
+`backend_unsupported:workspace_checkpoint`. kilndctl then prints the list's header line
+and exits 1 with
+`kilndctl: unimplemented: backend_unsupported:workspace_checkpoint: workspace checkpoints are not enabled`
+on standard error. kilnd checks that gate before reading any row, and refuses this way only
+while no checkpoint row, capture key or barrier marker exists and the barrier is not
+blocked. Anything else is not done: a successful list, even an empty one, any other error,
+or Health without its `checkpoints:` block (which is informational and also missing when
+reading the statistics fails, logged as `read checkpoint counts`). Keep the helper and
+kiln as they are and check again later. A deleted or failed checkpoint's history row stays
+until it is older than `--deleted-sandbox-max-age-secs` (default 7 days, at least one day)
+and its capture record is gone; a capture record is automatically retained for at least
+`--create-request-retention-secs` (default one day, counted again from a host reboot)
+unless released early with `kilndctl checkpoint rm --release-request-id`; a quarantined
+checkpoint stays until it is deleted; and no checkpoint row or capture key is pruned while
+the checkpoint barrier is blocked. Once the last of them may go, the next prune (every
+`--prune-interval-secs`, default 60) removes it.
 
 Turning the helper's group off, or installing an older kiln, while any of that remains
 makes removal impossible (rows stay DELETING and charged, and kilnd retries) and, at the
