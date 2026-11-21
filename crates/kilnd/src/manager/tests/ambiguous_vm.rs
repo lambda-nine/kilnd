@@ -4,7 +4,9 @@
 //! kilnd or kilnd-helper.
 //!
 //! Each step prints one `AMBIG VM` JSON line, the window's record. The test needs an
-//! empty `kiln ls` and an empty kiln runs directory to start, and leaves both so.
+//! empty `kiln ls` and an empty kiln runs directory to start, and leaves both so. It makes
+//! one empty image directory, `ambigvm-empty-<pid>`, kiln's own post-preflight trigger,
+//! and removes it by name once the create that needs it has run.
 //! `KILND_AMBIG_KILND` and `KILND_AMBIG_HELPER` name the `kilnd` and `kilnd-helper`
 //! binaries under test.
 
@@ -28,6 +30,9 @@ use crate::runtime::kiln::KilnRuntime;
 
 const KILN: &str = "/usr/local/bin/kiln";
 const RUNS: &str = "/var/lib/kiln/runs";
+const IMAGES: &str = "/var/lib/kiln/images";
+/// kiln's userns `ID_BASE`: sandbox root, the owner of every image directory.
+const SANDBOX_ID_BASE: u32 = 2_000_000_000;
 /// The private instance's directory: fixed, so the window's cleanup can name it.
 const DIR: &str = "/var/tmp/kilnd-ambig-vm";
 /// A run directory without `shim.pid`, which `kiln ls` skips.
@@ -378,6 +383,55 @@ fn paths(path: &str) -> CreateRequest {
     }
 }
 
+/// The row a failed create names: its message starts `create sandbox sb-…: `.
+fn row_named_by(error: &Error) -> String {
+    let message = error.to_string();
+    let id = message
+        .strip_prefix("create sandbox ")
+        .and_then(|rest| rest.split_once(": "))
+        .map(|(id, _)| id.to_string())
+        .unwrap_or_else(|| panic!("no row named: {message}"));
+    assert!(crate::model::valid_id("sb", &id), "{message}");
+    id
+}
+
+/// An image directory with nothing in it, owned by kiln's sandbox ID range (userns
+/// `ID_BASE`, the owner of every image), as kiln's create-certainty regressions make it.
+/// Named for this process, and removed by that name when dropped, panics included.
+struct EmptyImage {
+    name: String,
+    path: PathBuf,
+}
+
+impl EmptyImage {
+    fn create() -> Self {
+        let name = format!("ambigvm-empty-{}", std::process::id());
+        let path = Path::new(IMAGES).join(&name);
+        std::fs::create_dir(&path).unwrap();
+        let image = Self { name, path };
+        std::fs::set_permissions(&image.path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::chown(&image.path, Some(SANDBOX_ID_BASE), Some(SANDBOX_ID_BASE))
+            .unwrap();
+        record(
+            "empty image",
+            json!({ "name": image.name, "owner": SANDBOX_ID_BASE, "mode": "0755" }),
+        );
+        image
+    }
+}
+
+impl Drop for EmptyImage {
+    fn drop(&mut self) {
+        // rmdir, never a recursive removal: the directory was made empty and kiln's
+        // failed setup writes nothing into an image.
+        if let Err(e) = std::fs::remove_dir(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("AMBIG could not remove {}: {e}", self.path.display());
+        }
+    }
+}
+
 #[test]
 #[ignore = "a child role of the ambiguous-create VM test"]
 fn ambig_vm_lock_holder_child() {
@@ -573,9 +627,7 @@ async fn scenario() {
     let deleted_id = m.list(true).unwrap()[0].id.clone();
 
     // 3. A live sandbox of the instance's, which the release must explain (its published
-    //    shim, its init and their processes). Then a path kiln refuses only after
-    //    allocating still leaves an ambiguous FAILED row, charged; with the rest of the
-    //    node's memory budget it refuses every other uid.
+    //    shim, its init and their processes).
     let limits = Limits::default();
     let live = m
         .create_owned(
@@ -595,23 +647,93 @@ async fn scenario() {
         json!({ "id": live.id, "backend_id": live_backend, "memory_bytes": live.spec.memory_bytes,
                 "kiln": kiln_state(), "kiln_processes": kiln_processes() }),
     );
+    // Each create below asks for the rest of the node's memory budget, so a charge it
+    // kept would refuse every other uid.
     let ambiguous_memory = limits.max_node_memory_bytes - live.spec.memory_bytes;
+
+    // 3a. A writable path whose parent in the image is a regular file or a symlink: kiln's
+    //     create preflight refuses it before allocating (exit 124). INVALID_ARGUMENT naming
+    //     a FAILED, definitely-not-created row, nothing charged and nothing in kiln.
+    for path in ["/etc/passwd/x", "/var/run/x"] {
+        let step = format!("preflight-refused {path}");
+        let error = m
+            .create_owned(
+                CreateRequest {
+                    memory_bytes: ambiguous_memory,
+                    ..paths(path)
+                },
+                OWNER,
+            )
+            .await
+            .unwrap_err();
+        let id = row_named_by(&error);
+        let (row, _) = m.get(&id, 0).unwrap();
+        let charged = reserved(&m).await;
+        let other = m
+            .create_owned(CreateRequest::default(), OTHER)
+            .await
+            .unwrap();
+        let other_exec = m.exec(sh(&other.id, "echo ok")).await.unwrap();
+        let other_deleted = m.delete(&other.id).await.unwrap();
+        let deleted = m.delete(&row.id).await.unwrap();
+        record(
+            &step,
+            json!({
+                "code": code(&error), "message": error.to_string(), "id": row.id,
+                "state": format!("{:?}", row.state), "backend_id": row.backend_id,
+                "certainty": format!("{:?}", row.create_certainty), "charged": row.is_charged(),
+                "reserved_live_only": charged == live_charge,
+                "other_uid": { "id": other.id, "state": format!("{:?}", other.state),
+                               "exec_exit": other_exec.exit_code,
+                               "delete": format!("{:?}", other_deleted.state) },
+                "delete": format!("{:?}", deleted.state), "kiln": kiln_state(),
+            }),
+        );
+        assert_eq!(code(&error), "INVALID_ARGUMENT", "{step}: {error:?}");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "create sandbox {id}: kiln create failed (exit status: 124): "
+            )) && message.contains(path),
+            "{step}: {message}"
+        );
+        assert_eq!(
+            (row.state, &row.backend_id),
+            (SandboxState::Failed, &None),
+            "{step}"
+        );
+        assert_eq!(
+            row.create_certainty,
+            CreateCertainty::DefinitelyNotCreated,
+            "{step}"
+        );
+        assert!(!row.is_charged(), "{step}");
+        assert_eq!(charged, live_charge, "{step}: reservations");
+        assert_eq!(other.state, SandboxState::Ready, "{step}");
+        assert_eq!(other_exec.exit_code, Some(0), "{step}");
+        assert_eq!(other_deleted.state, SandboxState::Deleted, "{step}");
+        assert_eq!(deleted.state, SandboxState::Deleted, "{step}");
+        assert_eq!(reserved(&m).await, live_charge, "{step}: after");
+        assert_only(&step, &live_backend);
+    }
+
+    // 3b. kiln's own post-preflight trigger: an empty image directory, owned by the sandbox
+    //     ID range as every image is, passes the preflight and fails after `new_id`
+    //     (setup finds no /dev). That leaves an ambiguous FAILED row, charged; with the rest
+    //     of the node's memory budget it refuses every other uid.
+    let empty = EmptyImage::create();
     let error = m
         .create_owned(
             CreateRequest {
+                image: empty.name.clone(),
                 memory_bytes: ambiguous_memory,
-                ..paths("/etc/passwd/x")
+                ..Default::default()
             },
             OWNER,
         )
         .await
         .unwrap_err();
-    let row = m
-        .list(true)
-        .unwrap()
-        .into_iter()
-        .find(|s| s.state == SandboxState::Failed)
-        .expect("a FAILED row");
+    let (row, _) = m.get(&row_named_by(&error), 0).unwrap();
     let charged = reserved(&m).await;
     let other = m
         .create_owned(CreateRequest::default(), OTHER)
@@ -619,9 +741,9 @@ async fn scenario() {
         .unwrap_err();
     let delete = m.delete(&row.id).await.unwrap_err();
     record(
-        "ambiguous /etc/passwd/x",
+        "ambiguous empty image",
         json!({
-            "code": code(&error), "message": error.to_string(), "id": row.id,
+            "image": empty.name, "code": code(&error), "message": error.to_string(), "id": row.id,
             "state": format!("{:?}", row.state), "backend_id": row.backend_id,
             "certainty": format!("{:?}", row.create_certainty), "charged": row.is_charged(),
             "reserved_memory": charged.memory_bytes, "kiln": kiln_state(),
@@ -629,6 +751,11 @@ async fn scenario() {
             "delete": format!("{} {delete}", code(&delete)),
         }),
     );
+    // Only this create needed the image; it goes now, by name, and on any panic before.
+    drop(empty);
+    assert_eq!(code(&error), "backend", "{error:?}");
+    assert!(!error.to_string().contains("exit status: 124"), "{error}");
+    assert_eq!(row.state, SandboxState::Failed);
     assert_eq!(row.backend_id, None);
     assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
     assert!(row.is_charged());

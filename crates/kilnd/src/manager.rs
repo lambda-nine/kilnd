@@ -5104,7 +5104,7 @@ mod operator_release_tests;
 #[cfg(test)]
 // Approved (design 7.1): test fixtures, compiled only under cfg(test). The root VM test
 // runs kiln and kilnd release-ambiguous, and removes only its own private state, the one
-// kiln run and the one run directory it made.
+// kiln run, the one run directory and the one empty image directory it made.
 #[allow(clippy::disallowed_methods)]
 #[path = "manager/tests/ambiguous_vm.rs"]
 mod ambiguous_vm_tests;
