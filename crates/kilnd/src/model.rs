@@ -49,14 +49,6 @@ impl SandboxState {
             _ => return None,
         })
     }
-
-    /// States that hold, or may hold, backend resources.
-    pub fn is_active(self) -> bool {
-        matches!(
-            self,
-            Self::Creating | Self::Ready | Self::Deleting | Self::Quarantined
-        )
-    }
 }
 
 /// What a failed create proved about backend allocation. Only the runtime's

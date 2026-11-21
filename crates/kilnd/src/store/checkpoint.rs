@@ -1834,27 +1834,6 @@ impl Store {
         })
     }
 
-    /// Records a sandbox's image identity and checkpoint format once (design 4.2): only
-    /// for a new checkpoint-capable sandbox, never inferred for an older row.
-    pub fn record_sandbox_image_identity(&self, id: &str, identity: ImageIdentity) -> Result<bool> {
-        if identity.checkpoint_format_version != FORMAT_VERSION {
-            bail!(
-                "unsupported checkpoint format {}",
-                identity.checkpoint_format_version
-            );
-        }
-        let n = self.conn().execute(
-            "UPDATE sandboxes SET image_content_sha256 = ?2, checkpoint_format_version = ?3
-             WHERE id = ?1 AND image_content_sha256 IS NULL",
-            params![
-                id,
-                identity.content_sha256.to_string(),
-                identity.checkpoint_format_version
-            ],
-        )?;
-        Ok(n == 1)
-    }
-
     /// A capture's typed failure while CAPTURING (before its absence is proved), or a
     /// quarantine with it. Written once; the charge stays.
     pub fn record_checkpoint_failure(
