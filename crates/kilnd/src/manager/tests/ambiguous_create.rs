@@ -280,7 +280,7 @@ fn restores(fake: &FakeRuntime) -> usize {
 }
 
 #[tokio::test]
-async fn a_fork_below_a_floor_is_refused_before_any_pin_charge_or_restore() {
+async fn a_fork_below_a_floor_or_over_a_kiln_mount_is_refused_before_any_pin_charge_or_restore() {
     let fake = FakeRuntime::default().with_checkpoints();
     let m = manager(&fake, checkpoint_limits());
     let checkpoint = ready_checkpoint(&m, 1001).await;
@@ -291,7 +291,10 @@ async fn a_fork_below_a_floor_is_refused_before_any_pin_charge_or_restore() {
         .checkpoint_pins(checkpoint.id.as_str())
         .unwrap()
         .len();
-    for (name, request) in below_floor_requests() {
+    let paths = RESERVED_MOUNT_PATHS
+        .iter()
+        .map(|path| (*path, reserved_mount_request(path)));
+    for (name, request) in below_floor_requests().into_iter().chain(paths) {
         let error = m
             .create_owned(
                 CreateRequest {
@@ -303,7 +306,9 @@ async fn a_fork_below_a_floor_is_refused_before_any_pin_charge_or_restore() {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, Error::InvalidArgument(message) if message.contains("below the minimum")),
+            matches!(&error, Error::InvalidArgument(message)
+                if message.contains("below the minimum")
+                    || message.contains("kiln mounts its own filesystem")),
             "{name}: {error:?}"
         );
         assert_eq!(untouched(&m, &fake).await, before, "{name}");
@@ -318,4 +323,73 @@ async fn a_fork_below_a_floor_is_refused_before_any_pin_charge_or_restore() {
         );
     }
     drain(&m).await;
+}
+
+fn reserved_mount_request(path: &str) -> CreateRequest {
+    CreateRequest {
+        read_only_root: true,
+        writable_paths: vec!["/workspace".into(), path.into()],
+        ..Default::default()
+    }
+}
+
+const RESERVED_MOUNT_PATHS: [&str; 7] = [
+    "/proc",
+    "/proc/x",
+    "/proc/sys/x",
+    "/sys/x",
+    "/sys/fs/cgroup/x",
+    "/dev/x",
+    "/dev/null/x",
+];
+
+#[tokio::test]
+async fn writable_paths_over_kilns_mounts_are_refused_before_any_charge_or_runtime_call() {
+    let fake = FakeRuntime::default();
+    let m = manager(&fake, Limits::default());
+    let before = untouched(&m, &fake).await;
+    for path in RESERVED_MOUNT_PATHS {
+        for uid in [1001, 0] {
+            let error = m
+                .create_owned(reserved_mount_request(path), uid)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::InvalidArgument(message)
+                    if message.starts_with(&format!("invalid writable path {path:?}"))),
+                "{path}: {error:?}"
+            );
+            assert_eq!(untouched(&m, &fake).await, before, "{path}");
+        }
+    }
+    // Component-wise: look-alike names, and /dev/shm, which kiln makes writable, create.
+    for path in ["/procx", "/system", "/dev/shm/x"] {
+        let sandbox = m
+            .create_owned(reserved_mount_request(path), 1001)
+            .await
+            .unwrap();
+        assert_eq!(sandbox.state, SandboxState::Ready, "{path}");
+        m.delete(&sandbox.id).await.unwrap();
+    }
+    drain(&m).await;
+}
+
+#[test]
+fn the_helper_refuses_the_same_writable_paths() {
+    use crate::helper::protocol::validate_spec;
+    let spec = |path: &str| SandboxSpec {
+        image: "alpine".into(),
+        memory_bytes: 512 << 20,
+        cpu_millis: 1000,
+        pids: 128,
+        disk_bytes: 1 << 30,
+        network: Network::None,
+        read_only_root: true,
+        writable_paths: vec![path.into()],
+        labels: Default::default(),
+    };
+    validate_spec(&spec("/workspace")).unwrap();
+    for path in RESERVED_MOUNT_PATHS {
+        assert!(validate_spec(&spec(path)).is_err(), "{path}");
+    }
 }

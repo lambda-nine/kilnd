@@ -32,7 +32,14 @@ resolution failure is a later backend error.
 A writable path must not be `/` and must not contain an empty, `.`, or `..`
 component, a repeated or trailing slash, NUL, or another control character.
 Unicode and flag-like path components are valid. Rejecting `/` prevents a
-read-only root request from silently becoming writable.
+read-only root request from silently becoming writable. A writable path is also
+refused over a filesystem kiln mounts itself: `/proc`, `/sys` and everything under
+them (procfs at `/proc`, a read-only cgroup2 at `/sys/fs/cgroup`), and anything under
+`/dev` except `/dev/shm` (kiln's `/dev` is a 0755 tmpfs owned by host root, which
+sandbox root cannot create in; `/dev/shm` is a 1777 tmpfs kiln makes writable). kiln
+mounts these after it allocates, so such a path would fail in its shim's setup and
+leave an ambiguous reservation. The check is component-wise: `/procx`, `/system`
+and `/dev/shm/x` are valid.
 
 Argv is literal data, never host-shell text. Newlines, other non-NUL control
 characters, Unicode, flag-like values, and empty arguments after `argv[0]`

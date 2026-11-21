@@ -107,7 +107,28 @@ pub fn validate_writable_path(path: &str) -> Result<(), String> {
     {
         return Err(invalid());
     }
+    if under_runtime_mount(path) {
+        return Err(format!(
+            "invalid writable path {path:?}: kiln mounts its own filesystem there"
+        ));
+    }
     Ok(())
+}
+
+/// Whether a writable path (already canonical) lies over a filesystem kiln mounts itself
+/// after it allocates, where its shim's setup fails, so the create would be ambiguous:
+/// `/proc` and `/sys` and everything under them (kiln mounts procfs at `/proc` and a
+/// read-only cgroup2 at `/sys/fs/cgroup`), and anything under `/dev` but `/dev/shm`.
+/// kiln's `/dev` is a 0755 tmpfs owned by host root, which sandbox root (an unmapped
+/// host uid) cannot create in; `/dev/shm` is a 1777 tmpfs kiln makes writable itself.
+/// Component-wise, so `/procx` and `/system` are ordinary paths.
+fn under_runtime_mount(path: &str) -> bool {
+    let mut components = path[1..].split('/');
+    match components.next() {
+        Some("proc" | "sys") => true,
+        Some("dev") => !matches!(components.next(), None | Some("shm")),
+        _ => false,
+    }
 }
 
 /// Returns the API's argv byte accounting: UTF-8 bytes plus one separator per
@@ -217,6 +238,43 @@ mod tests {
             "", "/", "data", "/a/../b", "/a/./b", "/a//b", "/a/", "/a\nb",
         ] {
             assert!(validate_writable_path(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn writable_paths_over_kilns_own_mounts_are_refused() {
+        for refused in [
+            "/proc",
+            "/proc/x",
+            "/proc/sys/x",
+            "/sys",
+            "/sys/x",
+            "/sys/fs/cgroup",
+            "/sys/fs/cgroup/x",
+            "/dev/x",
+            "/dev/pts",
+            "/dev/null/x",
+        ] {
+            let error = validate_writable_path(refused).unwrap_err();
+            assert!(
+                error.starts_with(&format!("invalid writable path {refused:?}")),
+                "{error}"
+            );
+            assert!(error.contains("kiln mounts its own filesystem"), "{error}");
+        }
+        for valid in [
+            "/procx",
+            "/proc-data",
+            "/system",
+            "/sysx",
+            "/devx",
+            "/dev",
+            "/dev/shm",
+            "/dev/shm/x",
+            "/data/proc",
+            "/workspace/sys/fs/cgroup",
+        ] {
+            validate_writable_path(valid).unwrap();
         }
     }
 

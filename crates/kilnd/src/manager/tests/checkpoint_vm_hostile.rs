@@ -948,13 +948,26 @@ fn c6b_hostile_artifact_and_process_attacks_are_refused_typed() {
                     "exec_running_at_admission": true, "row": "failed checkpoint_busy",
                     "charge_artifacts_unchanged": true }),
         );
-        // 4. Writable paths over reserved ones, at create (a source can't have them).
-        // kiln may refuse such a path only after allocating, leaving a stale run kilnd
-        // cannot name (a recorded LOW). Each create is checked alone: the run
+        // 4. Writable paths at create (a source can't have them). One over a filesystem
+        // kiln mounts itself is refused before anything is allocated: INVALID_ARGUMENT,
+        // no row, no run.
+        for path in ["/proc/x", "/sys/fs/cgroup/x"] {
+            let runs_before = run_dirs();
+            let rows_before = w.host_state().sandboxes.len();
+            let r = w
+                .rpc(OWNER, json!({ "op": "create", "read_only_root": true, "writable_paths": [path] }))
+                .await;
+            assert_eq!(r["error"]["code"], "InvalidArgument", "{path}: {r}");
+            assert_eq!(w.host_state().sandboxes.len(), rows_before, "{path}: a refused create left a row");
+            assert_eq!(run_dirs(), runs_before, "{path}: a refused create left a run");
+            seen.insert(format!("writable {path}"), json!({ "create": r["error"] }));
+        }
+        // kiln may still refuse another path only after allocating, leaving a stale run
+        // kilnd cannot name (a recorded LOW). Each create is checked alone: the run
         // directories that appeared while it ran are its own, each must turn stale and
         // be named by no sandbox, and root's `kiln gc` removes exactly those (C6b review
         // HIGH 6: nothing else is ever collected).
-        for path in ["/dev/shm/x", "/proc/x", "/sys/fs/cgroup/x"] {
+        for path in ["/dev/shm/x", "/etc/passwd/x"] {
             let runs_before = run_dirs();
             let live = live_backends(&w);
             assert!(

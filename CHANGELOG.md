@@ -6,6 +6,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Refuse writable paths over the filesystems kiln mounts itself: `/proc`, `/sys` and
+  everything under them, and anything under `/dev` except `/dev/shm`. kiln's preflight
+  accepted them, then its shim failed setup after allocation (kiln mounts procfs,
+  cgroup2 and a host-root-owned `/dev` tmpfs there), so the create became an ambiguous
+  reservation, charged forever. They are now `INVALID_ARGUMENT` before anything is
+  charged, in kilnd, the root helper and the validator the broker protocol shares; the
+  check is component-wise, so `/procx`, `/system` and `/dev/shm/x` stay valid. Request
+  digests are unchanged.
+
 - Refuse create and fork limits below what kiln can start. kiln checks none of them
   before it allocates, so a create with `cpu_millis` 1-9 (kiln writes a cgroup quota
   below 1 ms, which the kernel refuses) failed in kiln's shim after allocation and was
