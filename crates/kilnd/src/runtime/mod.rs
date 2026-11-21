@@ -806,7 +806,6 @@ pub trait Runtime: Send + Sync + 'static {
 /// `RemoveTarget` variants and `PreparedCreate::allocation_id()`, so any signature drift
 /// in any backend fails the build. Instantiated for every backend in the tests below.
 #[cfg(test)]
-#[allow(dead_code)]
 async fn runtime_contract<R: Runtime>(runtime: &R, binding: &AllocationBinding) {
     let (deadline, cancel) = (Instant::now(), CancellationToken::new());
     let prepare = PrepareContext {

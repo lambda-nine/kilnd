@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Remove dead code: the guest broker's unused `tempfile` dev-dependency, seven items
+  nothing references (`KilnWorkers::with_runs_root`, `DEFAULT_EXEC_STORE`,
+  `DISPATCHED_ROLES`, `HELPER_STATE`, `open_work_dir`, `SandboxState::is_active`,
+  `Store::record_sandbox_image_identity`), the lock's never-read path field and two
+  dead-code allows that no longer suppress anything. No behaviour changes.
+
 - Document workspace checkpoints as a supported opt-in. With rollout-gate criteria 1-8
   met, `--enable-workspace-checkpoints` is no longer described as testing only: it is
   supported on a node that passes the gate's per-node criteria 9 (Health lists

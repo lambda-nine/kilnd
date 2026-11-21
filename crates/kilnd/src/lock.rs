@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
@@ -20,8 +20,6 @@ use anyhow::{Context, Result, bail};
 /// held would let another process lock a different inode at the same path.
 pub(crate) struct ExclusiveFileLock {
     _file: File,
-    #[allow(dead_code)]
-    path: PathBuf,
     #[cfg(test)]
     drop_probe: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
@@ -163,7 +161,6 @@ impl ExclusiveFileLock {
 
         Ok(Self {
             _file: file,
-            path: path.to_path_buf(),
             #[cfg(test)]
             drop_probe: None,
         })
