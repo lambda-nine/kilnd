@@ -1584,7 +1584,11 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
+        // 0700 whatever the umask: under 0002 the directory is group-writable and
+        // the state path's ancestor check refuses it.
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = temp.path().join("state");
         let account = own_account_name();
         let first = init_state(&state, &account, false).unwrap();
@@ -1633,7 +1637,11 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
+        // 0700 whatever the umask: under 0002 the directory is group-writable and
+        // the state path's ancestor check refuses it.
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = temp.path().join("state");
         let _daemon = Store::open(&state).unwrap();
         init_state(&state, &own_account_name(), false).unwrap_err();

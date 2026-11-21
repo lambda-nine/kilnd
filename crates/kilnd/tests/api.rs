@@ -1063,6 +1063,7 @@ fn bind_replaces_a_stale_socket_and_tightens_the_directory() {
 #[test]
 fn bind_preserves_a_stale_socket_when_refusal_is_ambiguous() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = tmp.path().join("run");
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let path = dir.join("kilnd.sock");

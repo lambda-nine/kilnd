@@ -1556,7 +1556,9 @@ async fn exec_output_is_bounded() {
     assert!(m.execution(&e.id).unwrap().stdout.truncated());
 }
 
-#[tokio::test]
+// Paused time: a 50 ms timeout on the wall clock can pass before the execution
+// starts on a loaded machine.
+#[tokio::test(start_paused = true)]
 async fn exec_times_out() {
     let (m, _) = manager();
     let s = m.create(CreateRequest::default()).await.unwrap();
@@ -1801,20 +1803,24 @@ async fn waiter_drop_preserves_a_backend_completed_outcome() {
     assert_eq!(execution.stdout.data, b"completed\n");
 }
 
-#[tokio::test]
+// The first exec is held in the backend until the second is queued behind it, on
+// paused time: polling for it to be running could miss a 100 ms run on a loaded
+// machine and then spin forever.
+#[tokio::test(start_paused = true)]
 async fn execs_in_one_sandbox_run_one_at_a_time() {
-    let (m, _) = manager();
+    let (m, fake) = manager();
     let s = m.create(CreateRequest::default()).await.unwrap();
+    let gate = FakeGate::default();
+    fake.state().exec_before_run = Some(gate.clone());
     let mut first = exec_req(&s.id, &["sleep"]);
     first.timeout_ms = 100;
-    let a = tokio::spawn({
-        let m = m.clone();
-        async move { m.exec(first).await }
-    });
-    while m.health().await.unwrap().running_executions == 0 {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    let b = m.exec(exec_req(&s.id, &["echo"])).await.unwrap();
+    let a = spawn_exec(&m, first);
+    gate.entered().await;
+    let b = spawn_exec(&m, exec_req(&s.id, &["echo"]));
+    until(|| m.admission.snapshot().execs.current == 2).await;
+    assert_eq!(fake.state().exec_calls.len(), 1, "the second ran beside the first");
+    gate.release();
+    let b = b.await.unwrap().unwrap();
     let a = a.await.unwrap().unwrap();
     assert_eq!(a.state, ExecutionState::TimedOut);
     assert!(

@@ -733,7 +733,9 @@ async fn failed_ready_publication_compensates_by_exact_allocation_and_stays_char
     assert_eq!(charged(&m), 0);
 }
 
-#[tokio::test]
+// Paused time: a 20 or 50 ms exec timeout on the wall clock can pass before
+// the execution starts on a loaded machine (DeadlineExceeded, not TimedOut).
+#[tokio::test(start_paused = true)]
 async fn timed_out_stopped_session_refuses_its_queued_successor() {
     let (m, fake) = manager();
     let sandbox = m.create(CreateRequest::default()).await.unwrap();
@@ -1817,7 +1819,9 @@ async fn create_rejection_with_unusable_absence_evidence_stays_charged() {
     assert_released_by_its_fence(&fake, &row(&m));
 }
 
-#[tokio::test]
+// Paused time: a 20 or 50 ms exec timeout on the wall clock can pass before
+// the execution starts on a loaded machine (DeadlineExceeded, not TimedOut).
+#[tokio::test(start_paused = true)]
 async fn invalid_exec_claims_fail_cleanup_and_quarantine_end_to_end() {
     use CleanupEvidence as C;
     use SandboxDisposition as D;

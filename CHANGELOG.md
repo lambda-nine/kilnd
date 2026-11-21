@@ -11,6 +11,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   `DISPATCHED_ROLES`, `HELPER_STATE`, `open_work_dir`, `SandboxState::is_active`,
   `Store::record_sandbox_image_identity`), the lock's never-read path field and two
   dead-code allows that no longer suppress anything. No behaviour changes.
+- Make four manager tests independent of machine load (test-only). Three tests ran 20
+  and 50 ms exec timeouts on the wall clock, which a loaded machine could spend before
+  the execution started (`DeadlineExceeded` instead of a timed-out execution); they now run
+  on paused time. `execs_in_one_sandbox_run_one_at_a_time` polled for its 100 ms first exec
+  to be running and spun forever if it missed it; the first exec is now held in the fake
+  backend until the second is queued behind it. Three tests that put a state directory or
+  socket in a fresh temporary directory now make it 0700, so a umask of 0002 no longer has
+  the ancestor checks refuse it. No behaviour changes.
 
 - Document workspace checkpoints as a supported opt-in. With rollout-gate criteria 1-8
   met, `--enable-workspace-checkpoints` is no longer described as testing only: it is
