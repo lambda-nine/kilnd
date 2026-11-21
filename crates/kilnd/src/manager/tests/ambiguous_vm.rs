@@ -7,6 +7,10 @@
 //! empty `kiln ls` and an empty kiln runs directory to start, and leaves both so. It makes
 //! one empty image directory, `ambigvm-empty-<pid>`, kiln's own post-preflight trigger,
 //! and removes it by name once the create that needs it has run.
+//!
+//! A second test, `ambig_vm_preflight_status_over_the_api`, serves the private instance
+//! on a private API socket and drives it with the `kilndctl` under test
+//! (`KILND_AMBIG_KILNDCTL`) as an ordinary uid, for the status codes a client sees.
 //! `KILND_AMBIG_KILND` and `KILND_AMBIG_HELPER` name the `kilnd` and `kilnd-helper`
 //! binaries under test.
 
@@ -464,6 +468,210 @@ fn ambig_vm_floors_paths_and_audited_release() {
         .build()
         .unwrap();
     rt.block_on(scenario());
+}
+
+#[test]
+#[ignore = "root on the prepared VM: a kiln preflight refusal's status over the API"]
+fn ambig_vm_preflight_status_over_the_api() {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+    assert_clean("api start");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(api_scenario());
+}
+
+fn kilndctl_bin() -> PathBuf {
+    PathBuf::from(std::env::var("KILND_AMBIG_KILNDCTL").expect("KILND_AMBIG_KILNDCTL"))
+}
+
+/// `kilndctl --socket SOCKET ARGS` as `OTHER`, an ordinary uid with no supplementary
+/// groups, in a clean environment: its exit code, stdout and stderr.
+async fn ctl(socket: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let out = tokio::process::Command::new(kilndctl_bin())
+        .arg("--socket")
+        .arg(socket)
+        .args(args)
+        .uid(OTHER)
+        .gid(OTHER)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    (out.status.code(), text(&out.stdout), text(&out.stderr))
+}
+
+/// The private instance behind a private API socket, reached with the branch's kilndctl
+/// as an ordinary uid: kiln's preflight refusals (a writable path whose image parent is
+/// a symlink, a missing image) are INVALID_ARGUMENT naming an uncharged FAILED row; a
+/// keyed one answers OK with that row on the original and its replay alike; and a
+/// failure after allocation (the empty image) stays INTERNAL.
+async fn api_scenario() {
+    let dir = Path::new(DIR);
+    std::fs::create_dir(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let instance = Instance {
+        state: dir.join("state"),
+        daemon_socket: dir.join("helper-daemon.sock"),
+        helper: std::sync::Mutex::new(None),
+    };
+    std::fs::create_dir(&instance.state).unwrap();
+    std::fs::set_permissions(&instance.state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let api_dir = dir.join("api");
+    std::fs::create_dir(&api_dir).unwrap();
+    let socket = api_dir.join("kilnd.sock");
+    let m = instance.start().await;
+    let zero = reserved(&m).await;
+    let bound = crate::server::bind(&socket, Some(OTHER)).await.unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(crate::server::serve(
+        Arc::clone(&m),
+        bound,
+        async {
+            let _ = stop_rx.await;
+        },
+        Duration::from_secs(1),
+    ));
+    let missing = format!("ambigvm-missing-{}", std::process::id());
+    let refusals = [
+        (
+            "api /var/run/x",
+            vec!["--read-only", "--writable", "/var/run/x"],
+            "/var/run/x",
+        ),
+        (
+            "api missing image",
+            vec!["--image", missing.as_str()],
+            missing.as_str(),
+        ),
+    ];
+    let mut refused_ids = Vec::new();
+    for (step, extra, names) in &refusals {
+        let mut args = vec!["create", "--memory", "64M", "--disk", "64M"];
+        args.extend(extra.iter().copied());
+        let (rc, out, err) = ctl(&socket, &args).await;
+        let id = err
+            .strip_prefix("kilndctl: invalidargument: create sandbox ")
+            .and_then(|rest| rest.split_once(": "))
+            .map(|(id, _)| id.to_string())
+            .unwrap_or_default();
+        let row = m.get(&id, 0).ok().map(|(row, _)| row);
+        record(
+            step,
+            json!({ "exit": rc, "stdout": out, "stderr": err, "id": id,
+                    "state": row.as_ref().map(|r| format!("{:?}", r.state)),
+                    "certainty": row.as_ref().map(|r| format!("{:?}", r.create_certainty)),
+                    "charged": row.as_ref().map(|r| r.is_charged()),
+                    "reserved_zero": reserved(&m).await == zero, "kiln": kiln_state() }),
+        );
+        assert_ne!(rc, Some(0), "{step}: {err}");
+        assert!(out.is_empty(), "{step}: {out}");
+        assert!(
+            err.starts_with(&format!(
+                "kilndctl: invalidargument: create sandbox {id}: kiln create failed (exit status: 124): "
+            )) && err.contains(names),
+            "{step}: {err}"
+        );
+        let row = row.unwrap_or_else(|| panic!("{step}: no row {id}"));
+        assert_eq!(row.state, SandboxState::Failed, "{step}");
+        assert_eq!(
+            row.create_certainty,
+            CreateCertainty::DefinitelyNotCreated,
+            "{step}"
+        );
+        assert!(!row.is_charged(), "{step}");
+        assert_eq!(reserved(&m).await, zero, "{step}");
+        assert_clean(step);
+        refused_ids.push(id);
+    }
+
+    // Keyed: the original and its replay give the same answer, OK with the FAILED row.
+    let key = format!("ambigvm-preflight-{}", std::process::id());
+    let keyed = [
+        "create",
+        "--memory",
+        "64M",
+        "--disk",
+        "64M",
+        "--read-only",
+        "--writable",
+        "/var/run/x",
+        "--request-id",
+        key.as_str(),
+    ];
+    let first = ctl(&socket, &keyed).await;
+    let replay = ctl(&socket, &keyed).await;
+    let keyed_row = m.get(&first.1, 0).ok().map(|(row, _)| row);
+    record(
+        "api keyed /var/run/x",
+        json!({ "first": { "exit": first.0, "stdout": first.1, "stderr": first.2 },
+                "replay": { "exit": replay.0, "stdout": replay.1, "stderr": replay.2 },
+                "state": keyed_row.as_ref().map(|r| format!("{:?}", r.state)),
+                "certainty": keyed_row.as_ref().map(|r| format!("{:?}", r.create_certainty)),
+                "failure_reason": keyed_row.as_ref().and_then(|r| r.failure_reason.clone()),
+                "reserved_zero": reserved(&m).await == zero, "kiln": kiln_state() }),
+    );
+    assert_eq!(first.0, Some(0), "keyed: {}", first.2);
+    assert_eq!(first, replay, "keyed replay");
+    let keyed_row = keyed_row.expect("the keyed row");
+    assert_eq!(keyed_row.state, SandboxState::Failed);
+    assert_eq!(
+        keyed_row.create_certainty,
+        CreateCertainty::DefinitelyNotCreated
+    );
+    assert!(
+        keyed_row
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("exit status: 124"),
+        "{keyed_row:?}"
+    );
+    assert_eq!(reserved(&m).await, zero);
+    assert_clean("api keyed");
+
+    // After allocation: kiln's empty-image trigger stays INTERNAL (and ambiguous; the
+    // private instance's state goes with it below).
+    let empty = EmptyImage::create();
+    let (rc, out, err) = ctl(
+        &socket,
+        &[
+            "create",
+            "--memory",
+            "64M",
+            "--disk",
+            "64M",
+            "--image",
+            empty.name.as_str(),
+        ],
+    )
+    .await;
+    drop(empty);
+    record(
+        "api empty image",
+        json!({ "exit": rc, "stdout": out, "stderr": err, "kiln": kiln_state() }),
+    );
+    assert_ne!(rc, Some(0), "{err}");
+    assert!(
+        err.starts_with("kilndctl: internal: create sandbox sb-"),
+        "{err}"
+    );
+    assert!(!err.contains("exit status: 124"), "{err}");
+    assert_clean("api empty image");
+
+    for id in refused_ids.iter().chain([&first.1]) {
+        let (rc, _, err) = ctl(&socket, &["rm", id]).await;
+        assert_eq!(rc, Some(0), "rm {id}: {err}");
+    }
+    stop_tx.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    instance.stop(m).await;
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_clean("api end");
 }
 
 async fn scenario() {
