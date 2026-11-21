@@ -331,7 +331,9 @@ fn ambig_vm_floors_paths_and_audited_release() {
 async fn scenario() {
     let dir = Path::new(DIR);
     std::fs::create_dir(dir).unwrap();
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+    // Readable: the state's opener walks every ancestor as a directory after dropping to
+    // the state's owner, as kilnd does under /var/lib. The sockets inside stay 0600.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let instance = Instance {
         state: dir.join("state"),
         daemon_socket: dir.join("helper-daemon.sock"),
