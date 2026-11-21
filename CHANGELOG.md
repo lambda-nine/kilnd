@@ -62,11 +62,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   section 16 uses its GitHub anchor, setup spreads the typed-termination history over
   schemas 3 to 5, and validation and architecture call the 256 KiB argv limit fixed in
   code rather than configurable. Setup's steps for moving the default instance to
-  Firecracker hold a manual admission fence (creators stopped and the socket root-only through
-  `--socket-group ''`, since kilnd has no drain mode) from before the drain until the first
-  Health check under Firecracker, rollback included; under it they drain every kiln row as root
-  (a non-root `kilndctl ls` sees only its own rows), leave no checkpoint state and list as root
-  once more as the last check before the switch; validation names the three spec fields a fork must match and
+  Firecracker first leave no checkpoint state with the node still serving (the feature flag
+  off, which refuses only captures and forks, until checkpoint List is refused), then hold a
+  manual admission fence (creators stopped and the socket root-only through a last-sorting
+  drop-in that replaces `--socket-group` with `''`, since kilnd has no drain mode) from before
+  the drain until the first Health check under Firecracker, rollback included; under it they
+  wait out in-flight kiln creates, drain every kiln row as root (a non-root `kilndctl ls` sees
+  only its own rows), check the checkpoint refusal again and list as root once more as the last
+  check before the switch, with a reload and restart after every drop-in edit; validation names the three spec fields a fork must match and
   its disk minimum, and says the fork's own network, limits, labels, default env and
   expiry apply; and `CheckpointLimits.request_retention_ms` is described as the node's
   current prune policy, which a release or a lower retention can shorten. No behaviour

@@ -4756,11 +4756,17 @@ listing is section 9.1, rewritten for B7: `PrepareContext`, `PreparedCreate::all
   any wire call, so the row stays DELETING and charged with the refusal as its reason, and
   it is listed as such. The drain procedure is operational and documented with B7's
   deployment notes ([setup.md](../setup.md#retired-token-compaction-b7)): before selecting
-  Firecracker for a database, fence creates off (kilnd has no drain mode, so every creator
-  is stopped and the socket made root-only with `--socket-group ''`), run it with
-  `--backend kiln` and delete every kiln row until root's `kilndctl ls` shows none, then
-  switch, keeping the fence on until the first Health check under Firecracker. B7's Firecracker startup counts charged rows of another backend and degrades
-  Health naming that count, so a skipped drain is visible rather than silent. Each further
+  Firecracker for a database, and before any fence, turn workspace checkpoints off and wait
+  until feature-off checkpoint List is refused `backend_unsupported:workspace_checkpoint`
+  (no checkpoint state left; new captures and forks are refused meanwhile, ordinary
+  creates are not). Then fence creates off (kilnd has no drain mode, so every creator is
+  stopped and the socket made root-only with `--socket-group ''`), run it with
+  `--backend kiln` and delete every kiln row until root's `kilndctl ls` shows none, check
+  the checkpoint refusal again, then switch, keeping the fence on until the first Health
+  check under Firecracker. If the Firecracker start refuses the empty group, the stopped
+  creators are the fence's remaining layer until then. B7's Firecracker Health counts
+  charged rows of another backend and names that count in its `detail` (it does not stop
+  serving or degrade Health for them), so a skipped drain is visible rather than silent. Each further
   Firecracker instance gets a fresh database under its own account (section 4.1), so this
   arises only for the default `kilnd` instance's existing database.
 - **Helper** (`helper/firecracker/mod.rs`, `workers.rs`, `journal.rs`): `Ledger::inspect`

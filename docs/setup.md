@@ -342,44 +342,82 @@ the build that can.
 
 A listing is a snapshot, not a barrier: while kilnd runs `--backend kiln` it accepts every
 create it is not shutting down for or blocked from, so a create that starts after an empty
-listing, or during the checkpoint step, leaves a kiln row the Firecracker start cannot
-drain. **kilnd has no drain or maintenance mode that refuses creates while root can still
-list and delete** (`scripts/kilnd-maintenance.py` stops every kilnd unit instead). The
-fence is manual, and it stays on from before the first listing until after the first
-Health check under Firecracker, rollback included:
+listing leaves a kiln row the Firecracker start cannot drain. **kilnd has no drain or
+maintenance mode that refuses creates while root can still list and delete**
+(`scripts/kilnd-maintenance.py` stops every kilnd unit instead). The fence is manual. It
+goes on only after checkpoints are off (step 1), because checkpoint state can take days to
+age out and the fence locks every ordinary client out, and it stays on from before the
+first kiln-row listing until after the first Health check under Firecracker, rollback
+included. Every edit below goes in the instance's drop-ins: after a direct edit, run
+`sudo systemctl daemon-reload` and then `sudo systemctl restart kilnd`, or the loaded
+command stays the old one.
 
-1. **Fence creates off.**
+1. **Leave no checkpoint state, before the fence.** Firecracker has no checkpoint group,
+   so it cannot inventory or remove checkpoints: under it an unsettled checkpoint or an
+   outstanding checkpoint barrier keeps allocation blocked (Health DEGRADED, every new
+   create refused), and only a clean inventory back under kiln clears it. So, with the
+   node still serving normally on kiln, turn workspace checkpoints off: remove
+   `--enable-workspace-checkpoints` from the instance's command (`sudo systemctl edit
+   kilnd`, or edit its drop-in directly, then `sudo systemctl daemon-reload`), then `sudo
+   systemctl restart kilnd`. With the flag off, new captures and forks are refused
+   `backend_unsupported` while ordinary creates, Get, List and Delete go on, so the node
+   stays usable while the old checkpoint state ages out. That can take up to the larger of
+   `--deleted-sandbox-max-age-secs` (default 7 days) and one day after the last checkpoint
+   was released, and a capture key lasts at least `--create-request-retention-secs`
+   (see step 4 of opting a node in to workspace checkpoints, under
+   [Operating notes](#operating-notes) below); deleting the live checkpoints first, and
+   releasing their capture keys with `kilndctl checkpoint rm --release-request-id`,
+   shortens it. The exit check: `sudo kilndctl --socket /run/kilnd/kilnd.sock checkpoint
+   ls --page-size 1` must be refused `UNIMPLEMENTED
+   backend_unsupported:workspace_checkpoint`. On a node that never enabled checkpoints
+   this already holds. Go on only once it does, and never put the checkpoint flag back in
+   any later command, the fence's and the rollback's included.
+2. **Fence creates off.**
    - **Stop every creator.** Stop every service, timer and user session that calls this
      instance's socket: the members of its socket group (`getent group kilnd`) and any root
      job that creates sandboxes. `ps -eo pid,user,supgrp,args` shows what still holds the
      group; only the kilnd daemon (its own account) and the root helper with its kiln
-     shims (`Group=kilnd` in its unit) may remain. Keep them stopped until step 8.
-   - **Make the socket root-only.** Restart kilnd with `--socket-group ''` through a
-     drop-in that sorts after any other, for example
-     `/etc/systemd/system/kilnd.service.d/90-backend-switch-fence.conf`: an empty
-     `ExecStart=`, then the instance's whole current command (`systemctl show -p ExecStart
-     kilnd`, every flag kept) with `--socket-group ''` added. Then `systemctl daemon-reload`
-     and `systemctl restart kilnd`. kilnd applies this itself at every start: an empty
-     group makes `/run/kilnd` 0700 and the socket 0600, both owned by the kilnd account,
-     before it serves anything, so only root and that account can connect.
-   - **Confirm it.** `sudo stat -c '%U %a %n' /run/kilnd /run/kilnd/kilnd.sock` shows
-     `kilnd 700` and `kilnd 600`, and kilnd's `serving` journal line has an empty `group`.
-     A non-root `kilndctl ls`, from any other account, fails before sending anything:
+     shims (`Group=kilnd` in its unit) may remain. Keep them stopped until step 9.
+   - **Make the socket root-only.** Write a drop-in whose name sorts after every other
+     one, including `systemctl edit`'s `override.conf`:
+     `/etc/systemd/system/kilnd.service.d/zz-backend-switch-fence.conf`. In it put an
+     empty `ExecStart=`, then the instance's whole current command (`systemctl show -p
+     ExecStart kilnd`, every flag kept, still without `--enable-workspace-checkpoints`)
+     with its `--socket-group` value **replaced** by `''`, or `--socket-group ''` added if
+     the command has none. `--socket-group` takes one value: given twice, kilnd refuses to
+     start. Write down the original value (or that there was none); step 9 restores
+     exactly that. Then `sudo systemctl daemon-reload` and `sudo systemctl restart kilnd`.
+     kilnd applies the empty group itself at every start: `/run/kilnd` becomes 0700 and the
+     socket 0600, both owned by the kilnd account, before it serves anything, so only root
+     and that account can connect.
+   - **Confirm it.** `systemctl cat kilnd` lists `zz-backend-switch-fence.conf` last of
+     the files that reset `ExecStart`, and `systemctl show -p ExecStart kilnd` shows its
+     command. `sudo stat -c '%U %a %n' /run/kilnd /run/kilnd/kilnd.sock` shows `kilnd 700`
+     and `kilnd 600`, and kilnd's `serving` journal line has an empty `group`. A
+     `kilndctl ls` run by a non-root member of the socket group, one that could connect
+     before this restart, fails before sending anything (an account outside the group
+     fails this way at any time, so it proves nothing):
 
      ```text
      kilndctl: connect to /run/kilnd/kilnd.sock: Permission denied (os error 13)
      ```
 
-2. **Let in-flight creates settle.** The fencing restart ends every create the old process
+3. **Let in-flight creates settle.** The fencing restart ends every create the old process
    accepted: on SIGTERM kilnd refuses new creates and lets the creates it accepted finish
    or compensate (see "Shutdown and restarts" in [architecture.md](architecture.md)), and
-   before serving again its startup reconciliation settles any row still CREATING (FAILED
-   `kilnd stopped while the sandbox was being created`, READY if its backend sandbox is
-   running, otherwise LOST). The one exception is a fork the checkpoint barrier keeps
-   CREATING, which that barrier's own pass settles. A create's row is written before the
-   backend runs, so an in-flight create always shows in root's listing as CREATING. Run
-   `sudo kilndctl --socket /run/kilnd/kilnd.sock ls` until no row is CREATING.
-3. **Delete every kiln row, as root.** List them against that instance's socket:
+   before serving again its startup reconciliation settles any kiln row still CREATING
+   (FAILED `kilnd stopped while the sandbox was being created`, READY if its backend
+   sandbox is running, otherwise LOST). A fork the checkpoint barrier keeps CREATING is
+   settled by that barrier's pass instead, but none can be left once step 1's check has
+   passed. A create's row is written before its backend runs, so an in-flight create shows
+   in root's listing as CREATING once its row has been written; one still in its read-only
+   preparation has no row yet, and after the shutdown began it can no longer insert one,
+   so the restart settles it too. Run `sudo kilndctl --socket /run/kilnd/kilnd.sock ls`
+   until no row whose `BACKEND` is `kiln` is CREATING. Reconciliation skips rows of
+   another backend, so a CREATING `firecracker` row left by an earlier attempt never
+   settles while kiln is selected: it is not part of this drain. Note it and handle it
+   separately with its own backend selected; it is what step 8's Health detail is about.
+4. **Delete every kiln row, as root.** List them against that instance's socket:
 
    ```sh
    sudo kilndctl --socket /run/kilnd/kilnd.sock ls
@@ -395,36 +433,32 @@ Health check under Firecracker, rollback included:
    the helper cannot yet prove gone: `sudo kilndctl get <id>` shows its state and failure
    reason; fix that cause with kiln still selected and delete it again. Do not switch while
    any remains.
-4. **Leave no checkpoint state.** Firecracker has no checkpoint group, so it cannot
-   inventory or remove checkpoints: under it an unsettled checkpoint or an outstanding
-   checkpoint barrier keeps allocation blocked (Health DEGRADED, every new create
-   refused), and only a clean inventory back under kiln clears it. So, still on kiln, turn
-   workspace checkpoints off and wait for that exit check to pass: `sudo kilndctl
-   checkpoint ls --page-size 1` against the same socket must be refused `UNIMPLEMENTED
-   backend_unsupported:workspace_checkpoint` (step 4 of opting a node in to workspace
-   checkpoints, under [Operating notes](#operating-notes) below). On a node that never
-   enabled checkpoints this already holds. Turning the flag off is a restart: drop
-   `--enable-workspace-checkpoints` from the fence drop-in's command and keep
-   `--socket-group ''` in it.
-5. **List once more, last.** With the fence still on and step 4's refusal seen, run
-   `sudo kilndctl --socket /run/kilnd/kilnd.sock ls` again. It must show no `kiln` row in
-   any state. If it shows one, go back to step 3. This listing is the last check before
-   the switch; nothing but the stop may come between it and step 6.
-6. **Switch.** Edit the fence drop-in's command to select Firecracker, then `systemctl
-   daemon-reload` and `systemctl restart kilnd`. Keep `--socket-group ''` if the
-   Firecracker start accepts it, and confirm it as in step 1. If the start refuses an empty
-   group, as this build's test-deployment gate does, use the group it requires: the socket
-   is then open to that group again, so until step 8 the fence is the stopped creators
-   alone.
-7. **Check Health first.** `sudo kilndctl --socket /run/kilnd/kilnd.sock health` must
+5. **Check checkpoints again.** `sudo kilndctl --socket /run/kilnd/kilnd.sock checkpoint
+   ls --page-size 1` must still be refused `UNIMPLEMENTED
+   backend_unsupported:workspace_checkpoint`, exactly as in step 1. If it is not, do not
+   switch: take the fence off as in step 9 and start again from step 1.
+6. **List once more, last.** With the fence still on, run `sudo kilndctl --socket
+   /run/kilnd/kilnd.sock ls` again. It must show no `kiln` row in any state. If it shows
+   one, go back to step 4. This listing is the last check before the switch; nothing but
+   the stop may come between it and step 7.
+7. **Switch.** Edit the fence drop-in's command to select Firecracker, then `sudo
+   systemctl daemon-reload` and `sudo systemctl restart kilnd`. Keep `--socket-group ''`
+   if the Firecracker start accepts it, and confirm it as in step 2. If the start refuses
+   an empty group, put back the value recorded in step 2: the socket is then open to that
+   group again, so until step 9 the fence is the stopped creators alone.
+8. **Check Health first.** `sudo kilndctl --socket /run/kilnd/kilnd.sock health` must
    show `backend: firecracker` and no `N charged row(s) of another backend cannot drain
    under firecracker` in its `detail:` line. If it names any, roll back with the fence
-   still on: put `--backend kiln` and `--socket-group ''` back in the drop-in, restart,
-   confirm as in step 1, and continue from step 2.
-8. **Fence off.** Only after that Health check: remove the drop-in's `--socket-group ''`
-   (or the drop-in, keeping the Firecracker selection in another), `systemctl
-   daemon-reload` and `systemctl restart kilnd`, which gives `/run/kilnd` 0750 and the
-   socket 0660 with the socket group again, then start the creators stopped in step 1.
+   still on: put `--backend kiln` and `--socket-group ''` back in the drop-in (still
+   without the checkpoint flag), `sudo systemctl daemon-reload` and `sudo systemctl
+   restart kilnd`, check that Health shows `backend: kiln`, confirm the fence as in step
+   2, and continue from step 3.
+9. **Fence off.** Only after that Health check: set `--socket-group` in the drop-in's
+   command back to exactly the value recorded in step 2, or remove the flag if the command
+   had none (or remove the drop-in, keeping the Firecracker selection in another), then
+   `sudo systemctl daemon-reload` and `sudo systemctl restart kilnd`, which gives
+   `/run/kilnd` 0750 and the socket 0660 with that group again. Then start the creators
+   stopped in step 2.
 
 ## Operating notes
 
