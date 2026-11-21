@@ -314,6 +314,23 @@ async fn a_slow_checkpoint_probe_withdraws_only_checkpoints() {
     assert!(advertised(&health(&s, 1000).await));
 }
 
+/// Capture request records are pruned by `--create-request-retention-secs`, so Health
+/// advertises that configured value for them, not the one-day minimum, and the same
+/// value as `create_request_retention_ms`.
+#[tokio::test]
+async fn health_reports_the_configured_capture_request_retention() {
+    let mut limits = fresh_limits();
+    limits.retention.create_request_retention_secs = 3 * 86_400;
+    let (m, _, _) = engine_with(FakeRuntime::default().with_checkpoints(), limits);
+    startup(&m).await;
+    let s = api(&m);
+    let h = health(&s, 1000).await;
+    assert!(advertised(&h), "{h:?}");
+    let l = h.runtime_capabilities.unwrap().limits.unwrap();
+    assert_eq!(l.create_request_retention_ms, 3 * 86_400_000);
+    assert_eq!(l.checkpoint.unwrap().request_retention_ms, 3 * 86_400_000);
+}
+
 /// Design 11.1: Firecracker advertises neither the feature nor the boolean, with the
 /// flag on, and Health never asks a checkpoint helper.
 #[tokio::test]

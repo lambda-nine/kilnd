@@ -42,6 +42,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   socket in a fresh temporary directory now make it 0700, so a umask of 0002 no longer has
   the ancestor checks refuse it. No behaviour changes.
 
+- Health's `ApiLimits.checkpoint.request_retention_ms` reports the configured
+  `--create-request-retention-secs`, which is what prunes capture request records, in
+  place of a fixed one day. It now matches `ApiLimits.create_request_retention_ms`; with
+  the default retention the value is unchanged.
+
 - Bring the docs in step with the code. The README lists ExecStream and the four
   checkpoint RPCs, every check `CLAUDE.md` asks for, and the helper socket's
   `kilnd-helper` group; architecture, the helper protocol and the threat model describe B6

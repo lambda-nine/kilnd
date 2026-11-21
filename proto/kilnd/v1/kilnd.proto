@@ -274,7 +274,9 @@ message CheckpointLimits {
   uint32 max_fork_depth = 17;
   uint64 worker_memory_bytes = 18;
   uint32 worker_max_fds = 19;
-  // The least time a capture request record is kept.
+  // The least time a capture request record is kept, measured on the boot
+  // clock: the node's create request retention, so the same value as
+  // ApiLimits.create_request_retention_ms.
   uint64 request_retention_ms = 20;
 }
 

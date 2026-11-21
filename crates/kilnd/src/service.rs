@@ -650,17 +650,22 @@ fn api_limits_pb(l: &Limits, features: &[Feature]) -> pb::ApiLimits {
             .checkpoints
             .as_ref()
             .filter(|_| listed(Feature::WorkspaceCheckpoint))
-            .map(checkpoint_limits_pb),
+            .map(|c| checkpoint_limits_pb(c, l.retention.create_request_retention_secs)),
     }
 }
 
 /// `ApiLimits.checkpoint` (design 6.2 and Appendix A). The format bounds are kiln's
 /// format-1 codec's (`runtime/src/checkpoint/mod.rs`: a symlink target is at most
-/// 1,023 bytes, XFS's own bound); the worker bounds are the design's.
-fn checkpoint_limits_pb(c: &crate::manager::CheckpointLimits) -> pb::CheckpointLimits {
+/// 1,023 bytes, XFS's own bound); the worker bounds are the design's. Capture request
+/// records are pruned by create's retention rules (API additions design 3.3), so
+/// `request_retention_ms` is the configured `--create-request-retention-secs`, like
+/// `ApiLimits.create_request_retention_ms`.
+fn checkpoint_limits_pb(
+    c: &crate::manager::CheckpointLimits,
+    request_retention_secs: u64,
+) -> pb::CheckpointLimits {
     use crate::store::{
         MAX_CHECKPOINT_IDLE_MS, MAX_CHECKPOINT_LIFETIME_MS, MIN_CHECKPOINT_EXPIRY_MS,
-        MIN_CHECKPOINT_HISTORY_SECS,
     };
     pb::CheckpointLimits {
         max_size_bytes: c.budgets.max_size_bytes,
@@ -682,7 +687,7 @@ fn checkpoint_limits_pb(c: &crate::manager::CheckpointLimits) -> pb::CheckpointL
         max_fork_depth: 0,
         worker_memory_bytes: 64 << 20,
         worker_max_fds: 256,
-        request_retention_ms: MIN_CHECKPOINT_HISTORY_SECS * 1000,
+        request_retention_ms: request_retention_secs.saturating_mul(1000),
     }
 }
 
