@@ -9,8 +9,6 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The helper's state root. Its jail and work subtrees are root-owned and 0700.
-pub const HELPER_STATE: &str = "/var/lib/kilnd-helper";
 /// The jailer's `--chroot-base-dir`, a private bind mount of itself so nothing mounted
 /// below propagates into another mount namespace.
 pub const JAIL_BASE: &str = "/var/lib/kilnd-helper/jails";
@@ -710,17 +708,6 @@ mod linux {
         let dir = private_dir(&firecracker, name, false)?;
         let identity = file_identity(&dir)?;
         Ok((dir, identity))
-    }
-
-    pub fn open_work_dir(paths: &AllocationPaths) -> io::Result<Option<File>> {
-        match open_trusted(&paths.work_dir) {
-            Ok(dir) => {
-                check_trusted_dir(&dir, true)?;
-                Ok(Some(dir))
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
     }
 
     /// The identity of a descriptor (`name` empty) or of a name in a directory, without

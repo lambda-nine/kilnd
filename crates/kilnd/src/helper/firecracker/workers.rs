@@ -2493,7 +2493,7 @@ pub fn supervisor_main(mut context: SupervisorContext) {
     let timings = context.config.timings;
     let mut last_helper = std::time::Instant::now();
     let mut last_beat = std::time::Instant::now();
-    #[allow(unused_mut, unused_variables)]
+    #[allow(unused_mut)]
     let mut vm: Option<ProcessId> = None;
     let mut gated = true;
     #[cfg(test)]

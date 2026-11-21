@@ -133,12 +133,6 @@ impl KilnWorkers {
         self
     }
 
-    /// Another runs directory, for tests.
-    pub fn with_runs_root(mut self, runs: PathBuf) -> Self {
-        self.runs = runs;
-        self
-    }
-
     /// Another image registry root, for tests (only the trust probe reads it).
     pub fn with_registry_root(mut self, registry: PathBuf) -> Self {
         self.registry = registry;

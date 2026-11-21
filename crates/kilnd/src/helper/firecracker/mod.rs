@@ -4894,8 +4894,5 @@ fn enroll_with(
     })
 }
 
-/// The role J, V and the formatter would be dispatched from, in plan order.
-pub const DISPATCHED_ROLES: [Role; 3] = [Role::Jailer, Role::Firecracker, Role::MkfsXfs];
-
 #[cfg(test)]
 mod tests;

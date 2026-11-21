@@ -17,7 +17,6 @@ pub const POLICY_SCHEMA: &str = "kilnd-firecracker-node-policy-v1";
 pub const PLAN_SCHEMA: &str = "kilnd-firecracker-plan-v1";
 pub const PLAN_VERSION: u32 = 1;
 pub const DEFAULT_LEDGER_DIR: &str = "/var/lib/kilnd-helper/firecracker";
-pub const DEFAULT_EXEC_STORE: &str = "/opt/kilnd/exec/sha256";
 pub const MAX_PROFILES: usize = 8;
 /// Enrolled instances when a policy doesn't say otherwise.
 pub const DEFAULT_MAX_ENROLLED: u32 = 8;
