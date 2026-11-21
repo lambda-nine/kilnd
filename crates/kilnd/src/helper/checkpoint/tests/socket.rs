@@ -86,7 +86,7 @@ struct Helper {
 }
 
 async fn helper(enabled: bool) -> Helper {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::short_tempdir().unwrap();
     let dir = temp.path().canonicalize().unwrap();
     let bin = fixture(&dir);
     let socket = dir.join("helper.sock");

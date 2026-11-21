@@ -11,6 +11,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   `DISPATCHED_ROLES`, `HELPER_STATE`, `open_work_dir`, `SandboxState::is_active`,
   `Store::record_sandbox_image_identity`), the lock's never-read path field and two
   dead-code allows that no longer suppress anything. No behaviour changes.
+
+- Make the tests pass under a long `TMPDIR` (test-only). Tests that bind a Unix socket
+  in a temporary directory now make it with a `short_tempdir()` helper (one for kilnd's
+  unit tests, one for its integration tests, one in kilndctl's transport tests), which
+  falls back to `/tmp` when `TMPDIR` would leave the socket path too long for `sun_path`;
+  51 tests failed with a 132-byte `TMPDIR`. The executable-table mode test gives its
+  object the caller's group before `chmod 02555` and checks the mode took, since macOS
+  silently drops setgid on a file whose group (`wheel` under `/tmp`) the owner is not in.
+  No behaviour changes.
+
 - Make four manager tests independent of machine load (test-only). Three tests ran 20
   and 50 ms exec timeouts on the wall clock, which a loaded machine could spend before
   the execution started (`DeadlineExceeded` instead of a timed-out execution); they now run

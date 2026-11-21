@@ -1368,7 +1368,7 @@ mod tests {
     /// refused: `learn_digest` still records over the cap.
     #[tokio::test]
     async fn prepare_at_the_digest_cap_is_exhausted_before_any_helper_call() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let path = dir.path().join("helper.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1409,7 +1409,7 @@ mod tests {
     /// nothing will remove, and the next Preflight reaches the helper.
     #[tokio::test]
     async fn stale_learns_after_terminal_answers_never_fill_the_digest_cap() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let path = dir.path().join("helper.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();

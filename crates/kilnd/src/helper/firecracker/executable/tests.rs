@@ -425,11 +425,18 @@ fn exit5_unsafe_ancestry_and_objects_are_refused_before_any_retained_table_exist
     // Wrong mode, including setuid and writable bits.
     for mode in [0o755, 0o575, 0o557, 0o4555, 0o2555, 0o500] {
         let fixture = store();
-        std::fs::set_permissions(
-            fixture.object(Role::MkfsXfs),
-            std::fs::Permissions::from_mode(mode),
-        )
-        .unwrap();
+        let object = fixture.object(Role::MkfsXfs);
+        // A new file takes its directory's group on macOS (`wheel` under /tmp), and
+        // chmod silently drops setgid for an owner outside the file's group. Give it the
+        // caller's own group so every mode below is the one the walk sees.
+        // SAFETY: no preconditions.
+        std::os::unix::fs::chown(&object, None, Some(unsafe { libc::getegid() })).unwrap();
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&object).unwrap().permissions().mode() & 0o7777,
+            mode,
+            "precondition: the object's mode"
+        );
         assert!(refuses(&fixture), "mode {mode:o}");
     }
     // Non-regular objects, with a FIFO that must not block the walk.

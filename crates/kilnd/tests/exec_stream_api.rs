@@ -6,6 +6,8 @@
 // unmount and remove their own scratch resources and replacements directly.
 #![allow(clippy::disallowed_methods)]
 
+mod common;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,7 +55,7 @@ struct Daemon {
 
 impl Daemon {
     async fn start(features: &[Feature], limits: Limits) -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = common::short_tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let fake = FakeRuntime::default();

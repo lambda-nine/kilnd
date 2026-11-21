@@ -163,6 +163,18 @@ impl pb::kilnd_service_server::KilndService for Daemon {
     }
 }
 
+/// [`tempfile::tempdir`], short enough for the socket bound in it. A socket path must
+/// fit in `sun_path` (104 bytes on macOS, 108 on Linux, with the terminating NUL), so
+/// under a `TMPDIR` that leaves less than 48 bytes for `/.tmpXXXXXX/kilnd.sock` the
+/// directory is made in `/tmp` instead. Otherwise it is exactly `tempdir()`.
+fn short_tempdir() -> std::io::Result<tempfile::TempDir> {
+    let root = std::env::temp_dir();
+    if root.as_os_str().len() + 48 > 103 {
+        return tempfile::tempdir_in("/tmp");
+    }
+    tempfile::tempdir_in(root)
+}
+
 /// Scripted daemons behind one socket path, one per accepted connection in order, as
 /// a restart would replace them. Connections beyond the script are counted and closed.
 struct Socket {
@@ -180,7 +192,7 @@ impl Socket {
     ) -> Self {
         use std::sync::atomic::{AtomicUsize, Ordering};
         // Removed with the directory when the socket is dropped.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = short_tempdir().unwrap();
         let path = dir.path().join("kilnd.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let (tx, seen) = mpsc::unbounded_channel();

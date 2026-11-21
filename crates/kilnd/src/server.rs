@@ -658,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn socket_directory_aliases_cannot_widen_state_permissions() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::short_tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = temp.path().join("state");
         let store = Store::open(&state).unwrap();
@@ -690,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn socket_directory_swap_cannot_redirect_lock_or_permissions_to_state() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::short_tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let safe_root = temp.path().join("safe");
         let state_root = temp.path().join("state-root");
@@ -740,7 +740,7 @@ mod tests {
     #[tokio::test]
     async fn raw_connection_ceiling_closes_excess_and_recovers_fd_permits() {
         use tokio::io::AsyncReadExt;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::short_tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = temp.path().join("run/kilnd.sock");
         let manager = Arc::new(Manager::new(
@@ -840,7 +840,7 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<Result<()>>,
     ) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::short_tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = temp.path().join("run/kilnd.sock");
         let manager = Arc::new(Manager::new(
@@ -1033,7 +1033,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_drains_detached_compensation_beyond_final_rpc_wait() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::short_tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let alternate = tmp.path().join("run/alternate.sock");
@@ -1118,7 +1118,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_drain_stops_at_its_limit() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::short_tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let fake = FakeRuntime::default();
@@ -1157,7 +1157,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_long_grace_still_ends_at_the_shutdown_drain_limit() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::short_tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let fake = FakeRuntime::default();
@@ -1195,7 +1195,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_without_transport_honors_grace_and_drains_exec_cleanup() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::short_tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let fake = FakeRuntime::default();
@@ -1264,7 +1264,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_holds_both_locks_while_terminal_execution_write_retries() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::short_tempdir().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("run/kilnd.sock");
         let alternate = tmp.path().join("run/alternate.sock");
@@ -1372,7 +1372,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stale_probe_refuses_a_socket_replaced_before_the_identity_check() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::short_tempdir().unwrap();
         let dir = tmp.path().join("run");
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         let path = dir.join("kilnd.sock");

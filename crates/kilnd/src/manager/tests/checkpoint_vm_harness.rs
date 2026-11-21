@@ -2180,7 +2180,7 @@ mod relay_tests {
     /// and refusals as JSON, a SIGKILL and a restart on the same state.
     #[tokio::test]
     async fn the_roles_serve_answer_and_survive_a_kill() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::short_tempdir().unwrap();
         set_mode(tmp.path(), 0o700);
         let state = tmp.path().join("state");
         std::fs::create_dir(&state).unwrap();
@@ -2225,7 +2225,7 @@ mod relay_tests {
 
     #[tokio::test]
     async fn the_relay_forwards_holds_and_passes_descriptors() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::short_tempdir().unwrap();
         let helper = tmp.path().join("h.sock");
         let relay_at = tmp.path().join("r.sock");
         let listener = UnixListener::bind(&helper).unwrap();

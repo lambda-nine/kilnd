@@ -12,7 +12,7 @@ use tokio::net::UnixStream;
 async fn exit1_deadline_does_not_race_response_eof_with_a_redundant_cancel_byte() {
     use tokio::io::AsyncReadExt;
     use tokio::time::{Instant, timeout};
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::short_tempdir().unwrap();
     let path = temp.path().join("helper.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let server = tokio::spawn(async move {
@@ -156,7 +156,7 @@ fn a_malformed_frame_error_never_quotes_its_values() {
 async fn received_peer_flag_mutation_cannot_stall_listener_or_deadline() {
     use tokio::io::AsyncReadExt;
     use tokio::time::{Instant, timeout};
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::short_tempdir().unwrap();
     let path = temp.path().join("helper.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let uid = unsafe { libc::geteuid() };
@@ -322,7 +322,7 @@ async fn descriptor_envelope_is_exact_and_refuses_regular_files() {
 
 #[tokio::test]
 async fn wrong_peer_and_malformed_frames_never_run_kiln() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::short_tempdir().unwrap();
     let socket = temp.path().join("helper.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let stop = tokio_util::sync::CancellationToken::new();
@@ -375,7 +375,7 @@ async fn helper_roundtrip_carries_binary_stdio_via_fds_and_truthful_totals() {
     use crate::model::CommandStatus;
     use crate::runtime::{ExecFinish, ExecSpec};
     use std::os::unix::fs::PermissionsExt;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::short_tempdir().unwrap();
     let bin = temp.path().join("kiln");
     std::fs::write(&bin, r#"#!/usr/bin/python3
 import os,sys,socket
@@ -503,7 +503,7 @@ async fn an_unconfirmed_helper_exec_quarantines_the_sandbox() {
 #[tokio::test]
 async fn stalled_capability_exchange_has_a_control_cleanup_bound() {
     use tokio::io::AsyncReadExt;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::short_tempdir().unwrap();
     let path = temp.path().join("stalled.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let (canceled_tx, canceled_rx) = tokio::sync::oneshot::channel();
@@ -600,7 +600,7 @@ async fn non_exec_wire_deadlines_and_cancellation_reap_children_without_false_ev
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncReadExt;
     use tokio::time::{Instant, timeout};
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::short_tempdir().unwrap();
     let bin = temp.path().join("kiln");
     let pid_file = temp.path().join("pid");
     let trace = temp.path().join("calls");
@@ -782,7 +782,7 @@ fn capture(bytes: &[u8]) -> CaptureInfo {
 async fn b6_firecracker_exec_carries_stdio_and_keeps_a_completed_session_reusable() {
     use crate::model::{CleanupEvidence, CommandStatus, SandboxDisposition};
     use crate::runtime::{ExecFinish, ExecSpec};
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::short_tempdir().unwrap();
     let path = temp.path().join("helper.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let server = tokio::spawn(serve_one_firecracker_exec(
@@ -838,7 +838,7 @@ async fn b6_firecracker_exec_carries_stdio_and_keeps_a_completed_session_reusabl
 async fn b6_a_timed_out_firecracker_exec_retires_the_session_with_host_proof() {
     use crate::model::{CleanupEvidence, SandboxDisposition};
     use crate::runtime::{ExecFinish, ExecSpec};
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_support::short_tempdir().unwrap();
     let path = temp.path().join("helper.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let server = tokio::spawn(serve_one_firecracker_exec(
@@ -1246,7 +1246,7 @@ sys.exit(125)
     async fn a_live_exec_delivers_offsets_and_keeps_the_authoritative_prefix() {
         use crate::exec_stream::LiveStream;
         use crate::runtime::{ExecFinish, ExecSpec};
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::short_tempdir().unwrap();
         let bin = fixture(
             temp.path(),
             "for i in range(20):\n    os.write(OUT,bytes([i])*5000)\n    os.write(ERR,b'e%d' % i)\n    time.sleep(0.005)",
@@ -1306,7 +1306,7 @@ sys.exit(125)
     async fn a_helper_that_dies_after_a_drop_leaves_the_tail_unknown() {
         use crate::exec_stream::{CaptureTotal, LiveEvent, LiveQueue, LiveStream, StreamFinal};
         use crate::runtime::ExecSpec;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::short_tempdir().unwrap();
         let path = temp.path().join("helper.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let uid = unsafe { libc::geteuid() };

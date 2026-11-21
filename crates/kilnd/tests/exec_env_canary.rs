@@ -9,6 +9,8 @@
 // remove their own scratch directories directly.
 #![allow(clippy::disallowed_methods)]
 
+mod common;
+
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -128,7 +130,7 @@ async fn secret_values_stay_out_of_logs_responses_and_history() {
     )
     .unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::short_tempdir().unwrap();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = tmp.path().join("run/kilnd.sock");
     let state = tmp.path().join("state");
