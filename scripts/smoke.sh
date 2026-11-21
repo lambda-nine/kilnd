@@ -318,7 +318,7 @@ ctl get "$id" | grep -q '^state: *deleted' || fail "sandbox not recorded as dele
 ctl rm "$id" >/dev/null || fail "second delete was not idempotent"
 
 echo "9. A sandbox removed behind kilnd's back is lost after restart"
-lost=$(ctl create --memory 64M --disk 16M)
+lost=$(ctl create --memory 64M --disk 64M)
 created+=("$lost")
 sudo kiln rm "$(backend_of "$lost")"
 restart_kilnd
@@ -331,7 +331,7 @@ unmanaged_live=$(sudo kiln create --memory=64M --disk=16M)
 backend_created+=("$unmanaged_live")
 unmanaged_stale=$(sudo kiln create --memory=64M --disk=16M)
 backend_created+=("$unmanaged_stale")
-managed_stale=$(ctl create --memory 64M --disk 16M)
+managed_stale=$(ctl create --memory 64M --disk 64M)
 created+=("$managed_stale")
 managed_backend=$(backend_of "$managed_stale")
 sudo kill -9 "$(sudo cat "/var/lib/kiln/runs/$unmanaged_stale/shim.pid")"
@@ -364,13 +364,13 @@ sudo kiln gc "$unmanaged_stale"
 ctl rm "$managed_stale"
 
 echo "11. One-shot run"
-[ "$(ctl run --memory 64M --disk 16M -- echo one-shot)" = one-shot ] || fail "run"
+[ "$(ctl run --memory 64M --disk 64M -- echo one-shot)" = one-shot ] || fail "run"
 
 echo "12. A preflight create failure releases its reservation, including across restart"
 node_reservations() { ctl health | awk '/^node reservations:/ { print $3, $4 }'; }
 reserved_before=$(node_reservations)
 backends_before=$(sudo kiln ls)
-if missing_out=$(ctl create --image kilnd-smoke-definitely-missing --memory 64M --disk 16M 2>&1); then
+if missing_out=$(ctl create --image kilnd-smoke-definitely-missing --memory 64M --disk 64M 2>&1); then
     created+=("$missing_out")
     fail "missing-image create succeeded"
 fi
@@ -399,7 +399,7 @@ echo "$line"
 
 echo "14. Expiry policy and renew (scripts/expiry-regressions.sh waits out real deadlines)"
 ctl health | grep -q '^features: .*sandbox_expiry' || fail "no sandbox_expiry feature"
-expiring=$(ctl create --memory 64M --disk 16M --idle-timeout 1h --max-lifetime 2h)
+expiring=$(ctl create --memory 64M --disk 64M --idle-timeout 1h --max-lifetime 2h)
 created+=("$expiring")
 ctl get "$expiring" | grep -q '^expiry: *lifetime 7200 s, idle 3600 s' || fail "effective policy not shown"
 [ "$(ctl renew "$expiring")" = "$expiring ready" ] || fail "renew"
@@ -409,9 +409,9 @@ ctl get "$expiring" | grep -q '^deleted by: *requested' || fail "user delete rea
 echo "15. Idempotent create (scripts/idempotent-create-regressions.sh covers crashes)"
 ctl health | grep -q '^features: .*idempotent_create' || fail "no idempotent_create feature"
 key="smoke-$$-$(date +%s)"
-keyed=$(ctl create --memory 64M --disk 16M --request-id "$key" --idle-timeout 1h)
+keyed=$(ctl create --memory 64M --disk 64M --request-id "$key" --idle-timeout 1h)
 created+=("$keyed")
-[ "$(ctl create --memory 64M --disk 16M --request-id "$key" --idle-timeout 1h)" = "$keyed" ] \
+[ "$(ctl create --memory 64M --disk 64M --request-id "$key" --idle-timeout 1h)" = "$keyed" ] \
     || fail "a keyed retry created another sandbox"
 ctl get "$keyed" | grep -q "^request id: *$key\$" || fail "request id not shown"
 ctl rm --release-request-id "$keyed" >/dev/null
@@ -419,7 +419,7 @@ ctl get "$keyed" | grep -q "^request id: *$key (released)" || fail "release not 
 
 echo "16. Exec cwd and env (needs kiln with exec options, bit 0x20)"
 if ctl health | grep -q '^features: .*exec_env'; then
-    opts=$(ctl create --memory 64M --disk 16M --default-env "SMOKE_DEFAULT=from-create")
+    opts=$(ctl create --memory 64M --disk 64M --default-env "SMOKE_DEFAULT=from-create")
     created+=("$opts")
     ctl get "$opts" | grep -q '^env: *SMOKE_DEFAULT (sha256 [0-9a-f]\{64\})' || fail "default env names not shown"
     # A relative script resolves in the cwd (the harness's fib.sh case).
@@ -437,7 +437,7 @@ if ctl health | grep -q '^features: .*exec_env'; then
     ctl rm "$opts" >/dev/null
 else
     echo "   (kiln lacks exec options; checking that kilndctl refuses them)"
-    plain=$(ctl create --memory 64M --disk 16M)
+    plain=$(ctl create --memory 64M --disk 64M)
     created+=("$plain")
     if ctl exec --cwd /workspace "$plain" -- true 2>/dev/null; then fail "cwd sent without exec_cwd"; fi
     ctl rm "$plain" >/dev/null
@@ -445,7 +445,7 @@ fi
 
 echo "17. ExecStream (live output through the helper's live socket)"
 ctl health | grep -q '^features: .*exec_stream' || fail "no exec_stream feature"
-streamed=$(ctl create --memory 64M --disk 16M)
+streamed=$(ctl create --memory 64M --disk 64M)
 created+=("$streamed")
 # Lines arrive as they are written, not when the command ends.
 python3 -I - "$streamed" <<'PY' || fail "stream output did not arrive live"

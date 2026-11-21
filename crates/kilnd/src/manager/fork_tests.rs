@@ -179,7 +179,13 @@ async fn a_foreign_fork_is_not_found_and_root_follows_the_design() {
 #[tokio::test]
 async fn compatibility_refusals_allocate_nothing() {
     let (m, fake, clock) = engine();
+    // Above the request disk floor, so a fork one byte short of the charge passes the
+    // floor and reaches the checkpoint's own refusal.
+    let default_charge = fake.checkpoints(|g| {
+        std::mem::replace(&mut g.charge_bytes, crate::validation::MIN_DISK_BYTES + S)
+    });
     let (_, c) = ready(&m, 1000).await;
+    fake.checkpoints(|g| g.charge_bytes = default_charge);
     let seal = c.seal.clone().unwrap();
     let cases: Vec<(CreateRequest, &str)> = vec![
         (

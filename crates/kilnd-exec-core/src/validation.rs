@@ -10,6 +10,16 @@ pub const MAX_IMAGE_BYTES: usize = 128;
 pub const MAX_WRITABLE_PATHS: usize = 16;
 pub const MAX_WRITABLE_PATH_BYTES: usize = 1024;
 
+/// The least an explicit create may ask for; 0 still means the node default. kiln
+/// checks none of these before it allocates, so a smaller value fails in its shim after
+/// allocation, which kilnd must record as an ambiguous reservation. kiln writes
+/// `cpu.max` as `round(cpus * 100000) 100000`, and cgroup v2 refuses a quota below 1 ms
+/// of each 100 ms period, so 10 millis is the least CPU kiln can start.
+pub const MIN_CPU_MILLIS: u32 = 10;
+pub const MIN_MEMORY_BYTES: u64 = 32 << 20;
+pub const MIN_PIDS: u32 = 16;
+pub const MIN_DISK_BYTES: u64 = 64 << 20;
+
 pub fn validate_image_name(image: &str) -> Result<(), String> {
     if image.is_empty()
         || image.len() > MAX_IMAGE_BYTES

@@ -108,7 +108,7 @@ try:
     print('2. Different real peer UIDs cannot see or mutate ownership', flush=True)
     for user in USERS:
         run(['useradd','--system','--gid','kilnd','--groups','kilnd-helper','--home-dir','/nonexistent','--shell','/usr/sbin/nologin',user])
-    id=ctl('create','--memory','64M','--disk','16M',uid=USERS[0]).stdout.strip(); IDS.append(id)
+    id=ctl('create','--memory','64M','--disk','64M',uid=USERS[0]).stdout.strip(); IDS.append(id)
     p=ctl('exec','--verbose',id,'--','printf','owner-output',uid=USERS[0]); assert p.stdout=='owner-output'
     ex=re.search(r'ex-[0-9a-f]{16}',p.stderr)[0]
     for args in [('get',id),('exec',id,'--','true'),('rm',id),('execution',ex)]:
@@ -120,7 +120,7 @@ try:
     # The helper's inherited family filter must permit both network setup and
     # libc DNS resolution. AF_UNIX/AF_NETLINK alone breaks hostname allowlists.
     for network in (['--net','full'], ['--allow','example.com:443']):
-        assert ctl('run','--memory','64M','--disk','16M',*network,'--','printf','network-ok').stdout=='network-ok'
+        assert ctl('run','--memory','64M','--disk','64M',*network,'--','printf','network-ok').stdout=='network-ok'
     print('3. Helper rejects group members, root and malformed service-UID requests', flush=True)
     helper_pid=run(['systemctl','show','-p','MainPID','--value','kilnd-helper']).stdout.strip()
     helper_status=dict(line.split(':',1) for line in open(f'/proc/{helper_pid}/status') if ':' in line)
@@ -153,7 +153,7 @@ try:
     run(['python3','-I',os.path.join(os.path.dirname(__file__),'helper-blocking-fd.py')],uid='kilnd')
     print('4. Periodic retention and metadata output', flush=True)
     first=start_aux('first')
-    sb=ctl('create','--memory','64M','--disk','16M',aux=True).stdout.strip(); IDS.append(sb)
+    sb=ctl('create','--memory','64M','--disk','64M',aux=True).stdout.strip(); IDS.append(sb)
     old=execute(sb,'secret-history',aux=True)
     assert ctl('execution',old,aux=True).stdout==''
     newest=execute(sb,'latest',aux=True)
@@ -168,10 +168,10 @@ try:
     ctl('execution',pending,aux=True)
     p.communicate(timeout=10); assert p.returncode==0
     ctl('rm',sb,aux=True); IDS.remove(sb)
-    sb2=ctl('create','--memory','64M','--disk','16M',aux=True).stdout.strip(); IDS.append(sb2)
+    sb2=ctl('create','--memory','64M','--disk','64M',aux=True).stdout.strip(); IDS.append(sb2)
     ctl('rm',sb2,aux=True); IDS.remove(sb2)
     eventually(lambda: ctl('get',sb,aux=True,ok=False).returncode!=0)
-    live=ctl('create','--memory','64M','--disk','16M',aux=True).stdout.strip(); IDS.append(live)
+    live=ctl('create','--memory','64M','--disk','64M',aux=True).stdout.strip(); IDS.append(live)
     live_ex=execute(live,'live',aux=True)
     run(['systemctl','stop',first])
     print('5. Startup prune retains charged rows and deletes eligible history', flush=True)
@@ -228,7 +228,7 @@ dest.close(); backup.close(); os.unlink(sys.argv[1]+'.fixture-backup')
         assert refused.returncode != 0 and 'sandbox_default_env' in refused.stderr, refused
         print('   SKIP positive checks: the installed kiln lacks exec options (bit 0x20)', flush=True)
     else:
-        sb = ctl('create', '--memory', '64M', '--disk', '16M', '--default-env', 'KILND_CANARY_DEFAULT',
+        sb = ctl('create', '--memory', '64M', '--disk', '64M', '--default-env', 'KILND_CANARY_DEFAULT',
                  aux=True, uid=USERS[0], env=caller).stdout.strip(); IDS.append(sb)
         # The workload proves it got both values by their digests, so neither is on any
         # argv, including the execution's own (which history keeps).

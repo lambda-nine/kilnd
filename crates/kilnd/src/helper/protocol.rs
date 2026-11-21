@@ -4,8 +4,9 @@ use crate::model::{
 };
 use crate::runtime::{BackendSandbox, BackendStatus, RuntimeError};
 use crate::validation::{
-    MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, validate_allowlist_entry, validate_argv,
-    validate_image_name, validate_writable_path,
+    MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, MIN_CPU_MILLIS, MIN_DISK_BYTES, MIN_MEMORY_BYTES,
+    MIN_PIDS, validate_allowlist_entry, validate_argv, validate_image_name,
+    validate_writable_path,
 };
 use kilnd_exec_core::exec_options::{EnvLimits, EnvVar, ExecOptions, MAX_CWD_BYTES};
 use serde::{Deserialize, Serialize};
@@ -835,13 +836,13 @@ impl FirecrackerResponse {
 
 pub(crate) fn validate_spec(spec: &SandboxSpec) -> Result<(), String> {
     validate_image_name(&spec.image)?;
-    if spec.memory_bytes == 0
+    if spec.memory_bytes < MIN_MEMORY_BYTES
         || spec.memory_bytes > 8 << 30
-        || spec.cpu_millis == 0
+        || spec.cpu_millis < MIN_CPU_MILLIS
         || spec.cpu_millis > 8000
-        || spec.pids == 0
+        || spec.pids < MIN_PIDS
         || spec.pids > 4096
-        || spec.disk_bytes == 0
+        || spec.disk_bytes < MIN_DISK_BYTES
         || spec.disk_bytes > 32 << 30
     {
         return Err("invalid resource limits".into());

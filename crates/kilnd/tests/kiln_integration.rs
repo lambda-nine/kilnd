@@ -374,7 +374,7 @@ async fn leader_exit_stops_detached_descendants_and_closes_output() {
         .create(CreateRequest {
             memory_bytes: 64 << 20,
             pids: 64,
-            disk_bytes: 16 << 20,
+            disk_bytes: 64 << 20,
             ..Default::default()
         })
         .await
@@ -466,7 +466,7 @@ async fn a_sandbox_killed_behind_kilnds_back_is_lost_after_reconcile() {
     let s = m
         .create(CreateRequest {
             memory_bytes: 64 << 20,
-            disk_bytes: 16 << 20,
+            disk_bytes: 64 << 20,
             ..Default::default()
         })
         .await
@@ -510,7 +510,7 @@ async fn a_reappeared_backend_recovers_after_manager_restart_once() {
         manager
             .create(CreateRequest {
                 memory_bytes: 64 << 20,
-                disk_bytes: 16 << 20,
+                disk_bytes: 64 << 20,
                 ..Default::default()
             })
             .await
@@ -619,7 +619,7 @@ async fn hidden_registry_mount_does_not_mark_a_live_sandbox_lost() {
         manager
             .create(CreateRequest {
                 memory_bytes: 64 << 20,
-                disk_bytes: 16 << 20,
+                disk_bytes: 64 << 20,
                 ..Default::default()
             })
             .await
@@ -679,7 +679,7 @@ async fn dropping_exec_waiter_cleans_detached_descendants_and_pipes() {
         .create(CreateRequest {
             memory_bytes: 64 << 20,
             pids: 64,
-            disk_bytes: 16 << 20,
+            disk_bytes: 64 << 20,
             ..Default::default()
         })
         .await

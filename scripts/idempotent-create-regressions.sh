@@ -13,7 +13,7 @@ set -euo pipefail
 
 ctl() { sudo kilndctl "$@"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
-small=(--memory 64M --disk 16M)
+small=(--memory 64M --disk 64M)
 run=idem-$$-$(date +%s)
 created=()
 create_client=

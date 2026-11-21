@@ -841,6 +841,7 @@ fn validated_limits(args: &Args) -> Result<Limits> {
             bail!("default sandbox {name} {default} exceeds node budget {node_limit}");
         }
     }
+    limits.check_default_floors().map_err(anyhow::Error::msg)?;
     if limits.default_timeout > limits.max_timeout {
         bail!("--default-timeout-secs is above --max-timeout-secs");
     }

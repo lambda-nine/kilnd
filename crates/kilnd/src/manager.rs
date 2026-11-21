@@ -34,8 +34,9 @@ use crate::store::{
     SandboxBudgets, SandboxResources, Store,
 };
 use crate::validation::{
-    MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, validate_allowlist_entry, validate_argv,
-    validate_image_name, validate_writable_path,
+    MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, MIN_CPU_MILLIS, MIN_DISK_BYTES, MIN_MEMORY_BYTES,
+    MIN_PIDS, validate_allowlist_entry, validate_argv, validate_image_name,
+    validate_writable_path,
 };
 
 /// Limits and defaults; see `Config` in main.rs for the flags that set them.
@@ -188,6 +189,30 @@ impl Default for Limits {
             max_exec_streams_per_uid: 8,
             exec_stream: crate::exec_stream::StreamBuffer::default(),
         }
+    }
+}
+
+impl Limits {
+    /// A default below a request floor would make every default create fail in kiln's
+    /// shim after allocation, so startup refuses it.
+    pub fn check_default_floors(&self) -> std::result::Result<(), String> {
+        for (name, default, floor) in [
+            ("memory", self.default_memory_bytes, MIN_MEMORY_BYTES),
+            (
+                "cpu millis",
+                u64::from(self.default_cpu_millis),
+                u64::from(MIN_CPU_MILLIS),
+            ),
+            ("pids", u64::from(self.default_pids), u64::from(MIN_PIDS)),
+            ("disk", self.default_disk_bytes, MIN_DISK_BYTES),
+        ] {
+            if default < floor {
+                return Err(format!(
+                    "default sandbox {name} {default} is below the request minimum {floor}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -4670,6 +4695,32 @@ impl<R: Runtime> Manager<R> {
             writable_paths: req.writable_paths,
             labels: req.labels,
         };
+        // The floors, like the maxima, refuse before anything is charged or the runtime
+        // is called: kiln would fail a smaller value only after allocating.
+        if spec.memory_bytes < MIN_MEMORY_BYTES {
+            return invalid(format!(
+                "memory {} is below the minimum of {MIN_MEMORY_BYTES}",
+                spec.memory_bytes
+            ));
+        }
+        if spec.cpu_millis < MIN_CPU_MILLIS {
+            return invalid(format!(
+                "cpu {} millis is below the minimum of {MIN_CPU_MILLIS}",
+                spec.cpu_millis
+            ));
+        }
+        if spec.pids < MIN_PIDS {
+            return invalid(format!(
+                "pids {} is below the minimum of {MIN_PIDS}",
+                spec.pids
+            ));
+        }
+        if spec.disk_bytes < MIN_DISK_BYTES {
+            return invalid(format!(
+                "disk {} is below the minimum of {MIN_DISK_BYTES}",
+                spec.disk_bytes
+            ));
+        }
         if spec.memory_bytes > l.max_memory_bytes {
             return invalid(format!(
                 "memory {} is above the limit of {}",
@@ -5008,3 +5059,9 @@ mod m3_tests;
 
 #[cfg(test)]
 mod m4_tests;
+
+// Under tests/, like the VM test modules, so section 7.1's source inventory reads it as
+// a test file: it names reserved-mount writable paths such as /proc/x as inputs.
+#[cfg(test)]
+#[path = "manager/tests/ambiguous_create.rs"]
+mod ambiguous_create_tests;

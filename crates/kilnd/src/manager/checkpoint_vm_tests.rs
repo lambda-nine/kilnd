@@ -701,18 +701,28 @@ async fn run_fork() {
         .await
         .unwrap();
     let runs = std::fs::read_dir(RUNS).unwrap().count();
+    let disk_bytes = c3.seal.as_ref().unwrap().charge_bytes - 1;
     let e = m
         .create_owned(
             CreateRequest {
                 from_checkpoint: Some(c3.id.to_string()),
-                disk_bytes: c3.seal.as_ref().unwrap().charge_bytes - 1,
+                disk_bytes,
                 ..CreateRequest::default()
             },
             1000,
         )
         .await
         .unwrap_err();
-    assert_eq!(token(&e), Some("checkpoint_disk_too_small"), "{e:?}");
+    // A size under the request floor is refused by the floor first, also before any
+    // allocation.
+    if disk_bytes >= MIN_DISK_BYTES {
+        assert_eq!(token(&e), Some("checkpoint_disk_too_small"), "{e:?}");
+    } else {
+        assert!(
+            matches!(&e, Error::InvalidArgument(message) if message.contains("below the minimum")),
+            "{e:?}"
+        );
+    }
     let e = m
         .create_owned(
             CreateRequest {

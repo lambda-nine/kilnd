@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Refuse create and fork limits below what kiln can start. kiln checks none of them
+  before it allocates, so a create with `cpu_millis` 1-9 (kiln writes a cgroup quota
+  below 1 ms, which the kernel refuses) failed in kiln's shim after allocation and was
+  recorded as an ambiguous reservation, charged forever. An explicit value below 10
+  CPU millis, 32 MiB memory, 16 pids or 64 MiB disk is now `INVALID_ARGUMENT` before
+  anything is charged or kiln is called, in kilnd and again in the root helper; 0
+  still selects the default, and startup refuses a default below a floor. A create
+  from a checkpoint takes its limits from the request and gets the same floors. The
+  privileged regression scripts and the kiln integration tests now create with 64 MiB
+  of disk instead of 16 MiB.
 - Remove dead code: the guest broker's unused `tempfile` dev-dependency, seven items
   nothing references (`KilnWorkers::with_runs_root`, `DEFAULT_EXEC_STORE`,
   `DISPATCHED_ROLES`, `HELPER_STATE`, `open_work_dir`, `SandboxState::is_active`,

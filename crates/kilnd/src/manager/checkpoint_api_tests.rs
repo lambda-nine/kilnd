@@ -824,7 +824,10 @@ async fn quotas_admit_x_and_refuse_x_plus_one() {
     let other = api_source(&s, 1000).await;
     let e = api_capture(&s, &other.id, 1000).await.unwrap_err();
     refused(&e, Code::ResourceExhausted, "checkpoint_quota");
-    // A fork's disk: exactly S is admitted, S - 1 refused typed before any row.
+    // A fork's disk: S is below the request disk floor, so S - 1 and S are refused as
+    // INVALID_ARGUMENT before any row, and the floor itself (above S) is admitted. The
+    // charge boundary itself (exactly the charge admitted, one byte less refused
+    // `checkpoint_disk_too_small`) is in fork::compatibility_refusals_allocate_nothing.
     let ready = ids(&s, 1000, "")
         .await
         .into_iter()
@@ -842,21 +845,27 @@ async fn quotas_admit_x_and_refuse_x_plus_one() {
         msg
     };
     let rows = m.store.sandboxes(true).unwrap().len();
-    let e = s
-        .create_sandbox(as_uid(sized_fork(S - 1), 1000))
-        .await
-        .unwrap_err();
-    refused(&e, Code::InvalidArgument, "checkpoint_disk_too_small");
-    assert_eq!(m.store.sandboxes(true).unwrap().len(), rows, "no row");
+    for disk in [S - 1, S] {
+        let e = s
+            .create_sandbox(as_uid(sized_fork(disk), 1000))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::InvalidArgument, "{e:?}");
+        assert!(e.message().contains("below the minimum"), "{e:?}");
+        assert_eq!(m.store.sandboxes(true).unwrap().len(), rows, "no row");
+    }
     let f = s
-        .create_sandbox(as_uid(sized_fork(S), 1000))
+        .create_sandbox(as_uid(sized_fork(crate::validation::MIN_DISK_BYTES), 1000))
         .await
         .unwrap()
         .into_inner()
         .sandbox
         .unwrap();
     assert_eq!(sandbox_state(&f), pb::SandboxState::Ready);
-    assert_eq!(f.reservation.unwrap().disk_bytes, S);
+    assert_eq!(
+        f.reservation.unwrap().disk_bytes,
+        crate::validation::MIN_DISK_BYTES
+    );
 }
 
 /// Design 6: caps lowered below what is already charged block only new captures. Existing

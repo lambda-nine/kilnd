@@ -511,27 +511,26 @@ async fn health_stats_follow_every_scenario() {
     running.await.unwrap().unwrap();
     assert_eq!(stats(&health(&s, 1000).await).current_workers, 0);
 
-    // Refusals: the size cap, a too-small fork, the headroom; each counted once.
+    // Refusals: the size cap, a mismatched fork, the headroom; each counted once. (A
+    // fork one byte short of this checkpoint's charge is below the request disk floor,
+    // refused before the fork preflight; the charge boundary is in the fork tests.)
     let before = stats(&health(&s, 1000).await);
     refused(
         &capture_sized(&s, &src.id, 2 * GIB, 1000).await.unwrap_err(),
         Code::ResourceExhausted,
         "checkpoint_size_limit",
     );
-    let small = pb::CreateSandboxRequest {
+    let mismatched = pb::CreateSandboxRequest {
         spec: Some(pb::SandboxSpec {
-            limits: Some(pb::ResourceLimits {
-                disk_bytes: c.size_bytes - 1,
-                ..Default::default()
-            }),
+            image: "other".into(),
             ..Default::default()
         }),
         ..fork_msg(&c.id)
     };
     refused(
-        &s.create_sandbox(as_uid(small, 1000)).await.unwrap_err(),
+        &s.create_sandbox(as_uid(mismatched, 1000)).await.unwrap_err(),
         Code::InvalidArgument,
-        "checkpoint_disk_too_small",
+        "checkpoint_spec_mismatch",
     );
     free(&fake, GIB + S - 1, 1 << 50);
     refused(

@@ -630,7 +630,7 @@ time.sleep(30)
         memory_bytes: 64 << 20,
         cpu_millis: 1000,
         pids: 64,
-        disk_bytes: 16 << 20,
+        disk_bytes: 64 << 20,
         network: Network::None,
         read_only_root: false,
         writable_paths: vec![],

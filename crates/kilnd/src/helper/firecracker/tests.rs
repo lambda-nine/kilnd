@@ -4715,7 +4715,7 @@ async fn exit1_legacy_kiln_still_runs_with_the_group_enabled_and_disabled_by_def
     let mut stream = UnixStream::connect(&path).await.unwrap();
     fds::send(&stream, &[]).await.unwrap();
     let frame = format!(
-        r#"{{"version":3,"timeout_ms":1000,"deadline_ns":{},"operation":{{"kiln":{{"create":{{"spec":{{"image":"alpine","memory_bytes":67108864,"cpu_millis":1000,"pids":64,"disk_bytes":16777216,"network":"none","read_only_root":false,"writable_paths":[],"labels":{{"a":"1","a":"2"}}}}}}}}}}}}"#,
+        r#"{{"version":3,"timeout_ms":1000,"deadline_ns":{},"operation":{{"kiln":{{"create":{{"spec":{{"image":"alpine","memory_bytes":67108864,"cpu_millis":1000,"pids":64,"disk_bytes":67108864,"network":"none","read_only_root":false,"writable_paths":[],"labels":{{"a":"1","a":"2"}}}}}}}}}}}}"#,
         wire_deadline(1),
     );
     stream.write_u32(frame.len() as u32).await.unwrap();

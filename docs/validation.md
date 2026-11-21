@@ -13,6 +13,7 @@ the shared contract at that boundary; invalid API values return gRPC
 | Image | Empty selects the daemon default; effective names are 1–128 ASCII bytes: letters, digits, `-`, `_`, or `.`; the first byte is not `-` or `.` |
 | Allowlist | At most 64 entries, each at most 260 ASCII bytes: `HOST[:PORT]` or `IPv4[/PREFIX][:PORT]` |
 | Writable paths | Only with a read-only root; at most 16 absolute UTF-8 paths of at most 1024 bytes |
+| Resource limits | 0 selects the daemon default. An explicit value is at least 10 CPU millis, 32 MiB memory, 16 pids and 64 MiB disk, and at most the per-sandbox maximum |
 | Labels | At most 32 entries; keys are 1–63 ASCII bytes and use alphanumeric, `-`, `_`, `.`, or `/`; values are at most 256 UTF-8 bytes and contain no controls |
 | Argv | 1–4096 UTF-8 arguments; `argv[0]` is nonempty; NUL is forbidden |
 | Exec `cwd` | Empty (`/`, as before) or an absolute UTF-8 path starting with `/`, at most 4,096 bytes (`--max-exec-cwd-bytes` may lower it), without NUL; not normalized |
@@ -46,6 +47,13 @@ API limit and maximum argc, the largest possible encoded body is
 `262144 + 3*4096 + 4 = 274436` bytes, safely below the backend cap.
 
 Create limits are checked as one request before persistence or backend work.
+The floors exist because kiln checks none of them before it allocates: a smaller value
+fails in kiln's shim after allocation (kiln writes `cpu.max` as
+`round(cpus * 100000) 100000`, and cgroup v2 refuses a quota below 1 ms), and kilnd
+must record that failure as an ambiguous reservation, charged until an operator
+releases it (see "Releasing an ambiguous reservation" in [setup.md](setup.md)). The
+same floors apply to a create from a checkpoint, which takes its limits from the
+request, and the defaults are checked against them at startup.
 Exec validation likewise happens before an execution row or backend spawn. An env
 or cwd the backend has not proven is refused `UNIMPLEMENTED` before it is validated;
 the root helper and kiln revalidate both at the code ceilings, kiln in a strict form

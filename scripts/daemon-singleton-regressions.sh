@@ -41,7 +41,7 @@ trap cleanup EXIT INT TERM
 
 echo "1. Start a real execution under the incumbent daemon"
 ctl health >/dev/null
-sandbox=$(ctl create --memory 64M --disk 16M)
+sandbox=$(ctl create --memory 64M --disk 64M)
 ctl exec "$sandbox" -- sh -c \
     'while [ ! -e /tmp/kilnd-singleton-release ]; do sleep 0.1; done; printf singleton-ok' \
     >"$tmp/exec.out" 2>"$tmp/exec.err" &

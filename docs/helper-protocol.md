@@ -128,7 +128,8 @@ must be upgraded with its helper as always.
 
 The helper reuses the API's image, allowlist, path, argv and backend-ID
 validators. It independently checks labels, resource ceilings, descriptor
-counts and sizes before any backend invocation. Hard ceilings are 8 GiB memory,
+counts and sizes before any backend invocation. Resource floors are 10 CPU millis,
+32 MiB memory, 16 PIDs and 64 MiB disk, the same as the daemon's. Hard ceilings are 8 GiB memory,
 8 CPUs, 4096 PIDs, 32 GiB disk, 64 allowlist entries, 16 writable paths,
 32 labels, 4096 argv entries / 256 KiB argv, 1 MiB stdin, 1 MiB retained
 output per stream, a 4,096-byte cwd, 64 env entries / 32 KiB env and a 40 KiB options
