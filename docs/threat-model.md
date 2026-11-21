@@ -445,21 +445,35 @@ sandbox compromises the host.
   release that reservation even when the ordinary listing is empty, because
   hidden or unpublished resources may survive. Neither an empty listing nor a
   retry returns this capacity. The one release is the operator's: `kilnd
-  release-ambiguous` (docs/setup.md), as root with this instance stopped. It
-  runs the startup reconciliation pass, then needs a second complete inventory
-  and a read of kiln's runs directory itself, since `kiln ls` skips a run
-  directory without `shim.pid`, to hold nothing a live row doesn't own. Any
-  error, deadline or unexplained entry refuses and names what to remove; the
-  release is one audit row (schema 17's `operator_releases`: owner, charges,
-  operator uid, time, reason and the inventory's SHA-256), append-only, whose
-  insert is the only write that can tag the row `operator_attested`. It trusts
-  root and the installed kiln: the proof is that nothing kilnd or kiln can see
-  remains, not that the kernel holds nothing else. Inputs kiln refuses only
-  after allocating (limits below kiln's floors, writable paths over the
-  filesystems kiln mounts itself) are refused before any charge, so a caller
-  can't make such a reservation on purpose. Ordinary RPC cancellation is not
-  this case: accepted creates are daemon-owned and finish or compensate after
-  the caller disconnects.
+  release-ambiguous` (docs/setup.md), as root with this instance's kilnd and
+  kilnd-helper stopped. The state lock alone proves only that no daemon of the
+  instance runs: a create the helper accepted can outlive the daemon, and kiln's
+  shim outlives its CLI and creates its run directory afterwards. So the command
+  holds the helper's serving lock, which every serving helper holds until its
+  accepted requests settle, from before its proof until after its commit, and is
+  itself the node's only helper meanwhile. It runs the startup reconciliation
+  pass, needs a second complete inventory, then needs every kiln process on the
+  node to be a published shim, a descendant of one or a kiln node service (two
+  full passes; any other, a hand-run `kiln` included, refuses with its pid), and
+  only then reads kiln's runs directory itself, since `kiln ls` skips a run
+  directory without `shim.pid`, to hold nothing a live row doesn't own. With no
+  helper serving and no kiln process left that could still publish a run, that
+  read is a fence rather than a snapshot. Any error, deadline or unexplained
+  entry refuses and names what to remove; the release is one audit row (schema
+  17's `operator_releases`: owner, charges, operator uid, time, reason and the
+  inventory's SHA-256), append-only, whose insert is the only write that can tag
+  the row `operator_attested`. It trusts root and the installed kiln: the proof
+  is that nothing kilnd or kiln can see remains, not that the kernel holds
+  nothing else, and a kiln that root starts by hand after the scan is outside it.
+  kilnd refuses the inputs it knows kiln rejects only after allocating (limits
+  below kiln's floors, writable paths over the filesystems kiln mounts itself)
+  before any charge. A writable path whose parent in the image is a symlink or a
+  regular file is refused before allocation only by a kiln whose create
+  preflight walks the image, which the next kiln release adds; with an older
+  kiln a caller can still leave such an ambiguous charged row on purpose, and
+  the operator release is the recovery. Ordinary RPC cancellation is not this
+  case: accepted creates are daemon-owned and finish or compensate after the
+  caller disconnects.
 - **Ownership is not resource isolation between group members.** It stops them
   from reaching each other's sandboxes through the API, but they share one kernel,
   one set of node budgets and one retention count, so one member can exhaust

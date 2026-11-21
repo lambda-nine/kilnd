@@ -804,24 +804,49 @@ can observe proves the create left nothing: kiln can leave a run directory with 
 `shim.pid`, which `kiln ls`, `kiln gc` and `kiln rm` all skip. Delete refuses such a
 row with `FAILED_PRECONDITION`. Enough of them fill a node for every uid.
 
-Inputs kiln refuses only after allocating are refused before any charge
-(`INVALID_ARGUMENT`; see the [validation contract](validation.md)), so these rows
-come from kiln failures, crashes or host trouble rather than from a caller. To
-release one, as root on the node, with that instance stopped:
+kilnd refuses the inputs it knows kiln rejects only after allocating, before any
+charge (`INVALID_ARGUMENT`; see the [validation contract](validation.md)): limits
+below kiln's floors and writable paths over the filesystems kiln mounts itself. A
+writable path whose parent in the image is a symlink or a regular file (Alpine's
+`/var/run -> ../run`, say, or `/etc/passwd/x`) is refused before allocation only by
+a kiln whose create preflight walks the image, which the next kiln release adds.
+With an older kiln such a request still leaves an ambiguous charged row, and a
+caller can make one on purpose; this command is the recovery. Other rows come from
+kiln failures, crashes or host trouble.
+
+To release one, as root on the node, stop both kilnd and kilnd-helper, run the
+command, then start the helper and then kilnd:
 
 ```sh
 sudo systemctl stop kilnd            # or kilnd@NAME for a further instance
+sudo systemctl stop kilnd-helper.socket kilnd-helper
 sudo kilnd release-ambiguous --sandbox sb-0123456789abcdef \
     --reason "kiln exited 1 during create; runs directory checked"
+sudo systemctl start kilnd-helper.socket kilnd-helper
 sudo systemctl start kilnd
 ```
 
-`--state-dir` (default `/var/lib/kilnd`) and `--helper-socket` (default
-`/run/kilnd-helper/helper.sock`) name the instance as the daemon's flags do; pass
-`--enable-workspace-checkpoints` if the daemon runs with it. The command gives up
-root for the state directory's own account before it opens the database, takes
-the state lock (exit 75 while kilnd or anything else holds it) and holds it to the
-end. It then proves the node clean, refusing at the first gap:
+Stopping the helper pauses every instance on the node, Firecracker ones included,
+until it starts again, but running sandboxes stay up: the unit's `KillMode=process`
+leaves their shims alone. Stop the socket too, or the next helper call reactivates
+it; a helper that starts during the release exits, since it can't take its serving
+lock, and `systemctl reset-failed kilnd-helper` may be needed before it starts again.
+
+`--state-dir` (default `/var/lib/kilnd`) names the instance as the daemon's flag
+does, and must belong to the `kilnd` account: kiln's helper group serves only it.
+`--helper-lock` (default `/var/lib/kilnd-helper/helper.lock`) and `--kiln` (default
+`/usr/local/bin/kiln`) are kilnd-helper's `--serve-lock` and `--kiln`; pass
+`--enable-workspace-checkpoints` if the daemon runs with it, which also serves the
+checkpoint group as the helper's `--enable-checkpoints` does.
+
+As root, the command first takes kilnd-helper's serving lock, which every serving
+helper holds until every request it accepted has settled (exit 75 while a helper or
+another release holds it), and keeps it to the end. It opens kiln's runs directory,
+then forks. The child gives up root for the state directory's own account before it
+opens the database, takes the state lock (exit 75 while kilnd or anything else holds
+it) and holds it to the end. The parent stays root as the node's only helper: it
+serves kiln to the child alone, on a private socket, and scans processes for it.
+The child then proves the node clean, refusing at the first gap:
 
 1. The row is a charged ambiguous `FAILED` legacy create with no backend ID
    (exit 65 otherwise: unknown, live, compensated, definitely not created, fenced
@@ -831,13 +856,23 @@ end. It then proves the node clean, refusing at the first gap:
    included), and the checkpoint barrier's inventory of checkpoint storage is
    clean. What it changes is what the next start would change.
 3. A second complete inventory names only backends a live row owns.
-4. kiln's runs directory (`/var/lib/kiln/runs`), read by its entries, holds only
+4. Every kiln process on the node (its image is the configured kiln, or its
+   executable is named `kiln`, deleted or not) is a published sandbox's shim (its
+   pid and start time are a run's `shim.pid` and `shim.start`), a descendant of one,
+   or one of kiln's node services (`kiln dns`, `metrics`, `metrics-collect`,
+   `network-setup`). Anything else exits 75 and names each pid and executable: a
+   create that a stopped helper started can still be setting up, since kiln's shim
+   outlives its CLI and creates its run directory afterwards. Any hand-run `kiln` on
+   the node (even `kiln ls`) refuses the release too; rerun it once those processes
+   have finished. Every process is read twice.
+5. kiln's runs directory (`/var/lib/kiln/runs`), read by its entries, holds only
    those backends and kiln's own `.checkpoints` store.
 
-Anything else exits 69 and names what was found: `kiln gc ID` removes a listed
-stale run, `kiln rm ID` a live one you have checked, and a directory without
-`shim.pid` must be inspected and removed by hand, once no create can still be
-working in it. Then retry. On success it prints one line:
+With no helper serving, nothing new can start a create, and step 4 leaves nothing
+old that can still publish one, so step 5's read is final. Anything else exits 69 and
+names what was found: `kiln gc ID` removes a listed stale run, `kiln rm ID` a live one
+you have checked, and a directory without `shim.pid` must be inspected and removed by
+hand. Then retry. On success it prints one line:
 
 ```text
 released sb-0123456789abcdef owner_uid=1000 sandboxes=1 host_cpu_millis=0 memory_bytes=536870912 pids=128 disk_bytes=1073741824 inventory_sha256=…

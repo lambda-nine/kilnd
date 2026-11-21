@@ -6,6 +6,25 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- `kilnd release-ambiguous` now fences the helper, not just the daemon. The state lock
+  proved no daemon of the instance ran, but a create the separate root helper had
+  accepted could outlive the daemon, and kiln's shim outlives its CLI and creates its
+  run directory afterwards, so a run could appear after the proof's runs-directory read
+  and the release still commit. Every serving `kilnd-helper` now holds a serving lock
+  (`--serve-lock`, default `/var/lib/kilnd-helper/helper.lock`) until every request it
+  accepted has settled, and exits rather than serve while it is held. The release takes
+  it as root before anything else (exit 75 while a helper serves; stop
+  `kilnd-helper.socket` and `kilnd-helper` first), holds it until after the commit, and
+  serves kiln to itself meanwhile: it forks, and the root half is the node's only helper,
+  for the unprivileged half alone, on a private abstract socket. Before reading the runs
+  directory it scans every process twice and refuses (exit 75, naming each pid and
+  executable) any kiln process that isn't a published sandbox's shim, a descendant of
+  one or a kiln node service; a hand-run `kiln` counts too. `--helper-socket` is gone,
+  `--helper-lock` and `--kiln` are new, and the state directory must be the `kilnd`
+  account's. The docs no longer claim a caller can't make an ambiguous reservation on
+  purpose: a writable path whose parent in the image is a symlink or a regular file
+  still makes one with a kiln older than the next release.
+
 - A source sandbox held in DELETING behind an interrupted capture no longer names
   another uid's checkpoint in its stored reason. When root captured someone else's
   sandbox, its owner saw root's checkpoint ID, which is `NOT_FOUND` to them; the

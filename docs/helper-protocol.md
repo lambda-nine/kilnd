@@ -9,6 +9,13 @@ connections whose kernel peer UID equals the configured `kilnd` account's UID, o
 root enrolled for a Firecracker instance, and only the `kilnd` account gets kiln requests.
 It rejects root connections. Group membership alone grants no helper access. The daemon verifies that its helper peer is root.
 
+A serving helper holds an exclusive lock, `--serve-lock` (default
+`/var/lib/kilnd-helper/helper.lock`, in its root-only state directory, close-on-exec),
+from before it accepts a request until every request it accepted has settled. It exits
+rather than serve if the lock is held: `kilnd release-ambiguous` holds it for its whole
+proof, and meanwhile serves the kiln group to itself, to the `kilnd` account alone, on a
+private abstract socket (docs/setup.md, "Releasing an ambiguous reservation").
+
 The helper accepts a private v3 typed request enum. Its outer `operation` enum
 has `kiln`, `firecracker` and `checkpoint` variants, each separately validated. The
 [Firecracker group](#firecracker-group-schema-2) and the

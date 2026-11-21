@@ -850,9 +850,12 @@ async fn an_operator_release_of_an_ambiguous_fork_frees_the_row_and_leaves_the_p
     // kiln's runs directory: the checkpoint store, the live source's run, and in the
     // first pass the directory a restore killed before shim.pid would leave.
     struct Runs(Vec<String>);
-    impl RunsDirectory for Runs {
+    impl ReleaseNode for Runs {
         fn entries(&self) -> anyhow::Result<Vec<std::ffi::OsString>> {
             Ok(self.0.iter().map(Into::into).collect())
+        }
+        fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
         }
     }
     let source_run = source.backend_id.clone().unwrap();

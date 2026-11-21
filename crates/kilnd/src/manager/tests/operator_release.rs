@@ -1,10 +1,10 @@
 //! `kilnd release-ambiguous` against the fake backend: an ambiguous reservation is
-//! released only after reconcile, a complete second inventory and kiln's runs
-//! directory all come back clean, with its audit row; every refusal leaves the row
-//! charged and writes nothing.
+//! released only after reconcile, a complete second inventory, the node's kiln
+//! processes and kiln's runs directory all come back clean, with its audit row; every
+//! refusal leaves the row charged and writes nothing.
 
 use std::ffi::OsString;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::model::{Digest, LegacyRelease, ReservationRelease};
@@ -12,20 +12,89 @@ use crate::runtime::fake::{FakeGate, FakeRuntime};
 
 type M = Arc<Manager<FakeRuntime>>;
 
-/// kiln's runs directory as a list of names.
+/// kiln's runs directory as a list of names, on a node whose kiln processes are all
+/// published shims, their descendants or node services.
 struct Runs(Vec<&'static str>);
 
-impl RunsDirectory for Runs {
+impl ReleaseNode for Runs {
     fn entries(&self) -> anyhow::Result<Vec<OsString>> {
         Ok(self.0.iter().map(OsString::from).collect())
+    }
+    fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
+        Ok(vec![])
     }
 }
 
 struct UnreadableRuns;
 
-impl RunsDirectory for UnreadableRuns {
+impl ReleaseNode for UnreadableRuns {
     fn entries(&self) -> anyhow::Result<Vec<OsString>> {
         anyhow::bail!("Permission denied (os error 13)")
+    }
+    fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
+        Ok(vec![])
+    }
+}
+
+/// The adversarial review's race, modeled as production allows it: a create the helper
+/// accepted before the daemon died outlives both, as a kiln shim still setting up
+/// (kiln forks it before it has a run directory and gives it no parent-death signal).
+/// `survivor` is what the process scan finds; `publish_on` is when the old create's run
+/// appears in the backend and the runs directory.
+struct OldHelperCreate {
+    fake: FakeRuntime,
+    survivor: Option<&'static str>,
+    publish_on: Publish,
+    published: Mutex<Option<String>>,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Publish {
+    /// As the runs directory is read, just behind the listing: the snapshot the unfenced
+    /// proof trusted.
+    DuringTheRunsRead,
+    /// While the processes are scanned: the shim finishes and exits mid-scan.
+    DuringTheProcessScan,
+}
+
+impl OldHelperCreate {
+    fn new(fake: &FakeRuntime, survivor: Option<&'static str>, publish_on: Publish) -> Self {
+        Self {
+            fake: fake.clone(),
+            survivor,
+            publish_on,
+            published: Mutex::new(None),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn publish(&self) {
+        let id = self.fake.insert(BackendStatus::Running);
+        *self.published.lock().unwrap() = Some(id);
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl ReleaseNode for OldHelperCreate {
+    fn entries(&self) -> anyhow::Result<Vec<OsString>> {
+        self.calls.lock().unwrap().push("runs");
+        let listed = self.published.lock().unwrap().iter().map(OsString::from).collect();
+        if self.publish_on == Publish::DuringTheRunsRead {
+            // Just behind the listing: the snapshot is empty, the backend no longer is.
+            self.publish();
+        }
+        Ok(listed)
+    }
+    fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
+        self.calls.lock().unwrap().push("processes");
+        if self.publish_on == Publish::DuringTheProcessScan {
+            self.publish();
+        }
+        Ok(self.survivor.iter().map(|p| p.to_string()).collect())
     }
 }
 
@@ -290,6 +359,99 @@ async fn a_run_directory_kilns_listing_skips_refuses() {
         .unwrap_err();
     assert!(
         matches!(refusal, ReleaseRefusal::Inventory(_)),
+        "{refusal:?}"
+    );
+    still_charged(&m, &stuck.id, 1).await;
+}
+
+/// The regression for the adversarial review's HIGH 2: the old create's shim survives the
+/// stopped helper and would publish its run while the runs directory is read. The process
+/// scan names it first, so the proof never reaches that read, nothing is released, and
+/// the command exits 75 naming the pid.
+#[tokio::test]
+async fn an_old_helper_create_still_setting_up_refuses_before_the_runs_snapshot() {
+    let (m, fake) = one_slot();
+    let stuck = ambiguous(&m, &fake, 1000).await;
+    let node = OldHelperCreate::new(
+        &fake,
+        Some("4242 /usr/local/bin/kiln"),
+        Publish::DuringTheRunsRead,
+    );
+
+    let refusal = m
+        .release_ambiguous(request(&stuck.id), &node)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&refusal, ReleaseRefusal::KilnProcesses(p) if p == &["4242 /usr/local/bin/kiln"]),
+        "{refusal:?}"
+    );
+    assert!(refusal.to_string().contains("4242 /usr/local/bin/kiln"), "{refusal}");
+    assert_eq!(
+        crate::release_ambiguous::refusal_exit(&refusal),
+        crate::release_ambiguous::EXIT_BUSY
+    );
+    assert_eq!(node.calls(), ["processes"], "the runs directory was read");
+    assert!(node.published.lock().unwrap().is_none(), "the old create published");
+    still_charged(&m, &stuck.id, 1).await;
+}
+
+/// The same create finishing while the processes are scanned leaves no process to name,
+/// but its run is there by the time the runs directory is read, which follows the scan:
+/// refused, naming the run.
+#[tokio::test]
+async fn a_run_published_during_the_process_scan_is_refused_by_the_runs_read() {
+    let (m, fake) = one_slot();
+    let stuck = ambiguous(&m, &fake, 1000).await;
+    let node = OldHelperCreate::new(&fake, None, Publish::DuringTheProcessScan);
+
+    let refusal = m
+        .release_ambiguous(request(&stuck.id), &node)
+        .await
+        .unwrap_err();
+
+    let published = node.published.lock().unwrap().clone().unwrap();
+    assert!(
+        matches!(&refusal, ReleaseRefusal::UnexplainedRunDirectories(n) if n.as_slice() == std::slice::from_ref(&published)),
+        "{refusal:?}"
+    );
+    assert_eq!(node.calls(), ["processes", "runs"]);
+    still_charged(&m, &stuck.id, 1).await;
+}
+
+/// The scan follows reconcile and the second inventory: a node they refuse is never
+/// scanned, and a failed scan refuses as an incomplete inventory.
+#[tokio::test]
+async fn the_process_scan_follows_the_inventory_and_its_failure_refuses() {
+    let (m, fake) = one_slot();
+    let stuck = ambiguous(&m, &fake, 1000).await;
+    let stray = fake.insert(BackendStatus::Running);
+    let node = OldHelperCreate::new(&fake, None, Publish::DuringTheRunsRead);
+    let refusal = m
+        .release_ambiguous(request(&stuck.id), &node)
+        .await
+        .unwrap_err();
+    assert!(matches!(refusal, ReleaseRefusal::UnexplainedRuns(_)), "{refusal:?}");
+    assert!(node.calls().is_empty(), "{:?}", node.calls());
+    fake.state().sandboxes.remove(&stray);
+    still_charged(&m, &stuck.id, 1).await;
+
+    struct ScanFails;
+    impl ReleaseNode for ScanFails {
+        fn entries(&self) -> anyhow::Result<Vec<OsString>> {
+            panic!("read after a failed scan")
+        }
+        fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
+            anyhow::bail!("read 77/exe: Permission denied (os error 13)")
+        }
+    }
+    let refusal = m
+        .release_ambiguous(request(&stuck.id), &ScanFails)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refusal, ReleaseRefusal::Inventory(e) if e.contains("Permission denied")),
         "{refusal:?}"
     );
     still_charged(&m, &stuck.id, 1).await;

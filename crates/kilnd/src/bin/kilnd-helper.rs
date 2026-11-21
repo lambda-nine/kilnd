@@ -5,7 +5,6 @@ use std::{
     ffi::CString,
     io::Read,
     os::fd::{AsRawFd, FromRawFd},
-    os::unix::fs::MetadataExt,
     path::PathBuf,
 };
 use tokio_util::sync::CancellationToken;
@@ -30,6 +29,11 @@ struct Args {
     /// off; without it the group answers Disabled.
     #[arg(long)]
     enable_checkpoints: bool,
+    /// The serving lock, held while this helper serves and until every request it
+    /// accepted has settled. `kilnd release-ambiguous` holds it for its whole proof; a
+    /// helper that finds it held exits rather than serve.
+    #[arg(long, default_value = kilnd::helper::DEFAULT_SERVE_LOCK)]
+    serve_lock: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -133,19 +137,7 @@ async fn main() -> Result<()> {
     }
     // No request can select an executable; the administrator's configured
     // executable and every ancestor must be root-owned and not writable.
-    if !args.kiln.is_absolute() {
-        bail!("kiln path must be absolute");
-    }
-    let bin = args.kiln.canonicalize()?;
-    for path in bin.ancestors() {
-        let m = std::fs::symlink_metadata(path)?;
-        if m.uid() != 0 || m.mode() & 0o022 != 0 {
-            bail!("untrusted executable path {}", path.display());
-        }
-    }
-    if !bin.is_file() {
-        bail!("kiln executable is not a file");
-    }
+    let bin = kilnd::helper::trusted_kiln(&args.kiln)?;
     if args.firecracker_init_ledger {
         let path = args.firecracker_policy.as_deref().context("policy path")?;
         let policy = kilnd::helper::firecracker::read_policy(path, service_uid()?)
@@ -155,6 +147,17 @@ async fn main() -> Result<()> {
             .map_err(anyhow::Error::msg)
             .context("provision node ledger");
     }
+    // Held to the end of main: past serve_with_groups, which returns only once every
+    // request task it spawned has settled, and past the groups' own shutdown.
+    let _serving = match kilnd::helper::ServeLock::acquire(&args.serve_lock) {
+        Ok(lock) => lock,
+        Err(kilnd::helper::ServeLockError::Held(path)) => bail!(
+            "{} is held: `kilnd release-ambiguous` (or another kilnd-helper) is running; \
+             not serving until it has finished",
+            path.display()
+        ),
+        Err(error) => return Err(anyhow::Error::new(error).context("take the serving lock")),
+    };
     if std::env::var("LISTEN_PID")?.parse::<u32>()? != std::process::id()
         || std::env::var("LISTEN_FDS")? != "1"
     {

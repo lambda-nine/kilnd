@@ -116,10 +116,19 @@ pub async fn serve_with_groups(
     let runtime = Arc::new(DirectKilnRuntime::new(bin));
     let budgets = Arc::new(Budgets::new());
     let tasks = TaskTracker::new();
+    // A listener error still waits for every accepted request below: the caller's serving
+    // lock must outlast every operation this helper started.
+    let mut failed = None;
     loop {
         let accepted = tokio::select! {
             _ = shutdown.cancelled() => break,
-            result = listener.accept() => result?,
+            result = listener.accept() => match result {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            },
         };
         let stream = accepted.0;
         // Reject before reading any attacker-controlled frame (including root). Darwin
@@ -157,7 +166,7 @@ pub async fn serve_with_groups(
     }
     tasks.close();
     tasks.wait().await;
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 struct Groups {

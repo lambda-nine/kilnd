@@ -28,6 +28,26 @@ pub(crate) struct AttachedConnection {
     _stream: UnixStream,
 }
 
+/// Connects to the helper. A path whose first byte is NUL, which no filesystem path and
+/// no command-line flag can be, names a Linux abstract socket: the private helper `kilnd
+/// release-ambiguous` serves to itself (`release_ambiguous::abstract_helper_path`).
+async fn connect(path: &std::path::Path) -> io::Result<UnixStream> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::ffi::OsStrExt;
+        if let Some(name) = path.as_os_str().as_bytes().strip_prefix(b"\0") {
+            let address = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+            // A Unix connect to a listening socket completes at once unless its backlog
+            // is full; the private helper accepts as fast as its one client calls.
+            let stream = std::os::unix::net::UnixStream::connect_addr(&address)?;
+            stream.set_nonblocking(true)?;
+            return UnixStream::from_std(stream);
+        }
+    }
+    UnixStream::connect(path).await
+}
+
 fn request_for(operation: Operation, deadline: Instant) -> io::Result<Request> {
     let remaining = deadline
         .saturating_duration_since(Instant::now())
@@ -121,7 +141,7 @@ impl Client {
     ) -> io::Result<(FirecrackerResponse, AttachedConnection)> {
         let deadline = deadline.min(group_deadline(&request.operation));
         let request = request_for(Operation::Firecracker(request), deadline)?;
-        let mut stream = timeout_at(deadline, UnixStream::connect(&self.path))
+        let mut stream = timeout_at(deadline, connect(&self.path))
             .await
             .map_err(io::Error::other)??;
         if stream.peer_cred()?.uid() != self.expected_uid {
@@ -201,7 +221,7 @@ impl Client {
         let request = request_for(operation, deadline)?;
         let mut stream = timeout_at(
             deadline.min(Instant::now() + Duration::from_secs(2)),
-            UnixStream::connect(&self.path),
+            connect(&self.path),
         )
         .await
         .map_err(io::Error::other)??;

@@ -307,15 +307,19 @@ Reservations on a legacy row follow ownership evidence:
   create and every row older than schema 5. Delete refuses to release it even
   with an empty listing: no current Runtime operation can account for hidden or
   unpublished resources without the ID. Only an operator releases it, with
-  `kilnd release-ambiguous` as root while the instance is stopped (setup.md): it
-  runs the startup reconciliation pass, then needs a second complete inventory and
-  kiln's runs directory, read by its entries since `kiln ls` skips a run directory
-  without `shim.pid`, to hold nothing a live row doesn't own. The release is one
-  insert into the append-only `operator_releases` table (schema 17), whose trigger
-  tags the row `operator_attested` in the same statement; the row stays `FAILED`
-  and then deletes as a `definitely_not_created` one does. Inputs kiln refuses only
-  after allocating are refused before any charge (below), so these rows come from
-  kiln failures and crashes, not from a caller's request.
+  `kilnd release-ambiguous` as root while the instance and kilnd-helper are stopped
+  (setup.md): holding the helper's serving lock throughout, so no helper serves, it
+  runs the startup reconciliation pass, then needs a second complete inventory, no
+  kiln process that isn't a published shim, a descendant of one or a kiln node
+  service, and kiln's runs directory, read by its entries since `kiln ls` skips a
+  run directory without `shim.pid`, to hold nothing a live row doesn't own. The
+  release is one insert into the append-only `operator_releases` table (schema 17),
+  whose trigger tags the row `operator_attested` in the same statement; the row
+  stays `FAILED` and then deletes as a `definitely_not_created` one does. Inputs
+  kilnd knows kiln refuses only after allocating are refused before any charge
+  (below); a writable path whose parent in the image is a symlink or a regular file
+  still leaves such a row with a kiln older than the next release, whose create
+  preflight walks the image.
 - `FAILED` with the durable `definitely_not_created` marker releases. Only the
   explicit `CreateFailure::definitely_not_created` constructor can produce it,
   and one SQLite update writes the state and marker together, so there is no

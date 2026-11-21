@@ -5,8 +5,27 @@
 //! with no backend ID is one it can't: kiln never reported an ID, and `kiln ls` skips a
 //! run directory without `shim.pid`, which a failed or killed create can leave
 //! (kiln `runtime/src/container.rs:125-139`, `runtime/src/persistent.rs:902-908`).
-//! With kilnd stopped, the operator can. The proof is everything below, in order, and
-//! any failure, deadline or unexplained entry refuses with nothing released:
+//! With kilnd and kilnd-helper stopped, the operator can.
+//!
+//! **Why one pass is a fence and not a snapshot.** The state lock only proves no daemon
+//! of this instance runs. The create may have been accepted by the separate root helper,
+//! whose kiln work outlives the daemon, so the caller also holds the helper's serving
+//! lock (`helper::ServeLock`) from before reconcile until after the commit below: no
+//! helper serves, so nothing new starts a kiln create. An old one can still publish,
+//! because kiln's create forks a detached shim before it has a run directory
+//! (`runtime/src/persistent.rs:239-264`: `new_id`, `fork`, `setsid`, then
+//! `supervise_persistent`), and that shim has no parent-death signal: when the helper
+//! kills or loses the CLI, the shim goes on to `create_run_dir`, its setup and
+//! `publish_shim_identity` (`runtime/src/container.rs:114-139`). With the serving lock
+//! held, a new kiln process can only come from forking an existing one, and a published
+//! shim's descendants (its sandbox init and what that runs) never create a host run
+//! directory. So a scan of every process that finds only published shims, their
+//! descendants and kiln's node services, followed by a read of the runs directory, is a
+//! fence: nothing unscanned can still publish a run there afterwards. The scan reads
+//! every process twice, so a shim forked while the first pass ran is in the second.
+//!
+//! The proof is everything below, in order, and any failure, deadline or unexplained
+//! entry refuses with nothing released:
 //!
 //! 1. The row is a charged ambiguous FAILED legacy create with no backend ID.
 //! 2. The startup reconciliation pass ([`Manager::reconcile`]) completes: the backend
@@ -17,7 +36,9 @@
 //! 3. Reconcile left no backend sandbox it can't name (`unmanaged`) and blocked
 //!    nothing.
 //! 4. A second complete inventory names only backends a live row owns.
-//! 5. kiln's runs directory, read by its own entries, holds only those backends and
+//! 5. Every kiln process on the node is a published shim, a descendant of one, or a
+//!    kiln node service ([`ReleaseNode::kiln_processes`]).
+//! 6. kiln's runs directory, read by its own entries, holds only those backends and
 //!    the checkpoint namespace kiln itself reserves there.
 //!
 //! The release commits with the SHA-256 of that inventory in its audit row.
@@ -42,10 +63,15 @@ use crate::store::{
 /// and inside `images/`, never directly here, so one here is unexplained.
 pub const KILN_RUNS_RESERVED: &str = ".checkpoints";
 
-/// kiln's runs directory, read by its entries. The binary opens it as root before
-/// giving up root, so the listing needs no privilege when it is read.
-pub trait RunsDirectory {
+/// What root sees of the node, for steps 5 and 6.
+pub trait ReleaseNode {
+    /// kiln's runs directory, read by its entries. The binary opens it as root before
+    /// giving up root, so the listing needs no privilege when it is read.
     fn entries(&self) -> anyhow::Result<Vec<OsString>>;
+    /// Every kiln process that is not a published shim, a descendant of one or a kiln
+    /// node service, each as `PID EXE`. The binary's root half reads every process
+    /// twice (`release_ambiguous::unexplained_kiln_processes`).
+    fn kiln_processes(&self) -> anyhow::Result<Vec<String>>;
 }
 
 /// What the operator asks for.
@@ -81,6 +107,9 @@ pub enum ReleaseRefusal {
     UnexplainedRuns(Vec<String>),
     /// Entries in kiln's runs directory no live row owns.
     UnexplainedRunDirectories(Vec<String>),
+    /// kiln processes that may still publish a run: a create a stopped helper started,
+    /// or a hand-run kiln.
+    KilnProcesses(Vec<String>),
     Store(String),
 }
 
@@ -114,6 +143,11 @@ impl std::fmt::Display for ReleaseRefusal {
                 "entries in kiln's runs directory no kilnd row owns: {}; `kiln gc ID` (stale) or `kiln rm ID` (live) removes one that has shim.pid, and one without it must be inspected and removed by hand (no create may still be running in it), then retry",
                 names.join(" ")
             ),
+            Self::KilnProcesses(processes) => write!(
+                f,
+                "kiln processes that are not a published sandbox's shim or its descendants: {}; a create a stopped kilnd-helper started may still be setting up, and a hand-run kiln counts too; wait for them to finish and retry",
+                processes.join(", ")
+            ),
             Self::Store(e) => write!(f, "{e}"),
         }
     }
@@ -125,12 +159,13 @@ fn hex(bytes: &[u8]) -> String {
 
 impl<R: Runtime> Manager<R> {
     /// Proves the node clean of anything the ambiguous create may have left, then
-    /// releases its reservation with an audit row. The caller holds the state lock,
-    /// so no daemon of this instance runs beside it.
+    /// releases its reservation with an audit row. The caller holds the state lock, so
+    /// no daemon of this instance runs beside it, and the helper's serving lock, so no
+    /// helper does (see the module documentation).
     pub async fn release_ambiguous(
         &self,
         request: ReleaseRequest<'_>,
-        runs: &dyn RunsDirectory,
+        node: &dyn ReleaseNode,
     ) -> Result<ReleaseProved, ReleaseRefusal> {
         let store_error = |e: anyhow::Error| ReleaseRefusal::Store(format!("{e:#}"));
         valid_release_reason(request.reason).map_err(ReleaseRefusal::Ineligible)?;
@@ -197,8 +232,17 @@ impl<R: Runtime> Manager<R> {
             return Err(ReleaseRefusal::UnexplainedRuns(unexplained));
         }
 
-        // 5: kiln's runs directory, whatever kiln's listing skips.
-        let mut directories: Vec<String> = runs
+        // 5: no kiln process left that could still publish a run, so the read below
+        // is the last word on the runs directory.
+        let processes = node.kiln_processes().map_err(|e| {
+            ReleaseRefusal::Inventory(format!("scan the node's kiln processes: {e:#}"))
+        })?;
+        if !processes.is_empty() {
+            return Err(ReleaseRefusal::KilnProcesses(processes));
+        }
+
+        // 6: kiln's runs directory, whatever kiln's listing skips.
+        let mut directories: Vec<String> = node
             .entries()
             .map_err(|e| ReleaseRefusal::Inventory(format!("read kiln's runs directory: {e:#}")))?
             .into_iter()

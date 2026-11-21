@@ -7,10 +7,12 @@ pub mod firecracker;
 /// ExecStream's fourth descriptor (API additions design 5.1).
 pub mod live;
 pub(crate) mod protocol;
+mod serve_lock;
 mod server;
 mod socket;
 pub(crate) use client::{AttachedConnection, Client};
 use serde::{Serialize, de::DeserializeOwned};
+pub use serve_lock::{DEFAULT_SERVE_LOCK, ServeLock, ServeLockError};
 pub use server::{serve, serve_with_firecracker, serve_with_groups};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -38,6 +40,26 @@ async fn write_frame(
     }
     stream.write_u32(bytes.len() as u32).await?;
     stream.write_all(&bytes).await
+}
+
+/// The administrator's configured kiln executable, canonical: absolute, a file, and with
+/// it and every ancestor root's and writable by no one else. No request can select one.
+pub fn trusted_kiln(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    if !path.is_absolute() {
+        anyhow::bail!("kiln path must be absolute");
+    }
+    let bin = path.canonicalize()?;
+    for ancestor in bin.ancestors() {
+        let m = std::fs::symlink_metadata(ancestor)?;
+        if m.uid() != 0 || m.mode() & 0o022 != 0 {
+            anyhow::bail!("untrusted executable path {}", ancestor.display());
+        }
+    }
+    if !bin.is_file() {
+        anyhow::bail!("kiln executable is not a file");
+    }
+    Ok(bin)
 }
 
 fn io_stage(stage: &str, error: io::Error) -> io::Error {

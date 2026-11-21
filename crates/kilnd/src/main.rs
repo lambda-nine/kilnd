@@ -280,12 +280,14 @@ enum Command {
     },
     /// Releases one ambiguous reservation: a FAILED create with no backend ID that kilnd
     /// keeps charged because it can't prove the create left nothing (docs/setup.md,
-    /// "Releasing an ambiguous reservation"). Root only, with this instance's kilnd
-    /// stopped: it takes the state lock (exit 75 while anything holds it) and holds it
-    /// throughout. It runs the startup reconciliation pass, then needs a complete
-    /// inventory and a runs directory holding only what live rows own (exit 69
-    /// otherwise, naming what to remove), and records an audit row with the release.
-    /// Exits 65 for a sandbox that isn't such a reservation, 77 when not root.
+    /// "Releasing an ambiguous reservation"). Root only, with this instance's kilnd and
+    /// kilnd-helper stopped: it takes the helper's serving lock and the state lock (exit
+    /// 75 while anything holds either) and holds both throughout, serving kiln to itself.
+    /// It runs the startup reconciliation pass, then needs a complete inventory and a
+    /// runs directory holding only what live rows own (exit 69 otherwise, naming what to
+    /// remove), and no kiln process besides published shims, their descendants and kiln's
+    /// node services (exit 75 otherwise, naming each), and records an audit row with the
+    /// release. Exits 65 for a sandbox that isn't such a reservation, 77 when not root.
     ReleaseAmbiguous {
         /// The FAILED sandbox's ID.
         #[arg(long)]
@@ -295,10 +297,15 @@ enum Command {
         reason: String,
         #[arg(long, default_value = "/var/lib/kilnd")]
         state_dir: PathBuf,
-        #[arg(long, default_value = "/run/kilnd-helper/helper.sock")]
-        helper_socket: PathBuf,
+        /// kilnd-helper's serving lock, as its `--serve-lock`.
+        #[arg(long, default_value = kilnd::helper::DEFAULT_SERVE_LOCK)]
+        helper_lock: PathBuf,
+        /// The kiln executable, as kilnd-helper's `--kiln`.
+        #[arg(long, default_value = "/usr/local/bin/kiln")]
+        kiln: PathBuf,
         /// As the daemon's flag: the checkpoint barrier's inventory runs whether or not
-        /// it is given whenever checkpoint state exists.
+        /// it is given whenever checkpoint state exists. It also serves the checkpoint
+        /// group, as kilnd-helper's `--enable-checkpoints`.
         #[arg(long)]
         enable_workspace_checkpoints: bool,
     },
@@ -341,6 +348,26 @@ fn main() -> ExitCode {
     // SAFETY: umask has no preconditions.
     unsafe { libc::umask(0o077) };
 
+    // Before any async runtime exists: the command forks, and each half builds its own.
+    if let Some(Command::ReleaseAmbiguous {
+        sandbox,
+        reason,
+        state_dir,
+        helper_lock,
+        kiln,
+        enable_workspace_checkpoints,
+    }) = &args.command
+    {
+        return ExitCode::from(release_ambiguous(&ReleaseArgs {
+            sandbox,
+            reason,
+            state_dir,
+            helper_lock,
+            kiln,
+            checkpoints: *enable_workspace_checkpoints,
+        }));
+    }
+
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -381,22 +408,7 @@ fn main() -> ExitCode {
             helper_socket,
             hold,
         )),
-        Some(Command::ReleaseAmbiguous {
-            sandbox,
-            reason,
-            state_dir,
-            helper_socket,
-            enable_workspace_checkpoints,
-        }) => {
-            return ExitCode::from(release_ambiguous(
-                &runtime,
-                &sandbox,
-                &reason,
-                &state_dir,
-                helper_socket,
-                enable_workspace_checkpoints,
-            ));
-        }
+        Some(Command::ReleaseAmbiguous { .. }) => unreachable!("dispatched above"),
         None => runtime.block_on(run(args)),
     };
     match outcome {
@@ -592,77 +604,234 @@ async fn serve_with<R: Runtime>(
     result
 }
 
-/// `kilnd release-ambiguous`: as root, the state directory's owner and kiln's runs
-/// directory; then, as that account alone, the state lock (held to the end), the proof
-/// and the release. Prints one line on release, and the refusal otherwise.
-fn release_ambiguous(
-    runtime: &tokio::runtime::Runtime,
-    sandbox: &str,
-    reason: &str,
-    state_dir: &Path,
-    helper_socket: PathBuf,
-    enable_workspace_checkpoints: bool,
-) -> u8 {
+// Only the Linux release reads past the root and argument checks.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct ReleaseArgs<'a> {
+    sandbox: &'a str,
+    reason: &'a str,
+    state_dir: &'a Path,
+    helper_lock: &'a Path,
+    kiln: &'a Path,
+    checkpoints: bool,
+}
+
+/// `kilnd release-ambiguous`: as root, the helper's serving lock (held to the end), the
+/// state directory's owner, kiln's runs directory and the private helper's socket; then
+/// a fork. The child, as that account alone, takes the state lock (held to the end) and
+/// runs the proof and the release; the parent stays root as the node's only helper
+/// (`kilnd::release_ambiguous`). Prints one line on release, and the refusal otherwise.
+fn release_ambiguous(args: &ReleaseArgs<'_>) -> u8 {
     use kilnd::release_ambiguous as ra;
-    let refuse = |code: u8, message: &dyn std::fmt::Display| {
-        eprintln!("kilnd release-ambiguous: refused: {message}");
-        code
-    };
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
-        return refuse(
+        return release_refused(
             ra::EXIT_NOT_ROOT,
-            &"run as root, with this instance's kilnd stopped",
+            &"run as root, with this instance's kilnd and kilnd-helper stopped",
         );
     }
-    if let Err(e) = ra::valid_sandbox_id(sandbox)
-        .and_then(|()| kilnd::store::valid_release_reason(reason))
+    if let Err(e) = ra::valid_sandbox_id(args.sandbox)
+        .and_then(|()| kilnd::store::valid_release_reason(args.reason))
     {
-        return refuse(ra::EXIT_USAGE, &e);
+        return release_refused(ra::EXIT_USAGE, &e);
     }
-    if !helper_socket.is_absolute() {
-        return refuse(ra::EXIT_USAGE, &"--helper-socket must be absolute");
-    }
-    let (uid, gid) = match ra::state_owner(state_dir) {
+    release_as_root(args)
+}
+
+fn release_refused(code: u8, message: &dyn std::fmt::Display) -> u8 {
+    eprintln!("kilnd release-ambiguous: refused: {message}");
+    code
+}
+
+#[cfg(not(target_os = "linux"))]
+fn release_as_root(_: &ReleaseArgs<'_>) -> u8 {
+    release_refused(1, &"kilnd release-ambiguous runs on Linux only")
+}
+
+#[cfg(target_os = "linux")]
+fn release_as_root(args: &ReleaseArgs<'_>) -> u8 {
+    use kilnd::release_ambiguous as ra;
+    // The fence first: from here no kilnd-helper serves until this command ends.
+    let (fence, runs) =
+        match ra::root_prerequisites(args.helper_lock, Path::new(ra::KILN_RUNS)) {
+            Ok(held) => held,
+            Err((code, message)) => return release_refused(code, &message),
+        };
+    let (uid, gid) = match ra::state_owner(args.state_dir) {
         Ok(owner) => owner,
-        Err(e) => return refuse(1, &format!("{e:#}")),
+        Err(e) => return release_refused(1, &format!("{e:#}")),
     };
-    let runs = match ra::RunsRoot::open(Path::new(ra::KILN_RUNS)) {
+    // The private helper serves the kiln group as kilnd-helper does: to the kilnd account.
+    match account_ids("kilnd") {
+        Ok((service, _)) if service == uid => {}
+        Ok((service, _)) => {
+            return release_refused(
+                1,
+                &format!(
+                    "{} belongs to uid {uid}, not the kilnd account (uid {service}), the only account kiln's helper group serves",
+                    args.state_dir.display()
+                ),
+            );
+        }
+        Err(e) => return release_refused(1, &format!("{e:#}")),
+    }
+    let kiln = match kilnd::helper::trusted_kiln(args.kiln)
+        .and_then(|bin| Ok((ra::KilnImage::of(&bin)?, bin)))
+    {
+        Ok(kiln) => kiln,
+        Err(e) => return release_refused(1, &format!("{e:#}")),
+    };
+    // The root half's own descriptor of the runs directory: no open file description,
+    // and so no directory offset, is shared with the child's.
+    let root_runs = match ra::RunsRoot::open(Path::new(ra::KILN_RUNS)) {
         Ok(runs) => runs,
-        Err(e) => return refuse(ra::EXIT_NOT_PROVED, &format!("{e:#}")),
+        Err(e) => return release_refused(ra::EXIT_NOT_PROVED, &format!("{e:#}")),
+    };
+    let name = format!("kilnd-release-{}", Id128::random());
+    let listener = match bind_abstract(&name) {
+        Ok(listener) => listener,
+        Err(e) => return release_refused(1, &format!("bind the private helper: {e:#}")),
+    };
+    let (child_control, root_control) = match std::os::unix::net::UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(e) => return release_refused(1, &format!("control socket: {e}")),
     };
     // SAFETY: getuid has no preconditions.
     let operator_uid = unsafe { libc::getuid() };
-    if let Err(e) = drop_privileges(uid, gid) {
-        return refuse(1, &format!("{e:#}"));
+    // SAFETY: no async runtime or other thread exists yet (main dispatches this command
+    // first), so the child starts with this one thread's consistent state.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return release_refused(1, &format!("fork: {}", std::io::Error::last_os_error()));
     }
-    let store = match Store::open(state_dir) {
+    if pid == 0 {
+        drop(listener);
+        drop(root_control);
+        drop(root_runs);
+        // The fence's descriptor stays open here too, so it holds until the commit.
+        let code = release_as_owner(
+            args,
+            uid,
+            gid,
+            operator_uid,
+            ra::ChildNode {
+                runs,
+                control: child_control,
+            },
+            ra::abstract_helper_path(&name),
+        );
+        drop(fence);
+        return code;
+    }
+    drop(child_control);
+    drop(runs);
+    let (image, bin) = kiln;
+    let served = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("start the root half's runtime")
+        .and_then(|runtime| {
+            runtime.block_on(async move {
+                listener.set_nonblocking(true)?;
+                let listener = tokio::net::UnixListener::from_std(listener)?;
+                ra::serve_root_half(listener, root_control, uid, bin, args.checkpoints, move || {
+                    ra::unexplained_kiln_processes(&ra::LinuxProcesses, image, &|| {
+                        root_runs.published_shims()
+                    })
+                })
+                .await
+            })
+        });
+    // The child's code is the command's: a failure of this half shows there as a
+    // refused helper call or process scan, and is reported here too.
+    if let Err(e) = served {
+        eprintln!("kilnd release-ambiguous: the root half: {e:#}");
+    }
+    let code = wait_for(pid);
+    drop(fence);
+    code
+}
+
+/// The child's half: the proof and the release as the state directory's account alone.
+#[cfg(target_os = "linux")]
+fn release_as_owner(
+    args: &ReleaseArgs<'_>,
+    uid: u32,
+    gid: u32,
+    operator_uid: u32,
+    node: kilnd::release_ambiguous::ChildNode,
+    helper: PathBuf,
+) -> u8 {
+    use kilnd::release_ambiguous as ra;
+    if let Err(e) = drop_privileges(uid, gid) {
+        return release_refused(1, &format!("{e:#}"));
+    }
+    let store = match Store::open(args.state_dir) {
         Ok(store) => store,
         Err(e) if ra::lock_held(&e) => {
-            return refuse(
-                ra::EXIT_DAEMON_RUNNING,
+            return release_refused(
+                ra::EXIT_BUSY,
                 &format!("{e:#}: stop this instance's kilnd and retry"),
             );
         }
-        Err(e) => return refuse(1, &format!("{e:#}")),
+        Err(e) => return release_refused(1, &format!("{e:#}")),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => return release_refused(1, &format!("start the async runtime: {e}")),
     };
     let limits = Limits {
-        checkpoints: enable_workspace_checkpoints
+        checkpoints: args
+            .checkpoints
             .then(kilnd::manager::CheckpointLimits::default),
         ..Limits::default()
     };
-    let manager = Manager::new(KilnRuntime::new(helper_socket), store, limits);
+    let manager = Manager::new(KilnRuntime::new(helper), store, limits);
     let request = kilnd::manager::ReleaseRequest {
-        sandbox_id: sandbox,
-        reason,
+        sandbox_id: args.sandbox,
+        reason: args.reason,
         operator_uid,
     };
-    match runtime.block_on(manager.release_ambiguous(request, &runs)) {
+    match runtime.block_on(manager.release_ambiguous(request, &node)) {
         Ok(proved) => {
             println!("{}", ra::released_line(&proved));
             ra::EXIT_RELEASED
         }
-        Err(refusal) => refuse(ra::refusal_exit(&refusal), &refusal),
+        Err(refusal) => release_refused(ra::refusal_exit(&refusal), &refusal),
+    }
+}
+
+/// A listener on the abstract socket `name`, which needs no file and leaves none.
+#[cfg(target_os = "linux")]
+fn bind_abstract(name: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::linux::net::SocketAddrExt;
+    let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+    std::os::unix::net::UnixListener::bind_addr(&address)
+}
+
+/// The child's exit code, once it has exited.
+#[cfg(target_os = "linux")]
+fn wait_for(pid: libc::pid_t) -> u8 {
+    let mut status = 0;
+    loop {
+        // SAFETY: status is writable; pid is this process's own child.
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if rc == pid {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            eprintln!("kilnd release-ambiguous: wait for the proof: {error}");
+            return 1;
+        }
+    }
+    if libc::WIFEXITED(status) {
+        u8::try_from(libc::WEXITSTATUS(status)).unwrap_or(1)
+    } else {
+        eprintln!("kilnd release-ambiguous: the proof ended by signal {}", libc::WTERMSIG(status));
+        1
     }
 }
 
@@ -1869,7 +2038,8 @@ mod tests {
         let Some(Command::ReleaseAmbiguous {
             sandbox,
             state_dir,
-            helper_socket,
+            helper_lock,
+            kiln,
             enable_workspace_checkpoints,
             ..
         }) = args.command
@@ -1878,8 +2048,17 @@ mod tests {
         };
         assert_eq!(sandbox, "sb-00000000000000ff");
         assert_eq!(state_dir, PathBuf::from("/var/lib/kilnd"));
-        assert_eq!(helper_socket, PathBuf::from("/run/kilnd-helper/helper.sock"));
+        assert_eq!(helper_lock, PathBuf::from("/var/lib/kilnd-helper/helper.lock"));
+        assert_eq!(kiln, PathBuf::from("/usr/local/bin/kiln"));
         assert!(!enable_workspace_checkpoints);
+        // The live helper's socket is no longer the command's to name.
+        assert!(
+            Args::try_parse_from([
+                "kilnd", "release-ambiguous", "--sandbox", "sb-00000000000000ff", "--reason",
+                "x", "--helper-socket", "/run/kilnd-helper/helper.sock",
+            ])
+            .is_err()
+        );
         // Both are required.
         assert!(Args::try_parse_from(["kilnd", "release-ambiguous", "--sandbox", "sb-00000000000000ff"]).is_err());
         assert!(Args::try_parse_from(["kilnd", "release-ambiguous", "--reason", "x"]).is_err());
@@ -1890,20 +2069,18 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let code = release_ambiguous(
-            &runtime,
-            "sb-00000000000000ff",
-            "why",
-            &state,
-            PathBuf::from("/run/kilnd-helper/helper.sock"),
-            false,
-        );
+        let lock = temp.path().join("helper.lock");
+        let code = release_ambiguous(&ReleaseArgs {
+            sandbox: "sb-00000000000000ff",
+            reason: "why",
+            state_dir: &state,
+            helper_lock: &lock,
+            kiln: Path::new("/usr/local/bin/kiln"),
+            checkpoints: false,
+        });
         assert_eq!(code, kilnd::release_ambiguous::EXIT_NOT_ROOT);
         assert!(!state.exists(), "nothing was opened or created");
+        assert!(!lock.exists(), "the serving lock was not taken");
     }
 
     #[test]
