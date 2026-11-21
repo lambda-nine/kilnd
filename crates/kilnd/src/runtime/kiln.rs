@@ -234,6 +234,12 @@ impl Runtime for KilnRuntime {
             Response::Error {
                 error,
                 definitely_not_created: true,
+                preflight_refused: true,
+            } => Err(CreateFailure::preflight_refused(error.into())),
+            Response::Error {
+                error,
+                definitely_not_created: true,
+                ..
             } => Err(CreateFailure::definitely_not_created(error.into())),
             Response::Error { error, .. } => Err(RuntimeError::from(error).into()),
             _ => Err(unexpected().into()),

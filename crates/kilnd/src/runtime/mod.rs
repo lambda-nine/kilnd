@@ -47,6 +47,9 @@ pub struct CreateFailure {
     /// The node authority refused for capacity (design 9.2: RESOURCE_EXHAUSTED). Still
     /// ambiguous: the row is released only by its fence, like any post-C1 refusal.
     exhausted: bool,
+    /// The backend refused this spec before allocating anything (kiln's trusted exit
+    /// 124): definitely not created, and the caller's input, so `INVALID_ARGUMENT`.
+    preflight_refused: bool,
 }
 
 impl CreateFailure {
@@ -59,7 +62,22 @@ impl CreateFailure {
             error,
             absence: None,
             exhausted: false,
+            preflight_refused: false,
         }
+    }
+
+    /// The backend's own preflight refused the spec before any allocation, with the
+    /// same proof `definitely_not_created` needs (for kiln: a trusted exit 124). The
+    /// row settles as definitely not created; only the caller's status code differs.
+    pub fn preflight_refused(error: RuntimeError) -> Self {
+        Self {
+            preflight_refused: true,
+            ..Self::definitely_not_created(error)
+        }
+    }
+
+    pub fn is_preflight_refused(&self) -> bool {
+        self.preflight_refused
     }
 
     /// The node refused this token for capacity. Ambiguous like any other post-C1
@@ -82,6 +100,7 @@ impl CreateFailure {
             error,
             absence: Some(Box::new(absence)),
             exhausted: false,
+            preflight_refused: false,
         }
     }
 
@@ -105,6 +124,7 @@ impl From<RuntimeError> for CreateFailure {
             error,
             absence: None,
             exhausted: false,
+            preflight_refused: false,
         }
     }
 }

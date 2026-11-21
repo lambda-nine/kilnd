@@ -184,6 +184,66 @@ async fn a_post_commit_failure_is_ok_for_the_original_and_every_retry() {
 }
 
 #[tokio::test]
+async fn a_preflight_refusal_is_invalid_argument_unkeyed_and_the_settled_row_keyed() {
+    let (m, fake, _) = clocked(limits());
+    fake.state().fail_create_preflight = Some("open writable /var/run/x: ENOTDIR".into());
+    // Unkeyed: the caller's error, naming the FAILED, uncharged, definite row.
+    let error = m
+        .create_owned(CreateRequest::default(), 1000)
+        .await
+        .unwrap_err();
+    let rows = m.list(true).unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    match &error {
+        Error::InvalidArgument(message) => {
+            assert_eq!(
+                message,
+                &format!(
+                    "create sandbox {}: open writable /var/run/x: ENOTDIR",
+                    row.id
+                )
+            );
+        }
+        other => panic!("expected INVALID_ARGUMENT, got {other:?}"),
+    }
+    assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
+    assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
+    assert!(!row.is_charged());
+    // Keyed (design 3.1): OK with the settled row, the same answer on every retry.
+    let refused = keyed(&m, 1000, "refused", "a").await.unwrap();
+    assert_eq!(refused.state, SandboxState::Failed);
+    assert!(!refused.is_charged());
+    assert!(
+        refused
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("ENOTDIR")
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            keyed(&m, 1000, "refused", "a").await.unwrap(),
+            m.load(&refused.id).unwrap()
+        );
+    }
+    // Only the preflight refusal changed: another definite failure and an
+    // ambiguous one are still the backend's error.
+    fake.state().fail_create_preflight = None;
+    fake.state().fail_create_definitely = Some("definitely not".into());
+    assert!(matches!(
+        m.create_owned(CreateRequest::default(), 1000).await,
+        Err(Error::Backend(_))
+    ));
+    fake.state().fail_create_definitely = None;
+    fake.state().fail_create = Some("ambiguous boom".into());
+    assert!(matches!(
+        m.create_owned(CreateRequest::default(), 1000).await,
+        Err(Error::Backend(_))
+    ));
+}
+
+#[tokio::test]
 async fn a_refusal_before_the_commit_leaves_the_id_free() {
     let (m, fake, _) = clocked(Limits {
         max_sandboxes: 1,

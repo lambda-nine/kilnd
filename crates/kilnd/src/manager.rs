@@ -2752,10 +2752,16 @@ impl<R: Runtime> Manager<R> {
                         Some(&reason),
                     )?,
                 }
-                Err(Error::Backend(format!(
-                    "create sandbox {}: {reason}",
-                    sandbox.id
-                )))
+                let message = format!("create sandbox {}: {reason}", sandbox.id);
+                // The backend's own preflight refused the caller's spec before
+                // allocating (kiln's trusted exit 124): the row above is FAILED and
+                // uncharged, and the caller gets a caller error, not INTERNAL.
+                if failure.is_preflight_refused()
+                    && failure.certainty() == CreateCertainty::DefinitelyNotCreated
+                {
+                    return Err(Error::InvalidArgument(message));
+                }
+                Err(Error::Backend(message))
             }
         }
     }

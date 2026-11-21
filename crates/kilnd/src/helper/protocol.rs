@@ -1008,6 +1008,11 @@ pub enum Response {
     Error {
         error: WireError,
         definitely_not_created: bool,
+        /// A create the backend's own preflight refused (kiln's trusted exit 124):
+        /// definitely not created, and the caller's input. Omitted when false, so every
+        /// other error reply is byte-identical; daemon and helper upgrade together.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        preflight_refused: bool,
     },
     /// A separate branch: every legacy kiln reply above stays byte-identical.
     Firecracker(FirecrackerResponse),

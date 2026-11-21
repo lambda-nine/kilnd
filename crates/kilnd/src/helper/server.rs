@@ -514,6 +514,7 @@ async fn dispatch(
     let error = |e| Response::Error {
         error: e,
         definitely_not_created: false,
+        preflight_refused: false,
     };
     Ok(match op {
         KilnRequest::Capabilities { id: None } => runtime
@@ -539,6 +540,7 @@ async fn dispatch(
             Response::Error {
                 error: WireError::Backend("create expired before invocation".into()),
                 definitely_not_created: true,
+                preflight_refused: false,
             }
         }
         KilnRequest::Create { spec } => runtime
@@ -547,6 +549,7 @@ async fn dispatch(
             .map(Response::Created)
             .unwrap_or_else(|e| Response::Error {
                 definitely_not_created: e.certainty() == CreateCertainty::DefinitelyNotCreated,
+                preflight_refused: e.is_preflight_refused(),
                 error: match e.error() {
                     crate::runtime::RuntimeError::Incompatible(s) => {
                         WireError::Incompatible(s.chars().take(2048).collect())

@@ -259,6 +259,9 @@ pub struct FakeState {
     pub fail_create: Option<String>,
     /// When set, `create` proves it failed before allocating anything.
     pub fail_create_definitely: Option<String>,
+    /// When set, `create` is refused by the backend's own preflight (kiln's trusted
+    /// exit 124): definitely not created, and the caller's input.
+    pub fail_create_preflight: Option<String>,
     /// When set, `create` allocates a backend, then fails without reporting
     /// its ID.
     pub fail_create_after_allocation: Option<String>,
@@ -339,6 +342,7 @@ impl Default for FakeState {
             gc_requests: Vec::new(),
             fail_create: None,
             fail_create_definitely: None,
+            fail_create_preflight: None,
             fail_create_after_allocation: None,
             panic_create: false,
             panic_exec: false,
@@ -1078,6 +1082,11 @@ impl Runtime for FakeRuntime {
         let (id, after) = {
             let mut s = self.state();
             assert!(!s.panic_create, "injected fake create panic");
+            if let Some(msg) = &s.fail_create_preflight {
+                return Err(CreateFailure::preflight_refused(RuntimeError::Backend(
+                    msg.clone(),
+                )));
+            }
             if let Some(msg) = &s.fail_create_definitely {
                 return Err(CreateFailure::definitely_not_created(
                     RuntimeError::Backend(msg.clone()),

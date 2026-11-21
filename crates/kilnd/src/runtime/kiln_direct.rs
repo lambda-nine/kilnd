@@ -438,7 +438,7 @@ fn create_result(out: &process::Outcome) -> Result<String, CreateFailure> {
         && out.stdout_completion == process::CaptureCompletion::Eof
         && out.stderr_completion == process::CaptureCompletion::Eof
     {
-        return Err(CreateFailure::definitely_not_created(error));
+        return Err(CreateFailure::preflight_refused(error));
     }
     Err(error.into())
 }
@@ -1533,6 +1533,8 @@ mod tests {
         let failure = runtime.create_now(&spec(Network::None)).await.unwrap_err();
         assert_eq!(failure.certainty(), CreateCertainty::DefinitelyNotCreated);
         assert!(failure.to_string().contains("image missing"), "{failure}");
+        // kiln's own preflight refused the caller's spec: a caller error upstream.
+        assert!(failure.is_preflight_refused(), "{failure}");
         // The gate runs for this exact create, then the flagged create follows.
         let trace = fs::read_to_string(tmp.path().join("calls")).unwrap();
         assert!(
@@ -1573,6 +1575,7 @@ mod tests {
                 CreateCertainty::AllocationAmbiguous,
                 "{body}: {failure}"
             );
+            assert!(!failure.is_preflight_refused(), "{body}: {failure}");
             assert!(calls(tmp.path()).contains(&"create".to_string()), "{body}");
         }
     }
@@ -1650,6 +1653,8 @@ mod tests {
         assert_eq!(failure.certainty(), CreateCertainty::DefinitelyNotCreated);
         assert!(matches!(failure.error(), RuntimeError::Incompatible(_)));
         assert!(failure.to_string().contains("0x10"), "{failure}");
+        // Definite, but the node's CLI is at fault, not the caller's spec.
+        assert!(!failure.is_preflight_refused(), "{failure}");
         assert_eq!(calls(tmp.path()), ["capabilities"]);
 
         // A spent budget refuses before launching even the capability probe.
@@ -1666,6 +1671,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(failure.certainty(), CreateCertainty::DefinitelyNotCreated);
+        assert!(!failure.is_preflight_refused(), "{failure}");
         assert!(calls(tmp.path()).is_empty());
     }
 
@@ -1747,8 +1753,25 @@ mod tests {
                 Store::open(&state).unwrap(),
                 limits.clone(),
             ));
-            manager.create(CreateRequest::default()).await.unwrap_err();
+            let error = manager.create(CreateRequest::default()).await.unwrap_err();
             let id = manager.list(true).unwrap().remove(0).id;
+            // A trusted 124 is the caller's error and names the row; anything else
+            // stays the backend's (INTERNAL).
+            let prefix = format!("create sandbox {id}: kiln create failed (");
+            match &error {
+                Error::InvalidArgument(message) if definite => {
+                    assert!(message.starts_with(&prefix), "{message}");
+                    assert!(message.contains("exit status: 124"), "{message}");
+                    assert!(message.contains("image missing"), "{message}");
+                }
+                Error::Backend(message) if !definite => {
+                    assert!(
+                        message.starts_with(&format!("create sandbox {id}: ")),
+                        "{message}"
+                    );
+                }
+                other => panic!("{body}: unexpected error {other:?}"),
+            }
             drop(manager);
 
             let manager = Arc::new(Manager::new(

@@ -594,6 +594,110 @@ async fn stdio_handoff_waits_for_installed_descriptors_before_closing_sent_endpo
     assert_eq!(bytes, b"err");
 }
 
+/// kiln's trusted exit 124 crosses the helper as `preflight_refused`, and the daemon
+/// answers the caller INVALID_ARGUMENT naming the uncharged FAILED row. Any other exit
+/// sends neither flag and stays the backend's error.
+#[tokio::test]
+async fn a_trusted_exit_124_crosses_the_helper_as_a_caller_error() {
+    use crate::manager::{CreateRequest, Error, Limits, Manager};
+    use crate::model::{CreateCertainty, Network, SandboxSpec, SandboxState};
+    use crate::runtime::kiln::KilnRuntime;
+    use crate::store::Store;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::time::Instant;
+    for (status, refused) in [(124, true), (1, false)] {
+        let temp = crate::test_support::short_tempdir().unwrap();
+        let bin = temp.path().join("kiln");
+        std::fs::write(&bin, format!(r#"#!/usr/bin/python3
+import os,sys
+CAPS=bytes.fromhex('4b494c4e45584f00010002001d0000001f000000010001000500080000000000302e312e306769742074657374')
+if sys.argv[1]=='capabilities':
+    os.write(1,CAPS); sys.exit(0)
+if sys.argv[1:]==['gc','--help']:
+    print('Usage: kiln gc [ID]...'); sys.exit(0)
+if sys.argv[1]=='create':
+    os.write(2,b'Error: persistent create rejected before allocation\n\nCaused by:\n    0: open writable /var/run/x without symlinks\n    1: ENOTDIR: Not a directory\n'); sys.exit({status})
+sys.exit(1)
+"#)).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = temp.path().join("helper.sock");
+        let uid = unsafe { libc::geteuid() };
+        let stop = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn(serve(
+            tokio::net::UnixListener::bind(&path).unwrap(),
+            uid,
+            bin,
+            stop.clone(),
+        ));
+        // The wire reply.
+        let spec = SandboxSpec {
+            image: "alpine".into(),
+            memory_bytes: 64 << 20,
+            cpu_millis: 1000,
+            pids: 64,
+            disk_bytes: 64 << 20,
+            network: Network::None,
+            read_only_root: false,
+            writable_paths: vec![],
+            labels: Default::default(),
+        };
+        let reply = Client {
+            path: path.clone(),
+            expected_uid: uid,
+        }
+        .call(
+            KilnRequest::Create { spec },
+            Instant::now() + Duration::from_secs(10),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        match reply {
+            Response::Error {
+                error: WireError::Backend(message),
+                definitely_not_created,
+                preflight_refused,
+            } => {
+                assert_eq!(
+                    (definitely_not_created, preflight_refused),
+                    (refused, refused)
+                );
+                assert!(message.contains("ENOTDIR"), "{message}");
+            }
+            other => panic!("exit {status}: {other:?}"),
+        }
+        // The daemon's answer through the same helper.
+        let manager = std::sync::Arc::new(Manager::new(
+            KilnRuntime::with_helper_uid(path, uid),
+            Store::open_in_memory().unwrap(),
+            Limits::default(),
+        ));
+        let error = manager.create(CreateRequest::default()).await.unwrap_err();
+        let row = manager.list(true).unwrap().remove(0);
+        assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
+        let prefix = format!(
+            "create sandbox {}: kiln create failed (exit status: {status}): ",
+            row.id
+        );
+        match &error {
+            Error::InvalidArgument(message) if refused => {
+                assert!(message.starts_with(&prefix), "{message}");
+                assert!(message.contains("ENOTDIR"), "{message}");
+                assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
+                assert!(!row.is_charged());
+            }
+            Error::Backend(message) if !refused => {
+                assert!(message.starts_with(&prefix), "{message}");
+                assert_eq!(row.create_certainty, CreateCertainty::AllocationAmbiguous);
+                assert!(row.is_charged());
+            }
+            other => panic!("exit {status}: {other:?}"),
+        }
+        stop.cancel();
+        server.await.unwrap().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn non_exec_wire_deadlines_and_cancellation_reap_children_without_false_evidence() {
     use crate::model::{Network, SandboxSpec};

@@ -607,6 +607,70 @@ async fn every_rpc_over_the_socket() {
         .unwrap();
     assert_eq!(deleted.state, pb::SandboxState::Deleted as i32);
 
+    // The backend's own preflight refused the spec (kiln's trusted exit 124): the
+    // caller's error, INVALID_ARGUMENT naming the row, and nothing charged.
+    {
+        let mut backend = fake.state();
+        backend.fail_create_definitely = None;
+        backend.fail_create_preflight = Some("open writable /var/run/x: ENOTDIR".into());
+    }
+    let err = c
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
+            spec: None,
+            expiry: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    assert!(err.message().starts_with("create sandbox sb-"), "{}", err.message());
+    assert!(err.message().ends_with(": open writable /var/run/x: ENOTDIR"), "{}", err.message());
+    let refused_id = err.message()["create sandbox ".len()..]
+        .split(':')
+        .next()
+        .unwrap()
+        .to_string();
+    let refused = c
+        .get_sandbox(pb::GetSandboxRequest { id: refused_id.clone(), execution_limit: 0 })
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_eq!(refused.state, pb::SandboxState::Failed as i32);
+    let reserved = || async {
+        let mut c = c.clone();
+        c.health(pb::HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .node_resources
+            .unwrap()
+            .reserved_sandboxes
+    };
+    assert_eq!(reserved().await, charged);
+    // A keyed create answers OK with the settled FAILED row, and its replay the same.
+    let keyed = |request_id: &str| {
+        let mut c = c.clone();
+        let request = pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(),
+            request_id: request_id.into(),
+            spec: None,
+            expiry: None,
+        };
+        async move { c.create_sandbox(request).await }
+    };
+    let first = keyed("preflight-refused").await.unwrap().into_inner().sandbox.unwrap();
+    assert_eq!(first.state, pb::SandboxState::Failed as i32);
+    assert!(first.failure_reason.contains("ENOTDIR"), "{first:?}");
+    let replay = keyed("preflight-refused").await.unwrap().into_inner().sandbox.unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(reserved().await, charged);
+    fake.state().fail_create_preflight = None;
+    for id in [refused_id, first.id] {
+        c.delete_sandbox(pb::DeleteSandboxRequest { release_request_id: false, id })
+            .await
+            .unwrap();
+    }
+
     drop(c);
     stop_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), server)

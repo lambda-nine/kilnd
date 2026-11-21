@@ -4616,8 +4616,17 @@ fn exit1_legacy_kiln_request_and_reply_bytes_are_unchanged() {
             Response::Error {
                 error: WireError::Incompatible("x".into()),
                 definitely_not_created: true,
+                preflight_refused: false,
             },
             r#"{"error":{"error":{"incompatible":"x"},"definitely_not_created":true}}"#,
+        ),
+        (
+            Response::Error {
+                error: WireError::Backend("x".into()),
+                definitely_not_created: true,
+                preflight_refused: true,
+            },
+            r#"{"error":{"error":{"backend":"x"},"definitely_not_created":true,"preflight_refused":true}}"#,
         ),
     ];
     for (reply, golden) in replies {
