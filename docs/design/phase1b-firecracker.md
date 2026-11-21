@@ -4755,9 +4755,11 @@ listing is section 9.1, rewritten for B7: `PrepareContext`, `PreparedCreate::all
   DELETING and reaches `remove(Legacy)` on the Firecracker adapter, which refuses before
   any wire call, so the row stays DELETING and charged with the refusal as its reason, and
   it is listed as such. The drain procedure is operational and documented with B7's
-  deployment notes: before selecting Firecracker for a database, run it with
-  `--backend kiln` and delete every kiln row until none is charged (`kilndctl list`), then
-  switch. B7's Firecracker startup counts charged rows of another backend and degrades
+  deployment notes ([setup.md](../setup.md#retired-token-compaction-b7)): before selecting
+  Firecracker for a database, fence creates off (kilnd has no drain mode, so every creator
+  is stopped and the socket made root-only with `--socket-group ''`), run it with
+  `--backend kiln` and delete every kiln row until root's `kilndctl ls` shows none, then
+  switch, keeping the fence on until the first Health check under Firecracker. B7's Firecracker startup counts charged rows of another backend and degrades
   Health naming that count, so a skipped drain is visible rather than silent. Each further
   Firecracker instance gets a fresh database under its own account (section 4.1), so this
   arises only for the default `kilnd` instance's existing database.
