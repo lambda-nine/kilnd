@@ -38,11 +38,11 @@ characters, Unicode, flag-like values, and empty arguments after `argv[0]`
 are preserved. Callers that want shell parsing must explicitly request a
 shell such as `sh -c`.
 
-kilnd's configurable argv limit counts each argument's UTF-8 bytes plus one
-separator byte; the default is 256 KiB. kiln's persistent-exec frame instead
+kilnd's argv limit, 256 KiB, is fixed in code (no flag sets it). It counts each
+argument's UTF-8 bytes plus one separator byte. kiln's persistent-exec frame instead
 contains a four-byte argc followed by a four-byte length and the bytes of each
-argument, and caps that encoded body at 1 MiB. kilnd checks both limits. At the
-default API limit and maximum argc, the largest possible encoded body is
+argument, and caps that encoded body at 1 MiB. kilnd checks both limits. At that
+API limit and maximum argc, the largest possible encoded body is
 `262144 + 3*4096 + 4 = 274436` bytes, safely below the backend cap.
 
 Create limits are checked as one request before persistence or backend work.

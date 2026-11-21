@@ -417,10 +417,10 @@ bounded `next_page_token` until empty, keeping `include_deleted` and the calling
 uid unchanged. Tokens do not survive the schema 7 upgrade: restart the listing.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
-bounds. Every older schema upgrades in order through the current one (16). Schema 5 introduced
-typed termination and runtime diagnostics together with output, terminal state,
-truncation facts and whether each byte total is exact, plus each sandbox's
-create certainty. Historical records retain unknown typed values and unknown
+bounds. Every older schema upgrades in order through the current one (16). Schemas 3 to 5
+added, alongside output, terminal state and truncation facts, typed termination and
+runtime diagnostics (schema 3), whether each byte total is exact (schema 4) and each
+sandbox's create certainty (schema 5). Historical records retain unknown typed values and unknown
 output-total certainty, and every existing no-ID `FAILED` row stays ambiguous and
 charged, even one whose text describes a missing image. Older binaries refuse
 the current schema, so keep a backup before upgrading.

@@ -75,7 +75,7 @@ The exact API/backend grammar and byte accounting are documented in the
 [request validation contract](validation.md). Create and Exec validate before
 inserting lifecycle rows or invoking the adapter. In particular, writable
 root and allowlist root are rejected, and argv is literal UTF-8 data rather
-than shell text. The configurable API argv limit counts bytes plus one per
+than shell text. The API argv limit (256 KiB, fixed in code) counts bytes plus one per
 argument; a separate check proves the four-byte-count/four-byte-length kiln
 frame stays within its 1 MiB body limit.
 
