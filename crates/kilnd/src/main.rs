@@ -842,6 +842,16 @@ fn validated_limits(args: &Args) -> Result<Limits> {
         }
     }
     limits.check_default_floors().map_err(anyhow::Error::msg)?;
+    // A per-sandbox maximum above its node budget would let one request take the whole
+    // node; the effective maximum is the smaller of the two.
+    let limits = limits.with_effective_maxima();
+    info!(
+        max_memory_bytes = limits.max_memory_bytes,
+        max_pids = limits.max_pids,
+        max_disk_bytes = limits.max_disk_bytes,
+        max_cpu_millis = limits.max_cpu_millis,
+        "per-sandbox maxima (compiled maxima, capped at the node budgets)"
+    );
     if limits.default_timeout > limits.max_timeout {
         bail!("--default-timeout-secs is above --max-timeout-secs");
     }
@@ -1157,6 +1167,36 @@ mod tests {
             error.contains("kilnd-fctest") && !error.contains("differs from"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn per_sandbox_maxima_are_capped_at_the_node_budgets_and_defaults_at_the_floors() {
+        let limits = validated_limits(&Args::try_parse_from(["kilnd"]).unwrap()).unwrap();
+        assert_eq!(
+            (limits.max_memory_bytes, limits.max_pids, limits.max_disk_bytes),
+            (3 << 30, 2048, 16 << 30)
+        );
+        assert_eq!(limits.max_cpu_millis, 8000, "kiln reserves no CPU budget");
+        // Larger budgets keep the compiled maxima; smaller ones lower them.
+        let args = Args::try_parse_from([
+            "kilnd",
+            "--max-node-memory-bytes",
+            &(64_u64 << 30).to_string(),
+            "--max-node-pids",
+            "100000",
+            "--max-node-disk-bytes",
+            &(1_u64 << 30).to_string(),
+        ])
+        .unwrap();
+        let limits = validated_limits(&args).unwrap();
+        assert_eq!(
+            (limits.max_memory_bytes, limits.max_pids, limits.max_disk_bytes),
+            (8 << 30, 4096, 1 << 30)
+        );
+        // A budget below the default sandbox is still refused, as before.
+        let args = Args::try_parse_from(["kilnd", "--max-node-pids", "100"]).unwrap();
+        let error = format!("{:#}", validated_limits(&args).unwrap_err());
+        assert!(error.contains("default sandbox pids 128 exceeds node budget 100"), "{error}");
     }
 
     #[test]

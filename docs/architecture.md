@@ -1862,7 +1862,7 @@ units, rounded up) equals the charge exactly.
 | ExecStream live queue / chunk (queue at least two chunks with their overhead and idle deque slots, 65,984 bytes for 32 KiB chunks; chunk at most 64 KiB) | 256 KiB / 32 KiB | `--exec-stream-buffer-bytes`, `--exec-stream-chunk-bytes` |
 | Helper live message | 16 KiB data | (code) |
 | Sandbox floors (for an explicit value; 0 is the default) | 10 CPU millis, 32 MiB, 16 pids, 64 MiB disk | (code) |
-| Sandbox maxima | 8 GiB, 8 CPUs, 4096 pids, 32 GiB disk | (code) |
+| Sandbox maxima: the compiled maxima, each capped at its node budget (computed and logged once at startup) | 3 GiB, 8 CPUs, 2048 pids, 16 GiB disk with the default budgets (compiled 8 GiB, 4096 pids, 32 GiB) | (code), `--max-node-memory-bytes`, `--max-node-pids`, `--max-node-disk-bytes` |
 | Workspace checkpoints (off by default; supported opt-in, see checkpoint-rollout-gate.md): 1 GiB each; 32 / 4 GiB per uid; 128 / 8 GiB per node; 24 h / 1 h default lifetime / idle, at most 7 d / 24 h; 2 workers, 1 per uid | off | `--enable-workspace-checkpoints` |
 | Free space every capture and fork must leave on kiln's runs filesystem and its loop backing | 1 GiB | `--checkpoint-headroom-bytes` |
 

@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Cap each per-sandbox maximum at its node budget. The compiled maxima (8 GiB memory,
+  4096 pids, 32 GiB disk) exceeded the default node budgets (3 GiB, 2048, 16 GiB), and
+  startup checked only the defaults against them. The effective maximum for memory,
+  pids and disk is now the smaller of the two, computed and logged once at startup and
+  used for every check; a request above it is `INVALID_ARGUMENT` before anything is
+  charged, where it was `RESOURCE_EXHAUSTED`. A maximum can still equal a whole budget;
+  the operator release below is the recovery if such a create ends ambiguous.
+
 - Refuse writable paths over the filesystems kiln mounts itself: `/proc`, `/sys` and
   everything under them, and anything under `/dev` except `/dev/shm`. kiln's preflight
   accepted them, then its shim failed setup after allocation (kiln mounts procfs,

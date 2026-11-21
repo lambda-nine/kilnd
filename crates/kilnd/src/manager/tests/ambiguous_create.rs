@@ -393,3 +393,100 @@ fn the_helper_refuses_the_same_writable_paths() {
         assert!(validate_spec(&spec(path)).is_err(), "{path}");
     }
 }
+
+#[test]
+fn effective_maxima_never_exceed_the_node_budgets() {
+    let compiled = Limits::default();
+    // The compiled maxima exceed the default node budgets: one request could take a
+    // whole budget, and more than it.
+    assert!(compiled.max_memory_bytes > compiled.max_node_memory_bytes);
+    assert!(u64::from(compiled.max_pids) > compiled.max_node_pids);
+    assert!(compiled.max_disk_bytes > compiled.max_node_disk_bytes);
+    let effective = compiled.clone().with_effective_maxima();
+    assert_eq!(effective.max_memory_bytes, compiled.max_node_memory_bytes);
+    assert_eq!(u64::from(effective.max_pids), compiled.max_node_pids);
+    assert_eq!(effective.max_disk_bytes, compiled.max_node_disk_bytes);
+    assert_eq!(effective.max_cpu_millis, compiled.max_cpu_millis);
+    let again = effective.clone().with_effective_maxima();
+    assert_eq!(
+        (again.max_memory_bytes, again.max_pids, again.max_disk_bytes),
+        (
+            effective.max_memory_bytes,
+            effective.max_pids,
+            effective.max_disk_bytes
+        )
+    );
+    // Larger budgets keep the compiled maxima.
+    let roomy = Limits {
+        max_node_memory_bytes: 1 << 40,
+        max_node_pids: 1 << 40,
+        max_node_disk_bytes: 1 << 50,
+        ..Limits::default()
+    }
+    .with_effective_maxima();
+    assert_eq!(
+        (roomy.max_memory_bytes, roomy.max_pids, roomy.max_disk_bytes),
+        (
+            compiled.max_memory_bytes,
+            compiled.max_pids,
+            compiled.max_disk_bytes
+        )
+    );
+    // The manager checks the effective maxima whatever it was given.
+    let m = manager(&FakeRuntime::default(), Limits::default());
+    assert_eq!(m.limits.max_memory_bytes, compiled.max_node_memory_bytes);
+    assert_eq!(u64::from(m.limits.max_pids), compiled.max_node_pids);
+    assert_eq!(m.limits.max_disk_bytes, compiled.max_node_disk_bytes);
+}
+
+#[tokio::test]
+async fn a_request_above_a_node_budget_is_invalid_before_any_charge() {
+    let fake = FakeRuntime::default();
+    let m = manager(&fake, Limits::default());
+    let l = Limits::default();
+    let before = untouched(&m, &fake).await;
+    for (name, request) in [
+        (
+            "memory",
+            CreateRequest {
+                memory_bytes: l.max_node_memory_bytes + 1,
+                ..Default::default()
+            },
+        ),
+        (
+            "pids",
+            CreateRequest {
+                pids: u32::try_from(l.max_node_pids).unwrap() + 1,
+                ..Default::default()
+            },
+        ),
+        (
+            "disk",
+            CreateRequest {
+                disk_bytes: l.max_node_disk_bytes + 1,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let error = m.create_owned(request, 1001).await.unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidArgument(message) if message.contains("is above the limit of")),
+            "{name}: {error:?}"
+        );
+        assert_eq!(untouched(&m, &fake).await, before, "{name}");
+    }
+    // Exactly a whole budget is still one valid request: the operator release below is
+    // the recovery if such a create ends ambiguous.
+    let whole = m
+        .create_owned(
+            CreateRequest {
+                memory_bytes: l.max_node_memory_bytes,
+                ..Default::default()
+            },
+            1001,
+        )
+        .await
+        .unwrap();
+    m.delete(&whole.id).await.unwrap();
+    drain(&m).await;
+}

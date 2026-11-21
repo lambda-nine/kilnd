@@ -13,7 +13,7 @@ the shared contract at that boundary; invalid API values return gRPC
 | Image | Empty selects the daemon default; effective names are 1–128 ASCII bytes: letters, digits, `-`, `_`, or `.`; the first byte is not `-` or `.` |
 | Allowlist | At most 64 entries, each at most 260 ASCII bytes: `HOST[:PORT]` or `IPv4[/PREFIX][:PORT]` |
 | Writable paths | Only with a read-only root; at most 16 absolute UTF-8 paths of at most 1024 bytes |
-| Resource limits | 0 selects the daemon default. An explicit value is at least 10 CPU millis, 32 MiB memory, 16 pids and 64 MiB disk, and at most the per-sandbox maximum |
+| Resource limits | 0 selects the daemon default. An explicit value is at least 10 CPU millis, 32 MiB memory, 16 pids and 64 MiB disk, and at most the per-sandbox maximum: 8 CPUs, and for memory, pids and disk the smaller of the compiled maximum (8 GiB, 4096, 32 GiB) and the node budget |
 | Labels | At most 32 entries; keys are 1–63 ASCII bytes and use alphanumeric, `-`, `_`, `.`, or `/`; values are at most 256 UTF-8 bytes and contain no controls |
 | Argv | 1–4096 UTF-8 arguments; `argv[0]` is nonempty; NUL is forbidden |
 | Exec `cwd` | Empty (`/`, as before) or an absolute UTF-8 path starting with `/`, at most 4,096 bytes (`--max-exec-cwd-bytes` may lower it), without NUL; not normalized |

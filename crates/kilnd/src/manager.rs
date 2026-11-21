@@ -193,6 +193,20 @@ impl Default for Limits {
 }
 
 impl Limits {
+    /// The per-sandbox maxima for memory, pids and disk, each at most its node budget:
+    /// one request can never ask for more than the whole node has, which would make it
+    /// refused at admission at best. The compiled maxima (8 GiB, 4096 pids, 32 GiB) are
+    /// not configurable; the budgets are flags, so the effective maxima are computed
+    /// here, once, from both. Idempotent: [`Manager::new`] applies it too.
+    pub fn with_effective_maxima(mut self) -> Self {
+        self.max_memory_bytes = self.max_memory_bytes.min(self.max_node_memory_bytes);
+        self.max_pids = self
+            .max_pids
+            .min(u32::try_from(self.max_node_pids).unwrap_or(u32::MAX));
+        self.max_disk_bytes = self.max_disk_bytes.min(self.max_node_disk_bytes);
+        self
+    }
+
     /// A default below a request floor would make every default create fail in kiln's
     /// shim after allocation, so startup refuses it.
     pub fn check_default_floors(&self) -> std::result::Result<(), String> {
@@ -947,6 +961,8 @@ impl<R: Runtime> Manager<R> {
 
     /// As [`Self::new`], with the clocks expiry reads.
     pub fn with_clock(runtime: R, store: Store, limits: Limits, clock: Arc<dyn Clock>) -> Self {
+        // Every maximum the manager checks is the effective one (see `with_effective_maxima`).
+        let limits = limits.with_effective_maxima();
         store.set_clock(clock.clone());
         Self {
             expiry: Mutex::new(ExpiryState {
