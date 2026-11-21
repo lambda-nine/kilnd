@@ -72,6 +72,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   from a checkpoint takes its limits from the request and gets the same floors. The
   privileged regression scripts and the kiln integration tests now create with 64 MiB
   of disk instead of 16 MiB.
+
 - Remove dead code: the guest broker's unused `tempfile` dev-dependency, seven items
   nothing references (`KilnWorkers::with_runs_root`, `DEFAULT_EXEC_STORE`,
   `DISPATCHED_ROLES`, `HELPER_STATE`, `open_work_dir`, `SandboxState::is_active`,
