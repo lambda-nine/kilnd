@@ -163,16 +163,132 @@ impl pb::kilnd_service_server::KilndService for Daemon {
     }
 }
 
-/// [`tempfile::tempdir`], short enough for the socket bound in it. A socket path must
-/// fit in `sun_path` (104 bytes on macOS, 108 on Linux, with the terminating NUL), so
-/// under a `TMPDIR` that leaves less than 48 bytes for `/.tmpXXXXXX/kilnd.sock` the
-/// directory is made in `/tmp` instead. Otherwise it is exactly `tempdir()`.
+/// Bytes the tests add below a [`short_tempdir`]: `/.tmpXXXXXX/kilnd.sock`, with room
+/// to spare.
+const SOCKET_ROOM: usize = 48;
+
+/// The longest socket path `sun_path` holds everywhere the tests run: 104 bytes on macOS
+/// and 108 on Linux, each with the terminating NUL.
+const SUN_PATH_MAX: usize = 103;
+
+/// A private (0700) temporary directory short enough for the socket bound in it. Under a
+/// `TMPDIR` that leaves less than [`SOCKET_ROOM`] bytes within `sun_path`, spelled or
+/// resolved (a short alias can resolve to a long path), the directory is made in `/tmp`
+/// instead. Either way it is created atomically at 0700, so neither the process umask
+/// nor `/tmp`'s sticky bit decides who can reach it.
 fn short_tempdir() -> std::io::Result<tempfile::TempDir> {
-    let root = std::env::temp_dir();
-    if root.as_os_str().len() + 48 > 103 {
-        return tempfile::tempdir_in("/tmp");
+    short_tempdir_under(&std::env::temp_dir())
+}
+
+/// [`short_tempdir`] with `root` in place of `TMPDIR`.
+fn short_tempdir_under(root: &std::path::Path) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let resolved = root.canonicalize()?;
+    let longest = root.as_os_str().len().max(resolved.as_os_str().len());
+    let parent = if longest + SOCKET_ROOM > SUN_PATH_MAX {
+        std::path::Path::new("/tmp")
+    } else {
+        root
+    };
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)?;
+    let mode = std::fs::metadata(dir.path())?.permissions().mode() & 0o7777;
+    if mode != 0o700 {
+        return Err(std::io::Error::other(format!(
+            "{} was created with mode {mode:o}, not 0700",
+            dir.path().display()
+        )));
     }
-    tempfile::tempdir_in(root)
+    Ok(dir)
+}
+
+#[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). The umask test
+// reruns this test binary in a child shell with another umask.
+#[allow(clippy::disallowed_methods)]
+mod umask {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::Path;
+
+    use super::{SOCKET_ROOM, SUN_PATH_MAX, short_tempdir, short_tempdir_under};
+
+    const CHILD_UMASK: &str = "KILND_TEST_SUPPORT_CHILD_UMASK";
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    // Every directory the helper makes is exactly 0700 under umask 0002 and 0000, on the
+    // ordinary path and the `/tmp` fallback, spelled long or through a short alias. The
+    // umask is process-wide, so each case runs in a child copy of this test binary that
+    // runs only this test.
+    #[test]
+    fn short_tempdirs_are_private_under_any_umask() {
+        if let Ok(umask) = std::env::var(CHILD_UMASK) {
+            let umask = u32::from_str_radix(&umask, 8).unwrap();
+            let tmp = Path::new("/tmp");
+            let base = short_tempdir_under(tmp).unwrap();
+            let probe = base.path().join("probe");
+            std::fs::create_dir(&probe).unwrap();
+            assert_eq!(
+                mode(&probe),
+                0o777 & !umask,
+                "umask {umask:o} not in effect"
+            );
+
+            let ordinary = short_tempdir_under(tmp).unwrap();
+            assert_eq!(ordinary.path().parent(), Some(tmp));
+            assert_eq!(mode(ordinary.path()), 0o700, "ordinary path");
+            let mut long = base.path().to_path_buf();
+            while long.as_os_str().len() < 132 {
+                long.push("d".repeat(20));
+            }
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&long)
+                .unwrap();
+            let fallback = short_tempdir_under(&long).unwrap();
+            assert_eq!(fallback.path().parent(), Some(tmp));
+            assert_eq!(mode(fallback.path()), 0o700, "fallback path");
+            let alias = base.path().join("a");
+            std::os::unix::fs::symlink(&long, &alias).unwrap();
+            assert!(alias.as_os_str().len() + SOCKET_ROOM <= SUN_PATH_MAX);
+            let aliased = short_tempdir_under(&alias).unwrap();
+            assert_eq!(
+                aliased.path().parent(),
+                Some(tmp),
+                "resolved length ignored"
+            );
+            assert_eq!(mode(aliased.path()), 0o700, "aliased path");
+            let default = short_tempdir().unwrap();
+            assert_eq!(mode(default.path()), 0o700, "TMPDIR path");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        for umask in ["0002", "0000"] {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", r#"umask "$0" && exec "$@""#, umask])
+                .arg(&exe)
+                .args([
+                    "--exact",
+                    "transport_tests::umask::short_tempdirs_are_private_under_any_umask",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD_UMASK, umask)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "umask {umask}: {}\n{stdout}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 }
 
 /// Scripted daemons behind one socket path, one per accepted connection in order, as

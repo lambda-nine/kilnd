@@ -12,6 +12,18 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   `Store::record_sandbox_image_identity`), the lock's never-read path field and two
   dead-code allows that no longer suppress anything. No behaviour changes.
 
+- Tighten the flaky-test fixes after an adversarial review (test-only).
+  `execs_in_one_sandbox_run_one_at_a_time` sampled the backend once while the first exec
+  was held, so a second exec let through after a short lock wait still passed; the fake
+  backend now keeps its peak concurrent executions and an enter/leave log per sandbox,
+  and the test asserts, after both finish, a peak of one and the first leaving before the
+  second enters. The `short_tempdir()` helpers create every directory atomically at 0700
+  (their `/tmp` fallback was group- or world-reachable under a 0002 or 0000 umask) and
+  budget the resolved as well as the spelled `TMPDIR` length, so a short alias to a long
+  path falls back too. On macOS's default `TMPDIR` (`/var/folders/...`, which resolves under
+  `/private`) that means the helpers now use `/tmp`. Two socket tests assert the exact
+  regular-file and live-listener refusals instead of any error. No behaviour changes.
+
 - Make the tests pass under a long `TMPDIR` (test-only). Tests that bind a Unix socket
   in a temporary directory now make it with a `short_tempdir()` helper (one for kilnd's
   unit tests, one for its integration tests, one in kilndctl's transport tests), which

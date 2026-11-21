@@ -1805,9 +1805,12 @@ async fn waiter_drop_preserves_a_backend_completed_outcome() {
 
 // The first exec is held in the backend until the second is queued behind it, on
 // paused time: polling for it to be running could miss a 100 ms run on a loaded
-// machine and then spin forever.
+// machine and then spin forever. Serialization is judged after both have finished,
+// from the fake's enter/leave log and its peak activity, so an overlap that starts
+// late (a waiter let through after some delay) fails as surely as an immediate one.
 #[tokio::test(start_paused = true)]
 async fn execs_in_one_sandbox_run_one_at_a_time() {
+    use crate::runtime::fake::FakeExecEvent::{Enter, Leave};
     let (m, fake) = manager();
     let s = m.create(CreateRequest::default()).await.unwrap();
     let gate = FakeGate::default();
@@ -1817,12 +1820,29 @@ async fn execs_in_one_sandbox_run_one_at_a_time() {
     let a = spawn_exec(&m, first);
     gate.entered().await;
     let b = spawn_exec(&m, exec_req(&s.id, &["echo"]));
-    until(|| m.admission.snapshot().execs.current == 2).await;
-    assert_eq!(fake.state().exec_calls.len(), 1, "the second ran beside the first");
+    // Queued behind the first, or (when serialization is broken) already in the backend.
+    until(|| m.admission.snapshot().execs.current == 2 || fake.state().exec_calls.len() == 2).await;
     gate.release();
     let b = b.await.unwrap().unwrap();
     let a = a.await.unwrap().unwrap();
     assert_eq!(a.state, ExecutionState::TimedOut);
+    assert_eq!(b.state, ExecutionState::Exited);
+
+    let state = fake.state();
+    assert_eq!(
+        state.exec_calls,
+        [vec!["sleep".to_owned()], vec!["echo".to_owned()]],
+        "both calls reached the backend, first one first"
+    );
+    assert_eq!(state.max_active_execs, 1, "the second ran beside the first");
+    assert_eq!(state.exec_events.len(), 1, "{:?}", state.exec_events);
+    let events = state.exec_events.values().next().unwrap();
+    assert_eq!(
+        events,
+        &[Enter(0), Leave(0), Enter(1), Leave(1)],
+        "the first left before the second entered"
+    );
+    // Secondary, millisecond-grained evidence from the execution rows.
     assert!(
         b.started_at_ms >= a.finished_at_ms.unwrap(),
         "the second waited for the first"

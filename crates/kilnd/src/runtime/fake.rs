@@ -77,6 +77,17 @@ impl FakeGate {
     }
 }
 
+/// One step of a backend execution in a sandbox's [`FakeState::exec_events`] log.
+/// The number is the call's index in [`FakeState::exec_calls`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeExecEvent {
+    /// The backend execution was entered (before any `exec_before_run` gate).
+    Enter(usize),
+    /// The backend execution ended and its activity count was released.
+    Leave(usize),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FakeEvidenceMode {
     #[default]
@@ -234,6 +245,12 @@ pub struct FakeState {
     pub version_cleanup_gate: Option<FakeGate>,
     pub panic_version: bool,
     pub active_execs: u32,
+    /// The most backend executions seen active at once.
+    #[cfg(test)]
+    pub max_active_execs: u32,
+    /// Per sandbox, every backend execution's enter and leave, in order.
+    #[cfg(test)]
+    pub exec_events: BTreeMap<String, Vec<FakeExecEvent>>,
     pub canceled_execs: u32,
     pub gc_runs: u32,
     /// Explicit ID scopes passed to garbage collection, in call order.
@@ -311,6 +328,10 @@ impl Default for FakeState {
             version_cleanup_gate: None,
             panic_version: false,
             active_execs: 0,
+            #[cfg(test)]
+            max_active_execs: 0,
+            #[cfg(test)]
+            exec_events: BTreeMap::new(),
             canceled_execs: 0,
             gc_runs: 0,
             gc_requests: Vec::new(),
@@ -349,6 +370,10 @@ pub struct FakeRuntime {
 
 struct ActiveExec {
     state: Arc<Mutex<FakeState>>,
+    #[cfg(test)]
+    sandbox: String,
+    #[cfg(test)]
+    call: usize,
 }
 
 struct ActiveVersion(Arc<Mutex<FakeState>>);
@@ -366,6 +391,12 @@ impl Drop for ActiveExec {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active_execs -= 1;
+        #[cfg(test)]
+        state
+            .exec_events
+            .entry(std::mem::take(&mut self.sandbox))
+            .or_default()
+            .push(FakeExecEvent::Leave(self.call));
     }
 }
 
@@ -1225,16 +1256,32 @@ impl Runtime for FakeRuntime {
                 ..no_output(Ok(ExecFinish::Canceled))
             };
         }
+        #[cfg(test)]
+        let call;
         let (gate, panic_exec) = {
             let mut state = self.state();
             state.exec_calls.push(spec.argv.to_vec());
             state.exec_options.push(spec.options.clone());
             state.exec_deadlines.push(spec.deadline);
             state.active_execs += 1;
+            #[cfg(test)]
+            {
+                call = state.exec_calls.len() - 1;
+                state.max_active_execs = state.max_active_execs.max(state.active_execs);
+                state
+                    .exec_events
+                    .entry(id.to_owned())
+                    .or_default()
+                    .push(FakeExecEvent::Enter(call));
+            }
             (state.exec_before_run.take(), state.panic_exec)
         };
         let _active = ActiveExec {
             state: self.state.clone(),
+            #[cfg(test)]
+            sandbox: id.to_owned(),
+            #[cfg(test)]
+            call,
         };
         if let Some(gate) = gate {
             gate.hold().await;

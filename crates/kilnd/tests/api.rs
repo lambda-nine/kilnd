@@ -1025,9 +1025,12 @@ async fn graceful_shutdown_drains_a_create_after_its_rpc_disconnects() {
     );
 }
 
+// The refusal must be the regular-file check itself, not an ancestor-mode refusal that
+// a group-writable fixture under umask 0002 would hit first.
 #[test]
 fn bind_refuses_to_replace_a_regular_file() {
     let tmp = common::short_tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = tmp.path().join("run");
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let path = dir.join("kilnd.sock");
@@ -1036,7 +1039,12 @@ fn bind_refuses_to_replace_a_regular_file() {
         .enable_all()
         .build()
         .unwrap();
-    assert!(rt.block_on(kilnd::server::bind(&path, None)).is_err());
+    let error = rt
+        .block_on(kilnd::server::bind(&path, None))
+        .err()
+        .expect("a regular file was replaced");
+    let expected = format!("{} exists and is not a socket", path.display());
+    assert!(format!("{error:#}").contains(&expected), "{error:#}");
     assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
 }
 
@@ -1084,9 +1092,85 @@ fn bind_preserves_a_stale_socket_when_refusal_is_ambiguous() {
     assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
 }
 
+// Every directory the shared helper makes is exactly 0700 under umask 0002 and 0000, on
+// the ordinary path and the `/tmp` fallback, spelled long or through a short alias. The
+// umask is process-wide, so each case runs in a child copy of this test binary that runs
+// only this test.
+#[test]
+fn short_tempdirs_are_private_under_any_umask() {
+    const CHILD_UMASK: &str = "KILND_TEST_SUPPORT_CHILD_UMASK";
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    if let Ok(umask) = std::env::var(CHILD_UMASK) {
+        let umask = u32::from_str_radix(&umask, 8).unwrap();
+        let tmp = std::path::Path::new("/tmp");
+        let base = common::short_tempdir_under(tmp).unwrap();
+        let probe = base.path().join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        assert_eq!(
+            mode(&probe),
+            0o777 & !umask,
+            "umask {umask:o} not in effect"
+        );
+
+        let ordinary = common::short_tempdir_under(tmp).unwrap();
+        assert_eq!(ordinary.path().parent(), Some(tmp));
+        assert_eq!(mode(ordinary.path()), 0o700, "ordinary path");
+        let mut long = base.path().to_path_buf();
+        while long.as_os_str().len() < 132 {
+            long.push("d".repeat(20));
+        }
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&long)
+            .unwrap();
+        let fallback = common::short_tempdir_under(&long).unwrap();
+        assert_eq!(fallback.path().parent(), Some(tmp));
+        assert_eq!(mode(fallback.path()), 0o700, "fallback path");
+        let alias = base.path().join("a");
+        std::os::unix::fs::symlink(&long, &alias).unwrap();
+        assert!(alias.as_os_str().len() + common::SOCKET_ROOM <= common::SUN_PATH_MAX);
+        let aliased = common::short_tempdir_under(&alias).unwrap();
+        assert_eq!(
+            aliased.path().parent(),
+            Some(tmp),
+            "resolved length ignored"
+        );
+        assert_eq!(mode(aliased.path()), 0o700, "aliased path");
+        let default = common::short_tempdir().unwrap();
+        assert_eq!(mode(default.path()), 0o700, "TMPDIR path");
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    for umask in ["0002", "0000"] {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"umask "$0" && exec "$@""#, umask])
+            .arg(&exe)
+            .args([
+                "--exact",
+                "short_tempdirs_are_private_under_any_umask",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_UMASK, umask)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "umask {umask}: {}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+// The refusal must be the live-listener check, not an ancestor-mode refusal.
 #[test]
 fn bind_refuses_to_replace_a_live_socket() {
     let tmp = common::short_tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let dir = tmp.path().join("run");
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let path = dir.join("kilnd.sock");
@@ -1096,7 +1180,12 @@ fn bind_refuses_to_replace_a_live_socket() {
         .enable_all()
         .build()
         .unwrap();
-    assert!(rt.block_on(kilnd::server::bind(&path, None)).is_err());
+    let error = rt
+        .block_on(kilnd::server::bind(&path, None))
+        .err()
+        .expect("a live listener was replaced");
+    let expected = format!("{} already has a live listener", path.display());
+    assert!(format!("{error:#}").contains(&expected), "{error:#}");
     assert_eq!(
         std::fs::symlink_metadata(&path).unwrap().ino(),
         incumbent_inode
