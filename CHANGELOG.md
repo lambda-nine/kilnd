@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- A source sandbox held in DELETING behind an interrupted capture no longer names
+  another uid's checkpoint in its stored reason. When root captured someone else's
+  sandbox, its owner saw root's checkpoint ID, which is `NOT_FOUND` to them; the
+  reason now says "held until an interrupted capture's storage is proved absent"
+  unless the owner owns the checkpoint too. The log keeps the ID.
+
 - Add `kilnd release-ambiguous`, the operator's release of an ambiguous reservation:
   a `FAILED` create with no backend ID, which kilnd keeps charged because it can't
   prove the create left nothing, so enough of them blocked a node for every uid with

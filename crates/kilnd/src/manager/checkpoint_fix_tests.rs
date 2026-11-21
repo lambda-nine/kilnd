@@ -1074,6 +1074,40 @@ async fn a_delete_after_restart_waits_for_the_interrupted_capture() {
     source_removed_after_the_capture(&m, &fake, &s, &c).await;
 }
 
+/// A held source's stored reason is its owner's to read: it names the interrupted
+/// capture's checkpoint only when that owner owns the checkpoint too. Here root
+/// captured uid 1001's sandbox, kilnd stopped mid-capture, and uid 1001 deleted it.
+#[tokio::test]
+async fn a_held_source_reason_never_names_a_checkpoint_its_owner_cannot_see() {
+    let (_tmp, dir, m, fake, clock) = persistent().await;
+    let s = source(&m, 1001).await;
+    let c = c1_owned_by(&m, &fake, &s, 0).await;
+    fake.checkpoints(|g| {
+        g.staging.insert(c.id.to_string());
+        g.workers.insert(c.id.to_string(), CancellationToken::new());
+    });
+    let limits = stop(m).await;
+    fake.checkpoints(|g| g.unavailable = true);
+    let m = on_disk(&dir, &fake, &clock, &limits);
+    startup_like_main(&m).await;
+    let e = m.delete(&s.id).await.unwrap_err();
+    assert!(matches!(e, Error::Backend(_)), "{e:?}");
+    let (seen, _) = m.get(&s.id, 0).unwrap();
+    assert_eq!(seen.state, SandboxState::Deleting);
+    let reason = seen.failure_reason.unwrap();
+    assert_eq!(reason, "held until an interrupted capture's storage is proved absent");
+    for shown in [reason.as_str(), &e.to_string()] {
+        assert!(!shown.contains(c.id.as_str()), "{shown}");
+    }
+    // The checkpoint itself stays NOT_FOUND to the sandbox's owner.
+    assert!(matches!(
+        m.get_checkpoint(c.id.as_str(), 1001),
+        Err(Error::NotFound(_))
+    ));
+    fake.checkpoints(|g| g.unavailable = false);
+    source_removed_after_the_capture(&m, &fake, &s, &c).await;
+}
+
 // --- Round 3 (second recheck) -----------------------------------------------------------
 
 /// Settled history, a failed session at startup, then retention ages the last row out.

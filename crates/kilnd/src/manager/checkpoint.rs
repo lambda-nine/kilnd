@@ -607,14 +607,24 @@ impl<R: Runtime> Manager<R> {
     }
 
     /// Keeps a held source DELETING, saying why; its removal resumes once the capture
-    /// is released (see [`Self::spawn_removal`]).
+    /// is released (see [`Self::spawn_removal`]). The stored reason, which the
+    /// sandbox's owner reads, names the checkpoint only when that owner owns it too: a
+    /// foreign checkpoint ID is `NOT_FOUND` to them (design 5.2), and its existence is
+    /// not theirs to learn either. The log keeps the ID.
     pub(super) fn hold_deleting_source(
         &self,
         id: &str,
         checkpoint: &CheckpointId,
     ) -> Result<String> {
-        let reason =
-            format!("held until checkpoint {checkpoint}'s capture storage is proved absent");
+        let theirs = match (self.db().checkpoint(checkpoint.as_str())?, self.store.sandbox(id)?) {
+            (Some(c), Some(s)) => c.owner_uid == s.owner_uid,
+            _ => false,
+        };
+        let reason = if theirs {
+            format!("held until checkpoint {checkpoint}'s capture storage is proved absent")
+        } else {
+            "held until an interrupted capture's storage is proved absent".to_string()
+        };
         warn!(sandbox = %id, checkpoint = %checkpoint, "source removal held until its interrupted capture is absent");
         self.store.compare_and_set_sandbox_state(
             id,

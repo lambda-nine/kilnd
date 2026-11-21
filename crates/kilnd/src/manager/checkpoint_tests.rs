@@ -1316,11 +1316,16 @@ async fn persistent() -> (
 /// Commits C1 directly (a crash right after it): a CAPTURING row bound to the
 /// helper's current epoch, with no dispatch.
 async fn c1_only(m: &M, fake: &FakeRuntime, s: &Sandbox) -> Checkpoint {
+    c1_owned_by(m, fake, s, 1000).await
+}
+
+/// As [`c1_only`], for a capture `owner_uid` made (root may capture anyone's sandbox).
+async fn c1_owned_by(m: &M, fake: &FakeRuntime, s: &Sandbox, owner_uid: u32) -> Checkpoint {
     // Record the identity the way a first capture does.
     let (epoch, boot) = fake.checkpoints(|g| (g.epoch, g.boot));
     let new = NewCheckpoint {
         id: CheckpointId::random(),
-        owner_uid: 1000,
+        owner_uid,
         generation: 1,
         source_sandbox_id: s.id.clone(),
         capture: HelperDispatch {
