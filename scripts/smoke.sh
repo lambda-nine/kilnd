@@ -327,9 +327,9 @@ ctl get "$lost" | grep -q '^state: *lost' || fail "sandbox not marked lost"
 ctl rm "$lost" >/dev/null
 
 echo "10. Reconciliation and shutdown preserve unmanaged live and stale sandboxes"
-unmanaged_live=$(sudo kiln create --memory=64M --disk=16M)
+unmanaged_live=$(sudo kiln create --memory=64M --disk=64M)
 backend_created+=("$unmanaged_live")
-unmanaged_stale=$(sudo kiln create --memory=64M --disk=16M)
+unmanaged_stale=$(sudo kiln create --memory=64M --disk=64M)
 backend_created+=("$unmanaged_stale")
 managed_stale=$(ctl create --memory 64M --disk 64M)
 created+=("$managed_stale")

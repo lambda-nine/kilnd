@@ -1896,7 +1896,7 @@ mod tests {
             memory_bytes: 64 << 20,
             cpu_millis: 500,
             pids: 32,
-            disk_bytes: 16 << 20,
+            disk_bytes: 64 << 20,
             network,
             read_only_root: false,
             writable_paths: vec![],
@@ -1915,7 +1915,7 @@ mod tests {
                 "--memory=67108864",
                 "--cpus=0.500",
                 "--pids=32",
-                "--disk=16777216",
+                "--disk=67108864",
                 "--net=none"
             ]
         );

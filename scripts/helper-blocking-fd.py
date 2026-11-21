@@ -77,7 +77,7 @@ def call(operation):
 def output_backpressure():
     # Use a directly managed fixture so the test leaves no API history rows.
     result = call({'create': {'spec': dict(image='alpine', memory_bytes=64 << 20,
-        cpu_millis=1000, pids=64, disk_bytes=16 << 20, network='none',
+        cpu_millis=1000, pids=64, disk_bytes=64 << 20, network='none',
         read_only_root=False, writable_paths=[], labels={})}})
     assert 'created' in result, result
     backend = result['created']
