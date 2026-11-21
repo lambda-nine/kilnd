@@ -632,7 +632,6 @@ dependencies = [
  "kilnd-broker-protocol",
  "kilnd-exec-core",
  "libc",
- "tempfile",
  "tokio",
  "tokio-util",
 ]
