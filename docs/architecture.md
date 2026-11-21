@@ -360,6 +360,18 @@ from diagnostics text:
 From the spawn attempt on, everything else stays ambiguous: any other status, a
 signal, a malformed success, deadline, cancellation, spawn or wait I/O failure.
 
+Only the second case is the caller's: kiln's preflight refused the spec it was given.
+The adapter marks it (`CreateFailure::preflight_refused`; over the helper,
+`preflight_refused` on the create error reply), and an unkeyed create answers
+`INVALID_ARGUMENT` with the message it always had, `create sandbox sb-…: kiln create
+failed (exit status: 124): <kiln's reason>`, after settling the row `FAILED` and
+definitely not created as above. kiln uses one exit status for every preflight
+refusal, so kilnd can't tell a missing image from a refused writable path without
+reading kiln's text, and doesn't: both are `INVALID_ARGUMENT`. The capability gate's
+refusal is the node's fault, not the caller's, and keeps its code (`INTERNAL`), as does
+every ambiguous failure. A keyed create answers `OK` with the settled row whatever
+the backend said (below), so it and its retries are unchanged.
+
 An absence-fenced row has one rule instead: it is charged until its nullable
 `release_evidence_id` references an immutable `release_evidence` row, whatever its
 state, backend ID or certainty says. A composite foreign key binds that reference to
@@ -1153,6 +1165,7 @@ metadata result alive and enforces an RSS increase below 32 MiB.
 | New create/Exec during shutdown | `UNAVAILABLE` |
 | Exec or RenewSandbox on a sandbox that is not `READY` | `FAILED_PRECONDITION` with a `kilnd-reason` trailer and token prefix |
 | Expiry policy below 10 s or above the node maximum | `INVALID_ARGUMENT`, before anything is prepared |
+| Unkeyed create kiln's preflight refused (trusted exit 124) | `INVALID_ARGUMENT` naming the `FAILED`, uncharged row |
 | RenewSandbox on a foreign or unknown ID | `NOT_FOUND`, no trailer |
 
 ## Shutdown and restarts

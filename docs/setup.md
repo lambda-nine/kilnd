@@ -810,7 +810,10 @@ below kiln's floors and writable paths over the filesystems kiln mounts itself. 
 writable path whose parent in the image is a symlink or a regular file (Alpine's
 `/var/run -> ../run`, say, or `/etc/passwd/x`) is refused before allocation only by
 a kiln whose create preflight walks the image, which the next kiln release adds.
-With an older kiln such a request still leaves an ambiguous charged row, and a
+That kiln refuses it with exit 124, before allocating anything, and kilnd answers the
+create `INVALID_ARGUMENT` naming a `FAILED` row that holds no charge (as for any kiln
+preflight refusal; see [architecture.md](architecture.md)), which a plain delete
+removes. With an older kiln such a request still leaves an ambiguous charged row, and a
 caller can make one on purpose; this command is the recovery. Other rows come from
 kiln failures, crashes or host trouble.
 
@@ -845,7 +848,9 @@ another release holds it), and keeps it to the end. It opens kiln's runs directo
 then forks. The child gives up root for the state directory's own account before it
 opens the database, takes the state lock (exit 75 while kilnd or anything else holds
 it) and holds it to the end. The parent stays root as the node's only helper: it
-serves kiln to the child alone, on a private socket, and scans processes for it.
+serves kiln to the `kilnd` account alone (authenticated by peer UID, as
+[helper-protocol.md](helper-protocol.md) says), on a private socket, and scans
+processes for it.
 The child then proves the node clean, refusing at the first gap:
 
 1. The row is a charged ambiguous `FAILED` legacy create with no backend ID
@@ -862,9 +867,10 @@ The child then proves the node clean, refusing at the first gap:
    or one of kiln's node services (`kiln dns`, `metrics`, `metrics-collect`,
    `network-setup`). Anything else exits 75 and names each pid and executable: a
    create that a stopped helper started can still be setting up, since kiln's shim
-   outlives its CLI and creates its run directory afterwards. Any hand-run `kiln` on
-   the node (even `kiln ls`) refuses the release too; rerun it once those processes
-   have finished. Every process is read twice.
+   outlives its CLI and creates its run directory afterwards. Any hand-run kiln
+   command other than the node-service subcommands (`dns`, `network-setup`, `metrics`,
+   `metrics-collect`) makes the release refuse too, even `kiln ls`; rerun it once those
+   processes have finished. Every process is read twice.
 5. kiln's runs directory (`/var/lib/kiln/runs`), read by its entries, holds only
    those backends and kiln's own `.checkpoints` store.
 

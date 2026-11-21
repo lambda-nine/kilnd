@@ -6,6 +6,22 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- A create kiln refuses before allocating anything (its trusted exit 124: a writable path
+  whose parent in the image is a symlink or a regular file, a missing image, or any other
+  check kiln's create preflight makes) is now answered `INVALID_ARGUMENT`, not
+  `INTERNAL`: the caller's input, not a node fault. The message still names the row
+  (`create sandbox sb-…: kiln create failed (exit status: 124): …`, kiln's reason
+  summarised as before), and the row is unchanged: `FAILED`, definitely not created and
+  uncharged. kiln has one exit status for every preflight refusal, so a missing image
+  gets the same code. A keyed create still answers `OK` with its settled `FAILED` row,
+  on the original call and every retry. The capability gate, a create that expired
+  before kiln ran, and every failure after allocation keep their codes. kilnd-helper
+  carries the fact as an optional `preflight_refused` on its create error reply, omitted
+  when false; upgrade daemon and helper together, as always. `scripts/smoke.sh`'s two
+  unmanaged kiln creates and `scripts/helper-blocking-fd.py`'s fixture ask for kiln's
+  64 MiB disk floor, and the ambiguous-create VM test forces its ambiguous row with
+  kiln's own post-preflight trigger, an empty image directory.
+
 - `kilnd release-ambiguous` now fences the helper, not just the daemon. The state lock
   proved no daemon of the instance ran, but a create the separate root helper had
   accepted could outlive the daemon, and kiln's shim outlives its CLI and creates its
@@ -16,10 +32,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   it as root before anything else (exit 75 while a helper serves; stop
   `kilnd-helper.socket` and `kilnd-helper` first), holds it until after the commit, and
   serves kiln to itself meanwhile: it forks, and the root half is the node's only helper,
-  for the unprivileged half alone, on a private abstract socket. Before reading the runs
-  directory it scans every process twice and refuses (exit 75, naming each pid and
-  executable) any kiln process that isn't a published sandbox's shim, a descendant of
-  one or a kiln node service; a hand-run `kiln` counts too. `--helper-socket` is gone,
+  for the `kilnd` account alone (authenticated by peer UID), on a private abstract
+  socket. Before reading the runs directory it scans every process twice and refuses
+  (exit 75, naming each pid and executable) any kiln process that isn't a published
+  sandbox's shim, a descendant of one or a kiln node service; a hand-run kiln command
+  other than the node-service subcommands (`dns`, `network-setup`, `metrics`,
+  `metrics-collect`) counts too. `--helper-socket` is gone,
   `--helper-lock` and `--kiln` are new, and the state directory must be the `kilnd`
   account's. The docs no longer claim a caller can't make an ambiguous reservation on
   purpose: a writable path whose parent in the image is a symlink or a regular file

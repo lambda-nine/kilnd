@@ -133,6 +133,15 @@ reply is byte-identical. Since M4 it adds `"exec_stream": true` when this helper
 carry live output, omitted when false; an M3b daemon, which does not know the field,
 must be upgraded with its helper as always.
 
+A failed `create` replies `{"error": {"error": E, "definitely_not_created": B}}`. When
+kiln's own preflight refused the spec (exit status exactly 124 from a CLI that
+advertised feature `0x10`, nothing on stdout, both pipes at EOF), the reply adds
+`"preflight_refused": true`, so the daemon can answer the caller `INVALID_ARGUMENT`;
+it is omitted when false, so every other reply is byte-identical. The daemon trusts
+it only together with `"definitely_not_created": true`. An older daemon refuses the
+field (`deny_unknown_fields`) and its create stays ambiguous: upgrade it with its
+helper, as always.
+
 The helper reuses the API's image, allowlist, path, argv and backend-ID
 validators. It independently checks labels, resource ceilings, descriptor
 counts and sizes before any backend invocation. Resource floors are 10 CPU millis,
