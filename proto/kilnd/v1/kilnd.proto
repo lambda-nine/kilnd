@@ -274,9 +274,14 @@ message CheckpointLimits {
   uint32 max_fork_depth = 17;
   uint64 worker_memory_bytes = 18;
   uint32 worker_max_fds = 19;
-  // The least time a capture request record is kept, measured on the boot
-  // clock: the node's create request retention, so the same value as
-  // ApiLimits.create_request_retention_ms.
+  // The node's current automatic-prune policy for capture request records,
+  // measured on the boot clock: its create request retention, so the same value
+  // as ApiLimits.create_request_retention_ms. Each prune applies the policy in
+  // force when it runs, so this is not a promise for a record already kept: an
+  // explicit release (DeleteCheckpointRequest.release_request_id, once the
+  // checkpoint is DELETED) drops its record at once, and lowering
+  // --create-request-retention-secs later prunes records sooner than an earlier
+  // Health response suggested.
   uint64 request_retention_ms = 20;
 }
 

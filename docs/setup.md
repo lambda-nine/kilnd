@@ -135,8 +135,10 @@ is untouched: the catalog is approved only by a `cfg(test)` gate.
 scripts/build-phase1b-tools.sh --out "$HOME/b4-build/out"
 # The privileged suite; B4_TOOLS, B4_VMM and B4_GUEST override the inputs.
 scripts/b4-vm-tests.sh                 # every b4_linux_root test, or pass a name filter
-scripts/b4-vm-tests.sh b5_linux_root   # B5's broker and console tests; two need B5's test
-                                       # guests from scripts/b5-test-guest.sh
+# B5's broker and console tests. Two need B5's test guests: build each with
+# scripts/b5-test-guest.sh kill-inner|console-flood BUNDLE OUT, then pass both.
+KILND_B5_KILL_INNER_GUEST=OUT1 KILND_B5_CONSOLE_FLOOD_GUEST=OUT2 \
+    scripts/b4-vm-tests.sh b5_linux_root
 B6_EVIDENCE=$HOME/b6-evidence scripts/b4-vm-tests.sh b6_linux_root # a whole session
                                        # through kilnd and kilndctl (deploy/firecracker-test/)
 ```
@@ -328,11 +330,41 @@ recorded token is ever issued again. If anything cannot be explained, re-provisi
 proving every resource absent.
 
 **Selecting Firecracker for a database that holds kiln rows.** Historical kiln rows do not
-drain under `--backend firecracker`: their Delete is refused before any helper call and the
-row stays DELETING and charged, and Health names the count. Before switching, run the
-database with `--backend kiln` and delete every kiln row until `kilndctl ls` shows none
-charged. Each further Firecracker instance has a fresh database, so this arises only for
-the default instance.
+drain under `--backend firecracker`: their Delete is refused before any helper call, the
+row stays DELETING and charged, reconciliation skips it, and Health's detail names the
+count (`N charged row(s) of another backend cannot drain under firecracker`). Each further
+Firecracker instance has a fresh database, so this arises only for the default instance.
+Before switching, with that instance still running `--backend kiln`:
+
+1. **Delete every kiln row, as root.** List them against that instance's socket:
+
+   ```sh
+   sudo kilndctl --socket /run/kilnd/kilnd.sock ls
+   ```
+
+   Run it as root: kilnd shows a non-root caller only the rows its own UID owns, so an
+   empty table without `sudo` proves nothing. `kilndctl ls` follows every page itself and
+   prints every row that is not DELETED, in any state (CREATING, READY, DELETING, FAILED,
+   LOST, QUARANTINED), plus any DELETED row whose accounting is still in question; each of
+   these can still hold a charge, and a FAILED row whose create was ambiguous always does.
+   Run `sudo kilndctl rm <id>` on every row whose `BACKEND` column is `kiln`. This step is
+   done only when that root listing shows no `kiln` row at all, whatever its state. A row
+   that will not delete (Delete fails, or it stays DELETING or QUARANTINED) is one kiln or
+   the helper cannot yet prove gone: `sudo kilndctl get <id>` shows its state and failure
+   reason; fix that cause with kiln still selected and delete it again. Do not switch while
+   any remains.
+2. **Leave no checkpoint state.** Firecracker has no checkpoint group, so it cannot
+   inventory or remove checkpoints: under it an unsettled checkpoint or an outstanding
+   checkpoint barrier keeps allocation blocked (Health DEGRADED, every new create
+   refused), and only a clean inventory back under kiln clears it. So, still on kiln, turn
+   workspace checkpoints off and wait for that exit check to pass: `sudo kilndctl
+   checkpoint ls --page-size 1` against the same socket must be refused `UNIMPLEMENTED
+   backend_unsupported:workspace_checkpoint` (step 4 of opting a node in to workspace
+   checkpoints, under [Operating notes](#operating-notes) below). On a node that never
+   enabled checkpoints this already holds.
+
+Then restart with `--backend firecracker` and check Health: if its detail names charged
+rows of another backend, switch back to `--backend kiln` and finish step 1.
 
 ## Operating notes
 

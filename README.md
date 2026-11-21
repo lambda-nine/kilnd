@@ -266,6 +266,12 @@ sudo python3 -I scripts/phase0-regressions.py # real UID ownership, helper, priv
 scripts/smoke.sh              # kilndctl → socket → service → kiln, checked through the API
 scripts/expiry-regressions.sh # real idle and lifetime expiry, grace, renew and restart (about 3 min)
 scripts/idempotent-create-regressions.sh # keyed retries, release and a kill mid-create (about 1 min)
+# Changes to install.sh, add-instance.sh, upgrade.sh, kilnd-maintenance.py or the units also
+# run these, between two different builds (see the script for what it needs):
+sudo python3 -I scripts/deployment-regressions.py --bin-a DIR --bin-b DIR
+sudo python3 -I scripts/deployment-regressions.py --bin-a DIR --bin-b DIR --reboot-arm POINT
+# ...a real reboot of the VM, then:
+sudo python3 -I scripts/deployment-regressions.py --reboot-verify
 ```
 
 ## Layout
