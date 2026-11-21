@@ -3179,8 +3179,11 @@ impl<R: Runtime> Manager<R> {
                 sandbox = self.load(id)?;
                 continue;
             }
+            // An operator release (`kilnd release-ambiguous`) has proved and released
+            // the reservation; only a still-charged one is refused.
             if sandbox.backend_id.is_none()
                 && sandbox.create_certainty == CreateCertainty::AllocationAmbiguous
+                && sandbox.is_charged()
                 && !matches!(
                     sandbox.state,
                     SandboxState::Deleted | SandboxState::Creating
@@ -3203,7 +3206,8 @@ impl<R: Runtime> Manager<R> {
                     // compensated history, including when compensation ended
                     // while Delete waited for the coordination lock, so never
                     // reassert ownership of the historical backend ID. Without
-                    // one, the typed create result proved nothing was allocated.
+                    // one, the typed create result proved nothing was allocated,
+                    // or an operator release proved the ambiguous one absent.
                     if self.store.publish_delete_intent(
                         id,
                         SandboxState::Failed,
@@ -3396,7 +3400,7 @@ impl<R: Runtime> Manager<R> {
     /// so an ambiguous reservation must stay charged, even on an empty list.
     fn ambiguous_reservation_error(&self, sandbox: &Sandbox) -> Error {
         Error::FailedPrecondition(format!(
-            "cannot release the ambiguous reservation for failed sandbox {}: no backend ID was reported; the {} backend listing cannot account for hidden or unpublished resources; authoritative resource reconciliation is required and is not currently supported",
+            "cannot release the ambiguous reservation for failed sandbox {}: no backend ID was reported; the {} backend listing cannot account for hidden or unpublished resources; authoritative resource reconciliation is required: with kilnd stopped, an operator can prove the node clean and release it with `kilnd release-ambiguous`",
             sandbox.id,
             self.runtime.name()
         ).into())
@@ -5052,6 +5056,11 @@ pub use checkpoint::{
     resolve_checkpoint_expiry,
 };
 
+mod operator_release;
+pub use operator_release::{
+    KILN_RUNS_RESERVED, ReleaseProved, ReleaseRefusal, ReleaseRequest, RunsDirectory,
+};
+
 #[cfg(test)]
 mod tests;
 
@@ -5081,3 +5090,15 @@ mod m4_tests;
 #[cfg(test)]
 #[path = "manager/tests/ambiguous_create.rs"]
 mod ambiguous_create_tests;
+
+#[cfg(test)]
+#[path = "manager/tests/operator_release.rs"]
+mod operator_release_tests;
+
+#[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). The root VM test
+// runs kiln and kilnd release-ambiguous, and removes only its own private state, the one
+// kiln run and the one run directory it made.
+#[allow(clippy::disallowed_methods)]
+#[path = "manager/tests/ambiguous_vm.rs"]
+mod ambiguous_vm_tests;

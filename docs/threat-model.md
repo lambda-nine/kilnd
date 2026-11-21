@@ -287,7 +287,10 @@ sandbox compromises the host.
   trusted root user or direct `kiln` invocation can create unmanaged backends
   outside these reservations. Ambiguous no-ID creates remain charged even
   after all listed backends are removed; unexplained backends are not charged
-  a fabricated spec.
+  a fabricated spec. Only root, with kilnd stopped, can release one
+  (`kilnd release-ambiguous`, below), and only after kilnd's own startup
+  reconciliation, a complete inventory and a scan of kiln's runs directory all
+  find nothing a live row doesn't own.
 - **Create certainty trusts the installed kiln CLI.** kilnd releases a
   reservation on exit status 124 from a CLI that advertised feature `0x10`, with
   no stdout and both pipes at EOF. It never parses diagnostics. The CLI is
@@ -440,11 +443,23 @@ sandbox compromises the host.
   ambiguous `FAILED` reservation and logs the backend as unmanaged; it cannot
   safely pair the two or remove an operator-created sandbox. Delete refuses to
   release that reservation even when the ordinary listing is empty, because
-  hidden or unpublished resources may survive. There is currently no supported
-  authoritative reconciliation to clear a no-ID reservation. A trusted operator
-  can investigate and remove stray resources, but an empty listing and a retry
-  alone cannot return this capacity. Ordinary RPC cancellation is not this case: accepted creates
-  are daemon-owned and finish or compensate after the caller disconnects.
+  hidden or unpublished resources may survive. Neither an empty listing nor a
+  retry returns this capacity. The one release is the operator's: `kilnd
+  release-ambiguous` (docs/setup.md), as root with this instance stopped. It
+  runs the startup reconciliation pass, then needs a second complete inventory
+  and a read of kiln's runs directory itself, since `kiln ls` skips a run
+  directory without `shim.pid`, to hold nothing a live row doesn't own. Any
+  error, deadline or unexplained entry refuses and names what to remove; the
+  release is one audit row (schema 17's `operator_releases`: owner, charges,
+  operator uid, time, reason and the inventory's SHA-256), append-only, whose
+  insert is the only write that can tag the row `operator_attested`. It trusts
+  root and the installed kiln: the proof is that nothing kilnd or kiln can see
+  remains, not that the kernel holds nothing else. Inputs kiln refuses only
+  after allocating (limits below kiln's floors, writable paths over the
+  filesystems kiln mounts itself) are refused before any charge, so a caller
+  can't make such a reservation on purpose. Ordinary RPC cancellation is not
+  this case: accepted creates are daemon-owned and finish or compensate after
+  the caller disconnects.
 - **Ownership is not resource isolation between group members.** It stops them
   from reaching each other's sandboxes through the API, but they share one kernel,
   one set of node budgets and one retention count, so one member can exhaust

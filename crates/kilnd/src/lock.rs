@@ -10,9 +10,25 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+
+/// Another process holds the lock: the one error a caller may tell apart (`kilnd
+/// release-ambiguous` exits with its own code while the daemon runs).
+#[derive(Debug)]
+pub(crate) struct AlreadyOwned {
+    resource: String,
+    path: PathBuf,
+}
+
+impl std::fmt::Display for AlreadyOwned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} already owned; lock is {}", self.resource, self.path.display())
+    }
+}
+
+impl std::error::Error for AlreadyOwned {}
 
 /// A nonblocking exclusive lock held for as long as its file stays open.
 ///
@@ -140,7 +156,11 @@ impl ExclusiveFileLock {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::WouldBlock {
-                bail!("{resource} already owned; lock is {}", path.display());
+                return Err(AlreadyOwned {
+                    resource: resource.to_string(),
+                    path: path.to_path_buf(),
+                }
+                .into());
             }
             return Err(error).with_context(|| format!("lock {resource} at {}", path.display()));
         }

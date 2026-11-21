@@ -834,6 +834,69 @@ async fn an_ambiguous_restore_stays_charged_and_its_pin_waits_for_absent() {
     assert_eq!(charge(&m), (0, 0));
 }
 
+/// `kilnd release-ambiguous` on an ambiguous fork: the proof covers the checkpoint
+/// barrier's inventory too, the release frees the fork row's own charge, and its pin
+/// keeps the path it has without one (`unknown` never releases it): it waits for the
+/// checkpoint's ABSENT.
+#[tokio::test]
+async fn an_operator_release_of_an_ambiguous_fork_frees_the_row_and_leaves_the_pin_to_absent() {
+    let (m, fake, clock) = engine();
+    let (source, c) = ready(&m, 1000).await;
+    script(&fake, &[FakeRestore::Ambiguous(Reason::Io)]);
+    fork(&m, &c, 1000).await.unwrap_err();
+    let f = forks_of(&m, &c).pop().unwrap();
+    assert!(f.is_charged());
+    let before = m.store_resources_for_test();
+    // kiln's runs directory: the checkpoint store, the live source's run, and in the
+    // first pass the directory a restore killed before shim.pid would leave.
+    struct Runs(Vec<String>);
+    impl RunsDirectory for Runs {
+        fn entries(&self) -> anyhow::Result<Vec<std::ffi::OsString>> {
+            Ok(self.0.iter().map(Into::into).collect())
+        }
+    }
+    let source_run = source.backend_id.clone().unwrap();
+    let request = ReleaseRequest {
+        sandbox_id: &f.id,
+        reason: "ambiguous fork restore; node checked",
+        operator_uid: 0,
+    };
+    let refusal = m
+        .release_ambiguous(
+            request,
+            &Runs(vec![KILN_RUNS_RESERVED.into(), source_run.clone(), "4f2a9c1e00d1b7aa".into()]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refusal, ReleaseRefusal::UnexplainedRunDirectories(names) if names == &["4f2a9c1e00d1b7aa".to_string()]),
+        "{refusal:?}"
+    );
+    assert!(m.store.sandbox(&f.id).unwrap().unwrap().is_charged());
+    let proved = m
+        .release_ambiguous(request, &Runs(vec![KILN_RUNS_RESERVED.into(), source_run]))
+        .await
+        .unwrap();
+    assert_eq!(proved.released.owner_uid, 1000);
+    assert!(!m.store.sandbox(&f.id).unwrap().unwrap().is_charged());
+    let after = m.store_resources_for_test();
+    assert_eq!(after.disk_bytes, before.disk_bytes - f.accounting.reservation.disk_bytes);
+    // The pin is not the row's: it is still live, and the checkpoint stays charged.
+    assert!(pin_of(&m, &f.id).unwrap().released_at_ms.is_none());
+    assert!(!m.allocation_blocked());
+    clock.advance(DEFAULT_CHECKPOINT_LIFETIME_MS as i64 + SEC);
+    m.expire_checkpoints_due();
+    until("lifetime ABSENT", || {
+        row(&m, c.id.as_str()).state == CheckpointState::Deleted
+    })
+    .await;
+    assert_eq!(
+        pin_of(&m, &f.id).unwrap().released_by.as_deref(),
+        Some("absent")
+    );
+    assert_eq!(charge(&m), (0, 0));
+}
+
 /// C6b V16: kiln's shim checks object digests after allocation, so a corrupt
 /// artifact comes back as an ambiguous restore. Its corrupt verdict still quarantines
 /// the checkpoint (design 10): the next fork is refused before admission, the charge

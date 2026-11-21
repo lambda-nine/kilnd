@@ -284,6 +284,8 @@ pub struct FakeState {
     pub unavailable: bool,
     /// When set, only `list` fails.
     pub fail_list: bool,
+    /// When set, a legacy `list` answers but calls its inventory incomplete.
+    pub list_incomplete: bool,
     /// Backend IDs `list` reports twice.
     pub listed_twice: Vec<String>,
     /// When set, a legacy `gc` records its scope, then answers this instead.
@@ -348,6 +350,7 @@ impl Default for FakeState {
             remove_after_delete: None,
             unavailable: false,
             fail_list: false,
+            list_incomplete: false,
             listed_twice: Vec::new(),
             gc_script: None,
             hidden_from_list: Vec::new(),
@@ -1620,7 +1623,7 @@ impl Runtime for FakeRuntime {
                 })
                 .collect(),
             generation: 0,
-            complete: true,
+            complete: !s.list_incomplete,
         })
     }
 

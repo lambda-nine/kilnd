@@ -11,6 +11,8 @@ pub mod expiry;
 pub mod manager;
 pub mod model;
 pub mod process;
+/// `kilnd release-ambiguous`'s root side: the state owner, kiln's runs directory, exits.
+pub mod release_ambiguous;
 pub mod runtime;
 pub mod server;
 pub mod service;

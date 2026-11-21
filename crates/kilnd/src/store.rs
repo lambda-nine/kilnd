@@ -32,7 +32,15 @@ use crate::runtime::{CreatedSandbox, FencedAbsence, RuntimeReceipt};
 
 mod checkpoint;
 mod checkpoint_schema;
+mod operator_release;
+#[cfg(test)]
+#[path = "store/operator_release_tests.rs"]
+mod operator_release_tests;
 
+pub use operator_release::{
+    MAX_RELEASE_REASON_BYTES, OperatorRelease, OperatorReleaseError, OperatorReleased,
+    operator_release_refusal, valid_release_reason,
+};
 pub use checkpoint::{
     Checkpoint, CheckpointBudgets, CheckpointCounts, CheckpointExhausted, CheckpointExpiry,
     CheckpointFailure, CheckpointPage, CheckpointPin, CheckpointSeal, CheckpointState,
@@ -47,7 +55,7 @@ pub use checkpoint::{
     MIN_CHECKPOINT_EXPIRY_MS, MIN_CHECKPOINT_HISTORY_SECS,
 };
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 const MIGRATE_V6: &str =
     "CREATE TABLE history_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL);
@@ -1046,6 +1054,7 @@ const LEGACY_TRANSITION: &str = "legacy_release = CASE WHEN accounting_kind = 'l
         WHEN ?2 = 'deleted' THEN 'deleted'
         WHEN ?2 = 'failed' AND COALESCE(?3, backend_id) IS NOT NULL THEN 'compensated'
         WHEN ?2 = 'failed' AND create_certainty = 'definitely_not_created' THEN 'definitely_not_created'
+        WHEN ?2 = 'failed' AND legacy_release = 'operator_attested' THEN 'operator_attested'
     END END,
     disposition = CASE WHEN accounting_kind = 'legacy' AND ?2 = 'ready' THEN 'reusable' ELSE disposition END";
 
@@ -2098,8 +2107,8 @@ impl Store {
             tx.execute_batch(MIGRATE_V14)?;
         }
         // Checkpoint design 9: audit the existing sandbox membership as it stands before
-        // schema 15 or 16 changes anything. Neither adds a membership column, so a
-        // schema 12-15 database keeps its aggregates byte for byte.
+        // schema 15, 16 or 17 changes anything. None adds a membership column, so a
+        // schema 12-16 database keeps its aggregates byte for byte.
         if version >= 12 {
             verify_sandbox_membership(&tx).with_context(|| {
                 format!("schema {version} reservation membership does not match; refusing to migrate to schema {SCHEMA_VERSION}")
@@ -2108,7 +2117,10 @@ impl Store {
         if version < 15 {
             tx.execute_batch(checkpoint::MIGRATE_V15)?;
         }
-        tx.execute_batch(checkpoint::MIGRATE_V16)?;
+        if version < 16 {
+            tx.execute_batch(checkpoint::MIGRATE_V16)?;
+        }
+        operator_release::migrate_v17(&tx)?;
         audit_accounting_full(&tx)?;
         if refuse_busy {
             refuse_busy_checkpoints(&tx)?;

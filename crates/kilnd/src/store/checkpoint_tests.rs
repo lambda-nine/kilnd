@@ -347,7 +347,7 @@ fn assert_migration_preserves(dir: &Path) {
     assert_eq!(
         conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        16
+        crate::store::SCHEMA_VERSION
     );
     // Schema 16: the barrier's marker table, empty.
     assert!(table_snapshot(&conn, "checkpoint_barrier").is_empty());
@@ -494,6 +494,12 @@ fn schema15_from_a_real_schema14_database_keeps_every_digest_and_charge() {
     let (digest, keyed) = store.create_request(1000, "key-ready").unwrap().unwrap();
     assert_eq!(keyed.state, SandboxState::Ready);
     assert_eq!(digest, Digest::of(b"request"));
+    // Schema 14 to 17 in one transaction: the audit table exists and is empty.
+    let audited: i64 = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM operator_releases", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(audited, 0);
 }
 
 /// The same proof for a copy of a real node's database, in a private state directory
@@ -585,11 +591,11 @@ fn a_newer_schema_is_refused() {
     let tmp = private_dir();
     drop(Store::open(tmp.path()).unwrap());
     let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
-    conn.pragma_update(None, "user_version", 17).unwrap();
+    conn.pragma_update(None, "user_version", 18).unwrap();
     drop(conn);
     let error = format!("{:#}", Store::open(tmp.path()).err().unwrap());
     assert!(
-        error.contains("schema version 17 is newer than this kilnd (16)"),
+        error.contains("schema version 18 is newer than this kilnd (17)"),
         "{error}"
     );
 }
@@ -620,17 +626,19 @@ fn every_table(conn: &Connection) -> Vec<(String, Vec<Vec<Value>>)> {
         .collect()
 }
 
-/// Schema 15 to 16: a schema 15 database with checkpoints in every state, keys, pins
-/// and evidence (written by this Store's API; schema 15 is schema 16 without the
-/// barrier table, which is all migration 16 adds) keeps every row of every table and
-/// gains an empty `checkpoint_barrier`, and its schema is the fresh one.
+/// Schema 15 to 17: a schema 15 database with checkpoints in every state, keys, pins
+/// and evidence (written by this Store's API; schema 15 is schema 17 without the
+/// barrier table, the audit table and the widened CHECK, which is all migrations 16
+/// and 17 add) keeps every row of every table and gains an empty `checkpoint_barrier`
+/// and `operator_releases`, and its schema is the fresh one.
 #[test]
-fn schema16_from_15_keeps_every_row_and_adds_an_empty_barrier() {
+fn schema17_from_15_keeps_every_row_and_adds_an_empty_barrier_and_audit() {
     let f = fixture();
     let dir = f._tmp.path().to_path_buf();
     let Fixture { _tmp, store, .. } = f;
     drop(store);
     let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+    crate::store::operator_release::undo_v17(&conn);
     conn.execute_batch("DROP TABLE checkpoint_barrier; PRAGMA user_version = 15;")
         .unwrap();
     let before = every_table(&conn);
@@ -641,13 +649,99 @@ fn schema16_from_15_keeps_every_row_and_adds_an_empty_barrier() {
     assert_eq!(
         conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        16
+        crate::store::SCHEMA_VERSION
     );
     let mut after = every_table(&conn);
-    after.retain(|(t, _)| t != "checkpoint_barrier");
+    after.retain(|(t, _)| t != "checkpoint_barrier" && t != "operator_releases");
     assert_eq!(after, before);
     assert!(table_snapshot(&conn, "checkpoint_barrier").is_empty());
+    assert!(table_snapshot(&conn, "operator_releases").is_empty());
     assert_eq!(schema_sql(&conn), schema_sql(&Store::open_in_memory().unwrap().conn()));
+}
+
+/// Schema 16 to 17: the same database at schema 16 keeps every row of every table,
+/// its membership aggregates included, gains only an empty `operator_releases`, and
+/// its schema is the fresh one; the CHECK it widened admits `operator_attested` and
+/// nothing else new.
+#[test]
+fn schema17_from_16_keeps_every_row_and_widens_only_the_release_check() {
+    let f = fixture();
+    let dir = f._tmp.path().to_path_buf();
+    let Fixture { _tmp, store, .. } = f;
+    drop(store);
+    let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+    crate::store::operator_release::undo_v17(&conn);
+    let before = every_table(&conn);
+    let before_schema = schema_sql(&conn);
+    assert!(!before_schema.iter().any(|(_, sql)| sql.contains("operator_attested")));
+    drop(conn);
+    let store = Store::reopen_after_restart(&dir);
+    let conn = store.conn();
+    assert_eq!(
+        conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+            .unwrap(),
+        17
+    );
+    let mut after = every_table(&conn);
+    after.retain(|(t, _)| t != "operator_releases");
+    assert_eq!(after, before);
+    assert!(table_snapshot(&conn, "operator_releases").is_empty());
+    let after_schema = schema_sql(&conn);
+    assert_eq!(after_schema, schema_sql(&Store::open_in_memory().unwrap().conn()));
+    // Every schema 16 object is unchanged but `sandboxes`, whose only change is the
+    // one new disjunct.
+    for (name, sql) in &before_schema {
+        let now = &after_schema.iter().find(|(n, _)| n == name).unwrap().1;
+        if name == "sandboxes" {
+            assert_eq!(
+                now.replacen(
+                    "\n        OR (legacy_release = 'operator_attested' AND state = 'failed' AND backend_id IS NULL AND create_certainty = 'allocation_ambiguous' AND accounting_kind = 'legacy')",
+                    "",
+                    1
+                ),
+                *sql
+            );
+        } else {
+            assert_eq!(now, sql, "{name}");
+        }
+    }
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+}
+
+/// A database whose `sandboxes` CHECK isn't schema 16's exact text is not migrated:
+/// startup refuses and the database stays at schema 16.
+#[test]
+fn schema17_refuses_a_sandboxes_table_it_does_not_recognize() {
+    let f = fixture();
+    let dir = f._tmp.path().to_path_buf();
+    let Fixture { _tmp, store, .. } = f;
+    drop(store);
+    let conn = Connection::open(dir.join("kilnd.db")).unwrap();
+    crate::store::operator_release::undo_v17(&conn);
+    // A hand-edited CHECK, by the same procedure.
+    let sql: String = conn
+        .query_row("SELECT sql FROM sqlite_schema WHERE name = 'sandboxes'", [], |r| r.get(0))
+        .unwrap();
+    let cookie: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
+    conn.execute_batch("BEGIN; PRAGMA writable_schema = ON;").unwrap();
+    conn.execute(
+        "UPDATE sqlite_schema SET sql = ?1 WHERE name = 'sandboxes'",
+        [sql.replace("AND create_certainty = 'definitely_not_created')),", "AND create_certainty = 'definitely_not_created' )),")],
+    )
+    .unwrap();
+    conn.execute_batch(&format!("PRAGMA schema_version = {}; PRAGMA writable_schema = OFF; COMMIT;", cookie + 1))
+        .unwrap();
+    drop(conn);
+    let error = format!("{:#}", Store::open(&dir).err().unwrap());
+    assert!(error.contains("schema 16's legacy-release CHECK"), "{error}");
+    let version: i64 = Connection::open(dir.join("kilnd.db"))
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 16);
 }
 
 /// The marker is one row, kept from its first set, and counts as checkpoint state.
@@ -2786,7 +2880,7 @@ fn maintenance_busy_query_matches_the_schema() {
     let version: i64 = db
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, crate::store::SCHEMA_VERSION);
     // The query has no parameters and returns one (checkpoint ID, kind) per busy row.
     let mut actual: Vec<(String, String)> = db
         .prepare(sql)
@@ -2901,10 +2995,11 @@ fn upgrade_init_state_refuses_each_busy_kind_inside_the_migration() {
         refused("at schema 16");
         // The same row in a schema 15 database: the check is in the migration's
         // transaction, so the refusal leaves schema 15 exactly as it was.
-        Connection::open(tmp.path().join("kilnd.db"))
-            .unwrap()
-            .execute_batch("DROP TABLE checkpoint_barrier; PRAGMA user_version = 15;")
+        let conn = Connection::open(tmp.path().join("kilnd.db")).unwrap();
+        crate::store::operator_release::undo_v17(&conn);
+        conn.execute_batch("DROP TABLE checkpoint_barrier; PRAGMA user_version = 15;")
             .unwrap();
+        drop(conn);
         refused("mid-migration");
         assert_eq!(user_version(tmp.path()), 15, "{kind}");
         let barrier: i64 = Connection::open(tmp.path().join("kilnd.db"))
@@ -2918,6 +3013,6 @@ fn upgrade_init_state_refuses_each_busy_kind_inside_the_migration() {
         assert_eq!(barrier, 0, "{kind}: nothing of the migration committed");
         // Without the flag, an open migrates it as it always has.
         drop(Store::open(tmp.path()).unwrap());
-        assert_eq!(user_version(tmp.path()), 16, "{kind}");
+        assert_eq!(user_version(tmp.path()), crate::store::SCHEMA_VERSION, "{kind}");
     }
 }

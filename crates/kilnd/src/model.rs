@@ -255,6 +255,10 @@ pub enum LegacyRelease {
     Compensated,
     /// The typed create result proved nothing was allocated.
     DefinitelyNotCreated,
+    /// Schema 17: an ambiguous FAILED create with no backend ID, released by
+    /// `kilnd release-ambiguous` after a complete inventory with kilnd stopped. Only
+    /// the insert of its `operator_releases` audit row sets it; nothing derives it.
+    OperatorAttested,
 }
 
 impl LegacyRelease {
@@ -263,6 +267,7 @@ impl LegacyRelease {
             Self::Deleted => "deleted",
             Self::Compensated => "compensated",
             Self::DefinitelyNotCreated => "definitely_not_created",
+            Self::OperatorAttested => "operator_attested",
         }
     }
 
@@ -271,6 +276,7 @@ impl LegacyRelease {
             "deleted" => Self::Deleted,
             "compensated" => Self::Compensated,
             "definitely_not_created" => Self::DefinitelyNotCreated,
+            "operator_attested" => Self::OperatorAttested,
             _ => return None,
         })
     }

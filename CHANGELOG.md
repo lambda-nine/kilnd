@@ -6,6 +6,20 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Add `kilnd release-ambiguous`, the operator's release of an ambiguous reservation:
+  a `FAILED` create with no backend ID, which kilnd keeps charged because it can't
+  prove the create left nothing, so enough of them blocked a node for every uid with
+  no recovery. As root with the instance stopped, it takes the state lock (exit 75
+  while held), runs the startup reconciliation pass, and needs a second complete
+  inventory and kiln's runs directory, read by its entries since `kiln ls` skips a
+  run directory without `shim.pid`, to hold nothing a live row doesn't own (exit 69
+  otherwise, naming what to remove). Schema 17 records the release as one
+  append-only `operator_releases` row (owner, charges, operator uid, time, reason,
+  inventory SHA-256) whose insert alone can tag the row `operator_attested`; Delete
+  and a keyed retry then treat the row as after a create that allocated nothing. Each
+  start logs how many releases the database holds. See `docs/setup.md`, "Releasing an
+  ambiguous reservation". Older binaries refuse schema 17.
+
 - Cap each per-sandbox maximum at its node budget. The compiled maxima (8 GiB memory,
   4096 pids, 32 GiB disk) exceeded the default node budgets (3 GiB, 2048, 16 GiB), and
   startup checked only the defaults against them. The effective maximum for memory,

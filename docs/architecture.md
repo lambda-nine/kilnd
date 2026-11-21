@@ -306,8 +306,16 @@ Reservations on a legacy row follow ownership evidence:
   This covers every ordinary error, panics, task cancellation, a crash during
   create and every row older than schema 5. Delete refuses to release it even
   with an empty listing: no current Runtime operation can account for hidden or
-  unpublished resources without the ID. Authoritative resource reconciliation
-  would be needed to release this reservation.
+  unpublished resources without the ID. Only an operator releases it, with
+  `kilnd release-ambiguous` as root while the instance is stopped (setup.md): it
+  runs the startup reconciliation pass, then needs a second complete inventory and
+  kiln's runs directory, read by its entries since `kiln ls` skips a run directory
+  without `shim.pid`, to hold nothing a live row doesn't own. The release is one
+  insert into the append-only `operator_releases` table (schema 17), whose trigger
+  tags the row `operator_attested` in the same statement; the row stays `FAILED`
+  and then deletes as a `definitely_not_created` one does. Inputs kiln refuses only
+  after allocating are refused before any charge (below), so these rows come from
+  kiln failures and crashes, not from a caller's request.
 - `FAILED` with the durable `definitely_not_created` marker releases. Only the
   explicit `CreateFailure::definitely_not_created` constructor can produce it,
   and one SQLite update writes the state and marker together, so there is no
@@ -1384,6 +1392,22 @@ see [setup.md](setup.md) for rollback.
 **Migration 15 to 16** (C5a-1) adds one table, `checkpoint_barrier`: at most one row
 (`id = 1`, `set_at_ms`), the checkpoint barrier's durable obligation (below). Every
 schema 15 row is unchanged; the table starts empty. Older binaries refuse schema 16.
+
+**Migration 16 to 17** adds the operator's release of an ambiguous reservation.
+`sandboxes`' legacy-release `CHECK` gains one disjunct, `operator_attested` on a
+`FAILED` legacy row with no backend ID and `allocation_ambiguous` certainty, widened
+in place by SQLite's documented `writable_schema` procedure in the migration's one
+transaction (the old text must be there exactly once, the schema cookie advances,
+and an integrity check runs before commit); a rebuild would have to recreate every
+trigger, index and key schemas 8 to 16 attached to the table. It adds the
+append-only `operator_releases` table (sandbox ID, owner uid, every released charge
+and the sandbox count, operator uid, time, a 1 to 512 byte printable-ASCII reason,
+the inventory's SHA-256) and triggers: an insert must name a charged ambiguous
+`FAILED` legacy row with its exact owner and charges, and itself tags that row in
+the same statement; no `UPDATE` or `INSERT` of a sandbox can write the tag without
+its audit row, and no sandbox can take an audited ID again; the audit refuses
+`UPDATE` and `DELETE`. No membership column changes, so every schema 16 row and
+aggregate is unchanged. Older binaries refuse schema 17.
 
 
 ## Workspace checkpoint engine (milestone C5a)

@@ -14,7 +14,11 @@ pub const MAX_WRITABLE_PATH_BYTES: usize = 1024;
 /// checks none of these before it allocates, so a smaller value fails in its shim after
 /// allocation, which kilnd must record as an ambiguous reservation. kiln writes
 /// `cpu.max` as `round(cpus * 100000) 100000`, and cgroup v2 refuses a quota below 1 ms
-/// of each 100 ms period, so 10 millis is the least CPU kiln can start.
+/// of each 100 ms period, so 10 millis is the least CPU kiln can start. On the
+/// supported 4 KiB-block XFS, a `--disk` of 1-12288 bytes fails with EDQUOT writing
+/// the run's own `policy`, `shim.start` or `shim.pid`, and leaves a run directory with
+/// no `shim.pid` that `kiln ls`, `gc` and `rm` all skip (kiln `runtime/src/container.rs`
+/// :125-139); the disk floor is well clear of that.
 pub const MIN_CPU_MILLIS: u32 = 10;
 pub const MIN_MEMORY_BYTES: u64 = 32 << 20;
 pub const MIN_PIDS: u32 = 16;

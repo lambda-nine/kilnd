@@ -794,3 +794,62 @@ Known limits, measured on one test machine
   headroom and operator accounting.
 - **Bare-metal Linux** works the same way: install kiln and kilnd, then
   enable both services and the helper socket. Only the Lima VM has been tested.
+
+### Releasing an ambiguous reservation
+
+A create that fails after kiln may have allocated, with no backend ID reported,
+leaves a `FAILED` row with `allocation_ambiguous` certainty. kilnd keeps its
+reservation charged, through restarts and an empty `kiln ls`, because nothing it
+can observe proves the create left nothing: kiln can leave a run directory with no
+`shim.pid`, which `kiln ls`, `kiln gc` and `kiln rm` all skip. Delete refuses such a
+row with `FAILED_PRECONDITION`. Enough of them fill a node for every uid.
+
+Inputs kiln refuses only after allocating are refused before any charge
+(`INVALID_ARGUMENT`; see the [validation contract](validation.md)), so these rows
+come from kiln failures, crashes or host trouble rather than from a caller. To
+release one, as root on the node, with that instance stopped:
+
+```sh
+sudo systemctl stop kilnd            # or kilnd@NAME for a further instance
+sudo kilnd release-ambiguous --sandbox sb-0123456789abcdef \
+    --reason "kiln exited 1 during create; runs directory checked"
+sudo systemctl start kilnd
+```
+
+`--state-dir` (default `/var/lib/kilnd`) and `--helper-socket` (default
+`/run/kilnd-helper/helper.sock`) name the instance as the daemon's flags do; pass
+`--enable-workspace-checkpoints` if the daemon runs with it. The command gives up
+root for the state directory's own account before it opens the database, takes
+the state lock (exit 75 while kilnd or anything else holds it) and holds it to the
+end. It then proves the node clean, refusing at the first gap:
+
+1. The row is a charged ambiguous `FAILED` legacy create with no backend ID
+   (exit 65 otherwise: unknown, live, compensated, definitely not created, fenced
+   or already released).
+2. kilnd's own startup reconciliation pass runs and completes, with its usual
+   deadlines: the backend answers, its inventory is complete (stale runs
+   included), and the checkpoint barrier's inventory of checkpoint storage is
+   clean. What it changes is what the next start would change.
+3. A second complete inventory names only backends a live row owns.
+4. kiln's runs directory (`/var/lib/kiln/runs`), read by its entries, holds only
+   those backends and kiln's own `.checkpoints` store.
+
+Anything else exits 69 and names what was found: `kiln gc ID` removes a listed
+stale run, `kiln rm ID` a live one you have checked, and a directory without
+`shim.pid` must be inspected and removed by hand, once no create can still be
+working in it. Then retry. On success it prints one line:
+
+```text
+released sb-0123456789abcdef owner_uid=1000 sandboxes=1 host_cpu_millis=0 memory_bytes=536870912 pids=128 disk_bytes=1073741824 inventory_sha256=…
+```
+
+The release is the insert of one row in the append-only `operator_releases`
+table (schema 17): the sandbox and owner, every charge released, the operator's
+uid, the time, the reason and the inventory's SHA-256. Its insert tags the row
+`operator_attested`, which nothing else can write. The row stays `FAILED`; its
+owner can Delete it and release its request ID as after any create that
+allocated nothing, and a keyed retry answers with it, as before. Each daemon
+start logs how many releases the database holds. A fork's checkpoint pin is not
+part of the row's charge: it keeps waiting for the checkpoint's removal, which
+its lifetime bounds. Opening an older database migrates it to schema 17 first,
+as a start would. Exit 77 means not root.

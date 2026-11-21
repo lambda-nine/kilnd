@@ -278,6 +278,30 @@ enum Command {
         #[arg(long)]
         hold: bool,
     },
+    /// Releases one ambiguous reservation: a FAILED create with no backend ID that kilnd
+    /// keeps charged because it can't prove the create left nothing (docs/setup.md,
+    /// "Releasing an ambiguous reservation"). Root only, with this instance's kilnd
+    /// stopped: it takes the state lock (exit 75 while anything holds it) and holds it
+    /// throughout. It runs the startup reconciliation pass, then needs a complete
+    /// inventory and a runs directory holding only what live rows own (exit 69
+    /// otherwise, naming what to remove), and records an audit row with the release.
+    /// Exits 65 for a sandbox that isn't such a reservation, 77 when not root.
+    ReleaseAmbiguous {
+        /// The FAILED sandbox's ID.
+        #[arg(long)]
+        sandbox: String,
+        /// Why, for the audit row: 1 to 512 printable ASCII bytes.
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "/var/lib/kilnd")]
+        state_dir: PathBuf,
+        #[arg(long, default_value = "/run/kilnd-helper/helper.sock")]
+        helper_socket: PathBuf,
+        /// As the daemon's flag: the checkpoint barrier's inventory runs whether or not
+        /// it is given whenever checkpoint state exists.
+        #[arg(long)]
+        enable_workspace_checkpoints: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -357,6 +381,22 @@ fn main() -> ExitCode {
             helper_socket,
             hold,
         )),
+        Some(Command::ReleaseAmbiguous {
+            sandbox,
+            reason,
+            state_dir,
+            helper_socket,
+            enable_workspace_checkpoints,
+        }) => {
+            return ExitCode::from(release_ambiguous(
+                &runtime,
+                &sandbox,
+                &reason,
+                &state_dir,
+                helper_socket,
+                enable_workspace_checkpoints,
+            ));
+        }
         None => runtime.block_on(run(args)),
     };
     match outcome {
@@ -396,6 +436,13 @@ async fn run(args: Args) -> Result<()> {
     // ownership domains must be established before reconciliation mutates
     // durable state or invokes kiln.
     let store = Store::open(&args.state_dir)?;
+    let operator_releases = store.operator_release_count()?;
+    if operator_releases != 0 {
+        info!(
+            operator_releases,
+            "ambiguous reservations an operator has released with kilnd release-ambiguous (the operator_releases table)"
+        );
+    }
     let state_directory = store
         .state_directory_identity()?
         .context("on-disk store has no state-directory identity")?;
@@ -543,6 +590,80 @@ async fn serve_with<R: Runtime>(
     drop(sweeper);
     info!("stopped");
     result
+}
+
+/// `kilnd release-ambiguous`: as root, the state directory's owner and kiln's runs
+/// directory; then, as that account alone, the state lock (held to the end), the proof
+/// and the release. Prints one line on release, and the refusal otherwise.
+fn release_ambiguous(
+    runtime: &tokio::runtime::Runtime,
+    sandbox: &str,
+    reason: &str,
+    state_dir: &Path,
+    helper_socket: PathBuf,
+    enable_workspace_checkpoints: bool,
+) -> u8 {
+    use kilnd::release_ambiguous as ra;
+    let refuse = |code: u8, message: &dyn std::fmt::Display| {
+        eprintln!("kilnd release-ambiguous: refused: {message}");
+        code
+    };
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return refuse(
+            ra::EXIT_NOT_ROOT,
+            &"run as root, with this instance's kilnd stopped",
+        );
+    }
+    if let Err(e) = ra::valid_sandbox_id(sandbox)
+        .and_then(|()| kilnd::store::valid_release_reason(reason))
+    {
+        return refuse(ra::EXIT_USAGE, &e);
+    }
+    if !helper_socket.is_absolute() {
+        return refuse(ra::EXIT_USAGE, &"--helper-socket must be absolute");
+    }
+    let (uid, gid) = match ra::state_owner(state_dir) {
+        Ok(owner) => owner,
+        Err(e) => return refuse(1, &format!("{e:#}")),
+    };
+    let runs = match ra::RunsRoot::open(Path::new(ra::KILN_RUNS)) {
+        Ok(runs) => runs,
+        Err(e) => return refuse(ra::EXIT_NOT_PROVED, &format!("{e:#}")),
+    };
+    // SAFETY: getuid has no preconditions.
+    let operator_uid = unsafe { libc::getuid() };
+    if let Err(e) = drop_privileges(uid, gid) {
+        return refuse(1, &format!("{e:#}"));
+    }
+    let store = match Store::open(state_dir) {
+        Ok(store) => store,
+        Err(e) if ra::lock_held(&e) => {
+            return refuse(
+                ra::EXIT_DAEMON_RUNNING,
+                &format!("{e:#}: stop this instance's kilnd and retry"),
+            );
+        }
+        Err(e) => return refuse(1, &format!("{e:#}")),
+    };
+    let limits = Limits {
+        checkpoints: enable_workspace_checkpoints
+            .then(kilnd::manager::CheckpointLimits::default),
+        ..Limits::default()
+    };
+    let manager = Manager::new(KilnRuntime::new(helper_socket), store, limits);
+    let request = kilnd::manager::ReleaseRequest {
+        sandbox_id: sandbox,
+        reason,
+        operator_uid,
+    };
+    match runtime.block_on(manager.release_ambiguous(request, &runs)) {
+        Ok(proved) => {
+            println!("{}", ra::released_line(&proved));
+            ra::EXIT_RELEASED
+        }
+        Err(refusal) => refuse(ra::refusal_exit(&refusal), &refusal),
+    }
 }
 
 /// `kilnd init-state --refuse-busy-checkpoints` found busy checkpoints (EX_TEMPFAIL).
@@ -1732,6 +1853,78 @@ mod tests {
             check.command,
             Some(Command::CheckAttachment { .. })
         ));
+    }
+
+    #[test]
+    fn release_ambiguous_parses_and_refuses_anyone_but_root_before_touching_anything() {
+        let args = Args::try_parse_from([
+            "kilnd",
+            "release-ambiguous",
+            "--sandbox",
+            "sb-00000000000000ff",
+            "--reason",
+            "kiln exited 1; node checked",
+        ])
+        .unwrap();
+        let Some(Command::ReleaseAmbiguous {
+            sandbox,
+            state_dir,
+            helper_socket,
+            enable_workspace_checkpoints,
+            ..
+        }) = args.command
+        else {
+            panic!("not release-ambiguous");
+        };
+        assert_eq!(sandbox, "sb-00000000000000ff");
+        assert_eq!(state_dir, PathBuf::from("/var/lib/kilnd"));
+        assert_eq!(helper_socket, PathBuf::from("/run/kilnd-helper/helper.sock"));
+        assert!(!enable_workspace_checkpoints);
+        // Both are required.
+        assert!(Args::try_parse_from(["kilnd", "release-ambiguous", "--sandbox", "sb-00000000000000ff"]).is_err());
+        assert!(Args::try_parse_from(["kilnd", "release-ambiguous", "--reason", "x"]).is_err());
+
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let code = release_ambiguous(
+            &runtime,
+            "sb-00000000000000ff",
+            "why",
+            &state,
+            PathBuf::from("/run/kilnd-helper/helper.sock"),
+            false,
+        );
+        assert_eq!(code, kilnd::release_ambiguous::EXIT_NOT_ROOT);
+        assert!(!state.exists(), "nothing was opened or created");
+    }
+
+    #[test]
+    fn a_held_state_lock_is_told_apart_from_other_open_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let daemon = Store::open(&state).unwrap();
+        let held = Store::open(&state).err().unwrap();
+        assert!(kilnd::release_ambiguous::lock_held(&held), "{held:#}");
+        assert!(held.to_string().contains("state directory already owned"));
+        drop(daemon);
+        // Any other failure (here, a file where the directory should be) is not one.
+        let file = temp.path().join("file");
+        std::fs::File::options().create_new(true).write(true).open(&file).unwrap();
+        let other = Store::open(&file).err().unwrap();
+        assert!(!kilnd::release_ambiguous::lock_held(&other), "{other:#}");
     }
 
     #[tokio::test]
