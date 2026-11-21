@@ -203,16 +203,10 @@ impl Instance {
         )
     }
 
-    /// The release refused with `exit`, its message naming `names`, and the row still
-    /// charged as before.
-    async fn refused(
-        &self,
-        step: &str,
-        sandbox: &str,
-        exit: i32,
-        names: &[&str],
-        charged: &SandboxResources,
-    ) {
+    /// The release refused with `exit` and its message naming `names`. The charge is
+    /// checked by `still_charged` once the step's obstacle is gone: reading it starts the
+    /// instance, which needs the state lock and an inventory with no unmanaged run.
+    async fn refused(&self, step: &str, sandbox: &str, exit: i32, names: &[&str]) {
         let (rc, out, err) = self.release(sandbox, None).await;
         record(step, json!({ "exit": rc, "stdout": out, "stderr": err }));
         assert_eq!(rc, exit, "{step}: {out} {err}");
@@ -220,7 +214,16 @@ impl Instance {
         for name in names {
             assert!(err.contains(name), "{step}: {err} does not name {name}");
         }
-        assert_eq!(&self.charge_as_root().await, charged, "{step}");
+    }
+
+    /// After a refusal, the instance still reserves exactly `charged`.
+    async fn still_charged(&self, step: &str, charged: &SandboxResources) {
+        let reserved = self.charge_as_root().await;
+        record(
+            step,
+            json!({ "reserved_unchanged": &reserved == charged, "kiln": kiln_state() }),
+        );
+        assert_eq!(&reserved, charged, "{step}");
     }
 
     /// The instance's reservations, read by starting it as root and stopping it again.
@@ -583,11 +586,13 @@ async fn scenario() {
             &row.id,
             75,
             &["already owned", "kilnd.lock"],
-            &charged,
         )
         .await;
     drop(holder.stdin.take());
     assert!(holder.wait().unwrap().success());
+    instance
+        .still_charged("charged after lock held", &charged)
+        .await;
 
     // A run kiln lists that no row owns: created by kiln itself, then removed by ID.
     let out = kiln(&[
@@ -603,13 +608,7 @@ async fn scenario() {
     let run = String::from_utf8(out.stdout).unwrap().trim().to_string();
     assert!(kiln_ls().iter().any(|l| l.starts_with(&run)), "{run}");
     instance
-        .refused(
-            "refused unexplained run",
-            &row.id,
-            69,
-            &[&run, "kiln rm"],
-            &charged,
-        )
+        .refused("refused unexplained run", &row.id, 69, &[&run, "kiln rm"])
         .await;
     let rm = kiln(&["rm", &run]);
     record(
@@ -618,6 +617,9 @@ async fn scenario() {
     );
     assert!(rm.status.success(), "{rm:?}");
     assert_clean("after kiln rm");
+    instance
+        .still_charged("charged after unexplained run", &charged)
+        .await;
 
     // A run directory without shim.pid, which kiln ls skips.
     let stray = Path::new(RUNS).join(STRAY);
@@ -625,26 +627,20 @@ async fn scenario() {
     std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(kiln_ls(), Vec::<String>::new());
     instance
-        .refused(
-            "refused pid-less run directory",
-            &row.id,
-            69,
-            &[STRAY],
-            &charged,
-        )
+        .refused("refused pid-less run directory", &row.id, 69, &[STRAY])
         .await;
     std::fs::remove_dir(&stray).unwrap();
     assert_clean("after the stray directory");
+    instance
+        .still_charged("charged after pid-less run directory", &charged)
+        .await;
 
     // Not an ambiguous reservation, and no such sandbox.
     instance
-        .refused(
-            "refused deleted row",
-            &deleted_id,
-            65,
-            &["not FAILED"],
-            &charged,
-        )
+        .refused("refused deleted row", &deleted_id, 65, &["not FAILED"])
+        .await;
+    instance
+        .still_charged("charged after deleted row", &charged)
         .await;
     instance
         .refused(
@@ -652,8 +648,10 @@ async fn scenario() {
             "sb-00000000000000ff",
             65,
             &["no such sandbox"],
-            &charged,
         )
+        .await;
+    instance
+        .still_charged("charged after unknown id", &charged)
         .await;
 
     // 5. Proved clean: released once, with its audit row.
@@ -676,8 +674,10 @@ async fn scenario() {
             &row.id,
             65,
             &["already released"],
-            &zero,
         )
+        .await;
+    instance
+        .still_charged("nothing charged after already released", &zero)
         .await;
 
     // 6. The instance again, as root: nothing charged, one audit row, and every uid
