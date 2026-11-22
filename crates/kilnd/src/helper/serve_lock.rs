@@ -112,6 +112,19 @@ impl ServeLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Runs `serve` holding the lock at `path`: taken before `serve` is first polled, and
+    /// released only once it has returned. kilnd-helper passes its whole serve, the
+    /// groups' shutdown included, so no release can run beside anything it started.
+    pub async fn hold_while<T>(
+        path: &Path,
+        serve: impl std::future::Future<Output = T>,
+    ) -> Result<T, ServeLockError> {
+        let lock = Self::acquire(path)?;
+        let served = serve.await;
+        drop(lock);
+        Ok(served)
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +150,47 @@ mod tests {
         }
         drop(first);
         ServeLock::acquire(&path).expect("free again once the holder is gone");
+    }
+
+    /// Review 2026-11-22 (spare kilnd security, T1): the helper's side of the fence.
+    /// The lock is held while the serve runs, through a request still in flight and the
+    /// groups' shutdown after it, and released only once the serve has returned; taken
+    /// elsewhere, the serve never starts.
+    #[tokio::test]
+    async fn the_lock_is_held_for_the_whole_serve_and_released_after_it() {
+        let dir = private_dir();
+        let path = dir.path().join("helper.lock");
+        let (in_flight, settle) = tokio::sync::oneshot::channel::<()>();
+        let (started, serving) = tokio::sync::oneshot::channel::<()>();
+        let held = path.clone();
+        let serve = tokio::spawn(async move {
+            ServeLock::hold_while(&held, async {
+                // As a release would see it from the start of the serve...
+                assert!(matches!(ServeLock::acquire(&held), Err(ServeLockError::Held(_))));
+                started.send(()).unwrap();
+                // ...through a request that has not settled...
+                settle.await.unwrap();
+                tokio::task::yield_now().await;
+                // ...and the groups' shutdown after the listener stops.
+                assert!(matches!(ServeLock::acquire(&held), Err(ServeLockError::Held(_))));
+                "served"
+            })
+            .await
+        });
+        serving.await.unwrap();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+            assert!(matches!(ServeLock::acquire(&path), Err(ServeLockError::Held(_))));
+        }
+        in_flight.send(()).unwrap();
+        assert_eq!(serve.await.unwrap().unwrap(), "served");
+        ServeLock::acquire(&path).expect("free once the serve returned");
+
+        // Held by a release: refused, and the serve is never polled.
+        let fence = ServeLock::acquire(&path).unwrap();
+        let refused = ServeLock::hold_while(&path, async { panic!("served beside a release") }).await;
+        assert!(matches!(refused, Err(ServeLockError::Held(_))), "{refused:?}");
+        drop(fence);
     }
 
     #[test]

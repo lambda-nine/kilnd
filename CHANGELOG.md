@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Host tests now pin both halves of the helper's side of the release fence, which only
+  the root VM test did: `ServeLock::hold_while`, which kilnd-helper now serves under,
+  holds the serving lock from before the serve starts until it has returned, the
+  groups' shutdown included; and a listener error still waits for every request the
+  helper accepted before the serve returns. kilnd-helper's behaviour is unchanged.
+
 - setup.md's release steps no longer suggest stopping `kilnd@NAME` for a further
   instance: the release serves kiln to the `kilnd` account alone and refuses any other
   instance's state directory, so following the hint paused every instance for a

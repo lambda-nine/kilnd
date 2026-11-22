@@ -113,6 +113,25 @@ pub async fn serve_with_groups(
     checkpoint: Option<Arc<super::checkpoint::Node>>,
     shutdown: CancellationToken,
 ) -> io::Result<()> {
+    let listener = &listener;
+    let accept = move || async move { listener.accept().await.map(|(stream, _)| stream) };
+    serve_accepting(accept, uid, bin, firecracker, checkpoint, shutdown).await
+}
+
+/// [`serve_with_groups`] over any source of accepted connections, so a test can fail
+/// the listener under an accepted request.
+async fn serve_accepting<F, A>(
+    mut accept: F,
+    uid: u32,
+    bin: PathBuf,
+    firecracker: Option<Arc<Node>>,
+    checkpoint: Option<Arc<super::checkpoint::Node>>,
+    shutdown: CancellationToken,
+) -> io::Result<()>
+where
+    F: FnMut() -> A,
+    A: std::future::Future<Output = io::Result<UnixStream>>,
+{
     let runtime = Arc::new(DirectKilnRuntime::new(bin));
     let budgets = Arc::new(Budgets::new());
     let tasks = TaskTracker::new();
@@ -122,7 +141,7 @@ pub async fn serve_with_groups(
     loop {
         let accepted = tokio::select! {
             _ = shutdown.cancelled() => break,
-            result = listener.accept() => match result {
+            result = accept() => match result {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     failed = Some(error);
@@ -130,7 +149,7 @@ pub async fn serve_with_groups(
                 }
             },
         };
-        let stream = accepted.0;
+        let stream = accepted;
         // Reject before reading any attacker-controlled frame (including root). Darwin
         // refuses this query once a peer has gone, which must not end the listener.
         let Ok(peer_uid) = stream.peer_cred().map(|peer| peer.uid()) else {
@@ -709,6 +728,59 @@ mod tests {
         ] {
             assert_eq!(request.is_recovery(), reserved, "{request:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod listener_error_tests {
+    use super::*;
+
+    /// Review 2026-11-22 (spare kilnd security, T2): a listener error ends the accept
+    /// loop, but the serve returns, and its caller releases the serving lock, only once
+    /// every request it had accepted has settled. Here one accepted request is still
+    /// being framed (its peer sent nothing yet) when the next accept fails.
+    #[tokio::test]
+    async fn a_listener_error_waits_for_every_accepted_request_before_returning() {
+        let temp = crate::test_support::short_tempdir().unwrap();
+        let path = temp.path().join("helper.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let accepts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = accepts.clone();
+        let listener = Arc::new(listener);
+        let accept = move || {
+            let listener = listener.clone();
+            let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    listener.accept().await.map(|(stream, _)| stream)
+                } else {
+                    Err(io::Error::other("listener failed"))
+                }
+            }
+        };
+        let mut serve = tokio::spawn(serve_accepting(
+            accept,
+            uid,
+            temp.path().join("missing"),
+            None,
+            None,
+            CancellationToken::new(),
+        ));
+        // The framing deadline is two seconds; well inside it the request is in flight.
+        let pending = timeout(Duration::from_millis(500), &mut serve).await;
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 2, "the listener failed");
+        assert!(pending.is_err(), "returned under an accepted request: {pending:?}");
+        // The peer goes away; its request settles, and only then does the serve return,
+        // with the listener's error.
+        drop(client);
+        let served = timeout(Duration::from_secs(10), serve)
+            .await
+            .expect("the serve returned once its request settled")
+            .unwrap();
+        assert_eq!(served.unwrap_err().to_string(), "listener failed");
     }
 }
 

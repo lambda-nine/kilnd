@@ -147,17 +147,22 @@ async fn main() -> Result<()> {
             .map_err(anyhow::Error::msg)
             .context("provision node ledger");
     }
-    // Held to the end of main: past serve_with_groups, which returns only once every
+    // Held for the whole serve: past serve_with_groups, which returns only once every
     // request task it spawned has settled, and past the groups' own shutdown.
-    let _serving = match kilnd::helper::ServeLock::acquire(&args.serve_lock) {
-        Ok(lock) => lock,
+    match kilnd::helper::ServeLock::hold_while(&args.serve_lock, serve(&args, bin)).await {
+        Ok(served) => served,
         Err(kilnd::helper::ServeLockError::Held(path)) => bail!(
             "{} is held: `kilnd release-ambiguous` (or another kilnd-helper) is running; \
              not serving until it has finished",
             path.display()
         ),
-        Err(error) => return Err(anyhow::Error::new(error).context("take the serving lock")),
-    };
+        Err(error) => Err(anyhow::Error::new(error).context("take the serving lock")),
+    }
+}
+
+/// Everything kilnd-helper does while it holds the serving lock: systemd's socket, the
+/// groups, the serve, and the groups' shutdown.
+async fn serve(args: &Args, bin: PathBuf) -> Result<()> {
     if std::env::var("LISTEN_PID")?.parse::<u32>()? != std::process::id()
         || std::env::var("LISTEN_FDS")? != "1"
     {
