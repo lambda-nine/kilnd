@@ -530,6 +530,15 @@ mod linux {
             open(relative, libc::O_RDONLY | libc::O_DIRECTORY)
         }
 
+        /// A whole file beneath the private instance, as [`open`], as bytes: for a file
+        /// whose text a process controls in part, as `PID/stat`'s and `PID/status`'s
+        /// command name.
+        pub fn read(relative: &str) -> io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            open(relative, libc::O_RDONLY)?.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+
         /// A whole file beneath the private instance, as [`open`].
         pub fn read_to_string(relative: &str) -> io::Result<String> {
             let mut text = String::new();

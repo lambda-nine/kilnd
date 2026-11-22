@@ -280,11 +280,15 @@ pub struct ProcessStat {
 }
 
 impl ProcessStat {
-    /// Parses `/proc/PID/stat`, whose command name is parenthesized and may hold spaces
-    /// and parentheses: the fields after its last `") "` begin at field 3.
-    pub fn parse(text: &str) -> io::Result<Self> {
+    /// Parses `/proc/PID/stat`, whose command name is parenthesized and may hold spaces,
+    /// parentheses and bytes that aren't UTF-8 (the process chose them): the fields
+    /// after its last `") "` begin at field 3, and they are ASCII. Read as bytes, so a
+    /// name nobody vouches for can't fail the scan.
+    pub fn parse(text: impl AsRef<[u8]>) -> io::Result<Self> {
         let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed stat");
-        let (_, fields) = text.rsplit_once(") ").ok_or_else(malformed)?;
+        let text = text.as_ref();
+        let end = text.windows(2).rposition(|w| w == b") ").ok_or_else(malformed)?;
+        let fields = std::str::from_utf8(&text[end + 2..]).map_err(|_| malformed())?;
         let fields: Vec<&str> = fields.split_whitespace().collect();
         let ppid = fields.get(1).and_then(|f| f.parse().ok()).ok_or_else(malformed)?;
         let start = fields.get(19).ok_or_else(malformed)?.to_string();
@@ -298,13 +302,19 @@ impl ProcessStat {
 pub struct ProcessUids(pub [u32; 4]);
 
 impl ProcessUids {
-    /// Parses `/proc/PID/status`: its one `Uid:` line, with exactly four uids.
-    pub fn parse(text: &str) -> io::Result<Self> {
+    /// Parses `/proc/PID/status`: its one `Uid:` line, with exactly four uids. Read as
+    /// bytes: the `Name:` line is the process's own command name, which the kernel copies
+    /// raw but for newline and backslash, so it need not be UTF-8 and can't add a line.
+    pub fn parse(text: impl AsRef<[u8]>) -> io::Result<Self> {
         let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed status Uid line");
-        let mut lines = text.lines().filter_map(|line| line.strip_prefix("Uid:"));
+        let mut lines = text
+            .as_ref()
+            .split(|b| *b == b'\n')
+            .filter_map(|line| line.strip_prefix(b"Uid:"));
         let (Some(line), None) = (lines.next(), lines.next()) else {
             return Err(malformed());
         };
+        let line = std::str::from_utf8(line).map_err(|_| malformed())?;
         let uids: Vec<u32> = line
             .split_whitespace()
             .map(|uid| uid.parse().map_err(|_| malformed()))
@@ -676,14 +686,14 @@ impl ProcessTable for LinuxProcesses {
     }
 
     fn uids(&self, pid: i32) -> io::Result<Option<ProcessUids>> {
-        gone(crate::sys::procfs::read_to_string(&format!("{pid}/status")))?
-            .map(|text| ProcessUids::parse(&text))
+        gone(crate::sys::procfs::read(&format!("{pid}/status")))?
+            .map(ProcessUids::parse)
             .transpose()
     }
 
     fn stat(&self, pid: i32) -> io::Result<Option<ProcessStat>> {
-        gone(crate::sys::procfs::read_to_string(&format!("{pid}/stat")))?
-            .map(|text| ProcessStat::parse(&text))
+        gone(crate::sys::procfs::read(&format!("{pid}/stat")))?
+            .map(ProcessStat::parse)
             .transpose()
     }
 
@@ -1164,6 +1174,87 @@ mod tests {
         let refusal = ReleaseRefusal::KilnProcesses(few).to_string();
         assert!(refusal.contains("descendants: 7 /usr/local/bin/kiln; "), "{refusal}");
         assert!(!refusal.contains("in all"), "{refusal}");
+    }
+
+    /// Fix review 2026-11-22 (R2): a process's command name is its own (an exec through
+    /// a symlink named `\xff`, or PR_SET_NAME), and the kernel copies it into `status`'s
+    /// `Name:` line and `stat`'s parenthesized field raw. Read as text, one that isn't
+    /// UTF-8 failed the whole scan before the uid check (exit 69, naming nothing), from
+    /// any account or any sandbox. Read as bytes, another account's is ignored, root's
+    /// still counts, and an ancestor's is read past.
+    #[test]
+    fn a_command_name_that_is_not_utf8_neither_fails_the_scan_nor_hides_roots_kiln() {
+        /// `LinuxProcesses` without the procfs: each file's bytes through the same parsers.
+        struct Raw {
+            status: &'static [u8],
+            stat: HashMap<i32, &'static [u8]>,
+            link: &'static [u8],
+        }
+        impl ProcessTable for Raw {
+            fn pids(&self) -> io::Result<Vec<i32>> {
+                Ok(vec![4242])
+            }
+            fn exe_link(&self, _: i32) -> io::Result<Option<Vec<u8>>> {
+                Ok(Some(self.link.to_vec()))
+            }
+            fn exe_image(&self, _: i32) -> io::Result<Option<KilnImage>> {
+                Ok(Some(OTHER))
+            }
+            fn uids(&self, _: i32) -> io::Result<Option<ProcessUids>> {
+                ProcessUids::parse(self.status).map(Some)
+            }
+            fn stat(&self, pid: i32) -> io::Result<Option<ProcessStat>> {
+                self.stat.get(&pid).map(ProcessStat::parse).transpose()
+            }
+            fn argv(&self, _: i32) -> io::Result<Option<Vec<Vec<u8>>>> {
+                Ok(Some(vec![b"/home/mallory/kiln".to_vec(), b"86400".to_vec()]))
+            }
+        }
+        let mut stat: HashMap<i32, &'static [u8]> = HashMap::new();
+        stat.insert(4242, b"4242 (\xff) S 3000 4242 4242 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 1234 1 2 3");
+        // The parent, a shell whose name isn't UTF-8 either and is itself a "(x) " trap.
+        stat.insert(3000, b"3000 (\xfe) (x) \xff) S 1 3000 3000 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 1000 1 2 3");
+        assert_eq!(
+            ProcessStat::parse(stat[&4242]).unwrap(),
+            ProcessStat { ppid: 3000, start: "1234".into() }
+        );
+        assert_eq!(ProcessStat::parse(stat[&3000]).unwrap().ppid, 1);
+        let none = || Ok(PublishedShims::new());
+        let mallory = Raw {
+            status: b"Name:\t\xff\nUmask:\t0022\nState:\tT (stopped)\nPid:\t4242\nPPid:\t3000\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n",
+            stat: stat.clone(),
+            link: b"/home/mallory/kiln",
+        };
+        assert!(unexplained_kiln_processes(&mallory, KILN, &none).unwrap().is_empty());
+        let root = Raw {
+            status: b"Name:\t\xff\\n\nUmask:\t0022\nState:\tT (stopped)\nPid:\t4242\nPPid:\t3000\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n",
+            stat,
+            link: b"/var/tmp/\xff/kiln (deleted)",
+        };
+        let found = unexplained_kiln_processes(&root, KILN, &none).unwrap();
+        assert_eq!(found.named, ["4242 /var/tmp/\u{fffd}/kiln (deleted)"]);
+        // The Uid: line itself must still be ASCII digits.
+        assert!(ProcessUids::parse(b"Name:\tk\nUid:\t1000\t\xff\t1000\t1000\n").is_err());
+        assert!(ProcessStat::parse(b"4242 (k) S \xff 1").is_err());
+    }
+
+    /// Fix review 2026-11-22 (T-1): the Linux reader itself, on this process. CI runs it
+    /// unprivileged on Linux (the private procfs falls back to /proc); the macOS host
+    /// compiles it out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_processes_reads_this_process_uids_and_stat() {
+        let (mut r, mut e, mut s) = (0, 0, 0);
+        // SAFETY: valid pointers to three uids.
+        assert_eq!(unsafe { libc::getresuid(&mut r, &mut e, &mut s) }, 0);
+        // SAFETY: getpid, getppid and setfsuid(-1) (a query) have no preconditions.
+        let (pid, ppid, fs) = unsafe { (libc::getpid(), libc::getppid(), libc::setfsuid(u32::MAX) as u32) };
+        let table = LinuxProcesses;
+        assert_eq!(table.uids(pid).unwrap(), Some(ProcessUids([r, e, s, fs])));
+        assert_eq!(table.stat(pid).unwrap().unwrap().ppid, ppid);
+        assert!(table.exe_link(pid).unwrap().is_some());
+        // Gone: a pid past pid_max.
+        assert_eq!(table.uids(1 << 23).unwrap(), None);
     }
 
     #[test]

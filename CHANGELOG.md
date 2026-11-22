@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- `kilnd release-ambiguous` no longer fails its process scan with exit 69 over a
+  command name that isn't UTF-8. It read `/proc/PID/stat`, and `/proc/PID/status` for a
+  process whose executable is named `kiln`, as text, and both carry the kernel's
+  command name, whose bytes the process sets (`prctl(PR_SET_NAME)`, or an executable
+  run through a link of that name). So one such kiln process, or a process a kiln
+  process descends from, made every release fail. Both files are now read as bytes,
+  and only the fields the scan uses are parsed as text.
+
 - Host tests now pin both halves of the helper's side of the release fence, which only
   the root VM test did: `ServeLock::hold_while`, which kilnd-helper now serves under,
   holds the serving lock from before the serve starts until it has returned, the
