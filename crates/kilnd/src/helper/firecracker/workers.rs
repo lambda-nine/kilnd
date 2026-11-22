@@ -1068,6 +1068,9 @@ pub struct TestInjection {
 pub enum FakeEffect {
     Marker(String),
     Vm,
+    /// M3-1 follow-up: the phases to READY journaled through a real `Link`, as the real
+    /// chain's S journals them, so H's READY handling runs on the fake path.
+    Ready,
 }
 
 /// Everything a forked worker needs, inherited as memory. Never serialized, so no
@@ -2932,6 +2935,28 @@ fn run_effect(
                     &SupervisorEvent::VmStarted(target),
                     Duration::from_secs(1),
                 );
+            }
+        }
+        FakeEffect::Ready => {
+            use super::supervisor::{Link, SupervisorRecord};
+            fault_point("S.effect.ready");
+            let mut link = Link::new(context, u64::MAX);
+            for (step, from, to) in [
+                ("spawn_intent", "preparing", "spawn_intent"),
+                ("harden", "spawn_intent", "booting"),
+            ] {
+                let recorded = link.step(step).and_then(|()| {
+                    link.record(SupervisorRecord::Phase {
+                        from: vec![from.into()],
+                        to: to.into(),
+                    })
+                });
+                if recorded.is_err() {
+                    return;
+                }
+            }
+            if link.step("broker_ready").is_ok() && link.record_ready().is_ok() {
+                link.report_ready("fake-boot".into(), "fake-inner".into());
             }
         }
     }

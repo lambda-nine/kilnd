@@ -462,3 +462,54 @@ async fn m3_a_p_refusals_carry_ps_steps() {
     }
     assert!(!named.contains(&"p.revalidate.table"), "{named:?}");
 }
+
+/// M3-1 follow-up: through the real H, L and a supervisor that journals READY through a
+/// real `Link` (fake effects otherwise), the line is written once S's last step has
+/// arrived, after H answered READY: complete, with `s.journal_ready` ending no earlier
+/// than H's own handling of the READY record.
+#[tokio::test]
+async fn m3_a_ready_line_waits_for_the_supervisors_last_step() {
+    let fixture = Fixture::new(NodeOptions {
+        effects: vec!["ready".into()],
+        ..NodeOptions::default()
+    })
+    .await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let (context, plan) = issued(&runtime, instance).await;
+    create_accepted(&fixture, &runtime, &context, &plan).await;
+    timing_line(&fixture, context.allocation_id).await;
+    let records = timing::read_records(
+        fixture.log().as_bytes(),
+        Select::Allocation(context.allocation_id),
+    )
+    .unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(
+        (record.outcome, record.incomplete),
+        (Outcome::Ready, false),
+        "{record:?}"
+    );
+    let step = |name: &str| {
+        record
+            .steps
+            .iter()
+            .find(|s| s.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} missing: {:?}", names(&record.steps)))
+    };
+    let committed = step(timing::READY_RECORD);
+    let tail = step(timing::READY_TAIL);
+    step("s.broker_ready");
+    step(timing::BOOTING_RECORD);
+    assert!(
+        tail.end_ns >= committed.end_ns && tail.records == 1,
+        "READY's step ends at H's answer: {tail:?} {committed:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fixture.log().matches(timing::LINE_PREFIX).count(),
+        1,
+        "one line per create"
+    );
+}

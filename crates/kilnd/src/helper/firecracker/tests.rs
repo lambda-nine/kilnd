@@ -189,6 +189,7 @@ fn node_fixture_child() {
             .iter()
             .map(|effect| match effect.strip_prefix("marker:") {
                 Some(name) => FakeEffect::Marker(name.to_string()),
+                None if effect == "ready" => FakeEffect::Ready,
                 None => FakeEffect::Vm,
             })
             .collect();
