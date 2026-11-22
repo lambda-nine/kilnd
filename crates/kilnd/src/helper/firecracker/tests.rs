@@ -5207,4 +5207,6 @@ mod lifecycle;
 mod recovery;
 #[cfg(target_os = "linux")]
 mod session;
+#[cfg(target_os = "linux")]
+mod stress;
 mod timing;
