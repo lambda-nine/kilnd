@@ -64,9 +64,18 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         admission.caller_create_requests = requests.caller;
         admission.rejected_create_requests = requests.rejected;
         // Checkpoint stats while checkpoints are on or any checkpoint state exists;
-        // otherwise absent, with no checkpoint store read (design Appendix A).
+        // otherwise absent, with no checkpoint store read (design Appendix A). A failed
+        // read leaves the block absent and Health DEGRADED, saying why: an absent block
+        // alone would read as "no checkpoint state".
+        let (mut serving, mut detail) = (h.serving, h.detail);
         let checkpoints = self.manager.checkpoint_stats(uid).unwrap_or_else(|error| {
-            tracing::warn!(error = %format!("{error:#}"), "read checkpoint counts");
+            let error = format!("{error:#}");
+            tracing::warn!(error = %error, "read checkpoint counts");
+            serving = false;
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(&health_sentence("checkpoint counts unreadable: ", &error));
             None
         });
         admission.checkpoints = checkpoints.map(checkpoint_stats_pb);
@@ -74,7 +83,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
         node_resources.checkpoint_reserved_disk_bytes = checkpoints.map_or(0, |c| c.reserved_bytes);
         let status = if h.shutting_down {
             pb::health_response::Status::ShuttingDown
-        } else if h.serving {
+        } else if serving {
             pb::health_response::Status::Serving
         } else {
             pb::health_response::Status::Degraded
@@ -84,7 +93,7 @@ impl<R: Runtime> pb::kilnd_service_server::KilndService for Service<R> {
             version: env!("CARGO_PKG_VERSION").into(),
             backend: h.backend.into(),
             backend_version: h.backend_version,
-            detail: h.detail,
+            detail,
             started_at_unix_ms: h.started_at_ms,
             active_sandboxes: h.active_sandboxes,
             running_executions: h.running_executions,
@@ -689,6 +698,43 @@ fn checkpoint_limits_pb(
         worker_max_fds: 256,
         request_retention_ms: request_retention_secs.saturating_mul(1000),
     }
+}
+
+/// The most one Health detail sentence built from an error holds, in bytes.
+const MAX_HEALTH_SENTENCE: usize = 512;
+
+/// `prefix` and `error` as one Health detail sentence: on one line (control characters
+/// become spaces) and at most [`MAX_HEALTH_SENTENCE`] bytes, cut on a UTF-8 boundary.
+fn health_sentence(prefix: &str, error: &str) -> String {
+    let mut sentence: String = prefix
+        .chars()
+        .chain(error.chars())
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if sentence.len() > MAX_HEALTH_SENTENCE {
+        let mut end = MAX_HEALTH_SENTENCE;
+        while !sentence.is_char_boundary(end) {
+            end -= 1;
+        }
+        sentence.truncate(end);
+    }
+    sentence
+}
+
+#[cfg(test)]
+#[test]
+fn a_health_sentence_is_one_bounded_line_cut_on_a_utf8_boundary() {
+    assert_eq!(
+        health_sentence("checkpoint counts unreadable: ", "disk I/O error:\nline two\r\t."),
+        "checkpoint counts unreadable: disk I/O error: line two  ."
+    );
+    // 30 prefix bytes, then three-byte characters: 512 falls inside one.
+    let long = "\u{20ac}".repeat(400);
+    let sentence = health_sentence("checkpoint counts unreadable: ", &long);
+    assert_eq!(sentence.len(), 30 + 3 * 160);
+    assert!(sentence.len() <= MAX_HEALTH_SENTENCE && MAX_HEALTH_SENTENCE - sentence.len() < 3);
+    assert!(sentence.ends_with('\u{20ac}'));
+    assert_eq!(health_sentence("p: ", "short"), "p: short");
 }
 
 fn checkpoint_stats_pb(s: crate::manager::CheckpointStats) -> pb::CheckpointStats {

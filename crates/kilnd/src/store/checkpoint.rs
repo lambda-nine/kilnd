@@ -1769,6 +1769,13 @@ impl Store {
     /// its charge, as node accounting keeps it ([`checkpoint_charge`]; C5b-2 adversarial
     /// review LOW 1): the cached counters already dropped it when it was released.
     pub fn checkpoint_usage(&self, owner_uid: u32) -> Result<CheckpointUsage> {
+        #[cfg(test)]
+        if self
+            .fail_checkpoint_usage
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("injected checkpoint usage read failure");
+        }
         self.audited_read(|conn| {
             let mut u = usage(conn, owner_uid)?;
             let mut stmt = conn.prepare_cached(

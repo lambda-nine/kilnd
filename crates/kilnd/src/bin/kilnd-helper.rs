@@ -217,16 +217,21 @@ async fn serve(args: &Args, bin: PathBuf) -> Result<()> {
         },
     };
     // As with Firecracker, a checkpoint group that can't start never takes kiln down.
+    // Exactly one startup line says which way it came up.
     let checkpoint = if args.enable_checkpoints {
         let workers = std::sync::Arc::new(kilnd::helper::checkpoint::KilnWorkers::new(bin.clone()));
         match kilnd::helper::checkpoint::Node::new(workers) {
-            Ok(node) => Some(node),
+            Ok(node) => {
+                eprintln!("{}", checkpoint_group_line(CheckpointGroup::Enabled));
+                Some(node)
+            }
             Err(error) => {
-                eprintln!("kilnd-helper: checkpoint group disabled: {error}");
+                eprintln!("{}", checkpoint_group_line(CheckpointGroup::Failed(&error)));
                 None
             }
         }
     } else {
+        eprintln!("{}", checkpoint_group_line(CheckpointGroup::Off));
         None
     };
     let stop = CancellationToken::new();
@@ -255,6 +260,26 @@ async fn serve(args: &Args, bin: PathBuf) -> Result<()> {
         node.shutdown().await;
     }
     served.context("root helper")
+}
+
+/// How the checkpoint group came up at startup.
+enum CheckpointGroup<'a> {
+    Enabled,
+    /// Started without `--enable-checkpoints`: the group answers Disabled.
+    Off,
+    /// Given the flag, but the group could not start: it answers Disabled too.
+    Failed(&'a dyn std::fmt::Display),
+}
+
+/// The helper's one startup line for its checkpoint group, on standard error.
+fn checkpoint_group_line(group: CheckpointGroup<'_>) -> String {
+    match group {
+        CheckpointGroup::Enabled => "kilnd-helper: checkpoint group: enabled".into(),
+        CheckpointGroup::Off => "kilnd-helper: checkpoint group: off (flag)".into(),
+        CheckpointGroup::Failed(error) => {
+            format!("kilnd-helper: checkpoint group: failed: {error}")
+        }
+    }
 }
 
 /// One of root's ledger commands, which reach it by no socket and answer on stdout.
@@ -400,4 +425,27 @@ fn account(name: &str) -> Result<(u32, u32)> {
         bail!("no such account");
     }
     Ok((pwd.pw_uid, pwd.pw_gid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Backlog B4 (row 12): one startup line for each way the checkpoint group comes up.
+    #[test]
+    fn the_checkpoint_group_logs_one_line_for_each_startup_state() {
+        assert_eq!(
+            checkpoint_group_line(CheckpointGroup::Enabled),
+            "kilnd-helper: checkpoint group: enabled"
+        );
+        assert_eq!(
+            checkpoint_group_line(CheckpointGroup::Off),
+            "kilnd-helper: checkpoint group: off (flag)"
+        );
+        let error = anyhow::anyhow!("no checkpoint session");
+        assert_eq!(
+            checkpoint_group_line(CheckpointGroup::Failed(&error)),
+            "kilnd-helper: checkpoint group: failed: no checkpoint session"
+        );
+    }
 }

@@ -1904,6 +1904,43 @@ mod tests {
         assert_eq!(out.stdout.data, b"saved");
     }
 
+    /// Backlog B4 (row 2), through the whole exec: the CLI dies with no status after the
+    /// sandbox's OOM group kill took its cgroup away. The cleanup failure names that, with
+    /// the OOM hint, and not an old kiln.
+    #[tokio::test]
+    async fn a_sandbox_cgroup_gone_after_the_start_is_not_reported_as_an_old_kiln() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = tmp.path().join("cgroup/abcd");
+        let runtime = fixture_runtime(
+            tmp.path(),
+            &format!(
+                "import shutil\ntime.sleep(.3)\nshutil.rmtree({sandbox:?})\nos.close(STATUS)\nsys.exit(137)"
+            ),
+        );
+        fs::write(
+            runtime.cgroup_root.join("abcd/exec/cgroup.events"),
+            "populated 1\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime.cgroup_root.join("abcd/memory.events"),
+            "oom 1\noom_kill 1\noom_group_kill 1\n",
+        )
+        .unwrap();
+        let out = execute(&runtime).await;
+        let d = out.finish.unwrap_err();
+        assert_eq!((d.kind, d.stage), (Kind::CleanupFailed, Stage::Cleanup), "{d:?}");
+        assert!(
+            d.message.starts_with(
+                "the sandbox's cgroup went away after the command started (the sandbox ran out of memory)"
+            ),
+            "{}",
+            d.message
+        );
+        assert!(!d.message.contains("3b42552"), "{}", d.message);
+        assert_eq!(out.disposition, SandboxDisposition::Quarantined);
+    }
+
     #[tokio::test]
     async fn replacement_between_handshake_and_exec_rejects_before_workload() {
         let tmp = tempfile::tempdir().unwrap();

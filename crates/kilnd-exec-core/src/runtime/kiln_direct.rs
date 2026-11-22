@@ -221,27 +221,35 @@ impl<'a> DirectKiln<'a> {
 
     /// A killed `kiln exec` client cannot receive PID 1's post-cleanup reply.
     /// The required kiln revision gives every command a fixed `exec` cgroup;
-    /// observing `populated 0` is the host-side cleanup acknowledgment.
-    pub async fn wait_exec_cleanup(&self, id: &str) -> Result<(), RuntimeError> {
+    /// observing `populated 0` is the host-side cleanup acknowledgment. `scope` is what
+    /// [`Self::observe_exec_scope`] saw once the command started; a missing barrier is
+    /// told apart with it (see [`MissingBarrier`]).
+    pub async fn wait_exec_cleanup(
+        &self,
+        id: &str,
+        mut scope: ExecScope,
+    ) -> Result<(), RuntimeError> {
         let events = self.cgroup_root.join(id).join("exec/cgroup.events");
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
         loop {
+            self.observe_oom_kills(id, &mut scope).await;
             match tokio::fs::read_to_string(&events).await {
-                Ok(value) => match exec_populated(&value) {
-                    Some(false) => return Ok(()),
-                    Some(true) => {}
-                    None => {
-                        return Err(RuntimeError::Backend(format!(
-                            "kiln cleanup barrier {} has no populated state",
-                            events.display()
-                        )));
+                Ok(value) => {
+                    scope.seen = true;
+                    match exec_populated(&value) {
+                        Some(false) => return Ok(()),
+                        Some(true) => {}
+                        None => {
+                            return Err(RuntimeError::Backend(format!(
+                                "kiln cleanup barrier {} has no populated state",
+                                events.display()
+                            )));
+                        }
                     }
-                },
+                }
                 Err(error) if error.kind() == ErrorKind::NotFound => {
-                    return Err(RuntimeError::Backend(format!(
-                        "kiln cleanup barrier {} is missing; kiln 3b42552 or later is required",
-                        events.display()
-                    )));
+                    let missing = self.missing_barrier(id, scope).await;
+                    return Err(RuntimeError::Backend(missing.message(&events)));
                 }
                 Err(error) => return Err(RuntimeError::Io(error)),
             }
@@ -253,6 +261,54 @@ impl<'a> DirectKiln<'a> {
                 )));
             }
             tokio::time::sleep(CLEANUP_POLL).await;
+        }
+    }
+
+    /// What the sandbox's exec cgroup looks like now, just after a command started:
+    /// whether its barrier exists, and the sandbox cgroup's OOM kills so far. Never
+    /// fails; what it can't read it leaves unknown.
+    pub async fn observe_exec_scope(&self, id: &str) -> ExecScope {
+        let events = self.cgroup_root.join(id).join("exec/cgroup.events");
+        let mut scope = ExecScope {
+            seen: tokio::fs::metadata(&events).await.is_ok(),
+            oom_kills: None,
+        };
+        self.observe_oom_kills(id, &mut scope).await;
+        scope
+    }
+
+    /// Keeps the highest `oom_kill` the sandbox cgroup's `memory.events` shows, when it
+    /// can be read; a read that fails changes nothing.
+    async fn observe_oom_kills(&self, id: &str, scope: &mut ExecScope) {
+        let path = self.cgroup_root.join(id).join("memory.events");
+        if let Ok(text) = tokio::fs::read_to_string(&path).await
+            && let Some(kills) = oom_kills(&text)
+        {
+            scope.oom_kills = Some(scope.oom_kills.map_or(kills, |seen| seen.max(kills)));
+        }
+    }
+
+    /// Why `exec/cgroup.events` is missing. The sandbox's cgroup existed when the
+    /// command started (its PID 1 lives there and just answered the capability probe),
+    /// so a sandbox cgroup gone now, or a barrier seen since, means it went away after
+    /// the start. Only a sandbox cgroup still there that never had the barrier is an
+    /// old kiln.
+    async fn missing_barrier(&self, id: &str, mut scope: ExecScope) -> MissingBarrier {
+        self.observe_oom_kills(id, &mut scope).await;
+        let gone = MissingBarrier::GoneAfterStart {
+            out_of_memory: scope.oom_kills.is_some_and(|kills| kills > 0),
+        };
+        if scope.seen {
+            return gone;
+        }
+        let cgroup = self.cgroup_root.join(id);
+        match tokio::fs::metadata(&cgroup).await {
+            Ok(_) => MissingBarrier::NeverExisted,
+            Err(error) if error.kind() == ErrorKind::NotFound => gone,
+            Err(error) => MissingBarrier::Uninspected(format!(
+                "inspect sandbox cgroup {}: {error}",
+                cgroup.display()
+            )),
         }
     }
 
@@ -358,6 +414,9 @@ impl<'a> DirectKiln<'a> {
                 )));
             }
         };
+        // Backlog B4: what the cleanup barrier looked like once the command started, so
+        // a barrier missing later can be told apart from an old kiln's.
+        let scope = self.observe_exec_scope(id).await;
         let mut stop = owner.supervise(spec.deadline, cancel).await;
         // StatusReady means the reader is joined and its complete final bytes
         // are immutable. Decode once here so malformed replies stop a hung CLI.
@@ -447,7 +506,7 @@ impl<'a> DirectKiln<'a> {
         if let Some(e) = reap_error {
             finish = Err(RuntimeDiagnostic::new(Kind::Io, Stage::Wait, e.to_string()));
         }
-        if !trusted_cleanup && let Err(e) = self.wait_exec_cleanup(id).await {
+        if !trusted_cleanup && let Err(e) = self.wait_exec_cleanup(id, scope).await {
             finish = Err(RuntimeDiagnostic::new(
                 Kind::CleanupFailed,
                 Stage::Cleanup,
@@ -564,6 +623,65 @@ impl<'a> DirectKiln<'a> {
             }
         }
     }
+}
+
+/// What [`DirectKiln::observe_exec_scope`] saw of a sandbox's exec cgroup once a
+/// command started, and the cleanup wait since.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecScope {
+    /// `exec/cgroup.events` existed once the command started, or a read of it since
+    /// succeeded.
+    pub seen: bool,
+    /// The highest `oom_kill` count the sandbox cgroup's `memory.events` showed, if it
+    /// could be read at all.
+    pub oom_kills: Option<u64>,
+}
+
+/// Why the cleanup barrier, `exec/cgroup.events`, was missing (backlog 2026-11-13: an
+/// OOM that killed the whole sandbox read as an old kiln).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MissingBarrier {
+    /// The sandbox's cgroup went away after the command started: the barrier was seen
+    /// and is gone, or the whole sandbox cgroup is. `out_of_memory` when the sandbox
+    /// cgroup's `memory.events` showed `oom_kill` above 0, read before or as it went.
+    GoneAfterStart { out_of_memory: bool },
+    /// The sandbox cgroup is there but never had the barrier: a kiln before 3b42552.
+    NeverExisted,
+    /// Neither, because the sandbox cgroup could not be inspected.
+    Uninspected(String),
+}
+
+impl MissingBarrier {
+    /// The cleanup failure's message, for the barrier at `events`.
+    pub fn message(&self, events: &Path) -> String {
+        match self {
+            Self::GoneAfterStart { out_of_memory } => format!(
+                "the sandbox's cgroup went away after the command started{}; kiln cleanup barrier {} is gone",
+                if *out_of_memory {
+                    " (the sandbox ran out of memory)"
+                } else {
+                    ""
+                },
+                events.display()
+            ),
+            Self::NeverExisted => format!(
+                "kiln cleanup barrier {} is missing; kiln 3b42552 or later is required",
+                events.display()
+            ),
+            Self::Uninspected(why) => format!(
+                "kiln cleanup barrier {} is missing; {why}",
+                events.display()
+            ),
+        }
+    }
+}
+
+/// The `oom_kill` count in a cgroup's `memory.events`, if it has one.
+pub fn oom_kills(events: &str) -> Option<u64> {
+    events.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        (key == "oom_kill").then(|| value.trim().parse().ok())?
+    })
 }
 
 /// `kiln create` flags for a spec. Every value uses the `--flag=value` form,
@@ -721,5 +839,156 @@ pub fn summarize(stderr: &[u8]) -> String {
         "no error output".into()
     } else {
         line
+    }
+}
+
+#[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They build and
+// remove their own scratch cgroup trees directly.
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "abcd";
+
+    /// A fake cgroup root with sandbox `abcd`, its `exec` barrier when `barrier`, and its
+    /// `memory.events` when given.
+    fn root(barrier: bool, memory_events: Option<&str>) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = tmp.path().join(ID);
+        std::fs::create_dir_all(&sandbox).unwrap();
+        if barrier {
+            std::fs::create_dir(sandbox.join("exec")).unwrap();
+            std::fs::write(sandbox.join("exec/cgroup.events"), "populated 1\n").unwrap();
+        }
+        if let Some(events) = memory_events {
+            std::fs::write(sandbox.join("memory.events"), events).unwrap();
+        }
+        tmp
+    }
+
+    fn message(result: Result<(), RuntimeError>) -> String {
+        match result {
+            Err(RuntimeError::Backend(message)) => message,
+            other => panic!("expected a Backend error, got {other:?}"),
+        }
+    }
+
+    const OOM: &str = "low 0\nhigh 0\nmax 12\noom 1\noom_kill 1\noom_group_kill 1\n";
+    const NO_OOM: &str = "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n";
+
+    #[test]
+    fn oom_kills_reads_only_the_oom_kill_line() {
+        assert_eq!(oom_kills(OOM), Some(1));
+        assert_eq!(oom_kills(NO_OOM), Some(0));
+        assert_eq!(oom_kills("oom 3\noom_group_kill 2\n"), None);
+        assert_eq!(oom_kills("oom_kill x\n"), None);
+        assert_eq!(oom_kills(""), None);
+    }
+
+    /// Backlog B4 (row 2): the barrier seen once the command started and gone at the
+    /// cleanup wait is the new reason, never the version hint; with `oom_kill 1` read
+    /// before it went, the OOM hint too.
+    #[tokio::test]
+    async fn a_barrier_gone_after_the_start_gives_the_new_reason_and_the_oom_hint() {
+        let bin = process::KilnBinary::new("/nonexistent/kiln".into());
+        for (events, hint) in [(Some(OOM), true), (Some(NO_OOM), false), (None, false)] {
+            let tmp = root(true, events);
+            let kiln = DirectKiln::new(&bin, tmp.path());
+            let scope = kiln.observe_exec_scope(ID).await;
+            assert!(scope.seen);
+            assert_eq!(scope.oom_kills, events.map(|e| oom_kills(e).unwrap()));
+            // The sandbox is torn down (an OOM group kill takes kiln's PID 1 with it).
+            std::fs::remove_dir_all(tmp.path().join(ID)).unwrap();
+            let text = message(kiln.wait_exec_cleanup(ID, scope).await);
+            assert!(
+                text.starts_with("the sandbox's cgroup went away after the command started"),
+                "{text}"
+            );
+            assert_eq!(text.contains("(the sandbox ran out of memory)"), hint, "{text}");
+            assert!(!text.contains("3b42552"), "{text}");
+        }
+    }
+
+    /// The same when only the barrier went and the sandbox cgroup stays: it was seen,
+    /// so it is not an old kiln. An OOM count read during the wait counts too.
+    #[tokio::test]
+    async fn a_barrier_seen_during_the_wait_and_then_gone_is_not_an_old_kiln() {
+        let bin = process::KilnBinary::new("/nonexistent/kiln".into());
+        let tmp = root(false, Some(NO_OOM));
+        let kiln = DirectKiln::new(&bin, tmp.path());
+        let scope = kiln.observe_exec_scope(ID).await;
+        assert!(!scope.seen, "no barrier yet at the start");
+        let sandbox = tmp.path().join(ID);
+        std::fs::create_dir(sandbox.join("exec")).unwrap();
+        std::fs::write(sandbox.join("exec/cgroup.events"), "populated 1\n").unwrap();
+        let wait = kiln.wait_exec_cleanup(ID, scope);
+        let tear_down = async {
+            tokio::time::sleep(CLEANUP_POLL * 5).await;
+            std::fs::write(sandbox.join("memory.events"), OOM).unwrap();
+            tokio::time::sleep(CLEANUP_POLL * 5).await;
+            std::fs::remove_dir_all(sandbox.join("exec")).unwrap();
+        };
+        let (result, ()) = tokio::join!(wait, tear_down);
+        let text = message(result);
+        assert!(
+            text.starts_with(
+                "the sandbox's cgroup went away after the command started (the sandbox ran out of memory)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("3b42552"), "{text}");
+    }
+
+    /// A sandbox cgroup with no barrier at the start or since is an old kiln: only then
+    /// the version hint, and not the new reason. A `memory.events` that can't be read
+    /// (here, missing) only leaves the hint out, and never fails the call any other way.
+    #[tokio::test]
+    async fn a_barrier_that_never_existed_keeps_only_the_version_hint() {
+        let bin = process::KilnBinary::new("/nonexistent/kiln".into());
+        for events in [Some(OOM), None] {
+            let tmp = root(false, events);
+            let kiln = DirectKiln::new(&bin, tmp.path());
+            let scope = kiln.observe_exec_scope(ID).await;
+            assert!(!scope.seen);
+            let text = message(kiln.wait_exec_cleanup(ID, scope).await);
+            assert_eq!(
+                text,
+                format!(
+                    "kiln cleanup barrier {} is missing; kiln 3b42552 or later is required",
+                    tmp.path().join(ID).join("exec/cgroup.events").display()
+                )
+            );
+            assert!(!text.contains("went away"), "{text}");
+        }
+    }
+
+    /// No barrier seen at the start, and the whole sandbox cgroup gone at the wait: it
+    /// existed when the command started (PID 1 answered the probe), so it went away
+    /// after; not an old kiln.
+    #[tokio::test]
+    async fn a_sandbox_cgroup_gone_before_the_barrier_was_seen_is_gone_after_start() {
+        let bin = process::KilnBinary::new("/nonexistent/kiln".into());
+        let tmp = root(false, None);
+        let kiln = DirectKiln::new(&bin, tmp.path());
+        let scope = kiln.observe_exec_scope(ID).await;
+        std::fs::remove_dir_all(tmp.path().join(ID)).unwrap();
+        let text = message(kiln.wait_exec_cleanup(ID, scope).await);
+        assert!(
+            text.starts_with("the sandbox's cgroup went away after the command started;"),
+            "{text}"
+        );
+        assert!(!text.contains("3b42552"), "{text}");
+    }
+
+    /// A barrier that empties is still the cleanup acknowledgment.
+    #[tokio::test]
+    async fn an_empty_barrier_still_acknowledges_cleanup() {
+        let bin = process::KilnBinary::new("/nonexistent/kiln".into());
+        let tmp = root(true, Some(OOM));
+        std::fs::write(tmp.path().join(ID).join("exec/cgroup.events"), "populated 0\n").unwrap();
+        let kiln = DirectKiln::new(&bin, tmp.path());
+        let scope = kiln.observe_exec_scope(ID).await;
+        assert!(kiln.wait_exec_cleanup(ID, scope).await.is_ok());
     }
 }

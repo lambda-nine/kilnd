@@ -6,6 +6,44 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Health no longer stays SERVING when kilnd can't read its checkpoint statistics. It
+  still leaves the `checkpoints` block out and logs `read checkpoint counts`, and now also
+  reports DEGRADED (SHUTTING_DOWN still wins) with `checkpoint counts unreadable: <why>` in
+  `detail`, on one line of at most 512 bytes. Before, the block just vanished, which read
+  like "no checkpoint state". No API change: Health still has no field of its own for the
+  checkpoint maintenance state.
+
+- Health's `detail` now names a pending checkpoint barrier: `a checkpoint barrier is
+  pending: new sandboxes (forks included) and captures are refused until a complete, clean
+  checkpoint inventory clears it`. Before, a barrier alone showed only `backend resources
+  no row explains block CreateSandbox until reconciled`, which now appears only when that
+  is the cause. The status is unchanged: either block keeps Health DEGRADED. The sentence
+  comes from the flag kilnd already holds, with no extra store read.
+
+- kilnd-helper logs exactly one startup line for its checkpoint group:
+  `kilnd-helper: checkpoint group: enabled`, `... off (flag)` without
+  `--enable-checkpoints`, or `... failed: <why>`. Before, it logged only the failure (as
+  `checkpoint group disabled: <why>`), and a helper started without the flag said
+  nothing. The opt-in steps in `docs/setup.md` and `docs/checkpoints.md` now check for the
+  `enabled` line. Nothing else changes.
+
+- An execution whose sandbox's cgroup went away after the command started, as when an OOM
+  kill takes the whole sandbox with it, now fails its cleanup with `the sandbox's cgroup
+  went away after the command started`, plus `(the sandbox ran out of memory)` when the
+  sandbox cgroup's `memory.events` showed `oom_kill` above 0 before it went. It used to
+  say `kiln 3b42552 or later is required`, which now appears only when the sandbox's cgroup
+  is there but never had the `exec` cleanup barrier. A `memory.events` that can't be read
+  only leaves the hint out. The verdict (CLEANUP_FAILED, the sandbox unusable) is
+  unchanged.
+
+- kilnd-helper's create timing lines can no longer run into each other. When journald's
+  socket took only part of a line and the newline that ends the fragment hit `EAGAIN`
+  too, the next line was appended to the fragment: both were unreadable, and `dropped`
+  counted one. Now the helper remembers the open fragment. The next line first sends the
+  newline; if that fails again, that line is dropped too and counted, and once it goes
+  through, the line follows it. Every unreadable line is counted in `dropped`. Still never
+  blocking, retrying in a loop or buffering lines.
+
 - kilnd-helper now times every Firecracker create step by step, from Preflight through
   BOOTING to READY, and logs one `create timing v1` line per create once it ends: H's, L's,
   M's and P's work, each supervisor step and each journal record's round trip, carried in
@@ -16,10 +54,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   sandbox ID, leased uid, gid or cid, path or refusal reason is logged. A READY line is
   written once the supervisor's last step (READY's own journal round trip) has arrived,
   after the helper answered it; refusals carry the worker's steps up to the refusal. The
-  helper never waits to write a line: journald's socket gets one non-blocking send, and a
-  line it can't take whole, or any line when standard error isn't a socket, is dropped and
-  counted in the next line's `dropped`. The journal, the ledger schema and every create's behaviour are
-  unchanged.
+  helper never waits to write a line: journald's socket gets non-blocking sends, at most
+  two per line, and a line it can't take whole, or any line when standard error isn't a
+  socket, is dropped and counted in the next line's `dropped` (see the next entry for a
+  line the socket takes only part of). The journal, the ledger schema and every create's
+  behaviour are unchanged.
 
 - An unkeyed create that named no image and no writable paths, which kiln's preflight
   refused (exit 124), now fails `UNAVAILABLE` with the typed reason

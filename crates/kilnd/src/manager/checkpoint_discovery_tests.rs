@@ -887,3 +887,87 @@ async fn an_older_helper_keeps_the_broad_removal_gate() {
     until("the retried removal", || charge(&m) == (0, 0)).await;
     assert_eq!(row(&m, &checkpoint.id).state, CheckpointState::Deleted);
 }
+
+/// Backlog B4 (row 10): a checkpoint stats read that fails no longer leaves Health
+/// SERVING with the block silently gone. Health is DEGRADED and `detail` says why, the
+/// block stays absent, and SHUTTING_DOWN still wins. (The store's
+/// `fail_checkpoint_usage` test seam fails the read.)
+#[tokio::test]
+async fn an_unreadable_checkpoint_count_degrades_health_and_says_why() {
+    const SENTENCE: &str =
+        "checkpoint counts unreadable: internal error: injected checkpoint usage read failure";
+    let (m, _fake, _, s) = ready_engine().await;
+    let h = health(&s, 1000).await;
+    assert_eq!(h.status, pb::health_response::Status::Serving as i32);
+    stats(&h);
+    assert!(!h.detail.contains("checkpoint counts"), "{}", h.detail);
+
+    m.store.fail_checkpoint_usage.store(true, Ordering::SeqCst);
+    let h = health(&s, 1000).await;
+    assert_eq!(h.status, pb::health_response::Status::Degraded as i32, "{h:?}");
+    assert_eq!(h.detail, SENTENCE);
+    assert!(h.admission.as_ref().unwrap().checkpoints.is_none(), "{h:?}");
+    assert_eq!(h.node_resources.unwrap().checkpoint_reserved_disk_bytes, 0);
+
+    // Readable again: SERVING, the block back, nothing said.
+    m.store.fail_checkpoint_usage.store(false, Ordering::SeqCst);
+    let h = health(&s, 1000).await;
+    assert_eq!(h.status, pb::health_response::Status::Serving as i32);
+    stats(&h);
+    assert!(h.detail.is_empty(), "{}", h.detail);
+
+    // SHUTTING_DOWN wins over the degraded read; the sentence still says why.
+    m.store.fail_checkpoint_usage.store(true, Ordering::SeqCst);
+    m.begin_shutdown();
+    let h = s
+        .health(as_uid(pb::HealthRequest {}, 1000))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(h.status, pb::health_response::Status::ShuttingDown as i32, "{h:?}");
+    assert!(h.detail.ends_with(SENTENCE), "{}", h.detail);
+}
+
+/// Backlog B4 (row 24): Health names a pending checkpoint barrier and what clears it, from
+/// the manager's own flag, apart from the "resources no row explains" block. Its status
+/// is the allocation block's, as before: DEGRADED while either part is set.
+#[tokio::test]
+async fn health_names_a_pending_checkpoint_barrier_and_only_while_it_is_pending() {
+    const BARRIER: &str = "a checkpoint barrier is pending: new sandboxes (forks included) and captures are refused until a complete, clean checkpoint inventory clears it";
+    const UNEXPLAINED: &str = "backend resources no row explains block CreateSandbox until reconciled";
+    let (m, _fake, _, s) = ready_engine().await;
+    let h = health(&s, 1000).await;
+    assert_eq!(h.status, pb::health_response::Status::Serving as i32);
+    assert!(!h.detail.contains("checkpoint barrier"), "{}", h.detail);
+
+    assert!(m.set_checkpoint_barrier(true).unwrap());
+    store_calls(&m);
+    let h = health(&s, 1000).await;
+    assert_eq!(h.status, pb::health_response::Status::Degraded as i32, "{h:?}");
+    assert_eq!(h.detail, BARRIER);
+    assert!(!h.detail.contains(UNEXPLAINED), "{}", h.detail);
+    let with_barrier = store_calls(&m);
+
+    // Both parts: both sentences, in order.
+    m.admission_blocked.store(true, Ordering::Relaxed);
+    let h = health(&s, 1000).await;
+    assert_eq!(h.status, pb::health_response::Status::Degraded as i32);
+    assert_eq!(h.detail, format!("{UNEXPLAINED}; {BARRIER}"));
+    m.admission_blocked.store(false, Ordering::Relaxed);
+
+    // A clean pass clears it: SERVING, and the sentence is gone.
+    assert!(!m.reconcile_checkpoints().await.unwrap());
+    assert!(!m.set_checkpoint_barrier(false).unwrap());
+    store_calls(&m);
+    let h = health(&s, 1000).await;
+    assert_eq!(h.status, pb::health_response::Status::Serving as i32, "{h:?}");
+    assert!(h.detail.is_empty(), "{}", h.detail);
+    // Naming the barrier read nothing more from the store than Health did without it.
+    assert_eq!(store_calls(&m), with_barrier);
+
+    // The other part alone still says only its own sentence.
+    m.admission_blocked.store(true, Ordering::Relaxed);
+    let h = health(&s, 1000).await;
+    assert_eq!(h.status, pb::health_response::Status::Degraded as i32);
+    assert_eq!(h.detail, UNEXPLAINED);
+}

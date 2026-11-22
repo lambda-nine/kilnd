@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Read};
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// What precedes the JSON of every timing line, wherever it is found in a log line.
 pub const LINE_PREFIX: &str = "kilnd-helper: create timing v1 ";
@@ -399,7 +399,7 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "is_false")]
     pub incomplete: bool,
     /// Lines this helper dropped before this one, since it started, because they could
-    /// not be written without blocking (see [`emit`]).
+    /// not be written whole without blocking (see [`Sink::emit`]).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub dropped: u64,
     pub steps: Vec<Step>,
@@ -551,18 +551,14 @@ fn push(timeline: &mut Timeline, step: Step) {
     }
 }
 
-/// Lines not written since this helper started, because no write that can't block
-/// could take them whole.
-static DROPPED: AtomicU64 = AtomicU64::new(0);
-
-/// Lines dropped so far; the next line written carries this count.
+/// Lines dropped on standard error so far; the next line written carries this count.
 pub fn dropped() -> u64 {
-    DROPPED.load(Ordering::Relaxed)
+    STDERR.dropped()
 }
 
-/// Writes one finished timeline to standard error. See [`emit_to`].
+/// Writes one finished timeline to standard error. See [`Sink::emit`].
 pub fn emit(record: Record) {
-    emit_to(libc::STDERR_FILENO, record);
+    STDERR.emit(record);
 }
 
 /// [`emit`], when a timeline did end.
@@ -572,61 +568,128 @@ pub fn emit_some(record: Option<Record>) {
     }
 }
 
-/// Writes one finished timeline to `fd` without ever blocking H, which runs every
-/// create on one thread. Returns whether the whole line was written; any other line is
-/// dropped and counted, and the next line written carries the count as `dropped`.
-///
-/// - A socket (journald's stream, under systemd): one send with `MSG_DONTWAIT`. A socket
-///   that can't take the whole line now costs the line, never time.
-/// - Anything else (a regular file, a pipe, a terminal): dropped. No write to a shared
-///   descriptor of those is sure not to block without changing its flags for every
-///   process sharing it, and the shipped unit logs to journald's socket.
-pub fn emit_to(fd: RawFd, mut record: Record) -> bool {
-    record.dropped = dropped();
-    let written = match serde_json::to_string(&record) {
-        Ok(json) => {
-            let mut line = String::with_capacity(LINE_PREFIX.len() + json.len() + 1);
-            line.push_str(LINE_PREFIX);
-            line.push_str(&json);
-            line.push('\n');
-            write_nonblocking(fd, line.as_bytes())
-        }
-        Err(_) => false,
-    };
-    if !written {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
-    }
-    written
+/// H's standard error, the only sink the helper writes timing lines to.
+static STDERR: Sink = Sink::new(libc::STDERR_FILENO);
+
+/// One descriptor timing lines go to: the lines it lost, and whether a line it took only
+/// part of is still unterminated there.
+pub struct Sink {
+    fd: RawFd,
+    /// Lines not written since this helper started, because no write that can't block
+    /// could take them whole.
+    dropped: AtomicU64,
+    /// A send took only part of a line and the newline that ends it hasn't gone through
+    /// yet. Until it does, a line written now would run into that fragment.
+    fragment: AtomicBool,
 }
 
-fn write_nonblocking(fd: RawFd, bytes: &[u8]) -> bool {
+impl Sink {
+    pub const fn new(fd: RawFd) -> Self {
+        Self {
+            fd,
+            dropped: AtomicU64::new(0),
+            fragment: AtomicBool::new(false),
+        }
+    }
+
+    /// Lines this sink dropped so far; the next line written carries this count.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Writes one finished timeline without ever blocking H, which runs every create on
+    /// one thread. Returns whether the whole line was written; any other line is dropped
+    /// and counted, and the next line written carries the count as `dropped`.
+    ///
+    /// - A socket (journald's stream, under systemd): non-blocking sends with
+    ///   `MSG_DONTWAIT`, at most two per line. A socket that can't take the whole line now
+    ///   costs the line, never time. See [`send_framed`] for a line it takes only part of.
+    /// - Anything else (a regular file, a pipe, a terminal): dropped. No write to a shared
+    ///   descriptor of those is sure not to block without changing its flags for every
+    ///   process sharing it, and the shipped unit logs to journald's socket.
+    pub fn emit(&self, record: Record) -> bool {
+        // Not a socket: every send "fails", so the line is dropped and counted.
+        let socket = is_socket(self.fd);
+        self.emit_via(record, |bytes| {
+            if socket {
+                send_dontwait(self.fd, bytes)
+            } else {
+                -1
+            }
+        })
+    }
+
+    /// [`Self::emit`] through `send`, one non-blocking send that returns the bytes it
+    /// took or a negative value (tests stand a scripted sink in for the socket).
+    fn emit_via(&self, mut record: Record, send: impl FnMut(&[u8]) -> isize) -> bool {
+        record.dropped = self.dropped();
+        let written = match serde_json::to_string(&record) {
+            Ok(json) => {
+                let mut line = String::with_capacity(LINE_PREFIX.len() + json.len() + 1);
+                line.push_str(LINE_PREFIX);
+                line.push_str(&json);
+                line.push('\n');
+                send_framed(&self.fragment, line.as_bytes(), send)
+            }
+            Err(_) => false,
+        };
+        if !written {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        written
+    }
+}
+
+fn is_socket(fd: RawFd) -> bool {
     // SAFETY: stat is writable; fstat on a possibly closed descriptor only fails.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return false;
     }
-    stat.st_mode & libc::S_IFMT == libc::S_IFSOCK && send_once(fd, bytes)
+    stat.st_mode & libc::S_IFMT == libc::S_IFSOCK
 }
 
-/// One non-blocking send. A partial line is ended, so it can't run into the next one,
-/// and counts as dropped.
-fn send_once(fd: RawFd, bytes: &[u8]) -> bool {
-    let send = |bytes: &[u8]| {
-        // SAFETY: the slice is live for the call.
-        unsafe {
-            libc::send(
-                fd,
-                bytes.as_ptr().cast(),
-                bytes.len(),
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            )
-        }
-    };
-    let sent = send(bytes);
-    if sent > 0 && (sent as usize) < bytes.len() {
-        send(b"\n");
+/// One non-blocking send: the bytes it took, or a negative value.
+fn send_dontwait(fd: RawFd, bytes: &[u8]) -> isize {
+    // SAFETY: the slice is live for the call.
+    unsafe {
+        libc::send(
+            fd,
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
     }
-    sent >= 0 && sent as usize == bytes.len()
+}
+
+/// Sends one whole `line` through `send`, which never blocks, so that no line ever runs
+/// into another. Returns whether `line` went out whole; a `false` line is lost.
+///
+/// - With an earlier fragment still unterminated (`fragment` set), the newline that ends
+///   it goes first. If that send fails too, this line is lost as well and `fragment`
+///   stays set for the next one; once the newline goes through, `fragment` clears and
+///   the line follows.
+/// - A send that takes only part of `line` loses it. One newline then ends the fragment;
+///   if that newline doesn't go through, `fragment` is set.
+///
+/// At most two sends a call, never a loop, and nothing allocated: the fragment a reader
+/// later sees ends at a newline and is not a valid line, and every line it cost is
+/// counted by the caller.
+fn send_framed(fragment: &AtomicBool, line: &[u8], mut send: impl FnMut(&[u8]) -> isize) -> bool {
+    if fragment.load(Ordering::Relaxed) {
+        if send(b"\n") != 1 {
+            return false;
+        }
+        fragment.store(false, Ordering::Relaxed);
+    }
+    let sent = send(line);
+    if sent > 0 && (sent as usize) < line.len() {
+        if send(b"\n") != 1 {
+            fragment.store(true, Ordering::Relaxed);
+        }
+        return false;
+    }
+    sent >= 0 && sent as usize == line.len()
 }
 
 // ---- the operator's report -------------------------------------------------------------
@@ -1215,17 +1278,25 @@ mod tests {
         book.finish(key(3), Outcome::Ready).unwrap()
     }
 
-    /// Runs `emit_to` on its own thread: a write that blocked would hang this test.
-    fn emit_within(fd: RawFd, bound: std::time::Duration) -> (bool, std::time::Duration) {
+    /// Runs `sink.emit` on its own thread: a write that blocked would hang this test.
+    fn emit_within(
+        sink: &std::sync::Arc<Sink>,
+        bound: std::time::Duration,
+    ) -> (bool, std::time::Duration) {
         let (done, result) = std::sync::mpsc::channel();
+        let sink = sink.clone();
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let written = emit_to(fd, one_record());
+            let written = sink.emit(one_record());
             let _ = done.send((written, started.elapsed()));
         });
         result
             .recv_timeout(bound)
-            .expect("emit_to blocked on a stalled sink")
+            .expect("Sink::emit blocked on a stalled sink")
+    }
+
+    fn sink(fd: RawFd) -> std::sync::Arc<Sink> {
+        std::sync::Arc::new(Sink::new(fd))
     }
 
     fn pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
@@ -1289,11 +1360,11 @@ mod tests {
         // A full, blocking pipe nobody reads: H's stderr behind a stalled reader.
         let (_reader, writer) = pipe();
         fill(writer.as_raw_fd(), false);
-        let before = dropped();
-        let (written, took) = emit_within(writer.as_raw_fd(), bound);
+        let stalled = sink(writer.as_raw_fd());
+        let (written, took) = emit_within(&stalled, bound);
         assert!(!written, "a full pipe takes no line");
         assert!(took < std::time::Duration::from_secs(1), "{took:?}");
-        assert!(dropped() > before, "the drop is counted");
+        assert_eq!(stalled.dropped(), 1, "the drop is counted");
 
         // A full, blocking socket. (Darwin can block a partial send despite MSG_DONTWAIT;
         // H's journald socket is a Linux one.)
@@ -1301,36 +1372,38 @@ mod tests {
         {
             let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
             fill(ours.as_raw_fd(), true);
-            let before = dropped();
-            let (written, took) = emit_within(ours.as_raw_fd(), bound);
+            let full = sink(ours.as_raw_fd());
+            let (written, took) = emit_within(&full, bound);
             assert!(!written, "a full socket takes no line");
             assert!(took < std::time::Duration::from_secs(1), "{took:?}");
-            assert!(dropped() > before);
+            assert_eq!(full.dropped(), 1);
         }
 
         // A regular file is never written either.
         let file = tempfile::tempfile().unwrap();
-        let before = dropped();
-        assert!(!emit_within(file.as_raw_fd(), bound).0);
-        assert!(dropped() > before);
+        let regular = sink(file.as_raw_fd());
+        assert!(!emit_within(&regular, bound).0);
+        assert_eq!(regular.dropped(), 1);
         assert_eq!(file.metadata().unwrap().len(), 0);
 
         // A socket with room takes the whole line, which carries the count so far.
         let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        let floor = dropped();
-        assert!(emit_within(ours.as_raw_fd(), bound).0);
+        let room = sink(ours.as_raw_fd());
+        room.dropped.store(2, Ordering::Relaxed);
+        assert!(emit_within(&room, bound).0);
+        assert_eq!(room.dropped(), 2, "a written line is not a drop");
         drop(ours);
         let mut text = String::new();
         theirs.read_to_string(&mut text).unwrap();
         let records = read_records(text.as_bytes(), Select::Last(5)).unwrap();
         assert_eq!(records.len(), 1, "{text}");
-        assert!(records[0].dropped >= floor && floor >= 2, "{text}");
+        assert_eq!(records[0].dropped, 2, "{text}");
 
         // A pipe with room is dropped too, and left blocking for everyone else.
         let (reader, writer) = pipe();
-        let before = dropped();
-        assert!(!emit_within(writer.as_raw_fd(), bound).0);
-        assert!(dropped() > before);
+        let open = sink(writer.as_raw_fd());
+        assert!(!emit_within(&open, bound).0);
+        assert_eq!(open.dropped(), 1);
         // SAFETY: fcntl on an owned descriptor.
         let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(flags & libc::O_NONBLOCK, 0, "the shared descriptor is unchanged");
@@ -1338,5 +1411,200 @@ mod tests {
         let mut text = String::new();
         std::fs::File::from(reader).read_to_string(&mut text).unwrap();
         assert!(text.is_empty(), "{text}");
+    }
+
+    /// A sink that takes what `script` says, one entry per send: `Some(n)` takes the
+    /// first `n` bytes (all of them at most), `None` fails as `EAGAIN` would. What it
+    /// took is in `stream`, as a reader would see it.
+    struct Scripted {
+        script: VecDeque<Option<usize>>,
+        stream: Vec<u8>,
+        sends: usize,
+    }
+
+    impl Scripted {
+        fn new(script: &[Option<usize>]) -> Self {
+            Self {
+                script: script.iter().copied().collect(),
+                stream: Vec::new(),
+                sends: 0,
+            }
+        }
+
+        fn send(&mut self, bytes: &[u8]) -> isize {
+            self.sends += 1;
+            match self.script.pop_front().expect("a send the script did not expect") {
+                Some(n) => {
+                    let n = n.min(bytes.len());
+                    self.stream.extend_from_slice(&bytes[..n]);
+                    n as isize
+                }
+                None => -1,
+            }
+        }
+    }
+
+    fn record_for(n: u8) -> Record {
+        let mut book = Book::default();
+        book.begin(key(n), 0);
+        book.step(key(n), Step::new(Name::of("l.issue"), 1, 2));
+        book.finish(key(n), Outcome::Ready).unwrap()
+    }
+
+    /// Backlog B4 (the M3-1 follow-up's MEDIUM): a partial send whose recovery newline
+    /// hits `EAGAIN` leaves an unterminated fragment. No later line may run into it, and
+    /// every line a reader can't read is counted in `dropped`.
+    #[test]
+    fn a_failed_recovery_newline_never_merges_the_next_line_and_every_loss_is_counted() {
+        let sink = Sink::new(-1);
+        let mut fake = Scripted::new(&[
+            // Line 1: a 40-byte prefix, then EAGAIN for the newline that would end it.
+            Some(40),
+            None,
+            // Line 2: the fragment's newline fails again, so line 2 is lost unsent.
+            None,
+            // Line 3: the newline goes through, then the whole line.
+            Some(1),
+            Some(usize::MAX),
+            // Line 4: unaffected, whole.
+            Some(usize::MAX),
+        ]);
+        assert!(!sink.emit_via(record_for(1), |b| fake.send(b)));
+        assert_eq!((sink.dropped(), fake.sends), (1, 2));
+        assert!(sink.fragment.load(Ordering::Relaxed), "the fragment is still open");
+        assert!(!sink.emit_via(record_for(2), |b| fake.send(b)));
+        assert_eq!((sink.dropped(), fake.sends), (2, 3), "one newline try, no line");
+        assert!(sink.fragment.load(Ordering::Relaxed));
+        assert!(sink.emit_via(record_for(3), |b| fake.send(b)));
+        assert!(!sink.fragment.load(Ordering::Relaxed), "the newline ended it");
+        assert!(sink.emit_via(record_for(4), |b| fake.send(b)));
+        assert_eq!((sink.dropped(), fake.sends), (2, 6));
+        assert!(fake.script.is_empty());
+
+        // The reader sees the fragment ended by its newline, then two whole lines.
+        let lines: Vec<&[u8]> = fake.stream.split_inclusive(|&b| b == b'\n').collect();
+        assert_eq!(lines.len(), 3, "{}", String::from_utf8_lossy(&fake.stream));
+        assert_eq!(lines[0].len(), 41, "the 40-byte fragment and its newline");
+        assert!(parse_line(lines[0].strip_suffix(b"\n").unwrap()).is_none());
+        let records = read_records(fake.stream.as_slice(), Select::Last(10)).unwrap();
+        let seen: Vec<_> = records.iter().map(|r| (r.allocation, r.dropped)).collect();
+        assert_eq!(
+            seen,
+            [(record_for(3).allocation, 2), (record_for(4).allocation, 2)],
+            "line 1 (the fragment) and line 2 are unreadable, and both are counted"
+        );
+    }
+
+    /// The same, when the partial line's own newline goes through at once: no fragment
+    /// stays open, and the next line is sent with no newline before it.
+    #[test]
+    fn a_partial_line_ended_at_once_leaves_nothing_pending() {
+        let sink = Sink::new(-1);
+        let mut fake = Scripted::new(&[Some(10), Some(1), Some(usize::MAX)]);
+        assert!(!sink.emit_via(record_for(1), |b| fake.send(b)));
+        assert!(!sink.fragment.load(Ordering::Relaxed));
+        assert!(sink.emit_via(record_for(2), |b| fake.send(b)));
+        assert_eq!((sink.dropped(), fake.sends), (1, 3));
+        let records = read_records(fake.stream.as_slice(), Select::Last(10)).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!((records[0].allocation, records[0].dropped), (record_for(2).allocation, 1));
+        // A line no send takes at all leaves nothing behind either.
+        let mut fake = Scripted::new(&[None, Some(usize::MAX)]);
+        assert!(!sink.emit_via(record_for(3), |b| fake.send(b)));
+        assert!(!sink.fragment.load(Ordering::Relaxed));
+        assert!(sink.emit_via(record_for(4), |b| fake.send(b)));
+        assert_eq!(fake.sends, 2);
+    }
+
+    /// The break-it review's reproduction, on a real `AF_UNIX` stream: fill the socket,
+    /// leave room for part of a large line, so the line goes out partial and its newline
+    /// hits `EAGAIN`; drain it and write a second line. The second line must parse, and
+    /// count the first as dropped. (Linux only: Darwin can block a partial send despite
+    /// `MSG_DONTWAIT`.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_partial_send_on_a_real_socket_never_hides_the_next_line() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd;
+        let large = || {
+            let mut steps = Vec::new();
+            for _ in 0..MAX_TIMELINE_STEPS {
+                let mut step = Step::new(Name::of("s.journal_ready"), u64::MAX, u64::MAX);
+                step.polls = u32::MAX;
+                step.waited_ns = u64::MAX;
+                step.records = u32::MAX;
+                step.record_ns = u64::MAX;
+                step.retries = u32::MAX;
+                steps.push(step);
+            }
+            Record {
+                allocation: record_for(1).allocation,
+                outcome: Outcome::Ready,
+                incomplete: false,
+                dropped: 0,
+                steps,
+            }
+        };
+        let recv_exact = |from: &mut std::os::unix::net::UnixStream, n: usize| {
+            let mut bytes = vec![0; n];
+            from.read_exact(&mut bytes).unwrap();
+            bytes
+        };
+        for sndbuf in [2_048, 4_096, 8_192, 16_384] {
+            for drain in [1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536] {
+                let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+                let fd = ours.as_raw_fd();
+                // SAFETY: setsockopt with a live int.
+                unsafe {
+                    let value: libc::c_int = sndbuf;
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&raw const value).cast(),
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                }
+                let chunk = b"f\n".repeat(32_768);
+                let mut filled = 0usize;
+                loop {
+                    let n = send_dontwait(fd, &chunk);
+                    if n <= 0 {
+                        break;
+                    }
+                    filled += n as usize;
+                }
+                if filled <= drain {
+                    continue;
+                }
+                recv_exact(&mut theirs, drain);
+                let sink = Sink::new(fd);
+                assert!(!sink.emit(large()), "the large line can't go out whole");
+                if !sink.fragment.load(Ordering::Relaxed) {
+                    // Not the case under test: no send, or the newline went through.
+                    continue;
+                }
+                assert_eq!(sink.dropped(), 1);
+                // Drain everything: the filler and the fragment.
+                recv_exact(&mut theirs, filled - drain);
+                set_nonblocking(theirs.as_raw_fd(), true);
+                let mut fragment = Vec::new();
+                let _ = theirs.read_to_end(&mut fragment);
+                set_nonblocking(theirs.as_raw_fd(), false);
+                assert!(!fragment.is_empty() && !fragment.ends_with(b"\n"));
+                assert!(sink.emit(record_for(2)), "the newline, then the whole line");
+                drop(ours);
+                let mut rest = Vec::new();
+                theirs.read_to_end(&mut rest).unwrap();
+                let mut stream = fragment;
+                stream.extend_from_slice(&rest);
+                let records = read_records(stream.as_slice(), Select::Last(10)).unwrap();
+                assert_eq!(records.len(), 1, "the second line parses");
+                assert_eq!(records[0].allocation, record_for(2).allocation);
+                assert_eq!(records[0].dropped, 1, "the one unreadable line is counted");
+                return;
+            }
+        }
+        panic!("could not force a partial AF_UNIX stream send with an EAGAIN newline");
     }
 }

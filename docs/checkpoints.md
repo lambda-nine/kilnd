@@ -28,13 +28,14 @@ unit has no flags), run `systemctl daemon-reload` and restart `kilnd-helper`. Th
 the running process: `tr '\0' ' ' < /proc/<pid>/cmdline`, with the PID from
 `systemctl show -p MainPID --value kilnd-helper`, must contain `--enable-checkpoints`, and
 its journal since that restart (`journalctl -u kilnd-helper --since "<restart time>"`)
-must have no `kilnd-helper: checkpoint group disabled` line. The journal alone is not
-enough: the helper prints that line only when the flag was given and the group failed to
-start, and without the flag it leaves the group off silently. Only then restart kilnd with
-its flag. If kilnd starts while the helper answers ordinary kiln operations but cannot
-give it a checkpoint maintenance session, the checkpoint barrier stays set: Health is
-DEGRADED, every new sandbox create is refused, kilnd's journal has `checkpoint
-reconciliation could not reach the helper; allocation blocked`, and captures and forks get
+must have the line `kilnd-helper: checkpoint group: enabled`. The helper logs exactly one
+such line at each start: `enabled`, `off (flag)` without the flag, or `failed: <why>` when
+the flag was given and the group could not start. Only then restart kilnd with its flag.
+If kilnd starts while the helper answers ordinary kiln operations but cannot give it a
+checkpoint maintenance session, the checkpoint barrier stays set: Health is DEGRADED (its
+`detail` says `a checkpoint barrier is pending`), every new sandbox create is refused,
+kilnd's journal has `checkpoint reconciliation could not reach the helper; allocation
+blocked`, and captures and forks get
 the allocation barrier's `FAILED_PRECONDITION` refusal, until the helper's group and a
 compatible kiln are back and a reconciliation completes cleanly. If the helper cannot be
 reached at all, kilnd's startup reconciliation fails and kilnd exits before serving.
@@ -65,7 +66,8 @@ on standard error. kilnd checks that gate before reading any row, and refuses th
 while no checkpoint row, capture key or barrier marker exists and the barrier is not
 blocked. Anything else is not done: a successful list, even an empty one, any other error,
 or Health without its `checkpoints:` block (which is informational and also missing when
-reading the statistics fails, logged as `read checkpoint counts`). Keep the helper and
+reading the statistics fails: kilnd logs `read checkpoint counts`, and Health is DEGRADED
+with `checkpoint counts unreadable: <why>` in its `detail`). Keep the helper and
 kiln as they are and check again later. A deleted or failed checkpoint's history row stays
 until it is older than `--deleted-sandbox-max-age-secs` (default 7 days, at least one day)
 and its capture record is gone; a capture record is automatically retained for at least

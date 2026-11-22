@@ -2178,13 +2178,26 @@ impl<R: Runtime> Manager<R> {
                 ));
             }
         }
+        // Either part of the allocation block degrades Health; each names itself.
         if self.allocation_blocked() {
             serving = false;
+        }
+        if self.admission_blocked.load(Ordering::Relaxed) {
             if !detail.is_empty() {
                 detail.push_str("; ");
             }
             detail
                 .push_str("backend resources no row explains block CreateSandbox until reconciled");
+        }
+        // B4 (backlog row 24): the checkpoint barrier's part (design 10.2), from the
+        // flag the manager holds; no store read.
+        if self.checkpoint.barrier_blocked.load(Ordering::Relaxed) {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(
+                "a checkpoint barrier is pending: new sandboxes (forks included) and captures are refused until a complete, clean checkpoint inventory clears it",
+            );
         }
         let lifecycle = self.lifecycle_snapshot();
         let stale = self.stale_expiry_deletes();

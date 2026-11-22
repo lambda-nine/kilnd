@@ -316,11 +316,15 @@ supervisor step up to BOOTING and READY, and each journal record's round trip, R
 included. The allocation ID is there so you can pick out one create; kilnd already logs it
 as the backend ID. No boot nonce, token key, work UUID, instance or sandbox ID, leased uid,
 gid or cid, path or refusal reason is logged. The helper never waits to write the line:
-under the shipped unit it goes to journald's socket with one non-blocking send, and is
-dropped if the socket is full. With standard error on anything but a socket (a file, a
-pipe or a terminal, when run by hand) the helper never writes it. A line
-carries `"dropped":N` once N earlier lines were lost that way, and `"incomplete":true` if
-READY was committed but the supervisor was gone before its last step arrived.
+under the shipped unit it goes to journald's socket with non-blocking sends, and is
+dropped if the socket can't take it whole now. A send that takes only part of a line
+loses that line, and the helper ends the fragment with a newline so no later line runs
+into it. If that newline can't go through either, each following line is dropped, unsent,
+until a newline does; then the line goes out after it. With standard error on anything
+but a socket (a file, a pipe or a terminal, when run by hand) the helper never writes it.
+A line carries `"dropped":N` once N earlier lines were lost that way, every line a reader
+can't parse included, and `"incomplete":true` if READY was committed but the supervisor
+was gone before its last step arrived.
 `kilnd-helper create-timings`
 (root, helper running or stopped) reads the helper's log on stdin and prints one
 allocation's waterfall, or the last N, or with `--summary` each step's p50, p95 and max:
@@ -665,18 +669,20 @@ To opt a node in:
    `--kiln` other than the binary checked in step 1). `systemctl show -p ExecStart
    kilnd-helper` shows what the loaded unit runs, which a missed restart leaves different
    from the running process. Then check that the helper's journal since that restart
-   (`journalctl -u kilnd-helper --since "<restart time>"`) has no
-   `kilnd-helper: checkpoint group disabled` line. The helper prints that line only when
-   it was given the flag and the group failed to start; started without the flag, it
-   leaves the group off silently, so the journal alone does not show a missed
-   `daemon-reload`, a wrong drop-in or the wrong unit. Only then restart kilnd
+   (`journalctl -u kilnd-helper --since "<restart time>"`) has the line
+   `kilnd-helper: checkpoint group: enabled`. The helper logs exactly one such line at
+   each start: `enabled`, `off (flag)` when it was started without the flag (a missed
+   `daemon-reload`, a wrong drop-in or the wrong unit), or `failed: <why>` when it was
+   given the flag and the group could not start. The command line check above still
+   matters: the journal says what the helper did, not what the unit file says. Only then restart kilnd
    with `--enable-workspace-checkpoints` (and `--checkpoint-headroom-bytes` if 1 GiB is
    not right for the node). The flag makes every kilnd startup reconcile checkpoints, and
    reconciliation needs the helper's checkpoint group and a kiln that lists format 1 and
    checks generations on removal. If the helper answers ordinary kiln operations but
    cannot give kilnd a checkpoint maintenance session (its group off, or a kiln without
    format 1 or generation-checked removal) when kilnd starts, the checkpoint barrier
-   stays set: Health is DEGRADED, every new sandbox create is refused, and captures and
+   stays set: Health is DEGRADED, its `detail` says `a checkpoint barrier is pending`,
+   every new sandbox create is refused, and captures and
    forks get the allocation barrier's `FAILED_PRECONDITION` refusal (not one of the typed
    checkpoint reasons below). kilnd retries on its own; the barrier clears once the
    helper's group and a compatible kiln are back and a reconciliation completes cleanly.
@@ -746,8 +752,9 @@ To opt a node in:
    marker, and the barrier not blocked. Anything else is not done: a list that succeeds,
    even an empty one, means kilnd still maintains checkpoint state, and any other error
    tells nothing. Keep the helper's group and kiln as they are and check again later.
-   Health's `checkpoints:` block is informational only: kilnd leaves it out when reading
-   the statistics fails (logging `read checkpoint counts`), so its absence proves
+   Health's `checkpoints:` block is informational only: when reading the statistics
+   fails, kilnd leaves it out, logs `read checkpoint counts` and reports Health DEGRADED
+   with `checkpoint counts unreadable: <why>` in its `detail`, so its absence proves
    nothing. Only after that refusal turn off the helper's group or install an older
    kiln.
 
