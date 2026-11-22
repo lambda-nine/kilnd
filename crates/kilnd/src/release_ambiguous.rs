@@ -364,17 +364,44 @@ const MAX_ANCESTRY: usize = 4096;
 /// root-only runs directory, so a name it chose is no evidence: without the uid check
 /// any local account could keep the release refused with `cp /bin/sleep ~/kiln; ~/kiln
 /// 86400`.
-fn is_kiln(table: &dyn ProcessTable, pid: i32, link: &[u8], kiln: KilnImage) -> io::Result<Option<bool>> {
-    let path = link.strip_suffix(b" (deleted)").unwrap_or(link);
-    let name = path.rsplit(|b| *b == b'/').next().unwrap_or(path);
-    if name == b"kiln" {
+///
+/// The exe link and the uids are two reads, and a process can exec between them: another
+/// account's `kiln` that execs a setuid-root program would read as root's kiln. So after
+/// a root name match the link is read again, and the match counts only if it is
+/// unchanged; a changed link is judged afresh, and a root process whose link changes on
+/// every read counts (fail closed). Answers the link to report, or `None` for a process
+/// that is not kiln or is gone.
+fn kiln_link(table: &dyn ProcessTable, pid: i32, mut link: Vec<u8>, kiln: KilnImage) -> io::Result<Option<Vec<u8>>> {
+    let mut reads = 1;
+    while named_kiln(&link) {
         match table.uids(pid)? {
             None => return Ok(None),
-            Some(uids) if uids.any_root() => return Ok(Some(true)),
-            Some(_) => {}
+            Some(uids) if uids.any_root() => {}
+            Some(_) => break,
         }
+        if reads == MAX_LINK_READS {
+            // Root, named kiln, and a different link on every read.
+            return Ok(Some(link));
+        }
+        let Some(again) = table.exe_link(pid)? else {
+            return Ok(None);
+        };
+        reads += 1;
+        if again == link {
+            return Ok(Some(link));
+        }
+        link = again;
     }
-    Ok(table.exe_image(pid)?.map(|image| image == kiln))
+    Ok(table.exe_image(pid)?.filter(|image| *image == kiln).map(|_| link))
+}
+
+/// How many times [`kiln_link`] reads one process's exe link.
+const MAX_LINK_READS: usize = 3;
+
+/// Whether an exe link's last component, ` (deleted)` aside, is `kiln`.
+fn named_kiln(link: &[u8]) -> bool {
+    let path = link.strip_suffix(b" (deleted)").unwrap_or(link);
+    path.rsplit(|b| *b == b'/').next().unwrap_or(path) == b"kiln"
 }
 
 fn is_published(shims: &PublishedShims, pid: i32, stat: &ProcessStat) -> bool {
@@ -411,10 +438,9 @@ pub fn unexplained_in_one_pass(
         let Some(link) = table.exe_link(pid)? else {
             continue;
         };
-        match is_kiln(table, pid, &link, kiln)? {
-            Some(true) => {}
-            Some(false) | None => continue,
-        }
+        let Some(link) = kiln_link(table, pid, link, kiln)? else {
+            continue;
+        };
         let Some(stat) = table.stat(pid)? else {
             continue;
         };
@@ -1248,6 +1274,66 @@ mod tests {
         // The Uid: line itself must still be ASCII digits.
         assert!(ProcessUids::parse(b"Name:\tk\nUid:\t1000\t\xff\t1000\t1000\n").is_err());
         assert!(ProcessStat::parse(b"4242 (k) S \xff 1").is_err());
+    }
+
+    /// Fix review 2026-11-22 (R3): the exe link and the uids are two reads. Another
+    /// account's `kiln` that execs a setuid-root program between them reads as root; the
+    /// second read of the link shows the exec, and the process is judged by what it now
+    /// runs. A root kiln whose link is stable counts, and one whose link changes on
+    /// every read counts too.
+    #[test]
+    fn a_kiln_named_process_that_execs_between_the_link_and_the_uid_reads_is_judged_afresh() {
+        struct Execs {
+            links: Vec<&'static [u8]>,
+            reads: Cell<usize>,
+            image: KilnImage,
+        }
+        impl ProcessTable for Execs {
+            fn pids(&self) -> io::Result<Vec<i32>> {
+                Ok(vec![4242])
+            }
+            fn exe_link(&self, _: i32) -> io::Result<Option<Vec<u8>>> {
+                let i = self.reads.get();
+                self.reads.set(i + 1);
+                Ok(Some(self.links[i.min(self.links.len() - 1)].to_vec()))
+            }
+            fn exe_image(&self, _: i32) -> io::Result<Option<KilnImage>> {
+                Ok(Some(self.image))
+            }
+            // Read after the first link, when the exec of su has made the process root.
+            fn uids(&self, _: i32) -> io::Result<Option<ProcessUids>> {
+                Ok(Some(ProcessUids(if self.reads.get() == 1 { [1000, 0, 0, 0] } else { ROOT })))
+            }
+            fn stat(&self, _: i32) -> io::Result<Option<ProcessStat>> {
+                Ok(Some(ProcessStat { ppid: 3000, start: "1".into() }))
+            }
+            fn argv(&self, _: i32) -> io::Result<Option<Vec<Vec<u8>>>> {
+                Ok(Some(vec![b"su".to_vec()]))
+            }
+        }
+        let scan = |links: Vec<&'static [u8]>, image| {
+            let table = Execs { links, reads: Cell::new(0), image };
+            let found = unexplained_in_one_pass(&table, KILN, &PublishedShims::new()).unwrap();
+            (found.named, table.reads.get())
+        };
+        // ~/kiln, then su: not kiln, by name or by image.
+        assert_eq!(scan(vec![b"/home/mallory/kiln", b"/usr/bin/su"], OTHER), (vec![], 2));
+        // An exec into the configured kiln under another name counts by its image, and
+        // the report names what it runs now.
+        assert_eq!(
+            scan(vec![b"/home/mallory/kiln", b"/opt/k2"], KILN),
+            (vec!["4242 /opt/k2".to_string()], 2)
+        );
+        // A stable root kiln: two reads agree.
+        assert_eq!(
+            scan(vec![b"/var/tmp/kiln (deleted)"], OTHER),
+            (vec!["4242 /var/tmp/kiln (deleted)".to_string()], 2)
+        );
+        // Root, named kiln, a new link on every read: counted after the last read.
+        assert_eq!(
+            scan(vec![b"/a/kiln", b"/b/kiln", b"/c/kiln", b"/d/kiln"], OTHER),
+            (vec!["4242 /c/kiln".to_string()], MAX_LINK_READS)
+        );
     }
 
     /// Fix review 2026-11-22 (R1): 64 names under paths of control bytes, which JSON

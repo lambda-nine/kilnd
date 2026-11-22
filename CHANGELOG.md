@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- `kilnd release-ambiguous` reads the executable of a root process named `kiln` again
+  after its uids, and counts the process only if both reads agree. A process that
+  exec'd between the two reads was judged by one executable's name and another's
+  uids; it is now judged afresh by the new executable, and one whose executable
+  differs on every read counts after three reads.
+
 - A `kilnd release-ambiguous` refusal cuts each process it names to 1 KiB, marked `…`.
   The 64-name cap didn't bound the scan's reply: JSON writes a control byte as six, so
   64 executables under long paths of control bytes took the reply past its 1 MiB cap,

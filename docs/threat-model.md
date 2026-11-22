@@ -454,8 +454,8 @@ sandbox compromises the host.
   itself the node's only helper meanwhile. It runs the startup reconciliation
   pass, needs a second complete inventory, then needs every kiln process on the
   node (the configured image, whoever runs it, or a process holding root whose
-  executable is named `kiln`: another account's binary of that name can't create a
-  run, so it is no evidence) to be a published shim, a
+  executable is named `kiln`, by reads before and after its uids that agree: another
+  account's binary of that name can't create a run, so it is no evidence) to be a published shim, a
   descendant of one or a kiln node service (two full passes; any other, a hand-run
   `kiln` included, refuses with its pid), and
   only then reads kiln's runs directory itself, since `kiln ls` skips a run
