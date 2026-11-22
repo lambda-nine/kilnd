@@ -6,6 +6,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- `kilnd release-ambiguous` no longer fails its process scan with exit 69, naming
+  nothing, over a process whose executable it can't read. Any account or sandbox can
+  run one: the kernel can't render an executable's path longer than `PATH_MAX`
+  (ENAMETOOLONG), and root may not open an image on another user's FUSE mount. Such
+  a process now counts as possibly kiln if it holds root by any uid, named with the
+  error (exit 75), and is ignored otherwise.
+
 - `kilnd release-ambiguous` no longer counts another account's process running the
   configured kiln as a kiln process. Its process scan counted the configured image
   whoever ran it, so any local account could keep the release refused (exit 75) with

@@ -865,8 +865,10 @@ The child then proves the node clean, refusing at the first gap:
 3. A second complete inventory names only backends a live row owns.
 4. Every kiln process on the node (it holds root by any uid, and its image is the
    configured kiln or its executable is named `kiln`, deleted or not; another
-   account's process can't create a run, so it never counts, whatever it runs) is a
-   published sandbox's shim (its pid and start time are a run's
+   account's process can't create a run, so it never counts, whatever it runs; a
+   root process whose executable can't be read, such as one under a path too long
+   for the kernel to show or on a FUSE mount root may not open, counts as possibly
+   kiln and is named with the error) is a published sandbox's shim (its pid and start time are a run's
    `shim.pid` and `shim.start`), a descendant of one, or one of kiln's node services
    (`kiln dns`, `metrics`, `metrics-collect`, `network-setup`). Anything else exits
    75 and names each pid and executable (each cut to 1 KiB), the first 64 and how many

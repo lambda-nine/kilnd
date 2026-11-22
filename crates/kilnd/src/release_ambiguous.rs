@@ -330,7 +330,9 @@ impl ProcessUids {
 
 /// The node's processes as root reads them. Each per-process read answers `None` once
 /// the process is gone (ENOENT or ESRCH, as when it exited mid-scan) or has no image (a
-/// kernel thread, a zombie); every other error is an error.
+/// kernel thread, a zombie); every other error is an error. The scan answers an
+/// `exe_link` or `exe_image` error by the process's uids (see [`kiln_link`]); any other
+/// read's error fails it.
 pub trait ProcessTable {
     fn pids(&self) -> io::Result<Vec<i32>>;
     /// The text of `/proc/PID/exe`, ` (deleted)` included.
@@ -374,9 +376,22 @@ const MAX_ANCESTRY: usize = 4096;
 /// as root's kiln, and a root process that drops its uids and execs kiln as another
 /// account would read as root's. So after a match the link is read again, and the match
 /// counts only if it is unchanged; a changed link is judged afresh, uids included, and a
-/// root process whose link changes on every read counts (fail closed). Answers the link
-/// to report, or `None` for a process that is not kiln or is gone.
-fn kiln_link(table: &dyn ProcessTable, pid: i32, mut link: Vec<u8>, kiln: KilnImage) -> io::Result<Option<Vec<u8>>> {
+/// root process whose link changes on every read counts (fail closed).
+///
+/// A link or image that can't be read for any reason but the process being gone (a path
+/// too long for the kernel to render, ENAMETOOLONG; an image on a FUSE mount root may
+/// not open) can't be judged by either rule, and must not fail the whole scan: any
+/// account can run such a process, and any sandbox too. So it counts as possibly kiln
+/// for a root process, which is named with the error (fail closed: the release refuses
+/// with exit 75), and is ignored for another account's, which can't be kiln whatever it
+/// runs. Answers the link to report, or `None` for a process that is not kiln or is
+/// gone.
+fn kiln_link(
+    table: &dyn ProcessTable,
+    pid: i32,
+    mut link: io::Result<Vec<u8>>,
+    kiln: KilnImage,
+) -> io::Result<Option<Vec<u8>>> {
     let mut reads = 1;
     loop {
         match table.uids(pid)? {
@@ -384,24 +399,44 @@ fn kiln_link(table: &dyn ProcessTable, pid: i32, mut link: Vec<u8>, kiln: KilnIm
             Some(uids) if uids.any_root() => {}
             Some(_) => return Ok(None),
         }
-        if !named_kiln(&link) {
-            match table.exe_image(pid)? {
-                Some(image) if image == kiln => {}
-                _ => return Ok(None),
-            }
-        }
+        let shown = match &link {
+            Ok(path) if named_kiln(path) => path.clone(),
+            Ok(path) => match table.exe_image(pid) {
+                Ok(Some(image)) if image == kiln => path.clone(),
+                Ok(_) => return Ok(None),
+                Err(error) => unreadable(Some(path), &error),
+            },
+            Err(error) => unreadable(None, error),
+        };
         if reads == MAX_LINK_READS {
-            // Root, kiln, and a different link on every read.
-            return Ok(Some(link));
+            // Root, possibly kiln, and a different link on every read.
+            return Ok(Some(shown));
         }
-        let Some(again) = table.exe_link(pid)? else {
+        let Some(again) = table.exe_link(pid).transpose() else {
             return Ok(None);
         };
         reads += 1;
-        if again == link {
-            return Ok(Some(link));
+        let same = match (&again, &link) {
+            (Ok(again), Ok(link)) => again == link,
+            (Err(_), Err(_)) => true,
+            _ => false,
+        };
+        if same {
+            return Ok(Some(shown));
         }
         link = again;
+    }
+}
+
+/// How a root process whose exe link (`path` is `None`) or image can't be read is named.
+fn unreadable(path: Option<&[u8]>, error: &io::Error) -> Vec<u8> {
+    match path {
+        Some(path) => {
+            let mut shown = path.to_vec();
+            shown.extend_from_slice(format!(" (image unreadable: {error})").as_bytes());
+            shown
+        }
+        None => format!("(executable unreadable: {error})").into_bytes(),
     }
 }
 
@@ -445,7 +480,7 @@ pub fn unexplained_in_one_pass(
 ) -> io::Result<KilnProcesses> {
     let mut found = KilnProcesses::default();
     for pid in table.pids()? {
-        let Some(link) = table.exe_link(pid)? else {
+        let Some(link) = table.exe_link(pid).transpose() else {
             continue;
         };
         let Some(link) = kiln_link(table, pid, link, kiln)? else {
@@ -804,12 +839,14 @@ mod tests {
     }
 
     /// A process table; `hidden_first` pids are missing from the first listing, as a
-    /// process forked while that listing ran can be. `failing` pids' exe link fails.
+    /// process forked while that listing ran can be. `link_errors` and `image_errors`
+    /// pids' exe link or image read fails with that errno.
     #[derive(Default)]
     struct Table {
         procs: HashMap<i32, Proc>,
         hidden_first: Vec<i32>,
-        failing: Vec<(i32, i32)>,
+        link_errors: HashMap<i32, i32>,
+        image_errors: HashMap<i32, i32>,
         listings: Cell<u32>,
     }
 
@@ -820,7 +857,6 @@ mod tests {
             let mut pids: Vec<i32> = self
                 .procs
                 .keys()
-                .chain(self.failing.iter().map(|(pid, _)| pid))
                 .copied()
                 .filter(|pid| !(first && self.hidden_first.contains(pid)))
                 .collect();
@@ -828,12 +864,15 @@ mod tests {
             Ok(pids)
         }
         fn exe_link(&self, pid: i32) -> io::Result<Option<Vec<u8>>> {
-            if let Some((_, errno)) = self.failing.iter().find(|(p, _)| *p == pid) {
+            if let Some(errno) = self.link_errors.get(&pid) {
                 return Err(io::Error::from_raw_os_error(*errno));
             }
             Ok(self.procs.get(&pid).map(|p| p.link.as_bytes().to_vec()))
         }
         fn exe_image(&self, pid: i32) -> io::Result<Option<KilnImage>> {
+            if let Some(errno) = self.image_errors.get(&pid) {
+                return Err(io::Error::from_raw_os_error(*errno));
+            }
             Ok(self.procs.get(&pid).map(|p| p.image))
         }
         fn uids(&self, pid: i32) -> io::Result<Option<ProcessUids>> {
@@ -1012,15 +1051,63 @@ mod tests {
         );
     }
 
+    /// Fix re-review 2026-11-22 (R4): an exe link or image that can't be read, but not
+    /// because the process is gone, failed the whole scan with exit 69, naming nothing:
+    /// the kernel can't render a path longer than PATH_MAX (ENAMETOOLONG), which any
+    /// account or sandbox can build, and root may not open an image on another user's
+    /// FUSE mount (EACCES). Now a root process's unreadable executable counts as
+    /// possibly kiln, named with the error (exit 75), and another account's is ignored.
     #[test]
-    fn a_process_gone_mid_scan_is_skipped_and_any_other_error_refuses() {
+    fn an_unreadable_executable_is_possibly_kiln_for_root_and_ignored_otherwise() {
         let mut table = Table::default();
-        // Listed, then gone before its exe was read: the table answers None.
-        table.failing.push((60, libc::EACCES));
+        let long = Proc {
+            link: "/home/mallory/deep/x",
+            image: OTHER,
+            uids: MALLORY,
+            ppid: 3000,
+            start: "1",
+            argv: &["./x", "86400"],
+        };
+        table.procs.insert(60, long.clone());
+        table.link_errors.insert(60, libc::ENAMETOOLONG);
+        table.procs.insert(61, Proc { link: "/home/mallory/fuse/x", ..long.clone() });
+        table.image_errors.insert(61, libc::EACCES);
+        table.procs.insert(62, Proc { link: "/home/mallory/fuse/y", ..long.clone() });
+        table.link_errors.insert(62, libc::EACCES);
+        assert_eq!(scan(&table, &[]).unwrap(), Vec::<String>::new());
+
+        for pid in [60, 61, 62] {
+            table.procs.get_mut(&pid).unwrap().uids = [1000, 1000, 0, 1000];
+        }
+        let found = scan(&table, &[]).unwrap();
         assert_eq!(
-            scan(&table, &[]).unwrap_err().raw_os_error(),
-            Some(libc::EACCES)
+            found,
+            [
+                format!("60 (executable unreadable: File name too long (os error {}))", libc::ENAMETOOLONG),
+                "61 /home/mallory/fuse/x (image unreadable: Permission denied (os error 13))".into(),
+                "62 (executable unreadable: Permission denied (os error 13))".into(),
+            ]
         );
+        let refusal = ReleaseRefusal::KilnProcesses(found.into_iter().collect());
+        assert_eq!(refusal_exit(&refusal), EXIT_BUSY);
+
+        // Possibly kiln, so explained as kiln is: a published shim's descendant.
+        table.procs.get_mut(&60).unwrap().ppid = 20;
+        table.procs.insert(20, kiln_proc(1, "600", CREATE));
+        assert_eq!(scan(&table, &[(20, "600")]).unwrap().len(), 2);
+
+        // An unreadable image doesn't matter for a process named kiln: the name decides.
+        table.procs.insert(63, Proc { link: "/var/tmp/kiln", uids: ROOT, ..long });
+        table.image_errors.insert(63, libc::EACCES);
+        assert!(
+            scan(&table, &[(20, "600")]).unwrap().contains(&"63 /var/tmp/kiln".to_string())
+        );
+    }
+
+    /// A process gone before its exe was read is skipped (a status read that fails
+    /// otherwise refuses: `a_kiln_named_process_whose_status_is_gone_…`).
+    #[test]
+    fn a_process_gone_mid_scan_is_skipped() {
         struct Gone;
         impl ProcessTable for Gone {
             fn pids(&self) -> io::Result<Vec<i32>> {

@@ -456,7 +456,8 @@ sandbox compromises the host.
   node (a process holding root by any uid whose image is the configured kiln or whose
   executable is named `kiln`, by link reads before and after its uids that agree:
   another account's process can't create a run, whatever it runs, so it is no
-  evidence) to be a published shim, a
+  evidence; a root process whose executable can't be read counts) to be a published
+  shim, a
   descendant of one or a kiln node service (two full passes; any other, a `kiln` that root
   runs by hand included, refuses with its pid), and
   only then reads kiln's runs directory itself, since `kiln ls` skips a run
