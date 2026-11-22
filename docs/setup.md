@@ -592,7 +592,8 @@ backup restore.
 Schema 17 adds the append-only `operator_releases` audit of `kilnd release-ambiguous`
 (see [Releasing an ambiguous reservation](#releasing-an-ambiguous-reservation)) and
 widens one `CHECK` so such a release can tag its row; schema 16 rows are unchanged and
-older binaries refuse schema 17.
+older binaries refuse schema 17. Rollback is the same database backup restore: a release
+recorded after that backup is lost with it, and its row is charged again.
 
 `--enable-workspace-checkpoints` (default off) serves the checkpoint RPCs and creates from
 a checkpoint. **It is off by default and a supported opt-in** on a node that passes the

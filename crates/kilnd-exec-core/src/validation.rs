@@ -17,8 +17,9 @@ pub const MAX_WRITABLE_PATH_BYTES: usize = 1024;
 /// refuses a quota below 1 ms of each 100 ms period, so 10 millis is the least CPU kiln
 /// can start. On the supported 4 KiB-block XFS, a `--disk` of 1-12288 bytes fails with
 /// EDQUOT writing the run's own `policy`, `shim.start` or `shim.pid`, and leaves a run
-/// directory with no `shim.pid` that `kiln ls`, `gc` and `rm` all skip (kiln
-/// `runtime/src/container.rs`:125-139); the disk floor is well clear of that.
+/// directory with no `shim.pid` that `kiln ls`, `gc` and `rm` all skip (kiln 00d61c5
+/// `runtime/src/container.rs`:119-124; kiln 1883d35 publishes the identity first); the
+/// disk floor is well clear of that.
 pub const MIN_CPU_MILLIS: u32 = 10;
 pub const MIN_MEMORY_BYTES: u64 = 32 << 20;
 pub const MIN_PIDS: u32 = 16;

@@ -99,13 +99,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   any account's, and that stopping it is the operator's call.
 
 - Bring the docs in step with the code. setup.md's upgrade notes name schema 17 as the
-  current one, and the release command's section gives the `--reason` bound and exit 64;
-  the README and the threat model say an ambiguous row has an operator release and that
-  kilnd-helper is stopped for it; the validation contract says the floors and the
-  mounted-filesystem paths go unchecked only by a kiln older than the next release. The
-  proto's comments give CreateSandbox's `INVALID_ARGUMENT` for a backend preflight
-  refusal, the resource floors and maxima, the refused writable paths and the operator
-  release in the reservation rules. Comments only; no behaviour changes.
+  current one and give its rollback, and the release command's section gives the
+  `--reason` bound and exit 64; the README and the threat model say an ambiguous row has
+  an operator release and that kilnd-helper is stopped for it; the validation contract
+  says the floors and the mounted-filesystem paths go unchecked only by a kiln older than
+  the next release. The proto's comments give CreateSandbox's `INVALID_ARGUMENT` for a
+  backend preflight refusal of a create not from a checkpoint, the resource floors and
+  maxima, the refused writable paths and the operator release in the reservation rules;
+  architecture.md's status table scopes that row the same way. Comments only; no
+  behaviour changes.
 
 - A create kiln refuses before allocating anything (its trusted exit 124: a writable path
   whose parent in the image is a symlink or a regular file, a missing image, or any other
@@ -116,9 +118,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   uncharged. kiln has one exit status for every preflight refusal, so a missing image
   gets the same code. A keyed create still answers `OK` with its settled `FAILED` row,
   on the original call and every retry. The capability gate, a create that expired
-  before kiln ran, and every failure after allocation keep their codes. kilnd-helper
-  carries the fact as an optional `preflight_refused` on its create error reply, omitted
-  when false; upgrade daemon and helper together, as always. `scripts/smoke.sh`'s two
+  before kiln ran, a create from a checkpoint (its refusals stay typed) and every
+  failure after allocation keep their codes. kilnd-helper carries the fact as an
+  optional `preflight_refused` on its create error reply, omitted when false; upgrade
+  daemon and helper together, as always. `scripts/smoke.sh`'s two
   unmanaged kiln creates and `scripts/helper-blocking-fd.py`'s fixture ask for kiln's
   64 MiB disk floor, and the ambiguous-create VM test forces its ambiguous row with
   kiln's own post-preflight trigger, an empty image directory.

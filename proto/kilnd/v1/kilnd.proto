@@ -29,9 +29,11 @@ service KilndService {
   // (create_in_flight); a caller at its request-record cap fails
   // RESOURCE_EXHAUSTED (request_id_quota). An unkeyed create that the backend's
   // own preflight refused before allocating anything (kiln's exit 124) fails
-  // INVALID_ARGUMENT naming its FAILED, uncharged row; a keyed one returns OK
-  // with that row. An expiry policy, if sent, is
-  // resolved once here and never changes; without one the sandbox never expires.
+  // INVALID_ARGUMENT naming its FAILED, uncharged row, unless it names
+  // from_checkpoint, whose refusals keep their typed checkpoint codes (Workspace
+  // checkpoints, below); a keyed create returns OK with that row either way. An
+  // expiry policy, if sent, is resolved once here and never changes; without one
+  // the sandbox never expires.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
   // Returns one sandbox and its most recent executions.

@@ -1165,7 +1165,7 @@ metadata result alive and enforces an RSS increase below 32 MiB.
 | New create/Exec during shutdown | `UNAVAILABLE` |
 | Exec or RenewSandbox on a sandbox that is not `READY` | `FAILED_PRECONDITION` with a `kilnd-reason` trailer and token prefix |
 | Expiry policy below 10 s or above the node maximum | `INVALID_ARGUMENT`, before anything is prepared |
-| Unkeyed create kiln's preflight refused (trusted exit 124) | `INVALID_ARGUMENT` naming the `FAILED`, uncharged row |
+| Unkeyed create, not from a checkpoint, that kiln's preflight refused (trusted exit 124) | `INVALID_ARGUMENT` naming the `FAILED`, uncharged row |
 | RenewSandbox on a foreign or unknown ID | `NOT_FOUND`, no trailer |
 
 ## Shutdown and restarts
