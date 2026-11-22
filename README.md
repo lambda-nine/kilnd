@@ -118,7 +118,9 @@ code, the test suite and `CHANGELOG.md`.
   most 3 GiB memory, 2,048 PIDs and 16 GiB disk for sandboxes. `LOST` remains
   reserved because it can recover; ambiguous `FAILED` creates remain reserved
   because no current operation can account for hidden resources without an ID.
-  Delete refuses to release those ambiguous rows, even with an empty listing.
+  Delete refuses to release those ambiguous rows, even with an empty listing;
+  only root's `kilnd release-ambiguous`, with kilnd and kilnd-helper stopped,
+  can (see [setup](docs/setup.md#releasing-an-ambiguous-reservation)).
   A create the backend proves failed before allocating anything, such as a
   missing image, releases as it durably becomes `FAILED`, and Delete retires
   that row without touching the backend.

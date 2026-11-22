@@ -37,8 +37,9 @@ refused over a filesystem kiln mounts itself: `/proc`, `/sys` and everything und
 them (procfs at `/proc`, a read-only cgroup2 at `/sys/fs/cgroup`), and anything under
 `/dev` except `/dev/shm` (kiln's `/dev` is a 0755 tmpfs owned by host root, which
 sandbox root cannot create in; `/dev/shm` is a 1777 tmpfs kiln makes writable). kiln
-mounts these after it allocates, so such a path would fail in its shim's setup and
-leave an ambiguous reservation. The check is component-wise: `/procx`, `/system`
+mounts these after it allocates, and a kiln older than the next release doesn't check
+for them first, so such a path would fail in its shim's setup and leave an ambiguous
+reservation. The check is component-wise: `/procx`, `/system`
 and `/dev/shm/x` are valid.
 
 Argv is literal data, never host-shell text. Newlines, other non-NUL control
@@ -54,11 +55,13 @@ API limit and maximum argc, the largest possible encoded body is
 `262144 + 3*4096 + 4 = 274436` bytes, safely below the backend cap.
 
 Create limits are checked as one request before persistence or backend work.
-The floors exist because kiln checks none of them before it allocates: a smaller value
-fails in kiln's shim after allocation (kiln writes `cpu.max` as
-`round(cpus * 100000) 100000`, and cgroup v2 refuses a quota below 1 ms), and kilnd
-must record that failure as an ambiguous reservation, charged until an operator
-releases it (see "Releasing an ambiguous reservation" in [setup.md](setup.md)). The
+The floors exist because a kiln older than the next release checks none of them before
+it allocates: a smaller value fails in kiln's shim after allocation (kiln writes
+`cpu.max` as `round(cpus * 100000) 100000`, and cgroup v2 refuses a quota below 1 ms),
+and kilnd must record that failure as an ambiguous reservation, charged until an
+operator releases it (see "Releasing an ambiguous reservation" in [setup.md](setup.md)).
+The next kiln release refuses the same floors, and the paths above, in its create
+preflight (exit 124), but kilnd's own check still comes first, before any charge. The
 same floors apply to a create from a checkpoint, which takes its limits from the
 request, and the defaults are checked against them at startup.
 Exec validation likewise happens before an execution row or backend spawn. An env

@@ -98,6 +98,15 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   the command's two halves carries that count. setup.md says a listed process may be
   any account's, and that stopping it is the operator's call.
 
+- Bring the docs in step with the code. setup.md's upgrade notes name schema 17 as the
+  current one, and the release command's section gives the `--reason` bound and exit 64;
+  the README and the threat model say an ambiguous row has an operator release and that
+  kilnd-helper is stopped for it; the validation contract says the floors and the
+  mounted-filesystem paths go unchecked only by a kiln older than the next release. The
+  proto's comments give CreateSandbox's `INVALID_ARGUMENT` for a backend preflight
+  refusal, the resource floors and maxima, the refused writable paths and the operator
+  release in the reservation rules. Comments only; no behaviour changes.
+
 - A create kiln refuses before allocating anything (its trusted exit 124: a writable path
   whose parent in the image is a symlink or a regular file, a missing image, or any other
   check kiln's create preflight makes) is now answered `INVALID_ARGUMENT`, not

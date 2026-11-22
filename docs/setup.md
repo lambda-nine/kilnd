@@ -543,7 +543,7 @@ bounded `next_page_token` until empty, keeping `include_deleted` and the calling
 uid unchanged. Tokens do not survive the schema 7 upgrade: restart the listing.
 Omitting `page_size` preserves complete-list behavior but now fails
 `RESOURCE_EXHAUSTED` when the result exceeds the configured count or byte
-bounds. Every older schema upgrades in order through the current one (16). Schemas 3 to 5
+bounds. Every older schema upgrades in order through the current one (17). Schemas 3 to 5
 added, alongside output, terminal state and truncation facts, typed termination and
 runtime diagnostics (schema 3), whether each byte total is exact (schema 4) and each
 sandbox's create certainty (schema 5). Historical records retain unknown typed values and unknown
@@ -588,6 +588,11 @@ Schema 16 adds one table, the checkpoint barrier's durable marker (see
 [architecture.md](architecture.md#workspace-checkpoint-engine-milestone-c5a)); schema 15
 rows are unchanged and older binaries refuse schema 16. Rollback is the same database
 backup restore.
+
+Schema 17 adds the append-only `operator_releases` audit of `kilnd release-ambiguous`
+(see [Releasing an ambiguous reservation](#releasing-an-ambiguous-reservation)) and
+widens one `CHECK` so such a release can tag its row; schema 16 rows are unchanged and
+older binaries refuse schema 17.
 
 `--enable-workspace-checkpoints` (default off) serves the checkpoint RPCs and creates from
 a checkpoint. **It is off by default and a supported opt-in** on a node that passes the
@@ -842,7 +847,9 @@ as its own `kilnd-NAME` account and has no kiln rows to release.
 `--helper-lock` (default `/var/lib/kilnd-helper/helper.lock`) and `--kiln` (default
 `/usr/local/bin/kiln`) are kilnd-helper's `--serve-lock` and `--kiln`; pass
 `--enable-workspace-checkpoints` if the daemon runs with it, which also serves the
-checkpoint group as the helper's `--enable-checkpoints` does.
+checkpoint group as the helper's `--enable-checkpoints` does. `--reason` goes into the
+audit row: 1 to 512 printable ASCII bytes, not only spaces. A malformed `--sandbox` or
+`--reason` exits 64 before anything else is touched.
 
 As root, the command first takes kilnd-helper's serving lock, which every serving
 helper holds until every request it accepted has settled (exit 75 while a helper or

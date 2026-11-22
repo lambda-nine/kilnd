@@ -287,7 +287,7 @@ sandbox compromises the host.
   trusted root user or direct `kiln` invocation can create unmanaged backends
   outside these reservations. Ambiguous no-ID creates remain charged even
   after all listed backends are removed; unexplained backends are not charged
-  a fabricated spec. Only root, with kilnd stopped, can release one
+  a fabricated spec. Only root, with kilnd and kilnd-helper stopped, can release one
   (`kilnd release-ambiguous`, below), and only after kilnd's own startup
   reconciliation, a complete inventory and a scan of kiln's runs directory all
   find nothing a live row doesn't own.
