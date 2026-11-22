@@ -8,6 +8,14 @@
 //! one empty image directory, `ambigvm-empty-<pid>`, kiln's own post-preflight trigger,
 //! and removes it by name once the create that needs it has run.
 //!
+//! The release's process scan must ignore other accounts' processes, whatever they run
+//! or are named, and must not fail over one it can't read: the test runs a copy of sleep
+//! named kiln, the same through a link named `\xff`, one under a path longer than
+//! PATH_MAX and the configured kiln itself as `OTHER`, and two such processes in the live
+//! sandbox, through the successful release; root's process under the long path refuses.
+//! The audit row's operator uid is the test's login uid when one is set (run it with
+//! sudo from a login).
+//!
 //! A second test, `ambig_vm_preflight_status_over_the_api`, serves the private instance
 //! on a private API socket and drives it with the `kilndctl` under test
 //! (`KILND_AMBIG_KILNDCTL`) as an ordinary uid, for the status codes a client sees.
@@ -17,6 +25,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -434,6 +443,258 @@ impl Drop for EmptyImage {
             eprintln!("AMBIG could not remove {}: {e}", self.path.display());
         }
     }
+}
+
+/// Where `OTHER`'s processes run from: root's, 0755, inside the private directory.
+const OTHERS: &str = "/var/tmp/kilnd-ambig-vm/other";
+/// 17 nested 250-byte directories: an executable below them has a path longer than
+/// PATH_MAX, which the kernel can't render as `/proc/PID/exe` (ENAMETOOLONG).
+const DEEP_LEVELS: usize = 17;
+
+/// In the live sandbox, as its root (another account to the host): a script named `\xff`
+/// (its command name) that waits, and busybox as `sleep` under a path longer than
+/// PATH_MAX, made one relative step at a time. Both detached, so they outlive the exec.
+const SANDBOX_HOSTILE: &str = r#"set -e
+ff=$(printf '\377')
+printf '#!/bin/sh\nsleep 600\n' > "/tmp/$ff"
+chmod 755 "/tmp/$ff"
+setsid "/tmp/$ff" </dev/null >/dev/null 2>&1 &
+d=$(printf "%0250d" 0)
+cd -P /tmp
+mkdir deep
+cd -P deep
+i=0
+while [ $i -lt 17 ]; do mkdir "$d"; cd -P "$d"; i=$((i+1)); done
+cp /bin/busybox bb
+ln -s bb sleep
+setsid ./sleep 600 </dev/null >/dev/null 2>&1 &
+echo planted"#;
+
+fn open_dir_at(at: libc::c_int, name: &std::ffi::CStr) -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: a live directory descriptor (or AT_FDCWD), a NUL-terminated name and flags.
+    let fd = unsafe {
+        libc::openat(
+            at,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    assert!(fd >= 0, "open {name:?}: {}", std::io::Error::last_os_error());
+    // SAFETY: openat returned a new owned descriptor.
+    unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+}
+
+/// A copy of sleep, `x`, at the bottom of [`DEEP_LEVELS`] directories below [`OTHERS`],
+/// made one component at a time (no path given to a system call passes PATH_MAX): the
+/// descriptor of its directory.
+fn deep_sleep() -> std::os::fd::OwnedFd {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let mut dir = open_dir_at(libc::AT_FDCWD, &std::ffi::CString::new(OTHERS).unwrap());
+    let name = std::ffi::CString::new("d".repeat(250)).unwrap();
+    for _ in 0..DEEP_LEVELS {
+        // SAFETY: a live directory descriptor and a NUL-terminated name.
+        let made = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) };
+        assert_eq!(made, 0, "mkdirat: {}", std::io::Error::last_os_error());
+        dir = open_dir_at(dir.as_raw_fd(), &name);
+    }
+    // SAFETY: a live directory descriptor, a NUL-terminated name, flags and a mode.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c"x".as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o755,
+        )
+    };
+    assert!(fd >= 0, "create x: {}", std::io::Error::last_os_error());
+    // SAFETY: openat returned a new owned descriptor.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(&std::fs::read("/bin/sleep").unwrap()).unwrap();
+    file.set_permissions(std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// `./x 600` in [`deep_sleep`]'s directory, as `uid` (root if `None`).
+fn spawn_deep(dir: &std::os::fd::OwnedFd, uid: Option<u32>) -> std::process::Child {
+    use std::os::fd::AsRawFd as _;
+    let fd = dir.as_raw_fd();
+    let mut command = Command::new("./x");
+    command
+        .arg("600")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(uid) = uid {
+        command.uid(uid).gid(uid);
+    }
+    // SAFETY: fchdir is async-signal-safe, and the descriptor stays open in the parent
+    // until spawn returns.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(fd) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    command.spawn().unwrap()
+}
+
+/// The configured kiln run by `OTHER` (`kiln ls`), its stdout and stderr a pipe already
+/// full: it blocks in its first write, alive and running kiln's image, for as long as
+/// the read end (returned) stays open and unread.
+fn blocked_kiln_as_other() -> (std::process::Child, std::os::fd::OwnedFd) {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    let mut fds = [0; 2];
+    // SAFETY: a valid array of two descriptors.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
+    // SAFETY: pipe2 returned two new owned descriptors.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for chunk in [4096, 1] {
+        let bytes = vec![b'x'; chunk];
+        // SAFETY: a live descriptor and a buffer of `chunk` bytes.
+        while unsafe { libc::write(write.as_raw_fd(), bytes.as_ptr().cast(), chunk) } > 0 {}
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EAGAIN));
+    }
+    // SAFETY: fcntl on a live descriptor.
+    unsafe {
+        let flags = libc::fcntl(write.as_raw_fd(), libc::F_GETFL);
+        assert_eq!(libc::fcntl(write.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK), 0);
+    }
+    let error = write.try_clone().unwrap();
+    let child = Command::new(KILN)
+        .arg("ls")
+        .uid(OTHER)
+        .gid(OTHER)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(write))
+        .stderr(Stdio::from(error))
+        .spawn()
+        .unwrap();
+    (child, read)
+}
+
+/// A copy of sleep named kiln in [`OTHERS`].
+fn kiln_copy() -> PathBuf {
+    Path::new(OTHERS).join("kiln")
+}
+
+/// A link named `\xff` to [`kiln_copy`]: a process run through it has that command name.
+fn kiln_copy_link() -> PathBuf {
+    Path::new(OTHERS).join(std::ffi::OsStr::from_bytes(b"\xff"))
+}
+
+/// [`OTHERS`], with [`kiln_copy`] and [`kiln_copy_link`] in it.
+fn plant_kiln_copy() {
+    std::fs::create_dir(OTHERS).unwrap();
+    std::fs::set_permissions(OTHERS, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::copy("/bin/sleep", kiln_copy()).unwrap();
+    std::fs::set_permissions(kiln_copy(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("kiln", kiln_copy_link()).unwrap();
+}
+
+/// `OTHER`'s processes, each a child of this test: killed and reaped when dropped.
+struct Others {
+    children: Vec<(&'static str, std::process::Child)>,
+    _pipe: std::os::fd::OwnedFd,
+}
+
+impl Others {
+    /// A copy of sleep named kiln (security review LOW 1), the same run through a link
+    /// named `\xff` (fix review R2), a copy of sleep under a path longer than PATH_MAX
+    /// (fix re-review R4) and the configured kiln itself (option (a)), all as `OTHER`.
+    fn start(deep: &std::os::fd::OwnedFd) -> Self {
+        let (copy, link) = (kiln_copy(), kiln_copy_link());
+        let as_other = |program: &Path| {
+            Command::new(program)
+                .arg("600")
+                .uid(OTHER)
+                .gid(OTHER)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let (kiln, pipe) = blocked_kiln_as_other();
+        let others = Self {
+            children: vec![
+                ("kiln copy", as_other(&copy)),
+                ("kiln copy through a link named \\xff", as_other(&link)),
+                ("sleep under a path past PATH_MAX", spawn_deep(deep, Some(OTHER))),
+                ("the configured kiln", kiln),
+            ],
+            _pipe: pipe,
+        };
+        // Each is exec'd and running: its image is what it was started from.
+        std::thread::sleep(Duration::from_secs(1));
+        others
+    }
+
+    /// Each process: its pid, whether it still runs, its exe link (or the error) and its
+    /// command name, as root reads them.
+    fn state(&mut self) -> Vec<Value> {
+        self.children
+            .iter_mut()
+            .map(|(what, child)| {
+                let pid = child.id();
+                let exe = match std::fs::read_link(format!("/proc/{pid}/exe")) {
+                    Ok(exe) => exe.to_string_lossy().into_owned(),
+                    Err(e) => format!("error: {e}"),
+                };
+                let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap_or_default();
+                let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
+                json!({ "what": what, "pid": pid, "running": child.try_wait().unwrap().is_none(),
+                        "exe": exe, "comm": format!("{:?}", String::from_utf8_lossy(&comm)),
+                        "wchan": wchan })
+            })
+            .collect()
+    }
+
+    fn all_running(&mut self) -> bool {
+        self.children
+            .iter_mut()
+            .all(|(_, child)| child.try_wait().unwrap().is_none())
+    }
+}
+
+impl Drop for Others {
+    fn drop(&mut self) {
+        for (_, child) in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// How many processes on the node have the command name `\xff`, and how many an exe
+/// link the kernel can't render: the record that the hostile set is in place.
+fn hostile_counts() -> (usize, usize) {
+    let (mut named, mut long) = (0, 0);
+    for entry in std::fs::read_dir("/proc").unwrap() {
+        let name = entry.unwrap().file_name();
+        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if std::fs::read(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm == b"\xff\n") {
+            named += 1;
+        }
+        if std::fs::read_link(format!("/proc/{pid}/exe"))
+            .is_err_and(|e| e.raw_os_error() == Some(libc::ENAMETOOLONG))
+        {
+            long += 1;
+        }
+    }
+    (named, long)
+}
+
+/// The audit login uid this test runs under, if a login set one: what a release it
+/// runs records as its operator.
+fn login_uid() -> Option<u32> {
+    let text = std::fs::read_to_string("/proc/self/loginuid").ok()?;
+    text.trim().parse().ok().filter(|&uid| uid != u32::MAX)
 }
 
 #[test]
@@ -855,6 +1116,22 @@ async fn scenario() {
         json!({ "id": live.id, "backend_id": live_backend, "memory_bytes": live.spec.memory_bytes,
                 "kiln": kiln_state(), "kiln_processes": kiln_processes() }),
     );
+    // Its own processes whose command name isn't UTF-8 and whose executable's path the
+    // kernel can't render (fix review R2, re-review R4): sandbox root is another account
+    // to the host, so the release's scan ignores them, through the release in step 5.
+    let planted = m.exec(sh(&live.id, SANDBOX_HOSTILE)).await.unwrap();
+    record(
+        "sandbox hostile processes",
+        json!({ "exit": planted.exit_code,
+                "stdout": String::from_utf8_lossy(&planted.stdout.data),
+                "stderr": String::from_utf8_lossy(&planted.stderr.data) }),
+    );
+    assert_eq!(
+        planted.exit_code,
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&planted.stderr.data)
+    );
     // Each create below asks for the rest of the node's memory budget, so a charge it
     // kept would refuse every other uid.
     let ambiguous_memory = limits.max_node_memory_bytes - live.spec.memory_bytes;
@@ -1085,6 +1362,93 @@ async fn scenario() {
         .still_charged("charged after stand-in shim", &charged)
         .await;
 
+    // A root process whose executable's path is longer than PATH_MAX: its exe link can't
+    // be read, so it is possibly kiln, named with the error (re-review R4).
+    // Root's run of a kiln copy through a link named `\xff` counts, its command name read
+    // as bytes (fix review R2).
+    plant_kiln_copy();
+    let mut root_named = Command::new(kiln_copy_link())
+        .arg("600")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    let comm = std::fs::read(format!("/proc/{}/comm", root_named.id())).unwrap();
+    record(
+        "root kiln copy named \\xff",
+        json!({ "pid": root_named.id(), "comm": format!("{comm:?}") }),
+    );
+    assert_eq!(comm, b"\xff\n");
+    instance
+        .refused(
+            "refused root's kiln copy named \\xff",
+            &row.id,
+            75,
+            &[&format!("{} {}", root_named.id(), kiln_copy().display())],
+        )
+        .await;
+    root_named.kill().unwrap();
+    root_named.wait().unwrap();
+    instance
+        .still_charged("charged after root's kiln copy named \\xff", &charged)
+        .await;
+
+    let deep = deep_sleep();
+    let mut root_deep = spawn_deep(&deep, None);
+    std::thread::sleep(Duration::from_secs(1));
+    let unreadable = std::fs::read_link(format!("/proc/{}/exe", root_deep.id()));
+    record(
+        "root process under a long path",
+        json!({ "pid": root_deep.id(), "exe": format!("{unreadable:?}") }),
+    );
+    assert_eq!(
+        unreadable.unwrap_err().raw_os_error(),
+        Some(libc::ENAMETOOLONG)
+    );
+    instance
+        .refused(
+            "refused root's unreadable executable",
+            &row.id,
+            75,
+            &[&format!(
+                "{} (executable unreadable: File name too long",
+                root_deep.id()
+            )],
+        )
+        .await;
+    root_deep.kill().unwrap();
+    root_deep.wait().unwrap();
+    instance
+        .still_charged("charged after root's unreadable executable", &charged)
+        .await;
+
+    // Another account's processes never refuse the release, whatever they run or are
+    // named, and whether or not their executable can be read (option (a), R2, R4). They
+    // run through every step below, the successful release included.
+    let mut others = Others::start(&deep);
+    let (named, long) = hostile_counts();
+    record(
+        "other accounts' processes",
+        json!({ "others": others.state(), "named_xff": named, "exe_too_long": long,
+                "kiln_processes": kiln_processes() }),
+    );
+    assert!(others.all_running(), "{:?}", others.state());
+    assert!(named >= 2 && long >= 2, "the sandbox's and OTHER's: {named} {long}");
+    // The checkpoint helper's process table reads the same node (fix review, outside its
+    // range): no command name fails it.
+    let kiln_meta = std::fs::metadata(KILN).unwrap();
+    let table = {
+        use std::os::unix::fs::MetadataExt as _;
+        crate::helper::checkpoint::kiln::process_table((kiln_meta.dev(), kiln_meta.ino()))
+    };
+    record(
+        "checkpoint process table",
+        json!({ "ok": table.is_ok(), "error": table.as_ref().err().map(|e| e.to_string()),
+                "artifact_readers": table.as_ref().map(Vec::len).ok() }),
+    );
+    assert!(table.is_ok(), "{table:?}");
+
     // The instance holds its lock.
     let mut holder = Command::new(std::env::current_exe().unwrap());
     holder
@@ -1212,6 +1576,13 @@ async fn scenario() {
         )) && out.contains(&format!(" memory_bytes={ambiguous_memory} ")),
         "{out}"
     );
+    let (named, long) = hostile_counts();
+    record(
+        "released with other accounts' processes running",
+        json!({ "others": others.state(), "named_xff": named, "exe_too_long": long }),
+    );
+    assert!(others.all_running(), "{:?}", others.state());
+    assert!(named >= 2 && long >= 2, "{named} {long}");
     instance
         .refused(
             "refused already released",
@@ -1266,5 +1637,29 @@ async fn scenario() {
     assert_eq!(reserved(&m).await, zero);
     assert_clean("end");
     instance.stop(m).await;
+    drop(others);
+
+    // The audit row's operator: the login uid when one is set (sudo leaves it as the
+    // login set it), else sudo's SUDO_UID, else the uid the command ran as (root).
+    let audit = rusqlite::Connection::open_with_flags(
+        instance.state.join("kilnd.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let operator: u32 = audit
+        .query_row(
+            "SELECT operator_uid FROM operator_releases WHERE sandbox_id = ?1",
+            [&row.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(audit);
+    let sudo_uid = std::env::var("SUDO_UID").ok().and_then(|uid| uid.parse::<u32>().ok());
+    let expected = login_uid().or(sudo_uid).unwrap_or(0);
+    record(
+        "audit operator uid",
+        json!({ "operator_uid": operator, "login_uid": login_uid(), "sudo_uid": sudo_uid }),
+    );
+    assert_eq!(operator, expected);
     std::fs::remove_dir_all(dir).unwrap();
 }
