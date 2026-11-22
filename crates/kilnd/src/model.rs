@@ -256,8 +256,9 @@ pub enum LegacyRelease {
     /// The typed create result proved nothing was allocated.
     DefinitelyNotCreated,
     /// Schema 17: an ambiguous FAILED create with no backend ID, released by
-    /// `kilnd release-ambiguous` after a complete inventory with kilnd stopped. Only
-    /// the insert of its `operator_releases` audit row sets it; nothing derives it.
+    /// `kilnd release-ambiguous` after a complete inventory with kilnd and kilnd-helper
+    /// stopped. Only the insert of its `operator_releases` audit row sets it; nothing
+    /// derives it.
     OperatorAttested,
 }
 

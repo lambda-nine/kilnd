@@ -431,6 +431,14 @@ async fn ambiguous_failed_reservation_survives_even_a_clean_backend_listing() {
         matches!(error, Error::FailedPrecondition(ref message) if message.contains("fake backend") && message.contains("authoritative resource reconciliation")),
         "{error}"
     );
+    // The release refuses while either holds its lock (exit 75): the operator is told to
+    // stop both, and the socket that would start the helper again.
+    assert!(
+        error.to_string().contains(
+            "with kilnd and kilnd-helper stopped (kilnd-helper.socket too, so nothing starts the helper again), an operator can prove the node clean and release it with `kilnd release-ambiguous`"
+        ),
+        "{error}"
+    );
     assert_eq!(m.get(&row.id, 0).unwrap().0.state, SandboxState::Failed);
     assert_eq!(
         m.health().await.unwrap().node_resources.reserved.sandboxes,

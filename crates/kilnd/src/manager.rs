@@ -3406,7 +3406,7 @@ impl<R: Runtime> Manager<R> {
     /// so an ambiguous reservation must stay charged, even on an empty list.
     fn ambiguous_reservation_error(&self, sandbox: &Sandbox) -> Error {
         Error::FailedPrecondition(format!(
-            "cannot release the ambiguous reservation for failed sandbox {}: no backend ID was reported; the {} backend listing cannot account for hidden or unpublished resources; authoritative resource reconciliation is required: with kilnd stopped, an operator can prove the node clean and release it with `kilnd release-ambiguous`",
+            "cannot release the ambiguous reservation for failed sandbox {}: no backend ID was reported; the {} backend listing cannot account for hidden or unpublished resources; authoritative resource reconciliation is required: with kilnd and kilnd-helper stopped (kilnd-helper.socket too, so nothing starts the helper again), an operator can prove the node clean and release it with `kilnd release-ambiguous`",
             sandbox.id,
             self.runtime.name()
         ).into())

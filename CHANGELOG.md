@@ -6,6 +6,11 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Delete's refusal of an ambiguous reservation now tells the operator to stop both
+  kilnd and kilnd-helper (and `kilnd-helper.socket`) before `kilnd release-ambiguous`.
+  It said "with kilnd stopped", and the release refuses with exit 75 while
+  kilnd-helper serves.
+
 - kilnd-helper's checkpoint group no longer retains every checkpoint removal while
   any process on the node has a command name that isn't UTF-8. Its process scan read
   every process's `/proc/PID/stat` as text, so one such process (a sandbox's

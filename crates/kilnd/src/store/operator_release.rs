@@ -1,9 +1,9 @@
 //! Schema 17: the operator's release of an ambiguous reservation (`kilnd
 //! release-ambiguous`). A FAILED legacy create with no backend ID and
 //! `allocation_ambiguous` certainty stays charged because nothing kilnd can observe
-//! proves its allocation absent. The operator proves it instead, with kilnd stopped:
-//! the startup reconciliation pass, a complete kiln inventory and a scan of kiln's
-//! runs directory, all clean. The release is the insert of one append-only audit row,
+//! proves its allocation absent. The operator proves it instead, with kilnd and
+//! kilnd-helper stopped: the startup reconciliation pass, a complete kiln inventory
+//! and a scan of kiln's runs directory, all clean. The release is the insert of one append-only audit row,
 //! whose own trigger moves the row to `legacy_release = 'operator_attested'` in the
 //! same statement. Nothing else can set that tag: no kilnd transition derives it, the
 //! CHECK allows it only on such a row, and an UPDATE or INSERT that writes it without
