@@ -1762,7 +1762,11 @@ pub mod supervise {
         // listens, the VMM answers CONNECT without OK. Only that is retried, every
         // 50 ms, within the original Create deadline; nothing was sent to a broker.
         let mut retry_at: Option<std::time::Instant> = None;
+        // M3-1: this loop's iterations and time, and its CONNECT retries.
+        let waiting = std::time::Instant::now();
+        let mut polls = 0u32;
         let report = loop {
+            polls = polls.saturating_add(1);
             link.beat();
             if let Some(command) = link.poll(Duration::from_millis(5))? {
                 return Err(Abort::Refused(format!("unexpected command {command:?}")));
@@ -1772,6 +1776,7 @@ pub mod supervise {
             }
             if retry_at.is_some_and(|at| std::time::Instant::now() >= at) {
                 retry_at = None;
+                link.timing.retried();
                 link.record(SupervisorRecord::Initialize)?;
                 submit(link, plan, booted, workers, request.clone(), Vec::new())
                     .map_err(|(_, e)| e)?;
@@ -1788,6 +1793,8 @@ pub mod supervise {
                 return Err(Abort::Expired);
             }
         };
+        link.timing
+            .waited(polls, waiting.elapsed().as_nanos() as u64);
         let (boot_id, inner_id) = match report {
             RelayReport::Ready { hello, ready, .. } => (hello.boot_id, ready.inner_id),
             RelayReport::Refused { error, .. } => {
@@ -1801,10 +1808,12 @@ pub mod supervise {
             }
             other => return Err(Abort::Refused(format!("unexpected {other:?}"))),
         };
+        link.timing.begin(super::super::timing::Name::of("s.broker_journal"));
         link.record(SupervisorRecord::Resource(ResourceRecord::Broker {
             boot_id: boot_id.to_string(),
             inner_id: inner_id.to_string(),
         }))?;
+        link.timing.begin(super::super::timing::Name::of("s.journal_ready"));
         link.record(SupervisorRecord::Phase {
             from: vec!["booting".into()],
             to: "ready".into(),

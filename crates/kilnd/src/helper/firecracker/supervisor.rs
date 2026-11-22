@@ -360,6 +360,8 @@ pub struct Link<'a> {
     console: Option<Console>,
     /// The launch step forward work last entered, named in a refusal's reason.
     step: &'static str,
+    /// M3-1: this S's step timings, carried to H on its records. Diagnostic only.
+    pub timing: super::timing::Clock,
 }
 
 const CONSOLE_PREFIX: usize = 64 * 1024;
@@ -414,6 +416,7 @@ impl<'a> Link<'a> {
             seq: 0,
             console: None,
             step: "start",
+            timing: super::timing::Clock::default(),
         }
     }
 
@@ -465,6 +468,7 @@ impl<'a> Link<'a> {
     /// The point before each forward effect: heartbeat, commands, deadline, and the
     /// test fault points that stall or kill S exactly here.
     pub fn step(&mut self, name: &'static str) -> Result<(), Abort> {
+        self.timing.begin(super::timing::Name::supervisor(name));
         self.step = name;
         self.beat();
         fault_point(&format!("S.step.{name}"));
@@ -489,28 +493,35 @@ impl<'a> Link<'a> {
         let _ = self.context.control.send(0, event, Duration::from_secs(1));
     }
 
-    /// Sends one record and waits for H's durable answer, heartbeating meanwhile.
+    /// Sends one record and waits for H's durable answer, heartbeating meanwhile. The
+    /// record carries S's completed step timings (M3-1).
     pub fn record(&mut self, record: SupervisorRecord) -> Result<(), Abort> {
         self.seq += 1;
         let seq = self.seq;
-        self.event(&SupervisorEvent::Record { seq, record });
-        loop {
+        let sent = super::timing::now();
+        let steps = self.timing.take();
+        self.event(&SupervisorEvent::Record { seq, record, steps });
+        let answer = loop {
             self.beat();
-            match self.poll(Duration::from_millis(10))? {
-                Some(SupervisorCommand::Recorded { seq: answered, ok }) if answered == seq => {
-                    return if ok {
+            match self.poll(Duration::from_millis(10)) {
+                Err(abort) => break Err(abort),
+                Ok(Some(SupervisorCommand::Recorded { seq: answered, ok })) if answered == seq => {
+                    break if ok {
                         Ok(())
                     } else {
                         Err(Abort::Refused("H refused the record".into()))
                     };
                 }
-                Some(other) => return Err(Abort::Refused(format!("unexpected {other:?}"))),
-                None => {}
+                Ok(Some(other)) => break Err(Abort::Refused(format!("unexpected {other:?}"))),
+                Ok(None) => {}
             }
             if monotonic_ns() >= self.deadline_ns {
-                return Err(Abort::Expired);
+                break Err(Abort::Expired);
             }
-        }
+        };
+        self.timing
+            .recorded(super::timing::now().saturating_sub(sent));
+        answer
     }
 
     /// Waits for a condition while staying responsive. `check` returns Some to finish.
@@ -519,19 +530,32 @@ impl<'a> Link<'a> {
         limit: Duration,
         mut check: impl FnMut() -> io::Result<Option<T>>,
     ) -> Result<T, Abort> {
-        let end = Instant::now() + limit;
-        loop {
-            if let Some(value) = check()? {
-                return Ok(value);
+        let started = Instant::now();
+        let end = started + limit;
+        let mut polls = 0u32;
+        let result = loop {
+            polls = polls.saturating_add(1);
+            match check() {
+                Ok(Some(value)) => break Ok(value),
+                Ok(None) => {}
+                Err(error) => break Err(Abort::from(error)),
             }
             self.beat();
-            if let Some(command) = self.poll(Duration::from_millis(5))? {
-                return Err(Abort::Refused(format!("unexpected command {command:?}")));
+            match self.poll(Duration::from_millis(5)) {
+                Err(abort) => break Err(abort),
+                Ok(Some(command)) => {
+                    break Err(Abort::Refused(format!("unexpected command {command:?}")));
+                }
+                Ok(None) => {}
             }
             if monotonic_ns() >= self.deadline_ns || Instant::now() >= end {
-                return Err(Abort::Expired);
+                break Err(Abort::Expired);
             }
-        }
+        };
+        // M3-1: the iterations and the time this bounded wait took.
+        self.timing
+            .waited(polls, started.elapsed().as_nanos() as u64);
+        result
     }
 }
 
@@ -791,6 +815,12 @@ mod linux {
             if meta.len() != pin.bytes {
                 return Err(Abort::Refused(format!("{name} size differs")));
             }
+            link.timing
+                .begin(super::super::timing::Name::of(if name == "Image" {
+                    "s.hash.image"
+                } else {
+                    "s.hash.rootfs"
+                }));
             let digest = storage::hash_with(&file, meta.len(), &mut || link.beat())?;
             if digest != pin.sha256 {
                 return Err(Abort::Refused(format!("{name} digest differs")));
@@ -852,6 +882,8 @@ mod linux {
             )
         };
         let report_raw = report_write.as_raw_fd();
+        link.timing
+            .begin(super::super::timing::Name::of("s.mkfs.exec"));
         // SAFETY: S is single-threaded; the child only arranges descriptors and execs.
         let forked = unsafe { proven::fork_child() }?;
         let mut child = match forked {
@@ -927,6 +959,8 @@ mod linux {
                 failed.len()
             )));
         }
+        link.timing
+            .begin(super::super::timing::Name::of("s.mkfs.run"));
         let status = match link.wait_for(Duration::from_secs(60), || child.try_reap()) {
             Ok(status) => status,
             Err(abort) => {
@@ -941,6 +975,8 @@ mod linux {
         if !observe {
             link.record(SupervisorRecord::InferredFromRetainedFd(mkfs))?;
         }
+        link.timing
+            .begin(super::super::timing::Name::of("s.mkfs.sync"));
         let after = storage::identity_at(dir, storage::WORK_FILE)?;
         if after != Some(identity) {
             return Err(Abort::Refused(
@@ -1047,12 +1083,20 @@ mod linux {
                 binding,
             )))?;
             link.step("loop_configure")?;
-            match storage::attach_loop(&binding, &work) {
+            let configured = {
+                let timing = &mut link.timing;
+                storage::attach_loop_marked(&binding, &work, &mut || {
+                    timing.begin(super::super::timing::Name::of("s.loop_discard_off"))
+                })
+            };
+            match configured {
                 Ok(attached) => {
                     link.after("loop_configure");
                     break (binding, attached);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempts < 4 => {
+                    // M3-1: this attempt met a busy slot.
+                    link.timing.retried();
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -1065,6 +1109,8 @@ mod linux {
             generation: attached.generation.clone(),
         }))?;
         link.after("loop_record");
+        link.timing
+            .begin(super::super::timing::Name::of("s.loop_persist"));
         storage::persist_loop(&binding, attached)?;
         drop(work);
         link.step("jail")?;
@@ -1180,6 +1226,8 @@ mod linux {
         binding: LoopBinding,
         jail: File,
     ) -> Result<Booted, Abort> {
+        link.timing
+            .begin(super::super::timing::Name::of("s.fork_jailer"));
         let (control_s, control_j) = std::os::unix::net::UnixStream::pair()?;
         let mut gate = [0 as RawFd; 2];
         cvt(unsafe { libc::pipe2(gate.as_mut_ptr(), libc::O_CLOEXEC) })?;
@@ -1283,6 +1331,8 @@ mod linux {
                 "the jailer's gate reply is malformed".into(),
             ));
         }
+        link.timing
+            .begin(super::super::timing::Name::of("s.jailer_observe"));
         // J is waiting: observe what actually runs, through the pinned process.
         let actual =
             executable::observe_process_image(j.pid, Role::Jailer, jailer.installation_generation)?;
@@ -1319,6 +1369,8 @@ mod linux {
         let v = adopt(link, plan, &identity)?;
         let v_pidfd = pin(v).map_err(|e| Abort::Refused(format!("VMM pidfd: {e}")))?;
         link.after("adopt");
+        link.timing
+            .begin(super::super::timing::Name::of("s.vmm_exe"));
         // J exits once it has cloned V and written the PID file, which can be before V
         // has dropped to the VMM's IDs and exec'd: until then the ptrace-read check on
         // /proc/<V>/exe refuses the VMM's filesystem IDs (V is root, or undumpable
@@ -1350,6 +1402,8 @@ mod linux {
         // wrong credential or another `Seccomp` value is refused at once below, and a
         // filter never observed is refused when the bound ends.
         let recipe = &plan.launch["resource_recipe"]["vmm_credentials"];
+        link.timing
+            .begin(super::super::timing::Name::of("s.vmm_seccomp"));
         let mut sample = None;
         let sampled = link.wait_for(Duration::from_secs(5), || {
             let status_text = proc_status(v.pid)?;
@@ -1370,6 +1424,8 @@ mod linux {
             (Err(abort), _) => return Err(abort),
             (Ok(()), None) => unreachable!("a finished wait has a sample"),
         };
+        link.timing
+            .begin(super::super::timing::Name::of("s.vmm_records"));
         link.record(SupervisorRecord::Child {
             role: ChildRole::Vm,
             process: v,
@@ -1380,6 +1436,8 @@ mod linux {
             credentials: credentials.clone(),
         }))?;
         link.event(&SupervisorEvent::VmStarted(v));
+        link.timing
+            .begin(super::super::timing::Name::of("s.vmm_checks"));
         if actual != vmm {
             return Err(Abort::Refused(
                 "the VMM's actual image differs from the journal".into(),
@@ -1416,6 +1474,8 @@ mod linux {
         proven::signal(&v_proof, libc::SIGCONT)?;
         drop(v_proof);
         link.after("harden");
+        link.timing
+            .begin(super::super::timing::Name::of("s.journal_booting"));
         link.record(SupervisorRecord::Phase {
             from: vec!["spawn_intent".into()],
             to: "booting".into(),

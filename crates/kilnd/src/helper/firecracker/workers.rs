@@ -17,6 +17,7 @@ use super::journal::{
     InventorySnapshot, IssueOutcome, Ledger, LedgerConfig, LedgerError, ReplaySnapshot,
     TokenLookup, WorkerIntentSpec,
 };
+use super::timing::{Clock, Name};
 use super::token::KeyTransfer;
 use super::manifest::{self, ManifestGate};
 use super::peer::PeerAttestor;
@@ -2059,12 +2060,14 @@ pub struct RevalidatedPlan {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PrepReply {
-    Prepared(Box<PreparedReply>),
+    /// With P's timed steps (M3-1, diagnostic only).
+    Prepared(Box<PreparedReply>, Vec<super::timing::Step>),
     /// A C0 refusal: nothing was created and no row should exist.
     Refused {
         reason: String,
     },
-    Revalidated(Box<RevalidatedPlan>),
+    /// With P's timed steps (M3-1, diagnostic only).
+    Revalidated(Box<RevalidatedPlan>, Vec<super::timing::Step>),
     Rejected {
         class: AmbiguousClass,
         reason: String,
@@ -2097,19 +2100,30 @@ fn expected_plan_shape(config: &NodeConfig, plan: &ExactPlan) -> Result<&'static
 }
 
 /// Reads and verifies the manifest and every artifact through a fresh protected walk.
+/// `clock` times each step, under a preflight's or a revalidation's names (M3-1).
 fn verify_bundle(
     config: &NodeConfig,
     profile: &ProfileRuntime,
+    clock: &mut Clock,
+    revalidate: bool,
 ) -> Result<manifest::VerifiedManifest, String> {
+    clock.begin(Name::prep(revalidate, "walk"));
     let bundle = executable::walk_directory(&config.walk, &profile.catalog.bundle_directory)
         .map_err(|e| e.to_string())?;
+    clock.begin(Name::prep(revalidate, "manifest_read"));
     let raw = manifest::read_manifest(&bundle, config.walk.owner_uid)?;
+    clock.begin(Name::prep(revalidate, "manifest_verify"));
     let verified =
         manifest::verify_manifest(&raw, &profile.catalog.approved_manifest_sha256, config.gate)?;
-    manifest::verify_artifacts(&bundle, config.walk.owner_uid, &verified)?;
+    clock.begin(Name::prep(revalidate, "list"));
+    manifest::verify_artifacts_with(&bundle, config.walk.owner_uid, &verified, &mut |name| {
+        clock.begin(Name::artifact(revalidate, name))
+    })?;
+    clock.close();
     Ok(verified)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn preflight_job(
     config: &NodeConfig,
     instance: Id128,
@@ -2118,20 +2132,23 @@ fn preflight_job(
     profile_name: String,
     spec: SandboxSpec,
     claimed: &ClaimedIdentities,
+    clock: &mut Clock,
 ) -> Result<PreparedReply, String> {
     let profile = config
         .profile(&profile_name)
         .ok_or_else(|| format!("profile {profile_name} is not approved on this node"))?;
     fault_point("P.preflight");
-    let verified = verify_bundle(config, profile)?;
+    let verified = verify_bundle(config, profile, clock, false)?;
     if verified.sha256 != profile.manifest_sha256 {
         return Err("catalog changed since startup; revalidation is required".into());
     }
+    clock.begin(Name::prep(false, "table"));
     let vector = profile.table.vector();
     profile
         .table
         .revalidate(&vector)
         .map_err(|e| e.to_string())?;
+    clock.begin(Name::prep(false, "plan"));
     let mut entropy_failed = false;
     let mut entropy = || {
         identity::random_u32().unwrap_or_else(|_| {
@@ -2158,6 +2175,7 @@ fn preflight_job(
         executables: vector,
         pins: profile.pins.clone(),
     })?;
+    clock.close();
     Ok(PreparedReply {
         node_id: config.node_id,
         allocation_id: allocation,
@@ -2184,8 +2202,10 @@ fn revalidate_job(
     sandbox_id: &str,
     plan: &[u8],
     plan_digest: &Digest,
+    clock: &mut Clock,
 ) -> Result<RevalidatedPlan, RevalidateRefusal> {
     fault_point("P.revalidate");
+    clock.begin(Name::prep(true, "verify_plan"));
     let plan = config::verify_plan_bytes(
         plan,
         plan_digest,
@@ -2204,11 +2224,13 @@ fn revalidate_job(
     };
     expected_plan_shape(config, &plan).map_err(current)?;
     let profile = config.profile(&plan.inputs.profile).expect("just checked");
-    verify_bundle(config, profile).map_err(current)?;
+    verify_bundle(config, profile, clock, true).map_err(current)?;
+    clock.begin(Name::prep(true, "table"));
     profile
         .table
         .revalidate(&plan.inputs.executables)
         .map_err(|e| current(e.to_string()))?;
+    clock.close();
     Ok(RevalidatedPlan {
         profile: plan.inputs.profile.clone(),
         manifest_sha256: plan.inputs.manifest_sha256,
@@ -2284,33 +2306,41 @@ pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat:
                 profile,
                 spec,
                 claimed,
-            } => match preflight_job(
-                &config, instance, allocation, sandbox_id, profile, spec, &claimed,
-            ) {
-                Ok(prepared) => PrepReply::Prepared(Box::new(prepared)),
-                Err(reason) => PrepReply::Refused { reason },
-            },
+            } => {
+                let mut clock = Clock::default();
+                match preflight_job(
+                    &config, instance, allocation, sandbox_id, profile, spec, &claimed,
+                    &mut clock,
+                ) {
+                    Ok(prepared) => PrepReply::Prepared(Box::new(prepared), clock.finish()),
+                    Err(reason) => PrepReply::Refused { reason },
+                }
+            }
             PrepRequest::Revalidate {
                 instance,
                 allocation,
                 sandbox_id,
                 plan,
                 plan_digest,
-            } => match revalidate_job(
-                &config,
-                instance,
-                allocation,
-                &sandbox_id,
-                &plan,
-                &plan_digest,
-            ) {
-                Ok(plan) => PrepReply::Revalidated(Box::new(plan)),
-                Err(refusal) => PrepReply::Rejected {
-                    class: AmbiguousClass::CatalogMismatch,
-                    reason: refusal.reason,
-                    malformed: refusal.malformed,
-                },
-            },
+            } => {
+                let mut clock = Clock::default();
+                match revalidate_job(
+                    &config,
+                    instance,
+                    allocation,
+                    &sandbox_id,
+                    &plan,
+                    &plan_digest,
+                    &mut clock,
+                ) {
+                    Ok(plan) => PrepReply::Revalidated(Box::new(plan), clock.finish()),
+                    Err(refusal) => PrepReply::Rejected {
+                        class: AmbiguousClass::CatalogMismatch,
+                        reason: refusal.reason,
+                        malformed: refusal.malformed,
+                    },
+                }
+            }
             PrepRequest::ObserveAllocation {
                 instance,
                 allocation,
@@ -2391,6 +2421,10 @@ pub enum SupervisorEvent {
     Record {
         seq: u64,
         record: super::supervisor::SupervisorRecord,
+        /// M3-1: S's steps completed since its last record, for H's create timeline.
+        /// Diagnostic only; H journals none of it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<super::timing::Step>,
     },
     /// Hashing, fallocate, mkfs and the private files are done: the P lease returns.
     PreparationDone,
@@ -2399,6 +2433,9 @@ pub enum SupervisorEvent {
     /// The launch stopped before BOOTING; what exists stays charged for Remove.
     LaunchRefused {
         reason: String,
+        /// M3-1: S's steps since its last record (diagnostic only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<super::timing::Step>,
     },
     /// V exited on its own while S lived.
     VmExited,
@@ -2639,6 +2676,7 @@ fn real_supervisor(
     plan_generation: u64,
 ) {
     use super::supervisor::{Abort, LaunchPlan, Link};
+    let opened = super::timing::now();
     let parsed = match LaunchPlan::parse(plan.as_bytes()) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -2646,6 +2684,7 @@ fn real_supervisor(
                 0,
                 &SupervisorEvent::LaunchRefused {
                     reason: error.to_string(),
+                    steps: Vec::new(),
                 },
                 Duration::from_secs(1),
             );
@@ -2656,6 +2695,8 @@ fn real_supervisor(
     let mut created = None;
     let descriptors = context.descriptors.take();
     let mut link = Link::new(context, deadline_ns);
+    link.timing
+        .begin_at(super::timing::Name::of("s.parse_plan"), opened);
     let result =
         super::supervisor::launch(&mut link, &parsed, expected, plan_generation, &mut created);
     let end = match result {
@@ -2676,7 +2717,8 @@ fn real_supervisor(
         Some(Abort::Expired) => link.event(&SupervisorEvent::SetupExpired),
         Some(Abort::Refused(reason)) => {
             let reason = format!("at {}: {reason}", link.current_step());
-            link.event(&SupervisorEvent::LaunchRefused { reason })
+            let steps = link.timing.finish();
+            link.event(&SupervisorEvent::LaunchRefused { reason, steps })
         }
         Some(Abort::Revoked | Abort::HelperGone) | None => {}
     }
@@ -2744,6 +2786,7 @@ fn real_supervisor(
         0,
         &SupervisorEvent::LaunchRefused {
             reason: "real launches need Linux".into(),
+            steps: Vec::new(),
         },
         Duration::from_secs(1),
     );

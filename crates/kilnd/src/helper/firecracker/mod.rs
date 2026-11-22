@@ -22,6 +22,7 @@ pub mod peer;
 pub mod proven;
 pub mod storage;
 pub mod supervisor;
+pub mod timing;
 pub mod token;
 pub mod workers;
 
@@ -623,6 +624,49 @@ pub struct Node {
     /// Test instrumentation: L calls made and tokens refused by the tag check.
     ledger_calls: AtomicU64,
     tag_refusals: AtomicU64,
+    /// M3-1: each create's step timings, until it ends and is logged. Diagnostic only.
+    timings: Mutex<timing::Book>,
+}
+
+/// M3-1: the timing name of H's handling of one of S's records.
+fn timing_record_name(record: &supervisor::SupervisorRecord) -> &'static str {
+    use supervisor::{ChildRole, SupervisorRecord};
+    match record {
+        SupervisorRecord::Resource(resource) => match resource.kind() {
+            "intent" => "h.rec.intent",
+            "cgroup" => "h.rec.cgroup",
+            "work_dir" => "h.rec.work_dir",
+            "work_file" => "h.rec.work_file",
+            "private_files" => "h.rec.private_files",
+            "loop_intent" => "h.rec.loop_intent",
+            "loop" => "h.rec.loop",
+            "loop_released" => "h.rec.loop_released",
+            "jail_intent" => "h.rec.jail_intent",
+            "jail_dir" => "h.rec.jail_dir",
+            "jail_mount" => "h.rec.jail_mount",
+            "jail_binds" => "h.rec.jail_binds",
+            "vmm" => "h.rec.vmm",
+            "broker" => "h.rec.broker",
+            "exec" => "h.rec.exec",
+            "exec_history" => "h.rec.exec_history",
+            _ => "other",
+        },
+        SupervisorRecord::Phase { to, .. } => match to.as_str() {
+            "spawn_intent" => "h.rec.phase.spawn_intent",
+            "booting" => timing::BOOTING_RECORD,
+            "ready" => timing::READY_RECORD,
+            _ => "h.rec.phase.other",
+        },
+        SupervisorRecord::Child { role, .. } => match role {
+            ChildRole::Jailer => "h.rec.child.jailer",
+            ChildRole::Vm => "h.rec.child.vm",
+            ChildRole::Relay => "h.rec.child.relay",
+            ChildRole::Console => "h.rec.child.console",
+        },
+        SupervisorRecord::Observed(_) => "h.rec.observed",
+        SupervisorRecord::InferredFromRetainedFd(_) => "h.rec.inferred",
+        SupervisorRecord::Initialize => "h.rec.initialize",
+    }
 }
 
 fn call_class(error: CallError) -> AmbiguousClass {
@@ -879,6 +923,7 @@ impl Node {
             compaction_fault: Mutex::new(None),
             ledger_calls: AtomicU64::new(0),
             tag_refusals: AtomicU64::new(0),
+            timings: Mutex::default(),
         });
         tokio::spawn(Self::monitor_events(Arc::downgrade(&node), monitor_events));
         tokio::spawn(Self::supervise(Arc::downgrade(&node)));
@@ -1712,6 +1757,34 @@ impl Node {
             }
         }
         None
+    }
+
+    /// M3-1: one of H's own steps for a timed create, from `start` to `end`.
+    fn timed_span(&self, key: Option<AllocationKey>, name: &str, start: u64, end: u64) {
+        if let Some(key) = key {
+            let step = timing::Step::new(timing::Name::of(name), start, end);
+            self.timings.lock().unwrap().step(key, step);
+        }
+    }
+
+    /// M3-1: one of H's own steps for a timed create, from `start` to now.
+    fn timed(&self, key: Option<AllocationKey>, name: &str, start: u64) {
+        self.timed_span(key, name, start, timing::now());
+    }
+
+    /// M3-1: a worker's steps for a timed create.
+    fn timed_steps(&self, key: AllocationKey, steps: Vec<timing::Step>) {
+        if !steps.is_empty() {
+            self.timings.lock().unwrap().steps(key, steps);
+        }
+    }
+
+    /// M3-1: ends a timed create, if it is still open, and logs its line.
+    fn timing_finish(&self, key: AllocationKey, outcome: timing::Outcome) {
+        let line = self.timings.lock().unwrap().finish(key, outcome);
+        if let Some(line) = line {
+            timing::emit(&line);
+        }
     }
 
     fn queue_record(&self, record: LedgerRequest) {
@@ -3144,6 +3217,7 @@ impl Node {
         spec: SandboxSpec,
         deadline: WireDeadline,
     ) -> FirecrackerResponse {
+        let started = timing::now();
         if !self.admission_open(instance) {
             return group_error(
                 GroupErrorKind::OwnershipConflict,
@@ -3169,6 +3243,7 @@ impl Node {
         if self.latched_once_answered(deadline.instant).await {
             return self.latch_refusal();
         }
+        let issuing = timing::now();
         let issued = self
             .ledger_call(
                 Lane::Normal,
@@ -3176,6 +3251,7 @@ impl Node {
                 deadline.ns,
             )
             .await;
+        let issued_at = timing::now();
         let (allocation, claimed) = match issued {
             Ok(LedgerReply::Issued(journal::IssueOutcome::Issued { token, claimed })) => {
                 (token, claimed)
@@ -3214,9 +3290,21 @@ impl Node {
             }
             _ => return group_error(GroupErrorKind::Unavailable, "ledger did not answer"),
         };
+        // M3-1: the create's timeline starts at this Preflight, now that it has a token.
+        let key = AllocationKey {
+            instance,
+            allocation,
+        };
+        let evicted = self.timings.lock().unwrap().begin(key, started);
+        if let Some(line) = evicted {
+            timing::emit(&line);
+        }
+        self.timed_span(Some(key), "h.preflight.slot", started, issuing);
+        self.timed_span(Some(key), "l.issue", issuing, issued_at);
         #[cfg(test)]
         workers::faults::hold("H.preflight.after_l_reply_before_public").await;
-        match self
+        let prepping = timing::now();
+        let prepared = self
             .prep_with(
                 lease,
                 PrepRequest::Preflight {
@@ -3229,15 +3317,18 @@ impl Node {
                 },
                 deadline,
             )
-            .await
-        {
-            Ok(PrepReply::Prepared(prepared)) if prepared.allocation_id == allocation => {
+            .await;
+        self.timed(Some(key), "p.preflight", prepping);
+        let response = match prepared {
+            Ok(PrepReply::Prepared(prepared, steps)) if prepared.allocation_id == allocation => {
+                self.timed_steps(key, steps);
                 if workers::fault_enabled("H.preflight.drop_public_reply") {
+                    self.timing_finish(key, timing::Outcome::PreflightRefused);
                     return group_error(GroupErrorKind::Unavailable, "injected lost reply");
                 }
                 FirecrackerResponse::Prepared(prepared)
             }
-            Ok(PrepReply::Prepared(_)) => group_error(
+            Ok(PrepReply::Prepared(..)) => group_error(
                 GroupErrorKind::Unavailable,
                 "preparation bound another token",
             ),
@@ -3247,12 +3338,44 @@ impl Node {
                 "every preparation slot is in use",
             ),
             _ => group_error(GroupErrorKind::Unavailable, "preparation worker failed"),
+        };
+        if matches!(response, FirecrackerResponse::Prepared(_)) {
+            let replied = timing::now();
+            self.timed_span(Some(key), "h.preflight.reply", replied, replied);
+        } else {
+            self.timing_finish(key, timing::Outcome::PreflightRefused);
         }
+        response
+    }
+
+    /// M3-1: Create, timed. Only the token's first Create is; anything but a new
+    /// acceptance ends its timeline here.
+    async fn create_flow(self: Arc<Self>, token: CreateToken) -> CreateReply {
+        let key = token.key();
+        let (first, evicted) = self
+            .timings
+            .lock()
+            .unwrap()
+            .create_call(key, timing::now());
+        if let Some(line) = evicted {
+            timing::emit(&line);
+        }
+        let reply = self.clone().create_steps(token, first.then_some(key)).await;
+        if first && !matches!(reply, CreateReply::Accepted { replay: false, .. }) {
+            self.timing_finish(key, timing::Outcome::Rejected);
+        }
+        reply
     }
 
     /// The detached body of Create. The ordering is the design's: durable token lookup
     /// first, then gate, epoch, deadline and revalidation, then the one C2 transaction.
-    async fn create_flow(self: Arc<Self>, token: CreateToken) -> CreateReply {
+    /// `timed` names the create whose steps are timed (M3-1).
+    async fn create_steps(
+        self: Arc<Self>,
+        token: CreateToken,
+        timed: Option<AllocationKey>,
+    ) -> CreateReply {
+        let entered = timing::now();
         // Holds a real manager's Create after its C1 and before anything here.
         #[cfg(test)]
         workers::faults::hold(&format!("H.create.enter.{}", token.instance)).await;
@@ -3270,7 +3393,9 @@ impl Node {
         let serial = gate.serial.clone().lock_owned().await;
         gate.waiters.fetch_sub(1, Ordering::AcqRel);
         let _serial = serial;
+        self.timed(timed, "h.create.serial", entered);
         // An existing record is authoritative whatever else has changed since.
+        let looking = timing::now();
         let reply = self
             .ledger_call(
                 Lane::Reserved,
@@ -3282,6 +3407,7 @@ impl Node {
                 token.deadline.with_grace(),
             )
             .await;
+        self.timed(timed, "l.lookup", looking);
         match reply {
             Ok(LedgerReply::Lookup(TokenLookup::Fenced { receipt })) => {
                 gate.mark_durable();
@@ -3389,7 +3515,8 @@ impl Node {
                 "the process monitor is not healthy".into(),
             );
         }
-        let revalidated = match self
+        let revalidating = timing::now();
+        let revalidation = self
             .queued_prep_call(
                 PrepRequest::Revalidate {
                     instance: token.instance,
@@ -3400,9 +3527,15 @@ impl Node {
                 },
                 token.deadline,
             )
-            .await
-        {
-            Ok(PrepReply::Revalidated(plan)) => plan,
+            .await;
+        self.timed(timed, "p.revalidate", revalidating);
+        let revalidated = match revalidation {
+            Ok(PrepReply::Revalidated(plan, steps)) => {
+                if let Some(key) = timed {
+                    self.timed_steps(key, steps);
+                }
+                plan
+            }
             Ok(PrepReply::Rejected {
                 class,
                 reason,
@@ -3459,6 +3592,7 @@ impl Node {
             admit_request(&token, *revalidated, &cgroup, &allowed_names, image);
         let expected = plan_generation_request.executables.clone();
         let profile = plan_generation_request.profile.clone();
+        let admitting = timing::now();
         let admission = self
             .ledger_call(
                 Lane::Normal,
@@ -3469,6 +3603,7 @@ impl Node {
                 token.deadline.ns,
             )
             .await;
+        self.timed(timed, "l.admit", admitting);
         match admission {
             Ok(LedgerReply::Admit(AdmitOutcome::Accepted {
                 generation,
@@ -3489,6 +3624,7 @@ impl Node {
                 // way the claim is durable, and held for an exact fence: nothing starts.
                 #[cfg(test)]
                 workers::faults::hold("H.create.before_effects").await;
+                let checking = timing::now();
                 let refused = if !self.revocations.is_current(&authority) {
                     Some((
                         AmbiguousClass::OldEpoch,
@@ -3508,6 +3644,7 @@ impl Node {
                 } else {
                     None
                 };
+                self.timed(timed, "h.effects_check", checking);
                 if let Some((class, reason)) = refused {
                     self.abandon_start(token.key(), reason);
                     return reject(class, reason.into());
@@ -3523,6 +3660,7 @@ impl Node {
                         &profile,
                         allowed_names,
                         expected,
+                        timed,
                     )
                     .await
                 {
@@ -3614,7 +3752,9 @@ impl Node {
         profile: &str,
         allowed_names: Vec<String>,
         expected: Vec<ExecutableIdentity>,
+        timed: Option<AllocationKey>,
     ) -> Result<u64, (AmbiguousClass, String)> {
+        let spawning = timing::now();
         let unavailable = |e: io::Error| (AmbiguousClass::MonitorUnavailable, e.to_string());
         let (host, child) = StdUnixStream::pair().map_err(unavailable)?;
         let (watch_monitor, watch_child) = StdUnixStream::pair().map_err(unavailable)?;
@@ -3654,6 +3794,7 @@ impl Node {
         entry.descriptors = Some(Arc::new(descriptors_host));
         self.supervisors.lock().unwrap().insert(key, entry);
         tokio::spawn(Self::supervisor_events(self.clone(), key, events));
+        self.timed(timed, "h.spawn_s", spawning);
         // A failure before the gate means S exits on EOF with nothing done. It is not
         // a lost boot: mark it expected, record the stop, and let the exit settle S.
         let abort = |class: AmbiguousClass, reason: String| {
@@ -3679,6 +3820,7 @@ impl Node {
             };
             abort(class, reason.to_string())
         };
+        let watching = timing::now();
         let (monitor_channel, descriptors) = {
             let monitor = self.monitor.lock().unwrap();
             (monitor.worker.channel.clone(), monitor.descriptors.clone())
@@ -3706,6 +3848,8 @@ impl Node {
         if !matches!(acknowledged, Ok(Ok(MonitorReply::Registered))) {
             return Err(step_failed("monitor did not acknowledge the watch"));
         }
+        self.timed(timed, "m.watch", watching);
+        let recording = timing::now();
         let identity = tokio::time::timeout_at(
             token.deadline.instant,
             self.ledger_call(
@@ -3718,6 +3862,8 @@ impl Node {
         if !matches!(identity, Ok(Ok(LedgerReply::Identity { .. }))) {
             return Err(step_failed("the ledger did not record the supervisor"));
         }
+        self.timed(timed, "l.record_worker", recording);
+        let advancing = timing::now();
         let advanced = tokio::time::timeout_at(
             token.deadline.instant,
             self.ledger_call(
@@ -3736,8 +3882,10 @@ impl Node {
         let Ok(Ok(LedgerReply::Generation(generation))) = advanced else {
             return Err(step_failed("the ledger did not record PREPARING"));
         };
+        self.timed(timed, "l.preparing", advancing);
         // A real launch carries the verified plan; the fake fixtures carry none.
         let real_plan = self.real_plan(&token.plan);
+        let leasing = timing::now();
         // Session preparation counts against the node's two P slots (section 6.4).
         if real_plan.is_some() {
             let Some(lease) = self.queued_prep_lease(token.deadline).await else {
@@ -3750,6 +3898,8 @@ impl Node {
                 entry.prep = Some(lease);
             }
         }
+        self.timed(timed, "h.prep_lease", leasing);
+        let opening = timing::now();
         // The last check before S may act. Each of these can have changed during C3.
         if !self.revocations.is_current(&authority) {
             return Err(abort(
@@ -3801,6 +3951,7 @@ impl Node {
                 "the supervisor could not be released".into(),
             ));
         }
+        self.timed(timed, "h.open_gate", opening);
         Ok(generation)
     }
 
@@ -3842,10 +3993,20 @@ impl Node {
                 }
                 SupervisorEvent::EffectsDone => {}
                 SupervisorEvent::SetupExpired => {
+                    self.timing_finish(key, timing::Outcome::Expired);
                     self.contain_allocation(key, "setup deadline expired");
                 }
-                SupervisorEvent::Record { seq, record } => {
+                SupervisorEvent::Record { seq, record, steps } => {
+                    // M3-1: S's steps since its last record, then H's own handling of
+                    // this one (its L call included). READY's commit ends the timeline.
+                    self.timed_steps(key, steps);
+                    let name = timing_record_name(&record);
+                    let started = timing::now();
                     let ok = self.on_record(key, record).await;
+                    self.timed(Some(key), name, started);
+                    if ok && name == timing::READY_RECORD {
+                        self.timing_finish(key, timing::Outcome::Ready);
+                    }
                     let channel = self
                         .supervisors
                         .lock()
@@ -3866,7 +4027,9 @@ impl Node {
                         entry.booted = true;
                     }
                 }
-                SupervisorEvent::LaunchRefused { reason } => {
+                SupervisorEvent::LaunchRefused { reason, steps } => {
+                    self.timed_steps(key, steps);
+                    self.timing_finish(key, timing::Outcome::Refused);
                     self.contain_allocation(key, &format!("launch refused: {reason}"));
                 }
                 SupervisorEvent::VmExited => {
@@ -4260,6 +4423,7 @@ impl Node {
     /// The durable fence now answers for this token; its memory can go.
     fn forget_token(&self, gate: &TokenGate, key: AllocationKey) {
         gate.mark_durable();
+        self.timing_finish(key, timing::Outcome::Absent);
         let removed = self.supervisors.lock().unwrap().remove(&key);
         if removed.is_some() {
             self.monitor
