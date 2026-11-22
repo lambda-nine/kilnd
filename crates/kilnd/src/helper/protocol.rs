@@ -1022,11 +1022,19 @@ pub use crate::checkpoint::wire::*;
 #[cfg(test)]
 mod reply_compat_tests {
     use super::*;
+    use crate::checkpoint::{
+        ArtifactRecord, ArtifactTarget, CaptureBinding, CheckpointId, CompleteFact, CopyOutcome,
+        Evidence, Fact, Reason, SealedEvidence,
+    };
+    use crate::helper::firecracker::config::{NodeCeilings, ProfileCatalog, SharedReserve};
+    use crate::helper::firecracker::journal::{AccountingSnapshot, ClaimTotals, TokenAccounting};
+    use crate::model::Network;
+    use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
+    use std::collections::BTreeSet;
 
-    fn decodes(reply: Value) -> Response {
-        serde_json::from_value(reply.clone()).unwrap_or_else(|e| panic!("{reply}: {e}"))
-    }
+    /// The field a newer helper might add to any reply.
+    const FUTURE: &str = "future_optional";
 
     fn refused(reply: Value) {
         assert!(
@@ -1035,72 +1043,1442 @@ mod reply_compat_tests {
         );
     }
 
-    /// A newer helper adds an optional field to a reply: this daemon ignores it, at the
-    /// top of a reply and nested inside one, in every group.
+    fn value(item: impl Serialize) -> Value {
+        serde_json::to_value(item).unwrap()
+    }
+
+    type Decode = fn(Value) -> serde_json::Result<()>;
+
+    fn decode<T: DeserializeOwned>(item: Value) -> serde_json::Result<()> {
+        serde_json::from_value::<T>(item).map(drop)
+    }
+
+    /// One named-field boundary: a valid sample, the JSON pointer to the object that type
+    /// owns in it, and how the daemon or helper decodes the sample.
+    struct Case {
+        boundary: &'static str,
+        sample: Value,
+        at: &'static str,
+        decode: Decode,
+    }
+
+    fn case(boundary: &'static str, sample: &Value, at: &'static str, decode: Decode) -> Case {
+        Case {
+            boundary,
+            sample: sample.clone(),
+            at,
+            decode,
+        }
+    }
+
+    /// `sample` with `FUTURE` added to the object at `at`, which must not have it yet.
+    fn injected(sample: &Value, at: &str) -> Value {
+        let mut sample = sample.clone();
+        let object = sample
+            .pointer_mut(at)
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| panic!("no object at {at:?}"));
+        assert!(object.insert(FUTURE.into(), 1.into()).is_none(), "{at}");
+        sample
+    }
+
+    fn id() -> Id128 {
+        Id128::random()
+    }
+
+    fn spec() -> SandboxSpec {
+        SandboxSpec {
+            image: "alpine".into(),
+            memory_bytes: 256 << 20,
+            cpu_millis: 1000,
+            pids: 64,
+            disk_bytes: 1 << 30,
+            network: Network::None,
+            read_only_root: false,
+            writable_paths: vec![],
+            labels: Default::default(),
+        }
+    }
+
+    fn target() -> ArtifactTarget {
+        ArtifactTarget {
+            instance: id(),
+            checkpoint: CheckpointId::random(),
+            generation: 1,
+        }
+    }
+
+    fn evidence(fact: Fact) -> Evidence {
+        Evidence {
+            version: 1,
+            instance: id(),
+            checkpoint: CheckpointId::random(),
+            generation: 1,
+            operation: id(),
+            helper_epoch: id(),
+            boot_id: id(),
+            fact,
+        }
+    }
+
+    fn sealed(fact: Fact) -> SealedEvidence {
+        evidence(fact).seal().unwrap()
+    }
+
+    fn complete() -> Fact {
+        Fact::Complete(Box::new(CompleteFact {
+            source: "ab".into(),
+            content_sha256: Digest::of(b"content"),
+            binding_sha256: Digest::of(b"binding"),
+            image: "alpine".into(),
+            image_sha256: Digest::of(b"image"),
+            entries: 1,
+            logical_bytes: 2,
+            allocated_bytes: 3,
+            charge_bytes: 4,
+            limit_bytes: 1 << 20,
+        }))
+    }
+
+    fn absent() -> Fact {
+        Fact::Absent { existed: true }
+    }
+
+    fn reader_ended() -> Fact {
+        Fact::ReaderEnded {
+            copy: CopyOutcome::Complete,
+        }
+    }
+
+    fn receipt() -> ReceiptBytes {
+        WireBytes(vec![0xab, 0xcd])
+    }
+
+    fn prepared() -> Value {
+        value(Response::Firecracker(FirecrackerResponse::Prepared(
+            Box::new(PreparedReply {
+                node_id: id(),
+                allocation_id: id(),
+                profile: "default".into(),
+                manifest_sha256: Digest::of(b"manifest"),
+                plan_version: 1,
+                plan: WireBytes(vec![1, 2, 3]),
+                plan_digest: Digest::of(b"plan"),
+                host_spec_sha256: Digest::of(b"host"),
+                guest_exec_spec_sha256: Digest::of(b"guest"),
+                reservation: ResourceReservation {
+                    memory_bytes: 1,
+                    disk_bytes: 2,
+                    pids: 3,
+                    host_cpu_millis: 4,
+                    virtual_cpu_slots: 5,
+                    host_pids: 6,
+                },
+            }),
+        )))
+    }
+
+    fn accounting() -> Value {
+        let totals = ClaimTotals {
+            slots: 1,
+            memory_bytes: 2,
+            ..ClaimTotals::default()
+        };
+        value(Response::Firecracker(FirecrackerResponse::Accounting(
+            AccountingReply::Fresh(Box::new(AccountingSnapshot {
+                node_id: id(),
+                generation: 7,
+                ceilings: NodeCeilings::default(),
+                shared: SharedReserve::default(),
+                claimed: totals,
+                committed: totals,
+                over_committed: false,
+                retired_tokens: 1,
+                ledger_bytes: 2,
+                tokens: Some(TokenAccounting {
+                    issue_next: 3,
+                    ..TokenAccounting::default()
+                }),
+                retained_admitted_total: 4,
+                retained_never_admitted_total: 5,
+                admitted_entries: 6,
+                share: 7,
+                share_shortfall: 0,
+                node_fault: None,
+                degraded: Some("lag".into()),
+            })),
+        )))
+    }
+
+    fn captured(fact: Fact) -> Value {
+        value(Response::Checkpoint(CheckpointResponse::Captured(
+            Box::new(CaptureReply::Complete {
+                evidence: sealed(fact),
+            }),
+        )))
+    }
+
+    /// Every reply-only struct and struct variant, decoded as the daemon decodes a reply.
+    /// `corpora_cover_every_named_field_boundary` keeps the list complete.
+    fn reply_corpus() -> Vec<Case> {
+        let reply = decode::<Response>;
+        let fc = |r: FirecrackerResponse| value(Response::Firecracker(r));
+        let cp = |r: CheckpointResponse| value(Response::Checkpoint(r));
+        let capture = CaptureInfo {
+            kept: 1,
+            total: 2,
+            known: true,
+            truncated: true,
+        };
+        let executed = value(Response::Executed {
+            finish: WireFinish::Completed,
+            status: Some(CommandStatus::Exited(0)),
+            stdout: capture.clone(),
+            stderr: capture.clone(),
+        });
+        let health = WorkerHealth::Healthy;
+        let capabilities = fc(FirecrackerResponse::Capabilities(CapabilitiesReply {
+            group_version: FIRECRACKER_GROUP_VERSION,
+            broker_protocol: 1,
+            helper_version: "0.1.0".into(),
+            enabled: true,
+            launch_enabled: false,
+            profiles: vec!["default".into()],
+            health: Some(WorkersHealth {
+                ledger: health,
+                preparation: [health; 2],
+                monitor: health,
+                recovery: [health; 2],
+                supervisors: 1,
+                ledger_fault: None,
+                node_fault: None,
+                compaction_fault: Some("stuck".into()),
+            }),
+        }));
+        let accounting = accounting();
+        let create = |r| fc(FirecrackerResponse::Create(r));
+        let fence = |r| fc(FirecrackerResponse::Fence(r));
+        let inspect = |r| fc(FirecrackerResponse::Inspect(r));
+        let validate = |r| fc(FirecrackerResponse::Validate(r));
+        let stop = |r| fc(FirecrackerResponse::Stop(r));
+        let gc = |outcome| {
+            fc(FirecrackerResponse::Gc(vec![GcResult {
+                allocation_id: id(),
+                outcome,
+            }]))
+        };
+        let list = fc(FirecrackerResponse::List(ListReply {
+            generation: 3,
+            complete: false,
+            incomplete_reason: Some("bound".into()),
+            records: vec![ListRecord {
+                allocation_id: id(),
+                plan_digest: Digest::of(b"plan"),
+                generation: 2,
+                status: ListStatus::Ready,
+            }],
+        }));
+        let exec = fc(FirecrackerResponse::Exec(Box::new(ExecReply {
+            finish: WireFinishFc::Completed,
+            status: Some(CommandStatus::Exited(1)),
+            stdout: capture.clone(),
+            stderr: capture,
+            cleanup: ExecCleanup::GuestCgroupDrained,
+            reusable: true,
+            dispatched: true,
+        })));
+        let detail = || "detail".to_string();
+        let checkpoint_capabilities = cp(CheckpointResponse::Capabilities(Box::new(
+            CheckpointCapabilities {
+                group_version: crate::checkpoint::GROUP_VERSION,
+                enabled: true,
+                helper_epoch: Some(id()),
+                boot_id: Some(id()),
+                format_version: 1,
+                supported: true,
+                unsupported_reason: None,
+                limits: HelperLimits {
+                    copy_workers: 1,
+                    cleanup_workers: 2,
+                    max_tracked_artifacts: 3,
+                    max_settled_operations: 4,
+                    max_inventory_entries: 5,
+                    helper_ceiling_ms: 6,
+                    tombstone_quiet_ms: 7,
+                },
+                copy_workers_busy: 0,
+                cleanup_workers_busy: 0,
+                untracked_workers: 0,
+                storage: Some(StorageFree {
+                    runs_free_bytes: 8,
+                    backing_free_bytes: Some(9),
+                }),
+                removal_supported: true,
+            },
+        )));
+        let captured_complete = captured(complete());
+        let captured_failed = cp(CheckpointResponse::Captured(Box::new(
+            CaptureReply::Failed {
+                reason: Reason::Busy,
+                detail: detail(),
+            },
+        )));
+        let restored = |r| cp(CheckpointResponse::Restored(Box::new(r)));
+        let removed = |r| cp(CheckpointResponse::Removed(Box::new(r)));
+        let source = |r| cp(CheckpointResponse::Source(Box::new(r)));
+        let activity = Activity {
+            exclusive: Some(ExclusiveOp {
+                kind: OpKind::Capture,
+                operation: id(),
+            }),
+            readers: vec![id()],
+            tombstone: None,
+            untracked_workers: false,
+        };
+        let inspected = |artifact| {
+            cp(CheckpointResponse::Inspected(Box::new(
+                ArtifactInspectReply {
+                    helper_epoch: id(),
+                    artifact,
+                    activity: activity.clone(),
+                    operation: Some(OperationState::Settled(Box::new(
+                        CheckpointResponse::Error(CheckpointError::new(
+                            CheckpointErrorKind::Busy,
+                            "busy",
+                        )),
+                    ))),
+                },
+            )))
+        };
+        let published = inspected(ArtifactView::Published {
+            record: ArtifactRecord {
+                instance: id(),
+                checkpoint: CheckpointId::random(),
+                generation: 1,
+                content_sha256: Digest::of(b"content"),
+                binding_sha256: Digest::of(b"binding"),
+                image: "alpine".into(),
+                image_sha256: Digest::of(b"image"),
+                entries: 1,
+                logical_bytes: 2,
+                allocated_bytes: 3,
+                charge_bytes: 4,
+                limit_bytes: 5,
+            },
+        });
+        let inventory = cp(CheckpointResponse::Inventory(Box::new(InventoryReply {
+            helper_epoch: id(),
+            complete: true,
+            incomplete_reason: None,
+            entries: vec![InventoryEntry {
+                checkpoint: CheckpointId::random(),
+                kind: ItemKind::Staging,
+            }],
+            unknown_entries: 0,
+            other_entries: 1,
+            tracked: vec![TrackedArtifact {
+                checkpoint: CheckpointId::random(),
+                generation: 2,
+                activity: Activity::default(),
+            }],
+            untracked_workers: vec![CheckpointId::random()],
+        })));
+        let checkpoint_error = cp(CheckpointResponse::Error(CheckpointError::new(
+            CheckpointErrorKind::Capacity,
+            "full",
+        )));
+        let (class, message) = (AmbiguousClass::Capacity, "full".to_string());
+        vec![
+            // The kiln group and the envelope.
+            case("Response::Executed", &executed, "/executed", reply),
+            case("CaptureInfo", &executed, "/executed/stdout", reply),
+            case("CaptureInfo", &executed, "/executed/stderr", reply),
+            case(
+                "Response::Features",
+                &value(Response::Features {
+                    features: 0x20,
+                    exec_options: true,
+                    exec_stream: true,
+                }),
+                "/features",
+                reply,
+            ),
+            case(
+                "Response::Error",
+                &value(Response::Error {
+                    error: WireError::Backend("refused".into()),
+                    definitely_not_created: true,
+                    preflight_refused: true,
+                }),
+                "/error",
+                reply,
+            ),
+            case(
+                "WireSandbox",
+                &value(Response::Listed(vec![WireSandbox {
+                    id: "ab".into(),
+                    stale: true,
+                }])),
+                "/listed/0",
+                reply,
+            ),
+            // The Firecracker group.
+            case(
+                "FirecrackerResponse::Attached",
+                &fc(FirecrackerResponse::Attached {
+                    node_id: id(),
+                    connection_epoch: id(),
+                    admission_open: true,
+                }),
+                "/firecracker/attached",
+                reply,
+            ),
+            case(
+                "FirecrackerResponse::TestDispatch",
+                &fc(FirecrackerResponse::TestDispatch { admitted: true }),
+                "/firecracker/test_dispatch",
+                reply,
+            ),
+            case(
+                "GroupError",
+                &fc(FirecrackerResponse::Error(GroupError::new(
+                    GroupErrorKind::Unavailable,
+                    "unavailable",
+                ))),
+                "/firecracker/error",
+                reply,
+            ),
+            case(
+                "CapabilitiesReply",
+                &capabilities,
+                "/firecracker/capabilities",
+                reply,
+            ),
+            case(
+                "WorkersHealth",
+                &capabilities,
+                "/firecracker/capabilities/health",
+                reply,
+            ),
+            case(
+                "AccountingSnapshot",
+                &accounting,
+                "/firecracker/accounting/fresh",
+                reply,
+            ),
+            case(
+                "ClaimTotals",
+                &accounting,
+                "/firecracker/accounting/fresh/claimed",
+                reply,
+            ),
+            case(
+                "ClaimTotals",
+                &accounting,
+                "/firecracker/accounting/fresh/committed",
+                reply,
+            ),
+            case(
+                "TokenAccounting",
+                &accounting,
+                "/firecracker/accounting/fresh/tokens",
+                reply,
+            ),
+            case(
+                "AccountingReply::Unknown",
+                &fc(FirecrackerResponse::Accounting(AccountingReply::Unknown {
+                    reason: "ledger".into(),
+                })),
+                "/firecracker/accounting/unknown",
+                reply,
+            ),
+            case("PreparedReply", &prepared(), "/firecracker/prepared", reply),
+            case(
+                "CreateReply::Accepted",
+                &create(CreateReply::Accepted {
+                    generation: 1,
+                    phase: "intent".into(),
+                    replay: false,
+                }),
+                "/firecracker/create/accepted",
+                reply,
+            ),
+            case(
+                "CreateReply::Absent",
+                &create(CreateReply::Absent { receipt: receipt() }),
+                "/firecracker/create/absent",
+                reply,
+            ),
+            case(
+                "CreateReply::Ambiguous",
+                &create(CreateReply::Ambiguous {
+                    class,
+                    message: message.clone(),
+                }),
+                "/firecracker/create/ambiguous",
+                reply,
+            ),
+            case(
+                "FenceReply::Absent",
+                &fence(FenceReply::Absent { receipt: receipt() }),
+                "/firecracker/fence/absent",
+                reply,
+            ),
+            case(
+                "FenceReply::Ambiguous",
+                &fc(FirecrackerResponse::Remove(FenceReply::Ambiguous {
+                    class,
+                    message: message.clone(),
+                })),
+                "/firecracker/remove/ambiguous",
+                reply,
+            ),
+            case(
+                "InspectReply::PresentReady",
+                &inspect(InspectReply::PresentReady {
+                    generation: 1,
+                    boot_id: "boot".into(),
+                    inner_id: "inner".into(),
+                }),
+                "/firecracker/inspect/present_ready",
+                reply,
+            ),
+            case(
+                "InspectReply::PresentBusy",
+                &inspect(InspectReply::PresentBusy {
+                    generation: 1,
+                    phase: "booting".into(),
+                    plan_digest: Some(Digest::of(b"plan")),
+                }),
+                "/firecracker/inspect/present_busy",
+                reply,
+            ),
+            case(
+                "InspectReply::StoppedWithResources",
+                &inspect(InspectReply::StoppedWithResources { generation: 1 }),
+                "/firecracker/inspect/stopped_with_resources",
+                reply,
+            ),
+            case(
+                "InspectReply::AbsentFenced",
+                &inspect(InspectReply::AbsentFenced { receipt: receipt() }),
+                "/firecracker/inspect/absent_fenced",
+                reply,
+            ),
+            case(
+                "InspectReply::Incompatible",
+                &inspect(InspectReply::Incompatible {
+                    message: "schema".into(),
+                }),
+                "/firecracker/inspect/incompatible",
+                reply,
+            ),
+            case(
+                "InspectReply::Unknown",
+                &inspect(InspectReply::Unknown {
+                    reason: "stale".into(),
+                }),
+                "/firecracker/inspect/unknown",
+                reply,
+            ),
+            case(
+                "ValidateReply::Ready",
+                &validate(ValidateReply::Ready {
+                    boot_id: "boot".into(),
+                    inner_id: "inner".into(),
+                }),
+                "/firecracker/validate/ready",
+                reply,
+            ),
+            case(
+                "ValidateReply::Busy",
+                &validate(ValidateReply::Busy {
+                    execution_token: id(),
+                }),
+                "/firecracker/validate/busy",
+                reply,
+            ),
+            case(
+                "ValidateReply::Incompatible",
+                &validate(ValidateReply::Incompatible {
+                    message: "booted again".into(),
+                }),
+                "/firecracker/validate/incompatible",
+                reply,
+            ),
+            case(
+                "ValidateReply::Unknown",
+                &validate(ValidateReply::Unknown {
+                    reason: "socket".into(),
+                }),
+                "/firecracker/validate/unknown",
+                reply,
+            ),
+            case("ExecReply", &exec, "/firecracker/exec", reply),
+            case("CaptureInfo", &exec, "/firecracker/exec/stdout", reply),
+            case(
+                "StopReply::Stopped",
+                &stop(StopReply::Stopped {
+                    generation: 1,
+                    observations: "empty".into(),
+                }),
+                "/firecracker/stop/stopped",
+                reply,
+            ),
+            case(
+                "StopReply::Unknown",
+                &stop(StopReply::Unknown {
+                    reason: "pending".into(),
+                }),
+                "/firecracker/stop/unknown",
+                reply,
+            ),
+            case(
+                "GcResult",
+                &gc(GcOutcome::Skipped {
+                    reason: "live".into(),
+                }),
+                "/firecracker/gc/0",
+                reply,
+            ),
+            case(
+                "GcOutcome::Removed",
+                &gc(GcOutcome::Removed { receipt: receipt() }),
+                "/firecracker/gc/0/outcome/removed",
+                reply,
+            ),
+            case(
+                "GcOutcome::Skipped",
+                &gc(GcOutcome::Skipped {
+                    reason: "live".into(),
+                }),
+                "/firecracker/gc/0/outcome/skipped",
+                reply,
+            ),
+            case(
+                "GcOutcome::Failed",
+                &gc(GcOutcome::Failed { class, message }),
+                "/firecracker/gc/0/outcome/failed",
+                reply,
+            ),
+            case("ListReply", &list, "/firecracker/list", reply),
+            case("ListRecord", &list, "/firecracker/list/records/0", reply),
+            // The checkpoint group.
+            case(
+                "CheckpointCapabilities",
+                &checkpoint_capabilities,
+                "/checkpoint/capabilities",
+                reply,
+            ),
+            case(
+                "HelperLimits",
+                &checkpoint_capabilities,
+                "/checkpoint/capabilities/limits",
+                reply,
+            ),
+            case(
+                "StorageFree",
+                &checkpoint_capabilities,
+                "/checkpoint/capabilities/storage",
+                reply,
+            ),
+            case(
+                "CaptureReply::Complete",
+                &captured_complete,
+                "/checkpoint/captured/complete",
+                reply,
+            ),
+            case(
+                "SealedEvidence",
+                &captured_complete,
+                "/checkpoint/captured/complete/evidence",
+                reply,
+            ),
+            case(
+                "CaptureReply::Failed",
+                &captured_failed,
+                "/checkpoint/captured/failed",
+                reply,
+            ),
+            case(
+                "RestoreReply::Created",
+                &restored(RestoreReply::Created {
+                    backend_id: "ab".into(),
+                    evidence: sealed(reader_ended()),
+                }),
+                "/checkpoint/restored/created",
+                reply,
+            ),
+            case(
+                "RestoreReply::NotCreated",
+                &restored(RestoreReply::NotCreated {
+                    reason: Reason::ImageUnavailable,
+                    detail: detail(),
+                    evidence: sealed(reader_ended()),
+                }),
+                "/checkpoint/restored/not_created",
+                reply,
+            ),
+            case(
+                "RestoreReply::Ambiguous",
+                &restored(RestoreReply::Ambiguous {
+                    reason: Reason::Busy,
+                    detail: detail(),
+                    evidence: sealed(reader_ended()),
+                }),
+                "/checkpoint/restored/ambiguous",
+                reply,
+            ),
+            case(
+                "RemoveReply::Absent",
+                &removed(RemoveReply::Absent {
+                    evidence: sealed(absent()),
+                }),
+                "/checkpoint/removed/absent",
+                reply,
+            ),
+            case(
+                "RemoveReply::Retained",
+                &removed(RemoveReply::Retained {
+                    reason: Reason::Busy,
+                    detail: detail(),
+                }),
+                "/checkpoint/removed/retained",
+                reply,
+            ),
+            case(
+                "SourceReply::Capable",
+                &source(SourceReply::Capable {
+                    image: "alpine".into(),
+                    image_sha256: Digest::of(b"image"),
+                }),
+                "/checkpoint/source/capable",
+                reply,
+            ),
+            case(
+                "SourceReply::Unsupported",
+                &source(SourceReply::Unsupported {
+                    reason: Reason::LayoutUnsupported,
+                    detail: detail(),
+                }),
+                "/checkpoint/source/unsupported",
+                reply,
+            ),
+            case(
+                "ArtifactInspectReply",
+                &published,
+                "/checkpoint/inspected",
+                reply,
+            ),
+            case(
+                "ArtifactView::Published",
+                &published,
+                "/checkpoint/inspected/artifact/published",
+                reply,
+            ),
+            case(
+                "ArtifactRecord",
+                &published,
+                "/checkpoint/inspected/artifact/published/record",
+                reply,
+            ),
+            case(
+                "Activity",
+                &published,
+                "/checkpoint/inspected/activity",
+                reply,
+            ),
+            case(
+                "ExclusiveOp",
+                &published,
+                "/checkpoint/inspected/activity/exclusive",
+                reply,
+            ),
+            case(
+                "CheckpointError",
+                &published,
+                "/checkpoint/inspected/operation/settled/error",
+                reply,
+            ),
+            case(
+                "ArtifactView::Unreadable",
+                &inspected(ArtifactView::Unreadable {
+                    reason: Reason::MetadataUnsupported,
+                    detail: detail(),
+                }),
+                "/checkpoint/inspected/artifact/unreadable",
+                reply,
+            ),
+            case(
+                "ArtifactView::Partial",
+                &inspected(ArtifactView::Partial {
+                    staging: 1,
+                    removing: 2,
+                }),
+                "/checkpoint/inspected/artifact/partial",
+                reply,
+            ),
+            case("InventoryReply", &inventory, "/checkpoint/inventory", reply),
+            case(
+                "InventoryEntry",
+                &inventory,
+                "/checkpoint/inventory/entries/0",
+                reply,
+            ),
+            case(
+                "TrackedArtifact",
+                &inventory,
+                "/checkpoint/inventory/tracked/0",
+                reply,
+            ),
+            case(
+                "Activity",
+                &inventory,
+                "/checkpoint/inventory/tracked/0/activity",
+                reply,
+            ),
+            case(
+                "CheckpointError",
+                &checkpoint_error,
+                "/checkpoint/error",
+                reply,
+            ),
+        ]
+    }
+
+    /// A newer helper adds an optional field to a reply: this daemon ignores it at every
+    /// reply-only struct and struct variant, top-level or nested, and keeps every field
+    /// it knows.
     #[test]
     fn replies_tolerate_unknown_fields() {
-        let error = decodes(json!({"error": {
-            "error": {"backend": "kiln refused the spec"},
-            "definitely_not_created": true,
-            "preflight_refused": true,
-            "refusal_detail": "a field from a newer helper",
-        }}));
-        assert!(matches!(
-            error,
-            Response::Error {
-                error: WireError::Backend(_),
-                definitely_not_created: true,
-                preflight_refused: true,
+        let mut failures = Vec::new();
+        for Case {
+            boundary,
+            sample,
+            at,
+            decode,
+        } in reply_corpus()
+        {
+            assert!(decode(sample.clone()).is_ok(), "{boundary}: {sample}");
+            match serde_json::from_value::<Response>(injected(&sample, at)) {
+                Ok(decoded) if value(&decoded) == sample => {}
+                Ok(decoded) => failures.push(format!(
+                    "{boundary} at {at}: decoded as {}",
+                    value(&decoded)
+                )),
+                Err(e) => failures.push(format!("{boundary} at {at}: {e}")),
             }
-        ));
-        let capture = json!({"kept": 0, "total": 0, "known": true, "truncated": false, "x": 1});
-        let executed = decodes(json!({"executed": {
-            "finish": "completed",
-            "status": {"exited": 0},
-            "stdout": capture,
-            "stderr": capture,
-            "x": 1,
-        }}));
-        assert!(matches!(
-            executed,
-            Response::Executed {
-                finish: WireFinish::Completed,
-                status: Some(CommandStatus::Exited(0)),
-                ..
+        }
+        assert!(
+            failures.is_empty(),
+            "replies that refuse a new optional field:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Every request struct and struct variant, and the stored, journalled, policy and
+    /// plan types: decoded where the helper or daemon decodes them, alone or nested
+    /// inside a tolerant reply. `corpora_cover_every_named_field_boundary` keeps the list
+    /// complete.
+    fn strict_corpus() -> Vec<Case> {
+        let request = decode::<Request>;
+        let reply = decode::<Response>;
+        let envelope = |operation| {
+            value(Request {
+                version: VERSION,
+                timeout_ms: 1000,
+                deadline_ns: 1,
+                operation,
+            })
+        };
+        let kiln = |r| envelope(Operation::Kiln(r));
+        let fc = |operation| {
+            envelope(Operation::Firecracker(FirecrackerRequest {
+                group_version: FIRECRACKER_GROUP_VERSION,
+                instance_id: id(),
+                connection_epoch: Some(id()),
+                operation,
+            }))
+        };
+        let cp = |operation| {
+            envelope(Operation::Checkpoint(CheckpointRequest {
+                group_version: crate::checkpoint::GROUP_VERSION,
+                helper_epoch: Some(id()),
+                operation,
+            }))
+        };
+        let rm = kiln(KilnRequest::Rm { id: "ab".into() });
+        let kiln_create = kiln(KilnRequest::Create { spec: spec() });
+        let preflight = fc(FirecrackerOperation::Preflight {
+            sandbox_id: "sb-0123456789abcdef".into(),
+            profile: "default".into(),
+            spec: spec(),
+        });
+        let fc_gc = fc(FirecrackerOperation::Gc {
+            targets: vec![GcTarget {
+                allocation_id: id(),
+                plan_digest: Digest::of(b"plan"),
+            }],
+        });
+        let capture = cp(CheckpointOperation::Capture {
+            binding: CaptureBinding {
+                target: target(),
+                operation: id(),
+                source: "ab".into(),
+                limit_bytes: 1 << 20,
+            },
+        });
+        let restore = cp(CheckpointOperation::Restore {
+            target: target(),
+            content_sha256: Digest::of(b"content"),
+            reader: id(),
+            spec: spec(),
+        });
+        let prepared = prepared();
+        let accounting = accounting();
+        let stored_absent = value(evidence(absent()));
+        let stored_reader = value(evidence(reader_ended()));
+        let stored_complete = value(evidence(complete()));
+        let captured_complete = captured(complete());
+        let removed_absent = value(Response::Checkpoint(CheckpointResponse::Removed(Box::new(
+            RemoveReply::Absent {
+                evidence: sealed(absent()),
+            },
+        ))));
+        let restored = value(Response::Checkpoint(CheckpointResponse::Restored(
+            Box::new(RestoreReply::Created {
+                backend_id: "ab".into(),
+                evidence: sealed(reader_ended()),
+            }),
+        )));
+        vec![
+            // Requests: the helper is the privileged side.
+            case("Request", &rm, "", request),
+            case(
+                "KilnRequest::Capabilities",
+                &kiln(KilnRequest::Capabilities {
+                    id: Some("ab".into()),
+                }),
+                "/operation/kiln/capabilities",
+                request,
+            ),
+            case(
+                "KilnRequest::Create",
+                &kiln_create,
+                "/operation/kiln/create",
+                request,
+            ),
+            case(
+                "SandboxSpec",
+                &kiln_create,
+                "/operation/kiln/create/spec",
+                request,
+            ),
+            case(
+                "KilnRequest::Exec",
+                &kiln(KilnRequest::Exec {
+                    id: "ab".into(),
+                    argv: vec!["true".into()],
+                    stdin_bytes: 0,
+                    max_output: 1024,
+                    cwd: Some("/".into()),
+                    env: vec![],
+                    live: true,
+                }),
+                "/operation/kiln/exec",
+                request,
+            ),
+            case(
+                "KilnRequest::Features",
+                &kiln(KilnRequest::Features { id: None }),
+                "/operation/kiln/features",
+                request,
+            ),
+            case("KilnRequest::Rm", &rm, "/operation/kiln/rm", request),
+            case(
+                "KilnRequest::Gc",
+                &kiln(KilnRequest::Gc {
+                    ids: vec!["ab".into()],
+                }),
+                "/operation/kiln/gc",
+                request,
+            ),
+            case(
+                "FirecrackerRequest",
+                &fc(FirecrackerOperation::List),
+                "/operation/firecracker",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::AttachInstance",
+                &fc(FirecrackerOperation::AttachInstance {
+                    database_uuid: id(),
+                    highest_token: Some(id()),
+                }),
+                "/operation/firecracker/operation/attach_instance",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::Preflight",
+                &preflight,
+                "/operation/firecracker/operation/preflight",
+                request,
+            ),
+            case(
+                "SandboxSpec",
+                &preflight,
+                "/operation/firecracker/operation/preflight/spec",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::Create",
+                &fc(FirecrackerOperation::Create {
+                    allocation_id: id(),
+                    sandbox_id: "sb-0123456789abcdef".into(),
+                    plan: WireBytes(vec![1]),
+                    plan_digest: Digest::of(b"plan"),
+                }),
+                "/operation/firecracker/operation/create",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::Inspect",
+                &fc(FirecrackerOperation::Inspect {
+                    allocation_id: id(),
+                    plan_digest: Digest::of(b"plan"),
+                }),
+                "/operation/firecracker/operation/inspect",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::FenceAbsent",
+                &fc(FirecrackerOperation::FenceAbsent {
+                    allocation_id: id(),
+                    sandbox_id: "sb-0123456789abcdef".into(),
+                    plan_digest: Digest::of(b"plan"),
+                }),
+                "/operation/firecracker/operation/fence_absent",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::Stop",
+                &fc(FirecrackerOperation::Stop {
+                    allocation_id: id(),
+                    expected_generation: 1,
+                    reason: StopReason::Delete,
+                }),
+                "/operation/firecracker/operation/stop",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::Remove",
+                &fc(FirecrackerOperation::Remove {
+                    allocation_id: id(),
+                    plan_digest: Digest::of(b"plan"),
+                }),
+                "/operation/firecracker/operation/remove",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::Gc",
+                &fc_gc,
+                "/operation/firecracker/operation/gc",
+                request,
+            ),
+            case(
+                "GcTarget",
+                &fc_gc,
+                "/operation/firecracker/operation/gc/targets/0",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::Validate",
+                &fc(FirecrackerOperation::Validate {
+                    allocation_id: id(),
+                    expected_boot_id: "boot".into(),
+                    expected_inner_id: "inner".into(),
+                }),
+                "/operation/firecracker/operation/validate",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::Exec",
+                &fc(FirecrackerOperation::Exec {
+                    allocation_id: id(),
+                    expected_boot_id: "boot".into(),
+                    execution_token: id(),
+                    execution_id: "ex-0123456789abcdef".into(),
+                    argv: vec!["true".into()],
+                    stdin_bytes: 0,
+                    max_output: 1024,
+                }),
+                "/operation/firecracker/operation/exec",
+                request,
+            ),
+            case(
+                "FirecrackerOperation::TestDispatchProbe",
+                &fc(FirecrackerOperation::TestDispatchProbe {
+                    allocation_id: id(),
+                }),
+                "/operation/firecracker/operation/test_dispatch_probe",
+                request,
+            ),
+            case(
+                "CheckpointRequest",
+                &capture,
+                "/operation/checkpoint",
+                request,
+            ),
+            case(
+                "CheckpointOperation::Capture",
+                &capture,
+                "/operation/checkpoint/operation/capture",
+                request,
+            ),
+            case(
+                "CaptureBinding",
+                &capture,
+                "/operation/checkpoint/operation/capture/binding",
+                request,
+            ),
+            case(
+                "ArtifactTarget",
+                &capture,
+                "/operation/checkpoint/operation/capture/binding/target",
+                request,
+            ),
+            case(
+                "CheckpointOperation::Restore",
+                &restore,
+                "/operation/checkpoint/operation/restore",
+                request,
+            ),
+            case(
+                "ArtifactTarget",
+                &restore,
+                "/operation/checkpoint/operation/restore/target",
+                request,
+            ),
+            case(
+                "SandboxSpec",
+                &restore,
+                "/operation/checkpoint/operation/restore/spec",
+                request,
+            ),
+            case(
+                "CheckpointOperation::Inspect",
+                &cp(CheckpointOperation::Inspect {
+                    target: target(),
+                    verify: true,
+                    operation: Some(id()),
+                }),
+                "/operation/checkpoint/operation/inspect",
+                request,
+            ),
+            case(
+                "CheckpointOperation::Remove",
+                &cp(CheckpointOperation::Remove {
+                    target: target(),
+                    operation: id(),
+                }),
+                "/operation/checkpoint/operation/remove",
+                request,
+            ),
+            case(
+                "CheckpointOperation::Inventory",
+                &cp(CheckpointOperation::Inventory { instance: id() }),
+                "/operation/checkpoint/operation/inventory",
+                request,
+            ),
+            case(
+                "CheckpointOperation::Source",
+                &cp(CheckpointOperation::Source {
+                    backend_id: "ab".into(),
+                }),
+                "/operation/checkpoint/operation/source",
+                request,
+            ),
+            case(
+                "CheckpointOperation::Acknowledge",
+                &cp(CheckpointOperation::Acknowledge {
+                    target: target(),
+                    operation: id(),
+                }),
+                "/operation/checkpoint/operation/acknowledge",
+                request,
+            ),
+            // The spec as stored in `sandboxes.spec`.
+            case("SandboxSpec", &value(spec()), "", decode::<SandboxSpec>),
+            // The reservation: stored, and inside the prepared plan's reply.
+            case(
+                "ResourceReservation",
+                &value(ResourceReservation::default()),
+                "",
+                decode::<ResourceReservation>,
+            ),
+            case(
+                "ResourceReservation",
+                &prepared,
+                "/firecracker/prepared/reservation",
+                reply,
+            ),
+            // Root's policy, alone and inside the accounting reply.
+            case(
+                "NodeCeilings",
+                &value(NodeCeilings::default()),
+                "",
+                decode::<NodeCeilings>,
+            ),
+            case(
+                "NodeCeilings",
+                &accounting,
+                "/firecracker/accounting/fresh/ceilings",
+                reply,
+            ),
+            case(
+                "SharedReserve",
+                &value(SharedReserve::default()),
+                "",
+                decode::<SharedReserve>,
+            ),
+            case(
+                "SharedReserve",
+                &accounting,
+                "/firecracker/accounting/fresh/shared",
+                reply,
+            ),
+            case(
+                "ProfileCatalog",
+                &value(ProfileCatalog {
+                    profile: "default".into(),
+                    approved_manifest_sha256: Digest::of(b"manifest"),
+                    bundle_directory: "/var/lib/bundle".into(),
+                    exec_store: "/var/lib/exec".into(),
+                    catalog_generation: 1,
+                    installation_generations: Default::default(),
+                }),
+                "",
+                decode::<ProfileCatalog>,
+            ),
+            // Checkpoint evidence: stored as strict `Evidence` bytes, and carried inside
+            // the tolerant `SealedEvidence` of a reply.
+            case("Evidence", &stored_absent, "", decode::<Evidence>),
+            case(
+                "Evidence",
+                &captured_complete,
+                "/checkpoint/captured/complete/evidence/evidence",
+                reply,
+            ),
+            case(
+                "Fact::Absent",
+                &stored_absent,
+                "/fact/absent",
+                decode::<Evidence>,
+            ),
+            case(
+                "Fact::Absent",
+                &removed_absent,
+                "/checkpoint/removed/absent/evidence/evidence/fact/absent",
+                reply,
+            ),
+            case(
+                "Fact::ReaderEnded",
+                &stored_reader,
+                "/fact/reader_ended",
+                decode::<Evidence>,
+            ),
+            case(
+                "Fact::ReaderEnded",
+                &restored,
+                "/checkpoint/restored/created/evidence/evidence/fact/reader_ended",
+                reply,
+            ),
+            case(
+                "CompleteFact",
+                &stored_complete,
+                "/fact/complete",
+                decode::<Evidence>,
+            ),
+            case(
+                "CompleteFact",
+                &captured_complete,
+                "/checkpoint/captured/complete/evidence/evidence/fact/complete",
+                reply,
+            ),
+        ]
+    }
+
+    /// Requests stay strict because the helper is the privileged side; stored,
+    /// journalled, policy and plan types stay strict wherever they are decoded, even
+    /// nested inside a tolerant reply. A dropped field there would be a wrong charge or
+    /// an unverified fact.
+    #[test]
+    fn strict_types_refuse_unknown_fields() {
+        let unknown = format!("unknown field `{FUTURE}`");
+        let mut failures = Vec::new();
+        for Case {
+            boundary,
+            sample,
+            at,
+            decode,
+        } in strict_corpus()
+        {
+            assert!(decode(sample.clone()).is_ok(), "{boundary}: {sample}");
+            match decode(injected(&sample, at)) {
+                Err(e) if e.to_string().contains(&unknown) => {}
+                Err(e) => failures.push(format!("{boundary} at {at:?}: another error: {e}")),
+                Ok(()) => failures.push(format!("{boundary} at {at:?}: accepted")),
             }
-        ));
-        let listed = decodes(json!({"listed": [{"id": "ab", "stale": false, "x": 1}]}));
-        assert!(matches!(listed, Response::Listed(ref s) if s.len() == 1 && s[0].id == "ab"));
-        let ambiguous = decodes(json!({"firecracker": {"create": {"ambiguous": {
-            "class": "capacity", "message": "full", "x": 1,
-        }}}}));
-        assert!(matches!(
-            ambiguous,
-            Response::Firecracker(FirecrackerResponse::Create(CreateReply::Ambiguous {
-                class: AmbiguousClass::Capacity,
-                ..
-            }))
-        ));
-        let group = decodes(json!({"firecracker": {"error": {
-            "kind": "unavailable", "message": "m", "x": 1,
-        }}}));
-        assert!(matches!(
-            group,
-            Response::Firecracker(FirecrackerResponse::Error(GroupError {
-                kind: GroupErrorKind::Unavailable,
-                ..
-            }))
-        ));
-        let checkpoint = decodes(json!({"checkpoint": {"error": {
-            "kind": "busy", "message": "m", "x": 1,
-        }}}));
-        assert!(matches!(
-            checkpoint,
-            Response::Checkpoint(CheckpointResponse::Error(CheckpointError {
-                kind: CheckpointErrorKind::Busy,
-                ..
-            }))
-        ));
+        }
+        assert!(
+            failures.is_empty(),
+            "strict types that accept an unknown field:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// The files whose `Deserialize` types the corpora cover. Any type in them that
+    /// tolerates unknown fields must be in the reply corpus.
+    const SOURCES: [(&str, &str); 6] = [
+        ("helper/protocol.rs", include_str!("protocol.rs")),
+        ("checkpoint/wire.rs", include_str!("../checkpoint/wire.rs")),
+        ("checkpoint.rs", include_str!("../checkpoint.rs")),
+        ("model.rs", include_str!("../model.rs")),
+        (
+            "helper/firecracker/journal.rs",
+            include_str!("firecracker/journal.rs"),
+        ),
+        (
+            "helper/firecracker/config.rs",
+            include_str!("firecracker/config.rs"),
+        ),
+    ];
+
+    /// The files whose strict types must all be in the strict corpus: the requests, the
+    /// checkpoint facts and the reservation. The journal's and the policy file's own
+    /// strict formats have their own tests.
+    const STRICT_SOURCES: [&str; 4] = [
+        "helper/protocol.rs",
+        "checkpoint/wire.rs",
+        "checkpoint.rs",
+        "model.rs",
+    ];
+
+    /// Strict types the strict corpus covers from elsewhere: root's policy types a reply
+    /// or the policy carries, and the spec (kilnd-exec-core), in requests and stored.
+    const STRICT_ELSEWHERE: [&str; 4] = [
+        "NodeCeilings",
+        "SharedReserve",
+        "ProfileCatalog",
+        "SandboxSpec",
+    ];
+
+    /// The named-field boundaries a file's `Deserialize` types declare, and whether each
+    /// denies unknown fields: `Type` for a struct with named fields, `Type::Variant` for
+    /// an enum's struct variant. A line-based reading of rustfmt'd source, comment lines
+    /// dropped first.
+    fn boundaries(source: &str) -> Vec<(String, bool)> {
+        let ident = |text: &str| -> String {
+            text.chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect()
+        };
+        let lines: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect();
+        let mut found = Vec::new();
+        let mut attributes = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.starts_with("#[") {
+                attributes.push_str(line);
+                continue;
+            }
+            let attributes = std::mem::take(&mut attributes);
+            let item = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub(super) "))
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let Some((kind, rest)) = item.split_once(' ') else {
+                continue;
+            };
+            if !matches!(kind, "struct" | "enum") || !attributes.contains("Deserialize") {
+                continue;
+            }
+            let deny = attributes.contains("deny_unknown_fields");
+            let name = ident(rest);
+            let after = &rest[name.len()..];
+            if kind == "struct" {
+                let brace = after.find('{');
+                if brace.is_some_and(|b| after.find(['(', ';']).is_none_or(|p| b < p)) {
+                    found.push((name, deny));
+                }
+                continue;
+            }
+            // An enum: its variants are the lines one brace deep.
+            let mut depth = 0usize;
+            for line in &lines[i..] {
+                if depth == 1 {
+                    let variant = ident(line);
+                    if !variant.is_empty() && line[variant.len()..].trim_start().starts_with('{') {
+                        found.push((format!("{name}::{variant}"), deny));
+                    }
+                }
+                depth += line.matches('{').count();
+                depth -= line.matches('}').count();
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+        found
+    }
+
+    /// The corpora name exactly the boundaries the source declares: a type made tolerant
+    /// or strict, or a new reply or request type, fails here until its case is added on
+    /// the right side.
+    #[test]
+    fn corpora_cover_every_named_field_boundary() {
+        let mut tolerant = BTreeSet::new();
+        let mut strict: BTreeSet<String> = STRICT_ELSEWHERE.map(String::from).into();
+        for (file, source) in SOURCES {
+            for (boundary, deny) in boundaries(source) {
+                if !deny {
+                    tolerant.insert(boundary);
+                } else if STRICT_SOURCES.contains(&file) {
+                    strict.insert(boundary);
+                }
+            }
+        }
+        let named = |corpus: Vec<Case>| -> BTreeSet<String> {
+            corpus.iter().map(|c| c.boundary.to_string()).collect()
+        };
+        let replies = named(reply_corpus());
+        let stricts = named(strict_corpus());
+        let missing: Vec<_> = tolerant.difference(&replies).collect();
+        let extra: Vec<_> = replies.difference(&tolerant).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "tolerant types without a reply case: {missing:?}; reply cases for types that are not tolerant: {extra:?}"
+        );
+        let missing: Vec<_> = strict.difference(&stricts).collect();
+        let extra: Vec<_> = stricts.difference(&strict).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "strict types without a strict case: {missing:?}; strict cases for types that are not strict: {extra:?}"
+        );
+        // The policy types the strict corpus names are strict in their own file too.
+        let (_, config) = SOURCES
+            .iter()
+            .find(|(file, _)| *file == "helper/firecracker/config.rs")
+            .unwrap();
+        for (boundary, deny) in boundaries(config) {
+            if STRICT_ELSEWHERE.contains(&boundary.as_str()) {
+                assert!(deny, "{boundary}");
+            }
+        }
     }
 
     /// Tolerance is for fields only: a reply this daemon cannot name still fails.
@@ -1143,68 +2521,5 @@ mod reply_compat_tests {
         refused(json!({"firecracker": {"create": {"ambiguous": {"class": "capacity"}}}}));
         refused(json!({"firecracker": {"error": {"kind": "unavailable"}}}));
         refused(json!({"checkpoint": {"error": {"kind": "busy"}}}));
-    }
-
-    /// Requests stay strict: the helper is the privileged side.
-    #[test]
-    fn requests_still_refuse_unknown_fields() {
-        let strict = |request: Value| {
-            assert!(
-                serde_json::from_value::<Request>(request.clone()).is_err(),
-                "{request}"
-            );
-        };
-        let kiln = json!({"version": 3, "timeout_ms": 1000, "deadline_ns": 1,
-            "operation": {"kiln": {"rm": {"id": "ab"}}}});
-        serde_json::from_value::<Request>(kiln.clone()).unwrap();
-        let mut top = kiln.clone();
-        top["x"] = 1.into();
-        strict(top);
-        let mut nested = kiln.clone();
-        nested["operation"]["kiln"]["rm"]["x"] = 1.into();
-        strict(nested);
-
-        let firecracker = serde_json::to_value(Request {
-            version: VERSION,
-            timeout_ms: 1000,
-            deadline_ns: 1,
-            operation: Operation::Firecracker(FirecrackerRequest {
-                group_version: FIRECRACKER_GROUP_VERSION,
-                instance_id: Id128::random(),
-                connection_epoch: Some(Id128::random()),
-                operation: FirecrackerOperation::Gc {
-                    targets: vec![GcTarget {
-                        allocation_id: Id128::random(),
-                        plan_digest: Digest::of(b"plan"),
-                    }],
-                },
-            }),
-        })
-        .unwrap();
-        serde_json::from_value::<Request>(firecracker.clone()).unwrap();
-        let mut group = firecracker.clone();
-        group["operation"]["firecracker"]["x"] = 1.into();
-        strict(group);
-        let mut target = firecracker;
-        target["operation"]["firecracker"]["operation"]["gc"]["targets"][0]["x"] = 1.into();
-        strict(target);
-
-        let checkpoint = serde_json::to_value(Request {
-            version: VERSION,
-            timeout_ms: 1000,
-            deadline_ns: 1,
-            operation: Operation::Checkpoint(CheckpointRequest {
-                group_version: crate::checkpoint::GROUP_VERSION,
-                helper_epoch: Some(Id128::random()),
-                operation: CheckpointOperation::Inventory {
-                    instance: Id128::random(),
-                },
-            }),
-        })
-        .unwrap();
-        serde_json::from_value::<Request>(checkpoint.clone()).unwrap();
-        let mut op = checkpoint;
-        op["operation"]["checkpoint"]["operation"]["inventory"]["x"] = 1.into();
-        strict(op);
     }
 }

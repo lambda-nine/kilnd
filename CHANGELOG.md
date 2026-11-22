@@ -30,7 +30,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   whole reply: a real preflight refusal from a newer helper surfaced as INTERNAL and its
   create stayed charged. An unknown reply variant or a missing field still fails, and
   requests to the helper stay strict, as do types also used in a request, a stored
-  format or root's policy.
+  format or root's policy. Two table-driven tests hold the line at every boundary: each
+  reply-only struct and struct variant takes a new field, and each request, stored,
+  journalled, policy and plan type refuses one, wherever it is decoded. A third test
+  checks both lists against the types the source declares.
 
 - The root VM test of `kilnd release-ambiguous` (`ambig_vm_floors_paths_and_audited_release`)
   now runs another account's processes through the successful release: a copy of sleep
