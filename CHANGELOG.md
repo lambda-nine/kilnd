@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- A capacity stress harness for the Firecracker test deployment:
+  `scripts/firecracker-two-daemon-stress.py` runs two kilnd instances against one test
+  helper and node ledger in the kiln VM, drives them only through `kilndctl` (steady churn,
+  a saturation race, hostile payloads inside guest sessions, a daemon, helper or ledger
+  worker killed mid-run, and a throttled ledger disk), samples the node's accounting and the
+  kernel's view of each session, and prints PASS or FAIL per check. Its teardown removes
+  exactly what its setup recorded. No limit, default or product behaviour changes.
+
 - kilnd-helper now times every Firecracker create step by step, from Preflight through
   BOOTING to READY, and logs one `create timing v1` line per create once it ends: H's, L's,
   M's and P's work, each supervisor step and each journal record's round trip, carried in

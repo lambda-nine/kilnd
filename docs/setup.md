@@ -334,6 +334,42 @@ journalctl -u kilnd-helper -o cat | sudo kilnd-helper create-timings --last 20 -
 It opens no ledger, socket or file of its own. The `gap.daemon` row is the time between
 the helper's Preflight reply and the daemon's Create.
 
+**Capacity stress across two daemons.** `scripts/firecracker-two-daemon-stress.py` runs
+the real chain in the kiln VM, as root under the shared VM lock, with one test helper and
+two kilnd instances (`fctest` and `fctest2`, each its own account, unit, database, socket
+and instance ID) sharing its node ledger under the default node policy. Every Create, Exec
+and Delete goes through `kilndctl`. It needs the inputs `b4-vm-tests.sh` uses and a
+directory holding `kilnd` and `kilndctl` (the `firecracker-test-deployment` profile, release),
+`kilnd-helper` and the static library test binary `kilnd-lib-tests`:
+
+```sh
+S="sudo python3 -I scripts/firecracker-two-daemon-stress.py --evidence /var/tmp/ev"
+$S setup --bin DIR        # refuses unless nothing of the test deployment exists
+$S s2                     # saturation race: 8 simultaneous Creates, split 5/3
+$S s1 --minutes 25        # steady churn: 3 create/exec/delete lanes per daemon
+$S s3                     # hostile payloads in guest sessions, neighbours on deadlines
+$S s4 --kill daemon       # then --kill helper, --kill L: SIGKILL mid-run
+$S s5                     # io.max on the ledger's own device, under the node's unit
+$S teardown               # stops the node, removes what setup recorded, checks inventory
+$S inventory              # proves nothing of it is left
+```
+
+The helper's root and ledger live on a small loop-backed ext4 (image in `/var/tmp/m3-2`,
+mounted at `/run/kilnd-m32`) so that s5 throttles the ledger alone; everything else is what
+the isolated test deployment always makes (`deploy/firecracker-test/README.md`). Every 5 s
+it samples helper Accounting, each allocation cgroup's `memory.peak`, `memory.events` and
+`pids.peak`, the VMM's RSS and PSS and its guest mapping, helper worker RSS and descriptors,
+ledger live bytes and compaction lag, jail tmpfs use and database sizes. Per daemon it
+reports READY p50/p95/max (client and helper timing lines), refusals by type and the time
+to the next admitted Create after a release, and per scenario one PASS or FAIL line per
+check in `summary.txt`, with JSON lines beside it. Scenarios are resumable: a complete one
+is not run again, a partial one is moved aside and rerun. The hostile payloads are plain
+shell scripts in `scripts/stress-payloads/`, sent to a fresh session's `sh` and bounded by
+their own timeouts. `python3 -I scripts/firecracker-two-daemon-stress-tests.py` tests its
+pure parts and runs the scenarios against a fake node. A pass shows these limits hold for
+these workloads on one test node; it does not show readiness for hostile multi-tenant
+production.
+
 **A node fault latches every forward effect, node-wide.** It comes from a daemon reporting a
 verified token the ledger has not issued, which only a restored or copied ledger produces,
 or from any failed ledger commit. New sessions and executions are refused on every instance;
