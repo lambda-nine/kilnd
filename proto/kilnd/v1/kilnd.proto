@@ -27,7 +27,10 @@ service KilndService {
   // fails ALREADY_EXISTS (kilnd-reason request_id_conflict); a retry whose
   // deadline passes while the original is still running fails DEADLINE_EXCEEDED
   // (create_in_flight); a caller at its request-record cap fails
-  // RESOURCE_EXHAUSTED (request_id_quota). An expiry policy, if sent, is
+  // RESOURCE_EXHAUSTED (request_id_quota). An unkeyed create that the backend's
+  // own preflight refused before allocating anything (kiln's exit 124) fails
+  // INVALID_ARGUMENT naming its FAILED, uncharged row; a keyed one returns OK
+  // with that row. An expiry policy, if sent, is
   // resolved once here and never changes; without one the sandbox never expires.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
@@ -320,7 +323,9 @@ enum NodeAccountingStatus {
 // reservation sums, not measured live consumption. FAILED without a backend ID
 // remains reserved because a create error may be ambiguous, unless the backend
 // proved the failure preceded any allocation; that FAILED and compensated FAILED
-// with the exact removed backend ID release. LOST and QUARANTINED remain reserved.
+// with the exact removed backend ID release. An ambiguous FAILED row also releases
+// once root's `kilnd release-ambiguous` records an audited release of it. LOST and
+// QUARANTINED remain reserved.
 // A backend with allocation-level recovery releases only with durable proof that
 // the allocation is absent. Check accounting_status before reading any total.
 message NodeResourceStats {
@@ -473,7 +478,9 @@ message NetworkPolicy {
   repeated string allow = 2;
 }
 
-// Zero means the daemon's default.
+// Zero means the daemon's default. An explicit value below 10 CPU millis, 32 MiB
+// memory, 16 pids or 64 MiB disk, or above the node's per-sandbox maximum, is
+// INVALID_ARGUMENT (docs/validation.md).
 message ResourceLimits {
   uint64 memory_bytes = 1;
   // CPU in thousandths of a core: 500 is half a core.
@@ -495,7 +502,8 @@ message SandboxSpec {
   bool read_only_root = 4;
   // Absolute UTF-8 paths that stay writable with read_only_root. At most 16,
   // each at most 1024 bytes; '/', control characters, and empty, '.' or '..'
-  // components are invalid.
+  // components are invalid, as are /proc, /sys and everything under them, and
+  // anything under /dev except /dev/shm and below it.
   repeated string writable_paths = 5;
   // At most 32 caller-defined tags, stored and returned as given. Keys are
   // 1–63 ASCII bytes; values are at most 256 UTF-8 bytes without controls.

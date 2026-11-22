@@ -246,8 +246,8 @@ pub struct CreateRequest {
     pub expiry: Option<RequestedExpiry>,
     /// `CreateSandboxRequest.default_env` as sent; values are redacted from `Debug`.
     pub default_env: Vec<crate::exec_env::EnvVar>,
-    /// Create from this workspace checkpoint (checkpoint design 7.2), Rust only until
-    /// the proto field exists; `None` is every legacy create, unchanged.
+    /// Create from this workspace checkpoint (checkpoint design 7.2,
+    /// `CreateSandboxRequest.from_checkpoint`); `None` is every legacy create, unchanged.
     pub from_checkpoint: Option<String>,
 }
 
