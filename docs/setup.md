@@ -821,7 +821,7 @@ To release one, as root on the node, stop both kilnd and kilnd-helper, run the
 command, then start the helper and then kilnd:
 
 ```sh
-sudo systemctl stop kilnd            # or kilnd@NAME for a further instance
+sudo systemctl stop kilnd
 sudo systemctl stop kilnd-helper.socket kilnd-helper
 sudo kilnd release-ambiguous --sandbox sb-0123456789abcdef \
     --reason "kiln exited 1 during create; runs directory checked"
@@ -836,7 +836,9 @@ it; a helper that starts during the release exits, since it can't take its servi
 lock, and `systemctl reset-failed kilnd-helper` may be needed before it starts again.
 
 `--state-dir` (default `/var/lib/kilnd`) names the instance as the daemon's flag
-does, and must belong to the `kilnd` account: kiln's helper group serves only it.
+does, and must belong to the `kilnd` account: kiln's helper group serves only it,
+so the command releases only the default instance's rows. A further instance runs
+as its own `kilnd-NAME` account and has no kiln rows to release.
 `--helper-lock` (default `/var/lib/kilnd-helper/helper.lock`) and `--kiln` (default
 `/usr/local/bin/kiln`) are kilnd-helper's `--serve-lock` and `--kiln`; pass
 `--enable-workspace-checkpoints` if the daemon runs with it, which also serves the

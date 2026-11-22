@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- setup.md's release steps no longer suggest stopping `kilnd@NAME` for a further
+  instance: the release serves kiln to the `kilnd` account alone and refuses any other
+  instance's state directory, so following the hint paused every instance for a
+  release that was always refused. It now says only the default instance's rows can be
+  released.
+
 - `kilnd release-ambiguous` records the administrator who ran it as the audit row's
   operator uid: the audit login uid (`/proc/self/loginuid`, which sudo leaves as the
   login set it) when it is set, else sudo's `SUDO_UID`, else the real uid. It recorded
