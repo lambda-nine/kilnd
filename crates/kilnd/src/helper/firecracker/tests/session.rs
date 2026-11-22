@@ -172,10 +172,13 @@ fn unit_properties(name: &str) -> Vec<String> {
 pub(super) const SECOND: &str = "fctest2";
 
 /// The checked-in deployment for `fctest`; any other name is the same deployment with
-/// that name in the account, group, unit, socket and state, and the same helper.
-pub(super) fn deployment_for(name: &str) -> TestDeployment {
+/// that name in the account, group, unit, socket and state, and the same helper. With
+/// `helper_root`, the test helper's root (and so its socket, ledger and logs) is there
+/// instead: M3-2's stress puts it on a filesystem of its own, whose I/O it can throttle,
+/// since the checked-in root is on `/run`, a tmpfs.
+pub(super) fn deployment_at(name: &str, helper_root: Option<&Path>) -> TestDeployment {
     let checked_in = TestDeployment::parse(CHECKED_IN.as_bytes()).unwrap();
-    if name == "fctest" {
+    if name == "fctest" && helper_root.is_none() {
         return checked_in;
     }
     let mut value: Value = serde_json::from_str(CHECKED_IN).unwrap();
@@ -192,6 +195,10 @@ pub(super) fn deployment_for(name: &str) -> TestDeployment {
             .unwrap()
             .replace("fctest", name);
         value["kilnd"][field] = json!(text);
+    }
+    if let Some(root) = helper_root {
+        value["helper"]["root"] = json!(root);
+        value["helper"]["socket"] = json!(root.join("helper.sock"));
     }
     TestDeployment::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
 }
@@ -269,11 +276,20 @@ impl Deployment {
     /// the deployment's root; root enrolls every daemon's account, unit, cgroup and image
     /// with the helper stopped, as add-instance.sh does, then starts it.
     pub(super) async fn new(names: &[&str], options: NodeOptions) -> Self {
+        Self::at(names, options, None).await
+    }
+
+    /// [`Deployment::new`] with the helper's root at `helper_root` ([`deployment_at`]).
+    pub(super) async fn at(
+        names: &[&str],
+        options: NodeOptions,
+        helper_root: Option<&Path>,
+    ) -> Self {
         let bin =
             PathBuf::from(std::env::var(BIN_ENV).expect("KILND_B6_BIN names kilnd and kilndctl"));
-        let first = deployment_for("fctest");
+        let first = deployment_at("fctest", helper_root);
         for name in names {
-            let deployment = deployment_for(name);
+            let deployment = deployment_at(name, helper_root);
             for leftover in [&deployment.kilnd.state_dir, &first.helper.root] {
                 assert!(
                     !leftover.exists(),
@@ -298,7 +314,7 @@ impl Deployment {
         let mut guards = Vec::new();
         let mut daemons = Vec::new();
         for name in names {
-            let deployment = deployment_for(name);
+            let deployment = deployment_at(name, helper_root);
             let account = deployment.kilnd.account.clone();
             guards.push(DaemonGuard {
                 unit: deployment.kilnd.unit.clone(),

@@ -25,7 +25,7 @@ DEPLOYMENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'dep
 
 
 # B6's crash matrix and regressions add a second daemon: the same deployment with this
-# name in place of the checked-in one (session.rs's deployment_for).
+# name in place of the checked-in one (session.rs's deployment_at).
 SECOND = 'fctest2'
 
 
