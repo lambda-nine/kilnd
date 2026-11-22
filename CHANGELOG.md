@@ -9,10 +9,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 - The root VM test of `kilnd release-ambiguous` (`ambig_vm_floors_paths_and_audited_release`)
   now runs another account's processes through the successful release: a copy of sleep
   named `kiln`, the same through a link named `\xff`, one under a path longer than
-  `PATH_MAX`, and the configured kiln itself, plus a sandbox's own such processes. It
-  checks that root's runs of the first two refuse with exit 75, that the checkpoint
-  helper's process table reads the same node, and that the audit row's operator uid is
-  the login uid.
+  `PATH_MAX`, and the configured kiln itself. It checks that root's runs of the
+  `\xff` link and of the long path refuse with exit 75, that the checkpoint helper's
+  process table reads the same node, and that the audit row's operator uid is the
+  login uid.
 
 - Tests now pin the release scan's byte reads of `/proc/PID/status` and `stat`, over a
   fake procfs whose command names aren't UTF-8 and, on Linux, from inside a thread
