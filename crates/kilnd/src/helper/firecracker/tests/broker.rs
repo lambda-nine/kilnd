@@ -863,6 +863,91 @@ async fn b5_linux_root_boot_timings() {
     );
 }
 
+/// M3-1: the same two warmups and twenty cold creates as B5's boot timings, each with
+/// its helper timing line: every step from Preflight to READY, S's included, and a
+/// waterfall and summary that hold no boot nonce or work UUID of any create.
+#[tokio::test]
+#[ignore = "needs root with the B4 launch capabilities: run scripts/b4-vm-tests.sh"]
+async fn m3_linux_root_create_waterfall() {
+    use crate::helper::firecracker::timing::{self, Outcome, Select};
+    let real = Real::new(NodeOptions::default()).await;
+    let mut measured = Vec::new();
+    let mut secrets = Vec::new();
+    for run in 0..22 {
+        let started = std::time::Instant::now();
+        let (runtime, context, plan) = create(&real).await;
+        let (boot, _) = wait_ready(&real, &runtime, &context).await;
+        let ready = started.elapsed();
+        let ran = exec(&real, &runtime, &context, &boot, &["true"], Vec::new()).await;
+        assert_eq!(ran.reply.unwrap().finish, WireFinishFc::Completed);
+        let kind = if run < 2 { "warmup" } else { "measured" };
+        eprintln!(
+            "M3 create: {{\"run\":{run},\"kind\":\"{kind}\",\"allocation\":\"{}\",\"create_ready_ms\":{}}}",
+            context.allocation_id,
+            ready.as_millis()
+        );
+        let document = crate::firecracker::strict_json(plan.backend_plan()).unwrap();
+        let subs = &document["substitutions"];
+        for name in ["boot_nonce", "work_uuid"] {
+            secrets.push(subs[name].as_str().unwrap().to_lowercase());
+        }
+        if run >= 2 {
+            measured.push(context.allocation_id);
+        }
+        removed_cleanly(&real, &runtime, &context).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let log = real.fixture.log();
+    let mut records = Vec::new();
+    for allocation in &measured {
+        let mut found =
+            timing::read_records(log.as_bytes(), Select::Allocation(*allocation)).unwrap();
+        assert_eq!(found.len(), 1, "one timing line for {allocation}");
+        let record = found.remove(0);
+        assert_eq!(record.outcome, Outcome::Ready, "{allocation}");
+        let names: Vec<&str> = record.steps.iter().map(|s| s.name.as_str()).collect();
+        for wanted in [
+            "l.admit",
+            "h.open_gate",
+            "s.parse_plan",
+            "s.mkfs",
+            "s.loop_configure",
+            "s.jail_mount",
+            "s.fork_jailer",
+            "s.vmm_checks",
+            "h.rec.phase.booting",
+            "s.broker_ready",
+            "h.rec.phase.ready",
+        ] {
+            assert!(names.contains(&wanted), "{wanted} missing: {names:?}");
+        }
+        eprintln!("M3 waterfall:\n{}", timing::waterfall(&record));
+        records.push(record);
+    }
+    for line in log.lines().filter(|l| l.contains(timing::LINE_PREFIX)) {
+        eprintln!("M3 line: {line}");
+    }
+    let summary = timing::summary(&records);
+    eprintln!("M3 summary:\n{summary}");
+    assert!(summary.starts_with("creates 20\n"), "{summary}");
+    // Plan section 10.3: no create's boot nonce or work UUID in any line or report.
+    let lines: String = log
+        .lines()
+        .filter(|l| l.contains(timing::LINE_PREFIX))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let reports = timing::report(log.as_bytes(), Select::Last(100), false).unwrap();
+    for text in [&lines, &reports, &summary] {
+        let lower = text.to_lowercase();
+        for secret in &secrets {
+            assert!(!lower.contains(secret.as_str()), "a plan secret in:\n{text}");
+            assert!(!lower.contains(&secret.replace('-', "")), "a plan secret in:\n{text}");
+        }
+    }
+    evidence("m3 waterfall", format!("{} creates timed to READY", records.len()));
+}
+
 // ---- hostile sources -------------------------------------------------------------------
 
 const HOSTILE_ENV: &str = "KILND_B5_HOSTILE";
