@@ -108,6 +108,20 @@ enum Command {
         #[arg(long, default_value = DEFAULT_POLICY)]
         policy: PathBuf,
     },
+    /// Root-only, helper running or stopped (M3-1): reads the helper's log on standard
+    /// input, as `journalctl -u kilnd-helper -o cat` prints it, and prints each create's
+    /// step waterfall from its timing line. It opens no ledger, socket or other file.
+    CreateTimings {
+        /// One allocation's create: its 32-digit hexadecimal ID.
+        #[arg(long, conflicts_with = "last")]
+        allocation: Option<String>,
+        /// The last N creates in the log.
+        #[arg(long, default_value_t = 1)]
+        last: usize,
+        /// Per step, its p50, p95 and max across the selected creates, instead.
+        #[arg(long)]
+        summary: bool,
+    },
     /// Root-only, helper stopped: puts back the images that `enrollments` printed earlier.
     /// Refused unless the file names exactly the instances enrolled, unchanged.
     RestoreEnrollments {
@@ -320,6 +334,22 @@ fn root_command(command: &Command) -> Result<String> {
             fc::clear_node_faults(&policy_at(policy)?, report)
                 .map_err(anyhow::Error::msg)
                 .context("clear node faults")
+        }
+        Command::CreateTimings {
+            allocation,
+            last,
+            summary,
+        } => {
+            let select = match allocation {
+                Some(id) => {
+                    fc::timing::Select::Allocation(kilnd::model::Id128::parse(id).map_err(
+                        |_| anyhow::anyhow!("--allocation must be a 32-digit hexadecimal ID"),
+                    )?)
+                }
+                None => fc::timing::Select::Last(*last),
+            };
+            fc::timing::report(std::io::stdin().lock(), select, *summary)
+                .context("read the helper's log")
         }
         Command::LedgerStats { policy } => fc::ledger_stats(&policy_at(policy)?)
             .map_err(anyhow::Error::msg)
