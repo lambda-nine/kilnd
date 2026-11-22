@@ -216,7 +216,6 @@ pub enum CopyOutcome {
 
 /// kiln's `kiln-checkpoint-record 1`, parsed strictly (kiln `docs/checkpoint-format-v1.md`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ArtifactRecord {
     pub instance: Id128,
     pub checkpoint: CheckpointId,
@@ -431,7 +430,6 @@ pub struct Evidence {
 
 /// Evidence on the wire and in the daemon: the record and the ID it must hash to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SealedEvidence {
     pub evidence: Evidence,
     pub id: Digest,

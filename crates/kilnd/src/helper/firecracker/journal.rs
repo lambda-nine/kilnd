@@ -696,7 +696,6 @@ pub enum Dimension {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClaimTotals {
     pub slots: u64,
     pub memory_bytes: u64,
@@ -1023,7 +1022,6 @@ pub struct Advance {
 
 /// RTC-16: the caller's own instance, never another's.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TokenAccounting {
     pub issue_next: u64,
     pub watermark: u64,
@@ -1040,7 +1038,6 @@ pub struct TokenAccounting {
 
 /// Node totals; no other instance's session identities appear here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AccountingSnapshot {
     pub node_id: Id128,
     pub generation: u64,

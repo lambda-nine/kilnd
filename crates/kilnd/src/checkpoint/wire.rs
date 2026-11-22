@@ -124,7 +124,7 @@ impl CheckpointRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckpointResponse {
     Capabilities(Box<CheckpointCapabilities>),
     Captured(Box<CaptureReply>),
@@ -138,7 +138,6 @@ pub enum CheckpointResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CheckpointCapabilities {
     pub group_version: u32,
     /// False unless root started the helper with checkpoints enabled.
@@ -173,7 +172,6 @@ pub struct CheckpointCapabilities {
 /// `statvfs` `f_bavail * f_frsize` of kiln's runs filesystem and of the filesystem
 /// holding its loop device's backing file, both found by the helper itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StorageFree {
     pub runs_free_bytes: u64,
     /// `None` when the backing filesystem could not be found or read (also when runs
@@ -182,7 +180,6 @@ pub struct StorageFree {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HelperLimits {
     pub copy_workers: u32,
     pub cleanup_workers: u32,
@@ -194,7 +191,7 @@ pub struct HelperLimits {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum CaptureReply {
     Complete {
         evidence: SealedEvidence,
@@ -210,7 +207,7 @@ pub enum CaptureReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum RestoreReply {
     /// The new sandbox exists; its reader ended with the copy complete.
     Created {
@@ -233,7 +230,7 @@ pub enum RestoreReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum RemoveReply {
     Absent {
         evidence: SealedEvidence,
@@ -250,7 +247,7 @@ pub enum RemoveReply {
 /// an image identity; anything unexpected in the records is `Unsupported` with a typed
 /// reason, never a guess.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceReply {
     /// The run records a registered image identity and a verified pinned layout.
     Capable { image: String, image_sha256: Digest },
@@ -259,7 +256,6 @@ pub enum SourceReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ArtifactInspectReply {
     pub helper_epoch: Id128,
     pub artifact: ArtifactView,
@@ -268,7 +264,7 @@ pub struct ArtifactInspectReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum ArtifactView {
     Published {
         record: ArtifactRecord,
@@ -298,7 +294,6 @@ pub enum OpKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExclusiveOp {
     pub kind: OpKind,
     pub operation: Id128,
@@ -306,7 +301,6 @@ pub struct ExclusiveOp {
 
 /// This helper epoch's private operation record for one artifact.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Activity {
     pub exclusive: Option<ExclusiveOp>,
     /// Reader leases: restores and inspections, each until its worker is reaped.
@@ -318,7 +312,7 @@ pub struct Activity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum OperationState {
     Active,
     /// Its final reply, exactly as it was or would have been sent.
@@ -337,14 +331,12 @@ pub enum ItemKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct InventoryEntry {
     pub checkpoint: CheckpointId,
     pub kind: ItemKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TrackedArtifact {
     pub checkpoint: CheckpointId,
     pub generation: u64,
@@ -352,7 +344,6 @@ pub struct TrackedArtifact {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct InventoryReply {
     pub helper_epoch: Id128,
     /// False when the listing could not be read whole, exceeded its bound, or a
@@ -388,7 +379,6 @@ pub enum CheckpointErrorKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CheckpointError {
     pub kind: CheckpointErrorKind,
     pub message: String,

@@ -530,7 +530,6 @@ pub enum GroupErrorKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GroupError {
     pub kind: GroupErrorKind,
     pub message: String,
@@ -554,7 +553,6 @@ pub enum WorkerHealth {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WorkersHealth {
     pub ledger: WorkerHealth,
     pub preparation: [WorkerHealth; 2],
@@ -570,7 +568,6 @@ pub struct WorkersHealth {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CapabilitiesReply {
     pub group_version: u32,
     pub broker_protocol: u32,
@@ -583,7 +580,7 @@ pub struct CapabilitiesReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum AccountingReply {
     Fresh(Box<super::firecracker::journal::AccountingSnapshot>),
     Unknown { reason: String },
@@ -591,7 +588,6 @@ pub enum AccountingReply {
 
 /// The prepared plan's wire form. The client reconstructs and verifies every field.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PreparedReply {
     pub node_id: Id128,
     /// B7 RTC-2: the token the helper issued, also bound into the plan's substitutions.
@@ -608,7 +604,7 @@ pub struct PreparedReply {
 
 /// B3 has no READY variant at all: fake effects cannot publish one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum CreateReply {
     /// Durable INTENT and claim exist; `replay` means no second claim was made.
     Accepted {
@@ -626,7 +622,7 @@ pub enum CreateReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum FenceReply {
     Absent {
         receipt: ReceiptBytes,
@@ -638,7 +634,7 @@ pub enum FenceReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum InspectReply {
     /// B5: READY with no execution in flight, on the journaled boot and inner sandbox.
     PresentReady {
@@ -668,7 +664,7 @@ pub enum InspectReply {
 
 /// B5's Validate: never absence, never a restart.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum ValidateReply {
     /// The broker answered idle on the journaled boot and inner sandbox.
     Ready { boot_id: String, inner_id: String },
@@ -697,7 +693,6 @@ pub enum ExecCleanup {
 /// B5's Exec answer: the typed outcome, both capture facts, and whether the next
 /// command may reuse this VM. Output bytes travel only on the stdio sockets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExecReply {
     pub finish: WireFinishFc,
     pub status: Option<CommandStatus>,
@@ -710,7 +705,7 @@ pub struct ExecReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum WireFinishFc {
     Completed,
     TimedOut,
@@ -720,7 +715,7 @@ pub enum WireFinishFc {
 
 /// A host stop receipt, or why there is none. Never a release.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReply {
     /// STOPPED is durable: the VM subtree is proven empty and the VMM gone.
     Stopped {
@@ -732,7 +727,7 @@ pub enum StopReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum GcOutcome {
     Removed {
         receipt: ReceiptBytes,
@@ -748,7 +743,6 @@ pub enum GcOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GcResult {
     pub allocation_id: Id128,
     pub outcome: GcOutcome,
@@ -767,7 +761,6 @@ pub enum ListStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ListRecord {
     pub allocation_id: Id128,
     pub plan_digest: Digest,
@@ -776,7 +769,6 @@ pub struct ListRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ListReply {
     pub generation: u64,
     pub complete: bool,
@@ -785,7 +777,7 @@ pub struct ListReply {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum FirecrackerResponse {
     Attached {
         node_id: Id128,
@@ -882,7 +874,7 @@ pub(crate) fn validate_spec(spec: &SandboxSpec) -> Result<(), String> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum WireError {
     Backend(String),
     NotFound(String),
@@ -914,7 +906,6 @@ impl From<WireError> for RuntimeError {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CaptureInfo {
     pub kept: usize,
     pub total: u64,
@@ -947,7 +938,7 @@ impl CaptureInfo {
     }
 }
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum WireFinish {
     Completed,
     TimedOut,
@@ -955,7 +946,6 @@ pub enum WireFinish {
     Failed(RuntimeDiagnostic),
 }
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WireSandbox {
     pub id: String,
     pub stale: bool,
@@ -980,8 +970,13 @@ impl From<WireSandbox> for BackendSandbox {
         }
     }
 }
+/// The helper's reply. Replies tolerate unknown fields, so a newer helper that adds an
+/// optional field still works with an older daemon; an unknown variant or a missing
+/// field still fails to decode. Requests stay strict (`deny_unknown_fields`) because
+/// the helper is the privileged side. A type used in both directions, a stored format
+/// or root's policy stays strict.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum Response {
     Version(String),
     Validated,
@@ -1023,3 +1018,193 @@ pub enum Response {
 /// The checkpoint group's wire types (milestone C3) live with its facts, so the runtime
 /// adapter can name them.
 pub use crate::checkpoint::wire::*;
+
+#[cfg(test)]
+mod reply_compat_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn decodes(reply: Value) -> Response {
+        serde_json::from_value(reply.clone()).unwrap_or_else(|e| panic!("{reply}: {e}"))
+    }
+
+    fn refused(reply: Value) {
+        assert!(
+            serde_json::from_value::<Response>(reply.clone()).is_err(),
+            "{reply}"
+        );
+    }
+
+    /// A newer helper adds an optional field to a reply: this daemon ignores it, at the
+    /// top of a reply and nested inside one, in every group.
+    #[test]
+    fn replies_tolerate_unknown_fields() {
+        let error = decodes(json!({"error": {
+            "error": {"backend": "kiln refused the spec"},
+            "definitely_not_created": true,
+            "preflight_refused": true,
+            "refusal_detail": "a field from a newer helper",
+        }}));
+        assert!(matches!(
+            error,
+            Response::Error {
+                error: WireError::Backend(_),
+                definitely_not_created: true,
+                preflight_refused: true,
+            }
+        ));
+        let capture = json!({"kept": 0, "total": 0, "known": true, "truncated": false, "x": 1});
+        let executed = decodes(json!({"executed": {
+            "finish": "completed",
+            "status": {"exited": 0},
+            "stdout": capture,
+            "stderr": capture,
+            "x": 1,
+        }}));
+        assert!(matches!(
+            executed,
+            Response::Executed {
+                finish: WireFinish::Completed,
+                status: Some(CommandStatus::Exited(0)),
+                ..
+            }
+        ));
+        let listed = decodes(json!({"listed": [{"id": "ab", "stale": false, "x": 1}]}));
+        assert!(matches!(listed, Response::Listed(ref s) if s.len() == 1 && s[0].id == "ab"));
+        let ambiguous = decodes(json!({"firecracker": {"create": {"ambiguous": {
+            "class": "capacity", "message": "full", "x": 1,
+        }}}}));
+        assert!(matches!(
+            ambiguous,
+            Response::Firecracker(FirecrackerResponse::Create(CreateReply::Ambiguous {
+                class: AmbiguousClass::Capacity,
+                ..
+            }))
+        ));
+        let group = decodes(json!({"firecracker": {"error": {
+            "kind": "unavailable", "message": "m", "x": 1,
+        }}}));
+        assert!(matches!(
+            group,
+            Response::Firecracker(FirecrackerResponse::Error(GroupError {
+                kind: GroupErrorKind::Unavailable,
+                ..
+            }))
+        ));
+        let checkpoint = decodes(json!({"checkpoint": {"error": {
+            "kind": "busy", "message": "m", "x": 1,
+        }}}));
+        assert!(matches!(
+            checkpoint,
+            Response::Checkpoint(CheckpointResponse::Error(CheckpointError {
+                kind: CheckpointErrorKind::Busy,
+                ..
+            }))
+        ));
+    }
+
+    /// Tolerance is for fields only: a reply this daemon cannot name still fails.
+    #[test]
+    fn replies_refuse_unknown_variants() {
+        refused(json!({"future_reply": {}}));
+        refused(json!("future_reply"));
+        refused(json!({"error": {
+            "error": {"future_class": "x"},
+            "definitely_not_created": true,
+        }}));
+        refused(json!({"executed": {
+            "finish": "future_finish",
+            "status": null,
+            "stdout": {"kept": 0, "total": 0, "known": true, "truncated": false},
+            "stderr": {"kept": 0, "total": 0, "known": true, "truncated": false},
+        }}));
+        refused(json!({"firecracker": {"future": {}}}));
+        refused(json!({"firecracker": {"create": {"ready": {"generation": 1}}}}));
+        refused(json!({"firecracker": {"create": {"ambiguous": {
+            "class": "future_class", "message": "m",
+        }}}}));
+        refused(json!({"checkpoint": {"future": {}}}));
+        refused(json!({"checkpoint": {"error": {"kind": "future_kind", "message": "m"}}}));
+    }
+
+    /// No field gained a default: a reply missing a required field still fails.
+    #[test]
+    fn replies_refuse_missing_fields() {
+        refused(json!({"error": {"error": {"backend": "x"}}}));
+        refused(json!({"error": {"definitely_not_created": true}}));
+        refused(json!({"features": {"features": 0}}));
+        refused(json!({"executed": {
+            "finish": "completed",
+            "status": null,
+            "stdout": {"kept": 0, "total": 0, "known": true},
+            "stderr": {"kept": 0, "total": 0, "known": true, "truncated": false},
+        }}));
+        refused(json!({"listed": [{"id": "ab"}]}));
+        refused(json!({"firecracker": {"create": {"ambiguous": {"class": "capacity"}}}}));
+        refused(json!({"firecracker": {"error": {"kind": "unavailable"}}}));
+        refused(json!({"checkpoint": {"error": {"kind": "busy"}}}));
+    }
+
+    /// Requests stay strict: the helper is the privileged side.
+    #[test]
+    fn requests_still_refuse_unknown_fields() {
+        let strict = |request: Value| {
+            assert!(
+                serde_json::from_value::<Request>(request.clone()).is_err(),
+                "{request}"
+            );
+        };
+        let kiln = json!({"version": 3, "timeout_ms": 1000, "deadline_ns": 1,
+            "operation": {"kiln": {"rm": {"id": "ab"}}}});
+        serde_json::from_value::<Request>(kiln.clone()).unwrap();
+        let mut top = kiln.clone();
+        top["x"] = 1.into();
+        strict(top);
+        let mut nested = kiln.clone();
+        nested["operation"]["kiln"]["rm"]["x"] = 1.into();
+        strict(nested);
+
+        let firecracker = serde_json::to_value(Request {
+            version: VERSION,
+            timeout_ms: 1000,
+            deadline_ns: 1,
+            operation: Operation::Firecracker(FirecrackerRequest {
+                group_version: FIRECRACKER_GROUP_VERSION,
+                instance_id: Id128::random(),
+                connection_epoch: Some(Id128::random()),
+                operation: FirecrackerOperation::Gc {
+                    targets: vec![GcTarget {
+                        allocation_id: Id128::random(),
+                        plan_digest: Digest::of(b"plan"),
+                    }],
+                },
+            }),
+        })
+        .unwrap();
+        serde_json::from_value::<Request>(firecracker.clone()).unwrap();
+        let mut group = firecracker.clone();
+        group["operation"]["firecracker"]["x"] = 1.into();
+        strict(group);
+        let mut target = firecracker;
+        target["operation"]["firecracker"]["operation"]["gc"]["targets"][0]["x"] = 1.into();
+        strict(target);
+
+        let checkpoint = serde_json::to_value(Request {
+            version: VERSION,
+            timeout_ms: 1000,
+            deadline_ns: 1,
+            operation: Operation::Checkpoint(CheckpointRequest {
+                group_version: crate::checkpoint::GROUP_VERSION,
+                helper_epoch: Some(Id128::random()),
+                operation: CheckpointOperation::Inventory {
+                    instance: Id128::random(),
+                },
+            }),
+        })
+        .unwrap();
+        serde_json::from_value::<Request>(checkpoint.clone()).unwrap();
+        let mut op = checkpoint;
+        op["operation"]["checkpoint"]["operation"]["inventory"]["x"] = 1.into();
+        strict(op);
+    }
+}

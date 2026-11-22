@@ -666,13 +666,19 @@ sys.exit(1)
             }
             other => panic!("exit {status}: {other:?}"),
         }
-        // An error reply's fields are closed: a daemon that predates one refuses it.
-        assert!(
+        // A reply tolerates a field this daemon does not know (a newer helper's): it
+        // is ignored, and the flags it does know keep their meaning.
+        assert!(matches!(
             serde_json::from_str::<Response>(
                 r#"{"error":{"error":{"backend":"x"},"definitely_not_created":true,"unknown":true}}"#
             )
-            .is_err()
-        );
+            .unwrap(),
+            Response::Error {
+                definitely_not_created: true,
+                preflight_refused: false,
+                ..
+            }
+        ));
         // The daemon's answer through the same helper.
         let manager = std::sync::Arc::new(Manager::new(
             KilnRuntime::with_helper_uid(path, uid),

@@ -51,7 +51,12 @@ are refused; daemon and helper must be upgraded together.
 
 The caller's marker is followed by a four-byte big-endian nonzero JSON length,
 then exactly that many request bytes (before the helper sends its envelope). Frames are limited to 2 MiB; request fields and enums are typed and
-unknown fields are refused. The request has `version: 3`, `timeout_ms`, and
+unknown fields are refused. Replies are typed too, but tolerate unknown fields: a newer
+helper that adds an optional field to a reply still works with an older daemon, which
+ignores it. An unknown reply variant or a missing field still fails to decode. Requests
+stay strict because the helper is the privileged side; so does any type that also
+appears in a request, a stored format or root's policy (`ResourceReservation`, the
+checkpoint evidence a reply carries, the policy's ceilings). The request has `version: 3`, `timeout_ms`, and
 `operation`, plus an absolute `deadline_ns` from CLOCK_MONOTONIC. The helper
 checks that this deadline fits the declared timeout and preserves it across
 connection setup. The response uses the same length framing and a typed result,
@@ -138,9 +143,9 @@ kiln's own preflight refused the spec (exit status exactly 124 from a CLI that
 advertised feature `0x10`, nothing on stdout, both pipes at EOF), the reply adds
 `"preflight_refused": true`, so the daemon can answer the caller `INVALID_ARGUMENT`;
 it is omitted when false, so every other reply is byte-identical. The daemon trusts
-it only together with `"definitely_not_created": true`. An older daemon refuses the
-field (`deny_unknown_fields`) and its create stays ambiguous: upgrade it with its
-helper, as always.
+it only together with `"definitely_not_created": true`. A daemon from before replies
+tolerated unknown fields refuses the field and its create stays ambiguous: upgrade it
+with its helper, as always.
 
 The helper reuses the API's image, allowlist, path, argv and backend-ID
 validators. It independently checks labels, resource ceilings, descriptor
@@ -370,7 +375,7 @@ the capacity checks, as before.
 helper's reply sees no `storage`: capacity unknown, so it fails closed as above. It sees
 `removal_supported: false` too, and then removes only under `supported`, the gate it
 had before (never wider). An older daemon (C5b-1) reading a newer
-helper's reply refuses it (`deny_unknown_fields`), so its checkpoint calls fail and it
+helper's reply refuses it (it predates tolerant replies), so its checkpoint calls fail and it
 captures and forks nothing; maintenance retries, as for an unreachable helper. The daemon
 and helper ship together and no release enables checkpoints, so this also fails closed.
 

@@ -14,6 +14,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   helper's log. No secret, identity or path is logged. The journal, the ledger schema and
   every create's behaviour are unchanged.
 
+- kilnd now ignores unknown fields in kilnd-helper's replies, so a newer helper that adds
+  an optional field to a reply works with this daemon. Before, the daemon refused the
+  whole reply: a real preflight refusal from a newer helper surfaced as INTERNAL and its
+  create stayed charged. An unknown reply variant or a missing field still fails, and
+  requests to the helper stay strict, as do types also used in a request, a stored
+  format or root's policy.
+
 - The root VM test of `kilnd release-ambiguous` (`ambig_vm_floors_paths_and_audited_release`)
   now runs another account's processes through the successful release: a copy of sleep
   named `kiln`, the same through a link named `\xff`, one under a path longer than

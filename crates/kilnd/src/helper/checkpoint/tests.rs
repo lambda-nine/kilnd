@@ -2536,10 +2536,10 @@ fn storage_probes_read_the_runs_mount_its_backing_and_the_registry() {
 }
 
 /// C5b-2 wire: `storage` is optional on the Capabilities reply. An older helper's reply
-/// (no field) parses with capacity unknown; a newer one parses under the daemon's
-/// `deny_unknown_fields` type; a field this daemon does not know is still refused.
+/// (no field) parses with capacity unknown; a newer one parses too. Replies tolerate a
+/// field this daemon does not know, so a newer helper still works with it.
 #[test]
-fn capabilities_storage_is_optional_and_strict() {
+fn capabilities_storage_is_optional_and_tolerant() {
     let reply = |storage: Option<StorageFree>| CheckpointCapabilities {
         group_version: GROUP_VERSION,
         enabled: true,
@@ -2578,12 +2578,18 @@ fn capabilities_storage_is_optional_and_strict() {
     old.as_object_mut()
         .unwrap()
         .insert("storagex".into(), serde_json::json!(1));
-    assert!(serde_json::from_value::<CheckpointCapabilities>(old).is_err());
+    assert_eq!(
+        serde_json::from_value::<CheckpointCapabilities>(old).unwrap(),
+        parsed
+    );
     let extra = text.replace(
         r#""backing_free_bytes":null"#,
         r#""backing_free_bytes":null,"x":1"#,
     );
-    assert!(serde_json::from_str::<CheckpointCapabilities>(&extra).is_err());
+    assert_eq!(
+        serde_json::from_str::<CheckpointCapabilities>(&extra).unwrap(),
+        new
+    );
     // A disabled helper reports no capacity.
     match disabled(&CheckpointOperation::Capabilities) {
         CheckpointResponse::Capabilities(caps) => {
