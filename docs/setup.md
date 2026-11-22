@@ -308,6 +308,24 @@ compaction lag; Health is degraded below 25% retained headroom, past two leases 
 token that cannot be compacted, or after a policy change shrank the shares, and fails on a
 node fault. `kilnd-helper ledger-stats` (root, helper stopped) prints the same per instance.
 
+**Create timings.** When a Firecracker create ends (READY, a refusal, an expiry or its
+fence), the helper logs one line, `kilnd-helper: create timing v1 {...}`: the allocation ID,
+the outcome and each step's monotonic start and end, as offsets from its Preflight. The
+steps are a fixed set of names: H's, L's, M's and P's work on Preflight and Create, every
+supervisor step up to BOOTING and READY, and each journal record's round trip. The line
+holds no boot nonce, work UUID, token, identity or path. `kilnd-helper create-timings`
+(root, helper running or stopped) reads the helper's log on stdin and prints one
+allocation's waterfall, or the last N, or with `--summary` each step's p50, p95 and max:
+
+```sh
+journalctl -u kilnd-helper -o cat | sudo kilnd-helper create-timings --last 5
+journalctl -u kilnd-helper -o cat | sudo kilnd-helper create-timings --allocation ID
+journalctl -u kilnd-helper -o cat | sudo kilnd-helper create-timings --last 20 --summary
+```
+
+It opens no ledger, socket or file of its own. The `gap.daemon` row is the time between
+the helper's Preflight reply and the daemon's Create.
+
 **A node fault latches every forward effect, node-wide.** It comes from a daemon reporting a
 verified token the ledger has not issued, which only a restored or copied ledger produces,
 or from any failed ledger commit. New sessions and executions are refused on every instance;

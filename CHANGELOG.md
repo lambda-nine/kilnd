@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- kilnd-helper now times every Firecracker create step by step, from Preflight through
+  BOOTING to READY, and logs one `create timing v1` line per create once it ends: H's, L's,
+  M's and P's work, each supervisor step and each journal record's round trip, carried in
+  the records the supervisor already sends. `kilnd-helper create-timings` prints a
+  waterfall for one allocation or the last N, or a per-step p50/p95/max summary, from the
+  helper's log. No secret, identity or path is logged. The journal, the ledger schema and
+  every create's behaviour are unchanged.
+
 - The root VM test of `kilnd release-ambiguous` (`ambig_vm_floors_paths_and_audited_release`)
   now runs another account's processes through the successful release: a copy of sleep
   named `kiln`, the same through a link named `\xff`, one under a path longer than
