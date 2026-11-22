@@ -6,6 +6,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- `kilnd release-ambiguous` no longer counts another account's process running the
+  configured kiln as a kiln process. Its process scan counted the configured image
+  whoever ran it, so any local account could keep the release refused (exit 75) with
+  `/usr/local/bin/kiln ls & kill -STOP $!`. Another account's process can't create a
+  run in kiln's root-only runs directory, whatever it runs, so a process now counts
+  only if it holds root by any uid, by the image rule as by the name rule. The scan
+  reads the uids first, so it never opens another account's executable, and a match
+  by image is read again like one by name. setup.md and threat-model.md say what
+  counts.
+
 - `kilnd release-ambiguous` reads the executable of a root process named `kiln` again
   after its uids, and counts the process only if both reads agree. A process that
   exec'd between the two reads was judged by one executable's name and another's

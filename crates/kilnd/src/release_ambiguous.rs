@@ -357,30 +357,41 @@ const KILN_NODE_SERVICES: [&[u8]; 4] = [b"dns", b"network-setup", b"metrics", b"
 /// The longest ancestry walked from one process before it counts as unexplained.
 const MAX_ANCESTRY: usize = 4096;
 
-/// A kiln process: its image is the configured kiln's, whoever runs it, or its
-/// executable's name is `kiln` and it holds root by any uid. The name rule catches a kiln
-/// that root started from a binary since replaced or deleted (every helper-started CLI
-/// and setup shim runs as root). Another account's process can't create a run in kiln's
-/// root-only runs directory, so a name it chose is no evidence: without the uid check
-/// any local account could keep the release refused with `cp /bin/sleep ~/kiln; ~/kiln
-/// 86400`.
+/// A kiln process: it holds root by any uid, and its image is the configured kiln's or
+/// its executable's name is `kiln`. The name rule catches a kiln that root started from
+/// a binary since replaced or deleted (every helper-started CLI and setup shim runs as
+/// root). Another account's process can't create a run in kiln's root-only runs
+/// directory, whatever it runs, so neither a name it chose nor the configured image is
+/// evidence: without the uid check any local account could keep the release refused
+/// with `cp /bin/sleep ~/kiln; ~/kiln 86400`, or with `kiln ls & kill -STOP $!`. A
+/// sandbox's own processes (its init, after `become_root`) are another account's too:
+/// while their shim lives they descend from it, and once it is gone the runs directory
+/// read lists its run as stale. The uids come first, so another account's image is
+/// never opened.
 ///
-/// The exe link and the uids are two reads, and a process can exec between them: another
-/// account's `kiln` that execs a setuid-root program would read as root's kiln. So after
-/// a root name match the link is read again, and the match counts only if it is
-/// unchanged; a changed link is judged afresh, and a root process whose link changes on
-/// every read counts (fail closed). Answers the link to report, or `None` for a process
-/// that is not kiln or is gone.
+/// The uids and the exe link and image are separate reads, and a process can exec
+/// between them: another account's `kiln` that execs a setuid-root program would read
+/// as root's kiln, and a root process that drops its uids and execs kiln as another
+/// account would read as root's. So after a match the link is read again, and the match
+/// counts only if it is unchanged; a changed link is judged afresh, uids included, and a
+/// root process whose link changes on every read counts (fail closed). Answers the link
+/// to report, or `None` for a process that is not kiln or is gone.
 fn kiln_link(table: &dyn ProcessTable, pid: i32, mut link: Vec<u8>, kiln: KilnImage) -> io::Result<Option<Vec<u8>>> {
     let mut reads = 1;
-    while named_kiln(&link) {
+    loop {
         match table.uids(pid)? {
             None => return Ok(None),
             Some(uids) if uids.any_root() => {}
-            Some(_) => break,
+            Some(_) => return Ok(None),
+        }
+        if !named_kiln(&link) {
+            match table.exe_image(pid)? {
+                Some(image) if image == kiln => {}
+                _ => return Ok(None),
+            }
         }
         if reads == MAX_LINK_READS {
-            // Root, named kiln, and a different link on every read.
+            // Root, kiln, and a different link on every read.
             return Ok(Some(link));
         }
         let Some(again) = table.exe_link(pid)? else {
@@ -392,7 +403,6 @@ fn kiln_link(table: &dyn ProcessTable, pid: i32, mut link: Vec<u8>, kiln: KilnIm
         }
         link = again;
     }
-    Ok(table.exe_image(pid)?.filter(|image| *image == kiln).map(|_| link))
 }
 
 /// How many times [`kiln_link`] reads one process's exe link.
@@ -1052,9 +1062,11 @@ mod tests {
     /// account runs from its own home, a login shell's child, is no kiln process: it can't
     /// create a run in kiln's root-only runs directory, and before the uid check any local
     /// account kept the release refused with `cp /bin/sleep ~/kiln; ~/kiln 86400`. The
-    /// same name under root still refuses, and the configured image counts whoever runs it.
+    /// same holds for the configured image itself (option (a) of the fix review): another
+    /// account's `kiln ls`, stopped, kept it refused just as well. The same processes
+    /// under root still refuse.
     #[test]
-    fn another_accounts_binary_named_kiln_is_ignored_and_roots_still_refuses() {
+    fn another_accounts_kiln_by_name_or_image_is_ignored_and_roots_still_refuses() {
         let mut table = Table::default();
         table.procs.insert(
             4242,
@@ -1104,7 +1116,7 @@ mod tests {
         }
         table.procs.get_mut(&4242).unwrap().uids = MALLORY;
 
-        // The configured image counts whoever runs it, under any name.
+        // The configured image counts only under root too, under any name.
         table.procs.insert(
             4244,
             Proc {
@@ -1127,9 +1139,62 @@ mod tests {
                 argv: &["k", "ls"],
             },
         );
+        assert_eq!(scan(&table, &[]).unwrap(), Vec::<String>::new());
+        for (i, uids) in [ROOT, [1000, 0, 1000, 1000], [1000, 1000, 0, 1000], [1000, 1000, 1000, 0]]
+            .into_iter()
+            .enumerate()
+        {
+            for pid in [4244, 4245] {
+                table.procs.get_mut(&pid).unwrap().uids = uids;
+            }
+            assert_eq!(
+                scan(&table, &[]).unwrap(),
+                ["4244 /usr/local/bin/kiln", "4245 /home/mallory/k"],
+                "{i}"
+            );
+        }
+    }
+
+    /// Option (a): the uids are read before the image, so another account's image is
+    /// never opened (a FUSE mount of its own can't fail or stall root's open), and its
+    /// processes running the configured kiln, a sandbox's init among them, are ignored.
+    #[test]
+    fn another_accounts_image_is_never_opened() {
+        struct NoImage(HashMap<i32, (&'static str, [u32; 4])>);
+        impl ProcessTable for NoImage {
+            fn pids(&self) -> io::Result<Vec<i32>> {
+                let mut pids: Vec<i32> = self.0.keys().copied().collect();
+                pids.sort();
+                Ok(pids)
+            }
+            fn exe_link(&self, pid: i32) -> io::Result<Option<Vec<u8>>> {
+                Ok(self.0.get(&pid).map(|p| p.0.as_bytes().to_vec()))
+            }
+            fn exe_image(&self, pid: i32) -> io::Result<Option<KilnImage>> {
+                assert!(self.0[&pid].1.contains(&0), "{pid}'s image opened");
+                Ok(Some(KILN))
+            }
+            fn uids(&self, pid: i32) -> io::Result<Option<ProcessUids>> {
+                Ok(self.0.get(&pid).map(|p| ProcessUids(p.1)))
+            }
+            fn stat(&self, _: i32) -> io::Result<Option<ProcessStat>> {
+                Ok(Some(ProcessStat { ppid: 1, start: "1".into() }))
+            }
+            fn argv(&self, _: i32) -> io::Result<Option<Vec<Vec<u8>>>> {
+                Ok(Some(vec![b"kiln".to_vec(), b"ls".to_vec()]))
+            }
+        }
+        let mut table = NoImage(HashMap::new());
+        table.0.insert(4244, ("/usr/local/bin/kiln", MALLORY));
+        table.0.insert(4245, ("/home/mallory/fuse/k", MALLORY));
+        // A sandbox's init, its shim gone: host uid 2000000000 in its user namespace.
+        table.0.insert(4246, ("/usr/local/bin/kiln", [2_000_000_000; 4]));
+        let none = || Ok(PublishedShims::new());
+        assert!(unexplained_kiln_processes(&table, KILN, &none).unwrap().is_empty());
+        table.0.insert(4247, ("/opt/k2", ROOT));
         assert_eq!(
-            scan(&table, &[]).unwrap(),
-            ["4244 /usr/local/bin/kiln", "4245 /home/mallory/k"]
+            unexplained_kiln_processes(&table, KILN, &none).unwrap().named,
+            ["4247 /opt/k2"]
         );
     }
 
@@ -1318,11 +1383,11 @@ mod tests {
         };
         // ~/kiln, then su: not kiln, by name or by image.
         assert_eq!(scan(vec![b"/home/mallory/kiln", b"/usr/bin/su"], OTHER), (vec![], 2));
-        // An exec into the configured kiln under another name counts by its image, and
-        // the report names what it runs now.
+        // An exec into the configured kiln under another name counts by its image, once
+        // its link reads the same again, and the report names what it runs now.
         assert_eq!(
             scan(vec![b"/home/mallory/kiln", b"/opt/k2"], KILN),
-            (vec!["4242 /opt/k2".to_string()], 2)
+            (vec!["4242 /opt/k2".to_string()], 3)
         );
         // A stable root kiln: two reads agree.
         assert_eq!(

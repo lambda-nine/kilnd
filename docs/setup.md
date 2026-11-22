@@ -863,19 +863,21 @@ The child then proves the node clean, refusing at the first gap:
    included), and the checkpoint barrier's inventory of checkpoint storage is
    clean. What it changes is what the next start would change.
 3. A second complete inventory names only backends a live row owns.
-4. Every kiln process on the node (its image is the configured kiln, whoever runs
-   it, or it holds root by any uid and its executable is named `kiln`, deleted or
-   not) is a published sandbox's shim (its pid and start time are a run's
+4. Every kiln process on the node (it holds root by any uid, and its image is the
+   configured kiln or its executable is named `kiln`, deleted or not; another
+   account's process can't create a run, so it never counts, whatever it runs) is a
+   published sandbox's shim (its pid and start time are a run's
    `shim.pid` and `shim.start`), a descendant of one, or one of kiln's node services
    (`kiln dns`, `metrics`, `metrics-collect`, `network-setup`). Anything else exits
    75 and names each pid and executable (each cut to 1 KiB), the first 64 and how many
    in all: a create
    that a stopped helper started can still be setting up, since kiln's shim outlives
-   its CLI and creates its run directory afterwards. Any hand-run kiln command other
-   than the node-service subcommands (`dns`, `network-setup`, `metrics`,
-   `metrics-collect`) makes the release refuse too, even `kiln ls`. A listed process
-   may belong to any account (`ps -o user=,pid=,args= -p PID` says whose it is):
-   whether to wait for it or stop it is yours to decide, then rerun the command.
+   its CLI and creates its run directory afterwards. Any kiln command root runs by hand
+   other than the node-service subcommands (`dns`, `network-setup`, `metrics`,
+   `metrics-collect`) makes the release refuse too, even `kiln ls`. Every listed process
+   holds root by at least one uid (`ps -o user=,ruser=,pid=,args= -p PID` says whose
+   it is): whether to wait for it or stop it is yours to decide, then rerun the
+   command.
    Every process is read twice.
 5. kiln's runs directory (`/var/lib/kiln/runs`), read by its entries, holds only
    those backends and kiln's own `.checkpoints` store.

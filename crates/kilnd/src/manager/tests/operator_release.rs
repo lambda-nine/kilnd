@@ -255,6 +255,92 @@ async fn an_unexplained_run_refuses_and_names_it() {
     }
 }
 
+/// A node whose kiln processes are found by the release's own scan over `procs`: pid,
+/// exe link, image and uids, each an orphan (parent 1) running `kiln ls`, with no
+/// published shim.
+struct Scanned(Vec<(i32, &'static str, crate::release_ambiguous::KilnImage, [u32; 4])>);
+
+const CONFIGURED_KILN: crate::release_ambiguous::KilnImage =
+    crate::release_ambiguous::KilnImage { dev: 1, ino: 100 };
+
+impl crate::release_ambiguous::ProcessTable for Scanned {
+    fn pids(&self) -> std::io::Result<Vec<i32>> {
+        Ok(self.0.iter().map(|p| p.0).collect())
+    }
+    fn exe_link(&self, pid: i32) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.0.iter().find(|p| p.0 == pid).map(|p| p.1.as_bytes().to_vec()))
+    }
+    fn exe_image(&self, pid: i32) -> std::io::Result<Option<crate::release_ambiguous::KilnImage>> {
+        Ok(self.0.iter().find(|p| p.0 == pid).map(|p| p.2))
+    }
+    fn uids(&self, pid: i32) -> std::io::Result<Option<crate::release_ambiguous::ProcessUids>> {
+        Ok(self
+            .0
+            .iter()
+            .find(|p| p.0 == pid)
+            .map(|p| crate::release_ambiguous::ProcessUids(p.3)))
+    }
+    fn stat(&self, pid: i32) -> std::io::Result<Option<crate::release_ambiguous::ProcessStat>> {
+        Ok(Some(crate::release_ambiguous::ProcessStat {
+            ppid: 1,
+            start: pid.to_string(),
+        }))
+    }
+    fn argv(&self, _: i32) -> std::io::Result<Option<Vec<Vec<u8>>>> {
+        Ok(Some(vec![b"/usr/local/bin/kiln".to_vec(), b"ls".to_vec()]))
+    }
+}
+
+impl ReleaseNode for Scanned {
+    fn entries(&self) -> anyhow::Result<Vec<OsString>> {
+        Ok(vec![OsString::from(KILN_RUNS_RESERVED)])
+    }
+    fn kiln_processes(&self) -> anyhow::Result<crate::manager::KilnProcesses> {
+        let none = || Ok(crate::release_ambiguous::PublishedShims::new());
+        Ok(crate::release_ambiguous::unexplained_kiln_processes(
+            self,
+            CONFIGURED_KILN,
+            &none,
+        )?)
+    }
+}
+
+/// Option (a): another account running the configured kiln itself (`kiln ls`, stopped,
+/// under its path or another name) doesn't block the release; the same process under
+/// root does, exit 75 naming it.
+#[tokio::test]
+async fn another_accounts_process_running_the_configured_kiln_does_not_block_the_release() {
+    let (m, fake) = one_slot();
+    let stuck = ambiguous(&m, &fake, 1000).await;
+    let mallory = [1000; 4];
+    let others = vec![
+        (4244, "/usr/local/bin/kiln", CONFIGURED_KILN, mallory),
+        (4245, "/home/mallory/k", CONFIGURED_KILN, mallory),
+        (4246, "/usr/local/bin/kiln (deleted)", CONFIGURED_KILN, mallory),
+    ];
+    let mut with_root = others.clone();
+    with_root.push((4250, "/usr/local/bin/kiln", CONFIGURED_KILN, [0; 4]));
+    let refusal = m
+        .release_ambiguous(request(&stuck.id), &Scanned(with_root))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refusal, ReleaseRefusal::KilnProcesses(p) if p.named == ["4250 /usr/local/bin/kiln"] && p.total == 1),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        crate::release_ambiguous::refusal_exit(&refusal),
+        crate::release_ambiguous::EXIT_BUSY
+    );
+    still_charged(&m, &stuck.id, 1).await;
+
+    m.release_ambiguous(request(&stuck.id), &Scanned(others))
+        .await
+        .unwrap();
+    assert!(!m.store.sandbox(&stuck.id).unwrap().unwrap().is_charged());
+    assert_eq!(reserved_sandboxes(&m).await, 0);
+}
+
 #[tokio::test]
 async fn a_reappearing_id_of_a_compensated_row_is_unexplained() {
     let (m, fake) = manager_with_slots(2);

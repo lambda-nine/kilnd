@@ -453,11 +453,12 @@ sandbox compromises the host.
   accepted requests settle, from before its proof until after its commit, and is
   itself the node's only helper meanwhile. It runs the startup reconciliation
   pass, needs a second complete inventory, then needs every kiln process on the
-  node (the configured image, whoever runs it, or a process holding root whose
-  executable is named `kiln`, by reads before and after its uids that agree: another
-  account's binary of that name can't create a run, so it is no evidence) to be a published shim, a
-  descendant of one or a kiln node service (two full passes; any other, a hand-run
-  `kiln` included, refuses with its pid), and
+  node (a process holding root by any uid whose image is the configured kiln or whose
+  executable is named `kiln`, by link reads before and after its uids that agree:
+  another account's process can't create a run, whatever it runs, so it is no
+  evidence) to be a published shim, a
+  descendant of one or a kiln node service (two full passes; any other, a `kiln` that root
+  runs by hand included, refuses with its pid), and
   only then reads kiln's runs directory itself, since `kiln ls` skips a run
   directory without `shim.pid`, to hold nothing a live row doesn't own. With no
   helper serving and no kiln process left that could still publish a run, that
