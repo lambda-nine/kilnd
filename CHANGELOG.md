@@ -6,6 +6,17 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- `kilnd release-ambiguous` no longer counts another account's binary named `kiln` as a
+  kiln process. Its process scan counted any executable of that name, so any local
+  account could keep the release refused (exit 75) with `cp /bin/sleep ~/kiln; ~/kiln
+  86400`, and a few hundred such processes under long paths took the scan's reply past
+  its 1 MiB cap, so the release refused with exit 69 and named none. A name-only match
+  now counts only if the process holds root by any uid on `/proc/PID/status`'s `Uid:`
+  line; the configured kiln image counts whoever runs it, as before. A refusal names
+  the first 64 processes and how many there were in all, and the scan's reply between
+  the command's two halves carries that count. setup.md says a listed process may be
+  any account's, and that stopping it is the operator's call.
+
 - A create kiln refuses before allocating anything (its trusted exit 124: a writable path
   whose parent in the image is a symlink or a regular file, a missing image, or any other
   check kiln's create preflight makes) is now answered `INVALID_ARGUMENT`, not

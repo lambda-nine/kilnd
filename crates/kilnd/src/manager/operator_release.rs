@@ -69,9 +69,60 @@ pub trait ReleaseNode {
     /// giving up root, so the listing needs no privilege when it is read.
     fn entries(&self) -> anyhow::Result<Vec<OsString>>;
     /// Every kiln process that is not a published shim, a descendant of one or a kiln
-    /// node service, each as `PID EXE`. The binary's root half reads every process
-    /// twice (`release_ambiguous::unexplained_kiln_processes`).
-    fn kiln_processes(&self) -> anyhow::Result<Vec<String>>;
+    /// node service, each as `PID EXE`, the first [`KilnProcesses::NAMED`] by name. The
+    /// binary's root half reads every process twice
+    /// (`release_ambiguous::unexplained_kiln_processes`).
+    fn kiln_processes(&self) -> anyhow::Result<KilnProcesses>;
+}
+
+/// What a process scan found: the first [`KilnProcesses::NAMED`] unexplained kiln
+/// processes, each as `PID EXE`, and how many there were in all, so that however many
+/// there are the refusal stays short and still names some.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KilnProcesses {
+    pub named: Vec<String>,
+    pub total: usize,
+}
+
+impl KilnProcesses {
+    /// The most processes a refusal names.
+    pub const NAMED: usize = 64;
+
+    pub fn push(&mut self, process: String) {
+        if self.named.len() < Self::NAMED {
+            self.named.push(process);
+        }
+        self.total += 1;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+}
+
+impl<S: Into<String>> FromIterator<S> for KilnProcesses {
+    fn from_iter<I: IntoIterator<Item = S>>(processes: I) -> Self {
+        let mut found = Self::default();
+        for process in processes {
+            found.push(process.into());
+        }
+        found
+    }
+}
+
+impl std::fmt::Display for KilnProcesses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.named.join(", "))?;
+        if self.total > self.named.len() {
+            write!(
+                f,
+                " and {} more ({} in all)",
+                self.total - self.named.len(),
+                self.total
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// What the operator asks for.
@@ -108,8 +159,8 @@ pub enum ReleaseRefusal {
     /// Entries in kiln's runs directory no live row owns.
     UnexplainedRunDirectories(Vec<String>),
     /// kiln processes that may still publish a run: a create a stopped helper started,
-    /// or a hand-run kiln.
-    KilnProcesses(Vec<String>),
+    /// or a kiln root runs by hand.
+    KilnProcesses(KilnProcesses),
     Store(String),
 }
 
@@ -145,8 +196,7 @@ impl std::fmt::Display for ReleaseRefusal {
             ),
             Self::KilnProcesses(processes) => write!(
                 f,
-                "kiln processes that are not a published sandbox's shim or its descendants: {}; a create a stopped kilnd-helper started may still be setting up, and a hand-run kiln counts too; wait for them to finish and retry",
-                processes.join(", ")
+                "kiln processes that are not a published sandbox's shim or its descendants: {processes}; a create a stopped kilnd-helper started may still be setting up, and a kiln root runs by hand counts too; wait for them to finish (or stop them) and retry"
             ),
             Self::Store(e) => write!(f, "{e}"),
         }

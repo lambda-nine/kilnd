@@ -24,7 +24,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::helper::{ServeLock, ServeLockError};
-use crate::manager::{ReleaseNode, ReleaseProved, ReleaseRefusal};
+use crate::manager::{KilnProcesses, ReleaseNode, ReleaseProved, ReleaseRefusal};
 
 /// kiln's runs directory, where every run, persistent or one-shot, has its directory
 /// (kiln `runtime/src/persistent.rs:24`, `runtime/src/container.rs:769`). The helper's
@@ -265,6 +265,32 @@ impl ProcessStat {
     }
 }
 
+/// The four uids on a `/proc/PID/status` `Uid:` line: real, effective, saved and
+/// filesystem, as root's user namespace sees them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessUids(pub [u32; 4]);
+
+impl ProcessUids {
+    /// Parses `/proc/PID/status`: its one `Uid:` line, with exactly four uids.
+    pub fn parse(text: &str) -> io::Result<Self> {
+        let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed status Uid line");
+        let mut lines = text.lines().filter_map(|line| line.strip_prefix("Uid:"));
+        let (Some(line), None) = (lines.next(), lines.next()) else {
+            return Err(malformed());
+        };
+        let uids: Vec<u32> = line
+            .split_whitespace()
+            .map(|uid| uid.parse().map_err(|_| malformed()))
+            .collect::<io::Result<_>>()?;
+        Ok(Self(uids.try_into().map_err(|_| malformed())?))
+    }
+
+    /// Whether the process holds root by any of its uids.
+    pub fn any_root(self) -> bool {
+        self.0.contains(&0)
+    }
+}
+
 /// The node's processes as root reads them. Each per-process read answers `None` once
 /// the process is gone (ENOENT or ESRCH, as when it exited mid-scan) or has no image (a
 /// kernel thread, a zombie); every other error is an error.
@@ -274,6 +300,8 @@ pub trait ProcessTable {
     fn exe_link(&self, pid: i32) -> io::Result<Option<Vec<u8>>>;
     /// The device and inode of the image `/proc/PID/exe` resolves to.
     fn exe_image(&self, pid: i32) -> io::Result<Option<KilnImage>>;
+    /// The uids of `/proc/PID/status`.
+    fn uids(&self, pid: i32) -> io::Result<Option<ProcessUids>>;
     fn stat(&self, pid: i32) -> io::Result<Option<ProcessStat>>;
     fn argv(&self, pid: i32) -> io::Result<Option<Vec<Vec<u8>>>>;
 }
@@ -292,13 +320,22 @@ const KILN_NODE_SERVICES: [&[u8]; 4] = [b"dns", b"network-setup", b"metrics", b"
 /// The longest ancestry walked from one process before it counts as unexplained.
 const MAX_ANCESTRY: usize = 4096;
 
-/// A kiln process: its image is the configured kiln's, or its executable's name is
-/// `kiln`, which also catches a binary replaced or deleted since it started.
+/// A kiln process: its image is the configured kiln's, whoever runs it, or its
+/// executable's name is `kiln` and it holds root by any uid. The name rule catches a kiln
+/// that root started from a binary since replaced or deleted (every helper-started CLI
+/// and setup shim runs as root). Another account's process can't create a run in kiln's
+/// root-only runs directory, so a name it chose is no evidence: without the uid check
+/// any local account could keep the release refused with `cp /bin/sleep ~/kiln; ~/kiln
+/// 86400`.
 fn is_kiln(table: &dyn ProcessTable, pid: i32, link: &[u8], kiln: KilnImage) -> io::Result<Option<bool>> {
     let path = link.strip_suffix(b" (deleted)").unwrap_or(link);
     let name = path.rsplit(|b| *b == b'/').next().unwrap_or(path);
     if name == b"kiln" {
-        return Ok(Some(true));
+        match table.uids(pid)? {
+            None => return Ok(None),
+            Some(uids) if uids.any_root() => return Ok(Some(true)),
+            Some(_) => {}
+        }
     }
     Ok(table.exe_image(pid)?.map(|image| image == kiln))
 }
@@ -326,13 +363,13 @@ fn descends_from_shim(table: &dyn ProcessTable, mut ppid: i32, shims: &Published
 }
 
 /// One pass: every kiln process that is not a published shim, a descendant of one, or a
-/// kiln node service, as `PID EXE`.
+/// kiln node service, as `PID EXE` (the first [`KilnProcesses::NAMED`] by name).
 pub fn unexplained_in_one_pass(
     table: &dyn ProcessTable,
     kiln: KilnImage,
     shims: &PublishedShims,
-) -> io::Result<Vec<String>> {
-    let mut found = Vec::new();
+) -> io::Result<KilnProcesses> {
+    let mut found = KilnProcesses::default();
     for pid in table.pids()? {
         let Some(link) = table.exe_link(pid)? else {
             continue;
@@ -369,14 +406,14 @@ pub fn unexplained_kiln_processes(
     table: &dyn ProcessTable,
     kiln: KilnImage,
     shims: &dyn Fn() -> io::Result<PublishedShims>,
-) -> io::Result<Vec<String>> {
+) -> io::Result<KilnProcesses> {
     for _ in 0..2 {
         let found = unexplained_in_one_pass(table, kiln, &shims()?)?;
         if !found.is_empty() {
             return Ok(found);
         }
     }
-    Ok(Vec::new())
+    Ok(KilnProcesses::default())
 }
 
 /// A short file below a directory descriptor, opened without following a link; `None`
@@ -450,9 +487,14 @@ impl RunsRoot {
     }
 }
 
-/// The scan request byte on the parent's control socket.
+/// The scan request byte on the parent's control socket. Each request is answered with a
+/// four-byte big-endian length and that much JSON: `{"processes": [...], "total": N}`,
+/// at most [`KilnProcesses::NAMED`] processes named and `N` counting them all, or
+/// `{"error": "..."}`. Parent and child are the one binary, forked, so the shape has no
+/// versions.
 const SCAN: u8 = b'S';
-/// The largest scan reply.
+/// The largest scan reply. The named processes bound a reply well below it: 64 exe links,
+/// each at most `PATH_MAX` plus ` (deleted)`.
 const MAX_SCAN_REPLY: usize = 1 << 20;
 
 /// The child's view of the node: kiln's runs directory through root's descriptor, and
@@ -467,7 +509,7 @@ impl ReleaseNode for ChildNode {
         self.runs.entries()
     }
 
-    fn kiln_processes(&self) -> Result<Vec<String>> {
+    fn kiln_processes(&self) -> Result<KilnProcesses> {
         let mut control = &self.control;
         control.write_all(&[SCAN]).context("ask root for the process scan")?;
         let mut length = [0u8; 4];
@@ -482,11 +524,21 @@ impl ReleaseNode for ChildNode {
         if let Some(error) = reply.get("error").and_then(|e| e.as_str()) {
             bail!("{error}");
         }
-        reply
+        let named: Vec<String> = reply
             .get("processes")
             .and_then(|p| p.as_array())
             .and_then(|p| p.iter().map(|v| v.as_str().map(str::to_string)).collect())
-            .context("malformed process scan reply")
+            .context("malformed process scan reply")?;
+        let total = reply
+            .get("total")
+            .and_then(|t| t.as_u64())
+            .and_then(|t| usize::try_from(t).ok())
+            .context("malformed process scan reply")?;
+        // As KilnProcesses::push builds it: every process named up to the cap.
+        if named.len() != total.min(KilnProcesses::NAMED) {
+            bail!("malformed process scan reply");
+        }
+        Ok(KilnProcesses { named, total })
     }
 }
 
@@ -500,7 +552,7 @@ pub async fn serve_root_half(
     uid: u32,
     kiln: PathBuf,
     checkpoints: bool,
-    scan: impl Fn() -> io::Result<Vec<String>> + Send + Sync + 'static,
+    scan: impl Fn() -> io::Result<KilnProcesses> + Send + Sync + 'static,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let checkpoint = if checkpoints {
@@ -532,7 +584,7 @@ pub async fn serve_root_half(
             }
             let scan = scan.clone();
             let reply = match tokio::task::spawn_blocking(move || scan()).await? {
-                Ok(processes) => serde_json::json!({ "processes": processes }),
+                Ok(found) => serde_json::json!({ "processes": found.named, "total": found.total }),
                 Err(error) => serde_json::json!({ "error": format!("{error}") }),
             };
             let reply = serde_json::to_vec(&reply)?;
@@ -596,6 +648,12 @@ impl ProcessTable for LinuxProcesses {
         }))
     }
 
+    fn uids(&self, pid: i32) -> io::Result<Option<ProcessUids>> {
+        gone(crate::sys::procfs::read_to_string(&format!("{pid}/status")))?
+            .map(|text| ProcessUids::parse(&text))
+            .transpose()
+    }
+
     fn stat(&self, pid: i32) -> io::Result<Option<ProcessStat>> {
         gone(crate::sys::procfs::read_to_string(&format!("{pid}/stat")))?
             .map(|text| ProcessStat::parse(&text))
@@ -636,11 +694,14 @@ mod tests {
 
     const KILN: KilnImage = KilnImage { dev: 1, ino: 100 };
     const OTHER: KilnImage = KilnImage { dev: 1, ino: 200 };
+    const ROOT: [u32; 4] = [0; 4];
+    const MALLORY: [u32; 4] = [1000; 4];
 
     #[derive(Clone)]
     struct Proc {
         link: &'static str,
         image: KilnImage,
+        uids: [u32; 4],
         ppid: i32,
         start: &'static str,
         argv: &'static [&'static str],
@@ -650,6 +711,7 @@ mod tests {
         Proc {
             link: "/usr/local/bin/kiln",
             image: KILN,
+            uids: ROOT,
             ppid,
             start,
             argv,
@@ -689,6 +751,9 @@ mod tests {
         fn exe_image(&self, pid: i32) -> io::Result<Option<KilnImage>> {
             Ok(self.procs.get(&pid).map(|p| p.image))
         }
+        fn uids(&self, pid: i32) -> io::Result<Option<ProcessUids>> {
+            Ok(self.procs.get(&pid).map(|p| ProcessUids(p.uids)))
+        }
         fn stat(&self, pid: i32) -> io::Result<Option<ProcessStat>> {
             Ok(self.procs.get(&pid).map(|p| ProcessStat {
                 ppid: p.ppid,
@@ -705,7 +770,9 @@ mod tests {
 
     fn scan(table: &Table, shims: &[(i32, &str)]) -> io::Result<Vec<String>> {
         let shims: PublishedShims = shims.iter().map(|(p, s)| (*p, s.to_string())).collect();
-        unexplained_kiln_processes(table, KILN, &|| Ok(shims.clone()))
+        let found = unexplained_kiln_processes(table, KILN, &|| Ok(shims.clone()))?;
+        assert_eq!(found.total, found.named.len());
+        Ok(found.named)
     }
 
     const CREATE: &[&str] = &["/usr/local/bin/kiln", "create", "--image=alpine"];
@@ -738,6 +805,7 @@ mod tests {
             Proc {
                 link: "/bin/busybox",
                 image: OTHER,
+                uids: ROOT,
                 ppid: 21,
                 start: "602",
                 argv: &["sh"],
@@ -748,6 +816,7 @@ mod tests {
             Proc {
                 link: "/usr/bin/kiln",
                 image: OTHER,
+                uids: ROOT,
                 ppid: 22,
                 start: "603",
                 argv: &["kiln"],
@@ -777,6 +846,7 @@ mod tests {
             Proc {
                 link: "/usr/local/bin/kiln (deleted)",
                 image: OTHER,
+                uids: ROOT,
                 ppid: 1,
                 start: "800",
                 argv: CREATE,
@@ -787,6 +857,7 @@ mod tests {
             Proc {
                 link: "/var/tmp/stand-in/kiln (deleted)",
                 image: OTHER,
+                uids: ROOT,
                 ppid: 1,
                 start: "801",
                 argv: &["kiln", "300"],
@@ -798,6 +869,7 @@ mod tests {
             Proc {
                 link: "/opt/k2",
                 image: KILN,
+                uids: ROOT,
                 ppid: 1,
                 start: "802",
                 argv: CREATE,
@@ -809,6 +881,7 @@ mod tests {
             Proc {
                 link: "/usr/bin/kilnd",
                 image: OTHER,
+                uids: ROOT,
                 ppid: 1,
                 start: "803",
                 argv: &["kilnd"],
@@ -874,6 +947,9 @@ mod tests {
             fn exe_image(&self, _: i32) -> io::Result<Option<KilnImage>> {
                 unreachable!()
             }
+            fn uids(&self, _: i32) -> io::Result<Option<ProcessUids>> {
+                unreachable!()
+            }
             fn stat(&self, _: i32) -> io::Result<Option<ProcessStat>> {
                 unreachable!()
             }
@@ -895,6 +971,172 @@ mod tests {
         table.hidden_first.push(80);
         assert_eq!(scan(&table, &[]).unwrap(), ["80 /usr/local/bin/kiln"]);
         assert_eq!(table.listings.get(), 2);
+    }
+
+    /// Review 2026-11-22 (spare kilnd security, LOW 1): a binary named kiln that another
+    /// account runs from its own home, a login shell's child, is no kiln process: it can't
+    /// create a run in kiln's root-only runs directory, and before the uid check any local
+    /// account kept the release refused with `cp /bin/sleep ~/kiln; ~/kiln 86400`. The
+    /// same name under root still refuses, and the configured image counts whoever runs it.
+    #[test]
+    fn another_accounts_binary_named_kiln_is_ignored_and_roots_still_refuses() {
+        let mut table = Table::default();
+        table.procs.insert(
+            4242,
+            Proc {
+                link: "/home/mallory/kiln",
+                image: OTHER,
+                uids: MALLORY,
+                ppid: 3000,
+                start: "123456",
+                argv: &["/home/mallory/kiln", "86400"],
+            },
+        );
+        table.procs.insert(
+            3000,
+            Proc {
+                link: "/bin/bash",
+                image: OTHER,
+                uids: MALLORY,
+                ppid: 1,
+                start: "123000",
+                argv: &["-bash"],
+            },
+        );
+        // Deleted under it, as a replaced kiln's would be: still not root's.
+        table.procs.insert(
+            4243,
+            Proc {
+                link: "/home/mallory/kiln (deleted)",
+                image: OTHER,
+                uids: MALLORY,
+                ppid: 3000,
+                start: "123457",
+                argv: &["/home/mallory/kiln", "86400"],
+            },
+        );
+        assert_eq!(scan(&table, &[]).unwrap(), Vec::<String>::new());
+
+        // The same process holding root by any one of its uids is kiln.
+        for (i, uids) in [ROOT, [1000, 0, 1000, 1000], [1000, 1000, 0, 1000], [1000, 1000, 1000, 0]]
+            .into_iter()
+            .enumerate()
+        {
+            table.procs.get_mut(&4242).unwrap().uids = uids;
+            assert_eq!(scan(&table, &[]).unwrap(), ["4242 /home/mallory/kiln"], "{i}");
+            let refusal = ReleaseRefusal::KilnProcesses(["4242 /home/mallory/kiln"].into_iter().collect());
+            assert_eq!(refusal_exit(&refusal), EXIT_BUSY);
+        }
+        table.procs.get_mut(&4242).unwrap().uids = MALLORY;
+
+        // The configured image counts whoever runs it, under any name.
+        table.procs.insert(
+            4244,
+            Proc {
+                link: "/usr/local/bin/kiln",
+                image: KILN,
+                uids: MALLORY,
+                ppid: 3000,
+                start: "123458",
+                argv: &["/usr/local/bin/kiln", "ls"],
+            },
+        );
+        table.procs.insert(
+            4245,
+            Proc {
+                link: "/home/mallory/k",
+                image: KILN,
+                uids: MALLORY,
+                ppid: 3000,
+                start: "123459",
+                argv: &["k", "ls"],
+            },
+        );
+        assert_eq!(
+            scan(&table, &[]).unwrap(),
+            ["4244 /usr/local/bin/kiln", "4245 /home/mallory/k"]
+        );
+    }
+
+    /// A process gone between its exe link and its status is skipped, like any other
+    /// read that finds it gone; a status read that fails otherwise refuses.
+    #[test]
+    fn a_kiln_named_process_whose_status_is_gone_is_skipped_and_an_error_refuses() {
+        struct Racing(Option<i32>);
+        impl ProcessTable for Racing {
+            fn pids(&self) -> io::Result<Vec<i32>> {
+                Ok(vec![90])
+            }
+            fn exe_link(&self, _: i32) -> io::Result<Option<Vec<u8>>> {
+                Ok(Some(b"/usr/local/bin/kiln".to_vec()))
+            }
+            fn exe_image(&self, _: i32) -> io::Result<Option<KilnImage>> {
+                unreachable!("read after the status")
+            }
+            fn uids(&self, _: i32) -> io::Result<Option<ProcessUids>> {
+                match self.0 {
+                    None => Ok(None),
+                    Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                }
+            }
+            fn stat(&self, _: i32) -> io::Result<Option<ProcessStat>> {
+                unreachable!()
+            }
+            fn argv(&self, _: i32) -> io::Result<Option<Vec<Vec<u8>>>> {
+                unreachable!()
+            }
+        }
+        let none = || Ok(PublishedShims::new());
+        assert!(unexplained_kiln_processes(&Racing(None), KILN, &none).unwrap().is_empty());
+        assert_eq!(
+            unexplained_kiln_processes(&Racing(Some(libc::EACCES)), KILN, &none)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+    }
+
+    #[test]
+    fn status_uids_are_the_one_uid_line_with_four_uids() {
+        let status = "Name:\tkiln\nUmask:\t0022\nState:\tS (sleeping)\nPid:\t4242\nPPid:\t1\nUid:\t1000\t0\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
+        let uids = ProcessUids::parse(status).unwrap();
+        assert_eq!(uids, ProcessUids([1000, 0, 1000, 1000]));
+        assert!(uids.any_root());
+        assert!(!ProcessUids::parse("Uid:\t1000\t1000\t1000\t1000\n").unwrap().any_root());
+        for bad in [
+            "Name:\tkiln\n",
+            "Uid:\t1000\t1000\t1000\n",
+            "Uid:\t1000\t1000\t1000\t1000\t1000\n",
+            "Uid:\t1000\t-1\t1000\t1000\n",
+            "Uid:\t0\t0\t0\t0\nUid:\t0\t0\t0\t0\n",
+        ] {
+            assert!(ProcessUids::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// However many processes match, the scan names the first 64 and counts them all,
+    /// and the refusal says how many it left out.
+    #[test]
+    fn many_unexplained_processes_are_named_up_to_the_cap_and_counted() {
+        let mut table = Table::default();
+        for pid in 1000..1200 {
+            table.procs.insert(pid, kiln_proc(1, "1", CREATE));
+        }
+        let found = unexplained_kiln_processes(&table, KILN, &|| Ok(PublishedShims::new())).unwrap();
+        assert_eq!(found.total, 200);
+        assert_eq!(found.named.len(), KilnProcesses::NAMED);
+        assert_eq!(found.named[0], "1000 /usr/local/bin/kiln");
+        assert_eq!(found.named[63], "1063 /usr/local/bin/kiln");
+        let refusal = ReleaseRefusal::KilnProcesses(found).to_string();
+        assert!(
+            refusal.contains("1063 /usr/local/bin/kiln and 136 more (200 in all); "),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("1064 "), "{refusal}");
+        let few: KilnProcesses = ["7 /usr/local/bin/kiln"].into_iter().collect();
+        let refusal = ReleaseRefusal::KilnProcesses(few).to_string();
+        assert!(refusal.contains("descendants: 7 /usr/local/bin/kiln; "), "{refusal}");
+        assert!(!refusal.contains("in all"), "{refusal}");
     }
 
     #[test]
@@ -1003,9 +1245,14 @@ mod tests {
         let dir = private_dir();
         let listener = tokio::net::UnixListener::bind(dir.path().join("h.sock")).unwrap();
         let (child, root) = UnixStream::pair().unwrap();
+        // Last first. Before the cap, about 256 processes under paths near PATH_MAX took
+        // the reply past MAX_SCAN_REPLY, and the release refused naming none of them.
+        let long = format!("/home/mallory/{}/kiln (deleted)", "d".repeat(4000));
+        let many: KilnProcesses = (0..300).map(|pid| format!("{pid} {long}")).collect();
         let answers = std::sync::Mutex::new(vec![
+            Ok(many.clone()),
             Err(io::Error::other("read 9/exe: Permission denied")),
-            Ok(vec!["7 /usr/local/bin/kiln".to_string()]),
+            Ok(["7 /usr/local/bin/kiln"].into_iter().collect()),
         ]);
         // SAFETY: geteuid has no preconditions.
         let uid = unsafe { libc::geteuid() };
@@ -1025,18 +1272,58 @@ mod tests {
             };
             let first = node.kiln_processes().map_err(|e| e.to_string());
             let second = node.kiln_processes().map_err(|e| e.to_string());
-            (first, second)
+            let third = node.kiln_processes().map_err(|e| e.to_string());
+            (first, second, third)
         })
         .await
         .unwrap();
-        assert_eq!(asked.0, Ok(vec!["7 /usr/local/bin/kiln".to_string()]));
+        assert_eq!(
+            asked.0,
+            Ok(KilnProcesses {
+                named: vec!["7 /usr/local/bin/kiln".to_string()],
+                total: 1
+            })
+        );
         assert!(asked.1.unwrap_err().contains("Permission denied"));
+        let third = asked.2.unwrap();
+        assert_eq!(third, many);
+        assert_eq!((third.named.len(), third.total), (KilnProcesses::NAMED, 300));
         // The child's socket closed with it: the root half stops serving and returns.
         tokio::time::timeout(std::time::Duration::from_secs(10), root)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// The child accepts only the shape the root half writes: the processes named up to
+    /// the cap, and a total that counts them.
+    #[test]
+    fn the_child_refuses_a_scan_reply_whose_total_does_not_match_its_names() {
+        let dir = private_dir();
+        for (reply, ok) in [
+            (serde_json::json!({ "processes": ["7 /k"], "total": 1 }), true),
+            (serde_json::json!({ "processes": [], "total": 0 }), true),
+            (serde_json::json!({ "processes": ["7 /k"] }), false),
+            (serde_json::json!({ "processes": ["7 /k"], "total": 2 }), false),
+            (serde_json::json!({ "processes": [], "total": 1 }), false),
+            (serde_json::json!({ "processes": ["7 /k"], "total": -1 }), false),
+            (serde_json::json!({ "processes": ["7 /k"], "total": 0 }), false),
+        ] {
+            let (child, mut root) = UnixStream::pair().unwrap();
+            let bytes = serde_json::to_vec(&reply).unwrap();
+            root.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+            root.write_all(&bytes).unwrap();
+            let node = ChildNode {
+                runs: runs_root(dir.path()),
+                control: child,
+            };
+            let got = node.kiln_processes();
+            assert_eq!(got.is_ok(), ok, "{reply} {got:?}");
+            let mut asked = [0u8; 1];
+            root.read_exact(&mut asked).unwrap();
+            assert_eq!(asked[0], SCAN);
+        }
     }
 
     #[test]

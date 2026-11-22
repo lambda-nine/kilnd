@@ -5064,7 +5064,7 @@ pub use checkpoint::{
 
 mod operator_release;
 pub use operator_release::{
-    KILN_RUNS_RESERVED, ReleaseNode, ReleaseProved, ReleaseRefusal, ReleaseRequest,
+    KILN_RUNS_RESERVED, KilnProcesses, ReleaseNode, ReleaseProved, ReleaseRefusal, ReleaseRequest,
 };
 
 #[cfg(test)]

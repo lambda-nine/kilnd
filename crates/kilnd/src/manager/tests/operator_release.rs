@@ -20,8 +20,8 @@ impl ReleaseNode for Runs {
     fn entries(&self) -> anyhow::Result<Vec<OsString>> {
         Ok(self.0.iter().map(OsString::from).collect())
     }
-    fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
-        Ok(vec![])
+    fn kiln_processes(&self) -> anyhow::Result<crate::manager::KilnProcesses> {
+        Ok(crate::manager::KilnProcesses::default())
     }
 }
 
@@ -31,8 +31,8 @@ impl ReleaseNode for UnreadableRuns {
     fn entries(&self) -> anyhow::Result<Vec<OsString>> {
         anyhow::bail!("Permission denied (os error 13)")
     }
-    fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
-        Ok(vec![])
+    fn kiln_processes(&self) -> anyhow::Result<crate::manager::KilnProcesses> {
+        Ok(crate::manager::KilnProcesses::default())
     }
 }
 
@@ -89,7 +89,7 @@ impl ReleaseNode for OldHelperCreate {
         }
         Ok(listed)
     }
-    fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
+    fn kiln_processes(&self) -> anyhow::Result<crate::manager::KilnProcesses> {
         self.calls.lock().unwrap().push("processes");
         if self.publish_on == Publish::DuringTheProcessScan {
             self.publish();
@@ -384,7 +384,7 @@ async fn an_old_helper_create_still_setting_up_refuses_before_the_runs_snapshot(
         .unwrap_err();
 
     assert!(
-        matches!(&refusal, ReleaseRefusal::KilnProcesses(p) if p == &["4242 /usr/local/bin/kiln"]),
+        matches!(&refusal, ReleaseRefusal::KilnProcesses(p) if p.named == ["4242 /usr/local/bin/kiln"] && p.total == 1),
         "{refusal:?}"
     );
     assert!(refusal.to_string().contains("4242 /usr/local/bin/kiln"), "{refusal}");
@@ -442,7 +442,7 @@ async fn the_process_scan_follows_the_inventory_and_its_failure_refuses() {
         fn entries(&self) -> anyhow::Result<Vec<OsString>> {
             panic!("read after a failed scan")
         }
-        fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
+        fn kiln_processes(&self) -> anyhow::Result<crate::manager::KilnProcesses> {
             anyhow::bail!("read 77/exe: Permission denied (os error 13)")
         }
     }

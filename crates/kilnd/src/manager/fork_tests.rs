@@ -854,8 +854,8 @@ async fn an_operator_release_of_an_ambiguous_fork_frees_the_row_and_leaves_the_p
         fn entries(&self) -> anyhow::Result<Vec<std::ffi::OsString>> {
             Ok(self.0.iter().map(Into::into).collect())
         }
-        fn kiln_processes(&self) -> anyhow::Result<Vec<String>> {
-            Ok(vec![])
+        fn kiln_processes(&self) -> anyhow::Result<crate::manager::KilnProcesses> {
+            Ok(crate::manager::KilnProcesses::default())
         }
     }
     let source_run = source.backend_id.clone().unwrap();
