@@ -317,8 +317,8 @@ included. The allocation ID is there so you can pick out one create; kilnd alrea
 as the backend ID. No boot nonce, token key, work UUID, instance or sandbox ID, leased uid,
 gid or cid, path or refusal reason is logged. The helper never waits to write the line:
 under the shipped unit it goes to journald's socket with one non-blocking send, and is
-dropped if the socket is full. Run by hand with standard error on a pipe or terminal, the
-helper writes it without blocking on Linux; on a regular file it never writes it. A line
+dropped if the socket is full. With standard error on anything but a socket (a file, a
+pipe or a terminal, when run by hand) the helper never writes it. A line
 carries `"dropped":N` once N earlier lines were lost that way, and `"incomplete":true` if
 READY was committed but the supervisor was gone before its last step arrived.
 `kilnd-helper create-timings`

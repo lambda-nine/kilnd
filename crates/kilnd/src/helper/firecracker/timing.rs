@@ -576,12 +576,11 @@ pub fn emit_some(record: Option<Record>) {
 /// create on one thread. Returns whether the whole line was written; any other line is
 /// dropped and counted, and the next line written carries the count as `dropped`.
 ///
-/// - A socket (journald's stream, under systemd): one send with `MSG_DONTWAIT`.
-/// - On Linux, a pipe, FIFO or terminal: one write through a private reopening of the
-///   same pipe or device with `O_NONBLOCK`, so the shared descriptor's flags never
-///   change under anyone else. A reader that doesn't keep up costs the line, never time.
-/// - A regular file, and on other systems a pipe or terminal: dropped. No write to them
-///   is sure not to block, and the shipped unit logs to journald's socket.
+/// - A socket (journald's stream, under systemd): one send with `MSG_DONTWAIT`. A socket
+///   that can't take the whole line now costs the line, never time.
+/// - Anything else (a regular file, a pipe, a terminal): dropped. No write to a shared
+///   descriptor of those is sure not to block without changing its flags for every
+///   process sharing it, and the shipped unit logs to journald's socket.
 pub fn emit_to(fd: RawFd, mut record: Record) -> bool {
     record.dropped = dropped();
     let written = match serde_json::to_string(&record) {
@@ -606,12 +605,7 @@ fn write_nonblocking(fd: RawFd, bytes: &[u8]) -> bool {
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return false;
     }
-    match stat.st_mode & libc::S_IFMT {
-        libc::S_IFSOCK => send_once(fd, bytes),
-        #[cfg(target_os = "linux")]
-        libc::S_IFIFO | libc::S_IFCHR => write_reopened(fd, bytes),
-        _ => false,
-    }
+    stat.st_mode & libc::S_IFMT == libc::S_IFSOCK && send_once(fd, bytes)
 }
 
 /// One non-blocking send. A partial line is ended, so it can't run into the next one,
@@ -633,38 +627,6 @@ fn send_once(fd: RawFd, bytes: &[u8]) -> bool {
         send(b"\n");
     }
     sent >= 0 && sent as usize == bytes.len()
-}
-
-/// One write through a new, non-blocking open file description of the same pipe or
-/// device. `O_NONBLOCK` set on `fd` itself would change it for every process sharing it.
-#[cfg(target_os = "linux")]
-fn write_reopened(fd: RawFd, bytes: &[u8]) -> bool {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let Ok(path) = std::ffi::CString::new(format!("/proc/self/fd/{fd}")) else {
-        return false;
-    };
-    // SAFETY: a valid C string; O_NONBLOCK makes neither the open nor the write wait (a
-    // FIFO without a reader is refused at once).
-    let reopened = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
-        )
-    };
-    if reopened < 0 {
-        return false;
-    }
-    // SAFETY: just opened and owned here.
-    let reopened = unsafe { OwnedFd::from_raw_fd(reopened) };
-    let write = |bytes: &[u8]| {
-        // SAFETY: the slice is live for the call.
-        unsafe { libc::write(reopened.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) }
-    };
-    let written = write(bytes);
-    if written > 0 && (written as usize) < bytes.len() {
-        write(b"\n");
-    }
-    written >= 0 && written as usize == bytes.len()
 }
 
 // ---- the operator's report -------------------------------------------------------------
@@ -1346,7 +1308,7 @@ mod tests {
             assert!(dropped() > before);
         }
 
-        // A regular file is never written: no write to it is sure not to block.
+        // A regular file is never written either.
         let file = tempfile::tempfile().unwrap();
         let before = dropped();
         assert!(!emit_within(file.as_raw_fd(), bound).0);
@@ -1364,21 +1326,17 @@ mod tests {
         assert_eq!(records.len(), 1, "{text}");
         assert!(records[0].dropped >= floor && floor >= 2, "{text}");
 
-        // A pipe with room: written on Linux, through its own non-blocking reopening,
-        // and left blocking for everyone else; dropped elsewhere.
+        // A pipe with room is dropped too, and left blocking for everyone else.
         let (reader, writer) = pipe();
-        let written = emit_within(writer.as_raw_fd(), bound).0;
+        let before = dropped();
+        assert!(!emit_within(writer.as_raw_fd(), bound).0);
+        assert!(dropped() > before);
         // SAFETY: fcntl on an owned descriptor.
         let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(flags & libc::O_NONBLOCK, 0, "the shared descriptor is unchanged");
         drop(writer);
         let mut text = String::new();
         std::fs::File::from(reader).read_to_string(&mut text).unwrap();
-        if cfg!(target_os = "linux") {
-            assert!(written);
-            assert_eq!(read_records(text.as_bytes(), Select::Last(5)).unwrap().len(), 1);
-        } else {
-            assert!(!written && text.is_empty());
-        }
+        assert!(text.is_empty(), "{text}");
     }
 }

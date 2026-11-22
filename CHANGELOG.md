@@ -16,10 +16,9 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   sandbox ID, leased uid, gid or cid, path or refusal reason is logged. A READY line is
   written once the supervisor's last step (READY's own journal round trip) has arrived,
   after the helper answered it; refusals carry the worker's steps up to the refusal. The
-  helper never waits to write a line: journald's socket gets one non-blocking send, a pipe
-  or terminal on Linux a non-blocking write, and a line that can't be written that way (or
-  any line, when standard error is a regular file) is dropped and counted in the next
-  line's `dropped`. The journal, the ledger schema and every create's behaviour are
+  helper never waits to write a line: journald's socket gets one non-blocking send, and a
+  line it can't take whole, or any line when standard error isn't a socket, is dropped and
+  counted in the next line's `dropped`. The journal, the ledger schema and every create's behaviour are
   unchanged.
 
 - An unkeyed create that named no image and no writable paths, which kiln's preflight
