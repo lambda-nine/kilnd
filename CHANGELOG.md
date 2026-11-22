@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Tests now pin the release scan's byte reads of `/proc/PID/status` and `stat`, over a
+  fake procfs whose command names aren't UTF-8 and, on Linux, from inside a thread
+  whose kernel name isn't (a std thread named 14 ASCII bytes and `€`), and the
+  `loginuid` read behind the audit's operator uid. Only the parsers were pinned.
+  Behaviour is unchanged.
+
 - Delete's refusal of an ambiguous reservation now tells the operator to stop both
   kilnd and kilnd-helper (and `kilnd-helper.socket`) before `kilnd release-ambiguous`.
   It said "with kilnd stopped", and the release refuses with exit 75 while

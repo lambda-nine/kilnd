@@ -238,13 +238,22 @@ pub fn operator_uid(loginuid: Option<&str>, sudo_uid: Option<&std::ffi::OsStr>, 
 
 /// [`operator_uid`] for this process.
 pub fn this_operator_uid() -> u32 {
-    #[cfg(target_os = "linux")]
-    let loginuid = crate::sys::procfs::read_to_string(&crate::sys::procfs::own("loginuid")).ok();
-    #[cfg(not(target_os = "linux"))]
-    let loginuid: Option<String> = None;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
-    operator_uid(loginuid.as_deref(), std::env::var_os("SUDO_UID").as_deref(), uid)
+    operator_uid(login_uid().as_deref(), std::env::var_os("SUDO_UID").as_deref(), uid)
+}
+
+/// The text of this process's `loginuid`, read beneath the private procfs instance;
+/// `None` if it can't be read.
+#[cfg(target_os = "linux")]
+fn login_uid() -> Option<String> {
+    crate::sys::procfs::read_to_string(&crate::sys::procfs::own("loginuid")).ok()
+}
+
+/// No platform but Linux has a login uid.
+#[cfg(not(target_os = "linux"))]
+fn login_uid() -> Option<String> {
+    None
 }
 
 /// The client path of the private helper's abstract socket `name` (see
@@ -724,13 +733,29 @@ pub async fn serve_root_half(
 #[cfg(target_os = "linux")]
 pub struct LinuxProcesses;
 
-#[cfg(target_os = "linux")]
+// Only LinuxProcesses and the tests read a procfs.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn gone<T>(result: io::Result<T>) -> io::Result<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// `pid`'s uids, from its `status` as `read` gives it (a file below a procfs root, as
+/// `"PID/status"`): as bytes, since its `Name:` line is the process's own.
+// Only LinuxProcesses and the tests read a procfs.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_uids(read: impl Fn(&str) -> io::Result<Vec<u8>>, pid: i32) -> io::Result<Option<ProcessUids>> {
+    gone(read(&format!("{pid}/status")))?.map(ProcessUids::parse).transpose()
+}
+
+/// `pid`'s `stat`, as `read` gives it, as [`read_uids`].
+// Only LinuxProcesses and the tests read a procfs.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_stat(read: impl Fn(&str) -> io::Result<Vec<u8>>, pid: i32) -> io::Result<Option<ProcessStat>> {
+    gone(read(&format!("{pid}/stat")))?.map(ProcessStat::parse).transpose()
 }
 
 #[cfg(target_os = "linux")]
@@ -764,15 +789,11 @@ impl ProcessTable for LinuxProcesses {
     }
 
     fn uids(&self, pid: i32) -> io::Result<Option<ProcessUids>> {
-        gone(crate::sys::procfs::read(&format!("{pid}/status")))?
-            .map(ProcessUids::parse)
-            .transpose()
+        read_uids(crate::sys::procfs::read, pid)
     }
 
     fn stat(&self, pid: i32) -> io::Result<Option<ProcessStat>> {
-        gone(crate::sys::procfs::read(&format!("{pid}/stat")))?
-            .map(ProcessStat::parse)
-            .transpose()
+        read_stat(crate::sys::procfs::read, pid)
     }
 
     fn argv(&self, pid: i32) -> io::Result<Option<Vec<Vec<u8>>>> {
@@ -1569,6 +1590,102 @@ mod tests {
         assert!(table.exe_link(pid).unwrap().is_some());
         // Gone: a pid past pid_max.
         assert_eq!(table.uids(1 << 23).unwrap(), None);
+    }
+
+    /// Fix re-review 2026-11-22 (T-2): `LinuxProcesses` reads `status` and `stat` through
+    /// `read_uids` and `read_stat`, which take the files' bytes. Over a fake procfs whose
+    /// command names aren't UTF-8 they still give the uids and the stat, a pid that has
+    /// no directory is gone, and any other read error is an error.
+    #[test]
+    fn the_readers_take_status_and_stat_as_bytes_from_any_procfs() {
+        let dir = private_dir();
+        std::fs::create_dir(dir.path().join("4242")).unwrap();
+        let file = |name: &str, bytes: &[u8]| {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.path().join("4242").join(name))
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        };
+        file(
+            "status",
+            b"Name:\tabcdefghijklmn\xe2\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t4242\nPid:\t4242\nPPid:\t3000\nUid:\t1000\t0\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n",
+        );
+        file(
+            "stat",
+            b"4242 (abcdefghijklmn\xe2) S 3000 4242 4242 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 1234 1 2 3\n",
+        );
+        let procfs = |relative: &str| std::fs::read(dir.path().join(relative));
+        assert_eq!(read_uids(procfs, 4242).unwrap(), Some(ProcessUids([1000, 0, 1000, 1000])));
+        assert_eq!(
+            read_stat(procfs, 4242).unwrap(),
+            Some(ProcessStat { ppid: 3000, start: "1234".into() })
+        );
+        assert_eq!(read_uids(procfs, 4243).unwrap(), None);
+        assert_eq!(read_stat(procfs, 4243).unwrap(), None);
+        let denied = |_: &str| -> io::Result<Vec<u8>> { Err(io::Error::from_raw_os_error(libc::EACCES)) };
+        assert_eq!(read_uids(denied, 4242).unwrap_err().raw_os_error(), Some(libc::EACCES));
+        assert_eq!(read_stat(denied, 4242).unwrap_err().raw_os_error(), Some(libc::EACCES));
+    }
+
+    /// Fix re-review 2026-11-22 (T-2), on the real procfs: std cuts a thread's kernel
+    /// name to 15 bytes byte by byte, so a thread named 14 ASCII bytes and `€` has a
+    /// kernel name that isn't UTF-8 (`abcdefghijklmn\xe2`), with no `prctl`. From inside
+    /// that thread, `LinuxProcesses` reads its own `status` and `stat` by its tid. CI runs
+    /// it unprivileged (through `/proc`), the VM also as root (through the private
+    /// instance).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_processes_reads_a_thread_whose_kernel_name_is_not_utf8() {
+        std::thread::Builder::new()
+            .name("abcdefghijklmn€".into())
+            .spawn(|| {
+                // SAFETY: gettid has no preconditions.
+                let tid = unsafe { libc::gettid() };
+                let status = crate::sys::procfs::read(&format!("{tid}/status")).unwrap();
+                assert!(
+                    status.starts_with(b"Name:\tabcdefghijklmn\xe2\n"),
+                    "the kernel name is UTF-8: {:?}",
+                    String::from_utf8_lossy(&status[..status.len().min(32)])
+                );
+                let stat = crate::sys::procfs::read(&format!("{tid}/stat")).unwrap();
+                assert!(std::str::from_utf8(&stat).is_err());
+                let (mut r, mut e, mut s) = (0, 0, 0);
+                // SAFETY: valid pointers to three uids.
+                assert_eq!(unsafe { libc::getresuid(&mut r, &mut e, &mut s) }, 0);
+                // SAFETY: getppid and setfsuid(-1) (a query) have no preconditions.
+                let (ppid, fs) = unsafe { (libc::getppid(), libc::setfsuid(u32::MAX) as u32) };
+                let table = LinuxProcesses;
+                assert_eq!(table.uids(tid).unwrap(), Some(ProcessUids([r, e, s, fs])));
+                assert_eq!(table.stat(tid).unwrap().unwrap().ppid, ppid);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Fix re-review 2026-11-22 (T-2): N1's loginuid read, on the real procfs. The
+    /// operator uid is this process's `loginuid` when it is set (a login session, under
+    /// sudo too), whatever the real uid; CI's runner may have none set, and the VM runs
+    /// it from a login, as root too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_operator_uid_reads_this_process_login_uid() {
+        let text = std::fs::read_to_string("/proc/self/loginuid").unwrap();
+        assert_eq!(login_uid().as_deref(), Some(text.as_str()));
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        let sudo_uid = std::env::var_os("SUDO_UID");
+        let expected = operator_uid(Some(&text), sudo_uid.as_deref(), uid);
+        assert_eq!(this_operator_uid(), expected);
+        let login: u32 = text.trim().parse().unwrap();
+        if login != LOGINUID_UNSET {
+            assert_eq!(this_operator_uid(), login);
+        }
+        eprintln!("loginuid {login} SUDO_UID {sudo_uid:?} uid {uid} operator_uid {expected}");
     }
 
     #[test]
