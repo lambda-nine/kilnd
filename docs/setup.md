@@ -868,7 +868,8 @@ The child then proves the node clean, refusing at the first gap:
    not) is a published sandbox's shim (its pid and start time are a run's
    `shim.pid` and `shim.start`), a descendant of one, or one of kiln's node services
    (`kiln dns`, `metrics`, `metrics-collect`, `network-setup`). Anything else exits
-   75 and names each pid and executable, the first 64 and how many in all: a create
+   75 and names each pid and executable (each cut to 1 KiB), the first 64 and how many
+   in all: a create
    that a stopped helper started can still be setting up, since kiln's shim outlives
    its CLI and creates its run directory afterwards. Any hand-run kiln command other
    than the node-service subcommands (`dns`, `network-setup`, `metrics`,

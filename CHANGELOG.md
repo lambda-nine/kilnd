@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- A `kilnd release-ambiguous` refusal cuts each process it names to 1 KiB, marked `…`.
+  The 64-name cap didn't bound the scan's reply: JSON writes a control byte as six, so
+  64 executables under long paths of control bytes took the reply past its 1 MiB cap,
+  and the release refused with exit 69 and named none. A compile-time check now pins
+  the bound. setup.md says so.
+
 - `kilnd release-ambiguous` no longer fails its process scan with exit 69 over a
   command name that isn't UTF-8. It read `/proc/PID/stat`, and `/proc/PID/status` for a
   process whose executable is named `kiln`, as text, and both carry the kernel's

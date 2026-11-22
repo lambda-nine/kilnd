@@ -76,8 +76,9 @@ pub trait ReleaseNode {
 }
 
 /// What a process scan found: the first [`KilnProcesses::NAMED`] unexplained kiln
-/// processes, each as `PID EXE`, and how many there were in all, so that however many
-/// there are the refusal stays short and still names some.
+/// processes, each as `PID EXE` cut to [`KilnProcesses::NAME_BYTES`], and how many there
+/// were in all, so that however many there are, and however long their paths, the
+/// refusal stays short and still names some.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KilnProcesses {
     pub named: Vec<String>,
@@ -87,9 +88,22 @@ pub struct KilnProcesses {
 impl KilnProcesses {
     /// The most processes a refusal names.
     pub const NAMED: usize = 64;
+    /// The longest name kept, in bytes; a longer one is cut at a character boundary and
+    /// ends in [`KilnProcesses::CUT`].
+    pub const NAME_BYTES: usize = 1024;
+    /// What ends a name that was cut.
+    pub const CUT: &str = "…";
 
-    pub fn push(&mut self, process: String) {
+    pub fn push(&mut self, mut process: String) {
         if self.named.len() < Self::NAMED {
+            if process.len() > Self::NAME_BYTES {
+                let mut end = Self::NAME_BYTES;
+                while !process.is_char_boundary(end) {
+                    end -= 1;
+                }
+                process.truncate(end);
+                process.push_str(Self::CUT);
+            }
             self.named.push(process);
         }
         self.total += 1;

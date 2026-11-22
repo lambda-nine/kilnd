@@ -530,9 +530,16 @@ impl RunsRoot {
 /// `{"error": "..."}`. Parent and child are the one binary, forked, so the shape has no
 /// versions.
 const SCAN: u8 = b'S';
-/// The largest scan reply. The named processes bound a reply well below it: 64 exe links,
-/// each at most `PATH_MAX` plus ` (deleted)`.
+/// The largest scan reply. The named processes bound a reply below it whatever their
+/// bytes: at most [`KilnProcesses::NAMED`] names of at most [`KilnProcesses::NAME_BYTES`]
+/// plus [`KilnProcesses::CUT`], and JSON writes no byte of a name as more than six (a
+/// control byte as `\u00XX`), plus its quotes and comma; 64 bytes more cover the object
+/// around them, a 20-digit total included.
 const MAX_SCAN_REPLY: usize = 1 << 20;
+const _: () = assert!(
+    KilnProcesses::NAMED * (6 * (KilnProcesses::NAME_BYTES + KilnProcesses::CUT.len()) + 3) + 64
+        <= MAX_SCAN_REPLY
+);
 
 /// The child's view of the node: kiln's runs directory through root's descriptor, and
 /// the process scan through the root half's control socket.
@@ -571,8 +578,13 @@ impl ReleaseNode for ChildNode {
             .and_then(|t| t.as_u64())
             .and_then(|t| usize::try_from(t).ok())
             .context("malformed process scan reply")?;
-        // As KilnProcesses::push builds it: every process named up to the cap.
-        if named.len() != total.min(KilnProcesses::NAMED) {
+        // As KilnProcesses::push builds it: every process named up to the cap, each name
+        // cut to its own.
+        if named.len() != total.min(KilnProcesses::NAMED)
+            || named
+                .iter()
+                .any(|name| name.len() > KilnProcesses::NAME_BYTES + KilnProcesses::CUT.len())
+        {
             bail!("malformed process scan reply");
         }
         Ok(KilnProcesses { named, total })
@@ -1238,6 +1250,75 @@ mod tests {
         assert!(ProcessStat::parse(b"4242 (k) S \xff 1").is_err());
     }
 
+    /// Fix review 2026-11-22 (R1): 64 names under paths of control bytes, which JSON
+    /// writes six bytes a byte, took the reply past MAX_SCAN_REPLY (1,471,120 bytes for
+    /// 3,855-byte links), and the release named none of them. Each name is cut to
+    /// NAME_BYTES, so the worst case fits: links of PATH_MAX control bytes.
+    #[tokio::test]
+    async fn the_worst_case_scan_reply_fits_and_names_all_64() {
+        let component = "\u{1}".repeat(255);
+        let mut link = String::new();
+        while link.len() + 1 + component.len() + "/kiln (deleted)".len() < 4096 {
+            link.push('/');
+            link.push_str(&component);
+        }
+        link.push_str("/kiln (deleted)");
+        let found: KilnProcesses = (0..300).map(|pid| format!("{pid} {link}")).collect();
+        assert_eq!((found.named.len(), found.total), (64, 300));
+        for name in &found.named {
+            assert!(name.len() <= KilnProcesses::NAME_BYTES + KilnProcesses::CUT.len());
+            assert!(name.ends_with(KilnProcesses::CUT), "{}", name.len());
+        }
+        let reply = serde_json::to_vec(&serde_json::json!({ "processes": found.named, "total": u64::MAX }))
+            .unwrap();
+        assert!(reply.len() <= MAX_SCAN_REPLY, "{}", reply.len());
+        assert!(reply.len() > 64 * 6 * 1000, "the worst case: {}", reply.len());
+
+        let dir = private_dir();
+        let listener = tokio::net::UnixListener::bind(dir.path().join("h.sock")).unwrap();
+        let (child, root) = UnixStream::pair().unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let sent = found.clone();
+        let root = tokio::spawn(serve_root_half(
+            listener,
+            root,
+            uid,
+            PathBuf::from("/usr/local/bin/kiln"),
+            false,
+            move || Ok(sent.clone()),
+        ));
+        let runs = dir.path().to_path_buf();
+        let asked = tokio::task::spawn_blocking(move || {
+            ChildNode {
+                runs: runs_root(&runs),
+                control: child,
+            }
+            .kiln_processes()
+            .map_err(|e| format!("{e:#}"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(asked.unwrap(), found);
+        tokio::time::timeout(std::time::Duration::from_secs(10), root)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_name_is_cut_at_a_character_boundary() {
+        let mut found = KilnProcesses::default();
+        // 1023 bytes, then a three-byte character across the limit.
+        found.push(format!("{}€tail", "a".repeat(1023)));
+        found.push("7 /usr/local/bin/kiln".to_string());
+        found.push("a".repeat(1024));
+        assert_eq!(found.named[0], format!("{}…", "a".repeat(1023)));
+        assert_eq!(found.named[1], "7 /usr/local/bin/kiln");
+        assert_eq!(found.named[2], "a".repeat(1024));
+    }
+
     /// Fix review 2026-11-22 (T-1): the Linux reader itself, on this process. CI runs it
     /// unprivileged on Linux (the private procfs falls back to /proc); the macOS host
     /// compiles it out.
@@ -1427,6 +1508,7 @@ mod tests {
             (serde_json::json!({ "processes": [], "total": 1 }), false),
             (serde_json::json!({ "processes": ["7 /k"], "total": -1 }), false),
             (serde_json::json!({ "processes": ["7 /k"], "total": 0 }), false),
+            (serde_json::json!({ "processes": [format!("7 /{}", "k".repeat(1100))], "total": 1 }), false),
         ] {
             let (child, mut root) = UnixStream::pair().unwrap();
             let bytes = serde_json::to_vec(&reply).unwrap();
