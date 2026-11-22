@@ -6,6 +6,12 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- `kilnd release-ambiguous` records the administrator who ran it as the audit row's
+  operator uid: the audit login uid (`/proc/self/loginuid`, which sudo leaves as the
+  login set it) when it is set, else sudo's `SUDO_UID`, else the real uid. It recorded
+  the real uid, which under `sudo` (the documented invocation) or a root login is 0
+  whoever released.
+
 - `kilnd release-ambiguous` no longer counts another account's binary named `kiln` as a
   kiln process. Its process scan counted any executable of that name, so any local
   account could keep the release refused (exit 75) with `cp /bin/sleep ~/kiln; ~/kiln

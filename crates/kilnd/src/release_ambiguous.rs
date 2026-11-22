@@ -220,6 +220,33 @@ pub fn root_prerequisites(
     Ok((fence, runs))
 }
 
+/// `/proc/self/loginuid`'s value while no login session has set it.
+const LOGINUID_UNSET: u32 = u32::MAX;
+
+/// The uid a release records as its operator's: the audit login uid (`loginuid`, the
+/// text of `/proc/self/loginuid`), which the login session sets and sudo leaves as it
+/// was, when it is set; else sudo's `SUDO_UID`; else `uid`, the real uid, which is 0
+/// under sudo and for a root login. The command runs as root, so this is attribution
+/// for the audit, not a check: root can set either input.
+pub fn operator_uid(loginuid: Option<&str>, sudo_uid: Option<&std::ffi::OsStr>, uid: u32) -> u32 {
+    loginuid
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .filter(|&uid| uid != LOGINUID_UNSET)
+        .or_else(|| sudo_uid?.to_str()?.parse().ok())
+        .unwrap_or(uid)
+}
+
+/// [`operator_uid`] for this process.
+pub fn this_operator_uid() -> u32 {
+    #[cfg(target_os = "linux")]
+    let loginuid = crate::sys::procfs::read_to_string(&crate::sys::procfs::own("loginuid")).ok();
+    #[cfg(not(target_os = "linux"))]
+    let loginuid: Option<String> = None;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    operator_uid(loginuid.as_deref(), std::env::var_os("SUDO_UID").as_deref(), uid)
+}
+
 /// The client path of the private helper's abstract socket `name` (see
 /// `helper::client::connect`).
 pub fn abstract_helper_path(name: &str) -> PathBuf {
@@ -1361,6 +1388,26 @@ mod tests {
         std::fs::create_dir(dir.path().join("real")).unwrap();
         std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
         assert!(RunsRoot::open(&dir.path().join("link")).is_err());
+    }
+
+    /// Review 2026-11-22 (spare kilnd security, N1): under sudo the real uid is 0, so the
+    /// audit recorded 0 whichever administrator released. The login uid names them, and
+    /// sudo's SUDO_UID does where no login session set one.
+    #[test]
+    fn the_operator_is_the_login_uid_then_sudo_uid_then_the_real_uid() {
+        use std::ffi::OsStr;
+        let sudo = Some(OsStr::new("1001"));
+        assert_eq!(operator_uid(Some("1000\n"), sudo, 0), 1000);
+        assert_eq!(operator_uid(Some("1000"), None, 0), 1000);
+        // A root login's own login uid is 0, and that is the operator.
+        assert_eq!(operator_uid(Some("0"), sudo, 0), 0);
+        // Unset (no login session, as under a service), unreadable or malformed.
+        for unset in [Some("4294967295"), None, Some(""), Some("x")] {
+            assert_eq!(operator_uid(unset, sudo, 0), 1001, "{unset:?}");
+            assert_eq!(operator_uid(unset, None, 0), 0, "{unset:?}");
+            assert_eq!(operator_uid(unset, Some(OsStr::new("-1")), 7), 7, "{unset:?}");
+            assert_eq!(operator_uid(unset, Some(OsStr::new("")), 7), 7, "{unset:?}");
+        }
     }
 
     #[test]

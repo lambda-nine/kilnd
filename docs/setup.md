@@ -889,7 +889,9 @@ released sb-0123456789abcdef owner_uid=1000 sandboxes=1 host_cpu_millis=0 memory
 
 The release is the insert of one row in the append-only `operator_releases`
 table (schema 17): the sandbox and owner, every charge released, the operator's
-uid, the time, the reason and the inventory's SHA-256. Its insert tags the row
+uid, the time, the reason and the inventory's SHA-256. The operator's uid is the
+audit login uid (`/proc/self/loginuid`, which sudo leaves as the login set it), else
+sudo's `SUDO_UID`, else the uid the command ran as. Its insert tags the row
 `operator_attested`, which nothing else can write. The row stays `FAILED`; its
 owner can Delete it and release its request ID as after any create that
 allocated nothing, and a keyed retry answers with it, as before. Each daemon

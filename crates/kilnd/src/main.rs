@@ -695,8 +695,8 @@ fn release_as_root(args: &ReleaseArgs<'_>) -> u8 {
         Ok(pair) => pair,
         Err(e) => return release_refused(1, &format!("control socket: {e}")),
     };
-    // SAFETY: getuid has no preconditions.
-    let operator_uid = unsafe { libc::getuid() };
+    // Who asked, for the audit: under sudo the real uid is root's.
+    let operator_uid = ra::this_operator_uid();
     // SAFETY: no async runtime or other thread exists yet (main dispatches this command
     // first), so the child starts with this one thread's consistent state.
     let pid = unsafe { libc::fork() };
