@@ -6,6 +6,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- kilnd-helper's checkpoint group no longer retains every checkpoint removal while
+  any process on the node has a command name that isn't UTF-8. Its process scan read
+  every process's `/proc/PID/stat` as text, so one such process (a sandbox's
+  `prctl(PR_SET_NAME)` is enough) failed the scan: every removal was retained with
+  "the process table could not be read" and every inspection was incomplete. It reads
+  `stat` as bytes now, through the parser the release's scan uses.
+
 - `kilnd release-ambiguous` no longer fails its process scan with exit 69, naming
   nothing, over a process whose executable it can't read. Any account or sandbox can
   run one: the kernel can't render an executable's path longer than `PATH_MAX`

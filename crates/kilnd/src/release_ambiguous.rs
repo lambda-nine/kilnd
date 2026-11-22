@@ -280,16 +280,11 @@ pub struct ProcessStat {
 }
 
 impl ProcessStat {
-    /// Parses `/proc/PID/stat`, whose command name is parenthesized and may hold spaces,
-    /// parentheses and bytes that aren't UTF-8 (the process chose them): the fields
-    /// after its last `") "` begin at field 3, and they are ASCII. Read as bytes, so a
+    /// Parses `/proc/PID/stat` as bytes ([`crate::proc_stat::fields`]), so a command
     /// name nobody vouches for can't fail the scan.
     pub fn parse(text: impl AsRef<[u8]>) -> io::Result<Self> {
         let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed stat");
-        let text = text.as_ref();
-        let end = text.windows(2).rposition(|w| w == b") ").ok_or_else(malformed)?;
-        let fields = std::str::from_utf8(&text[end + 2..]).map_err(|_| malformed())?;
-        let fields: Vec<&str> = fields.split_whitespace().collect();
+        let fields = crate::proc_stat::fields(text.as_ref())?;
         let ppid = fields.get(1).and_then(|f| f.parse().ok()).ok_or_else(malformed)?;
         let start = fields.get(19).ok_or_else(malformed)?.to_string();
         Ok(Self { ppid, start })

@@ -1001,7 +1001,7 @@ pub(crate) fn process_table(kiln: (u64, u64)) -> io::Result<Vec<ProcessArgs>> {
     scan(
         pids,
         kiln,
-        |pid| procfs::read_to_string(&format!("{pid}/stat")),
+        |pid| procfs::read(&format!("{pid}/stat")),
         |pid| {
             let mut cmdline = Vec::new();
             procfs::open(&format!("{pid}/cmdline"), libc::O_RDONLY)?
@@ -1027,21 +1027,20 @@ pub(crate) fn process_table(kiln: (u64, u64)) -> io::Result<Vec<ProcessArgs>> {
 pub fn scan(
     pids: impl IntoIterator<Item = u32>,
     kiln: (u64, u64),
-    stat: impl Fn(u32) -> io::Result<String>,
+    stat: impl Fn(u32) -> io::Result<Vec<u8>>,
     cmdline: impl Fn(u32) -> io::Result<Vec<u8>>,
     image: impl Fn(u32) -> io::Result<(u64, u64)>,
 ) -> io::Result<Vec<ProcessArgs>> {
     let gone = |e: &io::Error| {
         e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
     };
-    // `comm` may hold spaces and parentheses; the fields follow its last ')': the
-    // session (field 6) and the start time (field 22).
+    // `comm` is the process's own bytes, read as bytes ([`crate::proc_stat`]): one
+    // that isn't UTF-8 anywhere on the node must not fail the scan. The session (field
+    // 6) and the start time (field 22).
     let identity = |pid: u32| -> io::Result<(u32, u64)> {
         let stat = stat(pid)?;
-        let fields: Vec<&str> = stat
-            .rsplit_once(')')
-            .map(|(_, rest)| rest.split_whitespace().collect())
-            .unwrap_or_default();
+        let fields = crate::proc_stat::fields(&stat)
+            .map_err(|_| io::Error::other("malformed process stat"))?;
         match (
             fields.get(3).map(|s| s.parse::<u32>()),
             fields.get(19).map(|s| s.parse::<u64>()),

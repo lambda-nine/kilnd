@@ -11,6 +11,9 @@ pub mod expiry;
 pub mod manager;
 pub mod model;
 pub mod process;
+/// `/proc/PID/stat`'s fields, read as bytes: shared by the release's and the checkpoint
+/// helper's process scans.
+pub mod proc_stat;
 /// `kilnd release-ambiguous`'s root side: the state owner, kiln's runs directory, exits.
 pub mod release_ambiguous;
 pub mod runtime;

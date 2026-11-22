@@ -1152,7 +1152,7 @@ fn kiln_refused_command_lines_name_nothing() {
     let scanned = kiln::scan(
         [10],
         (7, 42),
-        |_| Ok(stat.clone()),
+        |_| Ok(stat.clone().into_bytes()),
         |_| Ok(cmdline.clone().into_bytes()),
         |_| Ok((7, 42)),
     )
@@ -1206,7 +1206,7 @@ fn kiln_s_clap_edges_and_capture_s_required_options() {
         kiln::scan(
             [10],
             (7, 42),
-            |_| Ok(stat.clone()),
+            |_| Ok(stat.clone().into_bytes()),
             |_| Ok(cmdline.clone()),
             |_| Ok((7, 42)),
         )
@@ -1278,7 +1278,7 @@ fn only_the_trusted_kiln_image_with_a_stable_start_is_evidence() {
         |pid| {
             // A PID's first read gives its first start time; a later one the second.
             let first = read.borrow_mut().insert(pid);
-            Ok(stat(pid, table[&pid].1[usize::from(!first)]))
+            Ok(stat(pid, table[&pid].1[usize::from(!first)]).into_bytes())
         },
         |_| Ok(worker.clone().into_bytes()),
         |pid| table[&pid].0.map_err(io::Error::from_raw_os_error),
@@ -1290,10 +1290,41 @@ fn only_the_trusted_kiln_image_with_a_stable_start_is_evidence() {
     let failed = kiln::scan(
         [10],
         kiln,
-        |pid| Ok(stat(pid, 5)),
+        |pid| Ok(stat(pid, 5).into_bytes()),
         |_| Ok(worker.clone().into_bytes()),
         |_| Err(io::Error::from_raw_os_error(libc::EIO)),
     );
+    assert!(failed.is_err());
+}
+
+/// Fix review 2026-11-22 (outside its range): the scan read every process's `stat` as
+/// text, so one process anywhere on the node whose command name isn't UTF-8 (a sandbox's
+/// `prctl(PR_SET_NAME, "\xff")` is enough) failed it, and while that process lived every
+/// checkpoint removal was retained and every inspection incomplete. Read as bytes, the
+/// scan reads past such a name, whether the process is a worker or not, and a stat that
+/// is malformed after the name still fails it.
+#[test]
+fn a_command_name_that_is_not_utf8_does_not_fail_the_scan() {
+    use std::io;
+    let kiln = (7, 42);
+    let worker =
+        format!("kiln\0checkpoint\0rm\0--instance={INSTANCE}\0--checkpoint={CHECKPOINT}\0");
+    let stat = |pid: u32| -> Vec<u8> {
+        match pid {
+            // The worker itself, run through a link named `\xff`.
+            10 => b"10 (\xff) S 1 1 77 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0".to_vec(),
+            // Another account's process, with a `) ` and a newline in its name.
+            11 => b"11 (\xfe) x\n\xff) S 1 11 11 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 600 0 0".to_vec(),
+            _ => b"12 (k) S 1 12 \xff 0".to_vec(),
+        }
+    };
+    let cmdline = |pid: u32| -> io::Result<Vec<u8>> {
+        Ok(if pid == 10 { worker.clone().into_bytes() } else { b"sleep\0x\0".to_vec() })
+    };
+    let scanned = kiln::scan([10, 11], kiln, |pid| Ok(stat(pid)), cmdline, |_| Ok(kiln)).unwrap();
+    assert_eq!(scanned.len(), 1, "{scanned:?}");
+    assert!(named_artifact(&scanned[0]).is_some());
+    let failed = kiln::scan([12], kiln, |pid| Ok(stat(pid)), cmdline, |_| Ok(kiln));
     assert!(failed.is_err());
 }
 
