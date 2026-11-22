@@ -2065,6 +2065,9 @@ pub enum PrepReply {
     /// A C0 refusal: nothing was created and no row should exist.
     Refused {
         reason: String,
+        /// P's timed steps up to the refusal (M3-1, diagnostic only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<super::timing::Step>,
     },
     /// With P's timed steps (M3-1, diagnostic only).
     Revalidated(Box<RevalidatedPlan>, Vec<super::timing::Step>),
@@ -2074,6 +2077,9 @@ pub enum PrepReply {
         /// The plan failed its own bytes or its binding to this token. A daemon verifies
         /// both before C1, so this token cannot be one it holds a charge for.
         malformed: bool,
+        /// P's timed steps up to the refusal (M3-1, diagnostic only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<super::timing::Step>,
     },
     Allocation(NamespaceObservation),
     Node(NodeObservation),
@@ -2293,11 +2299,13 @@ pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat:
         let reply = match request {
             PrepRequest::Preflight { .. } if expired => PrepReply::Refused {
                 reason: "preflight deadline expired".into(),
+                steps: Vec::new(),
             },
             PrepRequest::Revalidate { .. } if expired => PrepReply::Rejected {
                 class: AmbiguousClass::Expired,
                 reason: "create deadline expired before revalidation".into(),
                 malformed: false,
+                steps: Vec::new(),
             },
             PrepRequest::Preflight {
                 instance,
@@ -2313,7 +2321,10 @@ pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat:
                     &mut clock,
                 ) {
                     Ok(prepared) => PrepReply::Prepared(Box::new(prepared), clock.finish()),
-                    Err(reason) => PrepReply::Refused { reason },
+                    Err(reason) => PrepReply::Refused {
+                        reason,
+                        steps: clock.finish(),
+                    },
                 }
             }
             PrepRequest::Revalidate {
@@ -2338,6 +2349,7 @@ pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat:
                         class: AmbiguousClass::CatalogMismatch,
                         reason: refusal.reason,
                         malformed: refusal.malformed,
+                        steps: clock.finish(),
                     },
                 }
             }
@@ -2416,7 +2428,12 @@ pub enum SupervisorEvent {
     VmStarted(ProcessId),
     EffectsDone,
     /// Forward setup ran out of its original deadline. S stops here with nothing further.
-    SetupExpired,
+    SetupExpired {
+        /// M3-1: S's steps since its last record, the unfinished one included
+        /// (diagnostic only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<super::timing::Step>,
+    },
     /// Something S must make durable before it proceeds; H answers with `Recorded`.
     Record {
         seq: u64,
@@ -2447,6 +2464,10 @@ pub enum SupervisorEvent {
     Ready {
         boot_id: String,
         inner_id: String,
+        /// M3-1: S's last steps, `s.journal_ready` ended by H's answer to READY. H logs
+        /// the create's timing line once these arrive (diagnostic only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<super::timing::Step>,
     },
     /// B5: one relay report for a job H gave.
     Broker {
@@ -2675,7 +2696,7 @@ fn real_supervisor(
     deadline_ns: u64,
     plan_generation: u64,
 ) {
-    use super::supervisor::{Abort, LaunchPlan, Link};
+    use super::supervisor::{LaunchPlan, Link};
     let opened = super::timing::now();
     let parsed = match LaunchPlan::parse(plan.as_bytes()) {
         Ok(parsed) => parsed,
@@ -2684,7 +2705,11 @@ fn real_supervisor(
                 0,
                 &SupervisorEvent::LaunchRefused {
                     reason: error.to_string(),
-                    steps: Vec::new(),
+                    steps: vec![super::timing::Step::new(
+                        super::timing::Name::of("s.parse_plan"),
+                        opened,
+                        super::timing::now(),
+                    )],
                 },
                 Duration::from_secs(1),
             );
@@ -2713,14 +2738,8 @@ fn real_supervisor(
         Err(abort) => Some(abort),
     };
     let _ = super::supervisor::contain(&parsed, created.as_ref());
-    match end {
-        Some(Abort::Expired) => link.event(&SupervisorEvent::SetupExpired),
-        Some(Abort::Refused(reason)) => {
-            let reason = format!("at {}: {reason}", link.current_step());
-            let steps = link.timing.finish();
-            link.event(&SupervisorEvent::LaunchRefused { reason, steps })
-        }
-        Some(Abort::Revoked | Abort::HelperGone) | None => {}
+    if let Some(abort) = end {
+        link.report_abort(abort);
     }
     drop(link);
     send_watch_byte(&context.watch, b'E');
@@ -2854,7 +2873,11 @@ fn real_cleanup(
 fn report_setup_expired(context: &mut SupervisorContext) {
     let _ = context
         .control
-        .send(0, &SupervisorEvent::SetupExpired, Duration::from_secs(1));
+        .send(
+            0,
+            &SupervisorEvent::SetupExpired { steps: Vec::new() },
+            Duration::from_secs(1),
+        );
     send_watch_byte(&context.watch, b'E');
 }
 

@@ -1781,10 +1781,8 @@ impl Node {
 
     /// M3-1: ends a timed create, if it is still open, and logs its line.
     fn timing_finish(&self, key: AllocationKey, outcome: timing::Outcome) {
-        let line = self.timings.lock().unwrap().finish(key, outcome);
-        if let Some(line) = line {
-            timing::emit(&line);
-        }
+        let record = self.timings.lock().unwrap().finish(key, outcome);
+        timing::emit_some(record);
     }
 
     fn queue_record(&self, record: LedgerRequest) {
@@ -3296,9 +3294,7 @@ impl Node {
             allocation,
         };
         let evicted = self.timings.lock().unwrap().begin(key, started);
-        if let Some(line) = evicted {
-            timing::emit(&line);
-        }
+        timing::emit_some(evicted);
         self.timed_span(Some(key), "h.preflight.slot", started, issuing);
         self.timed_span(Some(key), "l.issue", issuing, issued_at);
         #[cfg(test)]
@@ -3332,7 +3328,10 @@ impl Node {
                 GroupErrorKind::Unavailable,
                 "preparation bound another token",
             ),
-            Ok(PrepReply::Refused { reason }) => group_error(GroupErrorKind::Incompatible, reason),
+            Ok(PrepReply::Refused { reason, steps }) => {
+                self.timed_steps(key, steps);
+                group_error(GroupErrorKind::Incompatible, reason)
+            }
             Err(CallError::Full) => group_error(
                 GroupErrorKind::ResourceExhausted,
                 "every preparation slot is in use",
@@ -3357,9 +3356,7 @@ impl Node {
             .lock()
             .unwrap()
             .create_call(key, timing::now());
-        if let Some(line) = evicted {
-            timing::emit(&line);
-        }
+        timing::emit_some(evicted);
         let reply = self.clone().create_steps(token, first.then_some(key)).await;
         if first && !matches!(reply, CreateReply::Accepted { replay: false, .. }) {
             self.timing_finish(key, timing::Outcome::Rejected);
@@ -3540,7 +3537,11 @@ impl Node {
                 class,
                 reason,
                 malformed,
+                steps,
             }) => {
+                if let Some(key) = timed {
+                    self.timed_steps(key, steps);
+                }
                 if malformed {
                     gate.close_evictable(class);
                     return ambiguous_create(class, reason);
@@ -3992,20 +3993,22 @@ impl Node {
                     self.on_vm_started(key, target).await;
                 }
                 SupervisorEvent::EffectsDone => {}
-                SupervisorEvent::SetupExpired => {
+                SupervisorEvent::SetupExpired { steps } => {
+                    self.timed_steps(key, steps);
                     self.timing_finish(key, timing::Outcome::Expired);
                     self.contain_allocation(key, "setup deadline expired");
                 }
                 SupervisorEvent::Record { seq, record, steps } => {
                     // M3-1: S's steps since its last record, then H's own handling of
-                    // this one (its L call included). READY's commit ends the timeline.
+                    // this one (its L call included). READY's commit doesn't end the
+                    // timeline: S's last step comes with `Ready`, after this answer.
                     self.timed_steps(key, steps);
                     let name = timing_record_name(&record);
                     let started = timing::now();
                     let ok = self.on_record(key, record).await;
                     self.timed(Some(key), name, started);
                     if ok && name == timing::READY_RECORD {
-                        self.timing_finish(key, timing::Outcome::Ready);
+                        self.timings.lock().unwrap().ready_committed(key);
                     }
                     let channel = self
                         .supervisors
@@ -4038,10 +4041,18 @@ impl Node {
                     }
                     self.contain_allocation(key, "the VMM exited");
                 }
-                SupervisorEvent::Ready { boot_id, inner_id } => {
+                SupervisorEvent::Ready {
+                    boot_id,
+                    inner_id,
+                    steps,
+                } => {
                     if let Some(entry) = self.supervisors.lock().unwrap().get_mut(&key) {
                         entry.ready = Some((boot_id, inner_id));
                     }
+                    // M3-1: S's tail, sent once it had H's answer to READY. The line is
+                    // written only now, after that answer, and never blocks.
+                    let record = self.timings.lock().unwrap().ready_tail(key, steps);
+                    timing::emit_some(record);
                 }
                 SupervisorEvent::Broker { report } => {
                     let job = report.job();
@@ -4076,6 +4087,10 @@ impl Node {
                 }
             }
         }
+        // M3-1: S is gone. A create whose READY was committed but whose tail never came
+        // ends now, marked incomplete; any other waits for its token's fence as before.
+        let record = self.timings.lock().unwrap().supervisor_gone(key);
+        timing::emit_some(record);
     }
 
     /// The precommitted authority's concrete target reaches M before anything else,

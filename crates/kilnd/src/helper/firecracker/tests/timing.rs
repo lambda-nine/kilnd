@@ -3,6 +3,7 @@
 //! that carries no secret of the create it describes.
 use super::*;
 use crate::helper::firecracker::timing::{self, Outcome, Select};
+use crate::helper::firecracker::workers::SupervisorEvent;
 
 /// As reconciliation would: a busy node's observation slot leaves the token charged and
 /// ambiguous, never absent, until a later attempt proves it.
@@ -241,4 +242,223 @@ async fn m3_a_preflight_refused_after_issue_ends_its_timeline() {
     assert_eq!(names[..2], ["h.preflight.slot", "l.issue"], "{names:?}");
     assert!(names.contains(&"p.preflight"), "{names:?}");
     assert!(!names.contains(&"h.preflight.reply"), "{names:?}");
+}
+
+/// A node config with no profile, for a supervisor link this test drives alone.
+fn bare_config(root: &Path) -> NodeConfig {
+    let walk = walk_for(root);
+    let node_id = Id128::random();
+    NodeConfig {
+        node_id,
+        ledger: LedgerConfig {
+            directory: root.join("ledger"),
+            policy: walk.clone(),
+            node_id,
+            ceilings: NodeCeilings::default(),
+            shared: SharedReserve::default(),
+            max_enrolled: DEFAULT_MAX_ENROLLED,
+            compaction: CompactionPolicy::default(),
+        },
+        ranges: IdentityRanges::default(),
+        profiles: Vec::new(),
+        walk,
+        gate: ManifestGate::TestApproved,
+        observation: ObservationBackend::FakeDirectory(root.join("fake")),
+        timings: Timings::default(),
+        helper_image: None,
+        // SAFETY: geteuid has no preconditions.
+        helper_uid: unsafe { libc::geteuid() },
+        max_enrolled: DEFAULT_MAX_ENROLLED,
+        test: TestInjection::default(),
+    }
+}
+
+/// What H saw from one supervisor link: each event, and for a record the moment H sent
+/// its answer.
+struct Seen {
+    event: SupervisorEvent,
+    answered_ns: Option<u64>,
+}
+
+/// Runs `drive` on a real `Link` whose H is a thread here that answers every record.
+fn through_link(drive: impl FnOnce(&mut super::super::supervisor::Link<'_>)) -> Vec<Seen> {
+    use super::super::workers::{Endpoint, Received, SupervisorCommand, SupervisorContext};
+    let temp = tempfile::tempdir().unwrap();
+    let (s_end, h_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (watch, _monitor) = std::os::unix::net::UnixStream::pair().unwrap();
+    let helper = std::thread::spawn(move || {
+        let mut h = Endpoint::new(h_end);
+        let mut seen = Vec::new();
+        loop {
+            match h.receive::<SupervisorEvent>(Duration::from_millis(20)) {
+                Ok(Received::Message { body, .. }) => {
+                    let answered_ns = if let SupervisorEvent::Record { seq, .. } = &body {
+                        let at = timing::now();
+                        h.send(
+                            0,
+                            &SupervisorCommand::Recorded { seq: *seq, ok: true },
+                            Duration::from_secs(1),
+                        )
+                        .unwrap();
+                        Some(at)
+                    } else {
+                        None
+                    };
+                    seen.push(Seen {
+                        event: body,
+                        answered_ns,
+                    });
+                }
+                Ok(Received::Idle) => {}
+                Ok(Received::Closed) | Err(_) => return seen,
+            }
+        }
+    });
+    let mut context = SupervisorContext {
+        config: Arc::new(bare_config(temp.path())),
+        instance: Id128::random(),
+        allocation: Id128::random(),
+        profile: PROFILE.into(),
+        control: Endpoint::new(s_end),
+        watch,
+        descriptors: None,
+    };
+    {
+        let mut link = super::super::supervisor::Link::new(&mut context, u64::MAX);
+        drive(&mut link);
+    }
+    drop(context);
+    helper.join().unwrap()
+}
+
+fn names(steps: &[timing::Step]) -> Vec<&'static str> {
+    steps.iter().map(|s| s.name.as_str()).collect()
+}
+
+/// M3-1 follow-up: S's frames carry S's steps. A record carries the steps finished before
+/// it; READY's own step stays open until H answers, and comes on `Ready`, which S sends
+/// only after that answer. A refusal and an expiry carry the step they stopped in.
+#[test]
+fn m3_s_frames_carry_its_steps_and_readys_tail_follows_the_answer() {
+    use super::super::supervisor::{Abort, SupervisorRecord};
+    let seen = through_link(|link| {
+        link.step("cgroup").unwrap();
+        link.step("join").unwrap();
+        link.record(SupervisorRecord::Initialize).unwrap();
+        link.step("broker_ready").unwrap();
+        link.record_ready().unwrap();
+        link.report_ready("boot".into(), "inner".into());
+    });
+    let [first, ready_record, ready] = &seen[..] else {
+        panic!("three frames");
+    };
+    let SupervisorEvent::Record { steps, .. } = &first.event else {
+        panic!("{:?}", first.event);
+    };
+    assert_eq!(names(steps), ["s.cgroup"], "the open step stays for later");
+    let SupervisorEvent::Record { steps, record, .. } = &ready_record.event else {
+        panic!("{:?}", ready_record.event);
+    };
+    assert!(
+        matches!(record, SupervisorRecord::Phase { to, .. } if to == "ready"),
+        "{record:?}"
+    );
+    assert_eq!(names(steps), ["s.join", "s.broker_ready"]);
+    let SupervisorEvent::Ready { steps, .. } = &ready.event else {
+        panic!("{:?}", ready.event);
+    };
+    assert_eq!(names(steps), [timing::READY_TAIL]);
+    let tail = steps[0];
+    assert_eq!(tail.records, 1, "{tail:?}");
+    assert!(
+        tail.end_ns >= ready_record.answered_ns.unwrap(),
+        "READY's step ends at H's answer: {tail:?}"
+    );
+
+    for (abort, step) in [
+        (Abort::Refused("no".into()), "s.loop"),
+        (Abort::Expired, "s.mkfs"),
+    ] {
+        let expired = matches!(abort, Abort::Expired);
+        let seen = through_link(move |link| {
+            link.step(step.strip_prefix("s.").unwrap()).unwrap();
+            link.report_abort(abort);
+        });
+        let steps = match &seen[..] {
+            [Seen {
+                event: SupervisorEvent::LaunchRefused { steps, .. },
+                ..
+            }] if !expired => steps,
+            [Seen {
+                event: SupervisorEvent::SetupExpired { steps },
+                ..
+            }] if expired => steps,
+            other => panic!("{:?}", other.iter().map(|s| &s.event).collect::<Vec<_>>()),
+        };
+        assert_eq!(names(steps), [step]);
+    }
+}
+
+/// The only timing record so far, once it is logged.
+async fn only_record(fixture: &Fixture) -> timing::Record {
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let records = timing::read_records(fixture.log().as_bytes(), Select::Last(5)).unwrap();
+        if let Some(record) = records.into_iter().next() {
+            return record;
+        }
+        assert!(std::time::Instant::now() < end, "{}", fixture.log());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// M3-1 follow-up: P's refusals carry P's clock, up to the step that refused, as its
+/// successful replies do. A changed artifact refuses at its hash.
+#[tokio::test]
+async fn m3_a_p_refusals_carry_ps_steps() {
+    let altered = |fixture: &Fixture| {
+        let path = fixture.root.join("bundle").join("rootfs.squashfs");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut changed = std::fs::read(&path).unwrap();
+        changed.push(b' ');
+        std::fs::write(&path, &changed).unwrap();
+    };
+    // Preflight: refused after its token was issued.
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    altered(&fixture);
+    assert!(
+        runtime
+            .prepare(&prep(instance), &spec(), deadline(10), &no_cancel())
+            .await
+            .is_err()
+    );
+    let record = only_record(&fixture).await;
+    assert_eq!(record.outcome, Outcome::PreflightRefused);
+    let named = names(&record.steps);
+    for wanted in ["p.preflight", "p.preflight.walk", "p.preflight.hash.rootfs"] {
+        assert!(named.contains(&wanted), "{wanted}: {named:?}");
+    }
+    assert!(!named.contains(&"p.preflight.table"), "{named:?}");
+
+    // Revalidation: rejected at Create.
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let runtime = fixture.runtime(instance, Id128::random());
+    let (context, plan) = issued(&runtime, instance).await;
+    altered(&fixture);
+    let reply = raw_create(&fixture, &context, epoch_of(&runtime).await, &plan).await;
+    assert_eq!(class_of(&reply), AmbiguousClass::CatalogMismatch);
+    let record = only_record(&fixture).await;
+    assert_eq!(record.outcome, Outcome::Rejected);
+    let named = names(&record.steps);
+    for wanted in [
+        "p.revalidate",
+        "p.revalidate.verify_plan",
+        "p.revalidate.walk",
+        "p.revalidate.hash.rootfs",
+    ] {
+        assert!(named.contains(&wanted), "{wanted}: {named:?}");
+    }
+    assert!(!named.contains(&"p.revalidate.table"), "{named:?}");
 }

@@ -501,6 +501,36 @@ impl Fixture {
             .append(true)
             .open(self.root.join("child.log"))
             .unwrap();
+        // The helper's stderr is a stream socket, as journald gives the installed unit:
+        // a timing line is written only where a write can't block (M3-1 follow-up). A
+        // thread here appends whole lines to the same log.
+        let (stderr, mut drain) = std::os::unix::net::UnixStream::pair().unwrap();
+        for (fd, option) in [
+            (stderr.as_raw_fd(), libc::SO_SNDBUF),
+            (drain.as_raw_fd(), libc::SO_RCVBUF),
+        ] {
+            let size: libc::c_int = 1 << 20;
+            // SAFETY: a valid option value of its own size; failure keeps the default.
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+        }
+        let mut appended = log.try_clone().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let mut lines = std::io::BufReader::new(&mut drain);
+            let mut line = Vec::new();
+            while matches!(lines.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+                let _ = appended.write_all(&line);
+                line.clear();
+            }
+        });
         let child = {
             let _guard = crate::process::spawn_guard();
             // The real chain runs H from its protected installed image.
@@ -516,8 +546,8 @@ impl Fixture {
                     "--nocapture",
                 ])
                 .env(FIXTURE_ENV, &self.root)
-                .stdout(log.try_clone().unwrap())
-                .stderr(log)
+                .stdout(log)
+                .stderr(std::process::Stdio::from(std::os::fd::OwnedFd::from(stderr)))
                 .spawn()
                 .unwrap()
         };

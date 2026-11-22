@@ -864,7 +864,8 @@ async fn b5_linux_root_boot_timings() {
 }
 
 /// M3-1: the same two warmups and twenty cold creates as B5's boot timings, each with
-/// its helper timing line: every step from Preflight to READY, S's included, and a
+/// its helper timing line: every step from Preflight to READY, S's included (its last,
+/// `s.journal_ready`, ended by H's answer to READY), and a
 /// waterfall and summary that hold no boot nonce or work UUID of any create.
 #[tokio::test]
 #[ignore = "needs root with the B4 launch capabilities: run scripts/b4-vm-tests.sh"]
@@ -906,6 +907,9 @@ async fn m3_linux_root_create_waterfall() {
         assert_eq!(found.len(), 1, "one timing line for {allocation}");
         let record = found.remove(0);
         assert_eq!(record.outcome, Outcome::Ready, "{allocation}");
+        // M3-1 follow-up: the line waited for S's tail, and no line was dropped.
+        assert!(!record.incomplete, "{allocation}");
+        assert_eq!(record.dropped, 0, "{allocation}");
         let names: Vec<&str> = record.steps.iter().map(|s| s.name.as_str()).collect();
         for wanted in [
             "l.admit",
@@ -919,6 +923,7 @@ async fn m3_linux_root_create_waterfall() {
             "h.rec.phase.booting",
             "s.broker_ready",
             "h.rec.phase.ready",
+            timing::READY_TAIL,
         ] {
             assert!(names.contains(&wanted), "{wanted} missing: {names:?}");
         }

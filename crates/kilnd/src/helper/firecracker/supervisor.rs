@@ -493,6 +493,45 @@ impl<'a> Link<'a> {
         let _ = self.context.control.send(0, event, Duration::from_secs(1));
     }
 
+    /// Journals READY. Its own step, `s.journal_ready`, stays open until H answers, so
+    /// it travels on [`Link::report_ready`], S's next frame (M3-1).
+    pub fn record_ready(&mut self) -> Result<(), Abort> {
+        self.timing
+            .begin(super::timing::Name::of(super::timing::READY_TAIL));
+        self.record(SupervisorRecord::Phase {
+            from: vec!["booting".into()],
+            to: "ready".into(),
+        })
+    }
+
+    /// Tells H the broker is ready, with S's last steps: H logs the create's timing line
+    /// once these arrive, so the line holds `s.journal_ready`.
+    pub fn report_ready(&mut self, boot_id: String, inner_id: String) {
+        let steps = self.timing.finish();
+        self.event(&SupervisorEvent::Ready {
+            boot_id,
+            inner_id,
+            steps,
+        });
+    }
+
+    /// Reports how forward work stopped, with S's steps since its last record, the
+    /// unfinished one included. A revoked S, or one whose H is gone, reports nothing.
+    pub fn report_abort(&mut self, abort: Abort) {
+        match abort {
+            Abort::Expired => {
+                let steps = self.timing.finish();
+                self.event(&SupervisorEvent::SetupExpired { steps });
+            }
+            Abort::Refused(reason) => {
+                let reason = format!("at {}: {reason}", self.current_step());
+                let steps = self.timing.finish();
+                self.event(&SupervisorEvent::LaunchRefused { reason, steps });
+            }
+            Abort::Revoked | Abort::HelperGone => {}
+        }
+    }
+
     /// Sends one record and waits for H's durable answer, heartbeating meanwhile. The
     /// record carries S's completed step timings (M3-1).
     pub fn record(&mut self, record: SupervisorRecord) -> Result<(), Abort> {

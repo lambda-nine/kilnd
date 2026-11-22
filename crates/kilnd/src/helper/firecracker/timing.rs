@@ -5,16 +5,23 @@
 //! timeline per create in memory and, once the create ends, writes it as one routine log
 //! line. Nothing here is journaled, decides anything or changes when anything happens.
 //!
-//! A line holds the allocation ID (kilnd already logs it as the backend ID `fc-<id>`), an
-//! outcome and step names from the fixed table below, and numbers. Never a boot nonce,
-//! token key, work UUID, identity, path or reason: `kilnd-helper create-timings` reads only
-//! these fields back, and refuses a step name outside the table.
+//! A line holds the allocation ID, an outcome, step names from the fixed table below, and
+//! numbers. The allocation ID is logged on purpose, so an operator can pick one create's
+//! line: kilnd already logs it as the backend ID `fc-<id>`. No boot nonce, token key, work
+//! UUID, instance or sandbox ID, leased uid, gid or cid, path or refusal reason is logged:
+//! `kilnd-helper create-timings` reads only these fields back, and refuses a step name
+//! outside the table.
+//!
+//! H never waits for a line. It writes one only after the create has ended, never before
+//! it has answered S's READY record, and only with a write that can't block: see [`emit`].
 use super::identity::AllocationKey;
 use crate::model::Id128;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Read};
+use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What precedes the JSON of every timing line, wherever it is found in a log line.
 pub const LINE_PREFIX: &str = "kilnd-helper: create timing v1 ";
@@ -387,13 +394,27 @@ impl Outcome {
 pub struct Record {
     pub allocation: Id128,
     pub outcome: Outcome,
+    /// READY was journaled, but S's last steps never reached H: S was gone, or the
+    /// timeline was ended for room, before S's next frame.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub incomplete: bool,
+    /// Lines this helper dropped before this one, since it started, because they could
+    /// not be written without blocking (see [`emit`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped: u64,
     pub steps: Vec<Step>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 struct Timeline {
     anchor_ns: u64,
     steps: Vec<Step>,
     created: bool,
+    /// L committed READY; the line waits for S's last steps, on its next frame.
+    ready: bool,
 }
 
 /// H's open timelines, bounded.
@@ -404,8 +425,8 @@ pub struct Book {
 }
 
 impl Book {
-    /// A new timeline anchored at `anchor_ns`. Returns the line of one evicted for it.
-    pub fn begin(&mut self, key: AllocationKey, anchor_ns: u64) -> Option<String> {
+    /// A new timeline anchored at `anchor_ns`. Returns the record of one evicted for it.
+    pub fn begin(&mut self, key: AllocationKey, anchor_ns: u64) -> Option<Record> {
         if self.open.contains_key(&key) {
             return None;
         }
@@ -423,6 +444,7 @@ impl Book {
                 anchor_ns,
                 steps: Vec::new(),
                 created: false,
+                ready: false,
             },
         );
         self.order.push_back(key);
@@ -431,7 +453,7 @@ impl Book {
 
     /// The first Create of this token; a duplicate's steps are not recorded. Creates a
     /// timeline anchored here if H never saw this token's Preflight.
-    pub fn create_call(&mut self, key: AllocationKey, at: u64) -> (bool, Option<String>) {
+    pub fn create_call(&mut self, key: AllocationKey, at: u64) -> (bool, Option<Record>) {
         let evicted = self.begin(key, at);
         let timeline = self.open.get_mut(&key).expect("just begun");
         if timeline.created {
@@ -460,11 +482,41 @@ impl Book {
         self.open.contains_key(&key)
     }
 
-    /// Ends the timeline and returns its line (without [`LINE_PREFIX`]).
-    pub fn finish(&mut self, key: AllocationKey, outcome: Outcome) -> Option<String> {
+    /// L committed this create's READY. Its line waits for S's last steps, which S sends
+    /// with its next frame, after H's answer: [`Book::ready_tail`].
+    pub fn ready_committed(&mut self, key: AllocationKey) {
+        if let Some(timeline) = self.open.get_mut(&key) {
+            timeline.ready = true;
+        }
+    }
+
+    /// S's last steps after READY (`s.journal_ready`, closed by H's answer): the
+    /// timeline ends as READY, complete.
+    pub fn ready_tail(&mut self, key: AllocationKey, steps: Vec<Step>) -> Option<Record> {
+        self.steps(key, steps);
+        self.finish(key, Outcome::Ready)
+    }
+
+    /// S is gone. A timeline whose READY was committed ends now, as READY but
+    /// incomplete; any other stays open for its token's fence, as before.
+    pub fn supervisor_gone(&mut self, key: AllocationKey) -> Option<Record> {
+        if self.open.get(&key).is_some_and(|timeline| timeline.ready) {
+            self.finish(key, Outcome::Ready)
+        } else {
+            None
+        }
+    }
+
+    /// Ends the timeline and returns its record. Once READY is committed the outcome is
+    /// READY whatever ended it, and incomplete unless S's last steps came first.
+    pub fn finish(&mut self, key: AllocationKey, outcome: Outcome) -> Option<Record> {
         let timeline = self.open.remove(&key)?;
         self.order.retain(|other| *other != key);
         let anchor = timeline.anchor_ns;
+        let tail = timeline
+            .steps
+            .iter()
+            .any(|step| step.name.as_str() == READY_TAIL);
         let steps = timeline
             .steps
             .into_iter()
@@ -474,14 +526,24 @@ impl Book {
                 step
             })
             .collect();
-        serde_json::to_string(&Record {
+        let (outcome, incomplete) = if timeline.ready {
+            (Outcome::Ready, !tail)
+        } else {
+            (outcome, false)
+        };
+        Some(Record {
             allocation: key.allocation,
             outcome,
+            incomplete,
+            dropped: 0,
             steps,
         })
-        .ok()
     }
 }
+
+/// S's last step, from sending the READY record to H's answer. It reaches H on the frame
+/// after that answer.
+pub const READY_TAIL: &str = "s.journal_ready";
 
 fn push(timeline: &mut Timeline, step: Step) {
     if timeline.steps.len() < MAX_TIMELINE_STEPS {
@@ -489,51 +551,120 @@ fn push(timeline: &mut Timeline, step: Step) {
     }
 }
 
-/// Writes one finished timeline to standard error without ever blocking H: on a socket
-/// (journald's stream, under systemd) a single non-blocking send, dropped if the socket
-/// can't take it; on a regular file an ordinary write; anything else (a pipe, a
-/// terminal, which a stalled reader could block) is skipped.
-pub fn emit(json: &str) {
-    let mut line = String::with_capacity(LINE_PREFIX.len() + json.len() + 1);
-    line.push_str(LINE_PREFIX);
-    line.push_str(json);
-    line.push('\n');
-    let bytes = line.as_bytes();
+/// Lines not written since this helper started, because no write that can't block
+/// could take them whole.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Lines dropped so far; the next line written carries this count.
+pub fn dropped() -> u64 {
+    DROPPED.load(Ordering::Relaxed)
+}
+
+/// Writes one finished timeline to standard error. See [`emit_to`].
+pub fn emit(record: Record) {
+    emit_to(libc::STDERR_FILENO, record);
+}
+
+/// [`emit`], when a timeline did end.
+pub fn emit_some(record: Option<Record>) {
+    if let Some(record) = record {
+        emit(record);
+    }
+}
+
+/// Writes one finished timeline to `fd` without ever blocking H, which runs every
+/// create on one thread. Returns whether the whole line was written; any other line is
+/// dropped and counted, and the next line written carries the count as `dropped`.
+///
+/// - A socket (journald's stream, under systemd): one send with `MSG_DONTWAIT`.
+/// - On Linux, a pipe, FIFO or terminal: one write through a private reopening of the
+///   same pipe or device with `O_NONBLOCK`, so the shared descriptor's flags never
+///   change under anyone else. A reader that doesn't keep up costs the line, never time.
+/// - A regular file, and on other systems a pipe or terminal: dropped. No write to them
+///   is sure not to block, and the shipped unit logs to journald's socket.
+pub fn emit_to(fd: RawFd, mut record: Record) -> bool {
+    record.dropped = dropped();
+    let written = match serde_json::to_string(&record) {
+        Ok(json) => {
+            let mut line = String::with_capacity(LINE_PREFIX.len() + json.len() + 1);
+            line.push_str(LINE_PREFIX);
+            line.push_str(&json);
+            line.push('\n');
+            write_nonblocking(fd, line.as_bytes())
+        }
+        Err(_) => false,
+    };
+    if !written {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    written
+}
+
+fn write_nonblocking(fd: RawFd, bytes: &[u8]) -> bool {
     // SAFETY: stat is writable; fstat on a possibly closed descriptor only fails.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(libc::STDERR_FILENO, &mut stat) } != 0 {
-        return;
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return false;
     }
     match stat.st_mode & libc::S_IFMT {
-        libc::S_IFSOCK => {
-            // SAFETY: the slice is live for the call.
-            let sent = unsafe {
-                libc::send(
-                    libc::STDERR_FILENO,
-                    bytes.as_ptr().cast(),
-                    bytes.len(),
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                )
-            };
-            // A partial line is ended, so it can't run into the next one.
-            if sent > 0 && (sent as usize) < bytes.len() {
-                // SAFETY: a one-byte static buffer.
-                unsafe {
-                    libc::send(
-                        libc::STDERR_FILENO,
-                        b"\n".as_ptr().cast(),
-                        1,
-                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                    )
-                };
-            }
-        }
-        libc::S_IFREG => {
-            // SAFETY: the slice is live for the call.
-            unsafe { libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len()) };
-        }
-        _ => {}
+        libc::S_IFSOCK => send_once(fd, bytes),
+        #[cfg(target_os = "linux")]
+        libc::S_IFIFO | libc::S_IFCHR => write_reopened(fd, bytes),
+        _ => false,
     }
+}
+
+/// One non-blocking send. A partial line is ended, so it can't run into the next one,
+/// and counts as dropped.
+fn send_once(fd: RawFd, bytes: &[u8]) -> bool {
+    let send = |bytes: &[u8]| {
+        // SAFETY: the slice is live for the call.
+        unsafe {
+            libc::send(
+                fd,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        }
+    };
+    let sent = send(bytes);
+    if sent > 0 && (sent as usize) < bytes.len() {
+        send(b"\n");
+    }
+    sent >= 0 && sent as usize == bytes.len()
+}
+
+/// One write through a new, non-blocking open file description of the same pipe or
+/// device. `O_NONBLOCK` set on `fd` itself would change it for every process sharing it.
+#[cfg(target_os = "linux")]
+fn write_reopened(fd: RawFd, bytes: &[u8]) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let Ok(path) = std::ffi::CString::new(format!("/proc/self/fd/{fd}")) else {
+        return false;
+    };
+    // SAFETY: a valid C string; O_NONBLOCK makes neither the open nor the write wait (a
+    // FIFO without a reader is refused at once).
+    let reopened = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if reopened < 0 {
+        return false;
+    }
+    // SAFETY: just opened and owned here.
+    let reopened = unsafe { OwnedFd::from_raw_fd(reopened) };
+    let write = |bytes: &[u8]| {
+        // SAFETY: the slice is live for the call.
+        unsafe { libc::write(reopened.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) }
+    };
+    let written = write(bytes);
+    if written > 0 && (written as usize) < bytes.len() {
+        write(b"\n");
+    }
+    written >= 0 && written as usize == bytes.len()
 }
 
 // ---- the operator's report -------------------------------------------------------------
@@ -649,12 +780,19 @@ pub fn waterfall(record: &Record) -> String {
         record.allocation,
         record.outcome.as_str()
     );
+    if record.incomplete {
+        out.push_str(" (incomplete)");
+    }
     for (label, name) in [("booting", BOOTING_RECORD), ("ready", READY_RECORD)] {
         if let Some(at) = milestone(record, name) {
             let _ = write!(out, "  {label} {} ms", ms(at));
         }
     }
-    let _ = writeln!(out, "  steps {}", record.steps.len());
+    let _ = write!(out, "  steps {}", record.steps.len());
+    if record.dropped > 0 {
+        let _ = write!(out, "  dropped before {}", record.dropped);
+    }
+    out.push('\n');
     let _ = writeln!(
         out,
         "{:>11} {:>10} {:>6} {:>10} {:>5} {:>10} {:>5}  step",
@@ -927,10 +1065,10 @@ mod tests {
         let (again, _) = book.create_call(key(1), 2_500);
         assert!(!again, "a duplicate Create is not timed");
         book.steps(key(1), vec![Step::new(Name::of("s.mkfs"), 3_000, 3_400)]);
-        let line = book.finish(key(1), Outcome::Ready).unwrap();
+        let record = book.finish(key(1), Outcome::Ready).unwrap();
         assert!(book.finish(key(1), Outcome::Ready).is_none(), "once");
-        let record: Record = serde_json::from_str(&line).unwrap();
         assert_eq!(record.outcome, Outcome::Ready);
+        assert!(!record.incomplete);
         let offsets: Vec<_> = record
             .steps
             .iter()
@@ -947,15 +1085,13 @@ mod tests {
         // A Create H never saw the Preflight of is anchored at its call.
         let (first, _) = book.create_call(key(2), 5_000);
         assert!(first);
-        let record: Record =
-            serde_json::from_str(&book.finish(key(2), Outcome::Rejected).unwrap()).unwrap();
+        let record = book.finish(key(2), Outcome::Rejected).unwrap();
         assert_eq!(record.steps[0].start_ns, 0);
         // Full: the oldest makes room, ended as evicted.
         for n in 0..MAX_OPEN {
             assert!(book.begin(key(10 + n as u8), n as u64).is_none());
         }
-        let evicted: Record =
-            serde_json::from_str(&book.begin(key(200), 0).expect("one evicted")).unwrap();
+        let evicted = book.begin(key(200), 0).expect("one evicted");
         assert_eq!(
             (evicted.allocation, evicted.outcome),
             (key(10).allocation, Outcome::Evicted)
@@ -965,8 +1101,7 @@ mod tests {
         for at in 0..(MAX_TIMELINE_STEPS as u64 + 5) {
             book.step(key(200), Step::new(Name::of("h.rec.intent"), at, at));
         }
-        let record: Record =
-            serde_json::from_str(&book.finish(key(200), Outcome::Absent).unwrap()).unwrap();
+        let record = book.finish(key(200), Outcome::Absent).unwrap();
         assert_eq!(record.steps.len(), MAX_TIMELINE_STEPS);
     }
 
@@ -1057,8 +1192,8 @@ mod tests {
             step.retries,
         ) = (1, 2, 3, 4, 5);
         book.step(key(7), step);
-        let line = book.finish(key(7), Outcome::Ready).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let record = book.finish(key(7), Outcome::Ready).unwrap();
+        let value = serde_json::to_value(&record).unwrap();
         let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys, ["allocation", "outcome", "steps"]);
         let keys: Vec<_> = value["steps"][0]
@@ -1068,5 +1203,182 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(keys, ["e", "n", "p", "r", "rw", "s", "w", "x"]);
+    }
+    /// READY's commit doesn't end the line: S's last step comes on its next frame, after
+    /// H's answer. Without it the line still ends, once, as READY marked incomplete.
+    #[test]
+    fn ready_waits_for_the_supervisors_tail() {
+        let tail = |at: u64| vec![Step::new(Name::of(READY_TAIL), at, at + 5)];
+        let mut book = Book::default();
+        book.begin(key(1), 0);
+        book.step(key(1), Step::new(Name::of(READY_RECORD), 10, 20));
+        book.ready_committed(key(1));
+        assert!(book.is_open(key(1)), "the commit alone ends nothing");
+        assert!(book.supervisor_gone(key(9)).is_none());
+        let record = book.ready_tail(key(1), tail(15)).unwrap();
+        assert_eq!((record.outcome, record.incomplete), (Outcome::Ready, false));
+        assert!(record.steps.iter().any(|s| s.name.as_str() == READY_TAIL));
+        assert!(book.ready_tail(key(1), tail(15)).is_none(), "once");
+        assert!(book.supervisor_gone(key(1)).is_none(), "once");
+
+        // S gone after the commit, before its tail.
+        book.begin(key(2), 0);
+        book.ready_committed(key(2));
+        let record = book.supervisor_gone(key(2)).unwrap();
+        assert_eq!((record.outcome, record.incomplete), (Outcome::Ready, true));
+        // A tail without the step, or another end after the commit, is incomplete READY.
+        book.begin(key(3), 0);
+        book.ready_committed(key(3));
+        let record = book.ready_tail(key(3), Vec::new()).unwrap();
+        assert_eq!((record.outcome, record.incomplete), (Outcome::Ready, true));
+        book.begin(key(4), 0);
+        book.ready_committed(key(4));
+        let record = book.finish(key(4), Outcome::Absent).unwrap();
+        assert_eq!((record.outcome, record.incomplete), (Outcome::Ready, true));
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["incomplete"], true);
+        // Before any commit, S's exit leaves the timeline for its token's fence.
+        book.begin(key(5), 0);
+        assert!(book.supervisor_gone(key(5)).is_none());
+        let record = book.finish(key(5), Outcome::Absent).unwrap();
+        assert_eq!((record.outcome, record.incomplete), (Outcome::Absent, false));
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(value.get("incomplete").is_none() && value.get("dropped").is_none());
+    }
+
+    fn one_record() -> Record {
+        let mut book = Book::default();
+        book.begin(key(3), 0);
+        book.step(key(3), Step::new(Name::of("l.issue"), 1, 2));
+        book.finish(key(3), Outcome::Ready).unwrap()
+    }
+
+    /// Runs `emit_to` on its own thread: a write that blocked would hang this test.
+    fn emit_within(fd: RawFd, bound: std::time::Duration) -> (bool, std::time::Duration) {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let written = emit_to(fd, one_record());
+            let _ = done.send((written, started.elapsed()));
+        });
+        result
+            .recv_timeout(bound)
+            .expect("emit_to blocked on a stalled sink")
+    }
+
+    fn pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: fds is writable.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both just created and owned here.
+        unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    fn set_nonblocking(fd: RawFd, on: bool) {
+        // SAFETY: fcntl on an owned descriptor.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            let flags = if on {
+                flags | libc::O_NONBLOCK
+            } else {
+                flags & !libc::O_NONBLOCK
+            };
+            assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags), 0);
+        }
+    }
+
+    /// Fills `fd` until not one more byte fits, then leaves it blocking, as a stderr
+    /// whose reader has stalled would be.
+    fn fill(fd: RawFd, socket: bool) {
+        set_nonblocking(fd, true);
+        for chunk in [65_536usize, 1] {
+            let bytes = vec![b'x'; chunk];
+            loop {
+                // SAFETY: the buffer is live for the call.
+                let n = unsafe {
+                    if socket {
+                        libc::send(fd, bytes.as_ptr().cast(), chunk, libc::MSG_DONTWAIT)
+                    } else {
+                        libc::write(fd, bytes.as_ptr().cast(), chunk)
+                    }
+                };
+                if n <= 0 {
+                    break;
+                }
+            }
+        }
+        set_nonblocking(fd, false);
+    }
+
+    /// M3-1 follow-up: a stalled sink costs the line, never time. H emits on the thread
+    /// that answers S, so a write that waited could hold S's acknowledgements.
+    #[test]
+    fn a_stalled_sink_never_blocks_the_emit_and_drops_are_counted() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd;
+        let bound = std::time::Duration::from_secs(10);
+
+        // A full, blocking pipe nobody reads: H's stderr behind a stalled reader.
+        let (_reader, writer) = pipe();
+        fill(writer.as_raw_fd(), false);
+        let before = dropped();
+        let (written, took) = emit_within(writer.as_raw_fd(), bound);
+        assert!(!written, "a full pipe takes no line");
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        assert!(dropped() > before, "the drop is counted");
+
+        // A full, blocking socket. (Darwin can block a partial send despite MSG_DONTWAIT;
+        // H's journald socket is a Linux one.)
+        #[cfg(target_os = "linux")]
+        {
+            let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            fill(ours.as_raw_fd(), true);
+            let before = dropped();
+            let (written, took) = emit_within(ours.as_raw_fd(), bound);
+            assert!(!written, "a full socket takes no line");
+            assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+            assert!(dropped() > before);
+        }
+
+        // A regular file is never written: no write to it is sure not to block.
+        let file = tempfile::tempfile().unwrap();
+        let before = dropped();
+        assert!(!emit_within(file.as_raw_fd(), bound).0);
+        assert!(dropped() > before);
+        assert_eq!(file.metadata().unwrap().len(), 0);
+
+        // A socket with room takes the whole line, which carries the count so far.
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let floor = dropped();
+        assert!(emit_within(ours.as_raw_fd(), bound).0);
+        drop(ours);
+        let mut text = String::new();
+        theirs.read_to_string(&mut text).unwrap();
+        let records = read_records(text.as_bytes(), Select::Last(5)).unwrap();
+        assert_eq!(records.len(), 1, "{text}");
+        assert!(records[0].dropped >= floor && floor >= 2, "{text}");
+
+        // A pipe with room: written on Linux, through its own non-blocking reopening,
+        // and left blocking for everyone else; dropped elsewhere.
+        let (reader, writer) = pipe();
+        let written = emit_within(writer.as_raw_fd(), bound).0;
+        // SAFETY: fcntl on an owned descriptor.
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0, "the shared descriptor is unchanged");
+        drop(writer);
+        let mut text = String::new();
+        std::fs::File::from(reader).read_to_string(&mut text).unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(written);
+            assert_eq!(read_records(text.as_bytes(), Select::Last(5)).unwrap().len(), 1);
+        } else {
+            assert!(!written && text.is_empty());
+        }
     }
 }

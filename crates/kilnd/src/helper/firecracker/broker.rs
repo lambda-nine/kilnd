@@ -1813,17 +1813,10 @@ pub mod supervise {
             boot_id: boot_id.to_string(),
             inner_id: inner_id.to_string(),
         }))?;
-        link.timing.begin(super::super::timing::Name::of("s.journal_ready"));
-        link.record(SupervisorRecord::Phase {
-            from: vec!["booting".into()],
-            to: "ready".into(),
-        })?;
+        link.record_ready()?;
         workers.expected.boot_id = Some(boot_id.clone());
         workers.expected.inner_id = Some(inner_id.clone());
-        link.event(&SupervisorEvent::Ready {
-            boot_id: boot_id.to_string(),
-            inner_id: inner_id.to_string(),
-        });
+        link.report_ready(boot_id.to_string(), inner_id.to_string());
         Ok((boot_id, inner_id))
     }
 
