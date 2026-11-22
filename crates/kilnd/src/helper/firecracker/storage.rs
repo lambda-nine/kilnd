@@ -890,6 +890,16 @@ mod linux {
     /// number on the same descriptor, verification and disabled discard. A busy slot is
     /// a conflict, never a replacement.
     pub fn attach_loop(binding: &LoopBinding, backing: &File) -> io::Result<AttachedLoop> {
+        attach_loop_marked(binding, backing, &mut || {})
+    }
+
+    /// [`attach_loop`], calling `before_discard_off` just before discard is disabled
+    /// (M3-1's step timings; it decides nothing).
+    pub fn attach_loop_marked(
+        binding: &LoopBinding,
+        backing: &File,
+        before_discard_off: &mut dyn FnMut(),
+    ) -> io::Result<AttachedLoop> {
         let meta = backing.metadata()?;
         if meta.dev() != binding.backing_dev
             || meta.ino() != binding.backing_ino
@@ -929,6 +939,7 @@ mod linux {
         {
             return Err(io::Error::other("loop binding differs from the intent"));
         }
+        before_discard_off();
         disable_discard(binding.minor)?;
         Ok(AttachedLoop {
             configured,

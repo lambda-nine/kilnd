@@ -293,6 +293,17 @@ pub fn verify_artifacts(
     owner_uid: u32,
     manifest: &VerifiedManifest,
 ) -> Result<(), String> {
+    verify_artifacts_with(bundle, owner_uid, manifest, &mut |_| {})
+}
+
+/// [`verify_artifacts`], calling `before_hash` with each artifact's name just before it
+/// is opened and hashed (M3-1's step timings; it decides nothing).
+pub fn verify_artifacts_with(
+    bundle: &ProtectedDir,
+    owner_uid: u32,
+    manifest: &VerifiedManifest,
+    before_hash: &mut dyn FnMut(&str),
+) -> Result<(), String> {
     let mut expected: BTreeSet<&str> = manifest.artifacts.keys().map(String::as_str).collect();
     expected.insert(MANIFEST_NAME);
     for entry in list_directory(bundle)? {
@@ -305,6 +316,7 @@ pub fn verify_artifacts(
         return Err(format!("missing bundle artifact {missing}"));
     }
     for (name, pin) in &manifest.artifacts {
+        before_hash(name);
         let (file, meta) = open_regular(bundle, name, owner_uid)?;
         if meta.len() != pin.bytes {
             return Err(format!("{name} size differs from the manifest"));
