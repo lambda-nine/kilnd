@@ -312,8 +312,16 @@ node fault. `kilnd-helper ledger-stats` (root, helper stopped) prints the same p
 fence), the helper logs one line, `kilnd-helper: create timing v1 {...}`: the allocation ID,
 the outcome and each step's monotonic start and end, as offsets from its Preflight. The
 steps are a fixed set of names: H's, L's, M's and P's work on Preflight and Create, every
-supervisor step up to BOOTING and READY, and each journal record's round trip. The line
-holds no boot nonce, work UUID, token, identity or path. `kilnd-helper create-timings`
+supervisor step up to BOOTING and READY, and each journal record's round trip, READY's
+included. The allocation ID is there so you can pick out one create; kilnd already logs it
+as the backend ID. No boot nonce, token key, work UUID, instance or sandbox ID, leased uid,
+gid or cid, path or refusal reason is logged. The helper never waits to write the line:
+under the shipped unit it goes to journald's socket with one non-blocking send, and is
+dropped if the socket is full. Run by hand with standard error on a pipe or terminal, the
+helper writes it without blocking on Linux; on a regular file it never writes it. A line
+carries `"dropped":N` once N earlier lines were lost that way, and `"incomplete":true` if
+READY was committed but the supervisor was gone before its last step arrived.
+`kilnd-helper create-timings`
 (root, helper running or stopped) reads the helper's log on stdin and prints one
 allocation's waterfall, or the last N, or with `--summary` each step's p50, p95 and max:
 
