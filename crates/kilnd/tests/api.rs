@@ -616,7 +616,10 @@ async fn every_rpc_over_the_socket() {
     }
     let err = c
         .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
-            spec: None,
+            spec: Some(pb::SandboxSpec {
+                image: "alpine".into(),
+                ..Default::default()
+            }),
             expiry: None,
         })
         .await
@@ -648,6 +651,46 @@ async fn every_rpc_over_the_socket() {
             .reserved_sandboxes
     };
     assert_eq!(reserved().await, charged);
+    // No image and no writable paths: kilnd supplied the node's default image, so the
+    // node is at fault. UNAVAILABLE default_image_unavailable, naming the same kind of
+    // FAILED row, and nothing charged.
+    let err = c
+        .clone()
+        .create_sandbox(pb::CreateSandboxRequest { from_checkpoint: String::new(), default_env: Vec::new(), request_id: String::new(),
+            spec: None,
+            expiry: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{err:?}");
+    assert_eq!(
+        err.metadata().get("kilnd-reason").map(|v| v.to_str().unwrap()),
+        Some("default_image_unavailable")
+    );
+    let prefix = "default_image_unavailable: create sandbox ";
+    assert!(err.message().starts_with(prefix), "{}", err.message());
+    assert!(
+        err.message().ends_with(
+            ": the node's default image \"alpine\" could not be prepared: open writable /var/run/x: ENOTDIR"
+        ),
+        "{}",
+        err.message()
+    );
+    let defaulted_id = err.message()[prefix.len()..]
+        .split(':')
+        .next()
+        .unwrap()
+        .to_string();
+    let defaulted = c
+        .clone()
+        .get_sandbox(pb::GetSandboxRequest { id: defaulted_id.clone(), execution_limit: 0 })
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_eq!(defaulted.state, pb::SandboxState::Failed as i32);
+    assert_eq!(reserved().await, charged);
     // A keyed create answers OK with the settled FAILED row, and its replay the same.
     let keyed = |request_id: &str| {
         let mut c = c.clone();
@@ -665,7 +708,7 @@ async fn every_rpc_over_the_socket() {
     assert_eq!(replay, first);
     assert_eq!(reserved().await, charged);
     fake.state().fail_create_preflight = None;
-    for id in [refused_id, first.id] {
+    for id in [refused_id, defaulted_id, first.id] {
         c.delete_sandbox(pb::DeleteSandboxRequest { release_request_id: false, id })
             .await
             .unwrap();

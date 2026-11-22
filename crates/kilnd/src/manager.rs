@@ -2502,7 +2502,10 @@ impl<R: Runtime> Manager<R> {
         let default_env = std::mem::take(&mut req.default_env);
         let (default_env_names, default_env_sha256) = self.check_default_env(&default_env)?;
         let from_checkpoint = req.from_checkpoint.take().filter(|c| !c.is_empty());
-        let spec = self.resolve_spec(req)?;
+        let ResolvedSpec {
+            spec,
+            default_image,
+        } = self.resolve_spec(req)?;
         // Checkpoint design 7.2 and 11.1: a create from a checkpoint is checked, and a
         // backend without checkpoints refuses, before prepare and before any row.
         let mut fork = match from_checkpoint.as_deref() {
@@ -2753,12 +2756,26 @@ impl<R: Runtime> Manager<R> {
                     )?,
                 }
                 let message = format!("create sandbox {}: {reason}", sandbox.id);
-                // The backend's own preflight refused the caller's spec before
-                // allocating (kiln's trusted exit 124): the row above is FAILED and
-                // uncharged, and the caller gets a caller error, not INTERNAL.
+                // The backend's own preflight refused the spec before allocating
+                // (kiln's trusted exit 124): the row above is FAILED and uncharged.
+                // The caller gets a caller error, not INTERNAL, unless nothing it
+                // sent was judged: the node's default image with no writable paths
+                // (kiln's walk over the image judges only those) is the node's fault.
                 if failure.is_preflight_refused()
                     && failure.certainty() == CreateCertainty::DefinitelyNotCreated
                 {
+                    if default_image && sandbox.spec.writable_paths.is_empty() {
+                        return Err(Error::Refused(
+                            RefusalCode::Unavailable,
+                            Refusal::typed(
+                                DEFAULT_IMAGE_UNAVAILABLE,
+                                format!(
+                                    "create sandbox {}: the node's default image {:?} could not be prepared: {reason}",
+                                    sandbox.id, sandbox.spec.image
+                                ),
+                            ),
+                        ));
+                    }
                     return Err(Error::InvalidArgument(message));
                 }
                 Err(Error::Backend(message))
@@ -4700,10 +4717,11 @@ impl<R: Runtime> Manager<R> {
         })
     }
 
-    fn resolve_spec(&self, req: CreateRequest) -> Result<SandboxSpec> {
+    fn resolve_spec(&self, req: CreateRequest) -> Result<ResolvedSpec> {
         let l = &self.limits;
         let invalid = |msg: String| Err(Error::InvalidArgument(msg));
-        let image = if req.image.is_empty() {
+        let default_image = req.image.is_empty();
+        let image = if default_image {
             l.default_image.clone()
         } else {
             req.image
@@ -4805,9 +4823,23 @@ impl<R: Runtime> Manager<R> {
                 return invalid(format!("invalid label {k:?}"));
             }
         }
-        Ok(spec)
+        Ok(ResolvedSpec {
+            spec,
+            default_image,
+        })
     }
 }
+
+/// A create's resolved spec, and whether its image is the node's `default_image`
+/// because the request named none. The flag is never stored: the row keeps the spec.
+struct ResolvedSpec {
+    spec: SandboxSpec,
+    default_image: bool,
+}
+
+/// The typed reason a create fails with when kiln's preflight refused it and nothing
+/// in it was the caller's to get wrong: the node's default image and no writable paths.
+const DEFAULT_IMAGE_UNAVAILABLE: &str = "default_image_unavailable";
 
 /// Today's "is X, not ready" refusal, with its typed reason (design section 1):
 /// only the message's token prefix is new, and the code is unchanged.

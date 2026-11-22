@@ -183,15 +183,22 @@ async fn a_post_commit_failure_is_ok_for_the_original_and_every_retry() {
     ));
 }
 
+/// A create that names its image, as the caller's spec the preflight judges.
+fn named_image() -> CreateRequest {
+    CreateRequest {
+        image: "alpine".into(),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn a_preflight_refusal_is_invalid_argument_unkeyed_and_the_settled_row_keyed() {
     let (m, fake, _) = clocked(limits());
+    let start = m.store.sandbox_resources().unwrap();
     fake.state().fail_create_preflight = Some("open writable /var/run/x: ENOTDIR".into());
     // Unkeyed: the caller's error, naming the FAILED, uncharged, definite row.
-    let error = m
-        .create_owned(CreateRequest::default(), 1000)
-        .await
-        .unwrap_err();
+    let error = m.create_owned(named_image(), 1000).await.unwrap_err();
+    assert_eq!(m.store.sandbox_resources().unwrap(), start);
     let rows = m.list(true).unwrap();
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
@@ -241,6 +248,84 @@ async fn a_preflight_refusal_is_invalid_argument_unkeyed_and_the_settled_row_key
         m.create_owned(CreateRequest::default(), 1000).await,
         Err(Error::Backend(_))
     ));
+}
+
+/// Backlog MEDIUM 1 (2026-11-21 follow-up adversarial review): a create that named no
+/// image got the node's `default_image`, so kiln's preflight refusing it is the node's
+/// fault: UNAVAILABLE `default_image_unavailable`, naming the image and the same FAILED,
+/// uncharged, definite row. The caller's own image (even one spelled like the default)
+/// and the caller's writable paths over the default image stay INVALID_ARGUMENT.
+#[tokio::test]
+async fn a_preflight_refusal_of_the_default_image_is_unavailable() {
+    let (m, fake, _) = clocked(limits());
+    assert_eq!(m.limits.default_image, "alpine");
+    let start = m.store.sandbox_resources().unwrap();
+    fake.state().fail_create_preflight = Some("image alpine: ENOENT".into());
+    let error = m
+        .create_owned(CreateRequest::default(), 1000)
+        .await
+        .unwrap_err();
+    assert_eq!(m.store.sandbox_resources().unwrap(), start);
+    let rows = m.list(true).unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(
+        refusal_of(&error),
+        Some((RefusalCode::Unavailable, "default_image_unavailable")),
+        "{error:?}"
+    );
+    let Error::Refused(_, refusal) = &error else {
+        unreachable!()
+    };
+    assert_eq!(
+        refusal.message(),
+        format!(
+            "create sandbox {}: the node's default image \"alpine\" could not be prepared: image alpine: ENOENT",
+            row.id
+        )
+    );
+    assert_eq!(row.spec.image, "alpine");
+    assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
+    assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
+    assert!(!row.is_charged());
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("image alpine: ENOENT")
+    );
+
+    // The caller named the image, spelled exactly as the default: its own choice.
+    let error = m.create_owned(named_image(), 1000).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+    assert_eq!(m.store.sandbox_resources().unwrap(), start);
+
+    // The default image with the caller's writable paths: kiln's walk judged the
+    // caller's paths over it, so the refusal may be the caller's.
+    let paths = CreateRequest {
+        read_only_root: true,
+        writable_paths: vec!["/var/run/x".into()],
+        ..Default::default()
+    };
+    let error = m.create_owned(paths, 1000).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+    assert_eq!(m.store.sandbox_resources().unwrap(), start);
+
+    // Every row is FAILED, definite and uncharged; nothing reached the backend.
+    let rows = m.list(true).unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
+        assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
+        assert!(!row.is_charged());
+    }
+    assert!(fake.state().created.is_empty());
+
+    // Keyed (design 3.1): OK with the settled row, as for any preflight refusal.
+    let refused = keyed(&m, 1000, "default", "a").await.unwrap();
+    assert_eq!(refused.state, SandboxState::Failed);
+    assert!(!refused.is_charged());
+    assert_eq!(m.store.sandbox_resources().unwrap(), start);
 }
 
 #[tokio::test]

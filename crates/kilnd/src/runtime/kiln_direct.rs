@@ -1755,11 +1755,14 @@ mod tests {
             ));
             let error = manager.create(CreateRequest::default()).await.unwrap_err();
             let id = manager.list(true).unwrap().remove(0).id;
-            // A trusted 124 is the caller's error and names the row; anything else
-            // stays the backend's (INTERNAL).
-            let prefix = format!("create sandbox {id}: kiln create failed (");
+            // A trusted 124 names the row; anything else stays the backend's
+            // (INTERNAL). This create named no image, so kilnd supplied the node's
+            // default and the refusal is the node's: UNAVAILABLE, typed.
+            let prefix = format!("create sandbox {id}: the node's default image \"alpine\" could not be prepared: kiln create failed (");
             match &error {
-                Error::InvalidArgument(message) if definite => {
+                Error::Refused(crate::manager::RefusalCode::Unavailable, refusal) if definite => {
+                    let message = refusal.message();
+                    assert_eq!(refusal.reason(), Some("default_image_unavailable"));
                     assert!(message.starts_with(&prefix), "{message}");
                     assert!(message.contains("exit status: 124"), "{message}");
                     assert!(message.contains("image missing"), "{message}");

@@ -14,6 +14,17 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   helper's log. No secret, identity or path is logged. The journal, the ledger schema and
   every create's behaviour are unchanged.
 
+- An unkeyed create that named no image and no writable paths, which kiln's preflight
+  refused (exit 124), now fails `UNAVAILABLE` with the typed reason
+  `default_image_unavailable`, naming the node's default image and the FAILED,
+  uncharged row. kilnd supplied that image, so the node is at fault, not the caller.
+  It was `INVALID_ARGUMENT`. A caller's own image, and the default image with writable
+  paths (kiln's walk judges those against the image), still answer `INVALID_ARGUMENT`;
+  keyed creates still return OK with the settled row. One case stays ambiguous: a
+  broken default image together with the caller's writable paths still answers
+  `INVALID_ARGUMENT`, because kiln's exit status doesn't say which it refused. The
+  `CreateSandbox` comment in the proto says so (comments only).
+
 - kilnd now ignores unknown fields in kilnd-helper's replies, so a newer helper that adds
   an optional field to a reply works with this daemon. Before, the daemon refused the
   whole reply: a real preflight refusal from a newer helper surfaced as INTERNAL and its

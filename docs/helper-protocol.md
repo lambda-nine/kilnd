@@ -141,7 +141,9 @@ must be upgraded with its helper as always.
 A failed `create` replies `{"error": {"error": E, "definitely_not_created": B}}`. When
 kiln's own preflight refused the spec (exit status exactly 124 from a CLI that
 advertised feature `0x10`, nothing on stdout, both pipes at EOF), the reply adds
-`"preflight_refused": true`, so the daemon can answer the caller `INVALID_ARGUMENT`;
+`"preflight_refused": true`, so the daemon can answer the caller `INVALID_ARGUMENT`
+(or `UNAVAILABLE default_image_unavailable` when the spec was the node's default image
+with no writable paths);
 it is omitted when false, so every other reply is byte-identical. The daemon trusts
 it only together with `"definitely_not_created": true`. A daemon from before replies
 tolerated unknown fields refuses the field and its create stays ambiguous: upgrade it

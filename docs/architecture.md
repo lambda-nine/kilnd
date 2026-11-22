@@ -367,7 +367,16 @@ The adapter marks it (`CreateFailure::preflight_refused`; over the helper,
 failed (exit status: 124): <kiln's reason>`, after settling the row `FAILED` and
 definitely not created as above. kiln uses one exit status for every preflight
 refusal, so kilnd can't tell a missing image from a refused writable path without
-reading kiln's text, and doesn't: both are `INVALID_ARGUMENT`. The capability gate's
+reading kiln's text, and doesn't. It knows only what the caller sent: when the request
+named no image (so kilnd supplied `default_image`) and no writable paths (the only
+part of a spec kiln's walk judges against the image), nothing the caller chose was
+refused, and the create answers `UNAVAILABLE default_image_unavailable`, `create
+sandbox sb-…: the node's default image "<image>" could not be prepared: <the same
+reason>`, with the same `FAILED`, uncharged row. A caller's own image, even one
+spelled like the default, and the default image with writable paths stay
+`INVALID_ARGUMENT`. That leaves one case misattributed: a broken default image with
+the caller's writable paths still answers `INVALID_ARGUMENT`, since kilnd can't tell
+which of the two kiln refused. The capability gate's
 refusal is the node's fault, not the caller's, and keeps its code (`INTERNAL`), as does
 every ambiguous failure. A keyed create answers `OK` with the settled row whatever
 the backend said (below), so it and its retries are unchanged.
@@ -538,7 +547,9 @@ retained `DELETED` row its deletion reason: `expired_idle`, `expired_lifetime` o
 foreign or pruned ID stays `NOT_FOUND` with no trailer, so "expired" and "never
 existed" stay distinguishable while the row is retained. Idempotent create adds
 `request_id_conflict` (`ALREADY_EXISTS`), `request_id_quota` (`RESOURCE_EXHAUSTED`),
-`create_in_flight` (`DEADLINE_EXCEEDED`) and `create_unsettled` (`UNAVAILABLE`). Exec
+`create_in_flight` (`DEADLINE_EXCEEDED`) and `create_unsettled` (`UNAVAILABLE`). An
+unkeyed create whose preflight refused the node's default image (above) is
+`default_image_unavailable` (`UNAVAILABLE`). Exec
 cwd and env add `backend_unsupported:<feature>` (`UNIMPLEMENTED`: `exec_cwd`,
 `exec_env`, `sandbox_default_env`) and `sandbox_unsupported:<feature>`
 (`FAILED_PRECONDITION`: `exec_cwd`, `exec_env`), and `sandbox_feature_probe_failed`
@@ -1165,7 +1176,7 @@ metadata result alive and enforces an RSS increase below 32 MiB.
 | New create/Exec during shutdown | `UNAVAILABLE` |
 | Exec or RenewSandbox on a sandbox that is not `READY` | `FAILED_PRECONDITION` with a `kilnd-reason` trailer and token prefix |
 | Expiry policy below 10 s or above the node maximum | `INVALID_ARGUMENT`, before anything is prepared |
-| Unkeyed create, not from a checkpoint, that kiln's preflight refused (trusted exit 124) | `INVALID_ARGUMENT` naming the `FAILED`, uncharged row |
+| Unkeyed create, not from a checkpoint, that kiln's preflight refused (trusted exit 124) | `INVALID_ARGUMENT` naming the `FAILED`, uncharged row; `UNAVAILABLE default_image_unavailable` naming it when the request named no image and no writable paths |
 | RenewSandbox on a foreign or unknown ID | `NOT_FOUND`, no trailer |
 
 ## Shutdown and restarts

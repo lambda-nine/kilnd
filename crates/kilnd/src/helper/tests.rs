@@ -685,7 +685,11 @@ sys.exit(1)
             Store::open_in_memory().unwrap(),
             Limits::default(),
         ));
-        let error = manager.create(CreateRequest::default()).await.unwrap_err();
+        let named = CreateRequest {
+            image: "alpine".into(),
+            ..CreateRequest::default()
+        };
+        let error = manager.create(named).await.unwrap_err();
         let row = manager.list(true).unwrap().remove(0);
         assert_eq!((row.state, &row.backend_id), (SandboxState::Failed, &None));
         let prefix = format!(
@@ -698,6 +702,16 @@ sys.exit(1)
                 assert!(message.contains("ENOTDIR"), "{message}");
                 assert_eq!(row.create_certainty, CreateCertainty::DefinitelyNotCreated);
                 assert!(!row.is_charged());
+                // No image and no writable paths: the node's default image was
+                // refused, so the node is at fault, through the helper too.
+                let error = manager.create(CreateRequest::default()).await.unwrap_err();
+                assert!(
+                    matches!(&error, Error::Refused(crate::manager::RefusalCode::Unavailable, r)
+                        if r.reason() == Some("default_image_unavailable")
+                            && r.message().contains("default image \"alpine\"")
+                            && r.message().contains("ENOTDIR")),
+                    "{error:?}"
+                );
             }
             Error::Backend(message) if !refused => {
                 assert!(message.starts_with(&prefix), "{message}");
