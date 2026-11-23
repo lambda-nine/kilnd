@@ -2098,7 +2098,8 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
     }
     fixture.wait_reached("P.preflight").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    // Both slots are busy: a third is refused at once, not queued or given a third P.
+    // Create's one slot is busy: another is refused at once, not queued, given the
+    // observation slot or given a third P.
     let began = std::time::Instant::now();
     let error = runtime
         .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
@@ -2108,7 +2109,7 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
     assert!(error.to_string().contains("preparation slot"), "{error}");
     let reply = timed_capabilities(&runtime, &fixture).await;
     let health = reply.health.unwrap();
-    assert_eq!(health.preparation, [WorkerHealth::Busy, WorkerHealth::Busy]);
+    assert_eq!(health.preparation, [WorkerHealth::Busy, WorkerHealth::Healthy]);
     // Waiters leave; the jobs stay owned and their slots stay occupied.
     for handle in stuck {
         assert!(handle.await.unwrap().is_err());
@@ -2133,9 +2134,9 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
             .unwrap(),
         AllocationObservation::Unknown { .. }
     ));
-    // List reports inconclusive rather than complete without its worker.
+    // List still observes: Create's work never holds the observation slot.
     let listed = runtime.list(deadline(5), &no_cancel()).await.unwrap();
-    assert!(!listed.complete);
+    assert!(listed.complete, "{listed:?}");
     // Fresh progress only when those original processes finish.
     fixture.clear("P.preflight.stall");
     let mut progressed = false;
@@ -5203,6 +5204,7 @@ mod compaction;
 mod control_plane;
 #[cfg(target_os = "linux")]
 mod lifecycle;
+mod observation;
 #[cfg(target_os = "linux")]
 mod recovery;
 #[cfg(target_os = "linux")]

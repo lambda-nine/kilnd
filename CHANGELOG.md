@@ -50,6 +50,22 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   through, the line follows it. Every unreadable line is counted in `dropped`. Still never
   blocking, retrying in a loop or buffering lines.
 
+- Firecracker: deleting a sandbox no longer fails, and leaves the node looking full,
+  just because other creates are busy. The helper's check that a sandbox's resources are
+  gone needs one of its two preparation workers, and concurrent creates could hold both,
+  so Delete failed with `ObservationUnavailable` while the VM was already gone and its
+  slot stayed charged until someone deleted it again. Creates now use only the first
+  worker, the second is kept for these checks, and a check waits up to five seconds for a
+  worker instead of failing at once. Creates are refused for a busy worker more often as
+  a result. If a Delete, or the cleanup after a refused create, still fails, kilnd now
+  retries it on its own, after one second and then with the wait doubling up to thirty
+  seconds, until the helper's absence receipt releases the sandbox; a refused create
+  stays FAILED. Rows left charged at startup are retried the same way. The caller still
+  gets the first error. Also, a create kilnd's own node budget would refuse is now refused
+  before the helper issues it a token, and a create refused after the helper issued one
+  gets that token fenced, best effort, so tokens are no longer left issued with nothing
+  recorded for them. kiln sandboxes behave exactly as before.
+
 - kilnd-helper now times every Firecracker create step by step, from Preflight through
   BOOTING to READY, and logs one `create timing v1` line per create once it ends: H's, L's,
   M's and P's work, each supervisor step and each journal record's round trip, carried in

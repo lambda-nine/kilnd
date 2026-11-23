@@ -692,6 +692,14 @@ pub trait Runtime: Send + Sync + 'static {
         async { Ok(crate::manager::ProvenFeatures::default()) }
     }
 
+    /// What this backend's preparation would reserve for `spec`, if the adapter knows
+    /// without asking anything (Firecracker's one profile). The manager refuses a create
+    /// its own node budget would refuse anyway before preparing it, so a refusal it can
+    /// predict issues no allocation token. `None`, the default, changes nothing.
+    fn predicted_reservation(&self, _spec: &SandboxSpec) -> Option<ResourceReservation> {
+        None
+    }
+
     /// Whether this backend has the root helper's checkpoint group at all (kiln). A
     /// backend without it (Firecracker) is refused before any helper call, allocation,
     /// reservation or row (design 11.1). Static: no probe, no I/O.

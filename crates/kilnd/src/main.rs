@@ -562,6 +562,11 @@ async fn serve_with<R: Runtime>(
     }
     manager.prune().context("startup history prune")?;
     let expiry_task = manager.start_expiry().context("start the expiry sweeper")?;
+    // Charged fenced rows whose settlement failed, startup's included, are retried
+    // until their receipts release them.
+    let settle_task = manager
+        .start_settle_retries()
+        .context("start the settlement retries")?;
     let prune_manager = manager.clone();
     let prune_cancel = tokio_util::sync::CancellationToken::new();
     let stop_prune = prune_cancel.clone();
@@ -599,6 +604,7 @@ async fn serve_with<R: Runtime>(
     // serve began shutdown unless it failed first; either way the sweeper stops.
     sweeper.begin_shutdown();
     expiry_task.await.context("join the expiry sweeper")?;
+    settle_task.await.context("join the settlement retries")?;
     drop(sweeper);
     info!("stopped");
     result

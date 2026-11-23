@@ -30,8 +30,8 @@ use crate::runtime::{
     Runtime, RuntimeCapabilities, RuntimeError, RuntimeReceipt,
 };
 use crate::store::{
-    ExecutionResult, ReleaseRequestId, RequestAdmission, ReserveFork, ReserveSandbox,
-    SandboxBudgets, SandboxResources, Store,
+    BudgetExhausted, ExecutionResult, ReleaseRequestId, RequestAdmission, ReserveFork,
+    ReserveSandbox, SandboxBudgets, SandboxResources, Store,
 };
 use crate::validation::{
     MAX_ALLOWLIST_ENTRIES, MAX_WRITABLE_PATHS, MIN_CPU_MILLIS, MIN_DISK_BYTES, MIN_MEMORY_BYTES,
@@ -692,6 +692,10 @@ pub struct Manager<R> {
     rejected_create_requests: AtomicU64,
     /// The checkpoint engine's in-memory state (milestone C5a).
     checkpoint: checkpoint::CheckpointEngine,
+    /// Charged absence-fenced rows whose settlement failed, by sandbox ID, until a
+    /// retry records their absence (`settle_retry`).
+    settle_retries: Mutex<HashMap<String, settle_retry::SettleRetry>>,
+    settle_changed: Notify,
     #[cfg(test)]
     idle_commit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
@@ -751,6 +755,78 @@ impl Drop for PendingSlot {
                 keyed.pending_by_uid.remove(&self.uid);
             }
         }
+    }
+}
+
+/// M3-2 F3: an allocation token a fenced backend's preparation issued, before any row
+/// names it. Dropped uncommitted (any refusal between the preflight and the accepting
+/// transaction), it fences the token in the background, best effort: one attempt, no
+/// retry. A fence the helper refuses (its quota of never-admitted fences is full) leaves
+/// the token issued with no outcome, which the helper's compaction lease covers.
+struct IssuedToken<R: Runtime + 'static> {
+    manager: Arc<Manager<R>>,
+    context: CreateContext,
+    plan_digest: Digest,
+    committed: bool,
+}
+
+impl<R: Runtime + 'static> IssuedToken<R> {
+    fn new(
+        manager: &Arc<Manager<R>>,
+        prepare: &PrepareContext,
+        plan: &PreparedCreate,
+    ) -> Option<Self> {
+        let EvidenceRegime::AbsenceFenced { .. } = plan.regime() else {
+            return None;
+        };
+        Some(Self {
+            manager: Arc::clone(manager),
+            context: CreateContext {
+                instance_id: prepare.instance_id,
+                allocation_id: plan.allocation_id()?,
+                sandbox_id: prepare.sandbox_id.clone(),
+            },
+            plan_digest: plan.plan_digest(),
+            committed: false,
+        })
+    }
+
+    fn committed(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl<R: Runtime + 'static> Drop for IssuedToken<R> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let (manager, context, digest) =
+            (Arc::clone(&self.manager), self.context.clone(), self.plan_digest);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let task = async move {
+            let fenced = manager
+                .runtime
+                .fence_absent(
+                    &context,
+                    &digest,
+                    Instant::now() + FENCE_TIMEOUT,
+                    &CancellationToken::new(),
+                )
+                .await;
+            match fenced {
+                Ok(_) => {
+                    info!(sandbox = %context.sandbox_id, allocation = %context.allocation_id, "refused create's token fenced");
+                }
+                Err(error) => {
+                    warn!(sandbox = %context.sandbox_id, allocation = %context.allocation_id, error = %error, "refused create's token not fenced; it stays issued with no outcome");
+                }
+            }
+        };
+        let _guard = handle.enter();
+        drop(self.manager.operations.spawn(task));
     }
 }
 
@@ -980,6 +1056,8 @@ impl<R: Runtime> Manager<R> {
             request_ids_released: AtomicU64::new(0),
             rejected_create_requests: AtomicU64::new(0),
             checkpoint: checkpoint::CheckpointEngine::default(),
+            settle_retries: Mutex::new(HashMap::new()),
+            settle_changed: Notify::new(),
             #[cfg(test)]
             idle_commit_hook: Mutex::new(None),
             clock,
@@ -2473,6 +2551,16 @@ impl<R: Runtime> Manager<R> {
         Ok(row)
     }
 
+    /// A create the daemon's own node budget refuses, before or after its preparation.
+    fn budget_exhausted(&self, exhausted: BudgetExhausted) -> Error {
+        self.node_resource_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        Error::ResourceExhausted(format!(
+            "node {} budget exhausted: {} reserved + {} requested exceeds limit {}",
+            exhausted.resource, exhausted.reserved, exhausted.requested, exhausted.limit
+        ))
+    }
+
     fn request_quota_error(&self, scope: &str, count: u64, limit: u64) -> Error {
         self.rejected_create_requests
             .fetch_add(1, Ordering::Relaxed);
@@ -2526,6 +2614,16 @@ impl<R: Runtime> Manager<R> {
             Some(id) => Some(self.fork_preflight(id, &spec, owner_uid).await?),
         };
         departed()?;
+        // M3-2 F3: a refusal the node budget below would make anyway comes before
+        // prepare, so it issues no token. Only a backend that knows its reservation
+        // without asking (Firecracker) predicts one; the accepting transaction decides.
+        if let Some(reservation) = self.runtime.predicted_reservation(&spec)
+            && let Some(exhausted) = self
+                .store
+                .budget_refusal(&reservation, self.sandbox_budgets())?
+        {
+            return Err(self.budget_exhausted(exhausted));
+        }
         // Design 9.1 (B7): preparation names no allocation. A fenced backend's
         // authority issues the token inside its preflight (RTC-2).
         let prepare_context = PrepareContext {
@@ -2534,6 +2632,12 @@ impl<R: Runtime> Manager<R> {
         };
         // C0: read-only preflight. A rejection here leaves no row and no charge.
         let prepared = self.prepare_create(&prepare_context, &spec).await;
+        // M3-2 F3: from here until the row commits, any refusal fences the token the
+        // preflight issued, so it never stays issued with no outcome.
+        let mut issued = prepared
+            .as_ref()
+            .ok()
+            .and_then(|plan| IssuedToken::new(&self, &prepare_context, plan));
         // Serving may have ended during that await. An operation tracked since
         // create_owned still refuses here, before any reservation or allocation.
         self.check_serving()?;
@@ -2665,18 +2769,17 @@ impl<R: Runtime> Manager<R> {
         match reserved {
             ReserveSandbox::Inserted => {
                 let _ = committed.set(sandbox.id.clone());
+                // The row names the token now: its settlement is the row's.
+                if let Some(issued) = issued.as_mut() {
+                    issued.committed();
+                }
             }
             ReserveSandbox::RequestQuota(quota) => {
                 return Err(self.request_quota_error(quota.scope, quota.count, quota.limit));
             }
             ReserveSandbox::RequestIdTaken => return Err(Error::RequestIdTaken),
             ReserveSandbox::Exhausted(exhausted) => {
-                self.node_resource_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(Error::ResourceExhausted(format!(
-                    "node {} budget exhausted: {} reserved + {} requested exceeds limit {}",
-                    exhausted.resource, exhausted.reserved, exhausted.requested, exhausted.limit
-                )));
+                return Err(self.budget_exhausted(exhausted));
             }
         }
         if let Some(plan) = fork {
@@ -2934,7 +3037,8 @@ impl<R: Runtime> Manager<R> {
         )?;
         let row = self.load(&id)?;
         if let Err(error) = self.settle_fenced(&row, SandboxState::Failed, None).await {
-            warn!(sandbox = %id, error = %error, "allocation stays charged; retry through Delete or reconciliation");
+            warn!(sandbox = %id, error = %error, "allocation stays charged; its settlement is retried");
+            self.schedule_settle_retry(&id);
         }
         if probe_failed {
             return Err(feature_probe_refusal(&id));
@@ -2975,6 +3079,7 @@ impl<R: Runtime> Manager<R> {
                 Error::Internal(publication)
             }
             Err(cleanup) => {
+                self.schedule_settle_retry(sandbox_id);
                 let reason = format!("{reason}; cleanup failed: {cleanup}");
                 if let Err(e) = self.store.compare_and_set_sandbox_state(
                     sandbox_id,
@@ -3368,6 +3473,8 @@ impl<R: Runtime> Manager<R> {
                 Err(e) => {
                     let reason = format!("delete failed: {e}");
                     warn!(sandbox = %id, error = %reason, "sandbox delete failed; allocation stays charged");
+                    // Retried behind this caller until the receipt releases it.
+                    self.schedule_settle_retry(id);
                     self.store.compare_and_set_sandbox_state(
                         id,
                         SandboxState::Deleting,
@@ -5107,6 +5214,8 @@ pub use checkpoint::{
     resolve_checkpoint_expiry,
 };
 
+mod settle_retry;
+
 mod operator_release;
 pub use operator_release::{
     KILN_RUNS_RESERVED, KilnProcesses, ReleaseNode, ReleaseProved, ReleaseRefusal, ReleaseRequest,
@@ -5123,6 +5232,12 @@ mod checkpoint_vm_tests;
 
 #[cfg(test)]
 mod fenced_tests;
+
+#[cfg(test)]
+mod settle_retry_tests;
+
+#[cfg(test)]
+mod issued_token_tests;
 
 #[cfg(test)]
 mod expiry_tests;

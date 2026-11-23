@@ -2370,6 +2370,7 @@ pub fn prep_main(mut endpoint: Endpoint, config: Arc<NodeConfig>, mut heartbeat:
             }
             PrepRequest::ObserveNode { instance, known } => {
                 fault_point("P.observe");
+                fault_point("P.observe_node");
                 PrepReply::Node(config.observation.observe_node(instance, &known))
             }
             PrepRequest::VerifyLeases { expected } => match verify_leases(&config, &expected) {

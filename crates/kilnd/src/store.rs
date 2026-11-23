@@ -2471,6 +2471,20 @@ impl Store {
         self.accounting_snapshot().map(|(resources, _)| resources)
     }
 
+    /// The budget `reserve_sandbox_with_env` would refuse `requested` for against what
+    /// is reserved now, as a read. Advisory: only that transaction admits or refuses.
+    pub fn budget_refusal(
+        &self,
+        requested: &ResourceReservation,
+        budgets: SandboxBudgets,
+    ) -> Result<Option<BudgetExhausted>> {
+        exhausted_budget(
+            self.sandbox_resources()?,
+            SandboxResources::for_reservation(requested),
+            budgets,
+        )
+    }
+
     /// A single trusted snapshot for Health: invalid releases remain charged and
     /// return degraded=true. Lost membership has unknown totals and is an error.
     pub fn accounting_snapshot(&self) -> Result<(SandboxResources, bool)> {

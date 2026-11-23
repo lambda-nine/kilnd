@@ -805,6 +805,14 @@ impl Runtime for FirecrackerRuntime {
         }
     }
 
+    /// The one profile's reservation, as the helper's Preflight computes it.
+    fn predicted_reservation(
+        &self,
+        spec: &crate::model::SandboxSpec,
+    ) -> Option<crate::model::ResourceReservation> {
+        crate::firecracker::offline_768_v1_reservation(spec).ok()
+    }
+
     async fn version(
         &self,
         deadline: Instant,

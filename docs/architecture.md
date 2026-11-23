@@ -229,7 +229,8 @@ dispatch stops the VM through the existing barrier. Production still serves no p
             create ok                 delete
  CREATING ───────────▶ READY ─────────────────▶ DELETING ──▶ DELETED
     │ create failed      │ backend gone            │ rm failed: stays DELETING
-    ▼                    ▼ (exec or startup)       │ (retry delete, or startup retries)
+    ▼                    ▼ (exec or startup)       │ (retry delete, or startup retries;
+                                                   │  a fenced row is also retried)
   FAILED               LOST
     └──── delete ───▶ DELETED ◀──── delete ────┘
 
@@ -400,6 +401,26 @@ Delete on such a row publishes `DELETING` first, then proves absence by exact to
 removal if a record exists, `fence_absent` if none does. A row without a backend ID
 can be fenced, unlike a legacy no-ID row. A failed READY publication compensates the
 same way and stays charged until the receipt commits.
+
+A failed settlement doesn't wait for someone to notice (M3-2 findings F1 and F2). When
+Delete, a refused create's fence or a compensation can't get its receipt (the helper had
+no fresh namespace observation, its ledger didn't answer), the caller still gets the
+error and the row stays visibly `DELETING` or `FAILED` and charged, and the row is queued
+for a retry behind it (`manager/settle_retry.rs`). One task makes one attempt at a time:
+the same Delete a client would send for a `DELETING` row, and reconciliation's
+settlement, under the row's exec lock, for a `FAILED` one, which stays `FAILED`. The
+first retry comes a second after the failure, and each failure doubles the wait up to
+thirty seconds, until the receipt releases the row or it is no longer a charged fenced
+row. At startup the task queues every charged fenced row reconciliation left `FAILED` or
+`DELETING`. Nothing here releases without the receipt, and legacy rows are never queued.
+
+Before preparing a create, kilnd asks the runtime what its preparation would reserve
+(`predicted_reservation`; Firecracker computes its one profile's reservation, kiln says
+nothing) and refuses there, with the same `RESOURCE_EXHAUSTED` budget error, if its own
+node budgets would refuse that later anyway. So a refusal it can predict issues no
+allocation token (M3-2 finding F3). The accepting transaction still decides. Any refusal
+between a fenced preparation and the row's commit fences the token it issued in the
+background, once, best effort ([protocol](helper-protocol.md#firecracker-group-schema-2)).
 
 Budgets are configured promises, not live RSS or disk-use measurements.
 Health reports both limits and reservations. `accounting_status` says where the

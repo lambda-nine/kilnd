@@ -77,6 +77,16 @@ const MAX_TOKEN_WAITERS: usize = 16;
 const MAX_DETACHED: usize = 128;
 /// Creates waiting for a preparation slot. Preflight never waits: it refuses at once.
 const MAX_PREP_WAITERS: usize = 16;
+/// The preparation slot Create's own work (Preflight, Revalidate and S's session
+/// preparation) never takes. Only the namespace observations that Delete, cleanup and a
+/// refused Create's fence depend on, List's and startup's lease check use it, so Create
+/// pressure can't leave an allocation charged for want of a fresh observation.
+const OBSERVATION_SLOT: usize = workers::PREP_SLOTS - 1;
+/// Observations waiting for a slot, counted apart from Create's waiters so neither can
+/// fill the other's.
+const MAX_OBSERVE_WAITERS: usize = 16;
+/// An observation waits at most this long for a slot, and never past its wire deadline.
+const OBSERVE_WAIT: Duration = Duration::from_secs(5);
 /// Later stop, settlement and observation records waiting for L.
 const MAX_PENDING_RECORDS: usize = 4096;
 /// A read-only fence lookup may answer this long after an expired wire deadline. It
@@ -588,6 +598,8 @@ pub struct Node {
     pending: Mutex<VecDeque<LedgerRequest>>,
     flushing: tokio::sync::Mutex<()>,
     prep_waiters: AtomicUsize,
+    /// Observations waiting for a P slot ([`MAX_OBSERVE_WAITERS`]).
+    observe_waiters: AtomicUsize,
     ledger_fault: Mutex<Option<String>>,
     /// B5-01: L refused an answer too large for one frame.
     ledger_reply_fault: Mutex<Option<String>>,
@@ -901,6 +913,7 @@ impl Node {
             pending: Mutex::default(),
             flushing: tokio::sync::Mutex::new(()),
             prep_waiters: AtomicUsize::new(0),
+            observe_waiters: AtomicUsize::new(0),
             ledger_fault: Mutex::new(None),
             ledger_reply_fault: Mutex::new(None),
             ledger_replacement_fault: Mutex::new(None),
@@ -997,7 +1010,7 @@ impl Node {
                 }
                 self.register_infrastructure().await?;
                 if !snapshot.executable_leases.is_empty()
-                    && let Some(slot) = self.try_prep_slot()
+                    && let Some(slot) = self.try_prep_slot(PrepClass::Observe)
                 {
                     let reply: Result<PrepReply, _> = slot
                         .channel
@@ -1242,9 +1255,16 @@ impl Node {
         (slot.channel.clone(), self.ledger_generation.load(Ordering::SeqCst))
     }
 
-    fn try_prep_slot(&self) -> Option<PrepLease> {
-        for slot in &self.prep {
-            let slot = slot.lock().unwrap();
+    /// A free preparation slot for `class`. Create's work never takes the observation
+    /// slot; an observation tries that slot first and then any other.
+    fn try_prep_slot(&self, class: PrepClass) -> Option<PrepLease> {
+        for index in 0..workers::PREP_SLOTS {
+            let index = match class {
+                PrepClass::Create if index == OBSERVATION_SLOT => continue,
+                PrepClass::Create => index,
+                PrepClass::Observe => workers::PREP_SLOTS - 1 - index,
+            };
+            let slot = self.prep[index].lock().unwrap();
             if !slot.reaped
                 && !slot.channel.is_closed()
                 && slot
@@ -1261,15 +1281,28 @@ impl Node {
         None
     }
 
-    /// Runs one job on one P slot. The job is detached from its waiter: if the waiter
-    /// leaves, the slot stays busy until that same process answers or exits.
-    async fn prep_call(
+    /// Runs one namespace observation on a P slot: the observation slot, or any other
+    /// that is free. It waits for one among at most [`MAX_OBSERVE_WAITERS`], for at most
+    /// [`OBSERVE_WAIT`] and never past its deadline. The job is detached from its waiter:
+    /// if the waiter leaves, the slot stays busy until that same process answers or exits.
+    async fn observe_call(
         &self,
         request: PrepRequest,
         deadline: WireDeadline,
     ) -> Result<PrepReply, CallError> {
-        let lease = self.try_prep_slot().ok_or(CallError::Full)?;
-        self.prep_with(lease, request, deadline).await
+        if self.observe_waiters.fetch_add(1, Ordering::AcqRel) >= MAX_OBSERVE_WAITERS {
+            self.observe_waiters.fetch_sub(1, Ordering::AcqRel);
+            return Err(CallError::Full);
+        }
+        let until = deadline.instant.min(Instant::now() + OBSERVE_WAIT);
+        let mut lease = self.try_prep_slot(PrepClass::Observe);
+        while lease.is_none() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            lease = self.try_prep_slot(PrepClass::Observe);
+        }
+        self.observe_waiters.fetch_sub(1, Ordering::AcqRel);
+        self.prep_with(lease.ok_or(CallError::Full)?, request, deadline)
+            .await
     }
 
     async fn prep_with(
@@ -1297,10 +1330,10 @@ impl Node {
             self.prep_waiters.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        let mut lease = self.try_prep_slot();
+        let mut lease = self.try_prep_slot(PrepClass::Create);
         while lease.is_none() && !deadline.expired() {
             tokio::time::sleep(Duration::from_millis(2)).await;
-            lease = self.try_prep_slot();
+            lease = self.try_prep_slot(PrepClass::Create);
         }
         self.prep_waiters.fetch_sub(1, Ordering::AcqRel);
         lease
@@ -1317,10 +1350,10 @@ impl Node {
             self.prep_waiters.fetch_sub(1, Ordering::AcqRel);
             return Err(CallError::Full);
         }
-        let mut lease = self.try_prep_slot();
+        let mut lease = self.try_prep_slot(PrepClass::Create);
         while lease.is_none() && !deadline.expired() {
             tokio::time::sleep(Duration::from_millis(2)).await;
-            lease = self.try_prep_slot();
+            lease = self.try_prep_slot(PrepClass::Create);
         }
         self.prep_waiters.fetch_sub(1, Ordering::AcqRel);
         self.prep_with(lease.ok_or(CallError::Full)?, request, deadline)
@@ -3229,8 +3262,9 @@ impl Node {
             return group_error(GroupErrorKind::Unavailable, "preflight deadline expired");
         }
         // Take the preparation slot before issuing, so a busy node refuses without
-        // consuming a seq. Preflight never waits for one.
-        let Some(lease) = self.try_prep_slot() else {
+        // consuming a seq. Preflight never waits for one, and never takes the
+        // observation slot.
+        let Some(lease) = self.try_prep_slot(PrepClass::Create) else {
             return group_error(
                 GroupErrorKind::ResourceExhausted,
                 "every preparation slot is in use",
@@ -4279,7 +4313,7 @@ impl Node {
             }
         }
         let observation = self
-            .prep_call(
+            .observe_call(
                 PrepRequest::ObserveAllocation {
                     instance: token.instance,
                     allocation: token.allocation,
@@ -4583,7 +4617,7 @@ impl Node {
             }
         };
         let namespace = match self
-            .prep_call(
+            .observe_call(
                 PrepRequest::ObserveNode {
                     instance,
                     known: journal.records.iter().map(|r| r.allocation_id).collect(),
@@ -4673,6 +4707,15 @@ impl Node {
 struct Orphan {
     worker_id: i64,
     target: ProcessId,
+}
+
+/// Who a preparation slot is leased to (see [`OBSERVATION_SLOT`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrepClass {
+    /// Preflight, Revalidate and S's session preparation.
+    Create,
+    /// A read-only namespace observation or the startup lease check.
+    Observe,
 }
 
 struct PrepLease {
