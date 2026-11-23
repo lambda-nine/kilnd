@@ -642,36 +642,186 @@ mod tests {
         );
     }
 
-    /// A listener as production's `serve` hands it on: a bound Unix socket, nonblocking,
-    /// under a fresh directory. The directory lives as long as the listener is used.
-    fn production_listener() -> (
-        tempfile::TempDir,
-        PathBuf,
-        std::os::unix::net::UnixListener,
-    ) {
+    /// The startup line `serve_groups` writes for each checkpoint flag.
+    const LINES: [(bool, &str); 2] = [
+        (false, "kilnd-helper: checkpoint group: off (flag)\n"),
+        (true, "kilnd-helper: checkpoint group: enabled\n"),
+    ];
+
+    /// What production's `serve` hands `serve_groups`, under a fresh directory: a bound,
+    /// nonblocking Unix listener, and a kiln path that exists nowhere and is this test's
+    /// alone. The directory lives as long as the setup.
+    struct Setup {
+        _dir: tempfile::TempDir,
+        socket: PathBuf,
+        kiln: PathBuf,
+        listener: std::os::unix::net::UnixListener,
+    }
+
+    fn setup() -> Setup {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("helper.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let socket = dir.path().join("helper.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        (dir, path, listener)
+        let kiln = dir.path().join("no-kiln-here");
+        Setup {
+            _dir: dir,
+            socket,
+            kiln,
+            listener,
+        }
     }
 
     /// Production's orchestration after the socket checks, as `serve` runs it, with no
-    /// Firecracker group. A real kiln is never reached: nothing here sends a request.
-    async fn run_serve_groups(
+    /// Firecracker group and this test's own user as the service account.
+    async fn serve_groups_as_production(
         listener: std::os::unix::net::UnixListener,
+        kiln: PathBuf,
         enable_checkpoints: bool,
         out: &mut impl std::io::Write,
-        within: std::time::Duration,
-    ) -> std::result::Result<Result<()>, tokio::time::error::Elapsed> {
+    ) -> Result<()> {
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        let bin = PathBuf::from("/nonexistent/kiln");
-        tokio::time::timeout(
-            within,
-            serve_groups(listener, uid, bin, None, enable_checkpoints, out),
+        serve_groups(listener, uid, kiln, None, enable_checkpoints, out).await
+    }
+
+    fn monotonic_ns() -> u64 {
+        let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: `time` is a valid timespec to write.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) },
+            0
+        );
+        time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+    }
+
+    /// The smallest request the helper answers without root or a kiln: the installed
+    /// CLI's capabilities, as kilnd's client sends it (an empty descriptor envelope, then
+    /// one length-prefixed frame).
+    fn capabilities_request() -> Vec<u8> {
+        let frame = format!(
+            r#"{{"version":3,"timeout_ms":5000,"deadline_ns":{},"operation":{{"kiln":{{"capabilities":{{"id":null}}}}}}}}"#,
+            monotonic_ns() + 5_000_000_000
+        );
+        let mut bytes = vec![0x4b];
+        bytes.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(frame.as_bytes());
+        bytes
+    }
+
+    /// Everything the helper sends back for [`capabilities_request`] when `kiln` doesn't
+    /// exist: its empty descriptor envelope, one frame, then EOF. The frame names `kiln`,
+    /// so only the runtime `serve_with_groups` builds from this test's own path answers it.
+    fn capabilities_reply(kiln: &std::path::Path) -> Vec<u8> {
+        let error = format!(
+            "{} requires persistent-exec protocol v1, scoped gc ID... and persistent-create \
+             certainty (feature 0x10): No such file or directory (os error 2)",
+            kiln.display()
+        );
+        let frame = format!(
+            r#"{{"error":{{"error":{{"incompatible":{}}},"definitely_not_created":false}}}}"#,
+            serde_json::to_string(&error).unwrap()
+        );
+        let mut bytes = vec![0x4b];
+        bytes.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(frame.as_bytes());
+        bytes
+    }
+
+    /// One client's whole exchange: connect, send [`capabilities_request`], keep its own
+    /// side open (an EOF would cancel the request) and read until the helper's EOF.
+    async fn ask(socket: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(socket).await?;
+        stream.write_all(&capabilities_request()).await?;
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await?;
+        Ok(reply)
+    }
+
+    /// Requires `serve_groups` with `out` to serve `setup`'s own listener: while it is
+    /// still running, a client's request on that socket gets the exact reply only the
+    /// helper's runtime gives, within the bound.
+    async fn assert_serves(setup: Setup, enable: bool, out: &mut impl std::io::Write, case: &str) {
+        let Setup {
+            _dir,
+            socket,
+            kiln,
+            listener,
+        } = setup;
+        let serving = serve_groups_as_production(listener, kiln.clone(), enable, out);
+        tokio::pin!(serving);
+        let reply = tokio::select! {
+            returned = &mut serving => panic!("{case}: stopped serving: {returned:?}"),
+            reply = tokio::time::timeout(std::time::Duration::from_secs(10), ask(&socket)) => reply,
+        };
+        let reply = reply
+            .unwrap_or_else(|_| panic!("{case}: no answer within 10 s"))
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        assert!(
+            reply == capabilities_reply(&kiln),
+            "{case}: answered {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// Requires `serve_groups` with `out` to fail with `error` and serve nothing. A
+    /// client is already connected with its request when it starts, so a helper that
+    /// served anything, on this listener or a copy of it, would have answered it; then
+    /// the socket refuses the next client.
+    async fn assert_refuses(
+        setup: Setup,
+        enable: bool,
+        out: &mut impl std::io::Write,
+        case: &str,
+        error: &str,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Setup {
+            _dir,
+            socket,
+            kiln,
+            listener,
+        } = setup;
+        let waiting = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        waiting.set_nonblocking(true).unwrap();
+        let mut waiting = tokio::net::UnixStream::from_std(waiting).unwrap();
+        waiting.write_all(&capabilities_request()).await.unwrap();
+        let returned = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_groups_as_production(listener, kiln, enable, out),
         )
         .await
+        .unwrap_or_else(|_| panic!("{case}: still serving after a failed startup line"));
+        let failed = returned.expect_err(case);
+        assert_eq!(
+            format!("{failed:#}"),
+            format!("write the checkpoint group's startup line to standard error: {error}"),
+            "{case}"
+        );
+        // The waiting client's connection ends with not one byte of an answer.
+        let mut answer = Vec::new();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            waiting.read_to_end(&mut answer),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: the waiting client's connection stayed open"));
+        if let Err(e) = ended {
+            assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{case}: {e}");
+        }
+        assert!(
+            answer.is_empty(),
+            "{case}: answered {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+        let refused = std::os::unix::net::UnixStream::connect(&socket)
+            .expect_err("nothing may accept on the helper's socket");
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "{case}"
+        );
     }
 
     /// A standard error that rejects every write and every flush.
@@ -689,72 +839,147 @@ mod tests {
 
     /// Backlog B4 fix round 3 (recheck 2's HIGH 1): the production orchestration itself,
     /// not only the helper inside it, refuses to serve when its startup line is rejected.
-    /// A helper that started serving never returns, so returning at all, and with the
-    /// write's error, is the proof; the socket then has no one accepting on it.
     #[tokio::test]
     async fn the_helper_does_not_serve_when_its_startup_line_is_rejected() {
-        for enable_checkpoints in [false, true] {
-            let (_dir, path, listener) = production_listener();
-            let returned = run_serve_groups(
-                listener,
-                enable_checkpoints,
+        for (enable, _) in LINES {
+            let case = format!("checkpoints {enable}, every write rejected");
+            assert_refuses(
+                setup(),
+                enable,
                 &mut RejectingWriter,
-                std::time::Duration::from_secs(5),
+                &case,
+                "stderr unavailable",
             )
-            .await
-            .unwrap_or_else(|_| {
-                panic!("checkpoints {enable_checkpoints}: still serving after a rejected line")
-            });
-            let error = returned.expect_err("a rejected startup line must fail startup");
-            assert_eq!(
-                format!("{error:#}"),
-                "write the checkpoint group's startup line to standard error: \
-                 stderr unavailable",
-                "checkpoints {enable_checkpoints}"
-            );
-            // The listener is gone with the call: a client finds no helper.
-            let refused = std::os::unix::net::UnixStream::connect(&path)
-                .expect_err("nothing may accept on the helper's socket");
-            assert_eq!(
-                refused.kind(),
-                std::io::ErrorKind::ConnectionRefused,
-                "checkpoints {enable_checkpoints}"
-            );
+            .await;
         }
     }
 
-    /// The control for the test above: the same orchestration with a working standard
-    /// error is still serving when a short timeout runs out, having written its one line,
-    /// so the timeout tells serving from not serving.
+    /// The control for the test above (fix round 4, recheck 3's HIGH 1): with a working
+    /// standard error the same orchestration answers a request on the listener it was
+    /// given, having written its one line.
     #[tokio::test]
     async fn the_helper_serves_once_its_startup_line_is_written() {
-        for (enable_checkpoints, line) in [
-            (false, "kilnd-helper: checkpoint group: off (flag)\n"),
-            (true, "kilnd-helper: checkpoint group: enabled\n"),
-        ] {
-            let (_dir, path, listener) = production_listener();
+        for (enable, line) in LINES {
             let mut out = Vec::new();
-            let serving = async {
-                run_serve_groups(
-                    listener,
-                    enable_checkpoints,
-                    &mut out,
-                    std::time::Duration::from_millis(300),
-                )
-                .await
-            };
-            // A client reaches a live listener while it serves.
-            let connect = async {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                tokio::net::UnixStream::connect(&path).await
-            };
-            let (served, connected) = tokio::join!(serving, connect);
-            assert!(
-                served.is_err(),
-                "checkpoints {enable_checkpoints}: stopped serving: {served:?}"
-            );
-            connected.unwrap_or_else(|e| panic!("checkpoints {enable_checkpoints}: {e}"));
+            assert_serves(setup(), enable, &mut out, &format!("checkpoints {enable}")).await;
             assert_eq!(String::from_utf8(out).unwrap(), line);
+        }
+    }
+
+    /// What a scripted standard error does to the write that reaches its offset.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Shape {
+        /// That write and every later one fail.
+        Error,
+        /// That write takes nothing, `Ok(0)`, which `write_all` reports as WriteZero.
+        Zero,
+        /// That write is interrupted once, which `write_all` retries; then it takes all.
+        Interrupted,
+    }
+
+    /// A standard error that takes at most `chunk` bytes per write, and shapes the first
+    /// write that arrives once it holds `at` bytes. It keeps every byte it took.
+    struct ScriptedWriter {
+        shape: Shape,
+        at: usize,
+        chunk: usize,
+        taken: Vec<u8>,
+        interrupted: bool,
+    }
+
+    impl std::io::Write for ScriptedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.taken.len() == self.at && !bytes.is_empty() {
+                match self.shape {
+                    Shape::Error => return Err(std::io::Error::other("stderr unavailable")),
+                    Shape::Zero => return Ok(0),
+                    Shape::Interrupted if !self.interrupted => {
+                        self.interrupted = true;
+                        return Err(std::io::ErrorKind::Interrupted.into());
+                    }
+                    Shape::Interrupted => {}
+                }
+            }
+            // Short of the offset, never past it, so the shaped write lands exactly there.
+            let room = if self.interrupted {
+                usize::MAX
+            } else {
+                self.at - self.taken.len()
+            };
+            let took = bytes.len().min(self.chunk).min(room);
+            self.taken.extend_from_slice(&bytes[..took]);
+            Ok(took)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every way the scripted writer can take a line: one byte per write, a few, or all
+    /// it is offered.
+    const CHUNKS: [usize; 3] = [1, 3, usize::MAX];
+
+    /// Fix round 4 (recheck 3's HIGH 2): a startup line that fails at any byte, after
+    /// any number of short writes, fails startup with that error, the writer holds
+    /// exactly the line's first bytes, and nothing is served, in both checkpoint states.
+    #[tokio::test]
+    async fn a_startup_line_that_fails_at_any_byte_is_never_served() {
+        for (enable, line) in LINES {
+            for chunk in CHUNKS {
+                for at in 0..line.len() {
+                    for (shape, error) in [
+                        (Shape::Error, "stderr unavailable"),
+                        (Shape::Zero, "failed to write whole buffer"),
+                    ] {
+                        let case = format!(
+                            "checkpoints {enable}, {shape:?} at byte {at} of {}, \
+                             writes of at most {chunk}",
+                            line.len()
+                        );
+                        let mut out = ScriptedWriter {
+                            shape,
+                            at,
+                            chunk,
+                            taken: Vec::new(),
+                            interrupted: false,
+                        };
+                        assert_refuses(setup(), enable, &mut out, &case, error).await;
+                        assert_eq!(out.taken, line.as_bytes()[..at], "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The other side of the test above: a line taken whole, in any number of short
+    /// writes, or after an interrupted write at any byte, is served.
+    #[tokio::test]
+    async fn a_startup_line_taken_whole_is_served_however_it_was_written() {
+        for (enable, line) in LINES {
+            for chunk in CHUNKS {
+                let mut cases: Vec<(Shape, usize)> =
+                    (0..line.len()).map(|at| (Shape::Interrupted, at)).collect();
+                // A writer that would fail only after the whole line never fails it.
+                cases.extend([(Shape::Error, line.len()), (Shape::Zero, line.len())]);
+                for (shape, at) in cases {
+                    let case = format!(
+                        "checkpoints {enable}, {shape:?} at byte {at} of {}, \
+                         writes of at most {chunk}",
+                        line.len()
+                    );
+                    let mut out = ScriptedWriter {
+                        shape,
+                        at,
+                        chunk,
+                        taken: Vec::new(),
+                        interrupted: false,
+                    };
+                    assert_serves(setup(), enable, &mut out, &case).await;
+                    assert_eq!(out.taken, line.as_bytes(), "{case}");
+                    assert_eq!(out.interrupted, shape == Shape::Interrupted, "{case}");
+                }
+            }
         }
     }
 
