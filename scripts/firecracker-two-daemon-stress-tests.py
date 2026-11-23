@@ -395,6 +395,23 @@ class Teardown(unittest.TestCase):
         self.assertEqual(failing(m.check_final({'offline_inventory': {'error': 'locked'}})),
                          ['the final offline inventory is clean'])
 
+    def test_node_processes_skip_this_script(self):
+        out = '\n'.join([
+            '9395 sudo python3 -I /var/tmp/m32-src/scripts/firecracker-two-daemon-stress.py'
+            ' --evidence /var/tmp/m3-2-ev/w1 setup --bin /var/tmp/m32-bin',
+            '9396 python3 -I /var/tmp/m32-src/scripts/firecracker-two-daemon-stress.py'
+            ' --evidence /var/tmp/m3-2-ev/w1 setup',
+            '9400 bash /tmp/m32-s/20-stress.sh w1 firecracker',
+            '500 /usr/bin/firecracker --id x --config-file /config.json',
+            '501 /var/tmp/m3-2/bin/kilnd-lib-tests --ignored',
+            '502 /var/tmp/m3-2/artifacts/jailer --id y',
+        ])
+        self.assertEqual(m.node_processes(out, {9400}),
+                         ['500 /usr/bin/firecracker --id x --config-file /config.json',
+                          '501 /var/tmp/m3-2/bin/kilnd-lib-tests --ignored',
+                          '502 /var/tmp/m3-2/artifacts/jailer --id y'])
+        self.assertIn(os.getpid(), m.own_ancestry() or {os.getpid()})
+
     def test_inventory_problems(self):
         clean = {'paths': [], 'accounts': [], 'units': {u: 'inactive' for u in m.UNITS},
                  'loops': [], 'mounts': [], 'processes': [], 'sockets': []}

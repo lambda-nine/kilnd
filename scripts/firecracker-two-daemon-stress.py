@@ -2002,6 +2002,33 @@ def made(state, kind, target, **extra):
     save_state(state)
 
 
+def own_ancestry():
+    """This process and its parents (sudo, the shell), whose command lines name this script."""
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        try:
+            with open(f'/proc/{pid}/stat') as f:
+                pid = int(f.read().rsplit(')', 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return pids
+
+
+def node_processes(pgrep_out, own):
+    """The `pgrep -a` lines that are the node's: a VMM, a jailer, the node test, or anything
+    running from WORK. This script's own chain is not one (its name says firecracker and its
+    evidence path starts with WORK's text)."""
+    found = []
+    for line in pgrep_out.splitlines():
+        pid, _, cmd = line.partition(' ')
+        if not pid.isdigit() or int(pid) in own or 'firecracker-two-daemon-stress' in cmd:
+            continue
+        if '--config-file /config.json' in cmd or 'kilnd-lib-tests' in cmd or WORK + '/' in cmd:
+            found.append(line)
+    return found
+
+
 def observe():
     """Everything of the node that could be left on the host."""
     paths = [p for p in NODE_PATHS + (WORK,) if os.path.lexists(p)]
@@ -2014,9 +2041,7 @@ def observe():
               or m['source'].startswith('kilnd-jail-')]
     out = subprocess.run(['pgrep', '-a', '-f', 'firecracker|jailer|kilnd-lib-tests'],
                          capture_output=True, text=True).stdout
-    processes = [l for l in out.splitlines()
-                 if '--config-file /config.json' in l or 'kilnd-lib-tests' in l
-                 or WORK in l]
+    processes = node_processes(out, own_ancestry())
     return {'paths': paths, 'accounts': [a for a in ACCOUNTS if account_exists(a)],
             'units': {u: unit_state(u) for u in UNITS}, 'loops': loops_left,
             'mounts': mounts, 'processes': processes, 'sockets': sockets}
