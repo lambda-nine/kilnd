@@ -62,6 +62,8 @@ class Refusals(unittest.TestCase):
                 'headroom',
             "kilndctl: resourceexhausted: this instance's issue sequence is exhausted":
                 'headroom',
+            'kilndctl: resourceexhausted: node memory bytes budget exhausted: 2818572288 '
+            'reserved + 939524096 requested exceeds limit 3221225472': 'daemon_budget',
             'kilndctl: resourceexhausted: something new': 'resource_exhausted_other',
             'kilndctl: unavailable: helper went away': 'unavailable',
             'kilndctl: deadlineexceeded: deadline': 'deadline',
@@ -73,7 +75,8 @@ class Refusals(unittest.TestCase):
             self.assertEqual(m.classify_refusal(message), kind, message)
 
     def test_only_capacity_refusals_are_expected(self):
-        self.assertEqual(set(m.EXPECTED_REFUSALS), {'prep_slot', 'node_capacity', 'headroom'})
+        self.assertEqual(set(m.EXPECTED_REFUSALS),
+                         {'prep_slot', 'node_capacity', 'daemon_budget', 'headroom'})
 
 
 class Resumability(unittest.TestCase):

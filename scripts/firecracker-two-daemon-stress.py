@@ -94,7 +94,10 @@ ASSUMED_OVERHEAD = 128 * MIB
 SCENARIOS = ('s1', 's2', 's3', 's4-daemon', 's4-helper', 's4-L', 's5')
 # Refusals a Create may meet under contention by design: P's two preparation slots, the
 # node's ceilings and RTC-17's admitted headroom. Anything else is unexplained.
-EXPECTED_REFUSALS = ('prep_slot', 'node_capacity', 'headroom')
+# The plan's refusal types: headroom, preparation slot and RESOURCE_EXHAUSTED, the last being the
+# helper's node vector (node_capacity) or the daemon's own node budget (daemon_budget,
+# manager.rs's `node <resource> budget exhausted`).
+EXPECTED_REFUSALS = ('prep_slot', 'node_capacity', 'daemon_budget', 'headroom')
 
 
 # ---------------------------------------------------------------------------------------
@@ -128,6 +131,8 @@ def classify_refusal(stderr):
     if ('headroom' in text or 'never-admitted' in text or 'past its share' in text
             or 'issue sequence is exhausted' in text):
         return 'headroom'
+    if re.search(r'node [a-z_ ]+ budget exhausted', text):
+        return 'daemon_budget'
     if 'client timeout' in text:
         return 'client_timeout'
     if 'resourceexhausted' in text or 'resource_exhausted' in text:
