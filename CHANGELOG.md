@@ -28,8 +28,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   nothing. The opt-in steps in `docs/setup.md` and `docs/checkpoints.md` now check for the
   `enabled` line. A helper that can't write the line to standard error exits with `write
   the checkpoint group's startup line to standard error` and never serves, as before,
-  when the old `eprintln!` panicked; it now also stops its Firecracker group first. Nothing
-  else changes.
+  when the old `eprintln!` panicked; it now also stops its Firecracker group first. A
+  helper whose systemd socket can't be handed to its async runtime now stops both its
+  Firecracker and checkpoint groups before it exits, too; before, it exited without
+  stopping either.
 
 - An execution whose sandbox's cgroup went away after the command started, as when an OOM
   kill takes the whole sandbox with it, now fails its cleanup with `the sandbox's cgroup
