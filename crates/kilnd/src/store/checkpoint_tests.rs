@@ -766,6 +766,51 @@ fn the_barrier_marker_is_one_row_and_counts_as_state() {
     assert!(!store.checkpoint_state_exists().unwrap());
 }
 
+/// The Health tests' seam (backlog B4): while set, every read of the barrier's table
+/// fails, by either Store accessor, a raw query or a statement cached before it was set,
+/// and nothing else does; cleared, each read answers again.
+#[test]
+fn denying_barrier_reads_fails_every_read_of_the_table_and_only_it() {
+    let (store, _) = store();
+    store.mark_checkpoint_barrier().unwrap();
+    const CACHED: &str = "SELECT count(*) FROM checkpoint_barrier";
+    let cached = |store: &Store| -> rusqlite::Result<i64> {
+        store.conn().prepare_cached(CACHED)?.query_row([], |r| r.get(0))
+    };
+    assert_eq!(cached(&store).unwrap(), 1);
+
+    store.deny_checkpoint_barrier_reads(true);
+    // SQLite's own authorization refusal (SQLITE_AUTH), not some other failure.
+    let refused = |error: anyhow::Error| {
+        let code = error
+            .chain()
+            .find_map(|e| e.downcast_ref::<rusqlite::Error>())
+            .and_then(rusqlite::Error::sqlite_error_code);
+        assert_eq!(
+            code,
+            Some(rusqlite::ErrorCode::AuthorizationForStatementDenied),
+            "{error:#}"
+        );
+    };
+    refused(store.checkpoint_barrier_marked().unwrap_err());
+    refused(store.checkpoint_state_exists().unwrap_err());
+    for sql in [
+        "SELECT set_at_ms FROM checkpoint_barrier",
+        "SELECT EXISTS (SELECT 1 FROM main.CHECKPOINT_BARRIER)",
+    ] {
+        let read = store.conn().query_row(sql, [], |r| r.get::<_, i64>(0));
+        refused(read.unwrap_err().into());
+    }
+    refused(cached(&store).unwrap_err().into());
+    // Other checkpoint tables still read.
+    store.checkpoint_usage(1000).unwrap();
+
+    store.deny_checkpoint_barrier_reads(false);
+    assert!(store.checkpoint_barrier_marked().unwrap());
+    assert!(store.checkpoint_state_exists().unwrap());
+    assert_eq!(cached(&store).unwrap(), 1);
+}
+
 #[test]
 fn empty_checkpoint_tables_add_zero_charge() {
     let (store, _) = store();

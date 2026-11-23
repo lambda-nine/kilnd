@@ -928,20 +928,22 @@ async fn an_unreadable_checkpoint_count_degrades_health_and_says_why() {
     assert!(h.detail.ends_with(SENTENCE), "{}", h.detail);
 }
 
-/// [`health`] for UID 1000 while every durable checkpoint-barrier read fails: the answer
-/// of a Health that names the barrier from the manager's flag alone.
+/// [`health`] for UID 1000 while SQLite refuses every read of the `checkpoint_barrier`
+/// table, by any Store method or raw query: the answer of a Health that names the
+/// barrier from the manager's flag alone.
 async fn health_with_no_barrier_read(m: &M, s: &Api) -> pb::HealthResponse {
-    m.store.fail_checkpoint_barrier_read.store(true, Ordering::SeqCst);
+    m.store.deny_checkpoint_barrier_reads(true);
     let h = health(s, 1000).await;
-    m.store.fail_checkpoint_barrier_read.store(false, Ordering::SeqCst);
+    m.store.deny_checkpoint_barrier_reads(false);
     h
 }
 
 /// Backlog B4 (row 24): Health names a pending checkpoint barrier and what clears it, from
 /// the manager's own flag, apart from the "resources no row explains" block. Its status
 /// is the allocation block's, as before: DEGRADED while either part is set. Every Health
-/// request here runs with the store's durable barrier read failing (the B4 break-it's
-/// HIGH 3), so a Health that read the store for the barrier fails the request.
+/// request here runs with SQLite denying any read of the barrier's table (the B4 break-it's
+/// HIGH 3 and its recheck's HIGH 2), so a Health that read the durable marker, through
+/// whichever Store method or query, fails the request.
 #[tokio::test]
 async fn health_names_a_pending_checkpoint_barrier_and_only_while_it_is_pending() {
     const BARRIER: &str = "a checkpoint barrier is pending: new sandboxes (forks included) and captures are refused until a complete, clean checkpoint inventory clears it";

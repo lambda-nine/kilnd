@@ -2401,13 +2401,6 @@ impl Store {
 
     /// Whether the barrier's marker is set (tests and diagnostics).
     pub fn checkpoint_barrier_marked(&self) -> Result<bool> {
-        #[cfg(test)]
-        if self
-            .fail_checkpoint_barrier_read
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            bail!("injected checkpoint barrier read failure");
-        }
         Ok(self.conn().query_row(
             "SELECT EXISTS (SELECT 1 FROM checkpoint_barrier)",
             [],
@@ -2434,6 +2427,56 @@ impl Store {
             database_uuid: Id128::parse(&database_uuid).map_err(anyhow::Error::msg)?,
             instance_id: Id128::parse(&instance_id).map_err(anyhow::Error::msg)?,
         })
+    }
+}
+
+/// Tests only: while `deny` is set, SQLite refuses to compile any statement that reads
+/// the `checkpoint_barrier` table, whichever Store method or raw query asks, so the read
+/// fails with SQLITE_AUTH ("not authorized") instead of answering. It watches the read
+/// itself, at the connection, not one accessor: Health must name the barrier from the
+/// manager's flag alone (backlog B4). Setting an authorizer expires every prepared
+/// statement, so a cached one is recompiled, and checked, at its next step.
+#[cfg(test)]
+impl Store {
+    pub(crate) fn deny_checkpoint_barrier_reads(&self, deny: bool) {
+        use rusqlite::ffi;
+        use std::ffi::{CStr, c_char, c_int, c_void};
+
+        /// SQLite's authorizer callback: deny SQLITE_READ of `checkpoint_barrier` (any
+        /// column, or none: SQLite passes "" for a table read for its rows alone).
+        unsafe extern "C" fn deny_barrier_reads(
+            _: *mut c_void,
+            action: c_int,
+            table: *const c_char,
+            _column: *const c_char,
+            _database: *const c_char,
+            _trigger: *const c_char,
+        ) -> c_int {
+            // SAFETY: for SQLITE_READ, SQLite passes the table's name as a
+            // NUL-terminated string that lives for the callback.
+            if action == ffi::SQLITE_READ
+                && !table.is_null()
+                && unsafe { CStr::from_ptr(table) }
+                    .to_bytes()
+                    .eq_ignore_ascii_case(b"checkpoint_barrier")
+            {
+                ffi::SQLITE_DENY
+            } else {
+                ffi::SQLITE_OK
+            }
+        }
+
+        let conn = self.conn();
+        // SAFETY: the handle is this live connection's, held under its lock for the call;
+        // the callback is a plain function that keeps no state (its argument is null).
+        let rc = unsafe {
+            ffi::sqlite3_set_authorizer(
+                conn.handle(),
+                deny.then_some(deny_barrier_reads as _),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK, "sqlite3_set_authorizer");
     }
 }
 
