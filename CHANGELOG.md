@@ -9,7 +9,8 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 - Health no longer stays SERVING when kilnd can't read its checkpoint statistics. It
   still leaves the `checkpoints` block out and logs `read checkpoint counts`, and now also
   reports DEGRADED (SHUTTING_DOWN still wins) with `checkpoint counts unreadable: <why>` in
-  `detail`, on one line of at most 512 bytes. Before, the block just vanished, which read
+  `detail`, on one line of at most 512 bytes (control characters and Unicode's line and
+  paragraph separators become spaces). Before, the block just vanished, which read
   like "no checkpoint state". No API change: Health still has no field of its own for the
   checkpoint maintenance state.
 

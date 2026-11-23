@@ -703,13 +703,15 @@ fn checkpoint_limits_pb(
 /// The most one Health detail sentence built from an error holds, in bytes.
 const MAX_HEALTH_SENTENCE: usize = 512;
 
-/// `prefix` and `error` as one Health detail sentence: on one line (control characters
+/// `prefix` and `error` as one Health detail sentence: on one line (control characters,
+/// U+0085 among them, and the Unicode line and paragraph separators U+2028 and U+2029
 /// become spaces) and at most [`MAX_HEALTH_SENTENCE`] bytes, cut on a UTF-8 boundary.
 fn health_sentence(prefix: &str, error: &str) -> String {
+    let breaks_a_line = |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}');
     let mut sentence: String = prefix
         .chars()
         .chain(error.chars())
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if breaks_a_line(c) { ' ' } else { c })
         .collect();
     if sentence.len() > MAX_HEALTH_SENTENCE {
         let mut end = MAX_HEALTH_SENTENCE;
@@ -735,6 +737,11 @@ fn a_health_sentence_is_one_bounded_line_cut_on_a_utf8_boundary() {
     assert!(sentence.len() <= MAX_HEALTH_SENTENCE && MAX_HEALTH_SENTENCE - sentence.len() < 3);
     assert!(sentence.ends_with('\u{20ac}'));
     assert_eq!(health_sentence("p: ", "short"), "p: short");
+    // The B4 break-it's LOW: Unicode's line and paragraph separators, and NEL.
+    assert_eq!(
+        health_sentence("p: ", "a\u{2028}b\u{2029}c\u{85}d"),
+        "p: a b c d"
+    );
 }
 
 fn checkpoint_stats_pb(s: crate::manager::CheckpointStats) -> pb::CheckpointStats {
