@@ -78,3 +78,58 @@ async fn a_legacy_budget_refusal_fences_nothing() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(fake.state().fenced.fence_calls, 0);
 }
+
+/// Option A, the documented instant: a Create is refused if the node budget is full when
+/// the pre-check reads it, before any Preflight. That refusal is final: it issues no
+/// token and prepares nothing, and a Delete that lands afterwards doesn't rescue it (the
+/// client may retry). Without a prediction the accepting transaction decides alone, so a
+/// Delete during the preparation admits the identical request with exactly one charge.
+#[tokio::test]
+async fn an_early_budget_refusal_is_final_and_the_commit_only_path_admits() {
+    let fake = FakeRuntime::fenced();
+    let m = Arc::new(Manager::new(
+        fake.clone(),
+        Store::open_in_memory().unwrap(),
+        Limits {
+            max_sandboxes: 1,
+            ..Limits::default()
+        },
+    ));
+    let existing = m.create(CreateRequest::default()).await.unwrap();
+    let predicted = crate::firecracker::offline_768_v1_reservation(&existing.spec).unwrap();
+    assert_eq!(existing.accounting.reservation, predicted);
+
+    // Predicted: refused at the pre-check, before any Preflight or token.
+    fake.state().fenced.predict_reservation = true;
+    let (prepared, issued) = {
+        let state = fake.state();
+        (state.fenced.prepare_calls, state.fenced.issued)
+    };
+    let error = m.create(CreateRequest::default()).await.unwrap_err();
+    assert!(
+        error.to_string().contains("sandboxes budget exhausted"),
+        "{error}"
+    );
+    assert_eq!(fake.state().fenced.prepare_calls, prepared, "nothing prepared");
+    assert_eq!(fake.state().fenced.issued, issued, "no token issued");
+    assert_eq!(m.list(true).unwrap().len(), 1, "no row for the refusal");
+    // The control: prediction off, a Delete lands during the gated preparation.
+    fake.state().fenced.predict_reservation = false;
+    let gate = FakeGate::default();
+    fake.state().fenced.prepare_gate = Some(gate.clone());
+    let pending = {
+        let m = m.clone();
+        tokio::spawn(async move { m.create(CreateRequest::default()).await })
+    };
+    gate.entered().await;
+    let deleted = m.delete(&existing.id).await.unwrap();
+    assert!(!deleted.is_charged());
+    gate.release();
+    let next = pending.await.unwrap().unwrap();
+    assert_eq!(next.state, SandboxState::Ready);
+    assert_eq!(next.accounting.reservation, predicted);
+    assert_eq!(m.store.sandbox_resources().unwrap().sandboxes, 1);
+    // The early refusal stayed a refusal: only the original and the control have rows.
+    let ids: BTreeSet<String> = m.list(true).unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(ids, BTreeSet::from([existing.id, next.id]));
+}

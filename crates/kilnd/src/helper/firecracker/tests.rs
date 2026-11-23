@@ -2098,15 +2098,27 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
     }
     fixture.wait_reached("P.preflight").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    // Create's one slot is busy: another is refused at once, not queued, given the
-    // observation slot or given a third P.
+    // Create's one slot is busy: another waits for it, and is refused once its wait
+    // ends (here its one-second deadline). It is never given the observation slot or a
+    // third P.
     let began = std::time::Instant::now();
     let error = runtime
-        .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
+        .prepare(
+            &prep(instance),
+            &spec(),
+            Instant::now() + Duration::from_secs(1),
+            &no_cancel(),
+        )
         .await
         .unwrap_err();
-    assert!(began.elapsed() < Duration::from_millis(500));
-    assert!(error.to_string().contains("preparation slot"), "{error}");
+    assert!(began.elapsed() >= Duration::from_millis(900));
+    assert!(began.elapsed() < Duration::from_millis(3_000));
+    // The wait and the wire deadline end together here; either answer is the refusal.
+    let text = error.to_string();
+    assert!(
+        text.contains("preparation slot") || text.contains("deadline expired"),
+        "{text}"
+    );
     let reply = timed_capabilities(&runtime, &fixture).await;
     let health = reply.health.unwrap();
     assert_eq!(health.preparation, [WorkerHealth::Busy, WorkerHealth::Healthy]);
@@ -2115,10 +2127,19 @@ async fn exit4_full_preparation_slots_refuse_quickly_and_are_never_replaced() {
         assert!(handle.await.unwrap().is_err());
     }
     let error = runtime
-        .prepare(&prep(instance), &spec(), deadline(5), &no_cancel())
+        .prepare(
+            &prep(instance),
+            &spec(),
+            Instant::now() + Duration::from_secs(1),
+            &no_cancel(),
+        )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("preparation slot"), "{error}");
+    let text = error.to_string();
+    assert!(
+        text.contains("preparation slot") || text.contains("deadline expired"),
+        "{text}"
+    );
     let during = fixture.census().await;
     assert_eq!(
         during["prep"], before["prep"],

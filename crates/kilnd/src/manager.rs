@@ -2614,9 +2614,13 @@ impl<R: Runtime> Manager<R> {
             Some(id) => Some(self.fork_preflight(id, &spec, owner_uid).await?),
         };
         departed()?;
-        // M3-2 F3: a refusal the node budget below would make anyway comes before
-        // prepare, so it issues no token. Only a backend that knows its reservation
-        // without asking (Firecracker) predicts one; the accepting transaction decides.
+        // M3-2 F3 (Option A): the node budgets are read here, before prepare, against
+        // the reservation the helper's Preflight would make. A budget that is full at
+        // this instant refuses the Create here, and it issues no token. That refusal is
+        // final: a Delete that lands while the Preflight would have run doesn't rescue
+        // it, and the client may retry. Only a backend that knows its reservation
+        // without asking (Firecracker) predicts one. A budget with room here is still
+        // decided by the accepting transaction.
         if let Some(reservation) = self.runtime.predicted_reservation(&spec)
             && let Some(exhausted) = self
                 .store
@@ -2632,8 +2636,10 @@ impl<R: Runtime> Manager<R> {
         };
         // C0: read-only preflight. A rejection here leaves no row and no charge.
         let prepared = self.prepare_create(&prepare_context, &spec).await;
-        // M3-2 F3: from here until the row commits, any refusal fences the token the
-        // preflight issued, so it never stays issued with no outcome.
+        // M3-2 F3: from here until the row commits, any refusal sends one best-effort
+        // fence for the token the preflight issued. If the helper refuses that fence (a
+        // full never-admitted quota, no observation) the token stays issued with no
+        // outcome, as one whose Preflight reply was lost does (helper-protocol.md).
         let mut issued = prepared
             .as_ref()
             .ok()

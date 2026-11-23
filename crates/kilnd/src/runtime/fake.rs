@@ -181,6 +181,9 @@ pub struct FakeFenced {
     /// Prepare refuses as Exhausted, as a full adapter cache does before Preflight.
     pub exhaust_prepare: Option<String>,
     pub prepare_gate: Option<FakeGate>,
+    /// Predicts the reservation Prepare would make, as Firecracker's adapter does, so
+    /// the manager's budget pre-check runs. Off by default: the commit decides alone.
+    pub predict_reservation: bool,
     pub prepare_panics: bool,
     /// Preflight finishes even after cancellation, so only the manager's own
     /// recheck stands between it and an allocation.
@@ -898,6 +901,16 @@ fn no_output(finish: Result<ExecFinish, RuntimeDiagnostic>) -> ExecOutcome {
 impl Runtime for FakeRuntime {
     fn name(&self) -> &'static str {
         "fake"
+    }
+
+    fn predicted_reservation(
+        &self,
+        spec: &SandboxSpec,
+    ) -> Option<crate::model::ResourceReservation> {
+        let state = self.state();
+        (state.mode == FakeEvidenceMode::Fenced && state.fenced.predict_reservation)
+            .then(|| crate::firecracker::offline_768_v1_reservation(spec).ok())
+            .flatten()
     }
 
     fn capabilities(&self) -> RuntimeCapabilities {

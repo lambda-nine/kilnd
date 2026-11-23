@@ -212,7 +212,7 @@ command or environment. Identities are typed 128-bit IDs and digests, profiles a
 | `attach_instance {database_uuid, highest_token}` | 5 s | `attached {node_id, connection_epoch, admission_open}`, and the connection stays open: its EOF is the detach. `highest_token` is the daemon's highest recorded complete token, or null; one that does not verify for this instance fails this attachment alone (`incompatible`), and a verified one at or above the issue pointer latches the node (see below) |
 | `capabilities` | 2 s | Cached group and worker health. Without a policy: `enabled: false` |
 | `accounting` | 5 s | Node totals with generation and once-only shared reserve, or `unknown`. No other namespace's identity. B7 adds the caller's own token figures (issue pointer, watermark, retained admitted and never-admitted rows, reserved share, pinned rows below the watermark, checkpoints, compaction lag), node retained totals, the share shortfall, a node fault by kind and a `degraded` reason |
-| `preflight {sandbox_id, profile, spec}` | 30 s | `prepared {allocation_id, ..}`: the token the helper issued for this preflight, bound into the plan's substitutions, with plan bytes, digests and reservation; or a refusal with no session effects. A refusal before issuance (a full preparation slot, no headroom, the never-admitted floor, the latch) consumes no sequence. One after it (P refuses the spec, P fails, the reply is lost) consumes one, and the token stays issued with no row: `inspect` answers `unknown` until W passes it, then `absent_fenced` (see below) |
+| `preflight {sandbox_id, profile, spec}` | 30 s | `prepared {allocation_id, ..}`: the token the helper issued for this preflight, bound into the plan's substitutions, with plan bytes, digests and reservation; or a refusal with no session effects. A refusal before issuance (no preparation slot within its wait, a full wait queue, no headroom, the never-admitted floor, the latch) consumes no sequence. One after it (P refuses the spec, P fails, the reply is lost) consumes one, and the token stays issued with no row: `inspect` answers `unknown` until W passes it, then `absent_fenced` (see below) |
 | `create {allocation_id, sandbox_id, plan, plan_digest}` | 120 s | `accepted`, the token's `absent` fence, or `ambiguous {class}`. There is no READY variant |
 | `inspect {allocation_id, plan_digest}` | 5 s | `present_ready {generation, boot_id, inner_id}` (B5: the phase is READY and no execution is in flight), `present_busy`, `stopped_with_resources`, `absent_fenced`, `incompatible` or `unknown`. A row with another plan digest is `incompatible`; a never-issued token is `incompatible`; an issued token with no row at or above the watermark is `unknown`; below it, `absent_fenced` with a receipt synthesized for this digest |
 | `list` | 30 s | This namespace's records with `complete`; anything stale or unexplained makes it incomplete |
@@ -261,7 +261,12 @@ whose daemon refused its Create before writing a row (M3-2 finding F3), has no a
 row and no fence. It holds nothing: no claim, lease, worker or host resource. kilnd keeps
 these rare. Before Preflight it checks the reservation the helper would make (computed the
 same way, from the one profile) against its own node budgets, so a refusal it can predict
-issues no token; the check is a read, and its accepting transaction still decides. After a
+issues no token. That read is the instant that decides such a refusal: a Create is refused
+if its predicted reservation doesn't fit a node budget when kilnd reads it, before any
+Preflight, and that refusal is final.
+A Delete that frees room while a Preflight would have run doesn't rescue it (the client may
+retry), where before this check the accepting transaction, later, might have admitted it. A
+budget with room at that read is still decided by the accepting transaction. After a
 Preflight, any refusal before its row commits (a budget race the check couldn't see, a
 quota, shutdown) sends one `fence_absent` for the token in the background, best effort: it
 is a never-admitted fence and counts against that quota, and if the helper refuses it (the
@@ -327,12 +332,23 @@ slots. Create's own work (Preflight, its revalidation and S's session preparatio
 only the first P slot; the second, the observation slot, is kept for the namespace
 observations that Remove, FenceAbsent and List run, and for startup's lease check, so Create
 pressure from any number of instances can't leave an allocation charged for want of a fresh
-observation (M3-2 finding F1). Preflight refuses at once when Create's slot is busy; Create
-may wait for it among at most 16 waiters and never past its deadline. An observation tries
-the observation slot first, then any free one, and waits for one among at most 16 other
-observations, for at most five seconds and never past its deadline. Only then do Remove
-and FenceAbsent answer `ambiguous {observation_unavailable}` with the charge held, and List
-report itself incomplete. A worker stuck in a syscall
+observation (M3-2 finding F1). Each kind of work that finds no slot it may take waits for
+one in its own bounded queue, polling, and a waiter that leaves early (its client cancels
+or disconnects, its wire deadline passes) gives its place back at once:
+
+- A Preflight takes Create's slot if it is free. Otherwise it waits for it among at most 16
+  other Preflights, for at most five seconds and never past its deadline, before issuing
+  anything. A full queue (16 waiting) refuses it at once, `resource_exhausted` with `wait
+  queue is full`; a wait that ends with the slot still busy refuses it with `no preparation
+  slot came free within the wait`. Either way no sequence is consumed.
+- Create's revalidation and S's session preparation wait for Create's slot among at most
+  16 others of their own (apart from the Preflights, so new requests can't refuse a Create
+  that already holds a token), never past their deadline. A full queue refuses at once.
+- An observation tries the observation slot first, then any free one, and waits for one
+  among at most 16 other observations, for at most five seconds and never past its
+  deadline. A full queue answers at once, without waiting; a wait that ends answers at its
+  end. Only then do Remove and FenceAbsent answer `ambiguous {observation_unavailable}`
+  with the charge held, and List report itself incomplete. A worker stuck in a syscall
 keeps its slot: a slot is reassigned only after that process has exited and been
 reaped and its permit has settled in the ledger. A replacement's expected image and
 identity are journaled before it is given any work (L, which must exist to write, does

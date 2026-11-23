@@ -410,15 +410,23 @@ for a retry behind it (`manager/settle_retry.rs`). One task makes one attempt at
 the same Delete a client would send for a `DELETING` row, and reconciliation's
 settlement, under the row's exec lock, for a `FAILED` one, which stays `FAILED`. The
 first retry comes a second after the failure, and each failure doubles the wait up to
-thirty seconds, until the receipt releases the row or it is no longer a charged fenced
-row. At startup the task queues every charged fenced row reconciliation left `FAILED` or
-`DELETING`. Nothing here releases without the receipt, and legacy rows are never queued.
+thirty seconds, until the receipt releases the row or the row is gone. A row that is still
+charged stays queued whatever state it moved to meanwhile (a client's Delete can take a
+`FAILED` row to `DELETING` and depart before running), and the next attempt follows its
+current state; a request that arrives during an attempt is never lost. At startup the task
+queues every charged fenced row reconciliation left `FAILED` or `DELETING`. Nothing here
+releases without the receipt. Legacy rows, and rows another backend wrote (the same check
+reconciliation makes), are never queued, and each attempt checks the backend again before
+it touches the row, so a restart with another backend never rewrites their failure.
 
 Before preparing a create, kilnd asks the runtime what its preparation would reserve
 (`predicted_reservation`; Firecracker computes its one profile's reservation, kiln says
 nothing) and refuses there, with the same `RESOURCE_EXHAUSTED` budget error, if its own
 node budgets would refuse that later anyway. So a refusal it can predict issues no
-allocation token (M3-2 finding F3). The accepting transaction still decides. Any refusal
+allocation token (M3-2 finding F3). That read decides such a refusal, and it is final: a
+Delete that frees room while the preparation would have run doesn't rescue it, and the
+client may retry. A create that fits at that read is still decided by the accepting
+transaction. Any refusal
 between a fenced preparation and the row's commit fences the token it issued in the
 background, once, best effort ([protocol](helper-protocol.md#firecracker-group-schema-2)).
 

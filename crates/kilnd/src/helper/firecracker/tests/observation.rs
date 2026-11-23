@@ -1,39 +1,76 @@
 //! The absence observation Delete, cleanup and a refused Create's fence depend on, under
 //! Create pressure (M3-2 findings F1 and F2), through the real H, L and P processes with
 //! fake effects. Create's own work (Preflight, Revalidate, S's session preparation) never
-//! takes the observation slot, and an observation waits a bounded time for a slot rather
-//! than failing at once.
+//! takes the observation slot; a Preflight or an observation that finds no slot waits a
+//! bounded time for one rather than failing at once, and a waiter that leaves early never
+//! stays counted.
+use super::super::{SlotWait, wait_for_slot};
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A Preflight from `runtime` that the `P.preflight.stall` marker holds inside P.
 fn stalled_preflight(
     runtime: &Arc<FirecrackerRuntime>,
     instance: Id128,
 ) -> tokio::task::JoinHandle<Result<PreparedCreate, RuntimeError>> {
+    cancellable_preflight(runtime, instance, deadline(30), no_cancel())
+}
+
+fn cancellable_preflight(
+    runtime: &Arc<FirecrackerRuntime>,
+    instance: Id128,
+    until: Instant,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<Result<PreparedCreate, RuntimeError>> {
     let runtime = runtime.clone();
     tokio::spawn(async move {
         runtime
-            .prepare(&prep(instance), &spec(), deadline(30), &no_cancel())
+            .prepare(&prep(instance), &spec(), until, &cancel)
             .await
     })
 }
 
-/// Holds Create's preparation slot with one stalled Preflight, and shows a second one is
-/// refused at once: Create pressure can take every slot but the observation slot.
+/// The preparation workers' health as Capabilities reports it.
+async fn preparation_health(fixture: &Fixture, runtime: &FirecrackerRuntime) -> Vec<WorkerHealth> {
+    timed_capabilities(runtime, fixture)
+        .await
+        .health
+        .unwrap()
+        .preparation
+        .to_vec()
+}
+
+/// Holds Create's preparation slot with one stalled Preflight, and a second one waiting
+/// for it: Create pressure can take every slot but the observation slot, and the waiting
+/// Preflight neither fails at once nor takes the observation slot.
 async fn hold_every_create_slot(
     fixture: &Fixture,
     runtime: &Arc<FirecrackerRuntime>,
     instance: Id128,
-) -> tokio::task::JoinHandle<Result<PreparedCreate, RuntimeError>> {
+) -> [tokio::task::JoinHandle<Result<PreparedCreate, RuntimeError>>; 2] {
     fixture.fault("P.preflight.stall");
     let held = stalled_preflight(runtime, instance);
     fixture.wait_reached("P.preflight").await;
-    let began = std::time::Instant::now();
-    let refused = stalled_preflight(runtime, instance).await.unwrap();
-    let error = refused.expect_err("a second Preflight must not get the observation slot");
-    assert!(error.to_string().contains("preparation slot"), "{error}");
-    assert!(began.elapsed() < Duration::from_millis(500));
-    held
+    let waiting = stalled_preflight(runtime, instance);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished(), "{:?}", waiting.await);
+    assert_eq!(
+        preparation_health(fixture, runtime).await,
+        [WorkerHealth::Busy, WorkerHealth::Healthy],
+        "the waiting Preflight never takes the observation slot"
+    );
+    [held, waiting]
+}
+
+/// Ends what [`hold_every_create_slot`] started.
+async fn release_create_slots(
+    fixture: &Fixture,
+    held: [tokio::task::JoinHandle<Result<PreparedCreate, RuntimeError>>; 2],
+) {
+    fixture.clear("P.preflight.stall");
+    for handle in held {
+        let _ = handle.await;
+    }
 }
 
 /// F1: Create pressure and a concurrent observation hold both preparation slots when an
@@ -82,9 +119,8 @@ async fn f1_a_fence_records_absence_under_create_pressure() {
     assert_eq!(node_totals(&runtime).await.claimed.slots, 0);
     assert_eq!(fixture.active_allocations(), 0);
     // Create's slot was never taken away from the stalled Preflight.
-    assert!(!held.is_finished());
-    fixture.clear("P.preflight.stall");
-    let _ = held.await;
+    assert!(!held[0].is_finished());
+    release_create_slots(&fixture, held).await;
 }
 
 /// F2: a Create the node refuses for capacity, while Create pressure holds every slot it
@@ -159,8 +195,7 @@ async fn f2_a_capacity_refusal_under_create_pressure_records_absence_without_del
     );
     // The holder's claim did not move.
     assert_eq!(node_totals(&holder_runtime).await.claimed.slots, 1);
-    fixture.clear("P.preflight.stall");
-    let _ = held.await;
+    release_create_slots(&fixture, held).await;
 }
 
 /// A manager over the real helper for its own new namespace.
@@ -254,4 +289,274 @@ async fn f3_a_predictable_budget_refusal_consumes_no_sequence() {
     assert_eq!(issue_next(&fixture, instance), 1, "no sequence consumed");
     assert_eq!(unaccounted(&fixture, instance), Vec::<i64>::new());
     assert_eq!(fixture.count("SELECT COUNT(*) FROM retired_tokens"), 0);
+}
+
+fn spawn_list(
+    runtime: &Arc<FirecrackerRuntime>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<Result<crate::runtime::BackendInventory, RuntimeError>> {
+    let runtime = runtime.clone();
+    tokio::spawn(async move { runtime.list(deadline(30), &cancel).await })
+}
+
+/// The wait itself: a waiter dropped while suspended (as H drops a request's future on
+/// the client's cancellation, its EOF or the wire deadline) gives its place back, a full
+/// queue refuses at once, and an expired wait gives its place back too.
+#[tokio::test(start_paused = true)]
+async fn a_slot_waiter_dropped_mid_wait_never_stays_counted() {
+    let waiters = AtomicUsize::new(0);
+    let until = Instant::now() + Duration::from_secs(5);
+    {
+        let first = wait_for_slot(|| None::<()>, &waiters, 2, until);
+        let second = wait_for_slot(|| None::<()>, &waiters, 2, until);
+        tokio::pin!(first, second);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut first).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut second).await.is_err());
+        assert_eq!(waiters.load(Ordering::SeqCst), 2, "both suspended in the wait");
+        // Full: refused at once, never counted.
+        let third = wait_for_slot(|| None::<()>, &waiters, 2, until).await;
+        assert_eq!(third, Err(SlotWait::QueueFull));
+        assert_eq!(waiters.load(Ordering::SeqCst), 2);
+    }
+    assert_eq!(waiters.load(Ordering::SeqCst), 0, "dropped waiters leave the queue");
+    // A free slot is taken at once, without a place in the queue.
+    assert_eq!(wait_for_slot(|| Some(7), &waiters, 0, until).await, Ok(7));
+    // An expired wait answers Expired at its bound and gives its place back.
+    let expired = wait_for_slot(|| None::<()>, &waiters, 2, until).await;
+    assert_eq!(expired, Err(SlotWait::Expired));
+    assert!(Instant::now() >= until);
+    assert_eq!(waiters.load(Ordering::SeqCst), 0);
+    // A slot that frees during the wait is taken.
+    let mut polls = 0;
+    let taken = wait_for_slot(
+        || {
+            polls += 1;
+            (polls == 3).then_some("slot")
+        },
+        &waiters,
+        1,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(taken, Ok("slot"));
+    assert_eq!(waiters.load(Ordering::SeqCst), 0);
+}
+
+/// A second Preflight while Create's slot is busy waits for it, and succeeds once the
+/// first finishes within the wait.
+#[tokio::test]
+async fn a_second_preflight_waits_for_creates_slot_and_succeeds_once_it_frees() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let held = hold_every_create_slot(&fixture, &runtime, instance).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!held[1].is_finished(), "still waiting after a second");
+    fixture.clear("P.preflight.stall");
+    for handle in held {
+        let plan = handle.await.unwrap().expect("both Preflights succeed");
+        assert!(plan.allocation_id().is_some());
+    }
+}
+
+/// A Preflight is refused only once its wait (five seconds) has passed with Create's
+/// slot still busy, and never by taking the observation slot.
+#[tokio::test]
+async fn a_waiting_preflight_is_refused_only_past_its_wait() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    fixture.fault("P.preflight.stall");
+    let held = stalled_preflight(&runtime, instance);
+    fixture.wait_reached("P.preflight").await;
+    let began = std::time::Instant::now();
+    let error = runtime
+        .prepare(&prep(instance), &spec(), deadline(30), &no_cancel())
+        .await
+        .unwrap_err();
+    let waited = began.elapsed();
+    assert!(
+        error.to_string().contains("no preparation slot came free within the wait"),
+        "{error}"
+    );
+    assert!(waited >= Duration::from_millis(4_900), "{waited:?}");
+    assert!(waited < Duration::from_millis(7_000), "{waited:?}");
+    // Create's worker is still held (by now it may read as stalled); the observation
+    // worker was never taken.
+    let health = preparation_health(&fixture, &runtime).await;
+    assert_ne!(health[0], WorkerHealth::Healthy, "{health:?}");
+    assert_eq!(health[1], WorkerHealth::Healthy, "{health:?}");
+    fixture.clear("P.preflight.stall");
+    assert!(held.await.unwrap().is_ok());
+}
+
+/// Sixteen Preflights may wait for Create's slot; the seventeenth is refused at once.
+/// Waiters whose clients cancel leave the queue, so the next Preflight waits again
+/// instead of finding it full.
+#[tokio::test]
+async fn a_full_preflight_queue_refuses_at_once_and_canceled_waiters_leave_it() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    fixture.fault("P.preflight.stall");
+    let held = stalled_preflight(&runtime, instance);
+    fixture.wait_reached("P.preflight").await;
+    let cancels: Vec<CancellationToken> = (0..16).map(|_| CancellationToken::new()).collect();
+    let waiting: Vec<_> = cancels
+        .iter()
+        .map(|cancel| cancellable_preflight(&runtime, instance, deadline(30), cancel.clone()))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(waiting.iter().all(|w| !w.is_finished()));
+    let began = std::time::Instant::now();
+    let error = runtime
+        .prepare(&prep(instance), &spec(), deadline(30), &no_cancel())
+        .await
+        .unwrap_err();
+    assert!(began.elapsed() < Duration::from_millis(1_000));
+    assert!(error.to_string().contains("wait queue is full"), "{error}");
+    for cancel in &cancels {
+        cancel.cancel();
+    }
+    for waiter in waiting {
+        assert!(waiter.await.unwrap().is_err());
+    }
+    // Every canceled waiter left: a new Preflight waits rather than being refused.
+    let next = stalled_preflight(&runtime, instance);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!next.is_finished(), "{:?}", next.await);
+    fixture.clear("P.preflight.stall");
+    assert!(held.await.unwrap().is_ok());
+    assert!(next.await.unwrap().is_ok());
+}
+
+/// The same for observations: sixteen Lists may wait while both slots are busy, the
+/// seventeenth reports itself incomplete at once, and canceled waiters leave the queue,
+/// so a later observation waits and completes.
+#[tokio::test]
+async fn a_full_observation_queue_refuses_at_once_and_canceled_waiters_leave_it() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    fixture.fault("P.preflight.stall");
+    let held = stalled_preflight(&runtime, instance);
+    fixture.wait_reached("P.preflight").await;
+    fixture.fault("P.observe_node.stall");
+    let first = spawn_list(&runtime, no_cancel());
+    fixture.wait_reached("P.observe_node").await;
+    let cancels: Vec<CancellationToken> = (0..16).map(|_| CancellationToken::new()).collect();
+    let waiting: Vec<_> = cancels
+        .iter()
+        .map(|cancel| spawn_list(&runtime, cancel.clone()))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(waiting.iter().all(|w| !w.is_finished()));
+    let began = std::time::Instant::now();
+    let refused = runtime.list(deadline(30), &no_cancel()).await.unwrap();
+    assert!(!refused.complete, "{refused:?}");
+    assert!(began.elapsed() < Duration::from_millis(1_000));
+    for cancel in &cancels {
+        cancel.cancel();
+    }
+    for waiter in waiting {
+        let _ = waiter.await.unwrap();
+    }
+    // Every canceled waiter left: a new List waits for a slot and completes.
+    let next = spawn_list(&runtime, no_cancel());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!next.is_finished(), "{:?}", next.await);
+    fixture.clear("P.observe_node.stall");
+    assert!(first.await.unwrap().unwrap().complete);
+    assert!(next.await.unwrap().unwrap().complete);
+    fixture.clear("P.preflight.stall");
+    assert!(held.await.unwrap().is_ok());
+}
+
+/// An observation that arrives first, with both slots idle, takes the observation slot
+/// and leaves Create's free: a Preflight right behind it proceeds at once.
+#[tokio::test]
+async fn an_observation_first_leaves_creates_slot_free() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    fixture.fault("P.observe_node.stall");
+    let listing = spawn_list(&runtime, no_cancel());
+    fixture.wait_reached("P.observe_node").await;
+    assert_eq!(
+        preparation_health(&fixture, &runtime).await,
+        [WorkerHealth::Healthy, WorkerHealth::Busy]
+    );
+    let prepared = tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.prepare(&prep(instance), &spec(), deadline(5), &no_cancel()),
+    )
+    .await
+    .expect("the Preflight did not wait behind the observation");
+    fixture.clear("P.observe_node.stall");
+    assert!(prepared.is_ok(), "{prepared:?}");
+    assert!(listing.await.unwrap().unwrap().complete);
+}
+
+/// S's session preparation holds Create's slot, not the observation slot. The marker
+/// makes a fake plan take the same lease a real plan does.
+#[tokio::test]
+async fn the_session_preparation_lease_takes_creates_slot() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let instance = Id128::random();
+    let runtime = fixture.runtime(instance, Id128::random());
+    let (context, plan) = issued(&runtime, instance).await;
+    fixture.fault("H.create.prep_lease_without_plan");
+    fixture.fault("H.create.before_open_gate.hold");
+    let epoch = epoch_of(&runtime).await;
+    let creating = raw_create(&fixture, &context, epoch, &plan);
+    tokio::pin!(creating);
+    let reached = async {
+        fixture.wait_reached("H.create.before_open_gate").await;
+        preparation_health(&fixture, &runtime).await
+    };
+    let health = tokio::select! {
+        reply = &mut creating => panic!("the create ended at the gate: {reply:?}"),
+        health = reached => health,
+    };
+    assert_eq!(
+        health,
+        [WorkerHealth::Busy, WorkerHealth::Healthy],
+        "S's lease is on Create's slot and the observation slot is free"
+    );
+    // An observation proceeds meanwhile on its own slot.
+    let cancel = no_cancel();
+    let listed = tokio::select! {
+        reply = &mut creating => panic!("the create ended at the gate: {reply:?}"),
+        listed = runtime.list(deadline(5), &cancel) => listed,
+    };
+    assert!(listed.unwrap().complete);
+    fixture.clear("H.create.before_open_gate.hold");
+    assert!(matches!(creating.await, CreateReply::Accepted { .. }));
+}
+
+/// F3 on the disk dimension: a 1 GiB disk fits a 1 GiB node disk budget, but the
+/// reservation the helper's Preflight would make (with its overhead) does not, so the
+/// refusal comes before the Preflight and consumes no sequence.
+#[tokio::test]
+async fn f3_a_predictable_disk_budget_refusal_consumes_no_sequence() {
+    let fixture = Fixture::new(NodeOptions::default()).await;
+    let (manager, instance) = real_manager(
+        &fixture,
+        Limits {
+            max_node_disk_bytes: 1 << 30,
+            ..Limits::default()
+        },
+    );
+    manager.reconcile().await.unwrap();
+    let before = issue_next(&fixture, instance);
+    let request = small_create();
+    assert_eq!(request.disk_bytes, 1 << 30, "the spec alone fits the budget");
+    let error = manager.create(request).await.unwrap_err();
+    assert!(
+        error.to_string().contains("disk bytes budget exhausted"),
+        "{error}"
+    );
+    assert!(manager.list(true).unwrap().is_empty(), "no row");
+    assert_eq!(issue_next(&fixture, instance), before, "no sequence consumed");
+    assert_eq!(unaccounted(&fixture, instance), Vec::<i64>::new());
 }

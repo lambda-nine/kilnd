@@ -56,15 +56,23 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   so Delete failed with `ObservationUnavailable` while the VM was already gone and its
   slot stayed charged until someone deleted it again. Creates now use only the first
   worker, the second is kept for these checks, and a check waits up to five seconds for a
-  worker instead of failing at once. Creates are refused for a busy worker more often as
-  a result. If a Delete, or the cleanup after a refused create, still fails, kilnd now
-  retries it on its own, after one second and then with the wait doubling up to thirty
-  seconds, until the helper's absence receipt releases the sandbox; a refused create
-  stays FAILED. Rows left charged at startup are retried the same way. The caller still
-  gets the first error. Also, a create kilnd's own node budget would refuse is now refused
-  before the helper issues it a token, and a create refused after the helper issued one
-  gets that token fenced, best effort, so tokens are no longer left issued with nothing
-  recorded for them. kiln sandboxes behave exactly as before.
+  worker instead of failing at once. A create that finds the first worker busy waits for
+  it too, up to five seconds and among at most 16 waiting creates (before, a create that
+  found no free worker was refused at once); it is refused only when 16 already wait (at
+  once) or the worker stays busy for the whole wait. A waiter whose client cancels or disconnects
+  leaves its place at once. If a Delete, or the cleanup after a refused create, still
+  fails, kilnd now retries it on its own, after one second and then with the wait
+  doubling up to thirty seconds, until the helper's absence receipt releases the sandbox
+  or the sandbox is gone; a refused create stays FAILED, and a sandbox another Delete
+  took over meanwhile stays queued until it is released. Rows left charged at startup are
+  retried the same way, except rows another backend wrote, which are never retried or
+  changed. The caller still gets the first error. Also, a create kilnd's own node budget
+  would refuse is now refused before the helper issues it a token: kilnd reads its budgets
+  before the helper's preparation, and a create that doesn't fit at that moment is
+  refused there for good, even if a Delete frees room during what would have been its
+  preparation (retry it). A create refused after the helper issued a token gets that
+  token fenced, best effort, so tokens are rarely left issued with nothing recorded for
+  them. kiln sandboxes behave exactly as before.
 
 - kilnd-helper now times every Firecracker create step by step, from Preflight through
   BOOTING to READY, and logs one `create timing v1` line per create once it ends: H's, L's,
