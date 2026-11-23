@@ -695,18 +695,23 @@ mod tests {
         time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
     }
 
-    /// The smallest request the helper answers without root or a kiln: the installed
-    /// CLI's capabilities, as kilnd's client sends it (an empty descriptor envelope, then
-    /// one length-prefixed frame).
-    fn capabilities_request() -> Vec<u8> {
+    /// A request as kilnd's client sends it: an empty descriptor envelope, then one
+    /// length-prefixed frame with a five-second deadline.
+    fn request(operation: &str) -> Vec<u8> {
         let frame = format!(
-            r#"{{"version":3,"timeout_ms":5000,"deadline_ns":{},"operation":{{"kiln":{{"capabilities":{{"id":null}}}}}}}}"#,
+            r#"{{"version":3,"timeout_ms":5000,"deadline_ns":{},"operation":{operation}}}"#,
             monotonic_ns() + 5_000_000_000
         );
         let mut bytes = vec![0x4b];
         bytes.extend_from_slice(&(frame.len() as u32).to_be_bytes());
         bytes.extend_from_slice(frame.as_bytes());
         bytes
+    }
+
+    /// The smallest request the helper answers without root or a kiln: the installed
+    /// CLI's capabilities.
+    fn capabilities_request() -> Vec<u8> {
+        request(r#"{"kiln":{"capabilities":{"id":null}}}"#)
     }
 
     /// Everything the helper sends back for [`capabilities_request`] when `kiln` doesn't
@@ -728,12 +733,12 @@ mod tests {
         bytes
     }
 
-    /// One client's whole exchange: connect, send [`capabilities_request`], keep its own
-    /// side open (an EOF would cancel the request) and read until the helper's EOF.
-    async fn ask(socket: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    /// One client's whole exchange: connect, send `request`, keep its own side open (an
+    /// EOF would cancel the request) and read until the helper's EOF.
+    async fn ask(socket: &std::path::Path, request: &[u8]) -> std::io::Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::UnixStream::connect(socket).await?;
-        stream.write_all(&capabilities_request()).await?;
+        stream.write_all(request).await?;
         let mut reply = Vec::new();
         stream.read_to_end(&mut reply).await?;
         Ok(reply)
@@ -741,8 +746,15 @@ mod tests {
 
     /// Requires `serve_groups` with `out` to serve `setup`'s own listener: while it is
     /// still running, a client's request on that socket gets the exact reply only the
-    /// helper's runtime gives, within the bound.
-    async fn assert_serves(setup: Setup, enable: bool, out: &mut impl std::io::Write, case: &str) {
+    /// helper's runtime gives, within the bound. Then `more` runs against the socket,
+    /// still while it serves.
+    async fn assert_serves_then<F: std::future::Future<Output = ()>>(
+        setup: Setup,
+        enable: bool,
+        out: &mut impl std::io::Write,
+        case: &str,
+        more: impl FnOnce(PathBuf) -> F,
+    ) {
         let Setup {
             _dir,
             socket,
@@ -751,18 +763,29 @@ mod tests {
         } = setup;
         let serving = serve_groups_as_production(listener, kiln.clone(), enable, out);
         tokio::pin!(serving);
-        let reply = tokio::select! {
-            returned = &mut serving => panic!("{case}: stopped serving: {returned:?}"),
-            reply = tokio::time::timeout(std::time::Duration::from_secs(10), ask(&socket)) => reply,
-        };
-        let reply = reply
+        let client = async {
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                ask(&socket, &capabilities_request()),
+            )
+            .await
             .unwrap_or_else(|_| panic!("{case}: no answer within 10 s"))
             .unwrap_or_else(|e| panic!("{case}: {e}"));
-        assert!(
-            reply == capabilities_reply(&kiln),
-            "{case}: answered {:?}",
-            String::from_utf8_lossy(&reply)
-        );
+            assert!(
+                reply == capabilities_reply(&kiln),
+                "{case}: answered {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+            more(socket.clone()).await;
+        };
+        tokio::select! {
+            returned = &mut serving => panic!("{case}: stopped serving: {returned:?}"),
+            () = client => {}
+        }
+    }
+
+    async fn assert_serves(setup: Setup, enable: bool, out: &mut impl std::io::Write, case: &str) {
+        assert_serves_then(setup, enable, out, case, |_| async {}).await;
     }
 
     /// Requires `serve_groups` with `out` to fail with `error` and serve nothing. A
@@ -856,12 +879,38 @@ mod tests {
 
     /// The control for the test above (fix round 4, recheck 3's HIGH 1): with a working
     /// standard error the same orchestration answers a request on the listener it was
-    /// given, having written its one line.
+    /// given, having written its one line, and serves the checkpoint group that line
+    /// names: its Capabilities say `enabled` exactly when the flag was given.
     #[tokio::test]
     async fn the_helper_serves_once_its_startup_line_is_written() {
         for (enable, line) in LINES {
             let mut out = Vec::new();
-            assert_serves(setup(), enable, &mut out, &format!("checkpoints {enable}")).await;
+            let case = format!("checkpoints {enable}");
+            assert_serves_then(setup(), enable, &mut out, &case, |socket| async move {
+                let reply = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    ask(
+                        &socket,
+                        &request(
+                            r#"{"checkpoint":{"group_version":1,"helper_epoch":null,"operation":"capabilities"}}"#,
+                        ),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                // The empty descriptor envelope, then one frame and EOF.
+                assert_eq!(reply[0], 0x4b, "{reply:?}");
+                let len = u32::from_be_bytes(reply[1..5].try_into().unwrap()) as usize;
+                assert_eq!(reply.len(), 5 + len, "{reply:?}");
+                let frame: serde_json::Value = serde_json::from_slice(&reply[5..]).unwrap();
+                assert_eq!(
+                    frame["checkpoint"]["capabilities"]["enabled"],
+                    serde_json::Value::Bool(enable),
+                    "{frame}"
+                );
+            })
+            .await;
             assert_eq!(String::from_utf8(out).unwrap(), line);
         }
     }
