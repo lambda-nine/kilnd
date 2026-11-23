@@ -217,23 +217,16 @@ async fn serve(args: &Args, bin: PathBuf) -> Result<()> {
         },
     };
     // As with Firecracker, a checkpoint group that can't start never takes kiln down.
-    // Exactly one startup line says which way it came up.
-    let checkpoint = if args.enable_checkpoints {
-        let workers = std::sync::Arc::new(kilnd::helper::checkpoint::KilnWorkers::new(bin.clone()));
-        match kilnd::helper::checkpoint::Node::new(workers) {
-            Ok(node) => {
-                eprintln!("{}", checkpoint_group_line(CheckpointGroup::Enabled));
-                Some(node)
-            }
-            Err(error) => {
-                eprintln!("{}", checkpoint_group_line(CheckpointGroup::Failed(&error)));
-                None
-            }
-        }
-    } else {
-        eprintln!("{}", checkpoint_group_line(CheckpointGroup::Off));
-        None
-    };
+    // Exactly one startup line, on standard error, says which way it came up.
+    let checkpoint = start_checkpoint_group(
+        args.enable_checkpoints,
+        || {
+            let workers =
+                std::sync::Arc::new(kilnd::helper::checkpoint::KilnWorkers::new(bin.clone()));
+            kilnd::helper::checkpoint::Node::new(workers)
+        },
+        &mut std::io::stderr(),
+    );
     let stop = CancellationToken::new();
     let stopped = stop.clone();
     tokio::spawn(async move {
@@ -263,16 +256,17 @@ async fn serve(args: &Args, bin: PathBuf) -> Result<()> {
 }
 
 /// How the checkpoint group came up at startup.
-enum CheckpointGroup<'a> {
+#[derive(Debug, PartialEq, Eq)]
+enum CheckpointGroup {
     Enabled,
     /// Started without `--enable-checkpoints`: the group answers Disabled.
     Off,
     /// Given the flag, but the group could not start: it answers Disabled too.
-    Failed(&'a dyn std::fmt::Display),
+    Failed(String),
 }
 
-/// The helper's one startup line for its checkpoint group, on standard error.
-fn checkpoint_group_line(group: CheckpointGroup<'_>) -> String {
+/// The helper's one startup line for its checkpoint group.
+fn checkpoint_group_line(group: &CheckpointGroup) -> String {
     match group {
         CheckpointGroup::Enabled => "kilnd-helper: checkpoint group: enabled".into(),
         CheckpointGroup::Off => "kilnd-helper: checkpoint group: off (flag)".into(),
@@ -280,6 +274,26 @@ fn checkpoint_group_line(group: CheckpointGroup<'_>) -> String {
             format!("kilnd-helper: checkpoint group: failed: {error}")
         }
     }
+}
+
+/// Starts the checkpoint group if `enabled`, by calling `construct` once, then writes
+/// the one line for the outcome to `out` (standard error in production) exactly once.
+/// Every outcome reaches that single write; a failed write costs only the line.
+fn start_checkpoint_group<N, E: std::fmt::Display>(
+    enabled: bool,
+    construct: impl FnOnce() -> std::result::Result<N, E>,
+    out: &mut impl std::io::Write,
+) -> Option<N> {
+    let (node, group) = if !enabled {
+        (None, CheckpointGroup::Off)
+    } else {
+        match construct() {
+            Ok(node) => (Some(node), CheckpointGroup::Enabled),
+            Err(error) => (None, CheckpointGroup::Failed(error.to_string())),
+        }
+    };
+    let _ = writeln!(out, "{}", checkpoint_group_line(&group));
+    node
 }
 
 /// One of root's ledger commands, which reach it by no socket and answer on stdout.
@@ -431,21 +445,41 @@ fn account(name: &str) -> Result<(u32, u32)> {
 mod tests {
     use super::*;
 
-    /// Backlog B4 (row 12): one startup line for each way the checkpoint group comes up.
+    /// Backlog B4 (row 12): one startup line for each way the checkpoint group comes up,
+    /// written once through the writer startup is given (the B4 break-it's HIGH 1: the
+    /// line itself, not only its text, is what the test watches).
     #[test]
     fn the_checkpoint_group_logs_one_line_for_each_startup_state() {
+        // Each outcome, the group it returns, and every byte its writer received.
+        let start = |enabled: bool, built: std::result::Result<u8, &str>| {
+            let mut out = Vec::new();
+            let mut calls = 0;
+            let node = start_checkpoint_group(
+                enabled,
+                || {
+                    calls += 1;
+                    built
+                },
+                &mut out,
+            );
+            (node, calls, String::from_utf8(out).unwrap())
+        };
         assert_eq!(
-            checkpoint_group_line(CheckpointGroup::Enabled),
-            "kilnd-helper: checkpoint group: enabled"
+            start(true, Ok(7)),
+            (Some(7), 1, "kilnd-helper: checkpoint group: enabled\n".into())
+        );
+        // Without the flag the group is never built, and the line still comes.
+        assert_eq!(
+            start(false, Ok(7)),
+            (None, 0, "kilnd-helper: checkpoint group: off (flag)\n".into())
         );
         assert_eq!(
-            checkpoint_group_line(CheckpointGroup::Off),
-            "kilnd-helper: checkpoint group: off (flag)"
-        );
-        let error = anyhow::anyhow!("no checkpoint session");
-        assert_eq!(
-            checkpoint_group_line(CheckpointGroup::Failed(&error)),
-            "kilnd-helper: checkpoint group: failed: no checkpoint session"
+            start(true, Err("no checkpoint session")),
+            (
+                None,
+                1,
+                "kilnd-helper: checkpoint group: failed: no checkpoint session\n".into()
+            )
         );
     }
 }
