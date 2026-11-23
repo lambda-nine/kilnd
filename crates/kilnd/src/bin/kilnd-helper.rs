@@ -217,42 +217,67 @@ async fn serve(args: &Args, bin: PathBuf) -> Result<()> {
         },
     };
     // As with Firecracker, a checkpoint group that can't start never takes kiln down.
-    // Exactly one startup line, on standard error, says which way it came up.
-    let checkpoint = start_checkpoint_group(
+    // Exactly one startup line, on standard error, says which way it came up. A helper
+    // that can't write that line doesn't serve, as when the eprintln! it replaced panicked.
+    let kiln = bin.clone();
+    let served_firecracker = firecracker.clone();
+    let started = serve_after_checkpoint_line(
         args.enable_checkpoints,
         || {
-            let workers =
-                std::sync::Arc::new(kilnd::helper::checkpoint::KilnWorkers::new(bin.clone()));
+            let workers = std::sync::Arc::new(kilnd::helper::checkpoint::KilnWorkers::new(kiln));
             kilnd::helper::checkpoint::Node::new(workers)
         },
         &mut std::io::stderr(),
-    );
-    let stop = CancellationToken::new();
-    let stopped = stop.clone();
-    tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).expect("SIGTERM");
-        let mut int = signal(SignalKind::interrupt()).expect("SIGINT");
-        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
-        stopped.cancel();
-    });
-    let served = kilnd::helper::serve_with_groups(
-        tokio::net::UnixListener::from_std(listener)?,
-        service_uid,
-        bin,
-        firecracker.clone(),
-        checkpoint.clone(),
-        stop,
+        |checkpoint| async move {
+            let stop = CancellationToken::new();
+            let stopped = stop.clone();
+            tokio::spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut term = signal(SignalKind::terminate()).expect("SIGTERM");
+                let mut int = signal(SignalKind::interrupt()).expect("SIGINT");
+                tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+                stopped.cancel();
+            });
+            let served = match tokio::net::UnixListener::from_std(listener) {
+                Err(error) => Err(error.into()),
+                Ok(listener) => kilnd::helper::serve_with_groups(
+                    listener,
+                    service_uid,
+                    bin,
+                    served_firecracker,
+                    checkpoint.clone(),
+                    stop,
+                )
+                .await
+                .context("root helper"),
+            };
+            (served, checkpoint)
+        },
     )
     .await;
     if let Some(node) = firecracker {
         node.shutdown();
     }
+    let (served, checkpoint) =
+        started.context("write the checkpoint group's startup line to standard error")?;
     // Every checkpoint worker is killed and reaped before the helper exits.
     if let Some(node) = checkpoint {
         node.shutdown().await;
     }
-    served.context("root helper")
+    served
+}
+
+/// Starts the checkpoint group ([`start_checkpoint_group`]) and only then, once its
+/// startup line is written, runs `serve` with it. A failed write is the error, and
+/// `serve` never runs.
+async fn serve_after_checkpoint_line<N, E: std::fmt::Display, S: std::future::Future>(
+    enabled: bool,
+    construct: impl FnOnce() -> std::result::Result<N, E>,
+    out: &mut impl std::io::Write,
+    serve: impl FnOnce(Option<N>) -> S,
+) -> std::io::Result<S::Output> {
+    let checkpoint = start_checkpoint_group(enabled, construct, out)?;
+    Ok(serve(checkpoint).await)
 }
 
 /// How the checkpoint group came up at startup.
@@ -278,12 +303,13 @@ fn checkpoint_group_line(group: &CheckpointGroup) -> String {
 
 /// Starts the checkpoint group if `enabled`, by calling `construct` once, then writes
 /// the one line for the outcome to `out` (standard error in production) exactly once.
-/// Every outcome reaches that single write; a failed write costs only the line.
+/// Every outcome reaches that single write. If the write fails, so does the call: the
+/// error comes back, any group it built is dropped unused, and the helper doesn't serve.
 fn start_checkpoint_group<N, E: std::fmt::Display>(
     enabled: bool,
     construct: impl FnOnce() -> std::result::Result<N, E>,
     out: &mut impl std::io::Write,
-) -> Option<N> {
+) -> std::io::Result<Option<N>> {
     let (node, group) = if !enabled {
         (None, CheckpointGroup::Off)
     } else {
@@ -292,8 +318,8 @@ fn start_checkpoint_group<N, E: std::fmt::Display>(
             Err(error) => (None, CheckpointGroup::Failed(error.to_string())),
         }
     };
-    let _ = writeln!(out, "{}", checkpoint_group_line(&group));
-    node
+    writeln!(out, "{}", checkpoint_group_line(&group))?;
+    Ok(node)
 }
 
 /// One of root's ledger commands, which reach it by no socket and answer on stdout.
@@ -462,7 +488,7 @@ mod tests {
                 },
                 &mut out,
             );
-            (node, calls, String::from_utf8(out).unwrap())
+            (node.unwrap(), calls, String::from_utf8(out).unwrap())
         };
         assert_eq!(
             start(true, Ok(7)),
@@ -480,6 +506,100 @@ mod tests {
                 1,
                 "kilnd-helper: checkpoint group: failed: no checkpoint session\n".into()
             )
+        );
+    }
+
+    /// A standard error that rejects every write, keeping what it was offered.
+    #[derive(Default)]
+    struct FailingWriter {
+        offered: Vec<u8>,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.offered.extend_from_slice(bytes);
+            Err(std::io::Error::other("stderr unavailable"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Backlog B4 fix round 2 (the recheck's HIGH 1): the eprintln! the startup line
+    /// replaced panicked when standard error rejected it, so the helper never served. Now
+    /// a rejected line fails startup in every outcome: the error comes back, `serve` never
+    /// runs, and a group that was built is dropped unused.
+    #[tokio::test]
+    async fn a_rejected_checkpoint_startup_line_fails_startup_in_every_outcome() {
+        let node = std::sync::Arc::new(7u8);
+        for (enabled, built, line, calls_wanted) in [
+            (true, Ok(()), "kilnd-helper: checkpoint group: enabled", 1),
+            (false, Ok(()), "kilnd-helper: checkpoint group: off (flag)", 0),
+            (
+                true,
+                Err("no checkpoint session"),
+                "kilnd-helper: checkpoint group: failed: no checkpoint session",
+                1,
+            ),
+        ] {
+            let mut out = FailingWriter::default();
+            let mut calls = 0;
+            let mut served = false;
+            let started = serve_after_checkpoint_line(
+                enabled,
+                || {
+                    calls += 1;
+                    built.map(|()| node.clone())
+                },
+                &mut out,
+                |_| {
+                    served = true;
+                    async {}
+                },
+            )
+            .await;
+            let error = started.expect_err(line);
+            assert_eq!(error.to_string(), "stderr unavailable", "{line}");
+            assert!(!served, "{line}: served after its startup line was rejected");
+            assert_eq!(calls, calls_wanted, "{line}");
+            // The line was offered (the writer refused it before its newline): the
+            // write failed, not a skipped line.
+            assert_eq!(String::from_utf8(out.offered).unwrap(), line);
+            // Nothing built survives the failed call.
+            assert_eq!(std::sync::Arc::strong_count(&node), 1, "{line}");
+        }
+        // With the line written, serve runs once, with the group the outcome built.
+        for (enabled, built, wanted) in [
+            (true, Ok(7u8), Some(7)),
+            (false, Ok(7), None),
+            (true, Err("no checkpoint session"), None),
+        ] {
+            let mut out = Vec::new();
+            let mut served = Vec::new();
+            serve_after_checkpoint_line(enabled, || built, &mut out, |group| {
+                served.push(group);
+                async {}
+            })
+            .await
+            .unwrap();
+            assert_eq!(served, [wanted]);
+            assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+        }
+    }
+
+    /// The recheck's own case: construction fails and standard error rejects the line
+    /// too. The helper used to panic here; startup must still fail, not carry on.
+    #[test]
+    fn a_checkpoint_startup_line_write_failure_keeps_the_old_exit_behavior() {
+        let mut out = FailingWriter::default();
+        assert!(
+            start_checkpoint_group::<u8, &str>(
+                true,
+                || Err("checkpoint construction failed"),
+                &mut out,
+            )
+            .is_err()
         );
     }
 }

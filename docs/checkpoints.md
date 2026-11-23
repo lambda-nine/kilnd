@@ -30,7 +30,8 @@ the running process: `tr '\0' ' ' < /proc/<pid>/cmdline`, with the PID from
 its journal since that restart (`journalctl -u kilnd-helper --since "<restart time>"`)
 must have the line `kilnd-helper: checkpoint group: enabled`. The helper logs exactly one
 such line at each start: `enabled`, `off (flag)` without the flag, or `failed: <why>` when
-the flag was given and the group could not start. Only then restart kilnd with its flag.
+the flag was given and the group could not start; a helper that can't write the line exits
+without serving. Only then restart kilnd with its flag.
 If kilnd starts while the helper answers ordinary kiln operations but cannot give it a
 checkpoint maintenance session, the checkpoint barrier stays set: Health is DEGRADED (its
 `detail` says `a checkpoint barrier is pending`), every new sandbox create is refused,

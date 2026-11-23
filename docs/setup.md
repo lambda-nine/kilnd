@@ -673,7 +673,8 @@ To opt a node in:
    `kilnd-helper: checkpoint group: enabled`. The helper logs exactly one such line at
    each start: `enabled`, `off (flag)` when it was started without the flag (a missed
    `daemon-reload`, a wrong drop-in or the wrong unit), or `failed: <why>` when it was
-   given the flag and the group could not start. The command line check above still
+   given the flag and the group could not start; a helper that can't write the line
+   exits without serving. The command line check above still
    matters: the journal says what the helper did, not what the unit file says. Only then restart kilnd
    with `--enable-workspace-checkpoints` (and `--checkpoint-headroom-bytes` if 1 GiB is
    not right for the node). The flag makes every kilnd startup reconcile checkpoints, and

@@ -26,7 +26,10 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   `--enable-checkpoints`, or `... failed: <why>`. Before, it logged only the failure (as
   `checkpoint group disabled: <why>`), and a helper started without the flag said
   nothing. The opt-in steps in `docs/setup.md` and `docs/checkpoints.md` now check for the
-  `enabled` line. Nothing else changes.
+  `enabled` line. A helper that can't write the line to standard error exits with `write
+  the checkpoint group's startup line to standard error` and never serves, as before,
+  when the old `eprintln!` panicked; it now also stops its Firecracker group first. Nothing
+  else changes.
 
 - An execution whose sandbox's cgroup went away after the command started, as when an OOM
   kill takes the whole sandbox with it, now fails its cleanup with `the sandbox's cgroup
