@@ -2331,7 +2331,7 @@ async fn b7_offline_inventory_walks_every_host_family_before_the_clear() {
         cgroup_tree: root.join("cgroup/kilnd-firecracker"),
         sys_block: root.join("block"),
         proc: ProcSource::Directory(root.join("proc")),
-        mountinfo: String::new(),
+        mountinfo: Vec::new(),
     };
     let file = |path: PathBuf, text: String| {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -315,8 +315,8 @@ pub struct MountEntry {
     pub read_only: bool,
 }
 
-fn unescape(field: &str) -> String {
-    let bytes = field.as_bytes();
+/// A mountinfo field's octal escapes (`\040` for a space) decoded, as bytes.
+fn unescape(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -335,32 +335,38 @@ fn unescape(field: &str) -> String {
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// Parses mountinfo text. Malformed lines fail the whole read rather than hide a mount.
-pub fn parse_mountinfo(text: &str) -> io::Result<Vec<MountEntry>> {
+/// Read as bytes: a mount's path or source is raw bytes but for the escapes, and need not
+/// be UTF-8. The mount point keeps its exact bytes; the source and type, which are only
+/// compared with kilnd's own ASCII names and logged, are kept lossily.
+pub fn parse_mountinfo(text: impl AsRef<[u8]>) -> io::Result<Vec<MountEntry>> {
+    use std::os::unix::ffi::OsStrExt;
+    let number = |field: &[u8], what: &str| -> io::Result<u64> {
+        std::str::from_utf8(field)
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| io::Error::other(what.to_string()))
+    };
     let mut entries = Vec::new();
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split(' ').collect();
+    for line in crate::proc_stat::lines(text.as_ref()) {
+        let fields: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
         let separator = fields
             .iter()
-            .position(|f| *f == "-")
+            .position(|f| *f == b"-")
             .ok_or_else(|| io::Error::other("mountinfo line without separator"))?;
         if separator < 6 || fields.len() < separator + 3 {
             return Err(io::Error::other("short mountinfo line"));
         }
         entries.push(MountEntry {
-            mount_id: fields[0]
-                .parse()
-                .map_err(|_| io::Error::other("mount ID"))?,
-            parent_id: fields[1]
-                .parse()
-                .map_err(|_| io::Error::other("parent mount ID"))?,
-            mount_point: PathBuf::from(unescape(fields[4])),
-            read_only: fields[5].split(',').any(|o| o == "ro"),
-            fs_type: fields[separator + 1].to_string(),
-            source: unescape(fields[separator + 2]),
+            mount_id: number(fields[0], "mount ID")?,
+            parent_id: number(fields[1], "parent mount ID")?,
+            mount_point: PathBuf::from(std::ffi::OsStr::from_bytes(&unescape(fields[4]))),
+            read_only: fields[5].split(|b| *b == b',').any(|o| o == b"ro"),
+            fs_type: String::from_utf8_lossy(fields[separator + 1]).into_owned(),
+            source: String::from_utf8_lossy(&unescape(fields[separator + 2])).into_owned(),
         });
     }
     Ok(entries)
@@ -393,23 +399,26 @@ pub struct Credentials {
     pub seccomp: u32,
 }
 
-/// Strict status parsing: a duplicate or missing field fails, never defaults.
-pub fn parse_status(text: &str) -> io::Result<Credentials> {
+/// Strict status parsing: a duplicate or missing field fails, never defaults. Read as
+/// bytes: the `Name:` line is the process's own command name, which need not be UTF-8;
+/// a field read below that isn't UTF-8 fails as a malformed one does.
+pub fn parse_status(text: impl AsRef<[u8]>) -> io::Result<Credentials> {
     let mut fields = std::collections::HashMap::new();
-    for line in text.lines() {
-        if let Some((name, value)) = line.split_once(':')
-            && fields
-                .insert(name.to_string(), value.trim().to_string())
-                .is_some()
+    for line in crate::proc_stat::lines(text.as_ref()) {
+        if let Some(at) = line.iter().position(|b| *b == b':')
+            && fields.insert(&line[..at], &line[at + 1..]).is_some()
         {
+            let name = String::from_utf8_lossy(&line[..at]);
             return Err(io::Error::other(format!("duplicate status field {name}")));
         }
     }
     let get = |name: &str| {
-        fields
-            .get(name)
-            .cloned()
-            .ok_or_else(|| io::Error::other(format!("status has no {name}")))
+        let value = fields
+            .get(name.as_bytes())
+            .ok_or_else(|| io::Error::other(format!("status has no {name}")))?;
+        std::str::from_utf8(value)
+            .map(|value| value.trim().to_string())
+            .map_err(|_| io::Error::other(name.to_string()))
     };
     let four = |name: &str| -> io::Result<[u32; 4]> {
         let values: Vec<u32> = get(name)?
@@ -664,9 +673,7 @@ mod linux {
         private_dir(&jails, "firecracker", true)?;
         private_dir(&state, "work", true)?;
         let base = Path::new(JAIL_BASE);
-        let mounts = parse_mountinfo(&sys::procfs::read_to_string(&sys::procfs::own(
-            "mountinfo",
-        ))?)?;
+        let mounts = parse_mountinfo(sys::procfs::own_mountinfo()?)?;
         let path = CString::new(base.as_os_str().as_bytes()).unwrap();
         if !mounts.iter().any(|m| m.mount_point == base) {
             sys::bind_onto_itself(&path)?;
@@ -1642,9 +1649,7 @@ mod linux {
         }
         // Exactly the contract's mounts remain: the tmpfs at the jail directory and the
         // five read-only binds directly on it.
-        let mounts = parse_mountinfo(&sys::procfs::read_to_string(&sys::procfs::own(
-            "mountinfo",
-        ))?)?;
+        let mounts = parse_mountinfo(sys::procfs::own_mountinfo()?)?;
         let under = mounts_under(&mounts, &paths.jail_dir);
         let tmpfs: Vec<&MountEntry> = under
             .iter()
@@ -1867,9 +1872,7 @@ mod linux {
     }
 
     fn read_mounts() -> io::Result<Vec<MountEntry>> {
-        parse_mountinfo(&sys::procfs::read_to_string(&sys::procfs::own(
-            "mountinfo",
-        ))?)
+        parse_mountinfo(sys::procfs::own_mountinfo()?)
     }
 
     fn jail_name(paths: &AllocationPaths) -> io::Result<&str> {
@@ -2053,9 +2056,7 @@ mod linux {
         if super::super::cgroup::exists(cgroup)? {
             names.push("cgroup".into());
         }
-        let entries = parse_mountinfo(&sys::procfs::read_to_string(&sys::procfs::own(
-            "mountinfo",
-        ))?)?;
+        let entries = parse_mountinfo(sys::procfs::own_mountinfo()?)?;
         for entry in mounts_under(&entries, &paths.jail_dir) {
             names.push(format!("mount:{}", entry.mount_point.display()));
         }
@@ -2146,8 +2147,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn mounted_at(path: &Path) -> Vec<MountEntry> {
-        let entries =
-            parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo").unwrap()).unwrap();
+        let entries = parse_mountinfo(std::fs::read("/proc/self/mountinfo").unwrap()).unwrap();
         entries
             .into_iter()
             .filter(|e| e.mount_point == path)
@@ -3300,6 +3300,256 @@ mod tests {
         assert!(parse_mountinfo("1 2 3\n").is_err());
     }
 
+    /// B5: mountinfo is read as bytes. A mount point that isn't UTF-8 keeps its exact
+    /// bytes, escapes decoded; a source or type that isn't is kept lossily; neither fails
+    /// the parse, and a malformed line still does.
+    #[test]
+    fn mountinfo_that_is_not_utf8_parses_by_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let text = b"40 25 0:40 / /home/u/\xff\\040x rw,nosuid - fuse.\xfe s\xfd\\011rc rw\n\
+                     41 25 0:41 / /mnt rw - tmpfs kilnd-jail-00 rw\n";
+        let entries = parse_mountinfo(text).unwrap();
+        assert_eq!(
+            entries[0].mount_point.as_os_str().as_bytes(),
+            b"/home/u/\xff x"
+        );
+        assert_eq!(entries[0].fs_type, "fuse.\u{fffd}");
+        assert_eq!(entries[0].source, "s\u{fffd}\trc");
+        assert_eq!(
+            (entries[1].mount_point.as_path(), entries[1].source.as_str()),
+            (Path::new("/mnt"), "kilnd-jail-00")
+        );
+        assert!(parse_mountinfo(b"4\xff 25 0:40 / /m rw - tmpfs t rw\n").is_err());
+        assert!(parse_mountinfo(b"40 25 0:40 / /\xff rw\n").is_err());
+    }
+
+    /// The text parser B5 replaced, kept to show the byte parser reads every valid UTF-8
+    /// text the same.
+    fn text_parse_mountinfo(text: &str) -> io::Result<Vec<MountEntry>> {
+        fn unescape(field: &str) -> String {
+            let bytes = field.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'\\'
+                    && i + 3 < bytes.len()
+                    && bytes[i + 1..i + 4]
+                        .iter()
+                        .all(|b| (b'0'..=b'7').contains(b))
+                {
+                    let value = (bytes[i + 1] - b'0') * 64
+                        + (bytes[i + 2] - b'0') * 8
+                        + (bytes[i + 3] - b'0');
+                    out.push(value);
+                    i += 4;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+        let mut entries = Vec::new();
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let separator = fields
+                .iter()
+                .position(|f| *f == "-")
+                .ok_or_else(|| io::Error::other("mountinfo line without separator"))?;
+            if separator < 6 || fields.len() < separator + 3 {
+                return Err(io::Error::other("short mountinfo line"));
+            }
+            entries.push(MountEntry {
+                mount_id: fields[0]
+                    .parse()
+                    .map_err(|_| io::Error::other("mount ID"))?,
+                parent_id: fields[1]
+                    .parse()
+                    .map_err(|_| io::Error::other("parent mount ID"))?,
+                mount_point: PathBuf::from(unescape(fields[4])),
+                read_only: fields[5].split(',').any(|o| o == "ro"),
+                fs_type: fields[separator + 1].to_string(),
+                source: unescape(fields[separator + 2]),
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Mountinfo texts for the equivalence checks: kernel-shaped lines, every prefix of
+    /// each (so every short or separator-less form), and edits that a hostile path or
+    /// source could make, joined in pairs with and without a final newline or `\r`. No
+    /// escape decodes to bytes that aren't UTF-8: there the text parser made a wrong path
+    /// (`U+FFFD` for the byte) and the byte parser keeps the byte.
+    pub(super) fn mountinfo_corpus() -> Vec<String> {
+        let lines = [
+            "36 25 0:32 / /var/lib/kilnd-helper/jails/firecracker/fc-0/root rw,nosuid shared:1 - tmpfs kilnd-jail-00ab rw,size=16384k",
+            "37 36 8:1 /x /mnt/a\\040b ro,nosuid,nodev - ext4 /dev/sda1 rw",
+            "98 22 7:0 / /var/lib/kiln/runs rw,relatime shared:50 - xfs /dev/loop0 rw,attr2,prjquota",
+            "38 25 0:33 / /mnt/é\\134x\\303\\251 rw master:2 - fuse.sshfs u@h:/\\011d rw,pquota",
+            "39 25 7:x / /var/lib/kiln/runs rw - xfs /dev/loop1 rw",
+        ];
+        let edits = [
+            "", " ", " - ", "-", "\\04", "\\0400", "\\1", "é", "\r", ":", "x",
+        ];
+        let mut variants = Vec::new();
+        for line in lines {
+            let words: Vec<&str> = line.split(' ').collect();
+            for k in 0..=words.len() {
+                variants.push(words[..k].join(" "));
+            }
+            for at in [5, 9, 20, line.len()] {
+                let at = (0..=at.min(line.len()))
+                    .rev()
+                    .find(|&i| line.is_char_boundary(i))
+                    .unwrap();
+                for edit in edits {
+                    variants.push(format!("{}{edit}{}", &line[..at], &line[at..]));
+                }
+            }
+        }
+        let mut texts = vec![String::new(), "\n".into()];
+        for (i, a) in variants.iter().enumerate() {
+            texts.push(a.clone());
+            texts.push(format!("{a}\n"));
+            texts.push(format!("{a}\r\n"));
+            let b = &variants[(i * 7 + 3) % variants.len()];
+            texts.push(format!("{a}\n{b}\n"));
+        }
+        texts
+    }
+
+    /// Every valid UTF-8 mountinfo text parses as it did when read as text.
+    #[test]
+    fn mountinfo_parses_as_the_text_parser_did_on_valid_utf8() {
+        let texts = mountinfo_corpus();
+        for text in &texts {
+            assert_eq!(
+                format!("{:?}", parse_mountinfo(text)),
+                format!("{:?}", text_parse_mountinfo(text)),
+                "{text:?}"
+            );
+        }
+        assert!(texts.len() > 500, "{}", texts.len());
+    }
+
+    /// B5: status is read as bytes. A `Name:` that isn't UTF-8 parses; a field read that
+    /// isn't fails as a malformed one does, and a duplicate still fails.
+    #[test]
+    fn status_with_a_command_name_that_is_not_utf8_parses() {
+        let good = status("0000000000000000", "");
+        let named = good
+            .replacen("Name:\tfirecracker", "Name:\t\u{1}", 1)
+            .into_bytes();
+        let named: Vec<u8> = named
+            .iter()
+            .map(|&b| if b == 1 { 0xff } else { b })
+            .collect();
+        assert_eq!(parse_status(&named).unwrap(), parse_status(&good).unwrap());
+        let uid = good
+            .replacen("Uid:\t300123", "Uid:\t30012\u{1}", 1)
+            .into_bytes();
+        let uid: Vec<u8> = uid.iter().map(|&b| if b == 1 { 0xff } else { b }).collect();
+        assert_eq!(parse_status(&uid).unwrap_err().to_string(), "Uid");
+        let twice = [&named[..], b"Name:\t\xfe\n"].concat();
+        assert_eq!(
+            parse_status(&twice).unwrap_err().to_string(),
+            "duplicate status field Name"
+        );
+    }
+
+    /// The text parser B5 replaced, for the equivalence check.
+    fn text_parse_status(text: &str) -> io::Result<Credentials> {
+        let mut fields = std::collections::HashMap::new();
+        for line in text.lines() {
+            if let Some((name, value)) = line.split_once(':')
+                && fields
+                    .insert(name.to_string(), value.trim().to_string())
+                    .is_some()
+            {
+                return Err(io::Error::other(format!("duplicate status field {name}")));
+            }
+        }
+        let get = |name: &str| {
+            fields
+                .get(name)
+                .cloned()
+                .ok_or_else(|| io::Error::other(format!("status has no {name}")))
+        };
+        let four = |name: &str| -> io::Result<[u32; 4]> {
+            let values: Vec<u32> = get(name)?
+                .split_whitespace()
+                .map(|v| v.parse().map_err(|_| io::Error::other(name.to_string())))
+                .collect::<io::Result<_>>()?;
+            values
+                .try_into()
+                .map_err(|_| io::Error::other(format!("{name} needs four values")))
+        };
+        let hex = |name: &str| -> io::Result<u64> {
+            let text = get(name)?;
+            if text.len() != 16 {
+                return Err(io::Error::other(format!("{name} is not 16 hex digits")));
+            }
+            u64::from_str_radix(&text, 16).map_err(|_| io::Error::other(name.to_string()))
+        };
+        let number = |name: &str| -> io::Result<u32> {
+            get(name)?
+                .parse()
+                .map_err(|_| io::Error::other(name.to_string()))
+        };
+        Ok(Credentials {
+            uid: four("Uid")?,
+            gid: four("Gid")?,
+            groups: get("Groups")?
+                .split_whitespace()
+                .map(|v| v.parse().map_err(|_| io::Error::other("Groups")))
+                .collect::<io::Result<_>>()?,
+            cap_inh: hex("CapInh")?,
+            cap_prm: hex("CapPrm")?,
+            cap_eff: hex("CapEff")?,
+            cap_bnd: hex("CapBnd")?,
+            cap_amb: hex("CapAmb")?,
+            no_new_privs: number("NoNewPrivs")?,
+            seccomp: number("Seccomp")?,
+        })
+    }
+
+    /// Every valid UTF-8 status text parses as it did when read as text: each line
+    /// dropped, doubled or edited, and command names a process can choose.
+    #[test]
+    fn status_parses_as_the_text_parser_did_on_valid_utf8() {
+        let base = status("000001ffffffffff", "27 1000");
+        let lines: Vec<&str> = base.lines().collect();
+        let mut texts = vec![String::new(), base.clone(), base.replace('\n', "\r\n")];
+        for name in ["", "a b", "x:y", "é€", "Uid:\t0\t0\t0\t0", " ", "\\n"] {
+            texts.push(base.replacen("firecracker", name, 1));
+        }
+        for i in 0..lines.len() {
+            let with = |line: &str| {
+                let mut edited = lines.clone();
+                edited[i] = line;
+                edited.join("\n") + "\n"
+            };
+            let mut dropped = lines.clone();
+            dropped.remove(i);
+            texts.push(dropped.join("\n"));
+            texts.push(format!("{base}{}\n", lines[i]));
+            for edit in ["x", " ", "\u{a0}", "é", "\r", "1"] {
+                texts.push(with(&format!("{}{edit}", lines[i])));
+                texts.push(with(&format!("{edit}{}", lines[i])));
+            }
+            texts.push(with(&lines[i].replacen(':', " ", 1)));
+            texts.push(with(&lines[i].replacen(':', "::", 1)));
+            texts.push(with(&lines[i].replacen('\t', "\u{2003}", 1)));
+        }
+        for text in &texts {
+            assert_eq!(
+                format!("{:?}", parse_status(text)),
+                format!("{:?}", text_parse_status(text)),
+                "{text:?}"
+            );
+        }
+    }
+
     fn status(caps: &str, groups: &str) -> String {
         format!(
             "Name:\tfirecracker\nUid:\t300123\t300123\t300123\t300123\nGid:\t300456\t300456\t300456\t300456\nGroups:\t{groups}\n\
@@ -3318,7 +3568,7 @@ mod tests {
     #[test]
     fn vmm_seccomp_pending_is_only_the_filter_not_yet_installed() {
         let at = |seccomp: &str| {
-            parse_status(&status("0000000000000000", "").replace("Seccomp:\t2", seccomp)).unwrap()
+            parse_status(status("0000000000000000", "").replace("Seccomp:\t2", seccomp)).unwrap()
         };
         assert!(vmm_seccomp_pending(&at("Seccomp:\t0"), &recipe()));
         assert!(!vmm_seccomp_pending(&at("Seccomp:\t2"), &recipe()), "installed");
@@ -3339,7 +3589,7 @@ mod tests {
 
     #[test]
     fn vmm_credentials_must_match_every_mask() {
-        let good = parse_status(&status("0000000000000000", "")).unwrap();
+        let good = parse_status(status("0000000000000000", "")).unwrap();
         check_vmm_credentials(&good, &recipe()).unwrap();
         // One bounding bit left set refuses the launch.
         let bounding = status("0000000000000000", "")
@@ -3347,7 +3597,7 @@ mod tests {
         let error =
             check_vmm_credentials(&parse_status(&bounding).unwrap(), &recipe()).unwrap_err();
         assert!(error.contains("CapBnd"), "{error}");
-        let groups = parse_status(&status("0000000000000000", "27")).unwrap();
+        let groups = parse_status(status("0000000000000000", "27")).unwrap();
         assert!(check_vmm_credentials(&groups, &recipe()).is_err());
         let swapped = status("0000000000000000", "").replace(
             "Uid:\t300123\t300123\t300123\t300123",
@@ -3355,7 +3605,7 @@ mod tests {
         );
         assert!(check_vmm_credentials(&parse_status(&swapped).unwrap(), &recipe()).is_err());
         assert!(
-            parse_status(&format!(
+            parse_status(format!(
                 "{}Uid:\t1\t1\t1\t1\n",
                 status("0000000000000000", "")
             ))

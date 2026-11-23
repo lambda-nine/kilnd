@@ -865,14 +865,14 @@ pub enum ProcessState {
 pub fn process_state(pid: i32) -> ProcessState {
     // Beneath the helper's private procfs instance, never a /proc pathname a mount in
     // its namespace could shadow (B4 recheck 5).
-    let Ok(stat) = crate::sys::procfs::read_to_string(&format!("{pid}/stat")) else {
+    // As bytes: the command name can hold spaces, parentheses and bytes that aren't
+    // UTF-8; only the fields after it are parsed ([`crate::proc_stat::fields`]).
+    let Ok(stat) = crate::sys::procfs::read(&format!("{pid}/stat")) else {
         return ProcessState::Gone;
     };
-    // The command name can hold spaces and parentheses: parse after the last ')'.
-    let Some(tail) = stat.rfind(')').map(|at| &stat[at + 1..]) else {
+    let Ok(fields) = crate::proc_stat::fields(&stat) else {
         return ProcessState::Gone;
     };
-    let fields: Vec<&str> = tail.split_whitespace().collect();
     match (fields.first(), fields.get(19).and_then(|f| f.parse().ok())) {
         (Some(&"Z"), _) | (Some(&"X"), _) => ProcessState::Zombie,
         (_, Some(start_time)) => ProcessState::Running { start_time },
@@ -3976,5 +3976,21 @@ pub(super) mod tests {
         }));
         assert_eq!(process_state(me), ProcessState::Running { start_time });
         assert!(host_boot_id().is_ok());
+    }
+
+    /// B5: `stat` is read as bytes, so a live process whose command name isn't UTF-8 is
+    /// running, with its own start time, never gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_command_name_is_not_utf8_is_running() {
+        let named = crate::test_support::non_utf8::Process::start();
+        let stat = std::fs::read(format!("/proc/{}/stat", named.pid())).unwrap();
+        let start_time = crate::proc_stat::fields(&stat).unwrap()[19]
+            .parse()
+            .unwrap();
+        assert_eq!(
+            process_state(named.pid()),
+            ProcessState::Running { start_time }
+        );
     }
 }

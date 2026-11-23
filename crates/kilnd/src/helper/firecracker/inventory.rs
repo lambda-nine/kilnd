@@ -272,6 +272,7 @@ mod host {
     use crate::helper::firecracker::storage::{JAIL_FS_SOURCE_PREFIX, MountEntry, parse_mountinfo};
     use std::collections::HashMap;
     use std::io;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::{Component, Path, PathBuf};
 
     /// Entries beyond the active allocations an owned directory may hold before the
@@ -314,12 +315,14 @@ mod host {
                 .collect())
         }
 
-        fn read(&self, pid: &str, file: &str) -> io::Result<String> {
+        /// As bytes: a command name and a cgroup's path are the process's (or its
+        /// cgroup creator's) own bytes, and need not be UTF-8.
+        fn read(&self, pid: &str, file: &str) -> io::Result<Vec<u8>> {
             match self {
                 #[cfg(target_os = "linux")]
-                Self::Private => crate::sys::procfs::read_to_string(&format!("{pid}/{file}")),
+                Self::Private => crate::sys::procfs::read(&format!("{pid}/{file}")),
                 #[cfg(test)]
-                Self::Directory(root) => std::fs::read_to_string(root.join(pid).join(file)),
+                Self::Directory(root) => std::fs::read(root.join(pid).join(file)),
             }
         }
     }
@@ -334,8 +337,8 @@ mod host {
         /// `/sys/block`.
         pub sys_block: PathBuf,
         pub proc: ProcSource,
-        /// This process's mountinfo text.
-        pub mountinfo: String,
+        /// This process's mountinfo, as bytes ([`parse_mountinfo`]).
+        pub mountinfo: Vec<u8>,
     }
 
     impl HostRoots {
@@ -343,10 +346,8 @@ mod host {
         pub fn production() -> Result<Self, String> {
             use crate::helper::firecracker::cgroup::CGROUP_ROOT;
             use crate::helper::firecracker::storage::{JAIL_BASE, WORK_BASE};
-            let mountinfo = crate::sys::procfs::read_to_string(&crate::sys::procfs::own(
-                "mountinfo",
-            ))
-            .map_err(|e| format!("mountinfo: {e}"))?;
+            let mountinfo =
+                crate::sys::procfs::own_mountinfo().map_err(|e| format!("mountinfo: {e}"))?;
             Ok(Self {
                 jail_base: JAIL_BASE.into(),
                 work_base: WORK_BASE.into(),
@@ -620,13 +621,19 @@ mod host {
             let comm = match roots.proc.read(&pid, "comm") {
                 Err(error) if vanished(&error) => continue,
                 Err(error) => return Err(format!("process {pid} comm: {error}")),
-                Ok(text) => text.trim_end_matches('\n').to_string(),
+                Ok(mut bytes) => {
+                    while bytes.last() == Some(&b'\n') {
+                        bytes.pop();
+                    }
+                    bytes
+                }
             };
-            let path = cgroup
-                .lines()
-                .find_map(|line| line.strip_prefix("0::"))
+            let path = crate::proc_stat::lines(&cgroup)
+                .find_map(|line| line.strip_prefix(b"0::"))
                 .ok_or_else(|| format!("process {pid} has no cgroup2 membership"))?;
-            let path = Path::new(path);
+            let path = Path::new(std::ffi::OsStr::from_bytes(path));
+            // Compared as bytes, logged lossily.
+            let named = String::from_utf8_lossy(&comm);
             if let Ok(rest) = path.strip_prefix(&tree) {
                 match ledger.of_path(rest) {
                     Some(key) => {
@@ -634,14 +641,14 @@ mod host {
                     }
                     None => walk.orphan(
                         FAMILY,
-                        format!("{pid} ({comm}) in cgroup {}", path.display()),
+                        format!("{pid} ({named}) in cgroup {}", path.display()),
                     ),
                 }
-            } else if comm == "firecracker" || comm == "jailer" {
+            } else if comm == b"firecracker" || comm == b"jailer" {
                 walk.orphan(
                     FAMILY,
                     format!(
-                        "{pid} ({comm}) outside every allocation cgroup, in {}",
+                        "{pid} ({named}) outside every allocation cgroup, in {}",
                         path.display()
                     ),
                 );
@@ -1095,7 +1102,7 @@ mod tests {
                 cgroup_tree: at("cgroup").join(super::super::cgroup::FIRECRACKER_TREE),
                 sys_block: at("block"),
                 proc: ProcSource::Directory(at("proc")),
-                mountinfo: String::new(),
+                mountinfo: Vec::new(),
             };
             mkdir(&roots.jail_base.join("firecracker"));
             mkdir(&roots.work_base);
@@ -1187,7 +1194,7 @@ mod tests {
         }
 
         fn observe(&mut self, known: &BTreeMap<Id128, Vec<Id128>>) -> OfflineObservation {
-            self.roots.mountinfo = self.mounts.join("\n");
+            self.roots.mountinfo = self.mounts.join("\n").into_bytes();
             ObservationBackend::FakeHost(self.roots.clone()).observe_offline(known)
         }
     }
@@ -1360,6 +1367,56 @@ mod tests {
         std::fs::remove_dir_all(host.work_dir(j, &host_name(j, b))).unwrap();
         write(&host.work_dir(j, &host_name(j, b)), "");
         sole_orphan(host.observe(&known), "work file");
+    }
+
+    /// B5: a process's `comm` and `cgroup` are read as bytes. A process whose name or
+    /// cgroup isn't UTF-8 is no failure of the walk, and an orphan so named is still
+    /// found, compared by its bytes and logged lossily.
+    #[test]
+    fn offline_walk_reads_names_and_cgroups_that_are_not_utf8() {
+        let raw = |host: &Host, pid: u32, cgroup: &[u8], comm: &[u8]| {
+            let proc = proc_dir(host).join(pid.to_string());
+            mkdir(&proc);
+            std::fs::write(proc.join("cgroup"), [b"0::", cgroup, b"\n"].concat()).unwrap();
+            std::fs::write(proc.join("comm"), [comm, b"\n"].concat()).unwrap();
+        };
+        let (mut host, known, pairs) = live();
+        raw(&host, 4100, b"/user.slice/\xff.scope", b"\xff");
+        raw(&host, 4101, b"/system.slice/x.service", b"firecracke\xff");
+        assert_eq!(
+            host.observe(&known),
+            OfflineObservation::Observed {
+                explained: pairs.into_iter().collect(),
+                orphans: vec![],
+            }
+        );
+        // In the tree but outside every allocation.
+        let (mut host, known, [(i, _), _]) = live();
+        let path = Host::cgroup_path(i, &stray(i), "vm/vmm");
+        raw(&host, 4102, path.as_bytes(), b"\xff");
+        let detail = sole_orphan(host.observe(&known), "process");
+        assert_eq!(detail, format!("4102 (\u{fffd}) in cgroup {path}"));
+        // A VMM outside the tree, in a cgroup whose name isn't UTF-8.
+        let (mut host, known, _) = live();
+        raw(&host, 4103, b"/user.slice/\xfe", b"firecracker");
+        let detail = sole_orphan(host.observe(&known), "process");
+        assert_eq!(
+            detail,
+            "4103 (firecracker) outside every allocation cgroup, in /user.slice/\u{fffd}"
+        );
+    }
+
+    /// B5: the private procfs instance's `comm` and `cgroup` are read as bytes: a live
+    /// process anywhere on the node whose command name isn't UTF-8 is no failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_walk_of_the_real_procfs_reads_a_name_that_is_not_utf8() {
+        let named = crate::test_support::non_utf8::Process::start();
+        let mut host = Host::new();
+        host.roots.proc = ProcSource::Private;
+        let observed = host.observe(&BTreeMap::new());
+        assert!(matches!(observed, OfflineObservation::Observed { .. }), "{observed:?}");
+        drop(named);
     }
 
     #[test]

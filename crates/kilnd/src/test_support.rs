@@ -153,3 +153,67 @@ mod tests {
         assert_eq!(spelled.path().parent(), Some(Path::new("/tmp")));
     }
 }
+
+/// A live process whose command name isn't UTF-8, for the tests of the procfs readers
+/// that read every process (or a given one) beneath the private instance.
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They start a
+// process through a link whose name isn't UTF-8, and kill and reap it when done.
+#[allow(clippy::disallowed_methods)]
+pub(crate) mod non_utf8 {
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// `/bin/sleep` run through a link named `\xff`: the kernel names a process for the
+    /// basename it was executed by, so its `comm` (and `stat`'s and `status`'s copies)
+    /// is that one byte. Killed and reaped when dropped.
+    pub(crate) struct Process {
+        child: Child,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Process {
+        pub(crate) fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff"));
+            std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
+            let child = Command::new(&link)
+                .arg("600")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let process = Self { child, _dir: dir };
+            // Named once it has executed: then a text read of its stat fails, as the
+            // readers under test did.
+            let pid = process.pid();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while std::fs::read(format!("/proc/{pid}/comm")).ok().as_deref() != Some(b"\xff\n") {
+                assert!(
+                    Instant::now() < deadline,
+                    "process {pid} was never named \\xff"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for file in ["stat", "status"] {
+                let text = std::fs::read_to_string(format!("/proc/{pid}/{file}"));
+                assert!(text.is_err(), "{file} read as text: {text:?}");
+            }
+            process
+        }
+
+        pub(crate) fn pid(&self) -> i32 {
+            self.child.id() as i32
+        }
+    }
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}

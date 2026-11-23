@@ -575,6 +575,12 @@ mod linux {
             format!("{}/{relative}", unsafe { libc::getpid() })
         }
 
+        /// This process's own `mountinfo`, as bytes: a mount's path is raw bytes but for
+        /// its octal escapes, and need not be UTF-8.
+        pub fn own_mountinfo() -> io::Result<Vec<u8>> {
+            read(&own("mountinfo"))
+        }
+
         /// This boot's ID text, `sys/kernel/random/boot_id`.
         pub fn boot_id() -> io::Result<String> {
             read_to_string("sys/kernel/random/boot_id")

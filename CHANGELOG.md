@@ -6,6 +6,14 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- kilnd-helper no longer fails a check over a process name or a mount path that isn't
+  UTF-8. The checkpoint group's storage probes read the helper's `mountinfo` as text,
+  so one mount on the node at such a path failed them. The Firecracker test
+  deployment read `stat`, `status`, `comm`, `cgroup` and `mountinfo` as text too: its
+  process checks took a live process so named for one that had exited, a peer so named
+  was refused, and the offline inventory and the jail mount checks failed. These files
+  are read as bytes now; names that are UTF-8 are read as before.
+
 - Health no longer stays SERVING when kilnd can't read its checkpoint statistics. It
   still leaves the `checkpoints` block out and logs `read checkpoint counts`, and now also
   reports DEGRADED (SHUTTING_DOWN still wins) with `checkpoint counts unreadable: <why>` in

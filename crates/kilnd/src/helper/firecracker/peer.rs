@@ -234,20 +234,25 @@ pub fn parse_cgroup(content: &str) -> Option<&str> {
     Some(path)
 }
 
-/// `Uid:` from `/proc/<pid>/status`: real, effective, saved, filesystem.
-pub fn parse_ids(status: &str, field: &str) -> Option<[u32; 4]> {
-    let values = status
-        .lines()
-        .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))?;
+/// `Uid:` from `/proc/<pid>/status`: real, effective, saved, filesystem. Read as bytes:
+/// the `Name:` line is the process's own command name, which need not be UTF-8.
+pub fn parse_ids(status: impl AsRef<[u8]>, field: &str) -> Option<[u32; 4]> {
+    let values = crate::proc_stat::lines(status.as_ref())
+        .find_map(|line| line.strip_prefix(field.as_bytes())?.strip_prefix(b":"))?;
+    let values = std::str::from_utf8(values).ok()?;
     let mut ids = values.split_whitespace().map(|id| id.parse().ok());
     let parsed = [ids.next()??, ids.next()??, ids.next()??, ids.next()??];
     ids.next().is_none().then_some(parsed)
 }
 
-/// Field 22 of `/proc/<pid>/stat`. The command name may hold spaces and parentheses.
-pub fn parse_start_time(stat: &str) -> Option<u64> {
-    let tail = &stat[stat.rfind(')')? + 1..];
-    tail.split_whitespace().nth(19)?.parse().ok()
+/// Field 22 of `/proc/<pid>/stat`. The command name may hold spaces, parentheses and
+/// bytes that aren't UTF-8 ([`crate::proc_stat::fields`]).
+pub fn parse_start_time(stat: impl AsRef<[u8]>) -> Option<u64> {
+    crate::proc_stat::fields(stat.as_ref())
+        .ok()?
+        .get(19)?
+        .parse()
+        .ok()
 }
 
 /// The peer process being examined. On Linux this holds both a pidfd and a `/proc/<pid>`
@@ -312,11 +317,23 @@ mod platform {
             Ok(text)
         }
 
+        /// As bytes, for `status` and `stat`: they hold the process's own command name,
+        /// which need not be UTF-8.
+        fn read_entry_bytes(&self, name: &str) -> io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            self.open_entry(name, libc::O_RDONLY)?
+                .take(MAX_PROC_READ as u64)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+
         pub(super) fn facts(&self) -> io::Result<PeerFacts> {
             let invalid = |what: &str| io::Error::other(format!("malformed {what}"));
-            let status = self.read_entry("status")?;
+            let status = self.read_entry_bytes("status")?;
+            // Text: the cgroup is matched only against kilnd's own units, so one that
+            // isn't UTF-8 could match none; it stays refused here, as before.
             let cgroup = self.read_entry("cgroup")?;
-            let stat = self.read_entry("stat")?;
+            let stat = self.read_entry_bytes("stat")?;
             Ok(PeerFacts {
                 uids: parse_ids(&status, "Uid").ok_or_else(|| invalid("status"))?,
                 gids: parse_ids(&status, "Gid").ok_or_else(|| invalid("status"))?,
@@ -330,7 +347,7 @@ mod platform {
         /// no CAP_SYS_PTRACE. Taking the peer's filesystem IDs for this one open
         /// satisfies that check without adding a capability to the service.
         pub(super) fn open_image(&self) -> io::Result<File> {
-            let status = self.read_entry("status")?;
+            let status = self.read_entry_bytes("status")?;
             let invalid = || io::Error::other("malformed status");
             let [_, _, _, fsuid] = parse_ids(&status, "Uid").ok_or_else(invalid)?;
             let [_, _, _, fsgid] = parse_ids(&status, "Gid").ok_or_else(invalid)?;
@@ -757,7 +774,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(
-            parse_start_time(&format!("1 (a) b) c) {fields} 777 23")),
+            parse_start_time(format!("1 (a) b) c) {fields} 777 23")),
             Some(777)
         );
         assert_eq!(parse_start_time("1 (a)"), None);
@@ -899,5 +916,78 @@ mod tests {
         assert!(view.facts().is_err());
         assert!(view.open_image().is_err());
         assert!(ProcessView::open(pid).is_err());
+    }
+
+    /// B5: `status` and `stat` are read as bytes. A peer whose command name isn't UTF-8
+    /// still has its real facts and its image.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_peer_whose_command_name_is_not_utf8_has_facts() {
+        let named = crate::test_support::non_utf8::Process::start();
+        let view = ProcessView::open(named.pid()).unwrap();
+        let facts = view.facts().unwrap();
+        // SAFETY: geteuid and getegid have no preconditions.
+        assert_eq!(facts.uids, [unsafe { libc::geteuid() }; 4]);
+        assert_eq!(facts.gids, [unsafe { libc::getegid() }; 4]);
+        let stat = std::fs::read(format!("/proc/{}/stat", named.pid())).unwrap();
+        let start: u64 = crate::proc_stat::fields(&stat).unwrap()[19]
+            .parse()
+            .unwrap();
+        assert_eq!(facts.start_time, start);
+        assert!(view.open_image().is_ok());
+    }
+
+    /// `parse_ids` and `parse_start_time` read every valid UTF-8 text as the text
+    /// parsers B5 replaced did, and read past a command name that isn't UTF-8.
+    #[test]
+    fn peer_parsers_read_as_the_text_parsers_did_on_valid_utf8() {
+        let text_ids = |status: &str, field: &str| -> Option<[u32; 4]> {
+            let values = status
+                .lines()
+                .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))?;
+            let mut ids = values.split_whitespace().map(|id| id.parse().ok());
+            let parsed = [ids.next()??, ids.next()??, ids.next()??, ids.next()??];
+            ids.next().is_none().then_some(parsed)
+        };
+        let text_start = |stat: &str| -> Option<u64> {
+            let tail = &stat[stat.rfind(')')? + 1..];
+            tail.split_whitespace().nth(19)?.parse().ok()
+        };
+        let base = "Name:\tsleep\nUid:\t1\t2\t3\t4\nGid:\t5\t6\t7\t8\n";
+        let mut texts = vec![String::new(), base.into(), base.replace('\n', "\r\n")];
+        for edit in ["", " ", "x", "\t9", "é", "\r", "\u{a0}", ":", "Uid"] {
+            for at in [0, 5, 10, 14, 20, base.len()] {
+                texts.push(format!("{}{edit}{}", &base[..at], &base[at..]));
+            }
+        }
+        for text in &texts {
+            for field in ["Uid", "Gid", "Name", "U"] {
+                assert_eq!(
+                    parse_ids(text, field),
+                    text_ids(text, field),
+                    "{text:?} {field}"
+                );
+            }
+        }
+        let fields = (4..=52)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for name in ["", "a", "a b", ") (", "a) S 1", "\n", "é)"] {
+            for state in ["S", "Z"] {
+                let stat = format!("9 ({name}) {state} {fields}\n");
+                assert_eq!(parse_start_time(&stat), text_start(&stat), "{stat:?}");
+                assert_eq!(parse_start_time(&stat), Some(22));
+            }
+        }
+        let named = format!("9 (\u{1}) S {fields}\n").replace('\u{1}', "\u{fffd}");
+        let raw = named.replace('\u{fffd}', "\u{1}").into_bytes();
+        let raw: Vec<u8> = raw.iter().map(|&b| if b == 1 { 0xff } else { b }).collect();
+        assert_eq!(parse_start_time(&raw), Some(22));
+        assert_eq!(
+            parse_ids(b"Name:\t\xff\nUid:\t1\t2\t3\t4\n", "Uid"),
+            Some([1, 2, 3, 4])
+        );
+        assert_eq!(parse_ids(b"Uid:\t1\t2\t3\t\xff\n", "Uid"), None);
     }
 }

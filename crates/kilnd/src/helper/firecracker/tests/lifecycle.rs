@@ -1943,9 +1943,7 @@ async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
     std::fs::create_dir(&paths.jail_root).unwrap();
     let reply = remove(&real, &runtime, &context).await;
     assert!(!is_absent(&reply), "{reply:?}");
-    let mounts =
-        storage::parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo").unwrap())
-            .unwrap();
+    let mounts = storage::parse_mountinfo(std::fs::read("/proc/self/mountinfo").unwrap()).unwrap();
     assert!(
         storage::mounts_under(&mounts, &paths.jail_dir)
             .iter()

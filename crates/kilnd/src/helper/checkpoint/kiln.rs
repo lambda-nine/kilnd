@@ -269,10 +269,11 @@ pub struct RunsMount {
 }
 
 /// Parses `/proc/<pid>/mountinfo` (proc(5)) for the entry at `runs`. Mount points are
-/// octal-escaped (`\040` for a space); an entry with a malformed device is refused.
-pub fn runs_mount(mountinfo: &str, runs: &Path) -> Result<RunsMount, String> {
-    let unescape = |field: &str| -> Vec<u8> {
-        let bytes = field.as_bytes();
+/// octal-escaped (`\040` for a space) and otherwise raw bytes, so the text is read as
+/// bytes: another mount's path that isn't UTF-8 is skipped like any other mount. An entry
+/// with a malformed device is refused.
+pub fn runs_mount(mountinfo: impl AsRef<[u8]>, runs: &Path) -> Result<RunsMount, String> {
+    let unescape = |bytes: &[u8]| -> Vec<u8> {
         let mut out = Vec::with_capacity(bytes.len());
         let mut i = 0;
         while i < bytes.len() {
@@ -294,22 +295,31 @@ pub fn runs_mount(mountinfo: &str, runs: &Path) -> Result<RunsMount, String> {
     };
     use std::os::unix::ffi::OsStrExt;
     let mut found = None;
-    for line in mountinfo.lines() {
-        let Some((head, tail)) = line.split_once(" - ") else {
+    for line in crate::proc_stat::lines(mountinfo.as_ref()) {
+        let Some(at) = line.windows(3).position(|w| w == b" - ") else {
             continue;
         };
-        let head: Vec<&str> = head.split(' ').collect();
-        let tail: Vec<&str> = tail.split(' ').collect();
+        let head: Vec<&[u8]> = line[..at].split(|b| *b == b' ').collect();
+        let tail: Vec<&[u8]> = line[at + 3..].split(|b| *b == b' ').collect();
         if head.len() < 5 || tail.len() < 3 || unescape(head[4]) != runs.as_os_str().as_bytes() {
             continue;
         }
-        let device = head[2]
-            .split_once(':')
+        let device = std::str::from_utf8(head[2])
+            .ok()
+            .and_then(|device| device.split_once(':'))
             .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
-            .ok_or_else(|| format!("malformed device {:?} for {}", head[2], runs.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "malformed device {:?} for {}",
+                    String::from_utf8_lossy(head[2]),
+                    runs.display()
+                )
+            })?;
         found = Some(RunsMount {
-            fstype: tail[0].to_string(),
-            project_quota: tail[2].split(',').any(|o| o == "prjquota" || o == "pquota"),
+            fstype: String::from_utf8_lossy(tail[0]).into_owned(),
+            project_quota: tail[2]
+                .split(|b| *b == b',')
+                .any(|o| o == b"prjquota" || o == b"pquota"),
             device,
         });
     }
@@ -378,10 +388,10 @@ fn storage_free(runs: &Path) -> Option<StorageFree> {
     })
 }
 
+/// As bytes: another mount's path need not be UTF-8 ([`runs_mount`]).
 #[cfg(target_os = "linux")]
-fn own_mountinfo() -> Result<String, String> {
-    crate::sys::procfs::read_to_string(&format!("{}/mountinfo", std::process::id()))
-        .map_err(|e| format!("mountinfo: {e}"))
+fn own_mountinfo() -> Result<Vec<u8>, String> {
+    crate::sys::procfs::own_mountinfo().map_err(|e| format!("mountinfo: {e}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -416,7 +426,7 @@ fn free_bytes(path: &Path) -> Option<u64> {
 
 /// Production runs on Linux only: elsewhere nothing is known.
 #[cfg(not(target_os = "linux"))]
-fn own_mountinfo() -> Result<String, String> {
+fn own_mountinfo() -> Result<Vec<u8>, String> {
     Err("no mountinfo on this platform".into())
 }
 

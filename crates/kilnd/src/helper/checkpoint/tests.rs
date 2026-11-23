@@ -1175,15 +1175,40 @@ fn kiln_s_clap_edges_and_capture_s_required_options() {
     // Capture's `--generation` and `--max-bytes` are required: each line has the
     // source positional and every other option right, and lacks just one of them.
     assert_eq!(
-        a(&[k, "checkpoint", "capture", &inst, &cp, "--generation=1", "ab12"]),
+        a(&[
+            k,
+            "checkpoint",
+            "capture",
+            &inst,
+            &cp,
+            "--generation=1",
+            "ab12"
+        ]),
         None
     );
     assert_eq!(
-        a(&[k, "checkpoint", "capture", &inst, &cp, "--max-bytes=9", "ab12"]),
+        a(&[
+            k,
+            "checkpoint",
+            "capture",
+            &inst,
+            &cp,
+            "--max-bytes=9",
+            "ab12"
+        ]),
         None
     );
     assert_eq!(
-        a(&[k, "checkpoint", "capture", &inst, &cp, "--generation=1", "--max-bytes=9", "ab12"]),
+        a(&[
+            k,
+            "checkpoint",
+            "capture",
+            &inst,
+            &cp,
+            "--generation=1",
+            "--max-bytes=9",
+            "ab12"
+        ]),
         expected
     );
     // `--require-exec-protocol` is clap's signed `u16` parser: `-0` and `+1` parse.
@@ -1197,8 +1222,14 @@ fn kiln_s_clap_edges_and_capture_s_required_options() {
     }
     // A `--writable` path is a `PathBuf`: clap refuses an empty one, either form.
     assert_eq!(a(&[k, "create", "--read-only", "--writable=", &from]), None);
-    assert_eq!(a(&[k, "create", "--read-only", "--writable", "", &from]), None);
-    assert_eq!(a(&[k, "create", "--read-only", "--writable=/w", &from]), expected);
+    assert_eq!(
+        a(&[k, "create", "--read-only", "--writable", "", &from]),
+        None
+    );
+    assert_eq!(
+        a(&[k, "create", "--read-only", "--writable=/w", &from]),
+        expected
+    );
     // Non-UTF-8: kiln refuses it in a `String` (an option value or a positional), and
     // takes it in a `--writable` path and the program name, which it never parses.
     let stat = "1 (kiln) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0".to_string();
@@ -1225,20 +1256,61 @@ fn kiln_s_clap_edges_and_capture_s_required_options() {
     let max = b"--max-bytes=9".as_slice();
     let refused: [&[&[u8]]; 4] = [
         // The capture's source positional.
-        &[b"kiln", b"checkpoint", b"capture", inst, cp, gen_, max, b"ab\xff"],
+        &[
+            b"kiln",
+            b"checkpoint",
+            b"capture",
+            inst,
+            cp,
+            gen_,
+            max,
+            b"ab\xff",
+        ],
         // A String option's inline and separate value.
         &[b"kiln", b"create", b"--hostname=h\xff", from],
         &[b"kiln", b"create", b"--image", b"a\xff", from],
         // After `--`, a word is a positional even if it reads like `--writable=`.
-        &[b"kiln", b"checkpoint", b"capture", inst, cp, gen_, max, b"--", b"--writable=\xff"],
+        &[
+            b"kiln",
+            b"checkpoint",
+            b"capture",
+            inst,
+            cp,
+            gen_,
+            max,
+            b"--",
+            b"--writable=\xff",
+        ],
     ];
     for argv in refused {
         assert!(scan(words(argv)).is_empty(), "{argv:?}");
     }
     let named: [&[&[u8]]; 3] = [
-        &[b"kiln", b"create", b"--read-only", b"--writable=/w\xff", from],
-        &[b"kiln", b"create", b"--read-only", b"--writable", b"/w\xff", from],
-        &[b"/usr/bin/kiln\xff", b"checkpoint", b"capture", inst, cp, gen_, max, b"ab12"],
+        &[
+            b"kiln",
+            b"create",
+            b"--read-only",
+            b"--writable=/w\xff",
+            from,
+        ],
+        &[
+            b"kiln",
+            b"create",
+            b"--read-only",
+            b"--writable",
+            b"/w\xff",
+            from,
+        ],
+        &[
+            b"/usr/bin/kiln\xff",
+            b"checkpoint",
+            b"capture",
+            inst,
+            cp,
+            gen_,
+            max,
+            b"ab12",
+        ],
     ];
     for argv in named {
         let scanned = scan(words(argv));
@@ -1297,6 +1369,166 @@ fn only_the_trusted_kiln_image_with_a_stable_start_is_evidence() {
     assert!(failed.is_err());
 }
 
+/// The text `runs_mount` B5 replaced, kept to show the byte parser reads every valid
+/// UTF-8 mountinfo the same.
+fn text_runs_mount(mountinfo: &str, runs: &Path) -> Result<kiln::RunsMount, String> {
+    let unescape = |field: &str| -> Vec<u8> {
+        let bytes = field.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let octal = bytes
+                .get(i + 1..i + 4)
+                .filter(|d| bytes[i] == b'\\' && d.iter().all(|b| (b'0'..=b'7').contains(b)));
+            match octal {
+                Some(d) => {
+                    out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+                    i += 4;
+                }
+                None => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let mut found = None;
+    for line in mountinfo.lines() {
+        let Some((head, tail)) = line.split_once(" - ") else {
+            continue;
+        };
+        let head: Vec<&str> = head.split(' ').collect();
+        let tail: Vec<&str> = tail.split(' ').collect();
+        if head.len() < 5 || tail.len() < 3 || unescape(head[4]) != runs.as_os_str().as_bytes() {
+            continue;
+        }
+        let device = head[2]
+            .split_once(':')
+            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
+            .ok_or_else(|| format!("malformed device {:?} for {}", head[2], runs.display()))?;
+        found = Some(kiln::RunsMount {
+            fstype: tail[0].to_string(),
+            project_quota: tail[2].split(',').any(|o| o == "prjquota" || o == "pquota"),
+            device,
+        });
+    }
+    found.ok_or_else(|| format!("{} is not a mount point", runs.display()))
+}
+
+/// Every valid UTF-8 mountinfo finds the runs mount, or fails, as the text parser did:
+/// every prefix of each line, edits a hostile path could make, in pairs, for each runs.
+#[test]
+fn runs_mount_reads_as_the_text_parser_did_on_valid_utf8() {
+    let lines = [
+        "98 22 7:0 / /var/lib/kiln/runs rw,relatime shared:50 - xfs /dev/loop0 rw,attr2,prjquota",
+        "99 22 7:1 / /var/lib/kiln/r\\040s rw - xfs /dev/loop1 rw,pquota,x",
+        "100 98 7:x / /var/lib/kiln/runs rw - ext4 /dev/loop2 rw",
+        "101 22 0:3 / /var/lib/kiln/é\\134x rw a - b - fuse.é s\\011x rw",
+    ];
+    let edits = ["", " ", " - ", "-", ":", "\\04", "\\0400", "é", "\r", "x"];
+    let mut variants = Vec::new();
+    for line in lines {
+        let words: Vec<&str> = line.split(' ').collect();
+        for k in 0..=words.len() {
+            variants.push(words[..k].join(" "));
+        }
+        for at in [3, 8, 12, 30, line.len()] {
+            let at = (0..=at.min(line.len()))
+                .rev()
+                .find(|&i| line.is_char_boundary(i))
+                .unwrap();
+            for edit in edits {
+                variants.push(format!("{}{edit}{}", &line[..at], &line[at..]));
+            }
+        }
+    }
+    let runs = [
+        "/var/lib/kiln/runs",
+        "/var/lib/kiln/r s",
+        "/var/lib/kiln/é\\x",
+        "/",
+    ];
+    let mut checked = 0;
+    for (i, a) in variants.iter().enumerate() {
+        let b = &variants[(i * 7 + 3) % variants.len()];
+        for text in [a.clone(), format!("{a}\n"), format!("{a}\r\n{b}\n")] {
+            for at in runs {
+                let at = Path::new(at);
+                assert_eq!(
+                    kiln::runs_mount(&text, at),
+                    text_runs_mount(&text, at),
+                    "{text:?} {at:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1000, "{checked}");
+}
+
+/// B5's shared own-mountinfo reader (`sys::procfs::own_mountinfo`), which the checkpoint
+/// storage probes, the offline inventory and the Firecracker storage checks all read
+/// through, with a mount point that isn't UTF-8 in this process's own mount namespace.
+/// An unprivileged process can't mount one (CI's user namespaces are restricted), so it
+/// runs as root in a private mount namespace made for it:
+///
+/// ```sh
+/// d=$(mktemp -d) && sudo unshare -m sh -c "mount --make-rprivate / &&
+///   mount -t tmpfs b5 \"$d/$(printf '\377')\" && KILND_B5_MOUNT_DIR=$d \
+///   <kilnd lib test binary> --ignored --exact \
+///   helper::checkpoint::tests::b5_linux_root_mountinfo_readers_take_a_mount_point_that_is_not_utf8"
+/// ```
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs root and a prepared mount: see the doc comment"]
+fn b5_linux_root_mountinfo_readers_take_a_mount_point_that_is_not_utf8() {
+    use crate::helper::firecracker::inventory::HostRoots;
+    use crate::helper::firecracker::storage::parse_mountinfo;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = std::env::var_os("KILND_B5_MOUNT_DIR").expect("KILND_B5_MOUNT_DIR");
+    let at = Path::new(&dir).join(std::ffi::OsStr::from_bytes(b"\xff"));
+    // The precondition: this process's mountinfo isn't text.
+    assert!(std::fs::read_to_string("/proc/self/mountinfo").is_err());
+    let bytes = crate::sys::procfs::own_mountinfo().unwrap();
+    // The checkpoint storage probes' parser finds it by its bytes.
+    let mount = kiln::runs_mount(&bytes, &at).unwrap();
+    assert_eq!(mount.fstype, "tmpfs");
+    // The Firecracker storage checks' parser, and the offline inventory's roots.
+    let entries = parse_mountinfo(&bytes).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.mount_point == at && e.source == "b5")
+    );
+    let roots = HostRoots::production().unwrap();
+    assert!(
+        parse_mountinfo(&roots.mountinfo)
+            .unwrap()
+            .iter()
+            .any(|e| e.mount_point == at)
+    );
+}
+
+/// The production process table, not only the injectable parser, must read every
+/// process's stat as bytes. The caller keeps a process with a non-UTF-8 comm alive.
+#[cfg(target_os = "linux")]
+#[test]
+fn production_process_table_reads_a_non_utf8_comm() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let named = crate::test_support::non_utf8::Process::start();
+    // Any executable's identity: the stat of every process is read before it is matched.
+    let meta = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+    let processes = kiln::process_table((meta.dev(), meta.ino())).unwrap();
+    eprintln!(
+        "production process table read {} artifact readers",
+        processes.len()
+    );
+    drop(named);
+}
+
 /// Fix review 2026-11-22 (outside its range): the scan read every process's `stat` as
 /// text, so one process anywhere on the node whose command name isn't UTF-8 (a sandbox's
 /// `prctl(PR_SET_NAME, "\xff")` is enough) failed it, and while that process lived every
@@ -1319,7 +1551,11 @@ fn a_command_name_that_is_not_utf8_does_not_fail_the_scan() {
         }
     };
     let cmdline = |pid: u32| -> io::Result<Vec<u8>> {
-        Ok(if pid == 10 { worker.clone().into_bytes() } else { b"sleep\0x\0".to_vec() })
+        Ok(if pid == 10 {
+            worker.clone().into_bytes()
+        } else {
+            b"sleep\0x\0".to_vec()
+        })
     };
     let scanned = kiln::scan([10, 11], kiln, |pid| Ok(stat(pid)), cmdline, |_| Ok(kiln)).unwrap();
     assert_eq!(scanned.len(), 1, "{scanned:?}");
@@ -2501,6 +2737,21 @@ fn storage_probes_read_the_runs_mount_its_backing_and_the_registry() {
     );
     let ext4 = "98 22 252:3 / /var/lib/kiln/runs rw - ext4 /dev/vdb rw\n";
     assert_eq!(runs_mount(ext4, runs).unwrap().fstype, "ext4");
+    // B5: read as bytes, another mount's path that isn't UTF-8 is skipped, and a runs
+    // whose own path isn't is found by its bytes.
+    let other = [
+        b"40 22 0:40 / /home/u/\xff rw - fuse.\xfe s\xfd rw\n",
+        info.as_bytes(),
+    ]
+    .concat();
+    assert_eq!(runs_mount(&other, runs), runs_mount(info, runs));
+    let raw = b"98 22 7:0 / /var/lib/kiln/r\xff\\040s rw - xfs /dev/loop0 rw,prjquota\n";
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let at = Path::new(std::ffi::OsStr::from_bytes(b"/var/lib/kiln/r\xff s"));
+        assert_eq!(runs_mount(raw, at).unwrap().device, (7, 0));
+    }
+    assert!(runs_mount(b"98 22 7:\xff / /var/lib/kiln/runs rw - xfs d rw\n", runs).is_err());
 
     assert_eq!(
         backing_path("/var/lib/kiln/storage.xfs\n"),
@@ -2629,10 +2880,10 @@ fn a_restored_sandboxs_shim_session_is_not_a_worker() {
         ]
     };
     let table = kiln::shim_sessions(vec![
-        (7471, 7471, create(c)), // the shim, setsid
-        (7472, 7471, create(c)), // its init, forked without exec
+        (7471, 7471, create(c)),     // the shim, setsid
+        (7472, 7471, create(c)),     // its init, forked without exec
         (7473, 7471, create(other)), // names another artifact: counts
-        (900, 800, create(c)), // the helper's CLI, in the helper's session
+        (900, 800, create(c)),       // the helper's CLI, in the helper's session
         (800, 800, vec!["kilnd-helper".into()]),
         (7480, 7480, vec!["sh".into()]),
         (7481, 7480, create(c)), // a session whose leader is not a shim

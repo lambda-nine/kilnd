@@ -670,17 +670,29 @@ mod linux {
         }
     }
 
-    fn proc_status(pid: i32) -> io::Result<String> {
-        crate::sys::procfs::read_to_string(&format!("{pid}/status"))
+    /// As bytes: its `Name:` line is the process's own command name, which need not be
+    /// UTF-8; only the fields read are parsed as text.
+    pub(super) fn proc_status(pid: i32) -> io::Result<Vec<u8>> {
+        crate::sys::procfs::read(&format!("{pid}/status"))
     }
 
-    fn ppid(pid: i32) -> io::Result<i32> {
-        let status = proc_status(pid)?;
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("PPid:"))
-            .and_then(|v| v.trim().parse().ok())
+    pub(super) fn ppid(pid: i32) -> io::Result<i32> {
+        parse_ppid(&proc_status(pid)?)
+    }
+
+    /// `PPid:` from `status`, as bytes ([`proc_status`]).
+    pub(super) fn parse_ppid(status: &[u8]) -> io::Result<i32> {
+        crate::proc_stat::lines(status)
+            .find_map(|l| l.strip_prefix(b"PPid:"))
+            .and_then(|v| std::str::from_utf8(v).ok()?.trim().parse().ok())
             .ok_or_else(|| io::Error::other("no PPid"))
+    }
+
+    /// Whether the process is stopped (`stat`'s state `T`). As bytes: the command name
+    /// before it need not be UTF-8 ([`crate::proc_stat::fields`]).
+    pub(super) fn stopped(pid: i32) -> io::Result<bool> {
+        let stat = crate::sys::procfs::read(&format!("{pid}/stat"))?;
+        Ok(crate::proc_stat::fields(&stat).is_ok_and(|f| f.first() == Some(&"T")))
     }
 
     /// Runs `body` with this process's filesystem IDs set to the VMM's. `/proc/<V>/exe`
@@ -1495,13 +1507,7 @@ mod linux {
         // V's journaled identity (this boot, PID, start time), proven on a pidfd.
         let v_proof = proven::prove_process(&v).map_err(|e| e.refusal("the VMM"))?;
         proven::signal(&v_proof, libc::SIGSTOP)?;
-        link.wait_for(Duration::from_secs(5), || {
-            let stat = crate::sys::procfs::read_to_string(&format!("{}/stat", v.pid))?;
-            let state = stat
-                .rfind(')')
-                .and_then(|at| stat[at + 1..].split_whitespace().next().map(str::to_owned));
-            Ok((state.as_deref() == Some("T")).then_some(()))
-        })?;
+        link.wait_for(Duration::from_secs(5), || Ok(stopped(v.pid)?.then_some(())))?;
         storage::harden_jail(
             &plan.paths,
             mount,
@@ -1780,5 +1786,91 @@ mod linux {
         }
         storage::remove_work(&plan.paths, recorded.work_dir.as_ref(), &files)?;
         Ok(())
+    }
+
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+// Approved (design 7.1): test fixtures, compiled only under cfg(test). They stop their
+// own child, which the fixture kills and reaps.
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::linux::{parse_ppid, ppid, proc_status, stopped};
+    use super::*;
+    use crate::test_support::non_utf8::Process;
+    use std::time::{Duration, Instant};
+
+    /// B5: `status` is read as bytes. A VMM candidate whose command name isn't UTF-8
+    /// still has its parent and its credentials read.
+    #[test]
+    fn the_status_of_a_process_whose_name_is_not_utf8_reads() {
+        let named = Process::start();
+        // SAFETY: getpid and getuid have no preconditions.
+        let (me, uid) = unsafe { (libc::getpid(), libc::getuid()) };
+        assert_eq!(ppid(named.pid()).unwrap(), me);
+        let status = proc_status(named.pid()).unwrap();
+        assert_eq!(storage::parse_status(&status).unwrap().uid, [uid; 4]);
+    }
+
+    /// B5: `stat` is read as bytes. The stop check before hardening sees a stopped
+    /// process whose command name isn't UTF-8, and a running one as running.
+    #[test]
+    fn the_stop_check_reads_a_process_whose_name_is_not_utf8() {
+        let named = Process::start();
+        assert!(!stopped(named.pid()).unwrap());
+        // SAFETY: a signal to this test's own live child.
+        assert_eq!(unsafe { libc::kill(named.pid(), libc::SIGSTOP) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !stopped(named.pid()).unwrap() {
+            assert!(Instant::now() < deadline, "never seen stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The text `PPid:` parse B5 replaced: the byte parse reads every valid UTF-8
+    /// status the same.
+    #[test]
+    fn ppid_parses_as_the_text_parser_did_on_valid_utf8() {
+        let text_ppid = |status: &str| -> Option<i32> {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix("PPid:"))
+                .and_then(|v| v.trim().parse().ok())
+        };
+        let base = "Name:\tfirecracker\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t7\nPid:\t7\nPPid:\t4242\nUid:\t0\t0\t0\t0\n";
+        let mut texts = vec![String::new(), base.into(), base.replace('\n', "\r\n")];
+        for name in ["PPid:\t1", "x y", "é", ""] {
+            texts.push(base.replacen("firecracker", name, 1));
+        }
+        for value in [
+            "",
+            "x",
+            " 12 ",
+            "\u{a0}12",
+            "-1",
+            "12\r",
+            "99999999999",
+            "1 2",
+            "+3",
+        ] {
+            texts.push(base.replacen("\t4242", value, 1));
+            texts.push(format!(
+                "{}PPid:{value}\n",
+                base.replacen("PPid:", "PPidx:", 1)
+            ));
+            texts.push(format!("{base}PPid:{value}\n"));
+        }
+        texts.push(base.replacen("PPid:\t4242\n", "", 1));
+        texts.push(base.replacen("PPid:\t4242\n", "PPid:\t4242", 1));
+        for text in &texts {
+            assert_eq!(
+                parse_ppid(text.as_bytes()).ok(),
+                text_ppid(text),
+                "{text:?}"
+            );
+        }
+        assert_eq!(parse_ppid(b"Name:\t\xff\nPPid:\t9\n").unwrap(), 9);
+        assert!(parse_ppid(b"PPid:\t9\xff\n").is_err());
     }
 }
