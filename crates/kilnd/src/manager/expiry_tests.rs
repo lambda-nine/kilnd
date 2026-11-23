@@ -1415,3 +1415,43 @@ async fn uncapped_unrepresentable_expiry_is_refused_before_preparation() {
     assert_eq!(fake.state().fenced.issued, 0);
     assert!(m.store.sandboxes(true).unwrap().is_empty());
 }
+
+/// Pre-review 3: a fenced READY sandbox under a 60 s policy, removed by the ordinary
+/// expiry sweep, ends DELETED and released by its receipt with its own reason, for
+/// lifetime and idle expiry alike, not FAILED.
+#[tokio::test]
+async fn fenced_expiry_ends_deleted_and_released_with_its_own_reason() {
+    for (lifetime, idle, reason) in [
+        (60, 0, DeletionReason::ExpiredLifetime),
+        (0, 60, DeletionReason::ExpiredIdle),
+    ] {
+        let fake = FakeRuntime::fenced();
+        let clock = ManualClock::default();
+        let m = Arc::new(Manager::with_clock(
+            fake,
+            Store::open_in_memory().unwrap(),
+            test_limits(),
+            Arc::new(clock.clone()),
+        ));
+        let sandbox = m.create(policy(lifetime, idle)).await.unwrap();
+        assert_eq!(sandbox.state, SandboxState::Ready);
+        assert!(sandbox.is_fenced() && sandbox.is_charged());
+        m.rebuild_expiry().unwrap();
+        clock.advance(61 * SEC);
+        sweep(&m).await;
+        let settled = row(&m, &sandbox.id);
+        assert_eq!(settled.lifecycle.deletion_reason, Some(reason));
+        assert_eq!(settled.state, SandboxState::Deleted, "{reason:?}");
+        assert!(settled.deleted_at_ms.is_some(), "{reason:?}");
+        assert!(!settled.is_charged(), "{reason:?}");
+        assert!(
+            matches!(settled.accounting.release, crate::model::ReservationRelease::Fenced(_)),
+            "{reason:?}: {:?}",
+            settled.accounting.release
+        );
+        assert_eq!(
+            m.store.sandbox_resources().unwrap(),
+            crate::store::SandboxResources::default()
+        );
+    }
+}

@@ -609,6 +609,9 @@ pub struct Node {
     preflight_waiters: AtomicUsize,
     /// Observations waiting for a P slot ([`MAX_OBSERVE_WAITERS`]).
     observe_waiters: AtomicUsize,
+    /// Wakes every P-slot waiter whenever a slot may have become usable: a lease given
+    /// back ([`PrepLease`]'s drop) or a replacement P published. See [`wait_for_slot`].
+    prep_freed: Arc<tokio::sync::Notify>,
     ledger_fault: Mutex<Option<String>>,
     /// B5-01: L refused an answer too large for one frame.
     ledger_reply_fault: Mutex<Option<String>>,
@@ -924,6 +927,7 @@ impl Node {
             prep_waiters: AtomicUsize::new(0),
             preflight_waiters: AtomicUsize::new(0),
             observe_waiters: AtomicUsize::new(0),
+            prep_freed: Arc::default(),
             ledger_fault: Mutex::new(None),
             ledger_reply_fault: Mutex::new(None),
             ledger_replacement_fault: Mutex::new(None),
@@ -1285,6 +1289,7 @@ impl Node {
                 return Some(PrepLease {
                     channel: slot.channel.clone(),
                     busy: slot.busy.clone(),
+                    freed: self.prep_freed.clone(),
                 });
             }
         }
@@ -1303,6 +1308,7 @@ impl Node {
         let until = deadline.instant.min(Instant::now() + OBSERVE_WAIT);
         let lease = wait_for_slot(
             || self.try_prep_slot(PrepClass::Observe),
+            &self.prep_freed,
             &self.observe_waiters,
             MAX_OBSERVE_WAITERS,
             until,
@@ -1335,6 +1341,7 @@ impl Node {
     async fn queued_prep_lease(&self, deadline: WireDeadline) -> Option<PrepLease> {
         wait_for_slot(
             || self.try_prep_slot(PrepClass::Create),
+            &self.prep_freed,
             &self.prep_waiters,
             MAX_PREP_WAITERS,
             deadline.instant,
@@ -1352,6 +1359,7 @@ impl Node {
     ) -> Result<PrepReply, CallError> {
         let lease = wait_for_slot(
             || self.try_prep_slot(PrepClass::Create),
+            &self.prep_freed,
             &self.prep_waiters,
             MAX_PREP_WAITERS,
             deadline.instant,
@@ -2228,6 +2236,8 @@ impl Node {
             }
             (SlotKind::Prep(index), Spawned::Plain(slot)) => {
                 *self.prep[index].lock().unwrap() = slot;
+                // A usable slot again: its waiters look now, not at their cutoff.
+                self.prep_freed.notify_waiters();
             }
             (SlotKind::Recovery(index), Spawned::Plain(slot)) => {
                 *self.recovery[index].lock().unwrap() = slot;
@@ -3269,6 +3279,7 @@ impl Node {
         let until = deadline.instant.min(Instant::now() + PREFLIGHT_WAIT);
         let lease = match wait_for_slot(
             || self.try_prep_slot(PrepClass::Create),
+            &self.prep_freed,
             &self.preflight_waiters,
             MAX_PREFLIGHT_WAITERS,
             until,
@@ -4776,42 +4787,71 @@ impl Drop for WaitPlace<'_> {
     }
 }
 
-/// How often a waiter looks for a free slot.
-const SLOT_POLL: Duration = Duration::from_millis(2);
-
-/// A slot from `try_slot`: at once if one is free; otherwise as one of at most `max`
-/// waiters counted in `waiters`, polling until `until`. The place is held by a drop guard,
-/// so a waiter that is dropped mid-wait never stays counted.
+/// A slot from `try_slot`, as one of at most `max` waiters counted in `waiters` if none
+/// is free at once, until `until`. The place is held by a drop guard, so a waiter that is
+/// dropped mid-wait never stays counted.
 ///
-/// `until` is a cutoff on every look, the first included: no slot is taken once the
-/// clock is past it. Each sleep is capped at the time left, so the last look lands at
-/// the cutoff, and the clock is read again on waking, before `try_slot`: a waiter woken
-/// late (a busy runtime) gets `Expired` and its place back, never a slot that first came
-/// free after its cutoff.
+/// The contract: a waiter is granted a slot if and only if it acquires one at a time
+/// `now <= until`; otherwise it gets `Expired` and its place back. It doesn't poll: every
+/// path that makes a slot usable (a [`PrepLease`] dropped, a replacement P published)
+/// calls `freed.notify_waiters()`, and a waiter registers for that wake *before* each
+/// look, so a release between a look and the wait that follows it is never lost. A slot
+/// released before the cutoff is taken at the release, whatever the timer's granularity
+/// (Tokio rounds timers up to the next millisecond). A slot released exactly at the cutoff
+/// is taken if the waiter's look after the release still reads `now <= until`; a waiter
+/// that only runs after the cutoff gets `Expired`.
+///
+/// `until` is checked on entry, after every wake and after every acquisition. A deadline
+/// wake that reads `now <= until` makes one last look; a late one (past the cutoff) makes
+/// none. A slot acquired by a look that started on time but finished past the cutoff (a
+/// synchronous look delayed on a busy runtime) is given back, which wakes the other
+/// waiters, and the answer is `Expired`. Waiters are woken together and race for the
+/// slot: there is no FIFO order.
 async fn wait_for_slot<T>(
     mut try_slot: impl FnMut() -> Option<T>,
+    freed: &tokio::sync::Notify,
     waiters: &AtomicUsize,
     max: usize,
     until: Instant,
 ) -> Result<T, SlotWait> {
+    // Granted only if the clock still reads `until` or earlier once the slot is held.
+    // A slot held too late is given back, and the other waiters are told.
+    let in_time = |slot: T| {
+        if Instant::now() > until {
+            drop(slot);
+            freed.notify_waiters();
+            Err(SlotWait::Expired)
+        } else {
+            Ok(slot)
+        }
+    };
     if Instant::now() > until {
         return Err(SlotWait::Expired);
     }
-    if let Some(slot) = try_slot() {
-        return Ok(slot);
-    }
-    let _place = WaitPlace::take(waiters, max).ok_or(SlotWait::QueueFull)?;
+    let deadline = tokio::time::sleep_until(until);
+    tokio::pin!(deadline);
+    let mut place = None;
     loop {
-        let now = Instant::now();
-        if now >= until {
-            return Err(SlotWait::Expired);
+        // Registered before the look: a release after this point wakes it.
+        let mut notified = std::pin::pin!(freed.notified());
+        notified.as_mut().enable();
+        if let Some(slot) = try_slot() {
+            return in_time(slot);
         }
-        tokio::time::sleep_until(until.min(now + SLOT_POLL)).await;
+        if place.is_none() {
+            place = Some(WaitPlace::take(waiters, max).ok_or(SlotWait::QueueFull)?);
+        }
+        let released = tokio::select! {
+            biased;
+            () = &mut notified => true,
+            () = &mut deadline => false,
+        };
         if Instant::now() > until {
             return Err(SlotWait::Expired);
         }
-        if let Some(slot) = try_slot() {
-            return Ok(slot);
+        if !released {
+            // Woken by the deadline at the cutoff itself: one last look.
+            return try_slot().ok_or(SlotWait::Expired).and_then(in_time);
         }
     }
 }
@@ -4819,11 +4859,14 @@ async fn wait_for_slot<T>(
 struct PrepLease {
     channel: Arc<Channel>,
     busy: Arc<std::sync::atomic::AtomicBool>,
+    /// The node's [`Node::prep_freed`]: dropping the lease wakes the slot's waiters.
+    freed: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for PrepLease {
     fn drop(&mut self) {
         self.busy.store(false, Ordering::Release);
+        self.freed.notify_waiters();
     }
 }
 

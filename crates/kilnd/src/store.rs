@@ -8076,6 +8076,140 @@ mod tests {
         );
     }
 
+    /// Pre-review 3: the terminal state follows the durable intent on the row, whoever
+    /// wrote it and whatever the releasing writer asked for. Every origin of a pending
+    /// release, against both requested terminal states: a client's Delete (of a refused
+    /// Create and of a READY sandbox), a lifetime expiry and an idle expiry all end
+    /// DELETED with their own reason; a failed READY publication's reasonless cleanup
+    /// intent and a plain refused Create end as asked. Each releases its charge by the
+    /// matching receipt, sets `deleted_at_ms` exactly when DELETED, and its exact replay
+    /// (and, once DELETED, a replay asking FAILED) changes nothing.
+    #[test]
+    fn every_release_origin_ends_by_its_durable_intent_whatever_its_writer_asked() {
+        #[derive(Clone, Copy, Debug)]
+        enum Origin {
+            DeleteOfRefused,
+            DeleteOfReady,
+            LifetimeExpiry,
+            IdleExpiry,
+            Compensation,
+            Refused,
+        }
+        let origins = [
+            (Origin::DeleteOfRefused, Some(DeletionReason::Requested)),
+            (Origin::DeleteOfReady, Some(DeletionReason::Requested)),
+            (Origin::LifetimeExpiry, Some(DeletionReason::ExpiredLifetime)),
+            (Origin::IdleExpiry, Some(DeletionReason::ExpiredIdle)),
+            (Origin::Compensation, None),
+            (Origin::Refused, None),
+        ];
+        for (origin, reason) in origins {
+            for requested in [SandboxState::Deleted, SandboxState::Failed] {
+                let at = format!("{origin:?} asking {requested:?}");
+                let store = Store::open_in_memory().unwrap();
+                let clock = crate::expiry::ManualClock::default();
+                store.set_clock(std::sync::Arc::new(clock.clone()));
+                let mut row = fenced_sandbox();
+                row.lifecycle.expiry = ExpiryPolicy {
+                    max_lifetime_ms: Some(60_000),
+                    idle_timeout_ms: Some(30_000),
+                };
+                store.insert_sandbox(&row).unwrap();
+                let cas = |to: SandboxState, why: &str| {
+                    assert!(
+                        store
+                            .compare_and_set_sandbox_state(
+                                &row.id,
+                                SandboxState::Creating,
+                                to,
+                                None,
+                                Some(why)
+                            )
+                            .unwrap(),
+                        "{at}"
+                    );
+                };
+                let ready = || {
+                    assert!(store.publish_fenced_ready(&row.id, &created_for(&row, 3)).unwrap());
+                    store.sandbox(&row.id).unwrap().unwrap()
+                };
+                match origin {
+                    Origin::DeleteOfRefused => {
+                        cas(SandboxState::Failed, "refused");
+                        assert!(
+                            store
+                                .publish_delete_intent(
+                                    &row.id,
+                                    SandboxState::Failed,
+                                    SandboxState::Deleting,
+                                    Some("refused"),
+                                    DeletionReason::Requested,
+                                )
+                                .unwrap(),
+                            "{at}"
+                        );
+                    }
+                    Origin::DeleteOfReady => {
+                        ready();
+                        assert!(
+                            store
+                                .publish_delete_intent(
+                                    &row.id,
+                                    SandboxState::Ready,
+                                    SandboxState::Deleting,
+                                    None,
+                                    DeletionReason::Requested,
+                                )
+                                .unwrap(),
+                            "{at}"
+                        );
+                    }
+                    Origin::LifetimeExpiry | Origin::IdleExpiry => {
+                        let seq = ready().lifecycle.activity_seq;
+                        clock.advance(60_001);
+                        let reason = reason.unwrap();
+                        let seq = (reason == DeletionReason::ExpiredIdle).then_some(seq);
+                        assert!(store.publish_expiry_intent(&row.id, reason, seq).unwrap(), "{at}");
+                    }
+                    Origin::Compensation => {
+                        cas(SandboxState::Deleting, "record ready state failed");
+                    }
+                    Origin::Refused => cas(SandboxState::Failed, "refused"),
+                }
+                let pending = store.sandbox(&row.id).unwrap().unwrap();
+                assert!(pending.is_charged(), "{at}");
+                assert_eq!(pending.lifecycle.deletion_reason, reason, "{at}");
+                let receipt = absence_for(&row, 4);
+                store.release_fenced(&row.id, requested, &receipt, None).unwrap();
+                let settled = store.sandbox(&row.id).unwrap().unwrap();
+                let expected = if reason.is_some() { SandboxState::Deleted } else { requested };
+                assert_eq!(settled.state, expected, "{at}");
+                assert_eq!(settled.lifecycle.deletion_reason, reason, "{at}");
+                assert_eq!(
+                    settled.accounting.release,
+                    ReservationRelease::Fenced(receipt.receipt_id()),
+                    "{at}"
+                );
+                assert_eq!(
+                    settled.deleted_at_ms.is_some(),
+                    expected == SandboxState::Deleted,
+                    "{at}"
+                );
+                assert!(!settled.is_charged(), "{at}");
+                assert_eq!(store.sandbox_resources().unwrap(), SandboxResources::default(), "{at}");
+                // Its exact replay changes nothing.
+                store.release_fenced(&row.id, requested, &receipt, None).unwrap();
+                assert_eq!(store.sandbox(&row.id).unwrap().unwrap(), settled, "{at}");
+                if expected == SandboxState::Deleted {
+                    store
+                        .release_fenced(&row.id, SandboxState::Failed, &receipt, None)
+                        .unwrap();
+                    assert_eq!(store.sandbox(&row.id).unwrap().unwrap(), settled, "{at}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn direct_sql_cannot_use_stale_generation_evidence_or_roll_back_a_generation() {
         let tmp = tempfile::tempdir().unwrap();

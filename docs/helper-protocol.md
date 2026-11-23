@@ -333,12 +333,20 @@ only the first P slot; the second, the observation slot, is kept for the namespa
 observations that Remove, FenceAbsent and List run, and for startup's lease check, so Create
 pressure from any number of instances can't leave an allocation charged for want of a fresh
 observation (M3-2 finding F1). Each kind of work that finds no slot it may take waits for
-one in its own bounded queue, polling, and a waiter that leaves early (its client cancels
-or disconnects, its wire deadline passes) gives its place back at once. The end of a wait is
-a cutoff on every look for a slot, the first included: each sleep is capped at the time
-left, so the last look lands at the cutoff, and the clock is read again on waking, before
-the slot is taken, so a waiter that wakes late is refused as expired, never handed a slot
-that first came free after its cutoff:
+one in its own bounded queue, and a waiter that leaves early (its client cancels or
+disconnects, its wire deadline passes) gives its place back at once. Waiters don't poll:
+every path that makes a slot usable (a lease given back, a replacement P published) wakes
+them all, and each waiter registers for that wake before every look, so a release between
+a look and the wait after it is never lost. The contract is that a waiter is granted a slot
+if and only if it acquires one while the clock reads at or before the end of its wait (its
+cutoff); otherwise it is refused as expired and gives its place back. So a slot released
+before the cutoff and still free is taken at its release, whatever the timer's granularity.
+A slot released exactly at the cutoff is taken if the waiter's look after the release still
+reads the cutoff; a waiter that only runs once the clock is past it is refused. The clock
+is read on entry, on every wake and after every acquisition: a waiter woken by its own
+deadline makes one last look only if the clock still reads the cutoff, a late one makes
+none, and a slot acquired by a look that finished past the cutoff (a busy runtime) is given
+back, waking the other waiters, and the answer is expired:
 
 - A Preflight takes Create's slot if it is free. Otherwise it waits for it among at most 16
   other Preflights, for at most five seconds and never past its deadline, before issuing
@@ -348,9 +356,9 @@ that first came free after its cutoff:
 - Create's revalidation and S's session preparation wait for Create's slot among at most
   16 others of their own, never past their deadline. A full queue refuses at once. Their
   queue is apart from the Preflights', so new Preflights can't fill it; that separation is
-  about queue capacity only. Both queues poll for the same slot, in no FIFO order, so a
-  stream of Preflights can still take that slot first and delay an issued Create's
-  revalidation until its own deadline.
+  about queue capacity only. A release wakes both queues together and they race for the
+  same slot, in no FIFO order, so a stream of Preflights can still take that slot first
+  and delay an issued Create's revalidation until its own deadline.
 - An observation tries the observation slot first, then any free one, and waits for one
   among at most 16 other observations, for at most five seconds and never past its
   deadline. A full queue answers at once, without waiting; a wait that ends answers at its

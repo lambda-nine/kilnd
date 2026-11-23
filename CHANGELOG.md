@@ -69,14 +69,16 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   client's Delete or an expiry moved to DELETING while the receipt was on its way ends
   DELETED, even if the Delete's caller has gone. A sandbox still CREATING or READY is
   never retried (startup reconciliation settles one a storage failure left CREATING).
-  A wait for a worker never hands one out after its five seconds (or its deadline) are
-  up, even when the waiter wakes late. Rows left charged at startup are
-  retried the same way, except rows another backend wrote, which are never retried or
-  changed. The caller still gets the first error. Also, a create kilnd's own node budget
-  would refuse is now refused before the helper issues it a token: kilnd reads its budgets
-  before the helper's preparation, and a create that doesn't fit at that moment is
-  refused there for good, even if a Delete frees room during what would have been its
-  preparation (retry it). A create refused after the helper issued a token gets that
+  A wait for a worker never hands one out after its five seconds (or its deadline) are up,
+  even when the waiter wakes late, and never refuses one that came free in time: giving a
+  worker back (or replacing a dead one) wakes its waiters at once instead of leaving them
+  to poll, so a worker freed a moment before the end of the wait is taken. Rows left
+  charged at startup are retried the same way, except rows another backend wrote, which
+  are never retried or changed. The caller still gets the first error. Also, a create
+  kilnd's own node budget would refuse is now refused before the helper issues it a
+  token: kilnd reads its budgets before the helper's preparation, and a create that
+  doesn't fit at that moment is refused there for good, even if a Delete frees room
+  during what would have been its preparation (retry it). A create refused after the helper issued a token gets that
   token fenced, best effort, so tokens are rarely left issued with nothing recorded for
   them. kiln sandboxes behave exactly as before.
 
