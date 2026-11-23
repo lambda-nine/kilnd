@@ -2401,6 +2401,13 @@ impl Store {
 
     /// Whether the barrier's marker is set (tests and diagnostics).
     pub fn checkpoint_barrier_marked(&self) -> Result<bool> {
+        #[cfg(test)]
+        if self
+            .fail_checkpoint_barrier_read
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("injected checkpoint barrier read failure");
+        }
         Ok(self.conn().query_row(
             "SELECT EXISTS (SELECT 1 FROM checkpoint_barrier)",
             [],

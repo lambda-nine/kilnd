@@ -1165,6 +1165,10 @@ pub struct Store {
     /// While set, every `checkpoint_usage` read fails: Health's checkpoint stats path.
     #[cfg(test)]
     pub(crate) fail_checkpoint_usage: AtomicBool,
+    /// While set, every durable checkpoint-barrier read fails: Health must name the
+    /// barrier from the manager's flag, never the store.
+    #[cfg(test)]
+    pub(crate) fail_checkpoint_barrier_read: AtomicBool,
 }
 
 /// How an execution ended, written in one transaction with what it means for its
@@ -1963,6 +1967,8 @@ impl Store {
             fail_execution_read: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             fail_checkpoint_usage: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_checkpoint_barrier_read: AtomicBool::new(false),
         };
         store.initialize(refuse_busy)?;
         Ok(store)

@@ -928,21 +928,32 @@ async fn an_unreadable_checkpoint_count_degrades_health_and_says_why() {
     assert!(h.detail.ends_with(SENTENCE), "{}", h.detail);
 }
 
+/// [`health`] for UID 1000 while every durable checkpoint-barrier read fails: the answer
+/// of a Health that names the barrier from the manager's flag alone.
+async fn health_with_no_barrier_read(m: &M, s: &Api) -> pb::HealthResponse {
+    m.store.fail_checkpoint_barrier_read.store(true, Ordering::SeqCst);
+    let h = health(s, 1000).await;
+    m.store.fail_checkpoint_barrier_read.store(false, Ordering::SeqCst);
+    h
+}
+
 /// Backlog B4 (row 24): Health names a pending checkpoint barrier and what clears it, from
 /// the manager's own flag, apart from the "resources no row explains" block. Its status
-/// is the allocation block's, as before: DEGRADED while either part is set.
+/// is the allocation block's, as before: DEGRADED while either part is set. Every Health
+/// request here runs with the store's durable barrier read failing (the B4 break-it's
+/// HIGH 3), so a Health that read the store for the barrier fails the request.
 #[tokio::test]
 async fn health_names_a_pending_checkpoint_barrier_and_only_while_it_is_pending() {
     const BARRIER: &str = "a checkpoint barrier is pending: new sandboxes (forks included) and captures are refused until a complete, clean checkpoint inventory clears it";
     const UNEXPLAINED: &str = "backend resources no row explains block CreateSandbox until reconciled";
     let (m, _fake, _, s) = ready_engine().await;
-    let h = health(&s, 1000).await;
+    let h = health_with_no_barrier_read(&m, &s).await;
     assert_eq!(h.status, pb::health_response::Status::Serving as i32);
     assert!(!h.detail.contains("checkpoint barrier"), "{}", h.detail);
 
     assert!(m.set_checkpoint_barrier(true).unwrap());
     store_calls(&m);
-    let h = health(&s, 1000).await;
+    let h = health_with_no_barrier_read(&m, &s).await;
     assert_eq!(h.status, pb::health_response::Status::Degraded as i32, "{h:?}");
     assert_eq!(h.detail, BARRIER);
     assert!(!h.detail.contains(UNEXPLAINED), "{}", h.detail);
@@ -950,7 +961,7 @@ async fn health_names_a_pending_checkpoint_barrier_and_only_while_it_is_pending(
 
     // Both parts: both sentences, in order.
     m.admission_blocked.store(true, Ordering::Relaxed);
-    let h = health(&s, 1000).await;
+    let h = health_with_no_barrier_read(&m, &s).await;
     assert_eq!(h.status, pb::health_response::Status::Degraded as i32);
     assert_eq!(h.detail, format!("{UNEXPLAINED}; {BARRIER}"));
     m.admission_blocked.store(false, Ordering::Relaxed);
@@ -959,7 +970,7 @@ async fn health_names_a_pending_checkpoint_barrier_and_only_while_it_is_pending(
     assert!(!m.reconcile_checkpoints().await.unwrap());
     assert!(!m.set_checkpoint_barrier(false).unwrap());
     store_calls(&m);
-    let h = health(&s, 1000).await;
+    let h = health_with_no_barrier_read(&m, &s).await;
     assert_eq!(h.status, pb::health_response::Status::Serving as i32, "{h:?}");
     assert!(h.detail.is_empty(), "{}", h.detail);
     // Naming the barrier read nothing more from the store than Health did without it.
@@ -967,7 +978,7 @@ async fn health_names_a_pending_checkpoint_barrier_and_only_while_it_is_pending(
 
     // The other part alone still says only its own sentence.
     m.admission_blocked.store(true, Ordering::Relaxed);
-    let h = health(&s, 1000).await;
+    let h = health_with_no_barrier_read(&m, &s).await;
     assert_eq!(h.status, pb::health_response::Status::Degraded as i32);
     assert_eq!(h.detail, UNEXPLAINED);
 }
