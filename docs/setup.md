@@ -362,7 +362,10 @@ it samples helper Accounting, each allocation cgroup's `memory.peak`, `memory.ev
 ledger live bytes and compaction lag, jail tmpfs use and database sizes. Per daemon it
 reports READY p50/p95/max (client and helper timing lines), refusals by type and the time
 to the next admitted Create after a release, and per scenario one PASS or FAIL line per
-check in `summary.txt`, with JSON lines beside it. Scenarios are resumable: a complete one
+check in `summary.txt`, with JSON lines beside it. A failed Delete is retried every second
+for up to 60 s, as the daemon's "retry through Delete" asks; each retry and the time to
+release are recorded, s1 fails if any Delete needs one, and a Delete still failing after
+60 s counts as a leak. Scenarios are resumable: a complete one
 is not run again, a partial one is moved aside and rerun. The hostile payloads are plain
 shell scripts in `scripts/stress-payloads/`, sent to a fresh session's `sh` and bounded by
 their own timeouts. `python3 -I scripts/firecracker-two-daemon-stress-tests.py` tests its

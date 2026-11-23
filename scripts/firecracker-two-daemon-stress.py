@@ -336,6 +336,13 @@ def check_churn(summary, ceilings, minutes):
         check('no unexplained refusal', not other, json.dumps(other)),
         check('every Exec and Delete succeeds', summary['op_failures'] == 0,
               f"{summary['op_failures']} failed: {json.dumps(summary['op_failure_samples'][:3])}"),
+        check('every Delete succeeds at its first attempt', summary['delete_retries'] == 0,
+              f"{summary['delete_retries']} needed a retry, released after "
+              f"{json.dumps(summary['delete_retry_release_ms'])} ms; "
+              f"{json.dumps(summary['delete_retry_samples'][:2])}"),
+        check(f'every retried Delete releases within {DELETE_RETRY_SECONDS} s',
+              summary['delete_leaks'] == 0,
+              f"{summary['delete_leaks']} leaked: {json.dumps(summary['delete_leak_samples'][:3])}"),
         check('no capture loss', summary['capture_mismatches'] == 0,
               f"{summary['capture_mismatches']} outputs differ"),
         check('no capacity leak', summary['claims_after'] == 0 and summary['charged_after'] == 0,
@@ -1065,13 +1072,64 @@ def wait_quiet(node, views, seconds=180):
     return False
 
 
-def remove_all(node, ids, timeout=120):
-    """Deletes every listed (daemon, sandbox); the failures."""
+# A failed Delete is retried every second for up to a minute after its first failure, as the
+# daemon's own "retry through Delete" asks. A Delete still failing then is a leak.
+DELETE_RETRY_SECONDS = 60
+DELETE_RETRY_INTERVAL = 1.0
+
+
+def delete_with_retry(node, daemon, sandbox, record=None, timeout=120,
+                      retry_seconds=DELETE_RETRY_SECONDS, interval=DELETE_RETRY_INTERVAL,
+                      clock=time.monotonic, sleep=time.sleep):
+    """Deletes `sandbox`, retrying a failed attempt every `interval` seconds until one
+    succeeds or `retry_seconds` have passed since the first failure. `record(n, ran)` is
+    called for each failed attempt n. The outcome: ok, attempts, retried, leaked, start and
+    end (Unix ms of the first attempt's start and the last one's end), release_ms (first
+    start to the successful end), and the first and last errors."""
+    attempts = []
+    give_up = None
+    while True:
+        ran = node.kilndctl(daemon, ['rm', sandbox], timeout=timeout)
+        attempts.append(ran)
+        if ran['code'] == 0:
+            break
+        if record is not None:
+            record(len(attempts), ran)
+        if give_up is None:
+            give_up = clock() + retry_seconds
+        if clock() >= give_up:
+            break
+        sleep(interval)
+    first, last = attempts[0], attempts[-1]
+    ok = last['code'] == 0
+    return {'ok': ok, 'code': last['code'], 'attempts': len(attempts),
+            'retried': len(attempts) > 1, 'leaked': not ok,
+            'start': first['start'], 'end': last['end'],
+            # Wall time, retries and their waits included (a neighbour's deadline is on it).
+            'ms': first['ms'] if len(attempts) == 1 else float(last['end'] - first['start']),
+            'release_ms': last['end'] - first['start'] if ok else None,
+            'first_err': first['err'].strip()[-300:] if first['code'] != 0 else '',
+            'err': last['err'].strip()[-300:]}
+
+
+def retry_entry(daemon, sandbox, removed):
+    """What a retried or leaked Delete leaves in the tally."""
+    return {'daemon': daemon, 'id': sandbox, 'attempts': removed['attempts'],
+            'release_ms': removed['release_ms'], 'first_err': removed['first_err'],
+            'err': removed['err'] if removed['leaked'] else ''}
+
+
+def remove_all(node, ids, timeout=120, tally=None):
+    """Deletes every listed (daemon, sandbox), each with delete_with_retry; the Deletes still
+    failing after their retries. Retried Deletes go to `tally` when given."""
     failures = []
     for daemon, sandbox in ids:
-        ran = node.kilndctl(daemon, ['rm', sandbox], timeout=timeout)
-        if ran['code'] != 0:
-            failures.append({'daemon': daemon, 'id': sandbox, 'err': ran['err'][-300:]})
+        removed = delete_with_retry(node, daemon, sandbox, timeout=timeout)
+        if tally is not None:
+            tally.deleted(daemon, sandbox, removed)
+        if removed['leaked']:
+            failures.append({'daemon': daemon, 'id': sandbox, 'attempts': removed['attempts'],
+                             'err': removed['err']})
     return failures
 
 
@@ -1092,12 +1150,21 @@ class Tally:
         self.op_failure_samples = []
         self.capture_mismatches = 0
         self.leftover = []         # (daemon, id) still to delete
+        self.delete_retried = []   # Deletes that failed at first (retry_entry)
+        self.delete_leaks = []     # Deletes still failing after their retries
 
     def refused(self, daemon, kind):
         with self.lock:
             self.refusals[kind] = self.refusals.get(kind, 0) + 1
             per = self.refusals_by_daemon.setdefault(daemon, {})
             per[kind] = per.get(kind, 0) + 1
+
+    def deleted(self, daemon, sandbox, removed):
+        with self.lock:
+            if removed['retried'] or removed['leaked']:
+                self.delete_retried.append(retry_entry(daemon, sandbox, removed))
+            if removed['leaked']:
+                self.delete_leaks.append(retry_entry(daemon, sandbox, removed))
 
 
 def lane(node, scenario, tally, daemon, lane_id, stop, command=None, pause=None):
@@ -1136,8 +1203,14 @@ def lane(node, scenario, tally, daemon, lane_id, stop, command=None, pause=None)
         scenario.record({'op': 'exec', 'daemon': daemon, 'lane': lane_id, 'id': sandbox,
                          'ok': ok, 'code': ran['code'], 'ms': ran['ms'],
                          'match': ran['out'] == expected, 'err': ran['err'].strip()[-300:]})
-        removed = node.kilndctl(daemon, ['rm', sandbox], timeout=120)
-        rm_ok = removed['code'] == 0
+        removed = delete_with_retry(
+            node, daemon, sandbox,
+            record=lambda n, r: scenario.record(
+                {'op': 'rm-retry', 'daemon': daemon, 'lane': lane_id, 'id': sandbox,
+                 'attempt': n, 'code': r['code'], 'start': r['start'], 'ms': r['ms'],
+                 'err': r['err'].strip()[-300:]}))
+        rm_ok = removed['ok']
+        tally.deleted(daemon, sandbox, removed)
         with tally.lock:
             if rm_ok:
                 tally.releases.append(removed['end'])
@@ -1152,7 +1225,8 @@ def lane(node, scenario, tally, daemon, lane_id, stop, command=None, pause=None)
                              'err': r['err'].strip()[-300:]})
         scenario.record({'op': 'rm', 'daemon': daemon, 'lane': lane_id, 'id': sandbox,
                          'ok': rm_ok, 'ms': removed['ms'], 'end': removed['end'],
-                         'err': removed['err'].strip()[-300:]})
+                         'attempts': removed['attempts'], 'release_ms': removed['release_ms'],
+                         'err': removed['err']})
 
 
 def churn(node, views, scenario, sampler, lanes_per_daemon, seconds, pause=None, extra=None):
@@ -1174,7 +1248,7 @@ def churn(node, views, scenario, sampler, lanes_per_daemon, seconds, pause=None,
     stop.set()
     for t in threads:
         t.join(timeout=400)
-    failures = remove_all(node, list(tally.leftover))
+    failures = remove_all(node, list(tally.leftover), tally=tally)
     tally.op_failures += len(failures)
     tally.op_failure_samples += failures
     return tally
@@ -1211,6 +1285,12 @@ def churn_summary(node, views, sampler, tally, started_ms):
         'next_admit_ready_ms': stats([g[1] for g in gaps]),
         'op_failures': tally.op_failures,
         'op_failure_samples': tally.op_failure_samples,
+        'delete_retries': len(tally.delete_retried),
+        'delete_retry_release_ms': stats([d['release_ms'] for d in tally.delete_retried
+                                          if d['release_ms'] is not None]),
+        'delete_retry_samples': tally.delete_retried[:10],
+        'delete_leaks': len(tally.delete_leaks),
+        'delete_leak_samples': tally.delete_leaks[:10],
         'capture_mismatches': tally.capture_mismatches,
         'claims_max': sampler.claims_max,
         'vector_violations': sampler.violations,
@@ -1349,6 +1429,8 @@ def churn_lines(summary):
     lines.append(f"refusals {json.dumps(summary['refusals_by_daemon'])}")
     lines.append(f"next admitted Create after a release: start {json.dumps(summary['next_admit_start_ms'])}"
                  f" ready {json.dumps(summary['next_admit_ready_ms'])}")
+    lines.append(f"Deletes retried {summary['delete_retries']}, released after"
+                 f" {json.dumps(summary['delete_retry_release_ms'])} ms; leaked {summary['delete_leaks']}")
     o = summary['overhead_idle']
     lines.append(f"session overhead (allocation memory.current - guest RSS): {json.dumps(o['overhead_bytes'])}"
                  f"; memory.peak {json.dumps(o['memory_peak_bytes'])}; VMM PSS {json.dumps(o['vmm_pss'])}")
@@ -1459,7 +1541,8 @@ def run_s2(args, node, views):
             break
         time.sleep(1)
     unaccounted = views.token_outcomes()
-    failures = remove_all(node, ready)
+    s2_tally = Tally()
+    failures = remove_all(node, ready, tally=s2_tally)
     quiet = wait_quiet(node, views, 120)
     totals, _ = views.claims()
     sampler.finish()
@@ -1469,6 +1552,7 @@ def run_s2(args, node, views):
         'claims_max': sampler.claims_max, 'vector_violations': sampler.violations,
         'unaccounted': sorted(s for v in unaccounted.values() for s in v),
         'bad_releases': bad, 'delete_failures': failures, 'quiet': quiet,
+        'delete_retried': s2_tally.delete_retried,
         'claims_after': totals['slots'], 'charged_after': views.charged_count(),
         'pointers_before': pointers_before, 'pointers_after': views.ledger_facts()['pointers'],
         'attempts_total': sum(len(r['attempts']) for r in results if r),
@@ -1522,14 +1606,16 @@ def hostile_lane(node, views, scenario, daemon, payloads, out, stop):
                                        'after'], timeout=60)
         execution = views.execution(daemon, sandbox)
         got = node.kilndctl(daemon, ['get', sandbox], timeout=10)
-        removed = node.kilndctl(daemon, ['rm', sandbox], timeout=120)
+        removed = delete_with_retry(node, daemon, sandbox)
         result = {'op': 'hostile', 'daemon': daemon, 'payload': name, 'id': sandbox,
                   'start': t0, 'ms': ran['ms'], 'code': ran['code'],
                   'out_tail': ran['out'][-600:], 'err_tail': ran['err'][-600:],
                   'session_after': {'code': after['code'], 'out': after['out'][-100:],
                                     'err': after['err'].strip()[-200:]},
                   'executions': execution, 'get': got['out'][-600:],
-                  'rm': {'code': removed['code'], 'err': removed['err'].strip()[-200:]}}
+                  'rm': {'code': removed['code'], 'err': removed['err'][-200:],
+                         'attempts': removed['attempts'], 'release_ms': removed['release_ms'],
+                         'first_err': removed['first_err'][-200:]}}
         out.append(result)
         scenario.record(result)
 
@@ -1551,12 +1637,21 @@ def neighbour_lane(node, scenario, daemon, out, stop):
         for op, argv in (('health', ['health']), ('get', ['get', sandbox]),
                          ('exec', ['exec', '--timeout', '60s', sandbox, '--', 'echo', 'healthy']),
                          ('health', ['health']), ('rm', ['rm', sandbox])):
-            ran = node.kilndctl(daemon, argv, timeout=NEIGHBOUR_DEADLINES[op] + 30)
+            if op == 'rm':
+                removed = delete_with_retry(node, daemon, sandbox,
+                                            timeout=NEIGHBOUR_DEADLINES[op] + 30)
+                ran = {'code': removed['code'], 'ms': removed['ms'], 'start': removed['start'],
+                       'out': '', 'err': removed['first_err'] or removed['err'],
+                       'attempts': removed['attempts']}
+            else:
+                ran = node.kilndctl(daemon, argv, timeout=NEIGHBOUR_DEADLINES[op] + 30)
             entry = {'op': op, 'daemon': daemon, 'ms': ran['ms'], 'code': ran['code'],
                      'start': ran['start'], 'id': sandbox,
                      'ok': ran['code'] == 0 or op == 'health',
                      'match': ran['out'] == 'healthy\n' if op == 'exec' else None,
                      'err': ran['err'].strip()[-200:]}
+            if 'attempts' in ran:
+                entry['attempts'] = ran['attempts']
             out.append(entry)
             scenario.record(entry)
 
@@ -1799,7 +1894,7 @@ def run_s4(args, node, views):
     pause.clear()
     for _, t in lanes:
         t.join(timeout=400)
-    failures = remove_all(node, list(tally.leftover))
+    failures = remove_all(node, list(tally.leftover), tally=tally)
     quiet = wait_quiet(node, views)
     totals, _ = views.claims()
     sampler.finish()
@@ -1933,7 +2028,7 @@ def run_s5(args, node, views):
     pause.clear()
     for t in lanes:
         t.join(timeout=400)
-    failures = remove_all(node, list(tally.leftover))
+    failures = remove_all(node, list(tally.leftover), tally=tally)
     quiet = wait_quiet(node, views)
     totals, _ = views.claims()
     sampler.finish()

@@ -11,7 +11,8 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   helper and node ledger in the kiln VM, drives them only through `kilndctl` (steady churn,
   a saturation race, hostile payloads inside guest sessions, a daemon, helper or ledger
   worker killed mid-run, and a throttled ledger disk), samples the node's accounting and the
-  kernel's view of each session, and prints PASS or FAIL per check. Its teardown removes
+  kernel's view of each session, and prints PASS or FAIL per check. A failed Delete is
+  retried every second for up to 60 s and recorded; one still failing is a leak. Its teardown removes
   exactly what its setup recorded. No limit, default or product behaviour changes.
 
 - kilnd-helper now times every Firecracker create step by step, from Preflight through

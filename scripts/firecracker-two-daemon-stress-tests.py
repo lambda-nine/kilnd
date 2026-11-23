@@ -79,6 +79,76 @@ class Refusals(unittest.TestCase):
                          {'prep_slot', 'node_capacity', 'daemon_budget', 'headroom'})
 
 
+class ScriptedNode:
+    """kilndctl answers from a script: one (code, err) per call, the last repeated."""
+    def __init__(self, answers, clock):
+        self.answers, self.calls, self.clock = list(answers), [], clock
+
+    def kilndctl(self, daemon, args, timeout, stdin=None):
+        self.calls.append((daemon, args))
+        code, err = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        start = int(self.clock.now * 1000)
+        self.clock.now += 0.05
+        return {'code': code, 'out': '', 'err': err, 'start': start,
+                'end': int(self.clock.now * 1000), 'ms': 50.0}
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class DeleteRetry(unittest.TestCase):
+    STUCK = 'kilndctl: internal: ... stays charged (ObservationUnavailable): no fresh namespace observation'
+
+    def run_delete(self, answers):
+        clock = FakeClock()
+        node = ScriptedNode(answers, clock)
+        failed = []
+        out = m.delete_with_retry(node, 'fctest', 'sb-1', record=lambda n, r: failed.append(n),
+                                  clock=clock, sleep=clock.sleep)
+        return out, node, failed
+
+    def test_first_attempt(self):
+        out, node, failed = self.run_delete([(0, '')])
+        self.assertEqual((out['ok'], out['attempts'], out['retried'], out['leaked']),
+                         (True, 1, False, False))
+        self.assertEqual(node.calls, [('fctest', ['rm', 'sb-1'])])
+        self.assertEqual((failed, out['first_err']), ([], ''))
+
+    def test_released_by_a_retry(self):
+        out, _, failed = self.run_delete([(1, self.STUCK), (1, self.STUCK), (0, '')])
+        self.assertEqual((out['ok'], out['attempts'], out['retried'], out['leaked']),
+                         (True, 3, True, False))
+        self.assertEqual(failed, [1, 2])
+        # Three 50 ms calls and two 1 s waits (whole ms, so within one of 2150).
+        self.assertAlmostEqual(out['release_ms'], 2150, delta=1)
+        self.assertAlmostEqual(out['ms'], 2150, delta=1)
+        self.assertIn('ObservationUnavailable', out['first_err'])
+        tally = m.Tally()
+        tally.deleted('fctest', 'sb-1', out)
+        self.assertEqual(len(tally.delete_retried), 1)
+        self.assertEqual(tally.delete_leaks, [])
+
+    def test_leak_after_a_minute(self):
+        out, node, failed = self.run_delete([(1, self.STUCK)])
+        self.assertEqual((out['ok'], out['leaked'], out['release_ms']), (False, True, None))
+        # The first failure, then one retry a second (plus 50 ms a call) until 60 s pass.
+        self.assertEqual(out['attempts'], len(node.calls))
+        self.assertTrue(57 <= out['attempts'] <= 61, out['attempts'])
+        self.assertEqual(failed, list(range(1, out['attempts'] + 1)))
+        tally = m.Tally()
+        tally.deleted('fctest', 'sb-1', out)
+        self.assertEqual((len(tally.delete_retried), len(tally.delete_leaks)), (1, 1))
+        self.assertIn('ObservationUnavailable', tally.delete_leaks[0]['err'])
+
+
 class Resumability(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -260,7 +330,9 @@ def churn_summary(**changes):
                'vector_violations': [], 'op_failures': 0, 'op_failure_samples': [],
                'capture_mismatches': 0, 'claims_after': 0, 'charged_after': 0,
                'unaccounted': {}, 'node_faults': 0, 'helper_rss_growth': 4 * MIB,
-               'helper_fd_spread': 6, 'watermark_advanced': True, 'pointers_end': {}}
+               'helper_fd_spread': 6, 'watermark_advanced': True, 'pointers_end': {},
+               'delete_retries': 0, 'delete_retry_release_ms': m.stats([]),
+               'delete_retry_samples': [], 'delete_leaks': 0, 'delete_leak_samples': []}
     summary.update(changes)
     return summary
 
@@ -327,6 +399,16 @@ class PassRules(unittest.TestCase):
         got = failing(m.check_churn(churn_summary(helper_rss_growth=33 * MIB,
                                                   helper_fd_spread=40), CEILINGS, 5))
         self.assertEqual(got, ['helper RSS stays bounded', 'helper descriptors stay bounded'])
+
+    def test_churn_delete_retries_and_leaks(self):
+        retried = churn_summary(delete_retries=2, delete_retry_release_ms=m.stats([1200, 3400]))
+        self.assertEqual(failing(m.check_churn(retried, CEILINGS, 25)),
+                         ['every Delete succeeds at its first attempt'])
+        leaked = churn_summary(delete_retries=1, delete_leaks=1,
+                               delete_leak_samples=[{'id': 'sb-1', 'attempts': 61}])
+        self.assertEqual(failing(m.check_churn(leaked, CEILINGS, 25)),
+                         ['every Delete succeeds at its first attempt',
+                          'every retried Delete releases within 60 s'])
 
     def test_watermark_is_checked_only_after_a_lease_and_a_pass(self):
         stuck = churn_summary(watermark_advanced=False)
