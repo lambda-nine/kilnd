@@ -910,34 +910,43 @@ mod tests {
         }
     }
 
-    /// The same when only the barrier went and the sandbox cgroup stays: it was seen,
-    /// so it is not an old kiln. An OOM count read during the wait counts too.
+    /// The same when the barrier went after the start: it was seen, so it is not an old
+    /// kiln, whether the sandbox cgroup stays or goes too. An OOM count read during the
+    /// wait counts. With the whole sandbox cgroup gone before the verdict, that one
+    /// positive sample read during the wait is the only evidence of the OOM (the B4
+    /// break-it's HIGH 2).
     #[tokio::test]
     async fn a_barrier_seen_during_the_wait_and_then_gone_is_not_an_old_kiln() {
         let bin = process::KilnBinary::new("/nonexistent/kiln".into());
-        let tmp = root(false, Some(NO_OOM));
-        let kiln = DirectKiln::new(&bin, tmp.path());
-        let scope = kiln.observe_exec_scope(ID).await;
-        assert!(!scope.seen, "no barrier yet at the start");
-        let sandbox = tmp.path().join(ID);
-        std::fs::create_dir(sandbox.join("exec")).unwrap();
-        std::fs::write(sandbox.join("exec/cgroup.events"), "populated 1\n").unwrap();
-        let wait = kiln.wait_exec_cleanup(ID, scope);
-        let tear_down = async {
-            tokio::time::sleep(CLEANUP_POLL * 5).await;
-            std::fs::write(sandbox.join("memory.events"), OOM).unwrap();
-            tokio::time::sleep(CLEANUP_POLL * 5).await;
-            std::fs::remove_dir_all(sandbox.join("exec")).unwrap();
-        };
-        let (result, ()) = tokio::join!(wait, tear_down);
-        let text = message(result);
-        assert!(
-            text.starts_with(
-                "the sandbox's cgroup went away after the command started (the sandbox ran out of memory)"
-            ),
-            "{text}"
-        );
-        assert!(!text.contains("3b42552"), "{text}");
+        for whole_sandbox in [false, true] {
+            let tmp = root(false, Some(NO_OOM));
+            let kiln = DirectKiln::new(&bin, tmp.path());
+            let scope = kiln.observe_exec_scope(ID).await;
+            assert!(!scope.seen, "no barrier yet at the start");
+            let sandbox = tmp.path().join(ID);
+            std::fs::create_dir(sandbox.join("exec")).unwrap();
+            std::fs::write(sandbox.join("exec/cgroup.events"), "populated 1\n").unwrap();
+            let wait = kiln.wait_exec_cleanup(ID, scope);
+            let tear_down = async {
+                tokio::time::sleep(CLEANUP_POLL * 5).await;
+                std::fs::write(sandbox.join("memory.events"), OOM).unwrap();
+                tokio::time::sleep(CLEANUP_POLL * 5).await;
+                if whole_sandbox {
+                    std::fs::remove_dir_all(&sandbox).unwrap();
+                } else {
+                    std::fs::remove_dir_all(sandbox.join("exec")).unwrap();
+                }
+            };
+            let (result, ()) = tokio::join!(wait, tear_down);
+            let text = message(result);
+            assert!(
+                text.starts_with(
+                    "the sandbox's cgroup went away after the command started (the sandbox ran out of memory)"
+                ),
+                "whole sandbox {whole_sandbox}: {text}"
+            );
+            assert!(!text.contains("3b42552"), "{text}");
+        }
     }
 
     /// A sandbox cgroup with no barrier at the start or since is an old kiln: only then
