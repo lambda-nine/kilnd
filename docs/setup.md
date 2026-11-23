@@ -27,7 +27,7 @@ Follow kiln's README "Dev setup (macOS)". The part kilnd needs:
 ```sh
 cd ~/Projects/lambda-nine/kiln
 git fetch origin
-git checkout --detach 00d61c546db7aa67ad283d10c2ca6165ca5f8166  # tested Phase 0 companion
+git checkout --detach dbcbfd8c1a028f926e1bd4502b053596a0466d97  # tested kiln
 limactl create --name=kiln lima.yaml && limactl start kiln
 limactl shell --workdir "$PWD" kiln
 sudo scripts/fetch-alpine.sh        # the "alpine" image
@@ -43,12 +43,13 @@ including `40d9aa5003205d4c171e1b3eca61e9868064e98b` and
 `46d84bdfe13e331f047e70e38848f7d74bcd2872`, which lack `0x10`: upgrade kiln
 before kilnd, or kilnd refuses to start. Sandboxes those revisions already
 started keep working; only the installed CLI needs the new feature.
-The tested Phase 0 companion is `00d61c546db7aa67ad283d10c2ca6165ca5f8166`: install, integration, smoke and every
-kilnd regression script passed against that immutable pin. Exec cwd and env
-(`ExecRequest.cwd` and `env`, `CreateSandboxRequest.default_env`) also need kiln's exec
-options, capability bit `0x20`, first in `5cada841edd0bbe112550816fad221dfb1db6a47`, the
-tested companion for them: install that revision instead to use them. With an older
-kiln, kilnd works as before and Health lists no `EXEC_CWD`, `EXEC_ENV` or
+The tested kiln is `dbcbfd8c1a028f926e1bd4502b053596a0466d97`, the immutable pin
+kilnd's main branch is tested against. It has all of the above and exec cwd and env
+(`ExecRequest.cwd` and `env`, `CreateSandboxRequest.default_env`), which need kiln's
+exec options, capability bit `0x20`, first in `5cada841edd0bbe112550816fad221dfb1db6a47`.
+The earlier Phase 0 companion, `00d61c546db7aa67ad283d10c2ca6165ca5f8166`, predates
+exec options. With a kiln older than `5cada841edd0bbe112550816fad221dfb1db6a47`,
+kilnd works as before and Health lists no `EXEC_CWD`, `EXEC_ENV` or
 `SANDBOX_DEFAULT_ENV`; sandboxes created before the upgrade keep refusing options
 (`sandbox_unsupported`), because their PID 1 predates them.
 Install a compatible artifact, then check `kiln capabilities --protocol=1`

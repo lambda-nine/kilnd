@@ -95,10 +95,9 @@ GC, are refused. CLI capability validation
 also requires complete, bounded `gc --help` output advertising `gc [ID]...`,
 within the caller's deadline. It never invokes global GC to test compatibility.
 That is the minimum revision for everything but exec options. Privileged verification
-uses the tested companions, which setup pins: kiln
-`00d61c546db7aa67ad283d10c2ca6165ca5f8166` for everything else, and kiln
-`5cada841edd0bbe112550816fad221dfb1db6a47`, the first with exec options (capability
-bit `0x20`), for exec cwd and env (see [Exec cwd and env](#exec-cwd-and-env)).
+uses the tested kiln, which setup pins: `dbcbfd8c1a028f926e1bd4502b053596a0466d97`.
+Exec cwd and env need kiln `5cada841edd0bbe112550816fad221dfb1db6a47` or later, the
+first with exec options (capability bit `0x20`; see [Exec cwd and env](#exec-cwd-and-env)).
 Both installed CLI and sandbox PID 1 capabilities are checked before each
 execution, within its existing deadline. A live PID 1 is only asked for the
 execution bits: it never allocates, so a sandbox started by an older CLI stays

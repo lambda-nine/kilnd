@@ -223,24 +223,40 @@ Full instructions: [docs/setup.md](docs/setup.md).
 # on the Mac
 git clone https://github.com/lambda-nine/kiln ~/Projects/lambda-nine/kiln
 git clone https://github.com/lambda-nine/kilnd ~/Projects/lambda-nine/kilnd
-git -C ~/Projects/lambda-nine/kiln checkout --detach 00d61c546db7aa67ad283d10c2ca6165ca5f8166
+git -C ~/Projects/lambda-nine/kiln checkout --detach dbcbfd8c1a028f926e1bd4502b053596a0466d97  # tested kiln
 cd ~/Projects/lambda-nine/kiln && limactl create --name=kiln lima.yaml && limactl start kiln
 
-# in the VM, once: kiln itself (see kiln's README), then kilnd
+# in the VM, once: kiln itself
+limactl shell --workdir ~/Projects/lambda-nine/kiln kiln
+sudo scripts/fetch-alpine.sh        # the "alpine" image
+sudo scripts/setup-storage.sh       # XFS project quotas for --disk
+unset CARGO_TARGET_DIR              # kiln's installer uses target/release
+scripts/install.sh                  # /usr/local/bin/kiln, kiln-dns, kiln-metrics
+exit
+
+# in the VM, once: kilnd
 limactl shell --workdir ~/Projects/lambda-nine/kilnd kiln
 sudo apt-get install -y protobuf-compiler sqlite3
+# Keep Linux build output off the shared checkout, where macOS builds go.
+echo 'export CARGO_TARGET_DIR=$HOME/.cache/kilnd-target' >> ~/.profile && . ~/.profile
 scripts/install.sh                      # daemon + helper + CLI, service account and hardened units
 
 sudo kilndctl health
 id=$(sudo kilndctl create --memory 256M --pids 64 --disk 256M --label owner=me)
 sudo kilndctl exec "$id" -- sh -c 'echo hello >/workspace/note; uname -a'
 sudo kilndctl exec --timeout 5s "$id" -- sleep 60; echo "exit $?"   # 124
-sudo kilndctl exec --cwd /workspace --env GREETING=hi "$id" -- sh -c 'pwd; echo $GREETING'  # kiln 5cada84 or later
+sudo kilndctl exec --cwd /workspace --env GREETING=hi "$id" -- sh -c 'pwd; echo $GREETING'  # needs kiln 5cada84 or later; the pin above has it
 sudo kilndctl get "$id"
 sudo kilndctl ls
 sudo kilndctl rm "$id"
 sudo kilndctl run -- echo one-shot      # create, exec, delete
 ```
+
+`protobuf-compiler` comes from the `apt-get` step: kiln's `lima.yaml` doesn't
+install it, and the build needs `protoc`. If your Mac already has a Lima instance
+named `kiln`, use it if it was created from kiln's `lima.yaml` (it mounts both
+checkouts); otherwise pick another name in `limactl create --name=` and use that
+name in each `limactl shell` line.
 
 Add yourself to the `kilnd` group (`sudo usermod -aG kilnd $USER`, then log
 in again) to use `kilndctl` without sudo. Without sudo you see only the sandboxes
