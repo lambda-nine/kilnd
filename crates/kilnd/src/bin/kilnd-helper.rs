@@ -216,18 +216,41 @@ async fn serve(args: &Args, bin: PathBuf) -> Result<()> {
             }
         },
     };
+    serve_groups(
+        listener,
+        service_uid,
+        bin,
+        firecracker,
+        args.enable_checkpoints,
+        &mut std::io::stderr(),
+    )
+    .await
+}
+
+/// Everything after the socket is checked and the Firecracker group is up: the
+/// checkpoint group's startup line to `out` (standard error in production), then
+/// serving, then both groups' shutdown. A failed line write is the error, after the
+/// Firecracker group is stopped, and nothing is served.
+async fn serve_groups(
+    listener: std::os::unix::net::UnixListener,
+    service_uid: u32,
+    bin: PathBuf,
+    firecracker: Option<std::sync::Arc<kilnd::helper::firecracker::Node>>,
+    enable_checkpoints: bool,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
     // As with Firecracker, a checkpoint group that can't start never takes kiln down.
-    // Exactly one startup line, on standard error, says which way it came up. A helper
-    // that can't write that line doesn't serve, as when the eprintln! it replaced panicked.
+    // Exactly one startup line says which way it came up. A helper that can't write that
+    // line doesn't serve, as when the eprintln! it replaced panicked.
     let kiln = bin.clone();
     let served_firecracker = firecracker.clone();
     let started = serve_after_checkpoint_line(
-        args.enable_checkpoints,
+        enable_checkpoints,
         || {
             let workers = std::sync::Arc::new(kilnd::helper::checkpoint::KilnWorkers::new(kiln));
             kilnd::helper::checkpoint::Node::new(workers)
         },
-        &mut std::io::stderr(),
+        out,
         |checkpoint| async move {
             let stop = CancellationToken::new();
             let stopped = stop.clone();
@@ -601,5 +624,121 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A listener as production's `serve` hands it on: a bound Unix socket, nonblocking,
+    /// under a fresh directory. The directory lives as long as the listener is used.
+    fn production_listener() -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::os::unix::net::UnixListener,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helper.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        (dir, path, listener)
+    }
+
+    /// Production's orchestration after the socket checks, as `serve` runs it, with no
+    /// Firecracker group. A real kiln is never reached: nothing here sends a request.
+    async fn run_serve_groups(
+        listener: std::os::unix::net::UnixListener,
+        enable_checkpoints: bool,
+        out: &mut impl std::io::Write,
+        within: std::time::Duration,
+    ) -> std::result::Result<Result<()>, tokio::time::error::Elapsed> {
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        let bin = PathBuf::from("/nonexistent/kiln");
+        tokio::time::timeout(
+            within,
+            serve_groups(listener, uid, bin, None, enable_checkpoints, out),
+        )
+        .await
+    }
+
+    /// A standard error that rejects every write and every flush.
+    struct RejectingWriter;
+
+    impl std::io::Write for RejectingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stderr unavailable"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("stderr unavailable"))
+        }
+    }
+
+    /// Backlog B4 fix round 3 (recheck 2's HIGH 1): the production orchestration itself,
+    /// not only the helper inside it, refuses to serve when its startup line is rejected.
+    /// A helper that started serving never returns, so returning at all, and with the
+    /// write's error, is the proof; the socket then has no one accepting on it.
+    #[tokio::test]
+    async fn the_helper_does_not_serve_when_its_startup_line_is_rejected() {
+        for enable_checkpoints in [false, true] {
+            let (_dir, path, listener) = production_listener();
+            let returned = run_serve_groups(
+                listener,
+                enable_checkpoints,
+                &mut RejectingWriter,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("checkpoints {enable_checkpoints}: still serving after a rejected line")
+            });
+            let error = returned.expect_err("a rejected startup line must fail startup");
+            assert_eq!(
+                format!("{error:#}"),
+                "write the checkpoint group's startup line to standard error: \
+                 stderr unavailable",
+                "checkpoints {enable_checkpoints}"
+            );
+            // The listener is gone with the call: a client finds no helper.
+            let refused = std::os::unix::net::UnixStream::connect(&path)
+                .expect_err("nothing may accept on the helper's socket");
+            assert_eq!(
+                refused.kind(),
+                std::io::ErrorKind::ConnectionRefused,
+                "checkpoints {enable_checkpoints}"
+            );
+        }
+    }
+
+    /// The control for the test above: the same orchestration with a working standard
+    /// error is still serving when a short timeout runs out, having written its one line,
+    /// so the timeout tells serving from not serving.
+    #[tokio::test]
+    async fn the_helper_serves_once_its_startup_line_is_written() {
+        for (enable_checkpoints, line) in [
+            (false, "kilnd-helper: checkpoint group: off (flag)\n"),
+            (true, "kilnd-helper: checkpoint group: enabled\n"),
+        ] {
+            let (_dir, path, listener) = production_listener();
+            let mut out = Vec::new();
+            let serving = async {
+                run_serve_groups(
+                    listener,
+                    enable_checkpoints,
+                    &mut out,
+                    std::time::Duration::from_millis(300),
+                )
+                .await
+            };
+            // A client reaches a live listener while it serves.
+            let connect = async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::net::UnixStream::connect(&path).await
+            };
+            let (served, connected) = tokio::join!(serving, connect);
+            assert!(
+                served.is_err(),
+                "checkpoints {enable_checkpoints}: stopped serving: {served:?}"
+            );
+            connected.unwrap_or_else(|e| panic!("checkpoints {enable_checkpoints}: {e}"));
+            assert_eq!(String::from_utf8(out).unwrap(), line);
+        }
     }
 }
