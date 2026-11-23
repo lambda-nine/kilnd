@@ -55,7 +55,7 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   written once the supervisor's last step (READY's own journal round trip) has arrived,
   after the helper answered it; refusals carry the worker's steps up to the refusal. The
   helper never waits to write a line: journald's socket gets non-blocking sends, at most
-  two per line, and a line it can't take whole, or any line when standard error isn't a
+  three per line, and a line it can't take whole, or any line when standard error isn't a
   socket, is dropped and counted in the next line's `dropped` (see the next entry for a
   line the socket takes only part of). The journal, the ledger schema and every create's
   behaviour are unchanged.

@@ -602,7 +602,7 @@ impl Sink {
     /// and counted, and the next line written carries the count as `dropped`.
     ///
     /// - A socket (journald's stream, under systemd): non-blocking sends with
-    ///   `MSG_DONTWAIT`, at most two per line. A socket that can't take the whole line now
+    ///   `MSG_DONTWAIT`, at most three per line. A socket that can't take the whole line now
     ///   costs the line, never time. See [`send_framed`] for a line it takes only part of.
     /// - Anything else (a regular file, a pipe, a terminal): dropped. No write to a shared
     ///   descriptor of those is sure not to block without changing its flags for every
@@ -672,7 +672,8 @@ fn send_dontwait(fd: RawFd, bytes: &[u8]) -> isize {
 /// - A send that takes only part of `line` loses it. One newline then ends the fragment;
 ///   if that newline doesn't go through, `fragment` is set.
 ///
-/// At most two sends a call, never a loop, and nothing allocated: the fragment a reader
+/// At most three sends a call (an earlier fragment's newline, the line, and a partial
+/// line's own newline), never a loop, and nothing allocated: the fragment a reader
 /// later sees ends at a newline and is not a valid line, and every line it cost is
 /// counted by the caller.
 fn send_framed(fragment: &AtomicBool, line: &[u8], mut send: impl FnMut(&[u8]) -> isize) -> bool {
@@ -1493,6 +1494,82 @@ mod tests {
             [(record_for(3).allocation, 2), (record_for(4).allocation, 2)],
             "line 1 (the fragment) and line 2 are unreadable, and both are counted"
         );
+    }
+
+    /// The bytes [`Sink::emit_via`] sends for `record` as a sink's first line, whole.
+    fn whole_line_len(record: Record) -> usize {
+        let sink = Sink::new(-1);
+        let mut fake = Scripted::new(&[Some(usize::MAX)]);
+        assert!(sink.emit_via(record, |b| fake.send(b)));
+        fake.stream.len()
+    }
+
+    /// The B4 break-it's HIGH 4: a partial send of `prefix` bytes, at either edge of
+    /// "took some but not all", is lost and framed like any other. Its recovery newline is
+    /// tried and hits `EAGAIN`, so the fragment stays pending; the next line sends that
+    /// newline first and then goes out whole, a record of its own counting the loss.
+    ///
+    /// At the far edge the fragment lacked only its newline, so the late newline makes it
+    /// a whole line a reader parses: counted as dropped all the same, never merged.
+    #[track_caller]
+    fn a_partial_send_at_the_edge_is_framed(prefix: usize) {
+        let whole = whole_line_len(record_for(1));
+        assert!((1..whole).contains(&prefix));
+        let sink = Sink::new(-1);
+        let mut fake = Scripted::new(&[
+            // Line 1: `prefix` bytes, then EAGAIN for its recovery newline.
+            Some(prefix),
+            None,
+            // Line 2: the pending newline, then the whole line.
+            Some(1),
+            Some(usize::MAX),
+        ]);
+        assert!(!sink.emit_via(record_for(1), |b| fake.send(b)));
+        assert_eq!(fake.sends, 2, "the recovery newline was tried");
+        assert!(sink.fragment.load(Ordering::Relaxed), "the fragment is pending");
+        assert_eq!(fake.stream.len(), prefix);
+        assert!(sink.emit_via(record_for(2), |b| fake.send(b)));
+        assert!(!sink.fragment.load(Ordering::Relaxed));
+        assert_eq!((sink.dropped(), fake.sends), (1, 4));
+        assert!(fake.script.is_empty());
+
+        let lines: Vec<&[u8]> = fake.stream.split_inclusive(|&b| b == b'\n').collect();
+        assert_eq!(lines.len(), 2, "{}", String::from_utf8_lossy(&fake.stream));
+        assert_eq!(lines[0].len(), prefix + 1, "the fragment, ended by its own newline");
+        let late_whole = prefix + 1 == whole;
+        let fragment = parse_line(lines[0].strip_suffix(b"\n").unwrap());
+        assert_eq!(fragment.is_some(), late_whole);
+        let records = read_records(fake.stream.as_slice(), Select::Last(10)).unwrap();
+        let seen: Vec<_> = records.iter().map(|r| (r.allocation, r.dropped)).collect();
+        let next = (record_for(2).allocation, 1);
+        if late_whole {
+            assert_eq!(seen, [(record_for(1).allocation, 0), next], "two separate lines");
+        } else {
+            assert_eq!(seen, [next], "the next line stays separate");
+        }
+    }
+
+    #[test]
+    fn a_one_byte_partial_send_still_opens_and_tracks_a_fragment() {
+        a_partial_send_at_the_edge_is_framed(1);
+    }
+
+    #[test]
+    fn a_partial_send_missing_only_its_newline_still_tracks_a_fragment() {
+        a_partial_send_at_the_edge_is_framed(whole_line_len(record_for(1)) - 1);
+    }
+
+    /// The B4 break-it's MEDIUM: with a fragment already open, one call can take three
+    /// sends (that fragment's newline, part of the line, and the line's own newline),
+    /// and no more.
+    #[test]
+    fn an_open_fragment_followed_by_another_partial_line_takes_three_sends() {
+        let fragment = AtomicBool::new(true);
+        let mut fake = Scripted::new(&[Some(1), Some(2), Some(1)]);
+        assert!(!send_framed(&fragment, b"next line\n", |b| fake.send(b)));
+        assert_eq!(fake.sends, 3);
+        assert!(!fragment.load(Ordering::Relaxed));
+        assert_eq!(fake.stream, b"\nne\n");
     }
 
     /// The same, when the partial line's own newline goes through at once: no fragment
