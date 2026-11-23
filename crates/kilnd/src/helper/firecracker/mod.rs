@@ -4755,12 +4755,18 @@ struct WaitPlace<'a>(&'a AtomicUsize);
 
 impl<'a> WaitPlace<'a> {
     fn take(waiters: &'a AtomicUsize, max: usize) -> Option<Self> {
-        waiters
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Self(waiters))
+        // A compare-exchange loop: `fetch_update` is deprecated from Rust 1.99 and its
+        // replacement `try_update` is not in the 1.88 MSRV.
+        let mut n = waiters.load(Ordering::Acquire);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match waiters.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self(waiters)),
+                Err(current) => n = current,
+            }
+        }
     }
 }
 
