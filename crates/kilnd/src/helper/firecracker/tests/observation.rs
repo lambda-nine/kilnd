@@ -643,6 +643,57 @@ async fn a_look_that_finishes_past_the_cutoff_gives_its_slot_back() {
     assert_eq!(outcomes, vec![Err(SlotWait::Expired); 2]);
 }
 
+/// Moves the paused clock on from inside a synchronous look, as a look that blocks its
+/// thread would let real time pass: `advance` moves the clock on its first poll.
+fn clock_moves_during_the_look(by: Duration) {
+    use std::future::Future;
+    let mut advance = std::pin::pin!(tokio::time::advance(by));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let _ = advance.as_mut().poll(&mut context);
+}
+
+/// The same on a deadline wake: the waiter's last look starts exactly at the cutoff and
+/// finishes a millisecond past it. The slot is given back, the other waiters are told,
+/// and the answer is `Expired`.
+#[tokio::test(start_paused = true)]
+async fn a_last_look_that_finishes_past_the_cutoff_gives_its_slot_back() {
+    let freed = Notify::new();
+    let waiters = AtomicUsize::new(0);
+    let start = Instant::now();
+    let cutoff = start + Duration::from_secs(5);
+    let held = Arc::new(());
+    let looks = Cell::new(0);
+    let began = Cell::new(None);
+    let mut other_waiter = None;
+    let result = wait_for_slot(
+        || {
+            looks.set(looks.get() + 1);
+            if looks.get() == 1 {
+                return None;
+            }
+            began.set(Some(Instant::now()));
+            clock_moves_during_the_look(Duration::from_millis(1));
+            let mut notified = Box::pin(freed.notified());
+            notified.as_mut().enable();
+            other_waiter = Some(notified);
+            Some(held.clone())
+        },
+        &freed,
+        &waiters,
+        1,
+        cutoff,
+    )
+    .await;
+    assert_eq!(began.get(), Some(cutoff), "the last look starts at the cutoff");
+    assert_eq!(Instant::now(), cutoff + Duration::from_millis(1));
+    assert_eq!(result.map(drop), Err(SlotWait::Expired));
+    assert_eq!(looks.get(), 2);
+    assert_eq!(Arc::strong_count(&held), 1, "the slot was given back");
+    let woken = tokio::time::timeout(Duration::from_secs(1), other_waiter.unwrap()).await;
+    assert!(woken.is_ok(), "the give-back woke the other waiters");
+    assert_eq!(waiters.load(Ordering::SeqCst), 0);
+}
+
 /// A second Preflight while Create's slot is busy waits for it, and succeeds once the
 /// first finishes within the wait. The first's lease, given back, wakes it at once: it
 /// doesn't sit out the rest of its five seconds.
