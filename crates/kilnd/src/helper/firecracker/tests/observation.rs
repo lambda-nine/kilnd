@@ -342,6 +342,75 @@ async fn a_slot_waiter_dropped_mid_wait_never_stays_counted() {
     assert_eq!(waiters.load(Ordering::SeqCst), 0);
 }
 
+/// The cutoff holds on every look. A waiter woken late, with the clock already past its
+/// cutoff, gets `Expired` and its place back, even though a slot is free by then: that
+/// slot first came free after the cutoff. (Every caller, observation, Preflight,
+/// revalidation and session preparation, waits through this one function.)
+#[tokio::test(start_paused = true)]
+async fn a_slot_first_free_after_the_cutoff_is_never_taken() {
+    let waiters = AtomicUsize::new(0);
+    let cutoff = Instant::now() + Duration::from_secs(5);
+    let looks_past_cutoff = std::cell::Cell::new(0);
+    let wait = wait_for_slot(
+        || {
+            let free = Instant::now() > cutoff;
+            looks_past_cutoff.set(looks_past_cutoff.get() + usize::from(free));
+            free.then_some(())
+        },
+        &waiters,
+        1,
+        cutoff,
+    );
+    tokio::pin!(wait);
+    tokio::select! {
+        biased;
+        result = &mut wait => panic!("unexpected initial result {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    assert_eq!(waiters.load(Ordering::SeqCst), 1);
+    // The runtime runs the waiter again only 5,001 ms later.
+    tokio::time::advance(Duration::from_millis(5_001)).await;
+    assert_eq!(wait.await, Err(SlotWait::Expired));
+    assert_eq!(looks_past_cutoff.get(), 0, "no look for a slot past the cutoff");
+    assert_eq!(waiters.load(Ordering::SeqCst), 0);
+    // Past the cutoff before the first look: a free slot is still not taken.
+    let past = Instant::now() - Duration::from_millis(1);
+    assert_eq!(wait_for_slot(|| Some(()), &waiters, 1, past).await, Err(SlotWait::Expired));
+    assert_eq!(waiters.load(Ordering::SeqCst), 0);
+}
+
+/// Each sleep is capped at the time left, so the last look lands exactly at the cutoff,
+/// off the poll grid too: a slot free by then is taken, one that never frees is refused
+/// at the cutoff and not a poll later, and a slot freed just before it is taken.
+#[tokio::test(start_paused = true)]
+async fn the_last_look_lands_at_the_cutoff() {
+    let waiters = AtomicUsize::new(0);
+    // 5,001 ms is not a multiple of the 2 ms poll.
+    let wait = Duration::from_millis(5_001);
+    let start = Instant::now();
+    let cutoff = start + wait;
+    let free_at_cutoff = || (Instant::now() >= cutoff).then_some("slot");
+    let taken = wait_for_slot(free_at_cutoff, &waiters, 1, cutoff).await;
+    assert_eq!(taken, Ok("slot"), "free at the cutoff: taken");
+    assert_eq!(start.elapsed(), wait);
+    assert_eq!(waiters.load(Ordering::SeqCst), 0);
+
+    let start = Instant::now();
+    let expired = wait_for_slot(|| None::<()>, &waiters, 1, start + wait).await;
+    assert_eq!(expired, Err(SlotWait::Expired));
+    assert_eq!(start.elapsed(), wait, "refused at the cutoff, not after it");
+    assert_eq!(waiters.load(Ordering::SeqCst), 0);
+
+    let start = Instant::now();
+    let cutoff = start + wait;
+    let just_before = cutoff - Duration::from_millis(1);
+    let free_before = || (Instant::now() >= just_before).then_some(1);
+    let taken = wait_for_slot(free_before, &waiters, 1, cutoff).await;
+    assert_eq!(taken, Ok(1), "freed 1 ms before the cutoff: taken");
+    assert!(start.elapsed() <= wait);
+    assert_eq!(waiters.load(Ordering::SeqCst), 0);
+}
+
 /// A second Preflight while Create's slot is busy waits for it, and succeeds once the
 /// first finishes within the wait.
 #[tokio::test]
@@ -559,4 +628,130 @@ async fn f3_a_predictable_disk_budget_refusal_consumes_no_sequence() {
     assert!(manager.list(true).unwrap().is_empty(), "no row");
     assert_eq!(issue_next(&fixture, instance), before, "no sequence consumed");
     assert_eq!(unaccounted(&fixture, instance), Vec::<i64>::new());
+}
+
+/// One profile spec at a given disk and PID count, as a request and as a spec.
+fn sized(disk_bytes: u64, pids: u32) -> (CreateRequest, SandboxSpec) {
+    let request = CreateRequest {
+        disk_bytes,
+        pids,
+        ..small_create()
+    };
+    let spec = SandboxSpec {
+        disk_bytes,
+        pids,
+        ..spec()
+    };
+    (request, spec)
+}
+
+/// Node budgets equal to `charge` on every dimension, room for one sandbox.
+fn exact_fit(charge: &crate::model::ResourceReservation) -> Limits {
+    Limits {
+        max_sandboxes: 1,
+        max_node_memory_bytes: charge.memory_bytes,
+        max_node_pids: charge.pids,
+        max_node_disk_bytes: charge.disk_bytes,
+        max_node_host_cpu_millis: charge.host_cpu_millis,
+        max_node_virtual_cpu_slots: charge.virtual_cpu_slots,
+        max_node_host_pids: charge.host_pids,
+        ..Limits::default()
+    }
+}
+
+/// F3, the whole vector: the manager's budget pre-check predicts exactly what the
+/// helper's Preflight charges, on every dimension and on both sides of each rounding
+/// boundary of `offline-768-v1` (the 512 MiB disk floor, the 64 MiB multiple, the PID
+/// addend). The charge is what a real Preflight through H and P returns, which is what
+/// the accepting transaction reserves. Then, through the real pre-check: budgets that
+/// fit the charge exactly admit the Create to its Preflight (an over-prediction on any
+/// dimension would refuse it), and one unit less on any single dimension is refused
+/// before the Preflight, naming that dimension, with no sequence consumed (an
+/// under-prediction would let it reach the Preflight and be refused only at commit).
+#[tokio::test]
+async fn f3_the_prediction_is_the_preparation_charge_on_every_dimension() {
+    let fixture = Fixture::new(NodeOptions {
+        ceilings: NodeCeilings {
+            slots: 1,
+            ..NodeCeilings::default()
+        },
+        ..NodeOptions::default()
+    })
+    .await;
+    // Another namespace holds the node's only slot.
+    let other = Id128::random();
+    let holder_runtime = fixture.runtime(other, Id128::random());
+    let (holder, holder_plan) = issued(&holder_runtime, other).await;
+    create_accepted(&fixture, &holder_runtime, &holder, &holder_plan).await;
+    for (disk, pids) in [
+        (256 * MIB, 16),
+        (256 * MIB + 1, 17),
+        (1 << 30, 128),
+        ((1 << 30) + 1, 129),
+        (64 * MIB, 4096),
+    ] {
+        let (request, spec) = sized(disk, pids);
+        let instance = Id128::random();
+        let runtime = fixture.runtime(instance, Id128::random());
+        let charge = runtime
+            .prepare(&prep(instance), &spec, deadline(10), &no_cancel())
+            .await
+            .unwrap_or_else(|error| panic!("disk {disk} pids {pids}: {error}"))
+            .reservation();
+        let predicted = runtime
+            .predicted_reservation(&spec)
+            .expect("Firecracker predicts its reservation");
+        let at = format!("disk {disk} pids {pids}");
+        assert_eq!(predicted.memory_bytes, charge.memory_bytes, "memory, {at}");
+        assert_eq!(predicted.disk_bytes, charge.disk_bytes, "disk, {at}");
+        assert_eq!(predicted.pids, charge.pids, "PIDs, {at}");
+        assert_eq!(predicted.host_cpu_millis, charge.host_cpu_millis, "host CPU, {at}");
+        assert_eq!(predicted.virtual_cpu_slots, charge.virtual_cpu_slots, "vCPU slots, {at}");
+        assert_eq!(predicted.host_pids, charge.host_pids, "host PIDs, {at}");
+        assert_eq!(predicted, charge, "{at}");
+
+        // An exact fit passes the pre-check: its Preflight runs and the transaction
+        // reserves exactly the charge.
+        let (manager, instance) = real_manager(&fixture, exact_fit(&charge));
+        manager.reconcile().await.unwrap();
+        let before = issue_next(&fixture, instance);
+        // The node's only slot is held, so the helper refuses it at admission once
+        // the row is reserved, and its own fence releases it: nothing boots.
+        let error = manager.create(request.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("Capacity"), "{at}: {error}");
+        assert_eq!(issue_next(&fixture, instance), before + 1, "{at}: Preflight ran");
+        let rows = manager.list(true).unwrap();
+        assert_eq!(rows.len(), 1, "{at}: the transaction admitted it");
+        assert_eq!(rows[0].accounting.reservation, charge, "{at}");
+        assert!(!rows[0].is_charged(), "{at}: its own fence released it");
+
+        // One unit short on any one dimension: refused at the pre-check.
+        type Short = fn(&mut Limits);
+        let shorts: [(&str, Short); 6] = [
+            ("memory bytes", |l| l.max_node_memory_bytes -= 1),
+            ("PIDs", |l| l.max_node_pids -= 1),
+            ("disk bytes", |l| l.max_node_disk_bytes -= 1),
+            ("host CPU millis", |l| l.max_node_host_cpu_millis -= 1),
+            ("vCPU slots", |l| l.max_node_virtual_cpu_slots -= 1),
+            ("host PIDs", |l| l.max_node_host_pids -= 1),
+        ];
+        for (resource, short) in shorts {
+            let mut limits = exact_fit(&charge);
+            short(&mut limits);
+            let (manager, instance) = real_manager(&fixture, limits);
+            manager.reconcile().await.unwrap();
+            let before = issue_next(&fixture, instance);
+            let error = manager.create(request.clone()).await.unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("node {resource} budget exhausted")),
+                "{at}, {resource}: {error}"
+            );
+            assert_eq!(
+                issue_next(&fixture, instance),
+                before,
+                "{at}, {resource}: refused before its Preflight"
+            );
+            assert!(manager.list(true).unwrap().is_empty(), "{at}, {resource}");
+        }
+    }
 }

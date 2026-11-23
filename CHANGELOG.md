@@ -64,7 +64,13 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
   fails, kilnd now retries it on its own, after one second and then with the wait
   doubling up to thirty seconds, until the helper's absence receipt releases the sandbox
   or the sandbox is gone; a refused create stays FAILED, and a sandbox another Delete
-  took over meanwhile stays queued until it is released. Rows left charged at startup are
+  took over meanwhile stays queued until it is released. Whichever attempt's receipt
+  releases a sandbox, the end state comes from the sandbox as it is at that moment: one a
+  client's Delete or an expiry moved to DELETING while the receipt was on its way ends
+  DELETED, even if the Delete's caller has gone. A sandbox still CREATING or READY is
+  never retried (startup reconciliation settles one a storage failure left CREATING).
+  A wait for a worker never hands one out after its five seconds (or its deadline) are
+  up, even when the waiter wakes late. Rows left charged at startup are
   retried the same way, except rows another backend wrote, which are never retried or
   changed. The caller still gets the first error. Also, a create kilnd's own node budget
   would refuse is now refused before the helper issues it a token: kilnd reads its budgets

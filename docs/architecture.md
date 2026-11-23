@@ -411,9 +411,18 @@ the same Delete a client would send for a `DELETING` row, and reconciliation's
 settlement, under the row's exec lock, for a `FAILED` one, which stays `FAILED`. The
 first retry comes a second after the failure, and each failure doubles the wait up to
 thirty seconds, until the receipt releases the row or the row is gone. A row that is still
-charged stays queued whatever state it moved to meanwhile (a client's Delete can take a
-`FAILED` row to `DELETING` and depart before running), and the next attempt follows its
-current state; a request that arrives during an attempt is never lost. At startup the task
+charged stays queued whatever settleable state it moved to meanwhile (a client's Delete can
+take a `FAILED` row to `DELETING` and depart before running), and the next attempt follows
+its current state; a request that arrives during an attempt is never lost. A `CREATING` or
+`READY` row belongs to its own operation (or, after a restart, to startup reconciliation),
+so an attempt that finds one drops it from the queue untouched rather than retrying it
+forever. Whichever writer's receipt commits, the store chooses the terminal state from the
+row inside that receipt's transaction, not from what the writer chose before it waited: a
+row carrying a Delete intent (`DELETING` with a deletion reason, which only a client's
+Delete or an expiry writes) ends `DELETED`, a `DELETED` row stays `DELETED`, and any other
+row ends as the writer asked, so a refused create with no Delete intent stays `FAILED`. A
+Delete that publishes its intent while a `FAILED` settlement waits for its receipt, and
+then departs, still leaves the row `DELETED`. At startup the task
 queues every charged fenced row reconciliation left `FAILED` or `DELETING`. Nothing here
 releases without the receipt. Legacy rows, and rows another backend wrote (the same check
 reconciliation makes), are never queued, and each attempt checks the backend again before

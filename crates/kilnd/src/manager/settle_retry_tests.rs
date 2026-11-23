@@ -420,3 +420,170 @@ async fn only_a_released_or_gone_row_leaves_the_queue_and_late_requests_survive(
     m.finish_settle_retry(&id, requests(&m), settle_retry::Attempt::Settled);
     assert!(m.settle_retries().is_empty());
 }
+
+/// A charged refused Create left FAILED, whose retry is waiting for its receipt: a
+/// client's Delete publishes its intent (DELETING) after the retry's locked reread and
+/// departs. The receipt then commits DELETED, not the FAILED the retry chose before it
+/// waited, with the charge released by that receipt and the queue empty.
+#[tokio::test(start_paused = true)]
+async fn a_receipt_that_commits_after_a_delete_intent_ends_deleted() {
+    use crate::runtime::fake::FakeGate;
+
+    let (m, fake) = manager();
+    {
+        let mut state = fake.state();
+        state.fenced.rejection = Some(FakeRejection::CapacityExhausted);
+        state.fenced.fence_unavailable = Some(UNAVAILABLE.into());
+    }
+    assert!(m.create(CreateRequest::default()).await.is_err());
+    let row = m.list(true).unwrap().pop().unwrap();
+    assert_eq!(row.state, SandboxState::Failed);
+    assert!(row.is_charged());
+
+    let receipt_ready = FakeGate::default();
+    {
+        let mut state = fake.state();
+        state.fenced.fence_unavailable = None;
+        state.fenced.fence_gate = Some(receipt_ready.clone());
+    }
+    let worker = m.start_settle_retries().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), receipt_ready.entered())
+        .await
+        .expect("the scheduled retry reached its receipt");
+    // The retry holds the exec lock and chose FAILED; the client's intent lands now.
+    let intent = m.prepare_delete(&row.id, m.load(&row.id).unwrap()).unwrap();
+    assert_eq!(intent.state, SandboxState::Deleting);
+    assert!(intent.is_charged());
+    receipt_ready.release();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let settled = m.load(&row.id).unwrap();
+    assert_eq!(settled.state, SandboxState::Deleted);
+    assert!(settled.deleted_at_ms.is_some());
+    assert!(!settled.is_charged());
+    assert!(released_by_fence(&fake, &settled));
+    assert_eq!(charged(&m), 0);
+    assert!(fake.state().remove_targets.is_empty());
+    assert!(m.settle_retries().is_empty());
+    m.begin_shutdown();
+    worker.await.unwrap();
+}
+
+/// The same race on the refused Create's own settlement: the Create chose FAILED and is
+/// waiting for its fence when a client's Delete publishes its intent. The receipt commits
+/// DELETED; nothing is queued.
+#[tokio::test(start_paused = true)]
+async fn a_refused_creates_own_receipt_honours_a_delete_intent_published_meanwhile() {
+    use crate::runtime::fake::FakeGate;
+
+    let (m, fake) = manager();
+    let fence_ready = FakeGate::default();
+    {
+        let mut state = fake.state();
+        state.fenced.rejection = Some(FakeRejection::CapacityExhausted);
+        state.fenced.fence_gate = Some(fence_ready.clone());
+    }
+    let creating = {
+        let m = m.clone();
+        tokio::spawn(async move { m.create(CreateRequest::default()).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), fence_ready.entered())
+        .await
+        .expect("the refused Create reached its fence");
+    let row = m.list(true).unwrap().pop().unwrap();
+    assert_eq!(row.state, SandboxState::Failed);
+    assert!(row.is_charged());
+    let intent = m.prepare_delete(&row.id, row.clone()).unwrap();
+    assert_eq!(intent.state, SandboxState::Deleting);
+    fence_ready.release();
+    let error = creating.await.unwrap().unwrap_err();
+    assert!(matches!(error, Error::ResourceExhausted(_)), "{error}");
+    let settled = m.load(&row.id).unwrap();
+    assert_eq!(settled.state, SandboxState::Deleted);
+    assert!(!settled.is_charged());
+    assert!(released_by_fence(&fake, &settled));
+    assert!(m.settle_retries().is_empty());
+}
+
+/// The reverse order: the retry's receipt commits first (FAILED, released), and a later
+/// Delete takes the released row to DELETED with no backend work and nothing queued.
+#[tokio::test(start_paused = true)]
+async fn a_delete_after_the_receipt_committed_needs_no_backend_work() {
+    let (m, fake) = manager();
+    {
+        let mut state = fake.state();
+        state.fenced.rejection = Some(FakeRejection::CapacityExhausted);
+        state.fenced.fence_unavailable = Some(UNAVAILABLE.into());
+    }
+    assert!(m.create(CreateRequest::default()).await.is_err());
+    let id = m.list(true).unwrap().pop().unwrap().id;
+    fake.state().fenced.fence_unavailable = None;
+    let worker = m.start_settle_retries().unwrap();
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let released = m.load(&id).unwrap();
+    assert_eq!(released.state, SandboxState::Failed, "no Delete intent: FAILED");
+    assert!(!released.is_charged());
+    assert!(m.settle_retries().is_empty());
+    let fences = fence_calls(&fake);
+    let deleted = m.delete(&id).await.unwrap();
+    assert_eq!(deleted.state, SandboxState::Deleted);
+    assert_eq!(deleted.accounting.release, released.accounting.release);
+    assert_eq!(fence_calls(&fake), fences, "no backend work");
+    assert!(fake.state().remove_targets.is_empty());
+    assert!(m.settle_retries().is_empty());
+    m.begin_shutdown();
+    worker.await.unwrap();
+}
+
+/// A charged CREATING row is its Create's, or after a restart startup reconciliation's
+/// (which settles CREATING), never this retry's: a row a storage failure left CREATING
+/// (READY publication and its cleanup intent both failed) would otherwise be retried
+/// forever with nothing to do. The attempt drops it from the queue untouched, once, with
+/// no backend work and no further attempts. READY is dropped the same way; LOST and
+/// QUARANTINED stay queued for their Delete (`only_a_released_or_gone_row_...`).
+#[tokio::test(start_paused = true)]
+async fn a_row_left_creating_leaves_the_queue_untouched_and_never_spins() {
+    use crate::runtime::fake::FakeGate;
+
+    for state in [SandboxState::Creating, SandboxState::Ready] {
+        let (m, fake) = manager();
+        let held = FakeGate::default();
+        let creating = if state == SandboxState::Creating {
+            fake.state().fenced.queued_create_gates.push_back(held.clone());
+            let m = m.clone();
+            let create = tokio::spawn(async move { m.create(CreateRequest::default()).await });
+            tokio::time::timeout(Duration::from_secs(3), held.entered())
+                .await
+                .expect("the Create reached its backend");
+            Some(create)
+        } else {
+            m.create(CreateRequest::default()).await.unwrap();
+            None
+        };
+        let before = m.list(true).unwrap().pop().unwrap();
+        assert_eq!(before.state, state);
+        assert!(before.is_charged());
+        m.schedule_settle_retry(&before.id);
+        assert_eq!(m.settle_retries(), [(before.id.clone(), 0)], "{state:?}");
+        let fences = fence_calls(&fake);
+        let worker = m.start_settle_retries().unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(m.settle_retries().is_empty(), "{state:?}: dropped at its first attempt");
+        assert_eq!(fence_calls(&fake), fences, "{state:?}: no backend work");
+        assert!(fake.state().remove_targets.is_empty(), "{state:?}");
+        assert_untouched(&m.load(&before.id).unwrap(), &before);
+        if let Some(create) = creating {
+            // Its Create, untouched by the retry, still finishes.
+            held.release();
+            assert_eq!(create.await.unwrap().unwrap().state, SandboxState::Ready);
+        }
+        // And nothing more is attempted.
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(m.settle_retries().is_empty(), "{state:?}");
+        assert_eq!(fence_calls(&fake), fences, "{state:?}");
+        assert!(fake.state().remove_targets.is_empty(), "{state:?}");
+        assert_eq!(m.load(&before.id).unwrap().state, SandboxState::Ready);
+        m.begin_shutdown();
+        worker.await.unwrap();
+    }
+}

@@ -6,13 +6,16 @@
 //! FAILED and charged, as before. What changed is that someone retries it: each such
 //! row is retried here, one attempt at a time, with a backoff from one second doubling
 //! to thirty, until its charge is released or the row is gone. A row that is still
-//! charged stays queued whatever state it moved to meanwhile (a client's Delete may have
-//! taken a FAILED row to DELETING and then departed), and the next attempt follows its
-//! current state. A retry is exactly what a client could do: a DELETING row gets the
-//! same Delete, and a FAILED row the same settlement that reconciliation runs, under the
-//! row's exec lock. Nothing here ever releases without the receipt. Legacy rows, and rows
-//! another backend wrote, are never queued or retried: like reconciliation, only rows of
-//! the running backend are this daemon's to settle.
+//! charged stays queued whatever settleable state it moved to meanwhile (a client's
+//! Delete may have taken a FAILED row to DELETING and then departed), and the next
+//! attempt follows its current state. A retry is exactly what a client could do: a
+//! DELETING row gets the same Delete, and a FAILED row the same settlement that
+//! reconciliation runs, under the row's exec lock. Whichever writer's receipt commits,
+//! the store picks the terminal state from the row in that transaction, so a Delete
+//! intent published while a FAILED settlement waited for its receipt still ends DELETED.
+//! Nothing here ever releases without the receipt. Legacy rows, rows another backend
+//! wrote, and CREATING or READY rows (their own operation's, or startup
+//! reconciliation's) are never retried: they leave the queue untouched.
 
 use super::*;
 
@@ -46,7 +49,8 @@ pub(super) fn settle_retry_delay(failures: u32) -> Duration {
 pub(super) enum Attempt {
     /// The charge is released, or the row is gone: nothing left to retry.
     Settled,
-    /// Not this retry's row: another backend's, or a legacy one. It is left untouched.
+    /// Not this retry's row: another backend's, a legacy one, or one another operation
+    /// owns (CREATING, READY). It leaves the queue and is left untouched.
     NotOurs(&'static str),
     /// Still charged: retried after the backoff, following its state then.
     Failed(String),
@@ -221,7 +225,9 @@ impl<R: Runtime> Manager<R> {
         let error = match row.state {
             // The same Delete a client would send.
             SandboxState::Deleting => self.delete(id).await.err().map(|e| e.to_string()),
-            // Reconciliation's settlement, which keeps the row FAILED.
+            // Reconciliation's settlement, which keeps the row FAILED. A Delete intent
+            // published after the reread below, while the receipt is outstanding, still
+            // wins: the store chooses DELETED inside the receipt's transaction.
             SandboxState::Failed => {
                 let slot = self.slot(id);
                 let _guard = slot.exec_lock.lock().await;
@@ -237,9 +243,18 @@ impl<R: Runtime> Manager<R> {
                     Err(error) => Some(error.to_string()),
                 }
             }
-            // CREATING and READY belong to their own operation; LOST and QUARANTINED
-            // wait for a Delete. A charged one stays queued and is looked at again.
-            _ => None,
+            // CREATING belongs to its Create, or after a restart to startup
+            // reconciliation, which settles a CREATING row; READY to its session. No
+            // attempt here can move either, so the entry leaves the queue untouched
+            // rather than being retried forever (a row a storage failure left CREATING
+            // after its Create ended waits for the next startup).
+            SandboxState::Creating => {
+                return Attempt::NotOurs("a CREATING row: its Create's or startup's");
+            }
+            SandboxState::Ready => return Attempt::NotOurs("a READY row: its session's"),
+            // LOST and QUARANTINED wait for a Delete. A charged one stays queued and is
+            // looked at again.
+            SandboxState::Lost | SandboxState::Quarantined | SandboxState::Deleted => None,
         };
         match self.store.sandbox(id) {
             Ok(None) => Attempt::Settled,

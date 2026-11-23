@@ -4776,24 +4776,40 @@ impl Drop for WaitPlace<'_> {
     }
 }
 
+/// How often a waiter looks for a free slot.
+const SLOT_POLL: Duration = Duration::from_millis(2);
+
 /// A slot from `try_slot`: at once if one is free; otherwise as one of at most `max`
 /// waiters counted in `waiters`, polling until `until`. The place is held by a drop guard,
 /// so a waiter that is dropped mid-wait never stays counted.
+///
+/// `until` is a cutoff on every look, the first included: no slot is taken once the
+/// clock is past it. Each sleep is capped at the time left, so the last look lands at
+/// the cutoff, and the clock is read again on waking, before `try_slot`: a waiter woken
+/// late (a busy runtime) gets `Expired` and its place back, never a slot that first came
+/// free after its cutoff.
 async fn wait_for_slot<T>(
     mut try_slot: impl FnMut() -> Option<T>,
     waiters: &AtomicUsize,
     max: usize,
     until: Instant,
 ) -> Result<T, SlotWait> {
+    if Instant::now() > until {
+        return Err(SlotWait::Expired);
+    }
     if let Some(slot) = try_slot() {
         return Ok(slot);
     }
     let _place = WaitPlace::take(waiters, max).ok_or(SlotWait::QueueFull)?;
     loop {
-        if Instant::now() >= until {
+        let now = Instant::now();
+        if now >= until {
             return Err(SlotWait::Expired);
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::sleep_until(until.min(now + SLOT_POLL)).await;
+        if Instant::now() > until {
+            return Err(SlotWait::Expired);
+        }
         if let Some(slot) = try_slot() {
             return Ok(slot);
         }

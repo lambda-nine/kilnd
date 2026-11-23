@@ -334,7 +334,11 @@ observations that Remove, FenceAbsent and List run, and for startup's lease chec
 pressure from any number of instances can't leave an allocation charged for want of a fresh
 observation (M3-2 finding F1). Each kind of work that finds no slot it may take waits for
 one in its own bounded queue, polling, and a waiter that leaves early (its client cancels
-or disconnects, its wire deadline passes) gives its place back at once:
+or disconnects, its wire deadline passes) gives its place back at once. The end of a wait is
+a cutoff on every look for a slot, the first included: each sleep is capped at the time
+left, so the last look lands at the cutoff, and the clock is read again on waking, before
+the slot is taken, so a waiter that wakes late is refused as expired, never handed a slot
+that first came free after its cutoff:
 
 - A Preflight takes Create's slot if it is free. Otherwise it waits for it among at most 16
   other Preflights, for at most five seconds and never past its deadline, before issuing
@@ -342,8 +346,11 @@ or disconnects, its wire deadline passes) gives its place back at once:
   queue is full`; a wait that ends with the slot still busy refuses it with `no preparation
   slot came free within the wait`. Either way no sequence is consumed.
 - Create's revalidation and S's session preparation wait for Create's slot among at most
-  16 others of their own (apart from the Preflights, so new requests can't refuse a Create
-  that already holds a token), never past their deadline. A full queue refuses at once.
+  16 others of their own, never past their deadline. A full queue refuses at once. Their
+  queue is apart from the Preflights', so new Preflights can't fill it; that separation is
+  about queue capacity only. Both queues poll for the same slot, in no FIFO order, so a
+  stream of Preflights can still take that slot first and delay an issued Create's
+  revalidation until its own deadline.
 - An observation tries the observation slot first, then any free one, and waits for one
   among at most 16 other observations, for at most five seconds and never past its
   deadline. A full queue answers at once, without waiting; a wait that ends answers at its

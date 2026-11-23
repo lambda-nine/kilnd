@@ -1757,6 +1757,21 @@ fn sandbox_resources(conn: &Connection) -> Result<SandboxResources> {
     Ok(resources)
 }
 
+/// The state a fenced release commits, chosen from the row inside the release's own
+/// write transaction. A row that carries a Delete intent ends DELETED: DELETING with a
+/// deletion reason, which only `publish_delete_intent` (a client's Delete) and
+/// `publish_expiry_intent` write, possibly while the releasing writer waited for its
+/// receipt. A DELETED row stays DELETED. Any other row ends as the releasing writer
+/// asked: an ordinary refused Create stays FAILED, and so does a failed READY
+/// publication's own cleanup intent (DELETING with no deletion reason).
+fn release_terminal(row: &Sandbox, requested: SandboxState) -> SandboxState {
+    match row.state {
+        SandboxState::Deleted => SandboxState::Deleted,
+        SandboxState::Deleting if row.lifecycle.deletion_reason.is_some() => SandboxState::Deleted,
+        _ => requested,
+    }
+}
+
 fn exhausted_budget(
     reserved: SandboxResources,
     requested: SandboxResources,
@@ -2472,7 +2487,11 @@ impl Store {
     }
 
     /// The budget `reserve_sandbox_with_env` would refuse `requested` for against what
-    /// is reserved now, as a read. Advisory: only that transaction admits or refuses.
+    /// is reserved now, as a read. The manager's pre-check before preparation (Option A,
+    /// docs/helper-protocol.md) treats a refusal here as final: the Create is refused at
+    /// that instant, even if a Delete frees room before its transaction would have run.
+    /// Room here admits nothing: the accepting transaction still checks the actual
+    /// charge and can refuse it.
     pub fn budget_refusal(
         &self,
         requested: &ResourceReservation,
@@ -3038,14 +3057,13 @@ impl Store {
                 )?;
             }
         }
-        // A terminal row keeps its first terminal evidence; only FAILED can still
+        // The terminal state comes from the row as this transaction reads it, not
+        // from what the caller chose before its backend work: a Delete intent
+        // published meanwhile ends DELETED, and DELETED stays DELETED. A
+        // terminal row keeps its first terminal evidence; only FAILED can still
         // advance to DELETED, without rewriting that reference. An exact replay
         // leaves every column, including timestamps, unchanged.
-        let state = if row.state == SandboxState::Deleted {
-            SandboxState::Deleted
-        } else {
-            terminal
-        };
+        let state = release_terminal(&row, terminal);
         if row.state == state
             && row.accounting.release == ReservationRelease::Fenced(receipt.receipt_id())
         {
@@ -7954,6 +7972,108 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.sandbox(&row.id).unwrap().unwrap(), deleted);
+    }
+
+    /// The terminal state is the row's, read inside the release's transaction, not the
+    /// one its writer chose before waiting for the receipt: a Delete intent published
+    /// meanwhile ends DELETED, and a row without one ends as asked.
+    #[test]
+    fn a_release_honours_a_delete_intent_published_while_its_receipt_was_outstanding() {
+        let store = Store::open_in_memory().unwrap();
+        // A refused Create's row, FAILED and charged: its writer chose FAILED, then a
+        // client's Delete published its intent before the receipt came back.
+        let intent = fenced_sandbox();
+        store.insert_sandbox(&intent).unwrap();
+        assert!(
+            store
+                .compare_and_set_sandbox_state(
+                    &intent.id,
+                    SandboxState::Creating,
+                    SandboxState::Failed,
+                    None,
+                    Some("refused")
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .publish_delete_intent(
+                    &intent.id,
+                    SandboxState::Failed,
+                    SandboxState::Deleting,
+                    Some("refused"),
+                    DeletionReason::Requested,
+                )
+                .unwrap()
+        );
+        let receipt = absence_for(&intent, 8);
+        store
+            .release_fenced(&intent.id, SandboxState::Failed, &receipt, None)
+            .unwrap();
+        let released = store.sandbox(&intent.id).unwrap().unwrap();
+        assert_eq!(released.state, SandboxState::Deleted);
+        assert!(released.deleted_at_ms.is_some());
+        assert_eq!(released.lifecycle.deletion_reason, Some(DeletionReason::Requested));
+        assert_eq!(
+            released.accounting.release,
+            ReservationRelease::Fenced(receipt.receipt_id())
+        );
+        // Its exact replay, still asking FAILED, leaves it DELETED and unchanged.
+        store
+            .release_fenced(&intent.id, SandboxState::Failed, &receipt, None)
+            .unwrap();
+        assert_eq!(store.sandbox(&intent.id).unwrap().unwrap(), released);
+
+        // The same refused Create with no Delete intent stays FAILED.
+        let refused = fenced_sandbox();
+        store.insert_sandbox(&refused).unwrap();
+        assert!(
+            store
+                .compare_and_set_sandbox_state(
+                    &refused.id,
+                    SandboxState::Creating,
+                    SandboxState::Failed,
+                    None,
+                    Some("refused")
+                )
+                .unwrap()
+        );
+        let receipt = absence_for(&refused, 8);
+        store
+            .release_fenced(&refused.id, SandboxState::Failed, &receipt, None)
+            .unwrap();
+        let failed = store.sandbox(&refused.id).unwrap().unwrap();
+        assert_eq!(failed.state, SandboxState::Failed);
+        assert!(failed.deleted_at_ms.is_none());
+        assert!(!failed.is_charged());
+
+        // A failed READY publication's own cleanup intent is DELETING with no deletion
+        // reason: no client asked for a Delete, so its compensation ends FAILED.
+        let compensated = fenced_sandbox();
+        store.insert_sandbox(&compensated).unwrap();
+        assert!(
+            store
+                .compare_and_set_sandbox_state(
+                    &compensated.id,
+                    SandboxState::Creating,
+                    SandboxState::Deleting,
+                    None,
+                    Some("record ready state failed")
+                )
+                .unwrap()
+        );
+        let receipt = absence_for(&compensated, 8);
+        store
+            .release_fenced(&compensated.id, SandboxState::Failed, &receipt, None)
+            .unwrap();
+        let row = store.sandbox(&compensated.id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxState::Failed);
+        assert_eq!(row.lifecycle.deletion_reason, None);
+        assert!(!row.is_charged());
+        assert_eq!(
+            store.sandbox_resources().unwrap(),
+            SandboxResources::default()
+        );
     }
 
     #[test]
