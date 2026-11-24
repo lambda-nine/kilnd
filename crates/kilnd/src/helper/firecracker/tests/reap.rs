@@ -502,6 +502,10 @@ fn a_teardown_that_leaves_something_fails_unless_already_panicking() {
 mod fake {
     use super::*;
 
+    /// A table past this many processes fails the test: forks are outrunning teardown,
+    /// and a table that doubles on every look would otherwise exhaust the host's memory.
+    const MAX_PROCS: usize = 10_000;
+
     #[derive(Clone, Debug)]
     pub struct Proc {
         pub pid: i32,
@@ -630,6 +634,11 @@ mod fake {
                 .filter(|p| p.forks && p.exited.is_none())
                 .map(|p| (p.group, p.session))
                 .collect();
+            assert!(
+                self.procs.len() + forkers.len() <= MAX_PROCS,
+                "forks outran teardown: {} processes",
+                self.procs.len() + forkers.len()
+            );
             for (group, session) in forkers {
                 let mut child = Proc::new(self.next_pid, group, session);
                 child.forks = true;
