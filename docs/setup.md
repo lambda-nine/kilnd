@@ -159,7 +159,12 @@ B6_EVIDENCE=$HOME/b6-evidence scripts/b4-vm-tests.sh b6_linux_root # a whole ses
 is installed in the protected store as the helper image and the contract approves static
 ELFs only. It installs under `/opt/kilnd`, uses `/var/lib/kilnd-helper/{jails,work}` and
 `/sys/fs/cgroup/kilnd-firecracker`, and its `scripts/b4-vm-cleanup.py` removes all of it
-and fails if any owned VMM, loop device, mount, cgroup or file is left. It first builds
+and fails if any owned VMM, loop device, mount, cgroup or file is left. Before a test
+returns, its helper fixture has already killed and reaped every process its helper
+started: each test helper leads a session of its own, and teardown kills that session's
+process groups and members, waits until none is left (zombies included), and fails the
+test if one is still there after ten seconds. Only a real VMM leaves that session (the
+launch's own `setsid`, into its allocation's cgroup), and is the cleanup script's. It first builds
 `kilnd` (with the `firecracker-test-deployment` feature) and `kilndctl` as ordinary
 release binaries for B6's session test, under `B6_TARGET_DIR` (default
 `~/.cache/kilnd-target-b6`); the static test binary goes under `B4_TARGET_DIR` (default

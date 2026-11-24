@@ -742,12 +742,14 @@ fn b3_linux_root_attestation_needs_no_cap_sys_ptrace() {
     }
     use std::os::unix::process::CommandExt;
     assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
-    let mut target = Command::new("/bin/sleep")
-        .arg("30")
-        .uid(NOBODY)
-        .gid(NOBODY)
-        .spawn()
-        .unwrap();
+    let mut target = super::reap::Reaped(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .uid(NOBODY)
+            .gid(NOBODY)
+            .spawn()
+            .unwrap(),
+    );
     let status = Command::new(std::env::current_exe().unwrap())
         .args([
             "--ignored",
@@ -785,12 +787,14 @@ fn b3r_02_linux_root_another_account_cannot_reach_memory_signals_or_state_at_yam
     if original.is_some() {
         std::fs::write("/proc/sys/kernel/yama/ptrace_scope", "0").unwrap();
     }
-    let mut daemon = Command::new("/bin/sleep")
-        .arg("60")
-        .uid(VICTIM_ACCOUNT.0)
-        .gid(VICTIM_ACCOUNT.1)
-        .spawn()
-        .unwrap();
+    let mut daemon = super::reap::Reaped(
+        Command::new("/bin/sleep")
+            .arg("60")
+            .uid(VICTIM_ACCOUNT.0)
+            .gid(VICTIM_ACCOUNT.1)
+            .spawn()
+            .unwrap(),
+    );
     let pid = daemon.id();
     // A state directory and database as the unit and store leave them.
     let state = tempfile::Builder::new()
@@ -854,10 +858,11 @@ async fn b3_01_linux_connection_pin_follows_the_connecting_process() {
             path.to_str().unwrap(),
         ])
         .spawn();
-    let Ok(mut connector) = python else {
+    let Ok(connector) = python else {
         eprintln!("python3 is unavailable here; the root scenario covers the pin");
         return;
     };
+    let mut connector = super::reap::Reaped(connector);
     let (stream, _) = listener.accept().await.unwrap();
     let pin = PeerPin::of_connection(stream.as_raw_fd()).unwrap();
     assert!(pin.alive());
@@ -1477,9 +1482,12 @@ async fn b3r_linux_root_the_listener_tells_real_accounts_apart() {
     }
 
     // The attacker holds every framing slot it can. The victim attaches anyway.
-    let mut silent = probe_as(ATTACKER_ACCOUNT, "silent", &socket)
-        .spawn()
-        .unwrap();
+    // It never stops by itself: only its kill, or this guard on a failed assertion, ends it.
+    let mut silent = super::reap::Reaped(
+        probe_as(ATTACKER_ACCOUNT, "silent", &socket)
+            .spawn()
+            .unwrap(),
+    );
     // The control: the shared slots really are gone, even for the service account.
     let mut crowded_out = false;
     for _ in 0..100 {

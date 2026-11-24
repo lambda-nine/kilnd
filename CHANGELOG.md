@@ -6,6 +6,19 @@ before 1.0, any minor release may change the CLI or on-disk layout. The
 
 ## Unreleased
 
+- Tests: the Firecracker helper fixture's teardown no longer leaves the helper's workers
+  running after a test. Each test helper now leads a session of its own; teardown kills
+  every process group and member of that session (and of any helper the test replaced),
+  waits until none is left, zombies included, and fails the test if one outlives ten
+  seconds. Before, it killed only the helper and the workers an earlier census had named,
+  so the recovery workers, which by design outlive a dead helper by about three seconds,
+  were still running as root after the real-chain session test returned (proof C5). The
+  real chain first gives its monitor and recovery workers up to ten seconds to finish
+  containing any VM, as they would in production. Five root and Linux tests' own
+  children (a probe that floods the helper's socket forever, and `sleep`s and a `python3`
+  connector) are now killed and reaped even when their test fails. Production code is
+  unchanged.
+
 - Health no longer stays SERVING when kilnd can't read its checkpoint statistics. It
   still leaves the `checkpoints` block out and logs `read checkpoint counts`, and now also
   reports DEGRADED (SHUTTING_DOWN still wins) with `checkpoint counts unreadable: <why>` in

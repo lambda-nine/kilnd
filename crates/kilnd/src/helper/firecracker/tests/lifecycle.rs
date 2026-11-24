@@ -220,12 +220,7 @@ impl Real {
         let (temp, root, config) = real_tree_with(options, guest, at);
         std::fs::write(root.join("faults/L.keep_launch_capabilities"), b"").unwrap();
         Ledger::provision(&ledger_config(&config)).unwrap();
-        let fixture = Fixture {
-            temp,
-            root,
-            child: Mutex::new(None),
-            seen: Mutex::default(),
-        };
+        let fixture = Fixture::with_tree(temp, root);
         Self {
             fixture,
             bundle: config.catalog.bundle_directory,
@@ -679,9 +674,8 @@ fn unsettled(real: &Real, allocation: Id128) -> i64 {
 }
 
 async fn restart_helper(real: &Real) {
-    if let Some(mut child) = real.fixture.child.lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    if real.fixture.child.lock().unwrap().is_some() {
+        real.fixture.kill_helper().await;
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     real.fixture.start().await;
@@ -1716,7 +1710,7 @@ async fn b4_linux_root_stalled_classes_and_full_pools_keep_capabilities_inspect_
 #[ignore = "needs root, KVM and the B4 artifacts: run scripts/b4-vm-tests.sh"]
 async fn b4_linux_root_stale_pids_and_inodes_protect_unrelated_resources() {
     // A reused PID: the recorded start time names a process that no longer exists.
-    let mut unrelated = Command::new("sleep").arg("60").spawn().unwrap();
+    let mut unrelated = super::reap::Reaped(Command::new("sleep").arg("60").spawn().unwrap());
     let pid = unrelated.id() as i32;
     let ProcessState::Running { start_time } = super::super::workers::process_state(pid) else {
         panic!("sleep is not running");
@@ -2556,4 +2550,29 @@ async fn b4_linux_root_scoped_gc_removes_only_proven_dead_allocations() {
     );
     remove_to_absent(&real, &runtime, &live, "gc live").await;
     remove_to_absent(&real, &other_runtime, &other, "gc other").await;
+}
+
+/// Proof C5's teardown gap on the real chain: the real helper's K workers outlive it by
+/// design, and a late worker and its grandchild (in a group of its own) never leave by
+/// themselves. Once the fixture is dropped, after the real chain's grace, none of them
+/// is left, not even a zombie, and no group they used exists.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs root and the B4 artifacts: run scripts/b4-vm-tests.sh"]
+async fn b4_linux_root_teardown_leaves_no_process_of_the_real_helper() {
+    let real = Real::unstarted(NodeOptions::default(), None, None);
+    let late =
+        super::reap::start_with_late_worker(&real.fixture, async || real.start().await).await;
+    let helper = real.fixture.helper_pid();
+    let before = super::reap::assert_whole_tree(helper, late);
+    let started = std::time::Instant::now();
+    drop(real);
+    let took = started.elapsed();
+    super::reap::assert_nothing_left(helper, &before);
+    // The late worker never leaves by itself: teardown waited out the grace, then killed.
+    assert!(took >= super::reap::REAL_GRACE, "{took:?}");
+    eprintln!(
+        "B4 evidence: teardown of the real helper's session ({} processes) took {} ms",
+        before.len(),
+        took.as_millis()
+    );
 }

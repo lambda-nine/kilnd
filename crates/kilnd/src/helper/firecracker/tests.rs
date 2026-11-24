@@ -274,6 +274,9 @@ fn node_fixture_child() {
                 }
             });
         }
+        if config.root.join("late-worker").exists() {
+            reap::spawn_late_worker(config.root.clone());
+        }
         // A test process that died cannot leave this fixture behind.
         let parent_root = config.root.clone();
         tokio::spawn(async move {
@@ -370,7 +373,11 @@ fn limit_to_unit_capabilities() {
 struct Fixture {
     temp: tempfile::TempDir,
     root: PathBuf,
+    /// The current helper H, which leads a session of its own (tests/reap.rs).
     child: Mutex<Option<Child>>,
+    /// Every helper started before the current one, kept unreaped until teardown so its
+    /// session's ID stays its own.
+    retired: Mutex<Vec<Child>>,
     seen: Mutex<Vec<i32>>,
 }
 
@@ -474,26 +481,26 @@ impl Fixture {
     async fn new(options: NodeOptions) -> Self {
         let (temp, root, config) = prepare_tree(options);
         Ledger::provision(&ledger_config(&config)).unwrap();
-        let fixture = Self {
+        let fixture = Self::with_tree(temp, root);
+        fixture.start().await;
+        fixture
+    }
+
+    fn with_tree(temp: tempfile::TempDir, root: PathBuf) -> Self {
+        Self {
             temp,
             root,
             child: Mutex::new(None),
+            retired: Mutex::default(),
             seen: Mutex::default(),
-        };
-        fixture.start().await;
-        fixture
+        }
     }
 
     /// Provisioned, with the helper not yet running: root's enrollment happens here.
     fn unstarted(options: NodeOptions) -> Self {
         let (temp, root, config) = prepare_tree(options);
         Ledger::provision(&ledger_config(&config)).unwrap();
-        Self {
-            temp,
-            root,
-            child: Mutex::new(None),
-            seen: Mutex::default(),
-        }
+        Self::with_tree(temp, root)
     }
 
     fn spawn_helper(&self) {
@@ -538,7 +545,19 @@ impl Fixture {
             let image = std::fs::read_to_string(self.root.join("helper-image"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| std::env::current_exe().unwrap());
-            Command::new(image)
+            let mut command = Command::new(image);
+            // H leads a new session, so teardown finds every process of its tree by one
+            // ID, whatever group a member moves to (tests/reap.rs).
+            // SAFETY: setsid is async-signal-safe and touches no memory.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command
                 .args([
                     "--ignored",
                     "--exact",
@@ -552,7 +571,11 @@ impl Fixture {
                 .spawn()
                 .unwrap()
         };
-        *self.child.lock().unwrap() = Some(child);
+        // A helper this one replaces keeps running (a second helper on one ledger), and
+        // is torn down with the fixture.
+        if let Some(replaced) = self.child.lock().unwrap().replace(child) {
+            self.retired.lock().unwrap().push(replaced);
+        }
     }
 
     async fn start(&self) {
@@ -587,11 +610,13 @@ impl Fixture {
         self.child.lock().unwrap().as_ref().unwrap().id() as i32
     }
 
-    /// SIGKILL H only. Its workers learn from the EOF on their own sockets.
+    /// SIGKILL H only. Its workers learn from the EOF on their own sockets. H has exited
+    /// when this returns, and stays unreaped until teardown (tests/reap.rs).
     async fn kill_helper(&self) {
         let mut child = self.child.lock().unwrap().take().unwrap();
         child.kill().unwrap();
-        child.wait().unwrap();
+        reap::wait_exited_unreaped(&child);
+        self.retired.lock().unwrap().push(child);
         let _ = std::fs::remove_file(self.root.join("helper.sock"));
     }
 
@@ -731,10 +756,14 @@ impl Drop for Fixture {
         // Clear every stall first, so nothing outlives this fixture.
         let _ = std::fs::remove_dir_all(self.root.join("faults"));
         let _ = std::fs::remove_dir_all(self.root.join("fake"));
-        if let Some(mut child) = self.child.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        // Every helper this fixture started, killed and left unreaped: each leads the
+        // session its whole tree is in.
+        let mut helpers: Vec<Child> = self.retired.lock().unwrap().drain(..).collect();
+        helpers.extend(self.child.lock().unwrap().take());
+        for helper in &mut helpers {
+            let _ = helper.kill();
         }
+        // The real chain's VMM leaves the session (its own setsid): the census named it.
         for pid in self.seen.lock().unwrap().drain(..) {
             // SAFETY: only pids this fixture's own census named; stopped ones need the
             // continue before a kill can be delivered and acted on.
@@ -743,6 +772,21 @@ impl Drop for Fixture {
                 libc::kill(pid, libc::SIGKILL);
             }
         }
+        let leaders: Vec<i32> = helpers.iter().map(|helper| helper.id() as i32).collect();
+        let grace = if self.root.join("helper-image").exists() {
+            reap::REAL_GRACE
+        } else {
+            Duration::ZERO
+        };
+        let result = reap::reap(&mut reap::Host, &leaders, grace, reap::REAP_LIMIT, |_| {
+            for helper in &mut helpers {
+                let _ = helper.wait();
+            }
+        });
+        for helper in &mut helpers {
+            let _ = helper.try_wait();
+        }
+        reap::fail_loudly(result, std::thread::panicking());
         let _ = &self.temp;
     }
 }
@@ -1919,9 +1963,8 @@ async fn exit3_second_helper_is_refused_by_the_persistent_node_lock() {
     // SAFETY: only this fixture's process; signal 0 checks it is alive.
     assert_eq!(unsafe { libc::kill(first, 0) }, 0);
     assert_eq!(fixture.count("SELECT COUNT(*) FROM node_identity"), 1);
-    // SAFETY: stopping the first helper's process, which spawn_helper replaced in the
-    // fixture's bookkeeping and so would otherwise be left running.
-    unsafe { libc::kill(first, libc::SIGKILL) };
+    // The first helper, which spawn_helper replaced in the fixture's bookkeeping, is
+    // torn down with the fixture, its whole session included.
 }
 
 #[tokio::test]
@@ -5226,6 +5269,7 @@ mod control_plane;
 #[cfg(target_os = "linux")]
 mod lifecycle;
 mod observation;
+mod reap;
 #[cfg(target_os = "linux")]
 mod recovery;
 #[cfg(target_os = "linux")]
