@@ -25,16 +25,26 @@ at the same paths. kilnd's mount is the only change kiln needed for this.
 Follow kiln's README "Dev setup (macOS)". The part kilnd needs:
 
 ```sh
+VM=kiln   # Lima instance name; see below if you already have one called kiln
 cd ~/Projects/lambda-nine/kiln
 git fetch origin
 git checkout --detach dbcbfd8c1a028f926e1bd4502b053596a0466d97  # tested kiln
-limactl create --name=kiln lima.yaml && limactl start kiln
-limactl shell --workdir "$PWD" kiln
+limactl create --name="$VM" lima.yaml && limactl start "$VM"
+limactl shell --workdir "$PWD" "$VM"
 sudo scripts/fetch-alpine.sh        # the "alpine" image
 sudo scripts/setup-storage.sh       # XFS project quotas for --disk
 unset CARGO_TARGET_DIR              # kiln's installer uses target/release
 scripts/install.sh                  # /usr/local/bin/kiln, kiln-dns, kiln-metrics
+exit
 ```
+
+If your Mac already has a Lima instance named `kiln`, the `limactl create` line
+fails because the name is taken. Reuse it only if it was created from kiln's
+`lima.yaml` (that file mounts both checkouts): skip the `limactl create` line and
+run `limactl start "$VM"` instead, which does nothing if the instance is already
+running. Otherwise set `VM` to a new name, such as `VM=kiln-kilnd`, before the
+`limactl create` line and run that line as written. Every `limactl shell` line
+here uses `$VM`.
 
 kilnd requires persistent-exec protocol v1, scoped `gc ID...` and
 persistent-create certainty (capability feature `0x10`). The minimum kiln
@@ -63,7 +73,8 @@ and is rejected before workload launch.
 ## 3. kilnd in the VM
 
 ```sh
-limactl shell --workdir ~/Projects/lambda-nine/kilnd kiln
+# on the Mac, with VM set as in step 2
+limactl shell --workdir ~/Projects/lambda-nine/kilnd "${VM:?set VM as in step 2}"
 sudo apt-get install -y protobuf-compiler sqlite3
 # Keep Linux build output off the shared checkout, where macOS builds go.
 echo 'export CARGO_TARGET_DIR=$HOME/.cache/kilnd-target' >> ~/.profile && . ~/.profile

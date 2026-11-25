@@ -221,13 +221,14 @@ Full instructions: [docs/setup.md](docs/setup.md).
 
 ```sh
 # on the Mac
+VM=kiln   # Lima instance name; see the note below if you already have one called kiln
 git clone https://github.com/lambda-nine/kiln ~/Projects/lambda-nine/kiln
 git clone https://github.com/lambda-nine/kilnd ~/Projects/lambda-nine/kilnd
 git -C ~/Projects/lambda-nine/kiln checkout --detach dbcbfd8c1a028f926e1bd4502b053596a0466d97  # tested kiln
-cd ~/Projects/lambda-nine/kiln && limactl create --name=kiln lima.yaml && limactl start kiln
+cd ~/Projects/lambda-nine/kiln && limactl create --name="$VM" lima.yaml && limactl start "$VM"
 
 # in the VM, once: kiln itself
-limactl shell --workdir ~/Projects/lambda-nine/kiln kiln
+limactl shell --workdir ~/Projects/lambda-nine/kiln "$VM"
 sudo scripts/fetch-alpine.sh        # the "alpine" image
 sudo scripts/setup-storage.sh       # XFS project quotas for --disk
 unset CARGO_TARGET_DIR              # kiln's installer uses target/release
@@ -235,7 +236,7 @@ scripts/install.sh                  # /usr/local/bin/kiln, kiln-dns, kiln-metric
 exit
 
 # in the VM, once: kilnd
-limactl shell --workdir ~/Projects/lambda-nine/kilnd kiln
+limactl shell --workdir ~/Projects/lambda-nine/kilnd "$VM"
 sudo apt-get install -y protobuf-compiler sqlite3
 # Keep Linux build output off the shared checkout, where macOS builds go.
 echo 'export CARGO_TARGET_DIR=$HOME/.cache/kilnd-target' >> ~/.profile && . ~/.profile
@@ -253,10 +254,18 @@ sudo kilndctl run -- echo one-shot      # create, exec, delete
 ```
 
 `protobuf-compiler` comes from the `apt-get` step: kiln's `lima.yaml` doesn't
-install it, and the build needs `protoc`. If your Mac already has a Lima instance
-named `kiln`, use it if it was created from kiln's `lima.yaml` (it mounts both
-checkouts); otherwise pick another name in `limactl create --name=` and use that
-name in each `limactl shell` line.
+install it, and the build needs `protoc`.
+
+If your Mac already has a Lima instance named `kiln`, the `limactl create` line
+fails because the name is taken. You have two choices:
+
+- Reuse it, but only if it was created from kiln's `lima.yaml` (that file mounts
+  both checkouts). Skip the `limactl create` line and run `limactl start "$VM"`
+  instead; it does nothing if the instance is already running.
+- Otherwise, set `VM` to a new name, such as `VM=kiln-kilnd`, before the
+  `limactl create` line, and run that line as written.
+
+Either way, both `limactl shell` lines use `$VM`, so they enter the right instance.
 
 Add yourself to the `kilnd` group (`sudo usermod -aG kilnd $USER`, then log
 in again) to use `kilndctl` without sudo. Without sudo you see only the sandboxes
